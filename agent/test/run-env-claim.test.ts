@@ -45,17 +45,17 @@ describe("run-env claim contract", () => {
   });
 
   it("decodes fixtures/claims/run-env-claim.json", () => {
-    const d = decodeRunEnv(readFixture("run-env-claim.json"));
-    assert.equal(d.runEnv.length, 2);
-    assert.equal(d.runEnvRedact.length, 2);
+    const fx = readFixture("run-env-claim.json");
+    const d = decodeRunEnv(fx);
+    // Every field round-trips exactly: a decoder that blanked a value or description fails here.
+    assert.deepEqual(d, { runEnv: fx.run_env, runEnvRedact: fx.run_env_redact });
     assert.deepEqual(d.runEnv.map((v) => v.secret), [false, true]);
-    assert.equal(d.runEnv[0]?.name, "SERVICE_URL");
-    assert.equal(d.runEnvRedact[1]?.scope, "user");
   });
 
   it("decodes fixtures/claims/run-env-redact-response.json", () => {
-    const r = decodeRunEnvRedactResponse(readFixture("run-env-redact-response.json"));
-    assert.equal(r.protected, true);
+    const fx = readFixture("run-env-redact-response.json");
+    const r = decodeRunEnvRedactResponse(fx);
+    assert.deepEqual(r, { protected: fx.protected, versions: fx.versions });
     assert.equal(r.versions.length, 3);
     assert.equal(r.versions[0]?.name, "SERVICE_PASSPHRASE");
   });

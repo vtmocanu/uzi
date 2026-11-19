@@ -461,8 +461,8 @@ func TestRunEnvValueAndNameRulesLiveDB(t *testing.T) {
 }
 
 // A row written before a name joined the denylist (here renamed in SQL to simulate it)
-// stays manageable: disable, enable and delete check only the name shape, while a PUT of
-// the same name is still refused.
+// stays manageable: disable and delete check only the name shape, while a PUT or an enable
+// of the same name is still refused.
 func TestRunEnvNowDeniedNameStaysManageableLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	f.put("STRANDED_ONE", jsonBody(map[string]any{"value": "12345678"}), http.StatusCreated)
@@ -475,9 +475,9 @@ func TestRunEnvNowDeniedNameStaysManageableLiveDB(t *testing.T) {
 	if f.rowCount("name='TMP' AND disabled_at IS NOT NULL AND retired_at IS NULL") != 1 {
 		t.Fatal("the denied-name row was not disabled")
 	}
-	f.must(f.do(http.MethodPost, "/TMP/enable", ""), http.StatusOK)
-	if f.rowCount("name='TMP' AND disabled_at IS NULL AND retired_at IS NULL") != 1 {
-		t.Fatal("the denied-name row was not enabled")
+	f.must(f.do(http.MethodPost, "/TMP/enable", ""), http.StatusUnprocessableEntity)
+	if f.rowCount("name='TMP' AND disabled_at IS NOT NULL AND retired_at IS NULL") != 1 {
+		t.Fatal("enable re-armed a denied-name row")
 	}
 	f.must(f.do(http.MethodDelete, "/TEMP", ""), http.StatusOK)
 	if f.rowCount("name='TEMP'") != 0 {

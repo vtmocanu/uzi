@@ -240,6 +240,26 @@
       "note": "writes the TLS session keys of the harness's provider traffic to a file"
     },
     {
+      "value": "CARES_HOSTS",
+      "invariant": "network_wiring",
+      "note": "c-ares hosts-file path read by the bundled Bun CLI; could remap the provider or gateway host"
+    },
+    {
+      "value": "HOSTALIASES",
+      "invariant": "network_wiring",
+      "note": "resolver host aliases file; could remap the provider or gateway host"
+    },
+    {
+      "value": "LOCALDOMAIN",
+      "invariant": "network_wiring",
+      "note": "resolver search domain override for the harness's provider traffic"
+    },
+    {
+      "value": "RES_OPTIONS",
+      "invariant": "network_wiring",
+      "note": "resolver options override for the harness's provider traffic"
+    },
+    {
       "value": "OPENSSL_CONF",
       "invariant": "process_loader",
       "note": "OpenSSL configuration read at startup by Node and Bun; can load providers and engines"
@@ -635,6 +655,11 @@
       "value": "CLAUDE_",
       "invariant": "provider_auth",
       "note": "Claude CLI settings, including every provider selector (CLAUDE_CODE_USE_*)"
+    },
+    {
+      "value": "_CLAUDE_",
+      "invariant": "provider_auth",
+      "note": "underscore-led Claude CLI internals; _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL makes the CLI treat the worker-selected ANTHROPIC_BASE_URL as the first-party API"
     },
     {
       "value": "ANTHROPIC_",

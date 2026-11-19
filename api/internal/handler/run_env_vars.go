@@ -589,7 +589,14 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	name := chi.URLParam(r, "name")
-	if err := runenv.ValidateNameShape(name); err != nil {
+	// Disable checks only the shape, so a row whose name joined the denylist after it was
+	// saved can still be switched off; enable applies the full name rules, so such a row
+	// can never be re-armed for delivery.
+	validate := runenv.ValidateNameShape
+	if !disabled {
+		validate = runenv.ValidateName
+	}
+	if err := validate(name); err != nil {
 		writeRunEnvRule(w, err)
 		return
 	}

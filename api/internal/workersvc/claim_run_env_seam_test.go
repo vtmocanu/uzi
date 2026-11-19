@@ -15,9 +15,14 @@ import (
 // The wire shape of ClaimSecrets.run_env / run_env_redact and of the maintenance response is
 // pinned by two shared fixtures, which the worker decodes in agent/test/run-env-claim.test.ts.
 
-func readSeamFixture(t *testing.T, name string) []byte {
+const (
+	runEnvClaimFixture  = "../../../fixtures/claims/run-env-claim.json"
+	runEnvRedactFixture = "../../../fixtures/claims/run-env-redact-response.json"
+)
+
+func readSeamFixture(t *testing.T, path string) []byte {
 	t.Helper()
-	raw, err := os.ReadFile("../../../fixtures/claims/" + name)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is one of the two constant fixture paths above
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +57,7 @@ func seamRequireJSONEqual(t *testing.T, got, want []byte) {
 }
 
 func TestRunEnvClaimFixtureRoundTrips(t *testing.T) {
-	raw := readSeamFixture(t, "run-env-claim.json")
+	raw := readSeamFixture(t, runEnvClaimFixture)
 	var secrets ClaimSecrets
 	seamStrictDecode(t, raw, &secrets)
 
@@ -110,7 +115,7 @@ func TestRunEnvFieldsOmittedWhenEmpty(t *testing.T) {
 }
 
 func TestRunEnvRedactResponseFixtureRoundTrips(t *testing.T) {
-	raw := readSeamFixture(t, "run-env-redact-response.json")
+	raw := readSeamFixture(t, runEnvRedactFixture)
 	var resp apitypes.RunEnvRedactResponse
 	seamStrictDecode(t, raw, &resp)
 	if !resp.Protected || len(resp.Versions) != 3 {
