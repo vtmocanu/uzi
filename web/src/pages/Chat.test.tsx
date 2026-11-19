@@ -12,7 +12,16 @@ vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { listChats: vi.fn(), listWorkers: vi.fn(), createChat: vi.fn(), continueChat: vi.fn() },
+    api: {
+      listChats: vi.fn(),
+      listWorkers: vi.fn(),
+      createChat: vi.fn(),
+      continueChat: vi.fn(),
+      // Issue #3261: the conversation's start cards read these through the shared preview
+      // store (a no-op here: the test renders no signed-in user).
+      getEffectiveSettings: vi.fn(),
+      previewStartSettings: vi.fn(),
+    },
   };
 });
 
