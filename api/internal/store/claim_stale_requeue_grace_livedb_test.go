@@ -353,7 +353,11 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 	cycle(1)
 	cycle(2)
 
-	// An expiry inside an episode releases the run (still inside the 30m ceiling, past grace).
+	// Issue #4476: before the claim provenance gate an expiry inside an episode released this
+	// Codex run to the peer. A Codex run at claim_generation >= 1 is now admitted only for its
+	// recorded last Codex claimant, and this seeded run has no recorded provenance (legacy), so
+	// the grace expiring releases it to nobody: neither the peer nor the stale owner.
 	fx.age(run, 11*time.Minute, 11*time.Minute)
-	fx.mustClaim(p, run, staleGrace, staleCeiling, "grace expired inside the second episode")
+	fx.mustBlock(p, staleGrace, staleCeiling, "grace expired inside the second episode: provenance gate holds the Codex run")
+	fx.mustBlock(w, staleGrace, staleCeiling, "legacy NULL provenance: not even the stale owner gets a fresh claim")
 }

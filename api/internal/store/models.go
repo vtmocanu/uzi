@@ -1408,6 +1408,8 @@ type Run struct {
 	ModelProviderKeySecretID          pgtype.UUID        `json:"model_provider_key_secret_id"`
 	ModelProviderKeyRev               pgtype.Int8        `json:"model_provider_key_rev"`
 	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
+	ClaimProvenanceWorkerID           pgtype.UUID        `json:"claim_provenance_worker_id"`
+	ClaimProvenanceGeneration         pgtype.Int8        `json:"claim_provenance_generation"`
 }
 
 type RunCompletionAttempt struct {

@@ -590,6 +590,8 @@ CROSS JOIN LATERAL (
            AND (r.kind <> 'job'
                 OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                     AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+           -- Issue #4476: ClaimRun's Codex claim-provenance clause.
+           AND fn_codex_claim_provenance_admits(r, w.id)
            -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
            AND (r.kind = 'cross_check' OR r.worker_id IS NULL OR r.worker_id = w.id
                 OR r.updated_at < $5::timestamptz

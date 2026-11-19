@@ -1504,6 +1504,10 @@ WITH checker_template_pins AS MATERIALIZED (
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR ('codex_harness_v1' = ANY(@worker_protocol_caps::text[]) AND 'codex_runtime_v2' = ANY(@worker_protocol_caps::text[])))
+      -- Issue #4476: Codex claim provenance. A Codex-indicating run that has been claimed before (generation >= 1)
+      -- is claimable only by its last successful Codex claimant for the CURRENT generation. Standalone,
+      -- like the clauses above; never bypassed by capability or affinity overrides.
+      AND fn_codex_claim_provenance_admits(r, @worker_id::uuid)
       -- Interlocked Codex turns require the newer completion loop, independently of overrides.
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -1786,6 +1790,9 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- claimant's @worker_protocol_caps).
                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR ('codex_harness_v1' = ANY(p.protocol_capabilities) AND 'codex_runtime_v2' = ANY(p.protocol_capabilities)))
+                -- Issue #4476: MIRROR the Codex claim-provenance clause for the peer, so a recorded worker never
+                -- defers to a peer that provenance would stop from claiming the run.
+                AND fn_codex_claim_provenance_admits(r, p.id)
                 AND (r.completion_contract_version IS NULL
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
@@ -2114,6 +2121,10 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
+    -- Issue #4476: Codex claim provenance, the (worker, generation) pair of this claim. Written only here,
+    -- for Codex-indicating rows; trg_runs_claim_provenance_guard rejects every other writer.
+    claim_provenance_worker_id = CASE WHEN (runs.harness = 'codex' OR runs.codex_material_revision IS NOT NULL OR runs.codex_secret_id IS NOT NULL) THEN @worker_id::uuid ELSE runs.claim_provenance_worker_id END,
+    claim_provenance_generation = CASE WHEN (runs.harness = 'codex' OR runs.codex_material_revision IS NOT NULL OR runs.codex_secret_id IS NOT NULL) THEN runs.claim_generation + 1 ELSE runs.claim_provenance_generation END,
     -- Compatible-lane one-claim Fresh (#3607 Mf): a pending authorization is consumed by exactly this
     -- claim, which records the generation it spent it on; RETURNING projects it for this claim only.
     -- Every right-hand side reads the PRE-update row.
@@ -11736,6 +11747,8 @@ WHERE run.id = @run_id
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- Issue #4476: Codex claim provenance, mirrored (see ClaimRun).
+  AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
@@ -12255,6 +12268,10 @@ WHERE r.status = 'queued'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
                 AND fn_forge_origin_owner_pins(ow, r, now())), false)
+  -- Issue #4476: a run held by Codex claim provenance (its last Codex claimant is the only worker
+  -- that may claim it) is never ephemeral demand: a new ephemeral worker is always a fresh id, so
+  -- the gate can never admit it. NULL claimant models that fresh worker.
+  AND fn_codex_claim_provenance_admits(r, NULL::uuid)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -12456,6 +12473,10 @@ WHERE r.status = 'queued'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
                 AND fn_forge_origin_owner_pins(ow, r, now())), false)
+  -- Issue #4476: a run held by Codex claim provenance (its last Codex claimant is the only worker
+  -- that may claim it) is never ephemeral demand: a new ephemeral worker is always a fresh id, so
+  -- the gate can never admit it. NULL claimant models that fresh worker.
+  AND fn_codex_claim_provenance_admits(r, NULL::uuid)
   AND now() - r.status_since > @saturation_delay::interval
   AND EXISTS (
       SELECT 1 FROM workers w
