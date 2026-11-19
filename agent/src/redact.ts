@@ -36,6 +36,23 @@ export const INVISIBLE_SRC = String.raw`\x1b\[[0-?]*[ -/]*[@-~]|[\p{Cc}\p{Cf}]`;
 const INVISIBLE = new RegExp(INVISIBLE_SRC, "gu");
 const INVISIBLE_TEST = new RegExp(INVISIBLE_SRC, "u");
 
+/** Every encoding of `key` a gateway error body is known to echo it in: raw, JSON-escaped, JSON
+ *  with `\/`, the HTML-safe `\u00XX` forms Go's encoding/json emits (both hex cases), and the
+ *  percent-encoded forms (both hex cases, and `+` for a space). Longest first, so a raw
+ *  substring never leaves the surrounding escape characters behind. */
+export function providerKeyForms(key: string): string[] {
+  const json = JSON.stringify(key).slice(1, -1);
+  const htmlSafe = (hex: (s: string) => string): string =>
+    json.replace(/[<>&\u2028\u2029]/g, (c) => `\\u${hex(c.charCodeAt(0).toString(16).padStart(4, "0"))}`);
+  const pct = encodeURIComponent(key);
+  const forms = [
+    key, json, json.replaceAll("/", "\\/"), htmlSafe((h) => h), htmlSafe((h) => h.toUpperCase()),
+    pct, pct.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()),
+  ];
+  if (key.includes(" ")) forms.push(pct.replaceAll("%20", "+"));
+  return [...new Set(forms)].sort((a, b) => b.length - a.length);
+}
+
 export type TextRedactor = (s: string) => string;
 export type PayloadRedactor = (payload: Record<string, unknown>) => Record<string, unknown>;
 

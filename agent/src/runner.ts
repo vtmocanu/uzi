@@ -244,7 +244,7 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { SecretSet } from "./redact.js";
+import { providerKeyForms, SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
@@ -6284,7 +6284,8 @@ export class RunRunner {
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
     // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
     // this registration (with the redactors' below) is the only protection for it.
-    if (claim.secrets.provider?.credential) runScopedSecrets.push(claim.secrets.provider.credential);
+    // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
+    if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -13825,7 +13826,7 @@ export class RunRunner {
     const secrets = [
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
-      claim.secrets.provider?.credential,
+      ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []),
       this.joinToken,
       gitBasic,
     ];

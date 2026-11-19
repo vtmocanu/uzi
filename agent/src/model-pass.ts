@@ -33,7 +33,7 @@ import { uidSplitActive } from "./runner-uid.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
-import { makeTextRedactor, type TextRedactor } from "./redact.js";
+import { makeTextRedactor, providerKeyForms, type TextRedactor } from "./redact.js";
 import type { Logger } from "./log.js";
 import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
@@ -242,7 +242,7 @@ function usageLatch(opts: ReadOnlyModelPassOpts, scope?: ProviderScope): {
 // Provider output redaction (issue #4505). A provider pass runs under a gateway key the worker
 // log may not have registered, and a gateway can echo that key into the model's text, the model
 // ids of the usage evidence, thrown errors and the pass's own log lines. Everything the pass hands
-// back is scrubbed of the key in every form keyForms builds (raw, JSON-escaped, `\/`, HTML-safe
+// back is scrubbed of the key in every form providerKeyForms builds (raw, JSON-escaped, `\/`, HTML-safe
 // \u00XX, percent-encoded). Vendor passes never build a scope.
 
 interface ProviderScope {
@@ -254,25 +254,8 @@ interface ProviderScope {
   thrown(err: unknown): unknown;
 }
 
-/** Every encoding of `key` a gateway error body is known to echo it in: raw, JSON-escaped, JSON
- *  with `\/`, the HTML-safe `\u00XX` forms Go's encoding/json emits (both hex cases), and the
- *  percent-encoded forms (both hex cases, and `+` for a space). Longest first, so a raw
- *  substring never leaves the surrounding escape characters behind. */
-function keyForms(key: string): string[] {
-  const json = JSON.stringify(key).slice(1, -1);
-  const htmlSafe = (hex: (s: string) => string): string =>
-    json.replace(/[<>&\u2028\u2029]/g, (c) => `\\u${hex(c.charCodeAt(0).toString(16).padStart(4, "0"))}`);
-  const pct = encodeURIComponent(key);
-  const forms = [
-    key, json, json.replaceAll("/", "\\/"), htmlSafe((h) => h), htmlSafe((h) => h.toUpperCase()),
-    pct, pct.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()),
-  ];
-  if (key.includes(" ")) forms.push(pct.replaceAll("%20", "+"));
-  return [...new Set(forms)].sort((a, b) => b.length - a.length);
-}
-
 function providerScope(key: string, base: Logger, label: string): ProviderScope {
-  const text = makeTextRedactor(keyForms(key));
+  const text = makeTextRedactor(providerKeyForms(key));
   return { text, log: redactingLogger(base, text), thrown: (err) => sanitizeThrown(err, text, label) };
 }
 

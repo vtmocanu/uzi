@@ -11,7 +11,8 @@ import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
 
 // PRD #4320 module 7 (activation-blocking): does the REAL bundled CLI, run with the provider-mode
 // env uzi builds, send every request (main agent, Task subagent, haiku auxiliary calls) ONLY to the
-// bound base URL, and does it refuse to follow a gateway redirect for either auth style?
+// bound base URL? Redirect handling is NOT activation-blocking: the pinned CLI follows a gateway 307,
+// an accepted risk (ADR-4320) whose observed behaviour the redirect tests below pin.
 //
 // The SDK `env` REPLACES the child environment (sdk-env.ts), so the CLI's environment is built from
 // {...buildSdkEnv(providerCredential, home), HTTPS_PROXY, HTTP_PROXY, NO_PROXY} (the SDK may add its own
@@ -309,20 +310,19 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
 
   async function redirectRun(authStyle: "bearer" | "x_api_key", target: "same-origin sibling path" | "second loopback server") {
     const rec = await startRecorder();
-    const other = new RecordingServer((_req, res) => { res.writeHead(500); res.end("must never be reached"); });
+    const other = new RecordingServer((_req, res) => { res.writeHead(500); res.end("redirect target"); });
     const otherAddr = await other.listen();
     let location = "";
     const gw = new Gateway(() => ({ status: 307, to: location }));
     const { port, origin } = await gw.listen();
     location = target === "same-origin sibling path" ? "/other-tenant/v1/messages" : `${otherAddr.origin}/v1/messages`;
     try {
-      const { failed } = await drive({
+      await drive({
         cred: credential(`${origin}${GATEWAY_PREFIX}`, authStyle), proxy: rec,
         noProxy: `127.0.0.1:${port},127.0.0.1:${otherAddr.port}`, withSubagent: false, boundedRetries: true, budgetMs: 40_000, prompt: REDIRECT_SENTINEL_PROMPT,
       });
       const line = (s: Seen): string => `${s.method} ${s.url}`;
       return {
-        failed,
         gatewayLines: gw.seen.map(line),
         gatewaySibling: gw.seen.filter((s) => s.url.startsWith("/other-tenant")),
         otherSeen: other.seen,
@@ -344,8 +344,10 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
         assert.ok(hop, "the redirect is followed (observed)");
         assert.equal(hop.method, "POST");
         assert.ok(hop.body.includes(REDIRECT_SENTINEL), "the request body is re-sent to the redirect target");
+        assert.deepEqual(r.recorderTargets, [], "no request left through the proxy recorder");
         const auth = hop.headers.authorization;
         const xKey = hop.headers["x-api-key"];
+        if (authStyle === "bearer") assert.equal(xKey, undefined, "bearer: no x-api-key header is sent");
         if (target === "same-origin sibling path") {
           if (authStyle === "bearer") assert.equal(auth, `Bearer ${KEY}`, "the key travels to the same-origin sibling");
           else assert.equal(xKey, KEY, "the key travels to the same-origin sibling");

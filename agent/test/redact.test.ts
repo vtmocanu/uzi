@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
 
 const TOKEN = "dummy-oauth-token-do-not-scan-0000";
 const PAT = "dummy-forge-pat-do-not-scan-1111";
@@ -107,4 +107,22 @@ describe("redaction across invisible separators: the shared fixture", () => {
   for (const c of fixture.cases) {
     it(`fixture: ${c.name}`, () => assert.equal(scrub(c.input), c.redacted));
   }
+});
+
+describe("providerKeyForms", () => {
+  const KEY = ["gw", "key", "do-not-scan", "ab/cd", "efgh"].join("-");
+
+  it("lists raw, JSON-slash and percent forms, deduplicated, longest first", () => {
+    const forms = providerKeyForms(KEY);
+    assert.ok(forms.includes(KEY));
+    assert.ok(forms.includes(KEY.replaceAll("/", "\\/")));
+    assert.ok(forms.includes(encodeURIComponent(KEY)));
+    assert.ok(forms.includes(encodeURIComponent(KEY).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase())));
+    assert.equal(new Set(forms).size, forms.length, "no duplicates");
+    for (let i = 1; i < forms.length; i++) assert.ok(forms[i - 1]!.length >= forms[i]!.length, "longest first");
+  });
+
+  it("collapses to one form for a key every encoding leaves untouched", () => {
+    assert.deepEqual(providerKeyForms("plainkey12345678"), ["plainkey12345678"]);
+  });
 });

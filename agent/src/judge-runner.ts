@@ -18,6 +18,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Logger } from "./log.js";
+import { providerKeyForms } from "./redact.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
@@ -327,11 +328,12 @@ export class JudgeRunner {
         // PRD #4320: the judge lane cannot serve a provider until PRD #4322 (the server refuses it first;
         // this is the worker's second layer). The judge is reported failed with the typed reason and no
         // model call, no fallback review, is made.
-        this.log.addSecret(claim.secrets.provider.credential);
+        const providerKeys = providerKeyForms(claim.secrets.provider.credential);
+        for (const k of providerKeys) this.log.addSecret(k);
         this.log.warn("judge claim carried a provider binding; refusing the lane", { run_id: judgeRunId, reason: PROVIDER_LANE_UNSUPPORTED });
         await safeReportFailed(this.client, this.log, "judge", judgeRunId, PROVIDER_LANE_UNSUPPORTED, undefined,
           claim.claim_generation, this.terminalDeps);
-        this.log.removeSecret(claim.secrets.provider.credential);
+        for (const k of providerKeys) this.log.removeSecret(k);
         required?.close();
         this.activeRuns?.remove(judgeRunId);
         return;

@@ -381,6 +381,28 @@ describe("ChatRunner — provider gateway key redaction (PRD #4320)", () => {
     assert.ok(emitted.includes("REDACTED"), "it was replaced, not dropped");
   });
 
+  it("scrubs the escaped-slash JSON and percent-encoded forms of a key containing slashes", async () => {
+    const SLASH_KEY = ["gw", "key", "do-not-scan", "6262", "ab/cd/efgh"].join("-");
+    const jsonSlash = SLASH_KEY.replaceAll("/", "\\/");
+    const pct = encodeURIComponent(SLASH_KEY);
+    const { messages, client } = fakeClient();
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      yield assistantText(`echo {"key":"${jsonSlash}"} and ?k=${pct}`);
+      yield resultSuccess();
+    })();
+    const { logger, added, removed } = secretRecordingLogger();
+    const claim = providerClaim();
+    claim.secrets = { ...claim.secrets, provider: { ...claim.secrets.provider!, credential: SLASH_KEY } };
+    const executor = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+    await new ChatRunner(client, () => executor, logger, 5, DEFAULTS, JOIN, { makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]) }).execute(claim);
+    const emitted = JSON.stringify(messages);
+    assert.ok(!emitted.includes(jsonSlash) && !emitted.includes(pct) && !emitted.includes(SLASH_KEY), "no encoding reaches a chat message");
+    assert.ok(emitted.includes("REDACTED"));
+    assert.ok(added.includes(jsonSlash) && added.includes(pct), "every form registered with the logger");
+    assert.deepEqual([...removed].sort(), [...added].sort(), "and evicted symmetrically");
+  });
+
   async function resultPayloads(claim: ChatClaimResponse): Promise<Record<string, unknown>[]> {
     const { messages, client } = fakeClient();
     const queryFn: SdkQueryFn = (params) => (async function* () {

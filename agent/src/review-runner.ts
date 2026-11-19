@@ -18,6 +18,7 @@ import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
+import { providerKeyForms } from "./redact.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
@@ -145,12 +146,12 @@ export class ReviewRunner {
       ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     scope?.own();
     // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
-    const providerKey = claim.secrets?.provider?.credential;
-    if (providerKey) this.log.addSecret(providerKey);
+    const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const k of providerKeys) this.log.addSecret(k);
     try { await this.executeClaim(claim, signal); }
     finally {
       scope?.close();
-      if (providerKey) this.log.removeSecret(providerKey);
+      for (const k of providerKeys) this.log.removeSecret(k);
     }
   }
 
