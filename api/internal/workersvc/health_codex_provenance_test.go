@@ -184,6 +184,10 @@ func TestCodexProvenanceHeldQuietTransitionsNeverLateNudge(t *testing.T) {
 			r.Health = healthWaitingWorker
 			r.HealthReason = pgtype.Text{String: tc.prior, Valid: true}
 			r.HealthSince = ago(time.Hour)
+			// Queued long before: the affinity ceiling (2h in pinSvc) ended before the episode began, so
+			// no window covers it. With a recent updated_at the time window would still be open at
+			// health_since and the hold would nudge once at that window's end (accepted).
+			r.UpdatedAt = ago(3 * time.Hour)
 			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 			svc, b := pinSvc(fs, defaultHealthSettings())
 			svc.detectRunHealth(context.Background(), t0)
@@ -216,6 +220,65 @@ func TestCodexProvenanceUnavailableNudgesOnEntryFromNonOK(t *testing.T) {
 	w := lastWrite(t, fs, r.ID)
 	if w.HealthReason.String != wantHeldUnavailble || !w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || !b.healthNudges[0] {
 		t.Fatalf("reason=%q nudges=%v notified=%v, want one nudge on entry", w.HealthReason.String, b.healthNudges, w.HealthNotifiedAt)
+	}
+}
+
+// The unavailable reason entered from an expired Codex admission wait still nudges on entry.
+func TestCodexProvenanceUnavailableNudgesFromExpiredAdmission(t *testing.T) {
+	r := heldCodexRun("")
+	r.Health = healthWaitingWorker
+	r.HealthReason = pgtype.Text{String: apitypes.CodexAdmissionReason("rate_limit", t0.Add(-time.Hour)), Valid: true}
+	r.HealthSince = ago(2 * time.Hour)
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc, b := pinSvc(fs, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != wantHeldUnavailble || !w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || !b.healthNudges[0] {
+		t.Fatalf("reason=%q nudges=%v notified=%v, want one nudge on entry", w.HealthReason.String, b.healthNudges, w.HealthNotifiedAt)
+	}
+}
+
+// The pinnable flags can drop mid-window (worker row replaced, drain ended, origin-owner pins
+// flipped); a quiet named hold must then still nudge exactly once, and not again.
+func TestCodexProvenanceQuietHoldNudgesWhenPinFlagsDrop(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func(*store.ListActiveRunsForHealthRow, bool)
+	}{
+		{"owner hold", func(r *store.ListActiveRunsForHealthRow, v bool) { r.OwnerHoldPinnable = v }},
+		{"stale requeue pin", func(r *store.ListActiveRunsForHealthRow, v bool) { r.StaleRequeuePinnable = v }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := heldCodexRun("A")
+			tc.set(&r, true)
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc, b := pinSvc(fs, defaultHealthSettings())
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			if w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] {
+				t.Fatalf("tick 1: nudges=%v notified=%v, want quiet", b.healthNudges, w.HealthNotifiedAt)
+			}
+
+			r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+			tc.set(&r, false)
+			fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc2, b2 := pinSvc(fs2, defaultHealthSettings())
+			if n := svc2.detectRunHealth(context.Background(), t0.Add(5*time.Minute)); n != 1 {
+				t.Fatalf("tick 2: changed=%d, want 1", n)
+			}
+			w2 := lastWrite(t, fs2, r.ID)
+			if len(b2.healthNudges) != 1 || !b2.healthNudges[0] || !w2.HealthNotifiedAt.Valid {
+				t.Fatalf("tick 2: nudges=%v notified=%v, want exactly one nudge", b2.healthNudges, w2.HealthNotifiedAt)
+			}
+
+			r.HealthNotifiedAt = w2.HealthNotifiedAt
+			fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc3, _ := pinSvc(fs3, defaultHealthSettings())
+			if n := svc3.detectRunHealth(context.Background(), t0.Add(10*time.Minute)); n != 0 {
+				t.Fatalf("tick 3: changed=%d, want 0", n)
+			}
+		})
 	}
 }
 
