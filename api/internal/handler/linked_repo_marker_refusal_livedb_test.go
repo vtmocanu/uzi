@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -255,4 +256,47 @@ func TestLinkedRepoFindingMarkerThatCannotBeWrittenIsRefusedLiveDB(t *testing.T)
 			f.dispositionIsOpenAndUnclaimed(t)
 		})
 	}
+}
+
+// PRD #4173 M5 review: when the label settings cannot be read, the accessor returns the
+// default names next to the error, and those cannot say which label the owner meant as a
+// run opt-in or which marker is required. Here the saved uzi label is "start", so the
+// owner's "uzi" is an ordinary label; with the defaults it would be rewritten to the
+// eligibility name and read as an opt-in. The single route answers 500 before the claim
+// and before any write, as the group route does.
+func TestFileFindingFailsClosedWhenTheLabelSettingsCannotBeReadLiveDB(t *testing.T) {
+	unreadable := func(f *neverEnabledFixture) {
+		f.h.settings = settings.New(&settingsStore{
+			rows: []store.AppSetting{
+				{Key: settings.KeyFindingLabel, Value: "reported"},
+				{Key: settings.KeyUziLabel, Value: "start"},
+			},
+			err: errors.New("settings store down"),
+		}, time.Minute)
+	}
+	t.Run("FileFinding", func(t *testing.T) {
+		f := seedNeverEnabledFixture(t)
+		srv := linkNeverEnabledFixture(t, f)
+		unreadable(f)
+		rr := httptest.NewRecorder()
+		f.h.FileFinding(rr, f.request(http.MethodPost, apitypes.FileFindingRequest{Labels: []string{"uzi"}}, map[string]string{"id": f.findID.String()}))
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d body = %s, want 500", rr.Code, rr.Body.String())
+		}
+		wantNoTrackerWrite(t, srv)
+		f.dispositionIsOpenAndUnclaimed(t)
+	})
+	// Control: the group route already refused this before any write.
+	t.Run("FileFindingGroup", func(t *testing.T) {
+		f := seedNeverEnabledFixture(t)
+		srv := linkNeverEnabledFixture(t, f)
+		unreadable(f)
+		rr := httptest.NewRecorder()
+		f.h.FileFindingGroup(rr, f.request(http.MethodPost, apitypes.FindingGroupFileRequest{IDs: []string{f.dispID.String()}, Labels: []string{"uzi"}}, nil))
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d body = %s, want 500", rr.Code, rr.Body.String())
+		}
+		wantNoTrackerWrite(t, srv)
+		f.dispositionIsOpenAndUnclaimed(t)
+	})
 }

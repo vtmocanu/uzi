@@ -134,7 +134,15 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// draft (GetFindingIssueDraft), and attach solely when the repo owner explicitly keeps them
 	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
 	// action, not an agent-injected one.
-	names, _ := h.settings.FilingLabels(ctx)
+	names, err := h.settings.FilingLabels(ctx)
+	if err != nil {
+		// Fail closed: on an unreadable settings store the accessor returns the default
+		// names, which cannot say which label the owner meant as a run opt-in or which
+		// marker is required. Nothing is claimed or written yet.
+		slog.Error("file finding: label settings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	filedLabels, requiredLabels, err := findingFilingLabels(repo, names, req.Labels, req.SendToUzi)
 	if err != nil {
 		// Refused before the claim and before any write (PRD #4173 M5 review).
