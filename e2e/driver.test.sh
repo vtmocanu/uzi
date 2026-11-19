@@ -1083,8 +1083,78 @@ pass "body ok"
 BODY
 run_driver 31
 has_row knob PASS || bad "run that settles should PASS: $(cat "$TSV")"
+contains "$(row_msg knob PASS)" "boundary cancelled undeclared run $R1 (settled)" || bad "PASS row lost the cancel trace: [$(row_msg knob PASS)]"
 f="$(qargs runs | sed -n 1p)"
 { [ "$f" -ge 119 ] && [ "$f" -le 120 ]; } || bad "first settlement bound should be the 120s default, got $f"
+end
+
+# ============================================================================
+# Case 32 — a sticky error ends the settle loop after the current sample: a rejected cancel
+# and a phase-start (D1) unverifiable read each FAIL after ONE sample although the run
+# persists and the deadline is far away (virtual clock: end_secs stays 0).
+# Mutation: break only on a failed read -> the loop keeps sampling to the deadline.
+begin "case32a: rejected cancel with a persisting run ends the loop after one sample" 32a
+export E2E_BOUNDARY_TIMEOUT=10 FAKE_CANCEL_CODE=403
+seqf runs "$R1"
+mkphase "$PHASES_DIR/10-stickycancel.sh" "rejected cancel" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 32a
+has_row stickycancel FAIL || bad "not FAIL: $(cat "$TSV")"
+[ "$(qcount runs)" -eq 1 ] || bad "expected exactly 1 runs sample, got $(qcount runs)"
+[ "$(bw_field stickycancel 3)" -eq 0 ] || bad "end_secs should be 0, got $(bw_field stickycancel 3)"
+end
+
+begin "case32b: phase-start owner read failure with a persisting new run ends after one sample" 32b
+export E2E_BOUNDARY_TIMEOUT=10
+seqf owner "!1"
+seqf runs "$R1"
+mkphase "$PHASES_DIR/10-stickyowner.sh" "owner unreadable" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 32b
+has_row stickyowner FAIL || bad "not FAIL: $(cat "$TSV")"
+contains "$(row_msg stickyowner FAIL)" "unverifiable owner" || bad "message: $(row_msg stickyowner FAIL)"
+[ "$(qcount runs)" -eq 1 ] || bad "expected exactly 1 runs sample, got $(qcount runs)"
+end
+
+# ============================================================================
+# Case 33 — a requires-miss FAIL row never ran a body, so (like a SKIP) it is not annotated
+# as having run after a contaminated boundary.
+# Mutation: annotate every non-SKIP row.
+begin "case33: requires-miss FAIL after a contaminated boundary is not annotated" 33
+seqp 10-dirty runs "$R1"
+mkphase "$PHASES_DIR/10-dirty.sh" "leaks" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-needs.sh" "needs FOO" no FOO "" "" <<'BODY'
+pass "never runs"
+BODY
+run_driver 33
+has_row dirty FAIL || bad "dirty not FAIL: $(cat "$TSV")"
+has_row needs FAIL || bad "needs not FAIL: $(cat "$TSV")"
+contains "$(row_msg needs FAIL)" "ran after contaminated" && bad "requires-miss row must not be annotated: $(row_msg needs FAIL)"
+end
+
+# ============================================================================
+# Case 34 — the top-level unset of declared names before the body: A provides and hands
+# forward RUN_X; B declares `handoff: RUN_X` without setting it while that run is still
+# residue -> B must FAIL (the value inherited from A must not count as B's declaration).
+# Mutation: remove the unset loop in driver.sh -> B reads PASS.
+begin "case34: a name declared by B but not set by B does not inherit A's value" 34
+seqp 10-ahands runs "$R1"
+seqp 11-bnoset runs "$R1"
+mkphase "$PHASES_DIR/10-ahands.sh" "A hands RUN_X" no "" RUN_X RUN_X <<BODY
+RUN_X=$R1
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-bnoset.sh" "B declares but never sets" no "" "" RUN_X <<'BODY'
+pass "body ok"
+BODY
+run_driver 34
+has_row ahands PASS || bad "ahands not PASS: $(cat "$TSV")"
+has_row bnoset FAIL || bad "bnoset did not FAIL (inherited declaration): $(cat "$TSV")"
+contains "$(row_msg bnoset FAIL)" "run=$R1" || bad "bnoset message: $(row_msg bnoset FAIL)"
 end
 
 # ============================================================================

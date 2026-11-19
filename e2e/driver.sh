@@ -5,8 +5,8 @@
 # do source; done` loop + roll-call), and by e2e/driver.test.sh with fakes. It
 # owns: header parse, lane filter, ONLY/SKIP selection, requires validation,
 # the errexit-safe subshell-per-phase, provides round-trip, fail-soft + critical,
-# the end-of-phase BOUNDARY (a phase that leaves a run, a worker row or a custody
-# hold behind FAILS, #2892), results (results.tsv / junit.xml / summary.md) and the
+# the end-of-phase BOUNDARY (#2892: undeclared residue that does not settle, a rejected
+# cancel or an unverifiable read FAILS the phase), results (results.tsv / junit.xml / summary.md) and the
 # roll-call. It ENDS WITH `exit`, which — because run-e2e.sh sources it last —
 # drives the cleanup EXIT trap with the suite's exit code.
 #
@@ -31,8 +31,12 @@
 # IDs); a worker row whose run is not so held (even a DB-terminal run); an open hold in
 # neither the baseline nor a `# handoff-holds:` variable (vars holding hold UUIDs).
 # An undeclared non-terminal run is cancelled ONCE through the API; the driver never
-# writes a run status. Any residue, unverifiable read or rejected cancel makes the
-# phase FAIL (the body's own row when the body failed too). Residue a boundary reports
+# writes a run status. The loop ends at the first of: nothing NEW pending, a sticky error
+# (unverifiable read, rejected or timed-out cancel, malformed declaration, unusable
+# phase-start snapshot), or the deadline. The phase FAILs (the body's own row when the body
+# failed too) when residue is still present in the last sample, or a sticky error was
+# recorded. An undeclared run the boundary cancels and that then settles is reported in
+# the PASS row's message but does not fail the phase. Residue a boundary reports
 # becomes KNOWN: later boundaries sample it once without waiting for it again, but
 # still FAIL while it is present, and every row after a failed boundary is annotated.
 #
@@ -52,17 +56,16 @@ _FAILED_PROVIDES=""   # space-padded list of provides tokens of phases that FAIL
 
 # Boundary state that outlives one phase (declared at top level so the functions below
 # mutate THESE, never function-locals).
-declare -A _KNOWN=()          # residue key -> slug of the boundary that first reported it
+# (No associative arrays, namerefs or ${x,,}: this file must run on bash 3.2.)
+_KN_K=(); _KN_V=()            # known residue: key / slug of the boundary that first reported it
 _contaminated=""              # space-prefixed slugs of phases whose boundary FAILed
 _bw_slugs=(); _bw_start=(); _bw_end=(); _bw_total=()
 # Per-boundary scratch.
-declare -A _BASE=()           # baseline open-hold IDs (phase start)
-declare -A _H_RUNS=()         # declared handoff run IDs
-declare -A _H_HOLDS=()        # declared handoff hold IDs
-declare -A _B_CANC=()         # run IDs already cancelled at this boundary
-declare -A _R_DESC=()         # residue key -> human identity
-declare -A _B_HOLD_OBS=()     # hold IDs observed in the latest sample
-_R_KEYS=(); _B_REASONS=(); _B_BREASONS=(); _B_PARSED=()
+# Space-padded ID sets (" id id "): baseline open holds, declared handoff runs / holds,
+# runs already cancelled at this boundary, hold IDs observed in the latest sample.
+_BASE=" "; _H_RUNS=" "; _H_HOLDS=" "; _B_CANC=" "; _B_HOLD_OBS=" "; _B_DECL=" "
+_R_KEYS=(); _R_DESC=()        # residue keys and (same index) their human identity
+_B_NOTE=""; _B_REASONS=(); _B_BREASONS=(); _B_PARSED=()
 _B_SR=(); _B_SW=(); _B_SH=()
 _OWNER=""; _bdir=""; _B_N=0; _B_DEADLINE=0; _B_READERR=0; _B_HOLDS_OK=0
 _B_FAILED=0; _B_MESSAGE=""; _B_START_SECS=0; _B_END_SECS=0; _B_OUT=""
@@ -136,14 +139,15 @@ _note_failed() {
   for p in $1; do _FAILED_PROVIDES="$_FAILED_PROVIDES $p"; done
 }
 
-# _record SLUG STATUS SECS MSG TITLE — append one row to the arrays and to
+# _record SLUG STATUS SECS MSG TITLE [noran] — append one row to the arrays and to
 # results.tsv (tab/newline in the message flattened so the TSV stays 4 columns).
 # Once a boundary has FAILed (D5), every later row of a phase that ran carries the
 # literal suffix naming the contaminated boundaries: a clean-looking result after a
-# dirty boundary is not trustworthy evidence. A SKIP never ran, so it is not annotated.
+# dirty boundary is not trustworthy evidence. A SKIP never ran, and a requires-miss FAIL
+# (6th argument `noran`) never ran its body, so neither is annotated.
 _record() {
   local m; m="$(printf '%s' "$4" | tr '\t\n' '  ')"
-  if [ -n "$_contaminated" ] && [ "$2" != SKIP ]; then
+  if [ -n "$_contaminated" ] && [ "$2" != SKIP ] && [ "${6:-}" != noran ]; then
     m="$m [ran after contaminated boundary:$_contaminated]"
   fi
   _slugs+=("$1"); _statuses+=("$2"); _secs+=("$3"); _msgs+=("$m"); _titles+=("$5")
@@ -187,6 +191,18 @@ _pos_int() {
   if [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$((10#$1))" -gt 0 ]; then printf '%s' "$((10#$1))"; else printf '%s' "$2"; fi
 }
 _is_uuid() { [[ "$1" =~ $_UUID_RE ]]; }
+# _lc STR — lowercase (bash 3.2 has no ${x,,}).
+_lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# _in_set SET ID — 0 when the space-padded SET holds ID.
+_in_set() { case "$1" in *" $2 "*) return 0 ;; esac; return 1; }
+# _known_get KEY — print the slug that first reported KEY (empty when KEY is not known).
+_known_get() {
+  local i
+  for ((i = 0; i < ${#_KN_K[@]}; i++)); do
+    if [ "${_KN_K[$i]}" = "$1" ]; then printf '%s' "${_KN_V[$i]}"; return 0; fi
+  done
+  return 0
+}
 
 # _b_rem — whole seconds left before the boundary deadline (0 when none remain).
 _b_rem() {
@@ -227,13 +243,13 @@ _b_parse() {
   while IFS= read -r line; do
     if [ "$kind" = runs ]; then
       _is_uuid "$line" || return 1
-      _B_PARSED+=("${line,,}")
+      _B_PARSED+=("$(_lc "$line")")
     else
       bars="${line//[^|]/}"
       [ "${#bars}" -eq 2 ] || return 1
       IFS='|' read -r a b c <<< "$line"
       _is_uuid "$a" && _is_uuid "$b" && [[ "$c" =~ ^[0-9]+$ ]] || return 1
-      _B_PARSED+=("${a,,}|${b,,}|$c")
+      _B_PARSED+=("$(_lc "$a")|$(_lc "$b")|$c")
     fi
   done <<< "$text"
   return 0
@@ -257,13 +273,13 @@ _b_fetch() {
 # _b_sample — one sample of the three settlement reads (runs, worker rows, owner holds).
 _b_sample() {
   local k
-  _B_SR=(); _B_SW=(); _B_SH=(); _B_HOLD_OBS=(); _B_READERR=0; _B_HOLDS_OK=0
-  if _b_fetch runs "$_Q_RUNS" runs; then _B_SR=("${_B_PARSED[@]}"); else _B_READERR=1; fi
-  if _b_fetch workers "$_Q_WORKERS" triple; then _B_SW=("${_B_PARSED[@]}"); else _B_READERR=1; fi
+  _B_SR=(); _B_SW=(); _B_SH=(); _B_HOLD_OBS=" "; _B_READERR=0; _B_HOLDS_OK=0
+  if _b_fetch runs "$_Q_RUNS" runs; then _B_SR=(${_B_PARSED[@]+"${_B_PARSED[@]}"}); else _B_READERR=1; fi
+  if _b_fetch workers "$_Q_WORKERS" triple; then _B_SW=(${_B_PARSED[@]+"${_B_PARSED[@]}"}); else _B_READERR=1; fi
   if [ -n "$_OWNER" ]; then
     if _b_fetch holds "SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id = '$_OWNER' AND state = 'open'" triple; then
-      _B_SH=("${_B_PARSED[@]}"); _B_HOLDS_OK=1
-      for k in "${_B_SH[@]}"; do _B_HOLD_OBS["${k%%|*}"]=1; done
+      _B_SH=(${_B_PARSED[@]+"${_B_PARSED[@]}"}); _B_HOLDS_OK=1
+      for k in ${_B_SH[@]+"${_B_SH[@]}"}; do _B_HOLD_OBS="$_B_HOLD_OBS${k%%|*} "; done
     else
       _B_READERR=1
     fi
@@ -275,20 +291,20 @@ _b_sample() {
 _b_residue() {
   local k id w r g
   _R_KEYS=(); _R_DESC=()
-  for id in "${_B_SR[@]}"; do
-    [ -z "${_H_RUNS[$id]:-}" ] || continue
-    _R_KEYS+=("run:$id"); _R_DESC["run:$id"]="run=$id"
+  for id in ${_B_SR[@]+"${_B_SR[@]}"}; do
+    ! _in_set "$_H_RUNS" "$id" || continue
+    _R_KEYS+=("run:$id"); _R_DESC+=("run=$id")
   done
-  for k in "${_B_SW[@]}"; do
+  for k in ${_B_SW[@]+"${_B_SW[@]}"}; do
     IFS='|' read -r w r g <<< "$k"
-    [ -z "${_H_RUNS[$r]:-}" ] || continue
-    _R_KEYS+=("worker:$w/$r/$g"); _R_DESC["worker:$w/$r/$g"]="worker=$w run=$r generation=$g"
+    ! _in_set "$_H_RUNS" "$r" || continue
+    _R_KEYS+=("worker:$w/$r/$g"); _R_DESC+=("worker=$w run=$r generation=$g")
   done
-  for k in "${_B_SH[@]}"; do
+  for k in ${_B_SH[@]+"${_B_SH[@]}"}; do
     IFS='|' read -r id r g <<< "$k"
-    [ -z "${_BASE[$id]:-}" ] || continue
-    [ -z "${_H_HOLDS[$id]:-}" ] || continue
-    _R_KEYS+=("hold:$id"); _R_DESC["hold:$id"]="hold=$id run=$r generation=$g"
+    ! _in_set "$_BASE" "$id" || continue
+    ! _in_set "$_H_HOLDS" "$id" || continue
+    _R_KEYS+=("hold:$id"); _R_DESC+=("hold=$id run=$r generation=$g")
   done
 }
 
@@ -296,8 +312,8 @@ _b_residue() {
 _b_count_new() {
   local k
   _B_PEND=0
-  for k in "${_R_KEYS[@]}"; do
-    if [ -z "${_KNOWN[$k]:-}" ]; then _B_PEND=$((_B_PEND + 1)); fi
+  for k in ${_R_KEYS[@]+"${_R_KEYS[@]}"}; do
+    if [ -z "$(_known_get "$k")" ]; then _B_PEND=$((_B_PEND + 1)); fi
   done
 }
 
@@ -306,12 +322,12 @@ _b_count_new() {
 # non-2xx or transport failure is sticky (FAIL even if the run later turns terminal).
 _b_cancel_new() {
   local k id rem pre rc ex code
-  for k in "${_R_KEYS[@]}"; do
+  for k in ${_R_KEYS[@]+"${_R_KEYS[@]}"}; do
     case "$k" in run:*) ;; *) continue ;; esac
-    [ -z "${_KNOWN[$k]:-}" ] || continue
+    [ -z "$(_known_get "$k")" ] || continue
     id="${k#run:}"
-    [ -z "${_B_CANC[$id]:-}" ] || continue
-    _B_CANC[$id]=1
+    ! _in_set "$_B_CANC" "$id" || continue
+    _B_CANC="$_B_CANC$id "
     rem="$(_b_rem)"
     if [ "$rem" -le 0 ]; then _b_reason "cancel not sent run=$id (deadline exhausted)"; continue; fi
     pre="$_bdir/cancel-$id"
@@ -327,18 +343,18 @@ _b_cancel_new() {
   done
 }
 
-# _b_declared NAMES SETVAR — add the lowercase UUID each declared variable holds to the
-# associative array SETVAR. An empty or unset variable declares nothing; a non-UUID value
-# (or an unusable name) is a boundary reason.
+# _b_declared NAMES — set _B_DECL to the space-padded lowercase UUIDs the declared variables
+# hold. An empty or unset variable declares nothing; a non-UUID value (or an unusable name)
+# is a boundary reason.
 _b_declared() {
   local name v
-  local -n _dset="$2"
+  _B_DECL=" "
   for name in $1; do
     case "$name" in env:*) continue ;; esac
     if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then _b_reason "malformed declaration $name (not a variable name)"; continue; fi
     v="${!name:-}"
     [ -n "$v" ] || continue
-    if _is_uuid "$v"; then _dset["${v,,}"]=1; else _b_reason "malformed declaration $name (not a UUID)"; fi
+    if _is_uuid "$v"; then _B_DECL="$_B_DECL$(_lc "$v") "; else _b_reason "malformed declaration $name (not a UUID)"; fi
   done
 }
 
@@ -351,12 +367,12 @@ _boundary_begin() {
   t0="$(date +%s)"
   _bdir="$RUNROOT/boundary/$1"
   rm -rf "$_bdir"; mkdir -p "$_bdir"
-  _OWNER=""; _BASE=(); _B_REASONS=()
+  _OWNER=""; _BASE=" "; _B_REASONS=()
   if [ -z "${ADMIN_EMAIL:-}" ] || [[ "$ADMIN_EMAIL" == *\'* ]]; then
     _b_reason "unverifiable owner (ADMIN_EMAIL unusable)"
   elif _b_read owner "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'" 10 "$_bdir/begin-owner"; then
     if [ -n "$_B_OUT" ] && [[ "$_B_OUT" != *$'\n'* ]] && _is_uuid "$_B_OUT"; then
-      _OWNER="${_B_OUT,,}"
+      _OWNER="$(_lc "$_B_OUT")"
     else
       _b_reason "unverifiable owner (malformed row)"
     fi
@@ -365,16 +381,16 @@ _boundary_begin() {
     stem="$_bdir/begin-baseline-holds"
     if _b_read "baseline holds" "SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id = '$_OWNER' AND state = 'open'" 10 "$stem"; then
       if _b_parse triple "$_B_OUT"; then
-        for k in "${_B_PARSED[@]}"; do
+        for k in ${_B_PARSED[@]+"${_B_PARSED[@]}"}; do
           id="${k%%|*}"
-          if [ -z "${_KNOWN[hold:$id]:-}" ]; then _BASE["$id"]=1; fi
+          if [ -z "$(_known_get "hold:$id")" ]; then _BASE="$_BASE$id "; fi
         done
       else
         _b_reason "unverifiable baseline holds (malformed row)"
       fi
     fi
   fi
-  _B_BREASONS=("${_B_REASONS[@]}")
+  _B_BREASONS=(${_B_REASONS[@]+"${_B_REASONS[@]}"})
   _B_START_SECS=$(( $(date +%s) - t0 ))
 }
 
@@ -382,17 +398,17 @@ _boundary_begin() {
 # Sets _B_FAILED (0/1), _B_MESSAGE (`boundary: …`) and _B_END_SECS.
 _boundary_end() {
   local nn_slug="$1" slug="$2" handoff="$3" holds="$4" body_rc="$5"
-  local t0 timeout interval rem k timed_out=0 parts=()
+  local t0 timeout interval rem k kn i timed_out=0 parts=()
   t0="$(date +%s)"
   timeout="$(_pos_int "${E2E_BOUNDARY_TIMEOUT:-}" 120)"
   interval="$(_pos_int "${E2E_BOUNDARY_INTERVAL:-}" 1)"
   _B_DEADLINE=$((t0 + timeout))
-  _B_REASONS=("${_B_BREASONS[@]}")
-  _H_RUNS=(); _H_HOLDS=(); _B_CANC=(); _B_N=0; _R_KEYS=(); _R_DESC=()
-  _B_SR=(); _B_SW=(); _B_SH=(); _B_HOLD_OBS=(); _B_HOLDS_OK=0
+  _B_REASONS=(${_B_BREASONS[@]+"${_B_BREASONS[@]}"})
+  _H_RUNS=" "; _H_HOLDS=" "; _B_CANC=" "; _B_N=0; _R_KEYS=(); _R_DESC=(); _B_NOTE=
+  _B_SR=(); _B_SW=(); _B_SH=(); _B_HOLD_OBS=" "; _B_HOLDS_OK=0
   if [ "$body_rc" -eq 0 ]; then
-    _b_declared "$handoff" _H_RUNS
-    _b_declared "$holds" _H_HOLDS
+    _b_declared "$handoff"; _H_RUNS="$_B_DECL"
+    _b_declared "$holds"; _H_HOLDS="$_B_DECL"
   fi
 
   while :; do
@@ -400,12 +416,15 @@ _boundary_end() {
     _b_sample
     _b_residue
     _b_cancel_new
-    [ "$_B_READERR" -eq 0 ] || break          # a failed read is sticky and ends the loop
+    # Any sticky reason (unverifiable read, rejected or timed-out cancel, phase-start or
+    # declaration error) ends the loop after this sample: more samples cannot clear it.
+    [ "${#_B_REASONS[@]}" -eq 0 ] || break
     _b_count_new
     [ "$_B_PEND" -gt 0 ] || break             # nothing NEW left to wait for
     rem="$(_b_rem)"
-    if [ "$rem" -le 0 ]; then timed_out=1; break; fi
-    if [ "$rem" -lt "$interval" ]; then sleep "$rem"; else sleep "$interval"; fi
+    # No time for another sample after sleeping an interval: stop instead of sleeping for nothing.
+    if [ "$rem" -le "$interval" ]; then timed_out=1; break; fi
+    sleep "$interval"
     rem="$(_b_rem)"
     if [ "$rem" -le 0 ]; then timed_out=1; break; fi
   done
@@ -416,12 +435,13 @@ _boundary_end() {
   if [ "${#_B_REASONS[@]}" -gt 0 ] || [ "${#_R_KEYS[@]}" -gt 0 ]; then _B_FAILED=1; fi
 
   if [ "$_B_FAILED" -eq 1 ]; then
-    parts=("${_B_REASONS[@]}")
-    for k in "${_R_KEYS[@]}"; do
-      if [ -n "${_KNOWN[$k]:-}" ]; then
-        parts+=("still present from ${_KNOWN[$k]}: ${_R_DESC[$k]}")
+    parts=(${_B_REASONS[@]+"${_B_REASONS[@]}"})
+    for ((i = 0; i < ${#_R_KEYS[@]}; i++)); do
+      k="${_R_KEYS[$i]}"; kn="$(_known_get "$k")"
+      if [ -n "$kn" ]; then
+        parts+=("still present from $kn: ${_R_DESC[$i]}")
       else
-        parts+=("${_R_DESC[$k]}")
+        parts+=("${_R_DESC[$i]}")
       fi
     done
     _boundary_history
@@ -430,14 +450,18 @@ _boundary_end() {
     [ "$timed_out" -eq 0 ] || _B_MESSAGE="$_B_MESSAGE [not settled within ${timeout}s]"
     [ "$body_rc" -eq 0 ] || _B_MESSAGE="$_B_MESSAGE (declarations unavailable: body failed)"
     # Remember what this boundary reported so later boundaries do not each wait it out.
-    for k in "${_R_KEYS[@]}"; do
-      if [ -z "${_KNOWN[$k]:-}" ]; then _KNOWN["$k"]="$slug"; fi
+    for k in ${_R_KEYS[@]+"${_R_KEYS[@]}"}; do
+      if [ -z "$(_known_get "$k")" ]; then _KN_K+=("$k"); _KN_V+=("$slug"); fi
     done
-    for k in "${!_KNOWN[@]}"; do printf '%s\t%s\n' "$k" "${_KNOWN[$k]}"; done | sort > "$_bdir/known-residue.txt"
+    for ((i = 0; i < ${#_KN_K[@]}; i++)); do printf '%s\t%s\n' "${_KN_K[$i]}" "${_KN_V[$i]}"; done \
+      | sort > "$_bdir/known-residue.txt"
   else
     _B_MESSAGE=""
+    # A run the boundary cancelled that then settled is not residue: keep the trace in the
+    # PASS row's message (non-failing).
+    for k in $_B_CANC; do _B_NOTE="${_B_NOTE:+$_B_NOTE; }boundary cancelled undeclared run $k (settled)"; done
   fi
-  printf '%s\n' "${_B_REASONS[@]}" > "$_bdir/reasons.txt" 2>/dev/null || true
+  printf '%s\n' ${_B_REASONS[@]+"${_B_REASONS[@]}"} > "$_bdir/reasons.txt" 2>/dev/null || true
   _B_END_SECS=$(( $(date +%s) - t0 ))
 }
 
@@ -457,18 +481,18 @@ _join() {
 # (verdict unchanged: stderr is kept under the evidence dir). Skipped for an empty set.
 _boundary_history() {
   local k id ids=() list="" rc=0 out line a b c d e f bars items=()
-  declare -A hs=()
+  local hs=" "
   _B_HISTORY=""
-  for k in "${_R_KEYS[@]}"; do
-    case "$k" in hold:*) hs["${k#hold:}"]=1 ;; esac
+  for k in ${_R_KEYS[@]+"${_R_KEYS[@]}"}; do
+    case "$k" in hold:*) hs="$hs${k#hold:} " ;; esac
   done
   if [ "$_B_HOLDS_OK" -eq 1 ]; then
-    for id in "${!_BASE[@]}"; do
-      [ -n "${_B_HOLD_OBS[$id]:-}" ] || hs["$id"]=1
+    for id in $_BASE; do
+      _in_set "$_B_HOLD_OBS" "$id" || hs="$hs$id "
     done
   fi
-  [ "${#hs[@]}" -gt 0 ] || return 0
-  while IFS= read -r id; do ids+=("'$id'"); done < <(printf '%s\n' "${!hs[@]}" | sort)
+  [ "$hs" != " " ] || return 0
+  while IFS= read -r id; do ids+=("'$id'"); done < <(printf '%s\n' $hs | sort -u)
   list="$(_join ',' "${ids[@]}")"
   out="$(db_psql_rows "SELECT id, run_id, generation, state, final_disposition, release_evidence FROM recovery_custody_holds WHERE id IN ($list)" 5 2> "$_bdir/history.stderr")" || rc=$?
   printf '%s\n' "$rc" > "$_bdir/history.exit"
@@ -630,7 +654,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     m="requires: $miss_tok not satisfied for phase $slug (provided by: $producer)"
     _requires_intersects_failed "$requires" && m="$m [suspect_cascade]"
     [ "$racesens" = yes ] && m="$m — possible race, see margins"
-    _record "$slug" FAIL 0 "$m" "$title"
+    _record "$slug" FAIL 0 "$m" "$title" noran
     _capture_artifacts "$nn_slug" 0
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
@@ -712,7 +736,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     >> "$RUNROOT/boundary_waits.tsv"
 
   if [ "$rc" -eq 0 ] && [ "$_B_FAILED" -eq 0 ]; then
-    _record "$slug" PASS "$secs" "" "$title"
+    _record "$slug" PASS "$secs" "$_B_NOTE" "$title"
   else
     if [ "$rc" -eq 0 ]; then
       fmsg="$_B_MESSAGE"

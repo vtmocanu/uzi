@@ -81,6 +81,14 @@ fi
 # limiter kill into the function's status, and must not leak into the caller.
 eval "$(awk '/^db_psql_rows\(\) \(/,/^\)/' "$LIB")"
 eval "$(awk '/^boundary_cancel\(\) \{/,/^\}/' "$LIB")"
+# The extraction must have produced both functions: an expect-failure case below would
+# otherwise pass vacuously on a missing function (rc 127).
+cases=$((cases + 1))
+if declare -F db_psql_rows >/dev/null && declare -F boundary_cancel >/dev/null; then
+  passed=$((passed + 1)); echo "PASS: db_psql_rows and boundary_cancel were extracted from lib.sh"
+else
+  echo "FAIL: db_psql_rows / boundary_cancel not defined after extraction from lib.sh"
+fi
 DBR_DIR="$(mktemp -d)"
 printf 'POSTGRES_PASSWORD=pw\n' > "$DBR_DIR/dbr.cfg"
 printf '#!/bin/sh\nexit 3\n' > "$DBR_DIR/compose-fail"
@@ -98,7 +106,7 @@ dbr_case() {
     if [ -n "$secs" ]; then db_psql_rows "SELECT 1" "$secs"; else db_psql_rows "SELECT 1"; fi
   )" || rc=$?
   elapsed=$((SECONDS - start))
-  if [ "$expect" = ok ]; then [ "$rc" -eq 0 ] || ok=0; else [ "$rc" -ne 0 ] || ok=0; fi
+  if [ "$expect" = ok ]; then [ "$rc" -eq 0 ] || ok=0; else { [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; } || ok=0; fi   # 127 = function missing, not a refusal
   [ -z "$want" ] || [ "$out" = "$want" ] || ok=0
   [ -z "$max" ] || [ "$elapsed" -lt "$max" ] || ok=0
   if [ "$ok" -eq 1 ]; then
@@ -148,7 +156,7 @@ bc_case() {
   local name="$1" code="$2" crc="$3" expect="$4" pre="$DBR_DIR/ev-$RANDOM" rc=0 good=1
   cases=$((cases + 1))
   FAKE_CURL_CODE="$code" FAKE_CURL_RC="$crc" boundary_cancel "/api/runs/r1/inputs" 7 "$pre" || rc=$?
-  if [ "$expect" = ok ]; then [ "$rc" -eq 0 ] || good=0; else [ "$rc" -ne 0 ] || good=0; fi
+  if [ "$expect" = ok ]; then [ "$rc" -eq 0 ] || good=0; else { [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; } || good=0; fi
   bc_args_have "--max-time 7" || good=0
   bc_args_have "$BASE/api/runs/r1/inputs" || good=0
   bc_args_have "X-CSRF-Token: tok" || good=0

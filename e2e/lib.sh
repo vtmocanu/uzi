@@ -1098,8 +1098,9 @@ db_psql() {
 # query whose result is enumerated row-by-row (the quarantine id sweep, the
 # multi-row artifact dumps) so 2+ rows don't fuse into one garbage token. It strips
 # only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
-# (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. PGPW
-# is the memoized module var db_psql uses.
+# (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. The
+# password comes from PGPW when set, else is read from ENVFILE on every call (this function
+# never writes PGPW: its body is a subshell).
 #
 # Optional SECS (a positive integer, else return 1) bounds the whole read: the compose exec runs
 # under `timeout --signal=KILL SECS` (or `gtimeout`); with neither installed it prints
@@ -1118,7 +1119,7 @@ db_psql_rows() (
     elif command -v gtimeout >/dev/null 2>&1; then lim=(gtimeout --signal=KILL "$secs")
     else echo 'db_psql_rows: no timeout limiter' >&2; return 1; fi
   fi
-  "${lim[@]}" "${COMPOSE[@]}" exec -T -e PGPASSWORD="$pw" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+  ${lim[@]+"${lim[@]}"} "${COMPOSE[@]}" exec -T -e PGPASSWORD="$pw" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
 )
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
