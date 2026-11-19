@@ -8,8 +8,12 @@
 //       before the worker container's teardown is awaited, while the producers' deadline has not passed (they
 //       were observed alive just before the kill), and gets `ineligible` (admission from another process), so
 //       it would send nothing. The same state under the dead worker's nonce is `eligible`.
+//       The same ordering is also observed live: before the kill, a second process inside the worker container
+//       runs the gate while both producers are confirmed alive, and gets `ineligible`.
 //   (b) EVENTUAL CLEANUP: the worker container stops (the worker's npm and tini exit), and after the
-//       producers' deadline neither ref exists and the producers' processes are gone.
+//       producers' deadline neither ref exists in a fresh container and the gate evidence is unchanged. Producer
+//       processes are asserted alive before the kill and the container asserted stopped after it; no process
+//       table is read afterwards.
 //
 // The worker is started through the shipped entrypoint chain: uzi-entrypoint (the image ENTRYPOINT) execs tini
 // as PID 1, which runs the image CMD `npm run start`, which runs `tsx src/main.ts`, which runs node. The only
@@ -74,7 +78,7 @@ function psTable(): { pid: number; ppid: number; pgid: number; args: string }[] 
     return { pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), args: m[4]! };
   });
 }
-test("a SIGKILLed worker's delayed refusal producers cannot land before a successor's gate says ineligible, and are gone after teardown", { timeout: 300_000 }, async () => {
+test("a SIGKILLed worker's delayed refusal producers cannot land before a successor's gate says ineligible, and never land after teardown", { timeout: 300_000 }, async () => {
   assert.equal(process.platform, "linux");
   dockerOk(["image", "inspect", "--format", "{{.Id}}", image], 20);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cdr-4481-main-"));
@@ -136,9 +140,6 @@ test("a SIGKILLed worker's delayed refusal producers cannot land before a succes
     const workerPgid = byPid.get(ready.pid)!.pgid;
     assert.equal(producers[0].pgid, workerPgid, "producer 1 is in the worker's process group");
     assert.notEqual(producers[1].pgid, workerPgid, "producer 2 is outside the worker's process group");
-    // Real count before the kill: both producers are live processes inside the worker's namespace.
-    console.log(`producer processes alive just before the kill: ${producers.length}`);
-    assert.equal(producers.length, 2);
 
     // The successor container exists and is warm BEFORE the kill, on the same volume, idle.
     dockerOk(["create", "--name", successor, ...common, "--entrypoint", "/bin/sh", image, "-c", "exec sleep 86400"], 60);
@@ -146,6 +147,20 @@ test("a SIGKILLed worker's delayed refusal producers cannot land before a succes
     waitFor("successor", () => state(successor) === "running", 20);
     assert.deepEqual(probeJson("refs").refs.split("\n").filter((r: string) => r.startsWith("refs/uzi-incoming/")), [], "nothing staged yet (warm-up)");
     assert.ok(Date.now() < ready.deadlineMs - 15_000, "enough of the producers' window remains after the warm-up");
+
+    // Live-producer ordering: a SECOND process inside the worker container (same uid, fresh process nonce)
+    // runs the real gate while the producers are pending.
+    const live = JSON.parse(dockerOk(["exec", worker, "node", "--import", tsx, probe, "gate", "-", ready.head], 90).split("\n").filter(Boolean).at(-1)!);
+    assert.equal(live.gate.kind, "ineligible", JSON.stringify(live));
+    assert.match(live.gate.reason, /admission for generation 1 is from another process/);
+    assert.notEqual(live.nonce, ready.nonce, "the second process has its own nonce");
+    assert.ok(live.at < ready.deadlineMs, "the in-container gate ran before the producers' deadline");
+    // Re-read the process table immediately before the kill: both producers are still pending.
+    const justBefore = psTable();
+    const stillPending = ready.producers.filter((p: any) => justBefore.some((t) => t.args.includes(`RT4481_PRODUCER=${p.ref}`)));
+    assert.equal(stillPending.length, ready.producers.length, "both producers are alive immediately before the kill");
+    assert.ok(justBefore.some((t) => t.pid === ready.pid), "the worker node process is alive immediately before the kill");
+    console.log(`live ordering: in-container gate margin ${ready.deadlineMs - live.at}ms; producers alive just before kill: ${stillPending.length}`);
 
     // SIGKILL only the worker node process, never PID 1.
     const killedAt = Date.now();
