@@ -407,11 +407,7 @@ func (m *Materializer) retireHibernationHistory(ctx context.Context, t *rollTick
 			if p == e || p.ns != e.ns {
 				continue
 			}
-			c, ok := coverageOf(p.w, p.ns)
-			outOfScope := ok && c.Owner != e.marker.Coverage.Owner && p.blocked == "" && !p.rawReservation &&
-				(p.claim == nil || p.claim.Annotations[annotationRoll] == "") &&
-				(p.marker == nil || p.marker.Coverage.Owner == c.Owner)
-			if outOfScope {
+			if rollPeerOutOfScope(p, e.marker.Coverage.Owner) {
 				continue
 			}
 			if p.marker != nil || p.rawReservation || (p.claim != nil && p.claim.Annotations[annotationRoll] != "") ||

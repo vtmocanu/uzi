@@ -62,6 +62,16 @@ type rollEntry struct {
 	claim              *corev1.PersistentVolumeClaim
 	rawReservation     bool
 	migrationHeldDrift bool
+	// mutated is set immediately before this tick's own API request that can change
+	// this worker's roll evidence (reservation or mirror patch, drain release). The
+	// orphan-canary adoption reads it to refuse acting on evidence this tick rewrote.
+	mutated bool
+	// identityAmbiguous and strayReservation are namespace-wide facts rollSnapshot
+	// records on every entry of the namespace it listed: two Deployments of ours carry
+	// one worker id, or a Deployment of ours outside the desired entries carries roll
+	// metadata. Either makes the per-id Deployment view untrustworthy for adoption.
+	identityAmbiguous bool
+	strayReservation  bool
 	// snapshotIncomplete is set when the roll snapshot could not read this worker's
 	// deployment/pod/claim evidence; display-only (RollMarkerReports), never read by planning.
 	snapshotIncomplete bool
@@ -453,6 +463,18 @@ func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, 
 	if e.dep == nil || e.marker == nil || e.marker.Completed {
 		return
 	}
+	// A promoted canary is the pool's only proof that its cohort was admitted: while
+	// an incomplete participant of the same cohort remains, withdrawing it would leave
+	// that participant without a canary. Keep the reservation and fence the pool.
+	if e.marker.Canary {
+		for _, p := range t.entries {
+			if p != e && !p.hibernation && p.marker != nil && !p.marker.Completed && !p.marker.Canary &&
+				coverageKey(p.marker.Coverage) == coverageKey(e.marker.Coverage) {
+				fence()
+				return
+			}
+		}
+	}
 	if e.claim != nil && e.claim.Annotations[annotationRoll] != "" {
 		if err := m.mirrorRoll(ctx, e, nil); err != nil {
 			e.blocked = "held reservation mirror cancellation unconfirmed"
@@ -474,6 +496,166 @@ func hasOpenReservation(e *rollEntry) bool {
 		return !e.marker.Completed
 	}
 	return (e.dep != nil && e.dep.Annotations[annotationRoll] != "") || (e.claim != nil && e.claim.Annotations[annotationRoll] != "")
+}
+
+// orphanHoldReason is reported when an earlier participant might still carry a
+// delayed adoption request, so no later participant is adopted as canary.
+const orphanHoldReason = "earlier participant may hold an unresolved adoption request"
+
+// rollPeerOutOfScope reports whether p is positively validated as another owner's
+// worker: its own coverage evidence decodes to a different owner and it carries no
+// unresolved, malformed or foreign roll metadata. Such a peer shares the namespace
+// but takes no part in this owner's cohorts.
+func rollPeerOutOfScope(p *rollEntry, owner string) bool {
+	c, ok := coverageOf(p.w, p.ns)
+	return ok && c.Owner != owner && p.blocked == "" && !p.rawReservation &&
+		(p.claim == nil || p.claim.Annotations[annotationRoll] == "") &&
+		(p.marker == nil || p.marker.Coverage.Owner == c.Owner)
+}
+
+// adoptOrphanCanary recovers a cohort whose canary evidence was lost (annotation
+// reset, Deployment recreated) while participants remain. It promotes exactly one
+// incomplete participant that is already proven on its current incarnation into the
+// canary by a single metadata-only reservation patch. It never touches the template,
+// replicas or claims, and adopts nothing unless the whole pool observation is clean.
+//
+// It returns adopted=true when it wrote (or tried to write) and fully settled the
+// tick's outcomes for the pool; the caller then returns. Otherwise the caller keeps
+// the existing hold, and holdID names an earlier participant that may still carry a
+// delayed adoption request (the caller reports it as the blocking worker).
+func (m *Materializer) adoptOrphanCanary(ctx context.Context, t *rollTick, pool []*rollEntry, blocker string, changed bool) (adopted bool, holdID string) {
+	if blocker != "" || changed || len(pool) == 0 {
+		return false, ""
+	}
+	inPool := map[*rollEntry]bool{}
+	for _, e := range pool {
+		if e.hibernation || e.mutated || t.unavailable[e.w.ID] {
+			return false, ""
+		}
+		inPool[e] = true
+	}
+	ns, key := pool[0].ns, coverageKey(pool[0].coverage)
+	owner, lane := pool[0].coverage.Owner, pool[0].coverage.Lane
+	if t.uncertain[key] || migrationLaneFenced(t, pool[0].coverage) || t.layoutUncertain[key] != "" {
+		return false, ""
+	}
+	for _, u := range t.unplanned {
+		if !u.nsKnown || u.ns == ns {
+			return false, ""
+		}
+	}
+	for _, p := range t.entries {
+		if p.ns != ns {
+			continue
+		}
+		if p.identityAmbiguous || p.strayReservation {
+			return false, ""
+		}
+		if inPool[p] {
+			continue
+		}
+		if p.marker != nil && p.marker.Canary && p.marker.Coverage.Owner == owner && p.marker.Coverage.Lane == lane {
+			return false, ""
+		}
+		if (p.marker != nil || p.rawReservation || (p.claim != nil && p.claim.Annotations[annotationRoll] != "") || hasOpenReservation(p)) &&
+			!rollPeerOutOfScope(p, owner) {
+			return false, ""
+		}
+	}
+	for _, e := range pool {
+		if e.rawReservation && e.marker == nil {
+			return false, ""
+		}
+		if e.claim != nil && e.claim.Annotations[annotationRoll] != "" && (e.dep == nil || e.dep.Annotations[annotationRoll] == "") {
+			return false, ""
+		}
+		if e.marker != nil && coverageKey(e.marker.Coverage) != key {
+			return false, ""
+		}
+	}
+
+	sorted := append([]*rollEntry{}, pool...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].w.ID < sorted[j].w.ID })
+	var chosen *rollEntry
+	for _, e := range sorted {
+		if m.orphanCanaryCandidate(t, e) {
+			chosen = e
+			break
+		}
+	}
+	if chosen == nil {
+		return false, ""
+	}
+	// An earlier participant that is neither adoptable now nor provably unable to
+	// accept a delayed patch may still land an adoption request issued by an earlier
+	// controller incarnation; adopting a later participant could then yield two canaries.
+	for _, z := range sorted {
+		if z.w.ID >= chosen.w.ID {
+			break
+		}
+		if z.marker != nil && !z.marker.Completed && !m.orphanCanaryCandidate(t, z) && !orphanPatchFenced(z) {
+			return false, z.w.ID
+		}
+	}
+
+	r := *chosen.marker
+	r.Canary = true
+	err := m.reserveRoll(ctx, chosen, &r)
+	t.uncertain[key] = true
+	for _, e := range pool {
+		p := t.outcomes[e.w.ID]
+		e.admitted = false
+		p.State = "held"
+		p.BlockingWorkerID = pacingText(chosen.w.ID)
+		switch {
+		case err == nil:
+			id := chosen.w.ID
+			p.CanaryID = &id
+			e.blocked = "canary adopted from proven participant; re-observation required"
+		case e == chosen:
+			e.blocked = "canary adoption unconfirmed"
+		default:
+			e.blocked = "canary adoption pending re-observation"
+		}
+		p.BlockingReason = pacingText(e.blocked)
+	}
+	return true, ""
+}
+
+// orphanCanaryCandidate reports whether e is an incomplete participant whose current
+// incarnation is proven against its own reservation, on an unmodified one-replica
+// Deployment, with no competing claim mirror.
+func (m *Materializer) orphanCanaryCandidate(t *rollTick, e *rollEntry) bool {
+	r := e.marker
+	if r == nil || r.Canary || r.Completed || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
+		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 || e.drift || e.recovery || e.blocked != "" ||
+		(e.claim != nil && e.claim.Annotations[annotationRoll] != "") {
+		return false
+	}
+	version := t.outcomes[e.w.ID].TargetVersion
+	if version == "" || r.TargetVersion != version || r.Hash != e.target.Spec.Template.Annotations[AnnotationSpecHash] ||
+		r.Image != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != r.Hash || workerImage(e.dep) != r.Image {
+		return false
+	}
+	c, ok := coverageOf(e.w, e.ns)
+	if !ok || r.Coverage.Owner != c.Owner || r.Coverage.Lane != e.ns {
+		return false
+	}
+	return m.promoted(t, e)
+}
+
+// orphanPatchFenced reports, from the current observation alone, that a delayed
+// metadata patch built from an earlier observation of z can no longer commit usefully:
+// the Deployment is gone or terminating, scaled away from one replica, retargeted, or
+// its reservation is absent or completed.
+func orphanPatchFenced(z *rollEntry) bool {
+	if z.marker == nil || z.marker.Completed || z.dep == nil || z.dep.DeletionTimestamp != nil {
+		return true
+	}
+	if z.dep.Spec.Replicas != nil && *z.dep.Spec.Replicas != 1 {
+		return true
+	}
+	return z.dep.Spec.Template.Annotations[AnnotationSpecHash] != z.marker.Hash || workerImage(z.dep) != z.marker.Image
 }
 
 func pacingText(s string) *string {
@@ -670,12 +852,20 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 	if changed {
 		blocker, poolReason = "", "roll target pin changed; pool held until reservations settle"
 	}
+	holdID := ""
 	if inFlight > 0 && canary == "" {
+		var adopted bool
+		if adopted, holdID = m.adoptOrphanCanary(ctx, t, pool, blocker, changed); adopted {
+			return
+		}
 		blocker, poolReason = "", "participant reservation without canary; explicit recovery required"
 		for _, e := range pool {
 			if e.marker != nil {
 				e.blocked = "participant reservation without canary; explicit recovery required"
 			}
+		}
+		if holdID != "" {
+			blocker = holdID
 		}
 	}
 	allPromoted := canary != ""
@@ -768,6 +958,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			reason = e.blocked
 		}
 	}
+	if holdID != "" {
+		reason = orphanHoldReason
+	}
 	for _, e := range pool {
 		p := t.outcomes[e.w.ID]
 		if canary != "" {
@@ -791,6 +984,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 				p.State = "held"
 			}
 			p.BlockingReason = pacingText(e.blocked)
+			if holdID != "" {
+				p.BlockingReason = pacingText(orphanHoldReason)
+			}
 			continue
 		}
 		if !active {
@@ -1001,6 +1197,7 @@ func (m *Materializer) releaseRollHold(ctx context.Context, t *rollTick, e *roll
 		return
 	}
 	if c, ok := m.cordoner.(rollCordoner); ok {
+		e.mutated = true
 		if err := c.ClearDrainWithReason(ctx, e.w.ID, "image_roll"); err != nil {
 			e.blocked = "roll-owned release unconfirmed; re-poll required"
 			t.uncertain[coverageKey(e.coverage)] = true
@@ -1066,6 +1263,7 @@ func (m *Materializer) releasePressureHold(ctx context.Context, t *rollTick, e *
 	if !ok {
 		return
 	}
+	e.mutated = true
 	if err := c.ClearDrainWithReason(ctx, w.ID, "pressure_recycle"); err != nil {
 		t.errors = append(t.errors, fmt.Errorf("pressure release unconfirmed for %s: %w", w.ID, err))
 	}
@@ -1183,6 +1381,7 @@ func (m *Materializer) mirrorRoll(ctx context.Context, e *rollEntry, marker *rol
 	if err != nil {
 		return err
 	}
+	e.mutated = true
 	got, err := m.client.CoreV1().PersistentVolumeClaims(e.ns).Patch(ctx, p.Name, types.MergePatchType, body, metav1.PatchOptions{})
 	if err != nil || got == nil || got.UID != p.UID || got.ResourceVersion == "" || got.ResourceVersion == p.ResourceVersion ||
 		(marker == nil && got.Annotations[annotationRoll] != "") || (marker != nil && got.Annotations[annotationRoll] != value) {
@@ -1470,6 +1669,8 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 	ctx, cancel := context.WithTimeout(markMaintenanceRead(ctx), 30*time.Second)
 	defer cancel()
 	deps := map[string]*appsv1.Deployment{}
+	depCount := map[string]int{}
+	annotatedIDs := map[string]bool{}
 	pods := []corev1.Pod{}
 	sets := map[types.UID]map[string]appsv1.ReplicaSet{}
 	err := maintenancePages(ctx, "roll deployments", func(opt metav1.ListOptions) (int, string, error) {
@@ -1481,12 +1682,28 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			d := &page.Items[i]
 			if id, ours := IsOurs(d.Labels); ours {
 				deps[id] = d.DeepCopy()
+				depCount[id]++
+				if d.Annotations[annotationRoll] != "" {
+					annotatedIDs[id] = true
+				}
 			}
 		}
 		return len(page.Items), page.Continue, nil
 	})
 	if err != nil {
 		return err
+	}
+	ambiguous, stray := false, false
+	known := map[string]bool{}
+	for _, e := range entries {
+		known[e.w.ID] = true
+	}
+	for id, n := range depCount {
+		ambiguous = ambiguous || n > 1
+		stray = stray || (annotatedIDs[id] && !known[id])
+	}
+	for _, e := range entries {
+		e.identityAmbiguous, e.strayReservation = ambiguous, stray
 	}
 
 	err = maintenancePages(ctx, "roll pods", func(opt metav1.ListOptions) (int, string, error) {
@@ -1668,6 +1885,7 @@ func (m *Materializer) reserveRoll(ctx context.Context, e *rollEntry, r *rollMar
 	if err != nil {
 		return err
 	}
+	e.mutated = true
 	d, err := m.client.AppsV1().Deployments(e.ns).Patch(ctx, e.dep.Name, types.MergePatchType, body, metav1.PatchOptions{})
 	if err != nil {
 		return fmt.Errorf("reservation mutation unconfirmed: %w", err)
