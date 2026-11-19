@@ -351,9 +351,9 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 	}
 	firstGen := readRun().StaleRequeueGeneration
 
-	// cycle runs one park -> promote episode. The clock first advances 3h (past both the 10m
-	// grace and the 30m ceiling, measured from the previous requeue/promotion), so only a
-	// promotion that restarts the clocks can explain a block afterwards.
+	// cycle runs one park -> promote episode. The clocks are back-dated 3h before the park and
+	// again after it, so fresh status_since/updated_at after the promotion can only come from the
+	// promotion's own reset. The peer's block is the provenance gate's (issue #4476).
 	cycle := func(n int) {
 		t.Helper()
 		fx.age(run, 3*time.Hour, 3*time.Hour)
@@ -370,6 +370,9 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 		if got := readRun().Status; got != "recovery_wait" {
 			t.Fatalf("cycle %d: status after park = %s, want recovery_wait", n, got)
 		}
+		// The park itself stamps both clocks; back-date them again so only the promotion's
+		// reset can explain fresh clocks below.
+		fx.age(run, 3*time.Hour, 3*time.Hour)
 		setGate(false) // the account recovers
 		if rows, err := fx.q.PromoteCodexAccountWaitRun(fx.ctx, run); err != nil || rows != 1 {
 			t.Fatalf("cycle %d promote = (%d, %v), want (1, nil)", n, rows, err)
