@@ -246,6 +246,32 @@ func TestPVCRejectionNamesTheClaim(t *testing.T) {
 	wantRefusal(t, m, "q2", protocol.BlockingKindPVCRejected, "Forbidden creating dind claim")
 }
 
+// A transient create failure is not the cluster rejecting the claim: nothing is recorded,
+// and the error still surfaces.
+func TestTransientPVCCreateErrorsRecordNothing(t *testing.T) {
+	gr := schema.GroupResource{Resource: "persistentvolumeclaims"}
+	for name, createErr := range map[string]error{
+		"timeout":  apierrors.NewTimeoutError("slow", 1),
+		"internal": apierrors.NewInternalError(errors.New("boom")),
+		"429":      apierrors.NewTooManyRequests("later", 1),
+		"conflict": apierrors.NewConflict(gr, "x", errors.New("c")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, client := refusalMat(t, testConfig())
+			client.PrependReactor("create", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, createErr
+			})
+			w := newWorkerFixture(xsWorker("t1"))
+			if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err == nil {
+				t.Fatal("a failed claim create must keep returning its error")
+			}
+			if got := m.SizeRefusals(); len(got) != 0 {
+				t.Fatalf("transient error recorded a refusal: %+v", got)
+			}
+		})
+	}
+}
+
 // Startup stays builtins-only: a chart ceiling below a shipped builtin (l's 50Gi) refuses
 // to boot regardless of what an admin has since defined, and the message says why.
 func TestValidatePVCCeilingsChecksOnlyTheCompiledInBuiltins(t *testing.T) {

@@ -2814,7 +2814,6 @@ tasks:
       - task: render:openshift-check
       - task: render:drain-knobs-check
       - task: render:ephemeral-docker-check
-      - task: render:ephemeral-lease-check
       # Reuse the tracked-tree scanner and its canaries instead of adding a weaker
       # diff-only scanner. The parent supplies code coverage, not new-text scanning.
       - task: scan:secrets

@@ -32,6 +32,10 @@ import (
 // an admin surface.
 const maxEvidenceBytes = 96
 
+// maxRefusedNamesShown caps the worker names in the "Refused workers" evidence row; the
+// rest are counted as "and K more" (each name is already bounded by maxEvidenceBytes).
+const maxRefusedNamesShown = 5
+
 // checkMeta is the fixed per-id metadata: the scope, group, human title, and docs slug
 // (empty ⇒ no doc link in M1). The registry order in Evaluate is the stable order; this
 // map only supplies the constant fields so each check builder sets just severity + text.
@@ -333,7 +337,15 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))})
 		}
 		if len(refusedNames) > 0 {
-			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Refused workers", Value: strings.Join(refusedNames, ", ")})
+			shown, more := refusedNames, 0
+			if len(shown) > maxRefusedNamesShown {
+				shown, more = shown[:maxRefusedNamesShown], len(shown)-maxRefusedNamesShown
+			}
+			value := strings.Join(shown, ", ")
+			if more > 0 {
+				value += fmt.Sprintf(" and %d more", more)
+			}
+			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Refused workers", Value: value})
 		}
 		actions := []string{}
 		if sizeRefused > 0 {

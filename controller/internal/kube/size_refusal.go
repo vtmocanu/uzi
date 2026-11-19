@@ -101,10 +101,16 @@ func (m *Materializer) checkSizeCeilings(w protocol.DesiredWorker, spec preset.S
 	return nil
 }
 
-// recordPVCRejection records a failed claim create as pvc_rejected. The reason is the
-// apiserver's StatusReason (Forbidden, Invalid, ...) plus which claim, never the raw
-// apiserver message, which can carry quota arithmetic and object names.
+// recordPVCRejection records a failed claim create as pvc_rejected, only when the cluster
+// refused the claim at admission (Forbidden, Invalid, RequestEntityTooLarge); transient
+// errors (timeouts, 429, 5xx) record nothing. The reason is the apiserver's StatusReason
+// plus which claim, never the raw apiserver message, which can carry quota arithmetic and
+// object names. For an admission-webhook denial the StatusReason can be webhook-authored
+// text, so the api truncates and sanitizes it before display.
 func (m *Materializer) recordPVCRejection(id, pvcName string, err error) {
+	if !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err) && !apierrors.IsRequestEntityTooLargeError(err) {
+		return
+	}
 	claim := "data"
 	switch pvcName {
 	case dindDataPVCName(id):

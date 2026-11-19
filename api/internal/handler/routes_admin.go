@@ -152,8 +152,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// cookie-only writes in the group below. No limiter: a local read.
 			r.Get("/egress-profiles", h.AdminListEgressProfiles)
 			r.Get("/egress-profiles/{name}", h.AdminGetEgressProfile)
-			// Hosted worker sizes (PRD #4213 M2): the editor's read. Reachable with an admin_ro
-			// token like the other admin reads; the edit and reset writes are cookie-only below.
+		})
+		// Hosted worker sizes (PRD #4213 M2): the editor's read. Browser-session only (PRD: no
+		// new CLI-readable route), so any Bearer, uza_ included, 401s before the handler.
+		// RequireAdminRO keeps a read-only admin's web session able to see the editor.
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireAuth())
+			r.Use(mw.RequireAdminRO)
 			r.Get("/worker-sizes", h.AdminListWorkerSizes)
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.

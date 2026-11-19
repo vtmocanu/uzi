@@ -401,12 +401,15 @@ func TestAdminWorkerSizesAuthBoundaryLiveDB(t *testing.T) {
 	body := sizeBody(500, 2000, 1024, 4096, 10, 10)
 	before := f.size(t, testSizeName)
 
-	// Reads: an admin_ro token may read; a masked uzc_ token and a non-admin session may not.
-	if rec := bearerReq(f.router, http.MethodGet, "/api/admin/worker-sizes", f.uza); rec.Code != http.StatusOK {
-		t.Errorf("uza_ GET = %d, want 200", rec.Code)
+	// Reads: cookie-only (no CLI-readable route). Any bearer 401s; an admin session reads.
+	if rec := bearerReq(f.router, http.MethodGet, "/api/admin/worker-sizes", f.uza); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uza_ GET = %d, want 401", rec.Code)
 	}
-	if rec := bearerReq(f.router, http.MethodGet, "/api/admin/worker-sizes", f.uzc); rec.Code != http.StatusForbidden {
-		t.Errorf("uzc_ GET = %d, want 403", rec.Code)
+	if rec := bearerReq(f.router, http.MethodGet, "/api/admin/worker-sizes", f.uzc); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uzc_ GET = %d, want 401", rec.Code)
+	}
+	if rec := cookieReq(t, f.router, http.MethodGet, "/api/admin/worker-sizes", f.jwt, ""); rec.Code != http.StatusOK {
+		t.Errorf("admin session GET = %d, want 200", rec.Code)
 	}
 	if rec := bearerReq(f.router, http.MethodGet, "/api/admin/worker-sizes", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("anonymous GET = %d, want 401", rec.Code)

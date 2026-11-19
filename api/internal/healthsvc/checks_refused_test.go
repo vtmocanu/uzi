@@ -1,6 +1,7 @@
 package healthsvc
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,17 @@ func TestFleetRollCountsBothRefusalKinds(t *testing.T) {
 		}
 	}
 	if !hasEvidence(c.Evidence, "Refused workers", "a, b, c") {
+		t.Errorf("evidence = %+v", c.Evidence)
+	}
+}
+
+func TestFleetRollCapsRefusedWorkerNames(t *testing.T) {
+	var rows []store.ListAllWorkersRow
+	for i := 0; i < 12; i++ {
+		rows = append(rows, refusedRow(fmt.Sprintf("w%02d", i), workersvc.BlockingKindSizeRefused, "r", "none", time.Second))
+	}
+	c := New(Config{HostedWorkerVersion: "new"}).checkFleetRoll(fixedNow, rows, true)
+	if !hasEvidence(c.Evidence, "Refused workers", "w00, w01, w02, w03, w04 and 7 more") {
 		t.Errorf("evidence = %+v", c.Evidence)
 	}
 }
