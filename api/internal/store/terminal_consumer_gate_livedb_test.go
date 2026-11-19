@@ -138,13 +138,17 @@ func TestTerminalConsumerGateWaiterVisibleInPgLocksAndBlocksExclusiveTry(t *test
 	ch := tcgLockAsync(ctx, waiter, repo, 5*time.Second)
 	tcgAwaitShareWaiter(ctx, t, pool, repo)
 
-	if ok, tx := tcgTry(ctx, t, pool, repo); ok {
-		t.Fatal("third connection acquired the gate while a waiter is queued behind an exclusive holder")
-	} else {
-		_ = tx.Rollback(ctx)
-	}
+	// Waiter priority: release the exclusive holder and, WITHOUT first receiving the waiter's
+	// result, try-take the gate exclusively. PostgreSQL grants the queued shared waiter inside
+	// the holder's lock release (before Commit returns), so the try must fail. Without a queued
+	// waiter this try would succeed, so the assertion is not vacuous.
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if ok, tx := tcgTry(ctx, t, pool, repo); ok {
+		t.Fatal("a try-exclusive after the holder released beat the queued shared waiter")
+	} else {
+		_ = tx.Rollback(ctx)
 	}
 	if err := tcgRecv(t, ch); err != nil {
 		t.Fatalf("waiter after release: %v", err)
@@ -166,7 +170,7 @@ func TestTerminalConsumerGateWaiterVisibleInPgLocksAndBlocksExclusiveTry(t *test
 func TestTerminalConsumerGateTimeoutAbortsTxWithoutRestore(t *testing.T) {
 	ctx, pool, _ := openRepoActivityLiveDB(t)
 	repo := uuid.New()
-	_ = tcgHold(ctx, t, pool, repo)
+	holder := tcgHold(ctx, t, pool, repo)
 	waiter := tcgBegin(ctx, t, pool, pgx.TxOptions{})
 	start := time.Now()
 	err := New(waiter).LockTerminalConsumerGateShared(ctx, repo, 200*time.Millisecond)
@@ -184,6 +188,24 @@ func TestTerminalConsumerGateTimeoutAbortsTxWithoutRestore(t *testing.T) {
 	err = waiter.QueryRow(ctx, "SELECT 1").Scan(&probe)
 	if !errors.As(err, &pgErr) || pgErr.Code != "25P02" {
 		t.Fatalf("follow-up statement err = %v, want 25P02 (tx aborted)", err)
+	}
+	// Recovery after contention clears: once the holder is gone, a fresh transaction admits.
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fresh := tcgBegin(ctx, t, pool, pgx.TxOptions{})
+	if err := New(fresh).LockTerminalConsumerGateShared(ctx, repo, time.Second); err != nil {
+		t.Fatalf("fresh tx after the holder released: %v", err)
+	}
+}
+
+func TestTerminalConsumerGateAlreadyCancelledContextIsBusy(t *testing.T) {
+	ctx, pool, _ := openRepoActivityLiveDB(t)
+	tx := tcgBegin(ctx, t, pool, pgx.TxOptions{})
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := New(tx).LockTerminalConsumerGateShared(cctx, uuid.New(), time.Second); !errors.Is(err, ErrTerminalConsumerGateBusy) {
+		t.Fatalf("err = %v, want ErrTerminalConsumerGateBusy", err)
 	}
 }
 

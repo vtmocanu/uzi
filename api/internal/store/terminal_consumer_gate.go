@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"strconv"
 	"time"
 
@@ -62,10 +63,20 @@ func (q *Queries) InTx() bool {
 // If the acquire fails the transaction is aborted and nothing more is sent on it: a lock
 // timeout (55P03), a cancelled query (57014) or an ended context return an error satisfying
 // errors.Is(err, ErrTerminalConsumerGateBusy), joined with the driver error; any other error
-// is returned as is.
+// is returned as is. An already-ended context is reported as busy too.
+//
+// Take it on the TOP-LEVEL transaction only: a pgx nested Tx is a savepoint, and ROLLBACK TO
+// SAVEPOINT releases an advisory xact lock taken inside it while the outer transaction goes on.
+// With pgx's default context watcher a cancelled wait closes the socket without a cancel
+// request, so the server backend can stay queued as a waiter until its lock_timeout expires;
+// keep wait short. That orphan never weakens the gate (if granted it only makes a retirement
+// try back off).
 func (q *Queries) LockTerminalConsumerGateShared(ctx context.Context, repoID uuid.UUID, wait time.Duration) error {
 	if !q.InTx() {
 		return ErrTerminalConsumerGateNoTx
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(ErrTerminalConsumerGateBusy, err)
 	}
 	var isolation, prevTimeout string
 	if err := q.db.QueryRow(ctx,
@@ -79,6 +90,9 @@ func (q *Queries) LockTerminalConsumerGateShared(ctx context.Context, repoID uui
 	ms := wait.Milliseconds()
 	if ms < 1 {
 		ms = 1 // lock_timeout 0 means wait forever
+	}
+	if ms > math.MaxInt32 {
+		ms = math.MaxInt32 // lock_timeout is an int4 of milliseconds
 	}
 	if _, err := q.db.Exec(ctx, "SELECT set_config('lock_timeout', $1, true)", strconv.FormatInt(ms, 10)+"ms"); err != nil {
 		return fmt.Errorf("terminal consumer gate: set lock_timeout: %w", err)
