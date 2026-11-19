@@ -562,7 +562,8 @@ workers:
   # The same read lets the controller confirm WaitForFirstConsumer for the paused-restore
   # bind-timeout exemption (#4468); with it disabled the exemption does not apply, a
   # waiting paced restore's claims can be reported stranded after the bind timeout, and
-  # that report holds the restore's roll pool until the claims bind.
+  # that report keeps the restore unadmitted at zero replicas, so its claims cannot bind
+  # and its roll pool stays held until the read is restored or an operator intervenes.
   storageClassRead:
     create: true
 
