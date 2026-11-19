@@ -325,40 +325,40 @@ dialog for that one run:
   A custom ID must be a single word; a Codex model is refused on Claude.
 - **Reasoning effort**: `low` to `max`.
 
-### The "If started now" preview
-
-Before you start, uzi shows what a start would use. It is read-only: the
-server predicts the harness, model, effort and token, each with its source,
-and the preview never disables **Start run**.
-
-- **Board card.** Under **Start run**, a quiet line reads **If started now:
-  harness · model · effort**. It is closed by default; open it to see each
-  value with its source, the token, and a **Run defaults** link to
-  [Settings → Run defaults](./worker-model.md).
-- **Issue page.** The same list, open by default.
-- **Run options dialog.** The same preview, following the harness, token,
-  model and effort you pick as you pick them.
-- **Chat.** The start card shows a static line; see [Chat](./chat.md).
-
-When the harness is chosen by the server at create (the automatic default),
-the preview shows **Chosen when started** with the server's reason, and one
-line per harness it might pick. On the board card and the issue page the
-preview notes that it is a prediction: claim-time settings are resolved when a
-worker picks the run up. While loading
-it shows **Resolving…**; if it cannot be fetched it shows **Preview
-unavailable; Start will validate your choices.** and Start still works.
-
 The **Default** options name their source, for example
-**Default · opus (lead template)**. A model or effort left on Default is
-resolved when a worker picks the run up, from your Settings. The harness, and
-a Codex credential, are not: they are fixed when the run is created. A model
-or effort you choose is frozen on the run:
+**Default · opus (lead template)**. A model, effort or Anthropic token left on
+Default is resolved when a worker picks the run up. The harness, a Codex
+credential and a pinned token are not: they are fixed when the run is created.
+A model or effort you choose is frozen on the run:
 requeues and resumes keep it (see [Worker model](./worker-model.md#a-model-chosen-when-starting-a-run)
 and [Reasoning effort](./worker-effort.md#a-run-level-effort)). If uzi refuses
 the choice, for example a model the resolved harness cannot run, the reason
 shows in the dialog and your choices stay so you can change one and start
 again. Wait-on-limit and MR rework are not in the dialog; set them on the run
 page after it starts.
+
+### The "If started now" preview
+
+Before you start, uzi shows what a start would use. It is read-only: the
+server predicts the harness, model, effort and token, with their sources where
+known, and the preview never disables **Start run**.
+
+- **Board card.** Under **Start run**, a quiet line reads **If started now:
+  harness · model · effort**. It is closed by default; open it to see each
+  value with its source, the token, and a **Run defaults** link to
+  Settings → Run defaults (see [Worker model](./worker-model.md)).
+- **Issue page.** The same list under **If it started now**, open by default.
+- **Run options dialog.** The same list, following the harness, token, model
+  and effort you pick as you pick them.
+- **Chat.** The start card shows a static line; see [Chat](./chat.md).
+
+When the harness is chosen by the server at create (the automatic default),
+the preview shows **Chosen when started** with the server's reason, and one
+line per harness it might pick. When any value is resolved at claim, the open
+list on the board card and the issue page notes that it is a prediction:
+claim-time settings are resolved when a worker picks the run up. While loading
+it shows **Resolving…**; if it cannot be fetched it shows **Preview
+unavailable; Start will validate your choices.** and Start still works.
 
 ## Staying in sync
 
