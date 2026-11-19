@@ -15,7 +15,8 @@ import (
 // Duplicate canary reservations (issue #4475). planPool keeps two canary reservations
 // held unless both prove a current old pod. One narrow shape is provably safe to
 // settle: a recycled participant (scaled to zero, no pod, no storage) that a stale
-// canary reservation was copied onto, next to a current canary that is serving. The
+// canary reservation was copied onto, next to a current canary (currentSurvivor needs
+// one replica and not absent; it requires no serving proof). The
 // stale reservation protects nothing, so it is cancelled by one conditioned
 // metadata-only patch and the pool is re-observed.
 
@@ -199,6 +200,10 @@ func (m *Materializer) cancelAbsentDuplicateCanary(ctx context.Context, t *rollT
 			return false
 		}
 	}
+	// planRoll groups a pool by the coverage key of the entry's own valid marker, and an
+	// entry whose marker owner or lane does not match is blocked (refused above), so
+	// every canary here already carries the pool's key; this check is defensive and has
+	// no reachable failing input from planPool.
 	for _, c := range canaries {
 		if coverageKey(c.marker.Coverage) != key {
 			return false

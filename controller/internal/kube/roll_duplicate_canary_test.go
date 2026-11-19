@@ -505,6 +505,58 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			bad.Template = "no-such-template"
 			o.workers = append(o.workers, bad)
 		}},
+		{name: "unplanned worker with unknown namespace", mutate: func(t *testing.T, o *orphanCohort) {
+			// Isolated plus Docker is a placement refusal, so the namespace is unknown.
+			bad := desired("w9")
+			bad.Isolated, bad.Docker = true, true
+			o.workers = append(o.workers, bad)
+		}},
+		{name: "three canaries in the pool", n: 3, mutate: func(t *testing.T, o *orphanCohort) {
+			o.setMarker(t, "w3", func(m *rollMarker) { m.Canary = true })
+		}},
+		{name: "survivor with nil replicas", mutate: func(t *testing.T, o *orphanCohort) {
+			o.edit(t, "w1", func(d *appsv1.Deployment) { d.Spec.Replicas = nil })
+		}},
+		{name: "D with nil replicas", mutate: func(t *testing.T, o *orphanCohort) {
+			o.edit(t, "w2", func(d *appsv1.Deployment) { d.Spec.Replicas = nil })
+		}},
+		{name: "survivor claim mirror differing from its deployment marker", mutate: func(t *testing.T, o *orphanCohort) {
+			mk := o.marker(t, "w1")
+			mk.Nonce += "-other"
+			raw, err := json.Marshal(mk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.editClaim(t, dataPVCName("w1"), func(p *corev1.PersistentVolumeClaim) {
+				if p.Annotations == nil {
+					p.Annotations = map[string]string{}
+				}
+				p.Annotations[annotationRoll] = string(raw)
+			})
+		}},
+		{name: "survivor deployment gone, canary only on its claim mirror", mutate: func(t *testing.T, o *orphanCohort) {
+			raw := o.dep(t, "w1").Annotations[annotationRoll]
+			o.editClaim(t, dataPVCName("w1"), func(p *corev1.PersistentVolumeClaim) {
+				if p.Annotations == nil {
+					p.Annotations = map[string]string{}
+				}
+				p.Annotations[annotationRoll] = raw
+			})
+			if err := o.c.Tracker().Delete(appsv1.SchemeGroupVersion.WithResource("deployments"), o.m.cfg.Namespace, deploymentName("w1")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "D with an empty deployment uid", mutate: func(t *testing.T, o *orphanCohort) {
+			o.edit(t, "w2", func(d *appsv1.Deployment) { d.UID = "" })
+		}},
+		{name: "unlabelled canonical data claim", mutate: func(t *testing.T, o *orphanCohort) {
+			o.addClaim(t, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: dataPVCName("w2")}})
+		}},
+		{name: "survivor unavailable without a fence on the pool", mutate: func(t *testing.T, o *orphanCohort) {
+			// A pending drain frozen under another owner and lane marks w1 unavailable
+			// but fences neither this pool's lane nor its coverage key.
+			o.m.migrationPending = map[string]rollCoverage{"w1": {Owner: "owner-B", Lane: "elsewhere"}}
+		}},
 		{name: "malformed third pool reservation", n: 3, mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w3", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = "{not json" })
 		}},
