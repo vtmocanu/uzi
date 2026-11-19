@@ -241,6 +241,8 @@ uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
+uzi settings set <setting> [--harness claude|codex] <value>
+uzi settings reset <setting> [--harness claude|codex]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -3478,8 +3480,8 @@ the instance defaults are untouched.
 | `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
 
 `reset` takes the same setting and `--harness` and no value. It clears the stored
-pin, so the setting follows the upstream default again (your value stops being
-a copy of it). For `judge-runs-on`, `reset judge-runs-on` and
+pin, so the setting follows the upstream default again (nothing is stored, so a
+later change to the default applies). For `judge-runs-on`, `reset judge-runs-on` and
 `set judge-runs-on same-as-run` are the same write: they clear the stored value, so
 the judge runs on the harness of the run it reviews.
 
@@ -3507,10 +3509,10 @@ Exit codes:
 | Exit | Meaning |
 | --- | --- |
 | 0 | The write succeeded. If the follow-up effective-settings read fails, the command still exits 0 and prints `Saved; the effective view is unavailable, so only stored values are shown.` (the read error goes to stderr). |
-| 1 | The server predates the route: `this server does not support CLI model-setting writes; upgrade the server`. |
+| 1 | The server predates the route: `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
 | 2 | Usage error: an unknown setting, a missing, invalid or unwanted `--harness`, or an invalid value is refused before any request is sent. A value the server rejects (for example a model the harness cannot run) also exits 2, with the server's message; nothing is written. |
 | 3 | Authentication failed. |
-| 6 | Server error or rate limit. Two 500s are worded for the write's state: `the save may or may not have been applied; check with `uzi settings get`` (the commit outcome is unknown) and `settings saved; reading them back failed` (the save is durable). Run `uzi settings get` before retrying. |
+| 6 | Server error or rate limit. Two 500s are worded for the write's state: "the save may or may not have been applied; check with `uzi settings get`" (the commit outcome is unknown) and `settings saved; reading them back failed` (the save is durable). Run `uzi settings get` before retrying. |
 
 Exit 6 and the exit 0 `Saved; ...` line are different cases: exit 6 means the
 server could not confirm or read back the write, while the exit 0 line means

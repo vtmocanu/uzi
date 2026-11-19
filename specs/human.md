@@ -1975,7 +1975,7 @@ Design record: issue #4373 (extends PRD `prds/done/3875-command-menu.md`).
 
 ## Feature #3264 — CLI model and effort settings
 
-PRD at `prds/3264-cli-model-settings.md` (module 1 only: the other modules are not shipped).
+PRD at `prds/3264-cli-model-settings.md` (milestone M1 only: M2 cross-check pins and M3 agent-template pins are not shipped).
 
 - A user can set and reset their own worker-model, effort, judge-model, summary-model (per harness) and judge-runs-on defaults from the CLI with `uzi settings set|reset`, over a `uzc_` or `uza_` token, through the dedicated allowlisted `PUT /api/me/model-settings` (nine fields, one transaction, unknown key 400). (AI-synced 2026-11-19)
 - `PUT /api/me/settings` and every consent switch (enable judge, cross-check, autopilot) stay cookie-only. The judge and summary fields only redirect which model or harness already-enabled work uses; they cannot enable it. (AI-synced 2026-11-19)
