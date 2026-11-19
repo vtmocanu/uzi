@@ -202,6 +202,23 @@ export function AppearanceSettings() {
   // sitting beside the "follows you across browsers" control. Live via useDemoMode().
   const demoMode = useDemoMode();
 
+  // Optimistic local state for the sidebar-animations toggle: it flips at once and
+  // clears when the save settles (success re-reads the session, failure rolls back).
+  const [pendingMotion, setPendingMotion] = useState<boolean | null>(null);
+  // The server-resolved sidebar_motion a successful PUT confirmed. It covers the gap
+  // when the follow-up session re-read fails (refresh swallows that and leaves the
+  // context stale), so the toggle, the root stamp and later saves agree with the
+  // stored value. It is tied to the appearance it was confirmed against, so any new
+  // session appearance supersedes it.
+  const [confirmedMotion, setConfirmedMotion] = useState<{
+    value: boolean;
+    against: typeof appearance;
+  } | null>(null);
+  const confirmed = confirmedMotion?.against === appearance ? confirmedMotion.value : null;
+  // Strict: an absent field (older server) reads as off, never as a stored value.
+  const resolvedMotion = confirmed ?? appearance.sidebar_motion === true;
+  const motionChecked = pendingMotion ?? resolvedMotion;
+
   // The current resolved appearance as applyAppearance's argument shape; each
   // handler replaces exactly one field before stamping.
   const current = {
@@ -209,14 +226,8 @@ export function AppearanceSettings() {
     light: appearance.light_theme,
     dark: appearance.dark_theme,
     typeface: appearance.typeface,
-    // Strict: an absent field (older server) reads as off, never as a stored value.
-    sidebarMotion: appearance.sidebar_motion === true,
+    sidebarMotion: resolvedMotion,
   };
-
-  // Optimistic local state for the sidebar-animations toggle: it flips at once and
-  // clears when the save settles (success re-reads the session, failure rolls back).
-  const [pendingMotion, setPendingMotion] = useState<boolean | null>(null);
-  const motionChecked = pendingMotion ?? current.sidebarMotion;
 
   const saveAppearance = async (
     optimistic: {
@@ -233,7 +244,9 @@ export function AppearanceSettings() {
     applyAppearance(optimistic);
     setAppearanceBusy(true);
     try {
-      await api.putMySettings(patch);
+      const res = await api.putMySettings(patch);
+      const saved = res?.settings?.effective_sidebar_motion;
+      if (typeof saved === "boolean") setConfirmedMotion({ value: saved, against: appearance });
       await refresh(); // sync overrides + re-apply the authoritative appearance
     } catch (err) {
       setAppearanceError(errorMessage(err, "Failed to save appearance"));

@@ -502,4 +502,44 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
     const cached = JSON.parse(localStorage.getItem("uzi.appearance") ?? "{}");
     expect(cached.sidebarMotion).toBe(false);
   });
+
+  it("keeps a confirmed save shown when the session re-read leaves the context stale, so the next click turns it off", async () => {
+    mockApi.putMySettings.mockResolvedValueOnce({
+      settings: { sidebar_motion: true, effective_sidebar_motion: true } as never,
+    });
+    // The real refresh() swallows a failed me() and leaves the appearance unchanged.
+    refresh.mockResolvedValueOnce(undefined);
+    renderPage();
+    fireEvent.click(motionSwitch());
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(motionSwitch().getAttribute("aria-disabled")).toBeNull());
+    expect(motionSwitch().getAttribute("aria-checked")).toBe("true");
+    expect(document.documentElement.dataset.motion).toBe("on");
+    expect(screen.queryByText(/Failed to save appearance/)).toBeNull();
+
+    mockApi.putMySettings.mockResolvedValueOnce({
+      settings: { sidebar_motion: false, effective_sidebar_motion: false } as never,
+    });
+    refresh.mockResolvedValueOnce(undefined);
+    fireEvent.click(motionSwitch());
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ sidebar_motion: false });
+    await waitFor(() => expect(motionSwitch().getAttribute("aria-checked")).toBe("false"));
+    expect(document.documentElement.dataset.motion).toBe("off");
+  });
+
+  it("carries the confirmed motion value into a later typeface save when the re-read stayed stale", async () => {
+    mockApi.putMySettings.mockResolvedValueOnce({
+      settings: { sidebar_motion: true, effective_sidebar_motion: true } as never,
+    });
+    refresh.mockResolvedValueOnce(undefined);
+    renderPage();
+    fireEvent.click(motionSwitch());
+    await waitFor(() => expect(motionSwitch().getAttribute("aria-disabled")).toBeNull());
+    fireEvent.click(within(screen.getByRole("radiogroup", { name: "Typeface" })).getByRole("radio", { name: "IBM Plex" }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    expect(document.documentElement.dataset.motion).toBe("on");
+    const cached = JSON.parse(localStorage.getItem("uzi.appearance") ?? "{}");
+    expect(cached.sidebarMotion).toBe(true);
+  });
 });
