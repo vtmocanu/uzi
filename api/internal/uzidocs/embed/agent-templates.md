@@ -117,6 +117,19 @@ Claude's **Other (custom model ID)…** option accepts custom IDs; Codex offers
 only the five role IDs above. The editor warns and blocks Save for a pin in
 the wrong family. See the [approved PRD](../prds/3249-per-harness-template-pins.md).
 
+### Changing your own pins from the CLI
+
+You can read and change the Claude and Codex pins of **your own** templates with
+`uzi agent-template list|show|set|reset`, for example `uzi agent-template set
+my-reviewer --harness claude sonnet`. The save-time rules above apply, since the
+server validates the pin like the web editor, and a clear (`reset`) makes that
+family inherit again. Only a template you own (scope `user`) is editable: a
+builtin or global template is edited in the web UI by an admin, even when the
+CLI token is an admin's, and another user's template is not found. The command
+changes only the two pins; description, tools and prompt are untouched. See
+[Agent-template model pins](./cli.md#agent-template-model-pins) for the commands,
+name and id resolution and exit codes.
+
 The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it
 alone can read the run's own forge (issues, merge requests, pipelines, label
 history) to check a claim against live state; see
@@ -273,7 +286,8 @@ take shipped changes on boot until it is reset.
 
 Drift and reset live in the web UI and the REST API — the badge, the
 shipped-vs-stored diff, and the reset action. There is no `uzi` command for
-template or skill drift or reset, by design: the CLI's admin surface is
+template or skill drift or reset, by design (`uzi agent-template` edits only the
+model pins of your own templates): the CLI's admin surface is
 read-only, and reset produces nothing a script would capture. Builtin **skills** follow the same edit-preserving rule
 with one difference worth knowing: a shipped change to a builtin skill is **not**
 re-applied on boot and carries no drift badge, so a builtin skill an admin has

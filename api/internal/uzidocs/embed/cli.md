@@ -243,6 +243,10 @@ uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
 uzi settings set <setting> [--harness claude|codex] <value>
 uzi settings reset <setting> [--harness claude|codex]
+uzi agent-template list
+uzi agent-template show <name|id>
+uzi agent-template set <name|id> --harness claude|codex <model>
+uzi agent-template reset <name|id> --harness claude|codex
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -3544,6 +3548,59 @@ are written in one transaction. Consent switches (enabling the judge, cross-chec
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
 `judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
 already-enabled judge and summary work uses, and cannot turn that work on.
+
+### Agent-template model pins
+
+```sh
+uzi agent-template list
+uzi agent-template show my-reviewer
+uzi agent-template set my-reviewer --harness claude sonnet
+uzi agent-template set my-reviewer --harness codex <model-id>
+uzi agent-template reset my-reviewer --harness claude
+```
+
+`uzi agent-template` reads and edits the Claude pin (`model`) and the Codex pin
+(`codex_model`) of **your own** agent templates over `GET /api/me/agent-templates`
+and `PUT /api/me/agent-templates/{id}/model-pins`, both of which accept a `uzc_`
+or `uza_` Bearer token. A pin is stored per family; `--harness claude` or
+`--harness codex` is required for `set` and `reset`, and the other family is left
+unchanged. `set` passes the model id through and the server validates it like the
+web editor (see [Model pins](./agent-templates.md#model-pins)). `reset` clears
+that pin so the family inherits again. Only the two pins change; description,
+tools and prompt are untouched, and the template's `customized` flag stays as it
+was.
+
+`list` prints your builtin, global and own templates with `NAME`, `SCOPE`,
+`CLAUDE PIN`, `CODEX PIN`, `EDITABLE` and `ID`. `show`, `set` and `reset` print
+the template's stored pins, each as the value or `inherit`. The output states
+stored pins only and never a resolved model, because the model a template
+actually uses depends on the run role it fills (see [Model
+pins](./agent-templates.md#model-pins)). `--json` prints the server's envelope;
+`list` prints `{"templates": [...]}`, and `set`, `reset` and `show` print
+`{"template": {...}}` (`show` has no route of its own, so it prints that entry of
+the list unchanged).
+
+Only a template you own (scope `user`) is editable. A builtin or global template
+exits 3 with "builtin and global templates are edited in the web UI by an admin",
+even with an admin token. Another user's template or an unknown name or id exits
+4.
+
+Every verb first lists to resolve `<name|id>`: an exact id (case-insensitive)
+wins over a name; otherwise the name must match exactly one template. A name that
+matches several (a template of yours that shares a builtin's name) exits 2 and
+lists the ids; pass the id of one.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | The template was read or the pin written. |
+| 1 | The server predates the routes: the list answered an error-less 404 or 405, printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
+| 3 | Authentication failed, or the template is builtin or global. |
+| 4 | The template does not exist or belongs to another user, including a `404` on the write. |
+| 6 | Server error or rate limit, including a typed 500 for an unknown commit outcome or a failed readback. |
+
+Only the list's error-less 404 or 405 means an older server; a 404 on the write
+is always exit 4. A malformed template id is a 400, as on `/api/agent-templates`.
 
 ### Effective settings
 

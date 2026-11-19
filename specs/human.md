@@ -1975,13 +1975,15 @@ Design record: issue #4373 (extends PRD `prds/done/3875-command-menu.md`).
 
 ## Feature #3264 — CLI model and effort settings
 
-PRD at `prds/3264-cli-model-settings.md` (milestones M1 and M2 shipped; M3 agent-template pins are not shipped).
+PRD at `prds/done/3264-cli-model-settings.md` (milestones M1 to M3 shipped).
 
 - A user can set and reset their own worker-model, effort, judge-model, summary-model (per harness) and judge-runs-on defaults from the CLI with `uzi settings set|reset`, over a `uzc_` or `uza_` token, through the dedicated allowlisted `PUT /api/me/model-settings` (ten fields including `cross_check_pins`, one transaction, unknown key 400). (AI-synced 2026-11-19)
 - `PUT /api/me/settings` and every consent switch (enable judge, cross-check, autopilot) stay cookie-only. The judge and summary fields only redirect which model or harness already-enabled work uses; they cannot enable it. (AI-synced 2026-11-19)
 - Reset clears the stored pin so the setting follows the upstream default; effort `runtime` is the explicit Runtime default mode and is distinct from reset. (AI-synced 2026-11-19)
-- A failed effective-settings readback after a confirmed save still exits 0; a commit-unknown or saved-but-unreadable server answer exits 6. An older server exits 1 with an upgrade message. Agent-template pins from the CLI are not shipped. (AI-synced 2026-11-19)
+- A failed effective-settings readback after a confirmed save still exits 0; a commit-unknown or saved-but-unreadable server answer exits 6. An older server exits 1 with an upgrade message. (AI-synced 2026-11-19)
 - `uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>] [--effort <level>]` pins one checker cell (at least one of model and effort; an omitted member is preserved; `runtime` is rejected), and `uzi settings reset cross-check --stage --harness` clears both members of that cell only. It prints that cell's row; `--json` prints the envelope. (AI-synced 2026-11-19)
+- `uzi agent-template list|show <name|id>|set <name|id> --harness claude|codex <model>|reset <name|id> --harness claude|codex` reads and edits the Claude and Codex model pins of the caller's own user-scope templates over `GET /api/me/agent-templates` and `PUT /api/me/agent-templates/{id}/model-pins` (CLI-token reachable). Output shows stored pins and `inherit`, never a resolved model. (AI-synced 2026-11-19)
+- Builtin and global templates exit 3 ("edited in the web UI by an admin"), even with an admin token; another user's or an unknown template exits 4; an ambiguous name exits 2 listing ids and an exact id beats a name. An older server (list answers an error-less 404 or 405) exits 1 with the upgrade message. A pin edit leaves `customized` unchanged. (AI-synced 2026-11-19)
 
 ## Demo mode branding
 
