@@ -22,6 +22,13 @@
 # Usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls]
 #                    [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]
 #                    [--max-unknown N]
+#   --since SHA       wait for contributor activity instead of merge-readiness. Use the
+#                     full reviewed commit SHA. Exit 13 on a changed head, a human issue
+#                     comment/review/thread reply created after that commit's committer
+#                     time, or head CI needing approval. Existing post-commit discussion
+#                     counts immediately, including the maintainer's own review. Bot
+#                     activity and edits to older comments do not count. Never merges,
+#                     requests reviews, or approves CI. Other readiness flags do not gate.
 #   interval_secs default 60, max_polls default 60.
 #   --reviewer        which bot must have reviewed the head (default any: either one).
 #                     Selecting ONE bot (coderabbit|greptile) also makes the OTHER fully
@@ -79,6 +86,8 @@
 #      (RESULT=unknown_persistent lookups=a,b). Fix or inspect that lookup; never merge on it.
 #  10  ci_fix ownership — active on this branch (even with green CI), or recent while CI is red.
 #      CI_FIX_ACTIVE/RECENT name the runs; decide wait/cancel/review before local work.
+#  13  author attention — --since observed head_changed, human_activity or
+#      ci_approval_required. Inspect the reason; this is never merge-readiness.
 # Branch-writer resolution precedes conflicts: unreadable uzi plus CONFLICTING is exit 9, not 8.
 #
 # "CodeRabbit reviewed this head" is the union of robust signals, because a
@@ -121,12 +130,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/ci-fix.sh"
 net_retry_install
 
-usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
+usage() { echo "usage: watch-pr.sh OWNER/REPO PR [--since FULL_SHA] [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
 
 REVIEWER="any"; GRACE_MIN=10; MAX_UNKNOWN="${WATCH_PR_MAX_UNKNOWN:-5}"; CI_GRACE_MIN="${WATCH_PR_CI_GRACE:-15}"
+SINCE=""; since_time=""
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    --since) [ $# -ge 2 ] && [ -n "$2" ] || usage; SINCE=$2; shift 2;;
     --reviewer) REVIEWER="${2:?}"; shift 2;;
     --reviewer-grace) GRACE_MIN="${2:?}"; shift 2;;
     --max-unknown) MAX_UNKNOWN="${2:?}"; shift 2;;
@@ -144,6 +155,8 @@ MAX=${POS[3]:-60}
 case "$REVIEWER" in any|coderabbit|greptile|none) ;; *) echo "bad --reviewer: $REVIEWER" >&2; usage;; esac
 case "$MAX_UNKNOWN" in ''|*[!0-9]*|0) echo "bad --max-unknown: $MAX_UNKNOWN" >&2; usage;; esac
 case "$CI_GRACE_MIN" in ''|*[!0-9]*) echo "bad --ci-grace: $CI_GRACE_MIN" >&2; usage;; esac
+if [ -n "$SINCE" ] && ! [[ "$SINCE" =~ ^[0-9a-fA-F]{40}$ ]]; then echo 'bad --since: use a full commit SHA' >&2; usage; fi
+SINCE=$(printf '%s' "$SINCE" | tr 'A-F' 'a-f')
 cj_errf=$(mktemp "${TMPDIR:-/tmp}/watch-pr-checks.XXXXXX") || exit 2
 trap 'rm -f "$cj_errf"' EXIT
 
@@ -175,6 +188,47 @@ pages_are_arrays() { printf '%s' "$1" | jq -es 'length>0 and all(.[]; type=="arr
 pages_are_checkruns() { printf '%s' "$1" | jq -es 'length>0 and all(.[]; type=="object" and has("check_runs"))' >/dev/null 2>&1; }
 is_array() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1; }
 
+# Share the existing poll budget and unknown/quota handling. Fetch only activity,
+# not merge gates: a contributor may respond while CI or review findings remain red.
+watch_author_activity() {
+  local baseline raw kind item runs run_id
+  if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then unk pr_view; return; fi
+  if [ "$head" != "$SINCE" ]; then
+    echo "RESULT=author_attention reason=head_changed head=$head"; exit 13
+  fi
+  if [ -z "$since_time" ]; then
+    if baseline=$(gh api "repos/$REPO/commits/$SINCE" 2>/dev/null) &&
+       since_time=$(printf '%s' "$baseline" | jq -er --arg sha "$SINCE" '
+         select(.sha == $sha) | .commit.committer.date | fromdateiso8601' 2>/dev/null); then :
+    else unk since_commit; return; fi
+  fi
+  for kind in comment review reply; do
+    case "$kind" in
+      comment) item="issues/$PR/comments" ;;
+      review) item="pulls/$PR/reviews" ;;
+      reply) item="pulls/$PR/comments" ;;
+    esac
+    if raw=$(gh api --paginate "repos/$REPO/$item?per_page=100" 2>/dev/null) && pages_are_arrays "$raw" &&
+       item=$(new_human_activity_json "$raw" "$kind" "$since_time"); then
+      if [ "$item" != null ]; then
+        echo "RESULT=author_attention reason=human_activity kind=$kind id=$item head=$head"; exit 13
+      fi
+    else unk "author_$kind"; fi
+  done
+  if runs=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$head&event=pull_request&per_page=100" 2>/dev/null) &&
+     run_id=$(printf '%s' "$runs" | jq -ers --arg head "$head" '
+       if length > 0 and all(.[]; (.workflow_runs | type) == "array") then
+         [.[].workflow_runs[] | select(.head_sha == $head)
+           | select(.status == "action_required" or .conclusion == "action_required")
+           | .id | if type == "number" then . else error("invalid run id") end]
+         | first // "none"
+       else error("unreadable runs") end' 2>/dev/null); then
+    if [ "$run_id" != none ]; then
+      echo "RESULT=author_attention reason=ci_approval_required run=$run_id head=$head"; exit 13
+    fi
+  else unk author_ci; fi
+}
+
 # uzi repo_id for the mr_rework check, resolved lazily inside the loop. THREE states are
 # kept distinct so a failed lookup never masquerades as "not connected" (which would skip
 # the rework check and risk a false ready): `repo_known=1` + non-empty id = connected, run
@@ -193,7 +247,7 @@ while [ "$i" -lt "$MAX" ]; do
   # is not the same as a zero result.
   unknown=0; unk_why=""
 
-  if [ "$repo_known" -eq 0 ]; then
+  if [ -z "$SINCE" ] && [ "$repo_known" -eq 0 ]; then
     # Only a listing that parses as an array is a KNOWN answer; malformed output must not
     # become "known, not connected" (which would skip the rework check on a false empty id).
     if rl=$(uzi repo list --json 2>/dev/null) && is_array "$rl"; then
@@ -215,6 +269,13 @@ while [ "$i" -lt "$MAX" ]; do
     continue
   fi
   if [ "$pstate" != "OPEN" ]; then echo "RESULT=pr_not_open state=$pstate"; exit 2; fi
+  if [ -n "$SINCE" ]; then
+    watch_author_activity
+    if [ "$unknown" -eq 1 ]; then unknown_streak; else unk_streak=0; fi
+    echo "try $i: waiting_on_author head=$head unknown_lookups=${unk_why:-none}"
+    sleep "$INTERVAL"
+    continue
+  fi
   # Resolve branch writers before conflict/rebase routing. Known-not-connected is
   # distinct from an unreadable listing; failed ownership lookups never mean none.
   mrw_active=0

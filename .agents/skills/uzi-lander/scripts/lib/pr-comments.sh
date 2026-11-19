@@ -86,6 +86,21 @@ _prc_sha() {
 # open_threads_json THREAD_NODES -> JSON array of thread items. rc 1 on unreadable input.
 open_threads_json() { printf '%s' "$1" | jq -c "$PRC_JQ"' open_threads' 2>/dev/null; }
 
+# new_human_activity_json PAGINATED_JSON KIND SINCE_EPOCH -> first new human item's
+# numeric id, or null. Include empty review bodies and thread replies. Unlike merge
+# acknowledgements, creation time governs activity; editing an old comment is not new.
+new_human_activity_json() {
+  printf '%s' "$1" | jq -cs --arg kind "$2" --argjson since "$3" '
+    [ .[][]
+      | if .user.type == "Bot" then empty
+        elif .user.type != "User" then error("unknown author type")
+        elif $kind == "review" and .submitted_at == null and .state == "PENDING" then empty
+        else (if $kind == "review" then .submitted_at else .created_at end | fromdateiso8601) as $time
+          | select($time > $since)
+          | .id | if type == "number" then . else error("invalid activity id") end
+        end ] | first // null' 2>/dev/null
+}
+
 # code_scanning_open REPO PR -> sets CS_STATE (ok|unavailable|unknown), CS_ITEMS (alert
 # items, [] unless ok) and CS_NOTE (why, for unavailable/unknown). Always rc 0.
 # shellcheck disable=SC2034  # CS_* are this function's outputs, read by the sourcing scripts.

@@ -1,5 +1,20 @@
 # Review-bot signals: what is pollable, per bot, per head
 
+## Wait for a contributor
+
+Run `scripts/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA [interval] [max_polls]`.
+Exit 13 (`RESULT=author_attention`) names `head_changed`, `human_activity` or
+`ci_approval_required`. Inspect the signal; this mode never establishes merge-readiness.
+It uses the same poll budget, unknown handling (exit 9), timeout (2) and GitHub quota
+handback (12), without polling merge gates or requesting a review.
+
+Use the reviewed commit's full 40-hex SHA. Its committer time is the discussion watermark:
+any human issue comment, submitted review (including an empty body), or inline reply
+created strictly later counts, including maintainers and already-present discussion.
+Bot activity, pending reviews and edits to older comments do not count. A changed head or
+an approval-required pull-request workflow run on the head triggers immediately. Re-arm
+readiness after reviewing updates; exit 13 never approves CI or authorizes a merge.
+
 Everything here is measured on this repo (PRs #1421, #1426, #1428, 2026-09-16/17, plus
 the earlier CodeRabbit measurements cited in `coderabbit-triage.md`). `scripts/watch-pr.sh`,
 `scripts/pr-findings.sh`, `scripts/takeover.sh` and `scripts/cr-rate-limit.sh` implement
