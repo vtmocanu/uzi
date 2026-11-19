@@ -859,10 +859,25 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 	// An incomplete non-canary reservation that is already proven (so not counted in
 	// inFlight) can still be the target of a delayed adoption patch; ordinary new-canary
 	// admission must not run while one exists without a canary.
+	// A same owner/lane canary in a sibling coverage pool keeps the existing ordinary
+	// planning (capability changes split pools); adoption already refuses there.
 	orphanReservation := false
 	for _, e := range pool {
 		if e.blocked == "" && e.marker != nil && !e.marker.Completed && !e.marker.Canary {
 			orphanReservation = true
+		}
+	}
+	if orphanReservation && inFlight == 0 && len(pool) > 0 {
+		inPool := map[*rollEntry]bool{}
+		for _, e := range pool {
+			inPool[e] = true
+		}
+		owner, lane := pool[0].coverage.Owner, pool[0].coverage.Lane
+		for _, p := range t.entries {
+			if !inPool[p] && p.marker != nil && p.marker.Canary && p.marker.Coverage.Owner == owner && p.marker.Coverage.Lane == lane {
+				orphanReservation = false
+				break
+			}
 		}
 	}
 	if (inFlight > 0 || orphanReservation) && canary == "" {
