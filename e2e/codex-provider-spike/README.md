@@ -50,6 +50,13 @@ Both restart rows positively exercise B first. Retaining closed A times out with
 request. The same-process dotted provider override separately failed within the observation
 window. Cancellation is owned-root abort after stream start, not a measured turn/interrupt RPC.
 
+Resume inventory and request projections cover the measured turn only: priming A and the
+B positive control are reset before the probe. `observerControlPassed` records that control
+separately. Native inventory fields are absent when no inventory was observed, rather than
+claiming suppression from silence. A negative resume deadline is accepted only after the
+actual resume probe starts. Protocol and teardown failures are retained together;
+`cleanupFailed` independently makes the harness fail even when the original error was a deadline.
+
 The unknown-model case observes a fallback warning and config/read's nullable-integer
 model_context_window property. No context-window override changes the fixed builder.
 No local /v1/models request was seen. Request/stream retries are configured zero and websockets
