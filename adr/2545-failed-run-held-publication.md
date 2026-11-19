@@ -374,8 +374,8 @@ durable refusal evidence exists) the restart rule makes a successor
 ineligible. If both the `refused-<sha>` write and the ledger append failed on a
 path with no fetch stage (P3-P7) and the worker then restarts, and the run's
 pins later reconcile below the cap, nothing durable records that head and the
-ordinary (`none`) release proceeds without proving it covered; this is an
-accepted residual. The gate's
+ordinary (`none`) release proceeds without proving it covered; this is a
+known residual, not yet accepted by the owner. The gate's
 tracking-tip rule (the run's own branch tracking ref must be covered) is an
 extra check that matters for P3 (same run) and P7; it is not what protects the
 other paths.

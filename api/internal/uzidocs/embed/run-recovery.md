@@ -1285,7 +1285,7 @@ them; any change in the evidence keeps everything locally.
 - a refusal whose refused-head ref and ledger writes both failed on a path
   without a fetch stage, followed by a worker restart and pins that later
   reconcile below the cap: nothing durable records that head, so the ordinary
-  release proceeds without proving it covered (an accepted residual);
+  release proceeds without proving it covered (a known residual, not yet accepted by the owner);
 - a later generation of a run after an earlier generation's cleanup, which
   cannot cap-release automatically;
 - a refusal under a legacy or no-generation context, whose hold and cleanup stay
