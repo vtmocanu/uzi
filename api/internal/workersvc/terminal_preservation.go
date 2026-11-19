@@ -151,6 +151,9 @@ type terminalHooks struct {
 	afterObserve  func(observedAt *time.Time) // after the forge observation, before tx-R1
 	afterDelete   func() error                // after the remote delete, before tx-R2; an error ends the item there
 	retireMaxAge  time.Duration               // replaces retireObservationMaxAge when non-zero
+	// beforeRetiringCommit runs in terminalRetireDecide after MarkTerminalPreservationRetiring and
+	// before tx-R1's COMMIT. Test-only; nil in production.
+	beforeRetiringCommit func()
 }
 
 func (h terminalHooks) prepareFn() func(context.Context, pushbroker.TerminalPackOptions) (*pushbroker.PreparedTerminalPack, error) {

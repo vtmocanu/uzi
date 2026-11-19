@@ -788,6 +788,9 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
+		if s.createBeforeCommitHook != nil {
+			s.createBeforeCommitHook(run)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
@@ -977,6 +980,9 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 
 	if err := s.persistHarnessDecision(ctx, qtx, &run, res.Decision); err != nil {
 		return store.Run{}, resolvedHarness{}, err
+	}
+	if s.createBeforeCommitHook != nil {
+		s.createBeforeCommitHook(run)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, resolvedHarness{}, err

@@ -2246,6 +2246,10 @@ type Service struct {
 	codexSelectHook            func(ctx context.Context)
 	codexSelectLockedHook      func(ctx context.Context)
 	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
+	// createBeforeCommitHook is a test-only seam in createRunAtomic: it runs with the created run
+	// inserted in the open transaction, right before that transaction's COMMIT, on every
+	// transactional create path. Nil in production.
+	createBeforeCommitHook func(run store.Run)
 	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
 	// (issue #3257): the first runs in the creating transaction after the isolation check and
 	// before the target lock, the second after the judge INSERT and before the commit. Nil in

@@ -666,6 +666,9 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 	if err != nil {
 		return 0, fmt.Errorf("terminal sweep: retiring: %w", err)
 	}
+	if s.terminal.beforeRetiringCommit != nil {
+		s.terminal.beforeRetiringCommit()
+	}
 	if err = tt.commit(); err != nil {
 		return 0, fmt.Errorf("terminal sweep: commit: %s", secretscrub.Scrub(err.Error()))
 	}
