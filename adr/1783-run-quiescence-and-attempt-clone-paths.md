@@ -2157,8 +2157,8 @@ real probe trusted.
   - The physical-object occurrence count, derived from `count-objects` rather than logged, predates
     this change. It is the tightest of these record and entry counters: about 68,000 of the same
     131,072 cap, about 52%.
-  - The per-snapshot content byte budget (`maxObjectStoreBytes`, 4 GiB) is closer still. S2 does
-    not charge it. A derived lower bound for this bare is about 77% (the summed logical size of
+  - The per-snapshot content byte budget (`maxObjectStoreBytes`, 4 GiB) is closer still. S2 charges
+    it only for path and name bytes (under 1 MB here), not for object content. A derived lower bound for this bare is about 77% (the summed logical size of
     the objects reachable from HEAD); it was not measured.
 
 Cost scales with paths. This is one measured point, not a worst case.
