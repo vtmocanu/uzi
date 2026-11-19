@@ -200,16 +200,20 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
     const m = mount("overview", rail);
     await hover(m.link);
     expect(cssAnims(m.svg).length).toBeGreaterThan(0);
+    // Test-only: stretch the :active transition (an inline duration outranks the stylesheet's
+    // 60ms) so it is reliably still running after the CDP press round trip on a slow host.
+    m.svg.style.transitionDuration = "10s";
     const { x, y } = pagePoint(m.link);
     await cdp().send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
     try {
       expect(m.link.matches(":active"), "link is :active").toBe(true);
-      // Held state, not the 60ms transition (which can finish before this check runs).
+      // Held state is applied while the pointer is down.
       expect(getComputedStyle(m.svg).transform, "the :active dip is applied while held").not.toBe("none");
       // Hold the :active transition running while the keyframe animations finish, so the
-      // test proves the transition is not counted regardless of its 60ms timing.
-      const transition = allAnims(m.svg).find((a) => a instanceof CSSTransition);
+      // test proves the transition is not counted toward "last animation ended".
+      const transition = allAnims(m.svg).find((a) => a instanceof CSSTransition) as CSSTransition | undefined;
       expect(transition, "the :active CSSTransition exists").toBeDefined();
+      expect(transition!.transitionProperty, "it is the press transform transition").toBe("transform");
       transition!.pause();
       for (const a of cssAnims(m.svg)) a.finish();
       await awaitRest(m.svg);
@@ -217,6 +221,17 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
     } finally {
       await cdp().send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
     }
+  });
+
+  it("lets a moving glyph overflow its box only while it plays", { timeout: 30000 }, async () => {
+    const m = mount("chat", rail);
+    expect(getComputedStyle(m.svg).overflow, "rest").toBe("hidden");
+    await hover(m.link);
+    expect(cssAnims(m.svg).length).toBeGreaterThan(0);
+    expect(getComputedStyle(m.svg).overflow, "during play").toBe("visible");
+    for (const a of allAnims(m.svg)) a.finish();
+    await awaitRest(m.svg);
+    expect(getComputedStyle(m.svg).overflow, "back at rest").toBe("hidden");
   });
 
   it("plays nothing with data-motion off", { timeout: 120000 }, async () => {
