@@ -1409,7 +1409,8 @@ chain in the diagram above, with no intervening `running`.
   ACK. `AdmitRunFollowupFinalize` is one fenced UPDATE under the claim-mutation
   locks that moves exactly that park back to `running` and stamps
   `followup_finalize_generation = claim_generation`.
-  - **Refusals.** A deliverable cancel always refuses (`cancel_pending`). A
+  - **Refusals.** A deliverable cancel always refuses, with `cancel_pending`
+    when the park is still at that seq or already admitted at it. A
     pending follow-up refuses an idle finalize (`followup_pending`), but a
     server-stamped stop does not. Anything else refuses with
     `followup_finalize_refused`, and a superseded claim with `stale_claim`. A
@@ -1417,18 +1418,20 @@ chain in the diagram above, with no intervening `running`.
     the meantime.
   - **Authority.** The worker finalizes only on an applied
     `followup_finalize_admitted` ACK. An unconfirmed reply keeps the flight and
-    custody and publishes nothing; it retries until a cancel, a shutdown or the
-    claim fence ends it.
+    custody and publishes nothing. It retries until a cancel, a shutdown, a
+    lifecycle abort or the claim fence ends it, and sends nothing while the
+    feature is withdrawn.
   - **Triggers (migration 00491).** They bind every writer, old api pods
     included:
     - `runs_followup_park_identity_trg` numbers each logical park. A retried
       report, or a same-generation snapshot re-adopt of a numbered park, keeps
       its seq. It also skips (`RETURN NULL`) any re-park after admission on the
       same unreleased claim.
-    - `run_user_inputs_followup_finalize_trg` refuses an owner follow-up once
-      admission is live (SQLSTATE `UZ415`, surfaced as 409 `follow_up_finalizing`
-      on web, chat, policy resume and Slack) until a re-claim bumps the
-      generation.
+    - `run_user_inputs_followup_finalize_trg` refuses every follow-up insert
+      on the interactive task once admission is live (SQLSTATE `UZ415`), until a
+      re-claim bumps the generation or the claim is released. Web, chat and
+      policy resume answer 409 `follow_up_finalizing`; Slack answers with a
+      "run is finishing" message.
   - **Residuals.**
     - An old worker on a new api still hangs at enrollment until it is upgraded.
     - A park ACKed by an old api or pod carries no seq, so no admission is sent.
