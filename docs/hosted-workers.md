@@ -745,10 +745,11 @@ Caveats:
   (see [ADR-0837](../adr/0837-worker-disk-lifecycle.md) D6), the worker has one Deployment
   held at explicit zero replicas under an open roll reservation for the API's desired
   worker, no pod labelled for the worker exists, no pod mounts the claim, and the claim's
-  StorageClass reads as `WaitForFirstConsumer`. The reservation is written only when the
-  restore is admitted, so a restore still waiting for its first admission carries none, and
-  its claims can still be reported stranded after the bind timeout; that is the same wait,
-  not a storage fault. The class read needs `workers.storageClassRead.create`
+  StorageClass reads as `WaitForFirstConsumer`. Without an open reservation there is no
+  exemption: a worker scaled to zero by hand in step 2.4 gets one only once its restore is
+  admitted, and a pin change can cancel one while the worker stays at zero. Until the worker
+  is admitted again its claims can still be reported stranded after the bind timeout, and
+  the report alone does not distinguish that wait from a storage fault. The class read needs `workers.storageClassRead.create`
   (default `true`); without it, a waiting restore's claims can be reported stranded. Claim
   ages are never reset: after replicas are restored the original age applies, so a brief
   `stuck` until the volume binds is expected. Waiting alone is not grounds to delete or
