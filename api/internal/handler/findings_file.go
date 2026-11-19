@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -133,8 +134,8 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// draft (GetFindingIssueDraft), and attach solely when the repo owner explicitly keeps them
 	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
 	// action, not an agent-injected one.
-	marker, _ := h.settings.FindingLabel(ctx)
-	filedLabels, requiredLabels, err := h.findingFilingLabels(ctx, repo, marker, req.Labels, req.SendToUzi)
+	names, _ := h.settings.FilingLabels(ctx)
+	filedLabels, requiredLabels, err := findingFilingLabels(repo, names, req.Labels, req.SendToUzi)
 	if err != nil {
 		// Refused before the claim and before any write (PRD #4173 M5 review).
 		httpx.Error(w, http.StatusConflict, err.Error())
@@ -320,22 +321,41 @@ func assembleFindingLabels(marker string, userLabels []string) []string {
 // eligibility tag already exists by id and is never created, and autopilot is not
 // offered (PRD #4173 D12, D14).
 //
-// A linked repo also refuses (issuesource.ErrMarkerConfersEligibility, before the caller
-// writes anything) a filing whose finding marker has the eligibility name without an
-// explicit opt-in: the marker would otherwise tag the issue eligible for runs. The opt-ins
-// are send-to-uzi, or an owner-chosen label that is the eligibility name or the configured
-// uzi label (which the linked set maps to it).
-func (h *Handler) findingFilingLabels(ctx context.Context, repo store.GetRepoForUserRow, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label, error) {
-	filed, required := h.forgeFindingFilingLabels(ctx, marker, userLabels, sendToUzi)
+// The marker and both run labels come from one settings snapshot (settings.FilingLabels).
+//
+// A linked repo refuses two filings before the caller writes anything, judged on the
+// linked label set actually built:
+//   - issuesource.ErrMarkerNotWritable when the finding marker is not in it under its own
+//     name (it is also the autopilot label, which is dropped, or the uzi label, which is
+//     rewritten). An eligibility opt-in does not waive the marker.
+//   - issuesource.ErrMarkerConfersEligibility when the set carries the eligibility name
+//     without an explicit opt-in: the issue would be tagged eligible for runs. The opt-ins
+//     are send-to-uzi, or an owner-chosen label that is the eligibility name or the
+//     configured uzi label (which the linked set maps to it).
+func findingFilingLabels(repo store.GetRepoForUserRow, names settings.FilingLabels, userLabels []string, sendToUzi bool) ([]string, []forge.Label, error) {
+	uzi, autopilot := names.Uzi, names.Autopilot
+	if uzi == "" {
+		uzi = settings.DefaultUziLabel
+	}
+	if autopilot == "" {
+		autopilot = settings.DefaultAutopilotLabel
+	}
+	filed, required := forgeFindingFilingLabels(names.Finding, uzi, autopilot, userLabels, sendToUzi)
 	eligibility, linked := linkedEligibility(repo)
 	if !linked {
 		return filed, required, nil
 	}
-	uzi, autopilot := h.runLabelNames(ctx)
-	if !sendToUzi && !ownerChoseEligibility(userLabels, uzi, eligibility) {
-		if err := issuesource.RefuseEligibilityMarkers(eligibility, marker); err != nil {
+	linkedFiled := issuesource.LinkedLabels(filed, uzi, autopilot, eligibility)
+	if err := issuesource.RequireMarker(linkedFiled, names.Finding); err != nil {
+		return nil, nil, err
+	}
+	if !sendToUzi && !ownerChoseEligibility(userLabels, uzi, eligibility) && slices.Contains(linkedFiled, eligibility) {
+		// Name the marker when it is the cause; otherwise the set still must not confer
+		// eligibility.
+		if err := issuesource.RefuseEligibilityMarkers(eligibility, names.Finding); err != nil {
 			return nil, nil, err
 		}
+		return nil, nil, issuesource.ErrMarkerConfersEligibility
 	}
 	linkedRequired := make([]forge.Label, 0, len(required))
 	for _, l := range required {
@@ -343,7 +363,7 @@ func (h *Handler) findingFilingLabels(ctx context.Context, repo store.GetRepoFor
 			linkedRequired = append(linkedRequired, l)
 		}
 	}
-	return issuesource.LinkedLabels(filed, uzi, autopilot, eligibility), linkedRequired, nil
+	return linkedFiled, linkedRequired, nil
 }
 
 // ownerChoseEligibility reports whether one of the labels the owner selected is the
@@ -360,26 +380,18 @@ func ownerChoseEligibility(userLabels []string, uziLabel, eligibility string) bo
 }
 
 // forgeFindingFilingLabels is the unlinked assembly findingFilingLabels starts from.
-func (h *Handler) forgeFindingFilingLabels(ctx context.Context, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
+func forgeFindingFilingLabels(marker, uzi, autopilot string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
 	filed := assembleFindingLabels(marker, userLabels)
 	required := []forge.Label{{Name: marker}}
 	if !sendToUzi {
 		return filed, required
-	}
-	eligibility, _ := h.settings.UziLabel(ctx)
-	if eligibility == "" {
-		eligibility = settings.DefaultUziLabel
-	}
-	autopilot, _ := h.settings.AutopilotLabel(ctx)
-	if autopilot == "" {
-		autopilot = settings.DefaultAutopilotLabel
 	}
 	filedSeen := make(map[string]bool, len(filed)+2)
 	for _, name := range filed {
 		filedSeen[name] = true
 	}
 	requiredSeen := map[string]bool{marker: true}
-	for _, name := range []string{eligibility, autopilot} {
+	for _, name := range []string{uzi, autopilot} {
 		if !filedSeen[name] {
 			filed = append(filed, name)
 			filedSeen[name] = true

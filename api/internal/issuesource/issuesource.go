@@ -81,6 +81,27 @@ func LinkedLabels(labels []string, uziLabel, autopilotLabel, eligibilityName str
 // tracker driver resolves that name to the eligibility tag id (PRD #4173 D12, D14).
 var ErrMarkerConfersEligibility = errors.New("a label uzi adds on its own would make this issue eligible for runs on the linked repo")
 
+// ErrMarkerNotWritable is returned when a label uzi must add to an issue on its own cannot
+// be written on the linked repo under its own name: the linked label set drops it (it is
+// also the autopilot label) or rewrites it (it is also the uzi label). The issue would be
+// created without its mandatory marker, so the create is refused instead.
+var ErrMarkerNotWritable = errors.New("a label uzi adds on its own cannot be written on the linked repo")
+
+// RequireMarker returns an error wrapping ErrMarkerNotWritable when marker is not in
+// linkedLabels, the set LinkedLabels built for the create, and nil when it is. A blank
+// marker is never required.
+func RequireMarker(linkedLabels []string, marker string) error {
+	if marker == "" {
+		return nil
+	}
+	for _, l := range linkedLabels {
+		if l == marker {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: the label %q is also a run label, which a repo linked to an issue tracker does not write; rename one of them", ErrMarkerNotWritable, marker)
+}
+
 // RefuseEligibilityMarkers returns an error wrapping ErrMarkerConfersEligibility naming the
 // first of markers whose name equals eligibilityName, and nil when none does. The match is
 // exact, as the driver's tag resolution is. A create site on a linked repo calls it with

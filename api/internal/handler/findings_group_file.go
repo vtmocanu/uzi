@@ -167,7 +167,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "description is too large")
 		return
 	}
-	marker, err := h.settings.FindingLabel(ctx)
+	names, err := h.settings.FilingLabels(ctx)
 	if err != nil {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
@@ -209,7 +209,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 		return
 	}
-	filedLabels, requiredLabels, err := h.findingFilingLabels(callCtx, repo, marker, req.Labels, req.SendToUzi)
+	filedLabels, requiredLabels, err := findingFilingLabels(repo, names, req.Labels, req.SendToUzi)
 	if err != nil {
 		// A marker that would tag the issue eligible: release the claim and refuse before
 		// any write (PRD #4173 M5 review).

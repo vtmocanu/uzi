@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,4 +144,115 @@ func TestLinkedRepoOrdinaryFindingFilingIsUnchangedByTheMarkerCheckLiveDB(t *tes
 		t.Fatalf("status = %d body = %s, want 201", rr.Code, rr.Body.String())
 	}
 	wantTags(t, srv, createdIID(t, rr.Body.Bytes()), false, "reported")
+}
+
+// changingSettingsStore serves first to the first read and then to every later one, as a
+// settings update that lands while a request is in flight would. With a zero TTL every
+// read reloads, so two reads in one request can see two different, each valid, settings.
+type changingSettingsStore struct {
+	mu          sync.Mutex
+	reads       int
+	first, then []store.AppSetting
+}
+
+func (s *changingSettingsStore) ListAppSettings(context.Context) ([]store.AppSetting, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reads++
+	if s.reads == 1 {
+		return s.first, nil
+	}
+	return s.then, nil
+}
+
+// setChangingLabels makes the finding marker and the uzi label swap between two reads:
+// first the marker is "agent-found" and the uzi label "uzi", then the marker is "reported"
+// and the uzi label "agent-found". Each of the two settings is valid on its own.
+func setChangingLabels(f *neverEnabledFixture) {
+	f.h.settings = settings.New(&changingSettingsStore{
+		first: []store.AppSetting{{Key: settings.KeyFindingLabel, Value: "agent-found"}, {Key: settings.KeyUziLabel, Value: "uzi"}},
+		then:  []store.AppSetting{{Key: settings.KeyFindingLabel, Value: "reported"}, {Key: settings.KeyUziLabel, Value: "agent-found"}},
+	}, 0)
+}
+
+// wantFiledWithoutEligibility checks a 201 whose issue carries exactly one marker, from one
+// of the two settings, and not the eligibility tag.
+func wantFiledWithoutEligibility(t *testing.T, srv *youtracktest.Server, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d body = %s, want 201", rr.Code, rr.Body.String())
+	}
+	ids, names := issueTags(srv, createdIID(t, rr.Body.Bytes()))
+	if slices.Contains(ids, youtracktest.EligibilityTagID) {
+		t.Errorf("the issue carries the eligibility tag with no opt-in (tags %v)", names)
+	}
+	if !slices.Equal(names, []string{"agent-found"}) && !slices.Equal(names, []string{"reported"}) {
+		t.Errorf("tag names = %v, want exactly one finding marker", names)
+	}
+}
+
+// PRD #4173 M5 review: the marker and the run labels are read from one settings snapshot.
+// A settings change between two reads must not turn the old marker into the new uzi label,
+// which the linked label set would rewrite to the eligibility tag.
+func TestLinkedRepoFindingLabelsComeFromOneSettingsSnapshotLiveDB(t *testing.T) {
+	t.Run("FileFinding", func(t *testing.T) {
+		f := seedNeverEnabledFixture(t)
+		srv := linkNeverEnabledFixture(t, f)
+		setChangingLabels(f)
+		rr := httptest.NewRecorder()
+		f.h.FileFinding(rr, f.request(http.MethodPost, apitypes.FileFindingRequest{}, map[string]string{"id": f.findID.String()}))
+		wantFiledWithoutEligibility(t, srv, rr)
+	})
+	t.Run("FileFindingGroup", func(t *testing.T) {
+		f := seedNeverEnabledFixture(t)
+		srv := linkNeverEnabledFixture(t, f)
+		setChangingLabels(f)
+		rr := httptest.NewRecorder()
+		f.h.FileFindingGroup(rr, f.request(http.MethodPost, apitypes.FindingGroupFileRequest{IDs: []string{f.dispID.String()}}, nil))
+		wantFiledWithoutEligibility(t, srv, rr)
+	})
+}
+
+// PRD #4173 M5 review: a finding marker that is also the autopilot label cannot be written
+// on a linked repo, because the linked label set drops the autopilot label. The filing is
+// refused before any write instead of creating an issue without its marker, and an
+// eligibility opt-in does not waive the marker.
+func TestLinkedRepoFindingMarkerThatCannotBeWrittenIsRefusedLiveDB(t *testing.T) {
+	autopilotMarker := func(f *neverEnabledFixture) {
+		f.h.settings = settings.New(&settingsStore{rows: []store.AppSetting{
+			{Key: settings.KeyFindingLabel, Value: "autopilot"},
+			{Key: settings.KeyUziLabel, Value: "uzi"},
+			{Key: settings.KeyAutopilotLabel, Value: "autopilot"},
+		}}, time.Minute)
+	}
+	for _, sendToUzi := range []bool{false, true} {
+		name := "without an opt-in"
+		if sendToUzi {
+			name = "with send to uzi"
+		}
+		t.Run("FileFinding/"+name, func(t *testing.T) {
+			f := seedNeverEnabledFixture(t)
+			srv := linkNeverEnabledFixture(t, f)
+			autopilotMarker(f)
+			rr := httptest.NewRecorder()
+			f.h.FileFinding(rr, f.request(http.MethodPost, apitypes.FileFindingRequest{SendToUzi: sendToUzi}, map[string]string{"id": f.findID.String()}))
+			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "autopilot") {
+				t.Fatalf("status = %d body = %s, want 409 naming the label", rr.Code, rr.Body.String())
+			}
+			wantNoTrackerWrite(t, srv)
+			f.dispositionIsOpenAndUnclaimed(t)
+		})
+		t.Run("FileFindingGroup/"+name, func(t *testing.T) {
+			f := seedNeverEnabledFixture(t)
+			srv := linkNeverEnabledFixture(t, f)
+			autopilotMarker(f)
+			rr := httptest.NewRecorder()
+			f.h.FileFindingGroup(rr, f.request(http.MethodPost, apitypes.FindingGroupFileRequest{IDs: []string{f.dispID.String()}, SendToUzi: sendToUzi}, nil))
+			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "autopilot") {
+				t.Fatalf("status = %d body = %s, want 409 naming the label", rr.Code, rr.Body.String())
+			}
+			wantNoTrackerWrite(t, srv)
+			f.dispositionIsOpenAndUnclaimed(t)
+		})
+	}
 }

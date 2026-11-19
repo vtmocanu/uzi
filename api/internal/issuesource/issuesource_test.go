@@ -109,3 +109,29 @@ func TestRefuseEligibilityMarkers(t *testing.T) {
 		})
 	}
 }
+
+func TestRequireMarker(t *testing.T) {
+	cases := []struct {
+		name    string
+		labels  []string
+		marker  string
+		refused bool
+	}{
+		{"the marker is in the set", []string{"agent-found", "ready"}, "agent-found", false},
+		{"the marker was dropped", []string{"ready"}, "autopilot", true},
+		{"an empty set", nil, "agent-found", true},
+		{"the match is exact", []string{"Agent-found"}, "agent-found", true},
+		{"a blank marker is never required", nil, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := RequireMarker(tc.labels, tc.marker)
+			if got := errors.Is(err, ErrMarkerNotWritable); got != tc.refused {
+				t.Fatalf("err = %v, refused = %v, want %v", err, got, tc.refused)
+			}
+			if tc.refused && !strings.Contains(err.Error(), `"`+tc.marker+`"`) {
+				t.Errorf("err = %v does not name the label", err)
+			}
+		})
+	}
+}
