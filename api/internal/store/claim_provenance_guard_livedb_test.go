@@ -668,6 +668,9 @@ func TestCodexProvenanceEphemeralMirrorsLiveDB(t *testing.T) {
 		optInEphemeral(fx)
 		busy := fx.worker("persistent", capOf(1), true)
 		fx.holdActive(busy, 1) // saturated
+		// Both persistent workers carry the Codex protocol capabilities, so a Codex run is dropped
+		// from the lists by provenance and never by capability.
+		mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, busy, guardCodexCaps)
 		mk := func(codexHeld bool, caps []string) uuid.UUID {
 			id := fx.queuedRun()
 			if codexHeld {
@@ -681,6 +684,10 @@ func TestCodexProvenanceEphemeralMirrorsLiveDB(t *testing.T) {
 		// Valid recorded provenance (A,1) with worker_id NULL (what a server-parked resume leaves).
 		a := fx.worker("recorded", capOf(1), false)
 		fx.holdActive(a, 1) // full too, so the saturation trigger still applies
+		mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, a, guardCodexCaps)
+		// Non-held Codex controls (generation 0): listed by both triggers.
+		gapCodex0, satCodex0 := mk(false, []string{"gh"}), mk(false, []string{})
+		mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET harness = 'codex' WHERE id = ANY($1)`, []uuid.UUID{gapCodex0, satCodex0})
 		mkRecorded := func(caps []string) uuid.UUID {
 			id := mk(false, caps)
 			mustExec(fx.ctx, t, fx.pool,
@@ -690,6 +697,9 @@ func TestCodexProvenanceEphemeralMirrorsLiveDB(t *testing.T) {
 		}
 		gapRec, satRec := mkRecorded([]string{"gh"}), mkRecorded([]string{})
 		gap := listedUnplaceable(fx, 1000, iv)
+		if !gap[gapCodex0] {
+			t.Fatalf("unplaceable did not list the generation-0 Codex control %s: %v", gapCodex0, gap)
+		}
 		if gap[gapRec] {
 			t.Fatalf("unplaceable listed the recorded-provenance run %s with worker_id NULL: %v", gapRec, gap)
 		}
@@ -697,6 +707,9 @@ func TestCodexProvenanceEphemeralMirrorsLiveDB(t *testing.T) {
 			t.Fatalf("unplaceable listed %v; want the Claude control %s, not the held run %s", gap, gapControl, gapHeld)
 		}
 		sat := listedSaturation(fx, 1000, iv)
+		if !sat[satCodex0] {
+			t.Fatalf("saturation did not list the generation-0 Codex control %s: %v", satCodex0, sat)
+		}
 		if sat[satRec] {
 			t.Fatalf("saturation listed the recorded-provenance run %s with worker_id NULL: %v", satRec, sat)
 		}
