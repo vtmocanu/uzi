@@ -35,8 +35,8 @@ func TestDecodePollAcceptsSharedEvidenceGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodePoll rejected the API's evidence-bearing golden: %v", err)
 	}
-	if len(got.Workers) != 4 {
-		t.Fatalf("decoded %d workers, want 4", len(got.Workers))
+	if len(got.Workers) != 5 {
+		t.Fatalf("decoded %d workers, want 5", len(got.Workers))
 	}
 	cleaning := got.Workers[3].Hibernation
 	if cleaning == nil || cleaning.Cleanup == nil ||

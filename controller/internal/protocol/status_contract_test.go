@@ -45,6 +45,7 @@ func sampleStatusReport() StatusReport {
 		PollIntervalSeconds: 10,
 		WorkerImageTag:      "0.11.7",
 		Hibernation:         2,
+		AdminSizes:          AdminSizesProtocolVersion,
 		Workers: []WorkerStatus{
 			{
 				// The motivating incident, in fixture form: an init container wedged in
@@ -128,5 +129,21 @@ func TestPhaseEnumLiterals(t *testing.T) {
 		if tc.got != tc.want {
 			t.Errorf("phase literal = %q, want %q — the api matches on the string, not the constant", tc.got, tc.want)
 		}
+	}
+}
+
+// An old controller (pre-#4213) never sends admin_sizes: the field is omitted rather
+// than written as 0, so the api reads it as "no admin-size support".
+func TestStatusReportOmitsAdminSizesWhenUnset(t *testing.T) {
+	out, err := json.Marshal(StatusReport{Kind: "fleet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["admin_sizes"]; ok {
+		t.Fatalf("admin_sizes present on a report that did not set it: %s", out)
 	}
 }

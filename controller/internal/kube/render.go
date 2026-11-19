@@ -527,6 +527,16 @@ type RenderConfig struct {
 	// invariant is a per-tier minimum rather than an equality.
 	MaxPVCStorage       string
 	DockerMaxPVCStorage string
+	// Per-tier CPU/memory LIMIT ceilings an admin-defined size is checked against at
+	// render time (PRD #4213, chart LimitRange max). Raw quantities; empty = no check.
+	// Distinct from MaxPVCStorage: the PVC ceilings gate startup against the compiled-in
+	// builtins, these gate each desired worker against the sizes the api sends.
+	MaxCPU            string
+	MaxMemory         string
+	DockerMaxCPU      string
+	DockerMaxMemory   string
+	IsolatedMaxCPU    string
+	IsolatedMaxMemory string
 	// DinDDataSize overrides the DinD daemon's data-root PVC size (issue #224 M-a).
 	// Empty ⇒ the preset table's per-size default (preset.Size.DinDDataSize, issue
 	// #3890); a non-empty value is a cluster-wide override that wins over every preset.

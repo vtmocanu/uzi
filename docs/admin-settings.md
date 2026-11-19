@@ -304,11 +304,20 @@ single setting bounds self-service provisioning:
 | Setting | Default | Controls |
 |---|---|---|
 | `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a [separate cap](#ephemeral-workers). |
-| `hosted_default_size` | `l` | Size the persistent provision form preselects: `s`, `m`, `l` or `l-highmem`. Only the preselection changes: the provision API still requires an explicit size, and existing workers keep theirs. |
+| `hosted_default_size` | `l` | Size the persistent provision form preselects: any existing size, shipped (`s`, `m`, `l`, `l-highmem`) or admin-added; an unknown name is refused. Only the preselection changes: the provision API still requires an explicit size, and existing workers keep theirs. |
 
 Edit them in the **Hosted worker quota** card on **Admin → Workers**. The quota
 must be an integer from `0` to `20`; each setting saves independently of the other cards.
 Saving an empty default size (**Reset to default**) restores `l`; the quota itself has no reset and needs a number.
+
+The same tab has a **Worker sizes** card that edits what each shipped size provides
+(CPU, memory, data and DinD disk), resets it to the shipped values, and adds or
+removes sizes; see [Editing sizes](./hosted-workers.md#editing-sizes-admins). The
+default-size settings here and under [Ephemeral workers](#ephemeral-workers) may name
+any existing size, shipped or admin-added, and a size either one names cannot be
+removed. The environment override `UZI_EPHEMERAL_DEFAULT_SIZE` (chart
+`workers.ephemeralDefaultSize`) still accepts shipped names only, because it is
+validated at boot before the size table exists.
 
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
@@ -326,7 +335,7 @@ The **Ephemeral workers** card on **Admin → Workers** holds the instance switc
 | Setting | Default | Controls | Env that overrides it |
 |---|---|---|---|
 | `ephemeral_max_per_user` | 2 | Maximum concurrent ephemeral workers each user may hold, from 0 to 20. `0` stops ephemeral provisioning for everyone. | `UZI_EPHEMERAL_MAX_PER_USER` |
-| `ephemeral_default_size` | `m` | Size every new ephemeral worker is provisioned at: `s`, `m`, `l` or `l-highmem`. | `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`) |
+| `ephemeral_default_size` | `m` | Size every new ephemeral worker is provisioned at: any existing size, shipped or admin-added (the environment override accepts shipped names only). | `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`) |
 | `ephemeral_lease` | `2h` | How long an idle ephemeral worker stays available to its owner's next run on the same repository and branch after a run completes. A Go duration from `0s` to `2h`; `0` means no lease. | `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`) |
 
 A write that is out of range (a negative or non-integer cap, an unknown size, a lease

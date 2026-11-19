@@ -435,6 +435,13 @@ func (l *Loop) Tick(ctx context.Context) error {
 	return reconcileErr
 }
 
+// Refusal is a per-tick size refusal or PVC rejection for one worker (PRD #4213):
+// Kind is protocol.BlockingKindSizeRefused or BlockingKindPVCRejected.
+type Refusal struct {
+	Kind   string
+	Reason string
+}
+
 // report sends per-worker roll health, if a reporter is wired.
 //
 // A nil reporter is a supported configuration, not a degraded one: it is what every
@@ -459,6 +466,29 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	}
 	workers := make([]protocol.WorkerStatus, 0, len(observed))
 	reported := make(map[string]bool, len(observed))
+	// A worker the controller refused to render (size_refused) or whose claim the
+	// apiserver rejected (pvc_rejected) reports stuck with that reason (PRD #4213). It is
+	// emitted first and marked reported so it outranks the hibernation suppression and the
+	// observed-row loop below: an edited size that cannot render must never read as
+	// settled, and a parked or ephemeral worker would otherwise strand silently. Only
+	// workers in this poll's desired snapshot get a row.
+	if source, ok := l.materializer.(interface {
+		SizeRefusals() map[string]Refusal
+	}); ok {
+		if refusals := source.SizeRefusals(); len(refusals) > 0 {
+			for _, w := range desired {
+				r, ok := refusals[w.ID]
+				if !ok || reported[w.ID] {
+					continue
+				}
+				reported[w.ID] = true
+				kind, reason := r.Kind, r.Reason
+				workers = append(workers, protocol.WorkerStatus{
+					ID: w.ID, Phase: protocol.PhaseStuck, BlockingKind: &kind, BlockingReason: &reason,
+				})
+			}
+		}
+	}
 	// A worker that is preparing to hibernate or is hibernated has no pod on purpose;
 	// a roll-health row for it (even the synthetic rolling-gap one below) would show a
 	// deliberately parked worker as an upgrade in progress. Mark it reported so neither
@@ -514,6 +544,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 		WorkerImageTag:      l.workerImageTag,
 		Workers:             workers,
 		Hibernation:         protocol.HibernationProtocolVersion,
+		AdminSizes:          protocol.AdminSizesProtocolVersion,
 	}
 	if err := l.reporter.Report(ctx, report); err != nil {
 		l.log.Warn("reporting roll health failed; reconciliation is unaffected", "error", err, "workers", len(workers))

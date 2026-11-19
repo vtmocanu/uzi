@@ -193,6 +193,7 @@ for (const width of [1440, 400]) {
       expect(tops.size, "every pill on the same line").toBe(1);
       expect(pills().map(idOf)).toEqual([
         "docker-allowlist",
+        "worker-sizes",
         "hosted-worker-quota",
         "custody-hold-limit",
         "ephemeral-workers",

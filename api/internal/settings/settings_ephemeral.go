@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 )
 
 // EphemeralLeaseMax is the longest ephemeral worker lease an admin may store. It
@@ -40,17 +40,17 @@ func (c *Cache) EphemeralMaxPerUser(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// EphemeralDefaultSize returns the workersize preset ephemeral workers are
-// provisioned at. A stored value that is not a known preset falls back to the
-// default. Errors only when the cache has no valid snapshot and the refresh fails;
+// EphemeralDefaultSize returns the worker size ephemeral workers are provisioned at.
+// A stored value that is not a well-formed size name falls back to the default; a
+// well-formed name (an admin-added size such as "xs") is returned as-is. Errors only when the cache has no valid snapshot and the refresh fails;
 // an env-overlaid value never errors.
 func (c *Cache) EphemeralDefaultSize(ctx context.Context) (string, error) {
 	return c.sizeSetting(ctx, KeyEphemeralDefaultSize)
 }
 
-// HostedDefaultSize returns the workersize preset the persistent provision form
-// preselects (the provision API still requires an explicit size). A stored value that is not a known
-// preset falls back to the default. Errors only when the cache has no valid snapshot
+// HostedDefaultSize returns the worker size the persistent provision form
+// preselects (the provision API still requires an explicit size). A stored value that is
+// not a well-formed size name falls back to the default. Errors only when the cache has no valid snapshot
 // and the refresh fails.
 func (c *Cache) HostedDefaultSize(ctx context.Context) (string, error) {
 	return c.sizeSetting(ctx, KeyHostedDefaultSize)
@@ -58,7 +58,10 @@ func (c *Cache) HostedDefaultSize(ctx context.Context) (string, error) {
 
 func (c *Cache) sizeSetting(ctx context.Context, key string) (string, error) {
 	v, err := c.get(ctx, key)
-	if !workersize.Valid(v) {
+	// Format only: whether a well-formed name still names a row is a database fact this
+	// cache-backed reader does not check (PRD #4213: the admin PUT validates membership in its
+	// write transaction, and a delete refuses while a stored default names the size).
+	if !builtin.WellFormed(v) {
 		v = Defaults[key]
 	}
 	return v, err
@@ -108,14 +111,17 @@ func validateEphemeralMaxPerUser(value string) error {
 	return nil
 }
 
-// validateWorkerSize is the write-time gate for the two default-size keys: a
-// workersize preset name; "" is the reset to the default.
+// validateWorkerSize is the write-time FORMAT gate for the two default-size keys: a
+// well-formed size name (builtin.WellFormed); "" is the reset to the default. Whether the
+// name still names a row is a database fact that cannot be checked here: the admin PUT
+// checks it inside its write transaction (FOR SHARE on the size rows), and deleting a size
+// refuses while a stored default names it (PRD #4213).
 func validateWorkerSize(value string) error {
 	v := strings.TrimSpace(value)
-	if v == "" || workersize.Valid(v) {
+	if v == "" || builtin.WellFormed(v) {
 		return nil
 	}
-	return fmt.Errorf("must be one of: %s", strings.Join(workersize.Names, ", "))
+	return errors.New("must be a size name: a lowercase letter then lowercase letters, digits or hyphens, at most 16 characters")
 }
 
 // validateEphemeralLease is the write-time gate for ephemeral_lease: a Go duration in

@@ -112,7 +112,8 @@ func TestProvisionHostedWorkerValidatesTemplateAndSize(t *testing.T) {
 		{"path-ish template", `{"template":"../base","size":"m"}`},
 		{"empty size", `{"template":"base","size":""}`},
 		{"missing size", `{"template":"base"}`},
-		{"unknown size", `{"template":"base","size":"xl"}`},
+		// A well-formed but unknown size ("xl") needs the database, so it is covered by
+		// TestProvisionHostedWorkerUnknownSizeLiveDB.
 		// The UI upper-cases for display; the wire value is lowercase. An accepted
 		// "M" would be stored and sent, and never resolve on the controller side.
 		{"upper-case size", `{"template":"base","size":"M"}`},
@@ -297,7 +298,10 @@ func TestHostedConfigReportsDefaultSize(t *testing.T) {
 		{"unset uses compiled-in default", "", "l"},
 		{"stored preset", "m", "m"},
 		{"stored highmem preset", "l-highmem", "l-highmem"},
-		{"unknown stored value falls back", "xl", "l"},
+		// A well-formed name is carried as-is (an admin-added size, PRD #4213); only a
+		// malformed stored value falls back.
+		{"well-formed admin size is kept", "xl", "xl"},
+		{"malformed stored value falls back", "XL?", "l"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHostedHandler(true, "5")

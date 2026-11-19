@@ -244,6 +244,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Seed/refresh the shipped hosted-worker sizes (PRD #4213) before anything serves the
+	// hosted poll or a provision: an existing pristine row tracks the shipped values, an
+	// admin-edited row is kept. A failure aborts boot like the template reconcile above.
+	if err := store.ReconcileBuiltinWorkerSizes(ctx, pool); err != nil {
+		return err
+	}
 	// Same for the builtin agent skills (PRD #16): missing builtin skills are
 	// inserted, admin edits survive restarts. Newly-inserted builtins also get
 	// their default shared allocations (PRD #72 M2).

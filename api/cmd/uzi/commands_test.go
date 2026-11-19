@@ -1745,7 +1745,8 @@ func TestWorkerListSanitizesVersion(t *testing.T) {
 	if betaRow == nil {
 		t.Fatalf("no row for worker beta:\n%s", out)
 	}
-	if len(betaRow) != 11 || betaRow[4] != "-" {
+	// SIZE ("-" for these kind-less fixtures) sits before UPTIME, so VERSION is at index 5 of 12.
+	if len(betaRow) != 12 || betaRow[5] != "-" {
 		t.Errorf("an all-format-character version must render \"-\" in the VERSION cell, got %q:\n%s", betaRow, out)
 	}
 }

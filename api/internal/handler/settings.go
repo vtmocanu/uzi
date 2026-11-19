@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -111,6 +114,40 @@ func (h *Handler) VaultMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"master_sealed": n})
+}
+
+// lockRequestedSizes takes FOR SHARE on the size rows a request names through the two
+// default-size keys (non-empty values only) and answers 400 for a key whose size is missing.
+// It reports true when it has written a response (a refusal or an error).
+func (h *Handler) lockRequestedSizes(ctx context.Context, w http.ResponseWriter, tx pgx.Tx, req map[string]string) bool {
+	var names []string
+	seen := map[string]bool{}
+	for _, key := range []string{settings.KeyEphemeralDefaultSize, settings.KeyHostedDefaultSize} {
+		if v := strings.TrimSpace(req[key]); v != "" && !seen[v] {
+			seen[v] = true
+			names = append(names, v)
+		}
+	}
+	if len(names) == 0 {
+		return false
+	}
+	found, err := store.LockWorkerSizesShared(ctx, tx, names)
+	if err != nil {
+		slog.Error("update settings: lock worker sizes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return true
+	}
+	have := map[string]bool{}
+	for _, n := range found {
+		have[n] = true
+	}
+	for _, key := range []string{settings.KeyEphemeralDefaultSize, settings.KeyHostedDefaultSize} {
+		if v := strings.TrimSpace(req[key]); v != "" && !have[v] {
+			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("%s: unknown worker size", key))
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateSettings writes one or more settings (admin only). It validates per key
@@ -256,6 +293,15 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("update settings: lock rows", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// PRD #4213 M3: a default-size setting may only name a size that exists. FOR SHARE on the
+	// named rows (one statement, name order) stops a concurrent size delete from committing
+	// until this transaction ends, and a delete that committed first leaves the name missing
+	// here. Lock order: the settings advisory lock, then app_settings rows, then size rows (a
+	// delete takes the size advisory lock and the size row only, and reads settings without
+	// locking them), so the two cannot wait on each other.
+	if refusal := h.lockRequestedSizes(ctx, w, tx, req.Settings); refusal {
 		return
 	}
 	committed := settings.Effective(locked)

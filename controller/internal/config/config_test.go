@@ -1061,6 +1061,61 @@ func TestLoadWorkerMaxPVCStoragePerTier(t *testing.T) {
 	})
 }
 
+// The per-tier CPU/memory render ceilings (PRD #4213): raw quantities, unset = empty
+// (no check), a typo is a boot error naming the key.
+func TestLoadWorkerSizeCeilingsPerTier(t *testing.T) {
+	t.Run("restricted and isolated are read with the docker tier OFF", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerMaxCPU != "" || cfg.WorkerMaxMemory != "" || cfg.WorkerIsolatedMaxCPU != "" || cfg.WorkerIsolatedMaxMemory != "" {
+			t.Fatalf("unset ceilings must stay empty: %+v", cfg)
+		}
+		t.Setenv("UZI_WORKER_MAX_CPU", "8")
+		t.Setenv("UZI_WORKER_MAX_MEMORY", "32Gi")
+		t.Setenv("UZI_WORKER_ISOLATED_MAX_CPU", "4")
+		t.Setenv("UZI_WORKER_ISOLATED_MAX_MEMORY", "16Gi")
+		cfg, err = Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerMaxCPU != "8" || cfg.WorkerMaxMemory != "32Gi" || cfg.WorkerIsolatedMaxCPU != "4" || cfg.WorkerIsolatedMaxMemory != "16Gi" {
+			t.Fatalf("ceilings not read: %+v", cfg)
+		}
+		for _, key := range []string{"UZI_WORKER_MAX_CPU", "UZI_WORKER_MAX_MEMORY", "UZI_WORKER_ISOLATED_MAX_CPU", "UZI_WORKER_ISOLATED_MAX_MEMORY"} {
+			t.Setenv(key, "12GB!")
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("err = %v, want a boot refusal naming %s", err, key)
+			}
+			t.Setenv(key, "")
+		}
+	})
+
+	t.Run("docker tier", func(t *testing.T) {
+		setDockerBaseEnv(t)
+		t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+		t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+		t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+		t.Setenv("UZI_WORKER_DOCKER_MAX_CPU", "16")
+		t.Setenv("UZI_WORKER_DOCKER_MAX_MEMORY", "64Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDockerMaxCPU != "16" || cfg.WorkerDockerMaxMemory != "64Gi" {
+			t.Fatalf("docker ceilings not read: %+v", cfg)
+		}
+		t.Setenv("UZI_WORKER_DOCKER_MAX_MEMORY", "64GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DOCKER_MAX_MEMORY") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DOCKER_MAX_MEMORY", err)
+		}
+	})
+}
+
 // The worker's requests.ephemeral-storage overrides (issue #224 M-b), per tier.
 //
 // The PLAIN one is read OUTSIDE validateDockerTier and this test's first half is what

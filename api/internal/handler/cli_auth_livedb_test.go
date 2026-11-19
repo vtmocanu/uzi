@@ -145,6 +145,14 @@ func cliMintToken(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, scope stri
 // (RequireAuth), so their success/gate paths are reachable only this way.
 func cookieReq(t *testing.T, router http.Handler, method, path, jwt, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return cookieReqPrepared(t, router, method, path, jwt, body)()
+}
+
+// cookieReqPrepared builds the request on the calling (test) goroutine, where a failure may
+// t.Fatal, and returns a closure that only serves it and never touches t, so it is safe to
+// run on another goroutine.
+func cookieReqPrepared(t *testing.T, router http.Handler, method, path, jwt, body string) func() *httptest.ResponseRecorder {
+	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
@@ -155,9 +163,11 @@ func cookieReq(t *testing.T, router http.Handler, method, path, jwt, body string
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	return rec
+	return func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
 }
 
 // cliSeedJudgedRun seeds a forge connection, a repo, a completed run owned by

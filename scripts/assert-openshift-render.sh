@@ -432,8 +432,8 @@ lane_rules() { q "$1" '[select(.kind == "NetworkPolicy" and .metadata.name == "u
 [ "$(lane_env "$WORK/default.yaml")" = 0 ] && ok "lane off: no UZI_WORKER_ISOLATED_* env and no UZI_FETCHER_TOKEN_SHA256" || bad "lane off still renders lane env"
 [ "$(lane_rules "$WORK/default.yaml")" = 0 ] && ok "lane off: the api admits neither the lane nor a fetcher" || bad "lane off still renders api ingress for the lane"
 render "$WORK/lane-on.yaml" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml"
-if [ "$(lane_objs "$WORK/lane-on.yaml")" -gt 0 ] && [ "$(lane_env "$WORK/lane-on.yaml")" = 4 ] && [ "$(lane_rules "$WORK/lane-on.yaml")" = 2 ]; then
-  ok "lane on: lane objects, the 3 controller env + the api hash, and 2 api ingress rules render (the lane-off checks are not vacuous)"
+if [ "$(lane_objs "$WORK/lane-on.yaml")" -gt 0 ] && [ "$(lane_env "$WORK/lane-on.yaml")" = 6 ] && [ "$(lane_rules "$WORK/lane-on.yaml")" = 2 ]; then
+  ok "lane on: lane objects, the 5 controller env + the api hash, and 2 api ingress rules render (the lane-off checks are not vacuous)"
 else
   bad "lane on renders objs=$(lane_objs "$WORK/lane-on.yaml") env=$(lane_env "$WORK/lane-on.yaml") api-rules=$(lane_rules "$WORK/lane-on.yaml")"
 fi

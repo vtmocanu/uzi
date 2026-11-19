@@ -435,7 +435,7 @@ func (m *Materializer) reportClaimStates(desired []protocol.DesiredWorker, obser
 		if err != nil {
 			continue
 		}
-		spec, err := m.resolver.Resolve(w.Template, w.Size)
+		spec, err := m.resolveWorker(w)
 		if err != nil {
 			continue
 		}

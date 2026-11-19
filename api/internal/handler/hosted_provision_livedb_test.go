@@ -50,6 +50,10 @@ func hostedLiveDB(t *testing.T, quota string) (*Handler, *pgxpool.Pool, *store.Q
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	// PRD #4213 M3: a provision and a default-size write now check the size row exists.
+	if err := store.ReconcileBuiltinWorkerSizes(ctx, pool); err != nil {
+		t.Fatalf("seed builtin sizes: %v", err)
+	}
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)

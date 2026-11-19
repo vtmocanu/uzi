@@ -138,6 +138,11 @@ type Materializer struct {
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
 	// which live in this package.
 	now func() time.Time
+	// refusals is this tick's per-worker size refusals / PVC rejections (PRD #4213),
+	// reset at the start of every Reconcile and read by the fleet report. See
+	// recordRefusal.
+	refusalMu sync.Mutex
+	refusals  map[string]reconcile.Refusal
 }
 
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
@@ -146,6 +151,44 @@ type Materializer struct {
 // recycle carries the M4 disk self-heal toggle + cooldown (see RecyclePolicy).
 func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, drain DrainPolicy, recycle RecyclePolicy, log *slog.Logger) *Materializer {
 	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, recycle: recycle, log: log, now: time.Now}
+}
+
+// resolveWorker is the ONE place a desired worker becomes a preset.Spec (PRD #4213):
+// it uses the integers the api sent on DesiredWorker.Resources when present, else the
+// compiled-in builtin for the size name. Every render, hash and PVC-size path goes
+// through it, so a size edit reaches the pod template, the spec-hash and the claims
+// identically; resolve_guard_test.go fails the build on any other resolver.Resolve call.
+func (m *Materializer) resolveWorker(w protocol.DesiredWorker) (preset.Spec, error) {
+	var res *preset.Resources
+	if r := w.Resources; r != nil {
+		res = &preset.Resources{
+			CPURequestMillicores: r.CPURequestMillicores,
+			CPULimitMillicores:   r.CPULimitMillicores,
+			MemoryRequestMiB:     r.MemoryRequestMiB,
+			MemoryLimitMiB:       r.MemoryLimitMiB,
+			DataGiB:              r.DataGiB,
+			DinDDataGiB:          r.DinDDataGiB,
+		}
+	}
+	spec, err := m.resolver.ResolveDesired(w.Template, w.Size, res)
+	if err != nil {
+		var invalid *preset.InvalidResourcesError
+		if errors.As(err, &invalid) {
+			err = &RefusedError{Reason: fmt.Sprintf("size refused: invalid %s %d", invalid.Field, invalid.Value)}
+		}
+	} else {
+		err = m.checkSizeCeilings(w, spec)
+	}
+	if err != nil {
+		var refused *RefusedError
+		if errors.As(err, &refused) {
+			// Recorded here, at the one resolve seam, so every call site (render, roll
+			// planning, drain, migration, claim expansion) reports the same refusal.
+			m.recordRefusal(w.ID, protocol.BlockingKindSizeRefused, refused.Reason)
+		}
+		return preset.Spec{}, err
+	}
+	return spec, nil
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -704,6 +747,7 @@ func (m *Materializer) flagOrphan(kind, name, ns string) {
 // FULL desired list, before anything is resolved or rendered, so no later failure
 // can silently shrink it.
 func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.DesiredWorker, observed []reconcile.ObservedWorker) error {
+	m.resetRefusals()
 	// Pass 1: the desired set. EVERY id, unconditionally — no resolve, no render, no
 	// error can remove one from here.
 	desiredIDs := make(map[string]bool, len(desired))
@@ -764,7 +808,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				// Independent fenced maintenance and mutation-free wake settlement
 				// are allowed even while image admission waits.
 				if ns, err := m.cfg.Placement(w); err == nil {
-					if spec, err := m.resolver.Resolve(w.Template, w.Size); err == nil {
+					if spec, err := m.resolveWorker(w); err == nil {
 						if e.blocked == "" {
 							var err error
 							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
@@ -1049,6 +1093,7 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 		}
 		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
+			m.recordPVCRejection(w.ID, pvc.Name, err)
 			return false, fmt.Errorf("create pvc %s: %w", pvc.Name, err)
 		}
 		if err != nil && placementSet {
@@ -1111,8 +1156,15 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		return nil
 	}
 
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
+		if IsRefused(err) {
+			// Same posture as an unknown preset: render nothing, touch nothing, keep the
+			// worker desired. The reason reaches the fleet report via recordRefusal.
+			m.log.Warn("desired worker's size is refused; skipping its RENDER only (its existing objects are deliberately left alone)",
+				"worker_id", w.ID, "reason", err.Error())
+			return nil
+		}
 		if preset.IsUnknown(err) {
 			// Log and skip RENDERING. The worker stays desired (see Reconcile's contract),
 			// so its existing objects are untouched and it is picked up the moment this

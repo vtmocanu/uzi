@@ -376,18 +376,26 @@ func ClassifyUpgradeWithTarget(in UpgradeInput, p UpgradeParams) (status, detail
 
 func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail string, resolvedTarget string) {
 	p = p.withDefaults()
-	if IsPodless(in.Hibernation) {
-		// Precedence: any non-none hibernation state first, waking included. "unknown" raises
-		// no upgrade alert, and the detail names the state; the DTO carries hibernation_state
-		// for display surfaces. A wake that fails is reported by fleet.hibernation_wake.
-		return UpgradeStatusUnknown, "worker is " + hibernationLabel(in.Hibernation), in.CPVersion
-	}
 	hosted := in.Kind == "hosted"
 	s := in.Signal
 
 	// A signal is fresh when the API's OWN receipt time is inside the TTL. Note what
 	// is NOT consulted: the wire's controller_reported_at. See RollSignal.ObservedAt.
 	signalFresh := s != nil && s.Phase != "" && in.Now.Sub(s.ObservedAt) <= p.ControllerSignalTTL
+
+	if IsPodless(in.Hibernation) {
+		// A fresh stuck controller refusal (size_refused / pvc_rejected, PRD #4213) is the
+		// exception: a pod-less worker has no pod to be stuck, the refusal is the reason it has
+		// none, so it falls through to R1 below and surfaces as a failed status with its reason.
+		refused := hosted && signalFresh && s.Phase == PhaseStuck &&
+			(StoredBlockingKind(s) == BlockingKindSizeRefused || StoredBlockingKind(s) == BlockingKindPVCRejected)
+		if !refused {
+			// Precedence: any non-none hibernation state first, waking included. "unknown" raises
+			// no upgrade alert, and the detail names the state; the DTO carries hibernation_state
+			// for display surfaces. A wake that fails is reported by fleet.hibernation_wake.
+			return UpgradeStatusUnknown, "worker is " + hibernationLabel(in.Hibernation), in.CPVersion
+		}
+	}
 
 	// The INV-5 ceiling. Gates R2 ONLY (issue #151): past the window the controller
 	// stops being believed when it claims a roll is still IN PROGRESS, and the row

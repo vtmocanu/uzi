@@ -748,6 +748,13 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 }
 
 func (m tuiModel) workerKind(r workerRow) string {
+	return m.workerKindFit(r, 0)
+}
+
+// workerKindFit renders the KIND text. With maxCells > 0 an admin-added size code is
+// clamped to the cells left after the prefix ("host·", "eph·") and the "+dk" suffix, so
+// a capped cell never loses either marker. Builtin codes (S/M/L/LHM) are never clamped.
+func (m tuiModel) workerKindFit(r workerRow, maxCells int) string {
 	if r.w.Kind == "external" {
 		return "ext"
 	}
@@ -761,6 +768,7 @@ func (m tuiModel) workerKind(r workerRow) string {
 	}
 	size := "?"
 	switch strings.ToUpper(t.hostedSize) {
+	case "":
 	case "S":
 		size = "S"
 	case "M":
@@ -769,6 +777,20 @@ func (m tuiModel) workerKind(r workerRow) string {
 		size = "L"
 	case "L-HIGHMEM":
 		size = "LHM"
+	default:
+		// An admin-added size: its name is untrusted text (D7), so sanitize through
+		// cellText before bounding it to workerSizeCodeWidth terminal cells (not runes: a CJK
+		// rune is two cells). A cut shows an ellipsis; the detail view carries the full name.
+		if name := strings.ToUpper(cellText(t.hostedSize)); name != "" {
+			size = clampVisual(name, workerSizeCodeWidth)
+			if maxCells > 0 {
+				suffix := 0
+				if r.w.Docker != nil && *r.w.Docker {
+					suffix = 3
+				}
+				size = clampVisual(size, max(1, maxCells-visualWidth(kind+"·")-suffix))
+			}
+		}
 	}
 	kind += "·" + size
 	if r.w.Docker != nil && *r.w.Docker {
@@ -837,6 +859,10 @@ const (
 	workerMemoryMinWidth    = 9  // includes ~12.0/16G
 	workerUptimeWidth       = 6  // 23h59m / 99d23h, the detail header's format
 	workerAttentionMinWidth = 16 // "✕ outbox blocked"
+	workerSizeCodeWidth     = 8  // cells of an admin-added size name in the KIND cell
+	workerKindMaxWidth      = 15 // "eph·" + 8-cell code + "+dk"; "host·" codes clamp to 7 cells
+	// "eph·LHM+dk" is 10 cells; "host·LHM+dk" is the widest builtin code, 11.
+	workerKindAdminDenseWidth = 11
 )
 
 func workerMemoryText(w apitypes.WorkerDTO) string {
@@ -871,7 +897,7 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 			text = "~" + text
 		}
 		columns.memory = max(columns.memory, visualWidth(text))
-		columns.kind = max(columns.kind, visualWidth(m.workerKind(row)))
+		columns.kind = min(workerKindMaxWidth, max(columns.kind, visualWidth(m.workerKind(row))))
 		marker := 0
 		if row.w.UpgradeStatus == "outdated" || workerRollFailure(row.w.UpgradeStatus) {
 			marker = 1
@@ -879,6 +905,12 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 		columns.version = max(columns.version, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
 	}
 	columns.dense = width >= 120 && (columns.intake == 0 || width >= 160)
+	if (columns.dense && m.board.admin) || width < 100 {
+		// The factory view also carries OWNER, and a narrow terminal has little to
+		// spare: hold KIND to the builtin docker l-highmem width so an admin-added
+		// size name yields before ATTENTION does.
+		columns.kind = min(columns.kind, workerKindAdminDenseWidth)
+	}
 	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
 	// and one attention glyph; factory scope adds owner plus its separator.
 	fixed := 1 + 13 + columns.state + columns.kind + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
@@ -916,7 +948,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
 	state := workerState(r)
-	fields = append(fields, cell(workerStateGlyph(state)+" "+state, columns.state, m.workerStateColor(state)), cell(m.workerKind(r), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
+	fields = append(fields, cell(workerStateGlyph(state)+" "+state, columns.state, m.workerStateColor(state)), cell(m.workerKindFit(r, columns.kind), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
 	if columns.dense {
 		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color

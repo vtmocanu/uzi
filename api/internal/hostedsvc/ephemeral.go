@@ -436,6 +436,21 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		return false, err
 	}
 
+	// PRD #4213 M3: FOR SHARE on the configured size's row, BEFORE any eviction or other write,
+	// so a size delete (FOR UPDATE on the same row) cannot commit between this check and the
+	// insert below, and a delete that committed first makes this skip. An absent size is not an
+	// error and never fails a run: the provision is skipped and the next pass retries (the
+	// setting then names a size that is gone only transiently, since a delete refuses while a
+	// stored default names it). Lock order: this user's provision advisory lock, then the row.
+	sizePresent, err := store.LockWorkerSizeShared(ctx, tx, knobs.defaultSize)
+	if err != nil {
+		return false, err
+	}
+	if !sizePresent {
+		slog.Warn("ephemeral provisioner: the configured default size does not exist; skipping", "run_id", runID, "size", knobs.defaultSize)
+		return false, nil
+	}
+
 	// PRD #4205 M5 (D9): a run whose recorded demand wake still covers it (its worker is waking,
 	// admitted for this run, and the first wake is younger than the wake timeout) must not also
 	// get an ephemeral worker. This is the one boundary all three triggers (capability gap,

@@ -76,6 +76,10 @@ func newWakeEnv(t *testing.T, ephemeralOn bool) *wakeEnv {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	// PRD #4213 M3: a provision and a default-size write now check the size row exists.
+	if err := store.ReconcileBuiltinWorkerSizes(ctx, pool); err != nil {
+		t.Fatalf("seed builtin sizes: %v", err)
+	}
 	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
 	if err != nil {
 		t.Fatalf("secretbox: %v", err)

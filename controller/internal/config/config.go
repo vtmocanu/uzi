@@ -366,6 +366,16 @@ type Config struct {
 	// LimitRanges, and the docker tier carries a third claim (the dind data root) the
 	// restricted tier does not have. Empty means no LimitRange on that tier.
 	WorkerDockerMaxPVCStorage string
+	// Per-tier render-time ceilings on an admin-defined size's CPU and memory LIMITS
+	// (PRD #4213; chart-rendered from each tier's LimitRange max). Raw k8s quantities,
+	// empty = no check for that tier/resource. The controller refuses to render a size
+	// above them (size_refused) instead of letting the apiserver reject the pod.
+	WorkerMaxCPU            string
+	WorkerMaxMemory         string
+	WorkerDockerMaxCPU      string
+	WorkerDockerMaxMemory   string
+	WorkerIsolatedMaxCPU    string
+	WorkerIsolatedMaxMemory string
 	// WorkerDinDDataSize overrides the size of the DinD daemon's data-root PVC (issue
 	// #224 M-a — it was an emptyDir on node ephemeral storage, which is what got
 	// workers evicted). Empty ⇒ the preset table's per-size default (s/m 20Gi, l/l-highmem 50Gi, issue #3890); a set value is a cluster-wide override that wins at every preset. Optional
@@ -669,6 +679,22 @@ func loadWorkerSettings(cfg *Config) error {
 	if err := parseQuantityEnv("UZI_WORKER_MAX_PVC_STORAGE", &cfg.WorkerMaxPVCStorage); err != nil {
 		return err
 	}
+	// Render-time CPU/memory ceilings for admin-defined sizes (PRD #4213). The restricted
+	// and isolated tiers exist on every instance (the isolated lane may be configured or
+	// not), so both are read here, outside the docker tier's early return.
+	for _, q := range []struct {
+		key string
+		dst *string
+	}{
+		{"UZI_WORKER_MAX_CPU", &cfg.WorkerMaxCPU},
+		{"UZI_WORKER_MAX_MEMORY", &cfg.WorkerMaxMemory},
+		{"UZI_WORKER_ISOLATED_MAX_CPU", &cfg.WorkerIsolatedMaxCPU},
+		{"UZI_WORKER_ISOLATED_MAX_MEMORY", &cfg.WorkerIsolatedMaxMemory},
+	} {
+		if err := parseQuantityEnv(q.key, q.dst); err != nil {
+			return err
+		}
+	}
 
 	// The Codex uid-split profile (PRD #1493 M1). Default false; a set-but-unparseable
 	// value is a BOOT error rather than a silent false, mirroring UZI_WORKER_FORCE_ROLL —
@@ -871,6 +897,8 @@ func validateDockerTier(cfg *Config) error {
 		{"UZI_WORKER_DIND_DATA_SIZE", &cfg.WorkerDinDDataSize},
 		{"UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", &cfg.WorkerDockerEphemeralRequest},
 		{"UZI_WORKER_DOCKER_MAX_PVC_STORAGE", &cfg.WorkerDockerMaxPVCStorage},
+		{"UZI_WORKER_DOCKER_MAX_CPU", &cfg.WorkerDockerMaxCPU},
+		{"UZI_WORKER_DOCKER_MAX_MEMORY", &cfg.WorkerDockerMaxMemory},
 	}
 	for _, q := range quantities {
 		if err := parseQuantityEnv(q.key, q.dst); err != nil {

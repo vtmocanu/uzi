@@ -71,5 +71,5 @@ func rawBlockingKind(reported hostedsvc.WorkerStatus, raw json.RawMessage) strin
 	if ws.BlockingReason != nil {
 		sig.BlockingReason = *ws.BlockingReason
 	}
-	return workersvc.EffectiveBlockingKind(sig)
+	return workersvc.StoredBlockingKind(sig)
 }

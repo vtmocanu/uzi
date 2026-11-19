@@ -52,6 +52,25 @@ const RegistrationLockKey int64 = 0x757A69 // "uzi"
 //     path to forget and no way to leak it by returning early.
 const HostedProvisionLockClass int32 = 0x757A6877 // "uzhw"
 
+// WorkerSizesLockClass is the class half of the advisory lock that serializes every
+// mutation of the worker_sizes table (PRD #4213): the boot reconcile today, and the
+// admin add, edit, reset and delete later. Taken as
+// pg_advisory_xact_lock(WorkerSizesLockClass, 0) as the first statement of the
+// transaction; the table is global, so the objid is the constant 0.
+//
+// It exists because the 16-size maximum and name uniqueness are not schema-enforceable
+// and a count taken under READ COMMITTED sees only the transaction's own snapshot: two
+// concurrent adds would each count 15 and both insert. The lock is a mutex over the
+// whole table, so the second transaction's count runs only after the first commits and
+// sees its row, regardless of which rows exist.
+//
+// Depends on the pool's default READ COMMITTED isolation, like SettingsMutationLockKey:
+// at REPEATABLE READ the snapshot would be fixed at the lock statement, before the winner
+// commits, and the race would reopen. Disjoint from the other lock spaces (the two-int
+// space differs from the one-bigint keys, and this class differs from every other
+// *LockClass). XACT-scoped: released on commit or rollback, no unlock to forget.
+const WorkerSizesLockClass int32 = 0x757A777A // "uzwz"
+
 // SecretMutationLockClass is the class half of the advisory lock that serializes
 // one user's anthropic-token mutations — create, set-default, delete (PRD #104 M2,
 // D12). Taken as pg_advisory_xact_lock(SecretMutationLockClass, objid(user_id)) as

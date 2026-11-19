@@ -26,7 +26,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
-	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 )
 
 // defaultDBMaxConns is the pgx pool size when neither DB_MAX_CONNS nor the DATABASE_URL
@@ -808,6 +808,13 @@ type Config struct {
 	// which is today's behavior.
 	HostedWorkerVersion string
 
+	// WorkerSizeCeilings and WorkerSizeQuota are the chart-rendered cluster limits a hosted
+	// worker size is validated against (PRD #4213; UZI_WORKER_SIZE_* env, see
+	// worker_sizes.go). Ceilings are strict at boot; quota is advisory and degrades to
+	// "unavailable" when absent or malformed.
+	WorkerSizeCeilings builtin.Ceilings
+	WorkerSizeQuota    builtin.Quota
+
 	// Ephemeral worker auto-provisioning knobs (PRD #529 M2). The feature is gated by
 	// TWO switches beyond these — the instance kill-switch (app_settings
 	// ephemeral_workers_enabled) and the per-user opt-in (users.ephemeral_workers_enabled)
@@ -1549,15 +1556,23 @@ func Load() (Config, error) {
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
 	// fall back to "m" with a boot warning so a typo cannot silently disable the feature.
 	cfg.EphemeralDefaultSize = strings.TrimSpace(getenv("UZI_EPHEMERAL_DEFAULT_SIZE", "m"))
-	if !workersize.Valid(cfg.EphemeralDefaultSize) {
-		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a known worker size preset; falling back to \"m\"",
-			"configured", cfg.EphemeralDefaultSize, "valid", workersize.Names)
+	// Builtins only, by design (PRD #4213): the size table is not readable at config load, so
+	// the env may name a shipped preset only. That is also what lets a size delete skip the env
+	// overlay: a builtin cannot be deleted. An admin-set ephemeral_default_size may name any
+	// existing size (checked at write time inside the settings transaction).
+	if !builtin.ValidBuiltin(cfg.EphemeralDefaultSize) {
+		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a builtin worker size preset; falling back to \"m\"",
+			"configured", cfg.EphemeralDefaultSize, "valid", builtin.Names())
 		cfg.EphemeralDefaultSize = "m"
 	}
 	// PRD #422: the concrete pinned hosted-worker image tag (deploy's workers.image.tag),
 	// used as the hosted-worker upgrade-badge target. Optional, unvalidated at load (empty
 	// falls back to the api's own release at classification time — today's behavior).
 	cfg.HostedWorkerVersion = getenv("HOSTED_WORKER_VERSION", "")
+	// PRD #4213: the chart-rendered ceilings and quota the admin size editor validates against.
+	if err := loadWorkerSizeLimits(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). parseInt/parseInt64/
 	// parseDuration all floor at >0, so a non-positive or malformed override falls back

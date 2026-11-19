@@ -11,7 +11,6 @@ import {
   type VaultStatus,
   type VaultDisableResponse,
 } from "../../lib/api";
-import { WORKER_SIZES } from "../../lib/workerSizes";
 import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
@@ -40,6 +39,7 @@ import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from 
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
 import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
+import { mockSizeSpec } from "./workerSizes";
 
 // PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
 // validation: CODEX_CURATED_MODELS (lib/codexModels.ts, PRD #3245) and the Claude
@@ -680,6 +680,18 @@ function slackLinkResponse(): { slack: SlackLink } {
 const EPHEMERAL_WORKER_KEYS = new Set(["ephemeral_max_per_user", "ephemeral_default_size", "hosted_default_size", "ephemeral_lease"]);
 const explicitWorkerKeys = new Set<string>();
 
+/**
+ * The default-size settings keys whose STORED value is the size `name`, sorted by key, as
+ * the api's delete guard reads app_settings (PRD #4213): a key at its compiled-in default and
+ * never saved is not stored, so it names nothing.
+ */
+export function mockStoredSizeSettings(name: string): string[] {
+  return (["ephemeral_default_size", "hosted_default_size"] as const).filter((key) => {
+    const stored = explicitWorkerKeys.has(key) || appSettings[key] !== SEED_APP_SETTINGS[key];
+    return stored && (appSettings[key] ?? "").trim() === name;
+  });
+}
+
 // settingsResponse builds the admin SettingsResponse from the mock's current
 // state: readable non-secret values, per-secret configured flags, and per-key
 // sources (all db/default — the demo has no ENV overlay).
@@ -1148,8 +1160,10 @@ export const settingsApi = {
           if (m0) for (const m of m0[1].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
           if (!m0) throw new ApiError(400, 'ephemeral_lease: must be a duration like "30m"');
           if (seconds > 2 * 3600) throw new ApiError(400, "ephemeral_lease: must be between 0s and 2h");
-        } else if (!(WORKER_SIZES as readonly string[]).includes(t)) {
-          throw new ApiError(400, `${key}: must be one of ${WORKER_SIZES.join(", ")}`);
+        } else if (!mockSizeSpec(t)) {
+          // Any size in the one mock size list, builtin or admin-added (PRD #4213 M3), as
+          // the api's write checks its size table; the text is the api's.
+          throw new ApiError(400, `${key}: unknown worker size`);
         }
         explicitWorkerKeys.add(key);
         (nonSecret as Record<string, string>)[key] = t;

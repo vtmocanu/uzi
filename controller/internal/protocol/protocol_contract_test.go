@@ -35,8 +35,8 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		t.Fatalf("decode golden: %v", err)
 	}
 
-	if len(resp.Workers) != 4 {
-		t.Fatalf("%d workers, want 4", len(resp.Workers))
+	if len(resp.Workers) != 5 {
+		t.Fatalf("%d workers, want 5", len(resp.Workers))
 	}
 
 	// A worker whose token is still awaiting delivery.
@@ -223,6 +223,22 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		h.OpID != "66666666-6666-6666-6666-666666666666" || h.Cleanup == nil ||
 		*h.Cleanup != (HibernationCleanup{OpID: "88888888-8888-8888-8888-888888888888", StopProofPodUID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", ReconcileSeq: 2}) {
 		t.Fatalf("cleaning worker lost its cleanup object: %+v", h)
+	}
+	// Resolved size integers (PRD #4213): absent on every pre-#4213 shape (nil, so the
+	// controller falls back to its compiled-in builtin values), the exact `l` integers on
+	// the fifth worker.
+	for i := 0; i < 4; i++ {
+		if r := resp.Workers[i].Resources; r != nil {
+			t.Fatalf("workers[%d] decoded Resources %+v from a shape that carries none", i, *r)
+		}
+	}
+	wantResources := SizeResources{
+		CPURequestMillicores: 1000, CPULimitMillicores: 4000,
+		MemoryRequestMiB: 14336, MemoryLimitMiB: 20480,
+		DataGiB: 50, DinDDataGiB: 50,
+	}
+	if r := resp.Workers[4].Resources; r == nil || *r != wantResources {
+		t.Fatalf("workers[4].Resources = %+v, want %+v", r, wantResources)
 	}
 	roundTrip, err := json.Marshal(resp)
 	if err != nil {

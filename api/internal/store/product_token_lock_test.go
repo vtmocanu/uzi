@@ -34,6 +34,7 @@ func TestProductTokenMintLockClassMatchesSQL(t *testing.T) {
 	}
 	for name, v := range map[string]int32{
 		"HostedProvisionLockClass":       HostedProvisionLockClass,
+		"WorkerSizesLockClass":           WorkerSizesLockClass,
 		"SecretMutationLockClass":        SecretMutationLockClass,
 		"JudgeDispositionCoordLockClass": JudgeDispositionCoordLockClass,
 		"RunBranchLockClass":             RunBranchLockClass,

@@ -752,6 +752,10 @@ scenarios are mutually exclusive by construction. Known values:
   staged-review (four changes), and sync-disabled states. The configured count
   comes from the same mock template list in all three. Turn on the separate
   `uzi_demo_mode` toggle to mask the source URL and ref in screenshots (#4367).
+- `sizes-readonly` — `/admin/workers?mock=sizes-readonly#worker-sizes`: the
+  Worker sizes editor is read-only (`controller_unsupported`, with the api's
+  reason), and every size save or reset is refused with the api's 409 body
+  (#4213).
 
 ### What keeps the mock build current
 
