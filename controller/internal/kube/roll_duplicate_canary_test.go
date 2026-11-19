@@ -442,6 +442,11 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		{name: "pod owned by an unlisted replicaset with D's name prefix", mutate: func(t *testing.T, o *orphanCohort) {
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-4", OwnerReferences: ownedBy("ReplicaSet", deploymentName("w2")+"-gone", "gone")}})
 		}},
+		{name: "pod owned by an unlisted replicaset uid whose name another deployment's replicaset reuses", mutate: func(t *testing.T, o *orphanCohort) {
+			reused := deploymentName("w2") + "-old"
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: reused, UID: "uid-reused", OwnerReferences: ownedBy("Deployment", "someone-else", "uid-someone-else")}})
+			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-8", OwnerReferences: ownedBy("ReplicaSet", reused, "uid-original")}})
+		}},
 		{name: "pod mounting a canonical claim", mutate: func(t *testing.T, o *orphanCohort) {
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-5"}, Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "d", VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: dataPVCName("w2")}}}}}})

@@ -47,13 +47,15 @@ func (r replicaSetOwners) record(rs *appsv1.ReplicaSet) {
 	r["name:"+rs.Name] = owners
 }
 
-// lookup resolves a pod's ReplicaSet owner reference by UID, else by name, and reports
-// whether the ReplicaSet was listed at all.
+// lookup resolves a pod's ReplicaSet owner reference and reports whether that exact
+// ReplicaSet was listed. A reference carrying a UID resolves by UID only: a listed
+// ReplicaSet that merely reuses the name under another UID is a different object, so the
+// reference is reported unlisted and the caller's name-prefix safeguard applies. Only a
+// UID-less reference falls back to the name.
 func (r replicaSetOwners) lookup(ref metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
 	if ref.UID != "" {
-		if o, ok := r["uid:"+string(ref.UID)]; ok {
-			return o, true
-		}
+		o, ok := r["uid:"+string(ref.UID)]
+		return o, ok
 	}
 	o, ok := r["name:"+ref.Name]
 	return o, ok
