@@ -2069,13 +2069,14 @@ Class (a) is a worker-trusted launch of a trusted binary. Class (b) is an untrus
 | `git.ts` `execScoped` / `execMeteredNative` / `spawnJoinedEpochChild` | argv supplied by the caller | set by the caller | the caller wraps; the epoch path is also checked by `preflightEpochNative` |
 | `git.ts` `spawnGit` and the worker `execScoped` callers | worker git on a bare or worker path; gitleaks | a | none |
 | eval and replay CLIs (`pr-description-eval*`, `code-cross-check-replay*`) | npm-script tooling, not on the worker run path | — | none |
+| `runner-group-trust.ts` P1 probe | `/bin/cat` of its own status file, once at startup | a (worker-authored fixed binary, run as the agent uids) | `runnerCommand` / `commandRootCommand` |
 
-The audit found no class (b) site that bypasses a wrapper on the split path. One residual is
+The audit table was taken at `6ac884bd7`, plus the last row, which this amendment adds. The audit found no class (b) site that bypasses a wrapper on the split path. One residual is
 accepted for a static P2. `execScoped`, `execMeteredNative` and `spawnJoinedEpochChild` take an
 arbitrary command and rely on the caller to wrap it. Outside the epoch preflight, no guard would
 catch a future unwrapped untrusted launch.
 
-Creation invariant (S4):
+Creation invariant (runner access to the bare):
 
 - **Runner access to the bare is read-only.** Only two runner launches reference a managed bare:
   the git.ts seed and attempt `clone --shared --no-checkout -- <bare> <clone>`. Both read the bare
@@ -2089,3 +2090,78 @@ Creation invariant (S4):
 
 ADR-3153 pins this with `TestDindContainersMountOnlyTheRunnerSubPathOfTheDataVolume`. The rootful
 DinD daemon's reach remains the accepted #3831 residual.
+
+### The `topology()` allowance: S1 to S4
+
+The allowance applies per managed store in the alternate graph. Only the issued probe result counts:
+the consumer accepts a value only if the module issued it (a `WeakSet`).
+
+- **S1, store ownership and mode.** A wrong uid or a world-writable store is refused, unchanged. A
+  store that is not group-writable is admitted whatever its gid, unchanged. A group-writable store
+  needs issued trusted trust, `process.getgid()` equal to the trust gid (re-checked at use), and a
+  store gid equal to the trust gid. Otherwise the refusal is `unowned alternate store`.
+- **S3, ancestors.** Runs in both passes and uses `lstat` only. Every ancestor from the repos root up
+  to and including the data dir must be a directory, owned by the worker uid or 0, and not
+  world-writable (sticky is no mitigation). It may be group-writable only with the trusted gid.
+- **S4, `core.sharedRepository`.** Runs in both passes. Under the allowance it is refused: a byte scan
+  in the topology-only pass, a key check in the full pass.
+- **S2, bare tree, filesystem and ACLs.** Runs in full passes only, after the topology walk and before
+  content:
+  - a bounded walk of the whole bare tree, charged against the existing limits (an overflow is
+    unknown), where every path passes the S1 predicate;
+  - `statfs` of the bare and its ancestors must report ext4, xfs, btrfs, tmpfs or overlay;
+  - an ACL observation by `/usr/bin/getfacl --absolute-names --physical --skip-base --numeric --
+    <paths>`, in chunks of 512 paths with the ancestors in every chunk. It runs as the worker with
+    `PATH=/usr/bin:/bin` and `LC_ALL=C`, through a new audited epoch-native launch shape. Any output,
+    error, timeout or missing binary is unknown.
+
+Every full snapshot re-runs all of this, including the final store re-check. A proof takes 3 full
+snapshots, and any metadata change between snapshots is refused.
+
+### Fail-closed mapping
+
+Every refusal is the existing unknown (`AutomaticCompletenessUnknown`). It flows through the unchanged
+settlement-uncertain and fatal policy for the discard, and to `completeness_unknown` in the
+hibernation census. Nothing becomes a keep or an admission.
+
+### Image and rollout
+
+The base and jvm images install Alpine `acl` (`getfacl`, `setfacl`; `getfacl 2.3.2`), with a
+fail-closed build assert. `scripts/agent-runtime-key.sh` hashes the runtime stage, so the worker
+runtime key changes, the runtime image rebuilds, and the release worker-tag autobump rolls the fleet.
+A worker on an older image has no `getfacl`, so group-writable bares stay refused (unknown), as today.
+
+A pod-epoch-real case proves, in both images, admission under the real probe and the real `getfacl`.
+It also proves that runner (10002) and runner-cmd (10003) get `EACCES` in `<bare>/objects` and `EPERM`
+on `setfacl`, that an access ACL on the store, an inherited default ACL and a non-inherited ACL on the
+repos root each refuse, and that a `chgrp` to 10002, 10003 or 10004 at `2775` refuses.
+
+### Feasibility
+
+Measured in the base image with the real `getfacl`, on a full-history bare of this repository: 65,055
+packed objects, a 173 MB pack, plus 3,000 loose objects, 2775 gid 10001, real probe trusted.
+
+- 3,293 walked paths per snapshot; 7 `getfacl` calls per snapshot (21 per proof).
+- `getfacl` took 114 to 142 ms per snapshot; the slowest single call was 22 ms against the 60 s
+  per-call timeout.
+- The whole proof took about 53.2 s, against 51.1 s for a 0755 bare (n=3 each). Of the ~2.1 s
+  difference, `getfacl` is ~0.4 s; the rest is the S2 walk.
+- Headroom: about 2.5% of `maxMetadataRecords` (131,072) and 1.6% of `maxDirectoryEntries` (16,384).
+
+Cost scales with paths. This is one measured point, not a worst case.
+
+### Residuals
+
+- A trusted operator's ACL or `chmod` change on the store or its ancestors after the proof is not
+  excluded.
+- The data dir's parent is not checked (S3 stops at the data dir).
+- The rootful DinD daemon's reach stays the accepted #3831 residual.
+- A failed probe turns the allowance off for the process lifetime.
+- P2 rests on the static audit and the runner-uid wrapper tests, not on runtime evidence.
+- `statfs` covers only the bare top and its ancestors, not a mount nested inside the bare. Creating
+  one needs a mount privilege the runner lacks.
+- For group-writable stores, loose objects are charged twice against the limits. This halves their
+  effective budget and fails closed.
+- Inherited gap, unchanged by this change by design ("keep today's admitted shapes"): the inner
+  directories of a non-group-writable bare are still not mode-checked, as before. It is filed
+  separately as an incidental finding.
