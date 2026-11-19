@@ -8,6 +8,7 @@ package issuesource
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 
@@ -71,4 +72,30 @@ func LinkedLabels(labels []string, uziLabel, autopilotLabel, eligibilityName str
 		out = append(out, l)
 	}
 	return out
+}
+
+// ErrMarkerConfersEligibility is returned when a label uzi adds to an issue on its own (a
+// bookkeeping marker such as the finding marker, the self-improve tracking label or a
+// proposal label) has the same name as the linked repo's stored eligibility tag. Creating
+// the issue would tag it eligible for runs without anyone opting in, because the issue
+// tracker driver resolves that name to the eligibility tag id (PRD #4173 D12, D14).
+var ErrMarkerConfersEligibility = errors.New("a label uzi adds on its own would make this issue eligible for runs on the linked repo")
+
+// RefuseEligibilityMarkers returns an error wrapping ErrMarkerConfersEligibility naming the
+// first of markers whose name equals eligibilityName, and nil when none does. The match is
+// exact, as the driver's tag resolution is. A create site on a linked repo calls it with
+// the markers it supplies implicitly, before any write, and refuses on an error instead of
+// dropping the marker. A site that has an explicit opt-in (a label the owner chose, or
+// send-to-uzi) does not call it. A blank name never matches, so an unlinked repo (no
+// eligibility name) is a no-op.
+func RefuseEligibilityMarkers(eligibilityName string, markers ...string) error {
+	if eligibilityName == "" {
+		return nil
+	}
+	for _, m := range markers {
+		if m == eligibilityName {
+			return fmt.Errorf("%w: the label %q is also this repo's issue tracker eligibility tag; rename one of them", ErrMarkerConfersEligibility, m)
+		}
+	}
+	return nil
 }

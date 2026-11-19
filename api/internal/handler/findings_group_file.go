@@ -209,7 +209,16 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 		return
 	}
-	filedLabels, requiredLabels := h.findingFilingLabels(callCtx, repo, marker, req.Labels, req.SendToUzi)
+	filedLabels, requiredLabels, err := h.findingFilingLabels(callCtx, repo, marker, req.Labels, req.SendToUzi)
+	if err != nil {
+		// A marker that would tag the issue eligible: release the claim and refuse before
+		// any write (PRD #4173 M5 review).
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
+			return
+		}
+		httpx.Error(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err := tr.EnsureLabels(callCtx, repo.ForgeProjectID, requiredLabels); err != nil {
 		if callCtx.Err() != nil {
 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")

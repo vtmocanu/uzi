@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -89,6 +90,16 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	// next tick, never parked) before any forge call or tracking-issue write.
 	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 		return FireOutcome{}, err
+	}
+	// PRD #4173 M5 review: the tracking label is uzi's own bookkeeping marker, never an
+	// opt-in. On a linked repo whose eligibility tag has that name, the tracking issue
+	// would be created eligible, so the cycle is refused (transient to advance: logged and
+	// retried next tick, so it fires again once either name changes) before the forge,
+	// the issue side, the tracking lookup and any write.
+	if repo.IssueTrackerConnectionID.Valid {
+		if err := issuesource.RefuseEligibilityMarkers(repo.EligibilityTagName.String, SelfImproveTrackingLabel); err != nil {
+			return FireOutcome{}, fmt.Errorf("self-improve tracking issue: %w", err)
+		}
 	}
 
 	// 2. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run

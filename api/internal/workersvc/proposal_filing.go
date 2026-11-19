@@ -151,6 +151,16 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		slog.Warn("file proposal: skipped", "run_id", run.ID, "error", err)
 		return
 	}
+	// PRD #4173 M5 review: the proposal label is uzi's own marker, never an opt-in. On a
+	// linked repo whose eligibility tag has that name the filed issue would be tagged
+	// eligible, so nothing is filed: refused before the forge build, the audit row and
+	// the issue tracker write.
+	if repo.IssueTrackerConnectionID.Valid {
+		if err := issuesource.RefuseEligibilityMarkers(repo.EligibilityTagName.String, labels...); err != nil {
+			slog.Warn("file proposal: refused", "run_id", run.ID, "error", err)
+			return
+		}
+	}
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Warn("file proposal: build forge", "run_id", run.ID, "error", err)

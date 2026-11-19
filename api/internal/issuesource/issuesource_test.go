@@ -3,6 +3,7 @@ package issuesource
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -80,5 +81,31 @@ func TestLinkedLabelsDoesNotMutateItsInput(t *testing.T) {
 	_ = LinkedLabels(in, "uzi", "autopilot", "ready")
 	if in[0] != "uzi" || in[1] != "autopilot" {
 		t.Fatalf("input mutated: %v", in)
+	}
+}
+
+func TestRefuseEligibilityMarkers(t *testing.T) {
+	cases := []struct {
+		name        string
+		eligibility string
+		markers     []string
+		refused     bool
+	}{
+		{"a marker equal to the eligibility name", "ready", []string{"agent-found", "ready"}, true},
+		{"no marker equal", "ready", []string{"agent-found", "proposal"}, false},
+		{"the match is exact", "ready", []string{"Ready", "ready "}, false},
+		{"no markers", "ready", nil, false},
+		{"a blank eligibility name never matches", "", []string{"", "proposal"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := RefuseEligibilityMarkers(tc.eligibility, tc.markers...)
+			if got := errors.Is(err, ErrMarkerConfersEligibility); got != tc.refused {
+				t.Fatalf("err = %v, refused = %v, want %v", err, got, tc.refused)
+			}
+			if tc.refused && !strings.Contains(err.Error(), `"ready"`) {
+				t.Errorf("err = %v does not name the colliding label", err)
+			}
+		})
 	}
 }

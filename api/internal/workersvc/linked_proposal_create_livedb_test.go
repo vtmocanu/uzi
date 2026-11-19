@@ -169,3 +169,70 @@ func TestLinkedScheduledProposalFilesInTheLinkedProjectWithoutTheEligibilityTagL
 		t.Error("a scheduled proposal carries the eligibility tag")
 	}
 }
+
+// PRD #4173 M5 review: a scheduled proposal's label is uzi's own marker, never an opt-in.
+// When it has the link's eligibility name the issue would be tagged eligible, so nothing is
+// filed: no issue tracker write, no audit row. The control (a different name) still files.
+func TestLinkedScheduledProposalRefusesAMarkerThatIsTheEligibilityNameLiveDB(t *testing.T) {
+	cases := []struct {
+		name        string
+		slug        string
+		eligibility string
+		wantFiled   bool
+	}{
+		{"bare proposal label", "", "proposal", false},
+		{"scoped proposal label", "tech-debt", "proposal::tech-debt", false},
+		{"control, bare label with another eligibility name", "", youtracktest.EligibilityTagName, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLinkedProposalFix(t)
+			f.env.exec(`UPDATE repos SET eligibility_tag_name = $2 WHERE id = $1`, f.repo, tc.eligibility)
+			params := store.CreateRunScheduleParams{
+				UserID: f.user, RepoID: f.repo, Target: "prompt", Prompt: pgtype.Text{String: "propose", Valid: true},
+				Timing: "recurring", CronExpr: pgtype.Text{String: "0 * * * *", Valid: true}, Timezone: "UTC",
+				NextFireAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}, Enabled: true,
+				OutputMode: pgtype.Text{String: "issues", Valid: true},
+			}
+			sched, err := f.env.q.CreateRunSchedule(f.env.ctx, params)
+			if err != nil {
+				t.Fatalf("create schedule: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = f.env.pool.Exec(f.env.ctx, `DELETE FROM runs WHERE schedule_id = $1`, sched.ID)
+				_, _ = f.env.pool.Exec(f.env.ctx, `DELETE FROM run_schedules WHERE id = $1`, sched.ID)
+			})
+			if tc.slug != "" {
+				f.env.exec(`UPDATE run_schedules SET catalog_slug = $2 WHERE id = $1`, sched.ID, tc.slug)
+			}
+			runID := uuid.New()
+			f.env.exec(`INSERT INTO runs (id, user_id, repo_id, issue_title, issue_description, status, kind, schedule_id)
+			            VALUES ($1, $2, $3, 'scheduled idea', 'd', 'completed', 'prompt', $4)`, runID, f.user, f.repo, sched.ID)
+			run, err := f.env.q.GetRunByID(f.env.ctx, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			f.svc.maybeFileProposal(f.env.ctx, run, &ProposalPayload{Title: "Scheduled proposal", Body: "proposal body"})
+
+			var rows int
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM issue_proposals WHERE run_id = $1`, runID).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantFiled {
+				if rows != 1 {
+					t.Fatalf("audit rows = %d, want 1 for the control", rows)
+				}
+				return
+			}
+			if rows != 0 {
+				t.Errorf("audit rows = %d, want 0 (refused before the audit row)", rows)
+			}
+			for _, r := range f.srv.Requests() {
+				if r.Method != http.MethodGet {
+					t.Errorf("an issue tracker write reached the fake: %s %s", r.Method, r.Path)
+				}
+			}
+		})
+	}
+}
