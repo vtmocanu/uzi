@@ -1167,3 +1167,90 @@ The `task scan:secrets` log reports non-gating findings in untracked
 tracked or published.
 
 Final-head re-run: the lead re-ran `check:api-v1-compat`, `check:token-literals`, `scan:secrets` and `sast:semgrep` on 607b1ebff, the commit that first added this paragraph. All four logs (`.uzi/scratch/ctl-logs/m4f-*.log`) end `SHA=607b1ebff… EXIT=0`. Later commits change only this record.
+
+## Owner partial decision and deferred m3 checklist (2026-11-19)
+
+The owner decided a partial delivery: m4, every reviewed commit and the
+qualifying clause-level evidence above are retained; milestone m3 is
+**deferred, not complete**. This authorizes a non-closing PR for review only,
+not merge or activation. No unvalidated criterion below is accepted or waived.
+Decision 11's fail-closed requirement stands: the current cross-worker
+recovery path is a **known nonconformance**, not an accepted residual.
+
+Each unchecked item is carried from the ledger's Clause-accounting table
+(`agent/test/credential-switch-proof-ledger.md`, "Clause accounting") or from
+section 5 above. Credited parts of each row stay credited as recorded there.
+
+### Deferred m3 checklist (unvalidated, uncontrolled or unclassified)
+
+- [ ] Admission refusals: pool_wait, terminal statuses, pinned-without-secret,
+      lane, no-live-worker, unsupported-worker and foreign-subscription targets.
+- [ ] Same flight/generation/worktree: effects beyond the five U2 injections and
+      the fresh_B return.
+- [ ] Strict persistence: pending-absent-before, other ownership legs, the
+      lost-reply clear and reopen's other guards.
+- [ ] A reap before B: in-flight tool callbacks, launcher must-not-exist and other
+      phases.
+- [ ] Scope/refresh/identity/summary replacement: B refresh suspension, Now and
+      summary gating during publication, A-account rejection, the bridge
+      post-call copy, `assertRefreshAdmission` and Now stale-result drops.
+- [ ] Resume: confirmed-refusal classification (timeout), the :4148 check and
+      session_missing on the switch path.
+- [ ] Policy under the apply lock: concurrent lock-order contention.
+- [ ] Lease/intent/lock order: per-account lock isolation, the target account's
+      intent check, the refresh admission's binding recheck in isolation and
+      global lock sorting.
+- [ ] Final reauthorization: the API-key A path and the vault-locked branch after
+      a switch.
+- [ ] Transactional apply: per-statement server-error returns, the empty
+      AccessToken check and the caller's deferred rollback.
+- [ ] Ordinal/attribution: per-field baseline comparisons, the epoch<=0 refusal,
+      the uncommitted-ordinal and generation-scope clamp branches on the Codex
+      path, and cross-generation spend joins.
+- [ ] Rollback/replay/fences: preflight's own non-owner refusal, the validator
+      replay copy, Step 1 worker check, apply Step 0 copies, other fence
+      conjuncts, the stamp checks, target sub-checks and old-alias refusals.
+- [ ] Stopped negotiation: the runner's own admission check, fence/Step 0
+      negotiation copies, null-heartbeat and registration sub-conjuncts, the
+      in-place conjunct, identical-tuple replay, first-READY latch, the
+      unchanged-stamp assertions and the worker-side worker_upgrade_required
+      reason.
+- [ ] Stopped pending input: paused-run carve-out variants, cancel/reject_plan
+      under the cutoff and the cutoff's run correlation.
+- [ ] Wall budget: the RunTimeout value, the future-started_at clamp and the
+      production default.
+- [ ] Stopped nonce: a NULL snapshot nonce; claim generation: the reconciled
+      `*g <= 0` copy.
+- [ ] Stopped binding identity beyond ownership (no predicate clause).
+- [ ] Stopped ownership/policy: paused-origin replay under concurrency, op-less
+      withdrawals, and owner writers that take no worker or run row lock.
+- [ ] Stopped preservation: other gate columns and replay tables not
+      individually injected; Slack, `cross_checks` and other trigger-closure
+      tables outside the snapshot.
+- [ ] Stopped request: other statuses, the envelope key count, null/missing fields
+      and case aliases beyond D25–D56.
+- [ ] Decision 11 (same worker): other auth directions, the `kind` half of the
+      gate, the re-hold variant, and observable discard of delivered material.
+- [ ] Token absence: the executor's second log registration and the surfaces
+      that are guardless by construction.
+- [ ] PRD #1147: a control for the subscription-to-paid-key direction
+      specifically, and an apply-request-shape control showing no secret id.
+- [ ] Clauses that fit no proof class (listed as "owner batch" in the ledger).
+- [ ] Two unledgered authorities, with no Clause-accounting row and no ledger
+      evidence: the owner-scoped usage refresh (`handleCodexUsageUnauthorized`)
+      and the fresh-claim pending expiry (`expireCodexSwitchOnFreshClaim`).
+- [ ] **Known nonconformance, decision 11 cross-worker path:** a successor claim
+      on another worker has no retained journal, so the `predecessor_capture`
+      / `quiescence_failed` gate does not run and the run proceeds with the
+      delivered binding. Required: fail closed (hold for the owner) there too.
+- [ ] Crash point 5 (predecessor host unreachable): owner-recorded environmental
+      limitation, unvalidated and uncredited; its fail-closed premise depends
+      on closing the item above.
+
+### Still pending outside m3
+
+- [ ] Landing obligation: `full agent suite: exact-head PR CI`, and the
+      exact-head run-store-it LiveDB sweep (test-api-store-it /
+      test-livedb-workersvc).
+- [ ] Owner acceptance: live cross-account `thread/resume` on two real Codex
+      accounts, not verified.
