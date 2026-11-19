@@ -215,6 +215,7 @@ func TestPutMyModelSettingsCrossCheckRejectsWithoutWritingLiveDB(t *testing.T) {
 			{"stage":"code","harness":"codex","effort":"high"}]`,
 	} {
 		t.Run(name, func(t *testing.T) {
+			f.t = t
 			rec := f.putModel(`{"default_effort":"max","cross_check_pins":` + pins + `}`)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("= %d %s, want 400", rec.Code, rec.Body.String())
@@ -333,6 +334,117 @@ func TestPutMyModelSettingsCrossCheckResetFollowsWorkerDefaultLiveDB(t *testing.
 	}
 }
 
+// routeTxPids makes the route's transaction record its backend pid and fail loudly instead of
+// hanging (lock_timeout 10s is above deadlock_timeout 1s). The first pid is sent on the channel.
+func (f *effFix) routeTxPids(t *testing.T) <-chan int32 {
+	t.Helper()
+	pids := make(chan int32, 1)
+	f.h.modelSettingsBeginTx = func(ctx context.Context) (pgx.Tx, error) {
+		tx, err := f.pool.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var pid int32
+		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '10s'`); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, err
+		}
+		if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, err
+		}
+		select {
+		case pids <- pid:
+		default:
+		}
+		return tx, nil
+	}
+	t.Cleanup(func() { f.h.modelSettingsBeginTx = nil })
+	return pids
+}
+
+// holdW opens connection W (a transaction with a 10s lock_timeout) and returns it with its pid.
+// The caller's deferred rollback is registered here.
+func (f *effFix) holdW(ctx context.Context, t *testing.T) (pgx.Tx, int32) {
+	t.Helper()
+	conn, err := f.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire W: %v", err)
+	}
+	t.Cleanup(conn.Release)
+	wtx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin W: %v", err)
+	}
+	t.Cleanup(func() { _ = wtx.Rollback(context.WithoutCancel(ctx)) })
+	if _, err := wtx.Exec(ctx, `SET LOCAL lock_timeout = '10s'`); err != nil {
+		t.Fatalf("W lock_timeout: %v", err)
+	}
+	var wpid int32
+	if err := wtx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&wpid); err != nil {
+		t.Fatalf("W pid: %v", err)
+	}
+	return wtx, wpid
+}
+
+type routeResult struct {
+	code int
+	body string
+}
+
+// startRoute runs PutMyModelSettings in a goroutine. The returned exited channel closes when it
+// has returned; a test waits on it (after releasing W) so no goroutine outlives the test.
+func (f *effFix) startRoute(body string) (done <-chan routeResult, exited <-chan struct{}) {
+	d := make(chan routeResult, 1)
+	e := make(chan struct{})
+	go func() {
+		defer close(e)
+		rec := httptest.NewRecorder()
+		f.h.PutMyModelSettings(rec, userReq(http.MethodPut, "/api/me/model-settings", body, f.user, nil))
+		d <- routeResult{rec.Code, rec.Body.String()}
+	}()
+	return d, e
+}
+
+// waitBlockedBy polls until the route's backend (the first pid on pids) is waiting on a lock held
+// by wpid, and returns that pid.
+func waitBlockedBy(ctx context.Context, t *testing.T, f *effFix, pids <-chan int32, done <-chan routeResult, wpid int32) int32 {
+	t.Helper()
+	var npid int32
+	select {
+	case npid = <-pids:
+	case r := <-done:
+		t.Fatalf("the route finished before opening its transaction: %d %s", r.code, r.body)
+	case <-ctx.Done():
+		t.Fatalf("the route never opened its transaction: %v", ctx.Err())
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for blocked := 0; blocked < 1; {
+		select {
+		case r := <-done:
+			t.Fatalf("the route finished before blocking on W: %d %s", r.code, r.body)
+		case <-ctx.Done():
+			t.Fatalf("route backend %d never blocked behind W: %v", npid, ctx.Err())
+		case <-ticker.C:
+		}
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE pid = $1 AND wait_event_type = 'Lock' AND $2 = ANY(pg_blocking_pids(pid))`, npid, wpid).Scan(&blocked); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+	}
+	return npid
+}
+
+// finishW rolls W back and waits for the route goroutine, so a failure path leaves nothing running.
+func finishW(ctx context.Context, wtx pgx.Tx, exited <-chan struct{}) {
+	_ = wtx.Rollback(context.WithoutCancel(ctx))
+	select {
+	case <-exited:
+	case <-time.After(20 * time.Second):
+	}
+}
+
 // Lock interleaving. The route holds the users row lock (FOR NO KEY UPDATE) while it waits for a
 // pin cell that another transaction holds. That other transaction then inserts a different pin
 // cell, whose foreign key takes a KEY SHARE lock on the users row. KEY SHARE does not conflict
@@ -341,8 +453,9 @@ func TestPutMyModelSettingsCrossCheckResetFollowsWorkerDefaultLiveDB(t *testing.
 //
 // Deterministic, with no sleeps for correctness: connection W holds cell A (code/claude); the
 // route's request (connection N) takes the users lock, writes default_effort and blocks on A; the
-// test polls pg_stat_activity until W is seen blocking a backend; only then does W write the
-// absent cell B (code/codex) and commit.
+// test polls until N itself is seen waiting on W, then proves from a third connection that N holds
+// the users lock in the right mode (FOR UPDATE NOWAIT is refused, FOR KEY SHARE NOWAIT succeeds);
+// only then does W write the absent cell B (code/codex) and commit.
 func TestModelSettingsUserLockAllowsConcurrentPinInsertLiveDB(t *testing.T) {
 	f := newEffFix(t, nil)
 	f.clearModelColumns()
@@ -353,72 +466,27 @@ func TestModelSettingsUserLockAllowsConcurrentPinInsertLiveDB(t *testing.T) {
 	ctx, cancel := context.WithTimeout(f.ctx, 40*time.Second)
 	defer cancel()
 
-	// Both sessions fail loudly instead of hanging: lock_timeout is above deadlock_timeout (1s).
-	f.h.modelSettingsBeginTx = func(ctx context.Context) (pgx.Tx, error) {
-		tx, err := f.pool.Begin(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '10s'`); err != nil {
-			_ = tx.Rollback(ctx)
-			return nil, err
-		}
-		return tx, nil
-	}
-	defer func() { f.h.modelSettingsBeginTx = nil }()
-
-	// Connection W.
-	conn, err := f.pool.Acquire(ctx)
-	if err != nil {
-		t.Fatalf("acquire W: %v", err)
-	}
-	defer conn.Release()
-	wtx, err := conn.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin W: %v", err)
-	}
-	defer func() { _ = wtx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := wtx.Exec(ctx, `SET LOCAL lock_timeout = '10s'`); err != nil {
-		t.Fatalf("W lock_timeout: %v", err)
-	}
-	var wpid int32
-	if err := wtx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&wpid); err != nil {
-		t.Fatalf("W pid: %v", err)
-	}
+	pids := f.routeTxPids(t)
+	wtx, wpid := f.holdW(ctx, t)
 	wq := store.New(wtx)
 	if err := wq.PatchUserCrossCheckPin(ctx, store.PatchUserCrossCheckPinParams{UserID: f.user, Stage: "code", Harness: "claude",
 		SetModel: true, Model: pgtype.Text{String: "haiku", Valid: true}}); err != nil {
 		t.Fatalf("W patch A: %v", err)
 	}
 
-	// Connection N: the route's own writer.
-	type result struct {
-		code int
-		body string
-	}
-	done := make(chan result, 1)
-	go func() {
-		rec := httptest.NewRecorder()
-		f.h.PutMyModelSettings(rec, userReq(http.MethodPut, "/api/me/model-settings",
-			`{"default_effort":"high","cross_check_pins":[{"stage":"code","harness":"claude","model":"opus"}]}`, f.user, nil))
-		done <- result{rec.Code, rec.Body.String()}
-	}()
+	done, exited := f.startRoute(`{"default_effort":"high","cross_check_pins":[{"stage":"code","harness":"claude","model":"opus"}]}`)
+	defer finishW(ctx, wtx, exited)
 
-	// Poll until a backend is blocked behind W.
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	for blocked := 0; blocked < 1; {
-		select {
-		case r := <-done:
-			t.Fatalf("the route finished before blocking on W: %d %s", r.code, r.body)
-		case <-ctx.Done():
-			t.Fatalf("no backend ever blocked behind W: %v", ctx.Err())
-		case <-ticker.C:
-		}
-		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))`, wpid).Scan(&blocked); err != nil {
-			t.Fatalf("poll pg_stat_activity: %v", err)
-		}
+	npid := waitBlockedBy(ctx, t, f, pids, done, wpid)
+
+	// N is waiting on W, so N has already taken the users lock: the lock is first in the route.
+	_, err := f.pool.Exec(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE NOWAIT`, f.user)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("FOR UPDATE NOWAIT while N (pid %d) waits = %v, want SQLSTATE 55P03: N does not hold a row lock on users", npid, err)
+	}
+	if _, err := f.pool.Exec(ctx, `SELECT 1 FROM users WHERE id = $1 FOR KEY SHARE NOWAIT`, f.user); err != nil {
+		t.Fatalf("FOR KEY SHARE NOWAIT while N (pid %d) waits = %v, want success: N's users lock is stronger than FOR NO KEY UPDATE", npid, err)
 	}
 
 	// W writes the absent cell B (FK KEY SHARE on the users row) and commits.
@@ -452,5 +520,83 @@ func TestModelSettingsUserLockAllowsConcurrentPinInsertLiveDB(t *testing.T) {
 	}
 	if got := f.modelRow()["default_effort"]; got != "high" {
 		t.Fatalf("default_effort = %q, want high", got)
+	}
+}
+
+// The users row lock is taken before the route reads the stored lane that feeds the legacy
+// default_model mirror, so a save that waits on another writer reads that writer's committed
+// value. W updates default_claude_model (uncommitted) and the route writes only the Codex lane for
+// a user whose harness resolves to Claude: the mirror is the stored Claude lane, which must be
+// W's value, read after the wait. Without the lock the lane is read before the wait and the mirror
+// is the stale pre-W value.
+func TestModelSettingsUserLockOrdersMirrorReadAfterConcurrentWriterLiveDB(t *testing.T) {
+	f := newEffFix(t, nil)
+	f.clearModelColumns()
+	f.exec(`UPDATE users SET default_claude_model = 'sonnet', default_model = 'sonnet' WHERE id = $1`, f.user)
+
+	ctx, cancel := context.WithTimeout(f.ctx, 40*time.Second)
+	defer cancel()
+
+	pids := f.routeTxPids(t)
+	wtx, wpid := f.holdW(ctx, t)
+	if _, err := wtx.Exec(ctx, `UPDATE users SET default_claude_model = 'opus' WHERE id = $1`, f.user); err != nil {
+		t.Fatalf("W update: %v", err)
+	}
+
+	done, exited := f.startRoute(`{"default_codex_model":"gpt-6-sol"}`)
+	defer finishW(ctx, wtx, exited)
+	waitBlockedBy(ctx, t, f, pids, done, wpid)
+	if err := wtx.Commit(ctx); err != nil {
+		t.Fatalf("W commit: %v", err)
+	}
+
+	select {
+	case r := <-done:
+		if r.code != http.StatusOK {
+			t.Fatalf("the route = %d %s, want 200", r.code, r.body)
+		}
+	case <-ctx.Done():
+		t.Fatalf("the route never finished: %v", ctx.Err())
+	}
+	row := f.modelRow()
+	if row["default_claude_model"] != "opus" || row["default_codex_model"] != "gpt-6-sol" || row["default_model"] != "opus" {
+		t.Fatalf("row = %v, want claude lane opus (W's write kept), codex lane gpt-6-sol and mirror opus read after the wait", row)
+	}
+}
+
+// The route's row lock is FOR NO KEY UPDATE, which is only the strength of a plain UPDATE if none
+// of the columns the route writes is a unique-index column or a key a foreign key references.
+// Read the catalogs to prove it.
+func TestModelSettingsWrittenColumnsAreNotKeyColumnsLiveDB(t *testing.T) {
+	f := newEffFix(t, nil)
+	written := []string{"default_claude_model", "default_codex_model", "default_model", "default_harness",
+		"default_effort", "default_codex_effort", "judge_model", "codex_judge_model", "judge_runs_on",
+		"summary_model", "codex_summary_model"}
+	rows, err := f.pool.Query(f.ctx, `SELECT a.attname FROM pg_attribute a
+		WHERE a.attrelid = 'users'::regclass AND a.attnum > 0 AND NOT a.attisdropped AND (
+			EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = a.attrelid AND i.indisunique AND a.attnum = ANY(i.indkey::int2[]))
+			OR EXISTS (SELECT 1 FROM pg_constraint c WHERE c.contype = 'f' AND c.confrelid = a.attrelid AND a.attnum = ANY(c.confkey)))`)
+	if err != nil {
+		t.Fatalf("query key columns: %v", err)
+	}
+	defer rows.Close()
+	keys := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		keys[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if !keys["id"] {
+		t.Fatalf("key columns = %v, want at least id (the query is not seeing the primary key)", keys)
+	}
+	for _, c := range written {
+		if keys[c] {
+			t.Fatalf("%s is a unique or foreign-key-referenced column of users; FOR NO KEY UPDATE no longer matches the lock an UPDATE of it takes", c)
+		}
 	}
 }

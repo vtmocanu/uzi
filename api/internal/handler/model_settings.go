@@ -207,7 +207,8 @@ func (e commitUnknownError) Unwrap() error { return e.err }
 // transaction the users row is locked first, then every write goes through the transaction's
 // queries, so a failure at any statement rolls all of them back.
 //
-// Invariant (documented in the header of model_settings_livedb_test.go; no test asserts it): none of the columns written below is users.id
+// Invariant (see the header of model_settings_livedb_test.go; asserted by
+// TestModelSettingsWrittenColumnsAreNotKeyColumnsLiveDB): none of the columns written below is users.id
 // or a unique or foreign-key-referenced column of users, so the FOR NO KEY UPDATE row lock is
 // the same strength as the lock each UPDATE takes on its own and conflicts with exactly the
 // other settings writers.

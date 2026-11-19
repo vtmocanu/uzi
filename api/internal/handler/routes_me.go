@@ -284,10 +284,12 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// RequireUser; if that authority is ever narrowed, revisit this mount.
 	//
 	// The judge and summary lanes (judge_model, codex_judge_model, summary_model,
-	// codex_summary_model) and judge_runs_on are a DELIBERATE NEW Bearer authority: before
-	// this route they were writable only through cookie-only PutMySettings, and CreateRun
-	// takes no judge or summary override. They redirect which model or harness
-	// already-enabled judge and summary work uses and never enable it: the consent switches
+	// codex_summary_model), judge_runs_on and cross_check_pins (the checker's per-stage,
+	// per-harness model and effort) are a DELIBERATE NEW Bearer authority: before this route
+	// they were writable only through cookie-only PutMySettings, and CreateRun takes no judge,
+	// summary or checker override. They redirect which model, effort or harness
+	// already-enabled judge, summary and cross-check work uses and never enable it (pins cannot
+	// turn cross-check on): the consent switches
 	// (/me/judge, /me/cross-check, autopilot, ...) stay cookie-only and the handler's
 	// allowlist rejects their keys. The authority is bounded by a token that can already
 	// create runs and spend.
