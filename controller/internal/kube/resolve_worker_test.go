@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -414,6 +415,65 @@ func TestNewPlacementCustomSize(t *testing.T) {
 			if !isStamped(npPVC(t, client, cfg.DockerNamespace, n)) {
 				t.Errorf("claim %s lost its stamp", n)
 			}
+		}
+	})
+
+	// A stamped worker whose live Deployment was rendered from DIFFERENT integers must
+	// be detected as drifted and rolled to the xs integers: skipping or mis-resolving the
+	// custom size would leave the stale Deployment (and its hash) untouched.
+	t.Run("stamped worker with a stale deployment rolls to the integers", func(t *testing.T) {
+		spec := resolveVia(t, w)
+		ew := evidence(w, m5Now)
+		stale := xsWorker("x1")
+		stale.Docker = true
+		stale.Resources = &protocol.SizeResources{
+			CPURequestMillicores: 500, CPULimitMillicores: 2000,
+			MemoryRequestMiB: 2048, MemoryLimitMiB: 4096,
+			DataGiB: 5, DinDDataGiB: 10,
+		}
+		staleSpec := resolveVia(t, stale)
+		wantHash := SpecHashOf(cfg.withPlacement(true), ew, spec)
+		if staleHash := SpecHashOf(cfg.withPlacement(true), evidence(stale, m5Now), staleSpec); staleHash == wantHash {
+			t.Fatal("fixture: stale and current integers hash alike")
+		}
+		var objs []runtime.Object
+		for _, p := range RenderPVCs(cfg.withPlacement(true), ew, spec) {
+			p.Annotations = map[string]string{AnnotationPlacement: placementNew}
+			p.Status.Phase = corev1.ClaimBound
+			objs = append(objs, p)
+		}
+		staleDep := RenderDeployment(cfg.withPlacement(true), evidence(stale, m5Now), staleSpec)
+		objs = append(objs, physicalOld(t, staleDep)...)
+		m, client := npMatFor(t, cfg, &fakeCordoner{}, DrainPolicy{Deadline: time.Hour}, objs...)
+		if err := npTick(t, m, ew); err != nil {
+			t.Fatal(err)
+		}
+		if got := templatePatches(client); len(got) != 1 || got[0] != deploymentName("x1") {
+			t.Fatalf("drifted custom-size worker was not rolled: patches=%v outcome=%+v", got, m.PacingOutcomes()["x1"])
+		}
+		// Neither recreate nor shrink the claims.
+		for _, wr := range writes(client) {
+			if strings.Contains(wr, "persistentvolumeclaims") {
+				t.Errorf("drift handling wrote a claim: %v", writes(client))
+			}
+		}
+		for _, n := range []string{dataPVCName("x1"), dindDataPVCName("x1")} {
+			if !isStamped(npPVC(t, client, cfg.DockerNamespace, n)) {
+				t.Errorf("claim %s lost its stamp", n)
+			}
+		}
+		dep := npDep(t, client, staleDep.Namespace, "x1")
+		if got := dep.Spec.Template.Annotations[AnnotationSpecHash]; got != wantHash {
+			t.Errorf("deployment spec-hash = %q, want the xs-integer hash %q (drift not rolled)", got, wantHash)
+		}
+		var cpu string
+		for _, c := range dep.Spec.Template.Spec.Containers {
+			if q, ok := c.Resources.Requests[corev1.ResourceCPU]; ok && c.Name != "dind" {
+				cpu = q.String()
+			}
+		}
+		if cpu != "" && cpu != "250m" {
+			t.Errorf("a container requests cpu %s, want 250m from the xs integers", cpu)
 		}
 	})
 }
