@@ -37,7 +37,7 @@
 # failed too) when residue is still present in the last sample, or a sticky error was
 # recorded. An undeclared run the boundary cancels and that then settles is reported in
 # the PASS row's message but does not fail the phase. Residue a boundary reports
-# becomes KNOWN: later boundaries sample it once without waiting for it again, but
+# becomes KNOWN: later boundaries still sample it but never wait for it (a boundary with only known residue takes one sample), but
 # still FAIL while it is present, and every row after a failed boundary is annotated.
 # Residue present in the sample a sticky error ended the loop on is recorded as known too,
 # even a run cancelled in that same sample that has not settled yet.
