@@ -444,7 +444,7 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     assert.equal(fs.existsSync(path.join(refDir(), ledgerName)), false, "no ledger claim was made");
     const tracking = kept[kept.length - 1]!;
     const verdict = await gate(coverOf([...kept]));
-    assert.deepEqual(verdict, { kind: "ineligible", reason: "refusal stage is not in the ledger" });
+    assert.deepEqual(verdict, { kind: "ineligible", reason: "refusal recording failed in this process" });
     assert.ok(incomingRefs().some((r) => r.includes(`refused-${tracking}`)));
   });
 
@@ -477,6 +477,51 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     gitIn(bare, ["update-ref", `refs/uzi-incoming/${RUN}/1/refused-${refused}-extra`, refused]);
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "mismatch");
     void kept;
+  });
+});
+
+describe("issue4481 recording failure latch", { timeout: 300_000 }, () => {
+  /** Drive the chokepoint directly for a non-tracking head (the P4/P5/P6 shape the tracking-tip rule cannot see). */
+  async function refuseWithFailure(failRef: boolean, failLedger: boolean): Promise<{ kept: string[]; head: string }> {
+    const kept = await atCap();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    const head = commitTree("unseen head", false);
+    toBare(head);
+    const internals = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const original = internals.runGit.bind(cache);
+    if (failRef) internals.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "update-ref" && String(args[1]).includes("/refused-")) throw new Error("injected refused-ref failure");
+      return original(cwd, args, ...rest);
+    };
+    if (failLedger) fs.chmodSync(refDir(), 0o500);
+    try {
+      await assert.rejects(cache["pinOwedUnderLock"](ctx, head, "P4"), /owed candidate limit/);
+    } finally {
+      internals.runGit = original;
+      fs.chmodSync(refDir(), 0o700);
+    }
+    return { kept, head };
+  }
+  for (const [name, failRef, failLedger] of [["refused-ref write", true, false], ["ledger write", false, true], ["both writes", true, true]] as const) {
+    it(`a failed ${name} latches the run: the gate and the seal stay ineligible`, async () => {
+      const { kept, head } = await refuseWithFailure(failRef, failLedger);
+      // The surviving evidence alone would look covered: the head is an ancestor of the gate head.
+      const cover = coverOf([...kept, head]);
+      assert.deepEqual(await gate(cover), { kind: "ineligible", reason: "refusal recording failed in this process" });
+      assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "ineligible");
+      assert.equal(refusalFiles().some((n) => n.startsWith("final-")), false);
+      // The latch is per run: another run on the same cache is unaffected.
+      assert.deepEqual(await cache.refusalReleaseGate(bare, "other-run", 1, cover), { kind: "none" });
+    });
+  }
+  it("the writes are independent: a failed ref write still ledgers the head", async () => {
+    const { head } = await refuseWithFailure(true, false);
+    assert.deepEqual(readJson(ledgerName).entries.map((e: any) => e.sha), [head]);
+    assert.equal(incomingRefs().some((r) => r.includes("/refused-")), false);
+  });
+  it("a successful recording does not latch", async () => {
+    const { kept, head } = await refuseWithFailure(false, false);
+    assert.equal((await gate(coverOf([...kept, head]))).kind, "eligible");
   });
 });
 

@@ -6174,6 +6174,8 @@ export class GitCache {
   private readonly processNonce: string;
   /** issue #4481: in-process fence, run id to the highest closed refusal generation. */
   private readonly closedRefusalGenerations = new Map<string, number>();
+  /** issue #4481: runs whose refusal recording failed in this process; their gate and seal stay ineligible. */
+  private readonly refusalRecordingFailed = new Set<string>();
   /** issue #4481: what the chokepoint reported per refused sha for one import's options object. */
   private readonly refusalNotes = new WeakMap<object, Map<string, { sealed: boolean; alreadyLedgered: boolean }>>();
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
@@ -29579,27 +29581,41 @@ try {
   private async recordRefusalUnderLock(c: StoredOwedContext, sha: string, refusalPath: RefusalPath):
     Promise<{ sealed: boolean; alreadyLedgered: boolean }> {
     const outcome = { sealed: false, alreadyLedgered: false };
-    try {
-      const generation = c.generation ?? 0;
+    const generation = c.generation ?? 0;
+    let abort: Error | undefined;
+    const attempt = async (step: () => Promise<boolean>): Promise<boolean> => {
+      try { return await step(); }
+      catch (cause) { abort ??= this.boundaryAbortError(cause); return false; }
+    };
+    // The seal check is the only step that ends recording without a failure: a sealed generation takes no evidence.
+    if (!await attempt(async () => {
       const sealedGenerations = refusalFileGenerations(await this.refusalNames(c.barePath), "final", c.runId);
-      if (sealedGenerations.some((g) => g >= generation)) { outcome.sealed = true; return outcome; }
+      if (sealedGenerations.some((g) => g >= generation)) outcome.sealed = true;
+      return true;
+    })) { this.refusalRecordingFailed.add(c.runId); if (abort) throw abort; return outcome; }
+    if (outcome.sealed) return outcome;
+    // The refused ref and the ledger entry are independent: either alone still makes the gate demand coverage,
+    // and a failure of either latches this run ineligible for the process lifetime.
+    const refWritten = await attempt(async () => {
       const ref = `refs/uzi-incoming/${c.runId}/${generation}/refused-${sha}`;
       await this.runGit(c.barePath, ["update-ref", ref, sha]);
-      if (await this.checkedRefSha(c.barePath, ref) !== sha) throw new Error("refused head readback mismatch");
+      return await this.checkedRefSha(c.barePath, ref) === sha;
+    });
+    const ledgerWritten = await attempt(async () => {
       const name = `refusals-${c.runId}.json`;
       const read = await this.readRefusalRecord(c.barePath, name, parseRefusalLedger);
-      if (read.state === "invalid") return outcome;
+      if (read.state === "invalid") return false;
       const ledger: RefusalLedger = read.state === "valid" ? read.value
         : { runId: c.runId, branch: c.branch, barePath: c.barePath, entries: [] };
-      if (ledger.runId !== c.runId || ledger.branch !== c.branch || ledger.barePath !== c.barePath) return outcome;
-      if (ledger.entries.some((e) => e.sha === sha)) { outcome.alreadyLedgered = true; return outcome; }
-      if (ledger.entries.length >= MAX_OWED_CANDIDATES_PER_RUN) return outcome;
+      if (ledger.runId !== c.runId || ledger.branch !== c.branch || ledger.barePath !== c.barePath) return false;
+      if (ledger.entries.some((e) => e.sha === sha)) { outcome.alreadyLedgered = true; return true; }
+      if (ledger.entries.length >= MAX_OWED_CANDIDATES_PER_RUN) return false;
       await this.writeOwedFile(c.barePath, name, { version: 1, runId: ledger.runId, branch: ledger.branch,
         barePath: ledger.barePath, entries: [...ledger.entries, { generation, sha, path: refusalPath }] }, REFUSAL_DIRECTORY);
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-    }
+      return true;
+    });
+    if (!refWritten || !ledgerWritten) this.refusalRecordingFailed.add(c.runId);
+    if (abort) throw abort;
     return outcome;
   }
 
@@ -29633,6 +29649,7 @@ try {
 
   private async refusalGateUnderLock(barePath: string, runId: string, G: number, headSha: string): Promise<RefusalReleaseGate> {
     const ineligible = (reason: string): RefusalReleaseGate => ({ kind: "ineligible", reason });
+    if (this.refusalRecordingFailed.has(runId)) return ineligible("refusal recording failed in this process");
     const names = await this.refusalNames(barePath);
     if (names.some((n) => n.startsWith(".tmp-"))) return ineligible("temporary refusal metadata present");
     const ledgerRead = await this.readRefusalRecord(barePath, `refusals-${runId}.json`, parseRefusalLedger);
