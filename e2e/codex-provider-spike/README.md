@@ -12,10 +12,17 @@ The opt-in root Taskfile target is `test:codex-provider-spike`. No relay or forw
 The runtime must be image-baked with its matching receipt and lock. Supervisor posture is synthetic,
 protocol-only; this makes no packaged OS isolation claim. No real credentials or host environment are used.
 
-The 20 rows include production baseline, wrong-key rejection, guard removal, receiver positive control,
+The 21 rows include production baseline, wrong-key rejection, guard removal, receiver positive control,
 provider-table env-key/alternate-header variants, unsupported wire and Responses restoration through the
 same fixture transform, redirects, and TLS CA variants. Controls fail the runner if their relation is wrong;
 unexpected fixture errors are harness failures. Cross-host bind failure is unverified.
+receiver-control uses Node's HTTP client and has path identity fixture-control; it does not
+exercise the production launcher. The other 20 rows use the native runtime (production-launcher
+or fixture-config). The new 307-port-stall receiver consumes the redirected body but stalls its
+response. Even when the turn throws on timeout, final evidence must retain body=true,
+reason=forwarded and outcome=observed-failure; losing that relation fails the runner.
+Observations are copied during finally independently of turn success; an unexpected harness
+error still marks the run broken even when forwarding overrides the row reason.
 
 Schema 1 rows contain finite configuration identity, outcome/reason, elapsedMs, exact observed request
 paths and header names (no values), credential equality, and redirect-target credential-header presence
@@ -44,10 +51,18 @@ watchdog/finally calls. No process.exit is used. Timers are event-loop timers, n
 synchronous filesystem/crypto operations can delay their delivery. Certificate generation has individual
 five-second subprocess timeouts.
 
-Evidence limitation: the pinned runtime retries TLS refusal beyond the eight-second turn observation
-window. In the observed run, no-CA and untrusted-CA rows report deadline, just like TLS stall.
-The tls-refused diagnostic code exists but those rows do not yet prove certificate refusal separately.
-Do not claim that acceptance is complete.
+M1 observed behavior: baseline and restored Responses stream successfully; wrong-key rejects,
+and removing the guard restores streaming. Env-key and alternate-header work but remain held.
+Same-origin redirects forward credential headers and bodies; cross-port/host redirects forward
+bodies while stripping the credential header. Trusted SSL_CERT_FILE, CODEX_CA_CERTIFICATE
+and their combination stream successfully. The pinned runtime retries TLS refusal beyond the
+eight-second turn observation window: no-CA and untrusted-CA report deadline, as does TLS stall.
+That deadline is the observed runtime surface; these rows do not distinguish certificate refusal
+from a stalled handshake. M2 remains pending, including auxiliary-destination verification.
+
+Timing evidence supplied by main: baseline 72 seconds versus integrated 152 seconds during
+concurrent validation. Queue, cache and contention costs were not isolated, so this is not an
+isolated runtime regression measurement. No CI lane was added.
 
 Tester mutation coordinates (disposable exact-candidate export only):
 - ownership.ts ownChild: install the close listener inside the returned cleanup instead of at spawn.
@@ -56,6 +71,13 @@ Tester mutation coordinates (disposable exact-candidate export only):
 - runner.ts wireFixture: remove the Responses restoration conditional; fixture transform regression must fail.
 - fake-provider.ts connection listener: replace global connections.size check with p.sockets.size;
   the shared-cap test must fail.
+- runner.ts finally: remove the header/body observation copy (or move it back after the awaited
+  runProtocolTurn). The real 307-port-stall row must lose body=true and its relation guard must
+  produce a nonzero exit. Also remove the forwarding override to test reason/outcome protection.
+- driver.ts validateFixtureTable: restore the column-zero-only section count; the indented tools
+  and array-section fixture tests must fail.
+- runner.ts receiver-control path: relabel it production-launcher; the regenerated row must fail
+  the tester's fixture-control identity assertion.
 No executable mutation was performed by this implementation unit. These are tester obligations.
 
 Validation logs and remaining obligations are in the handoff to main. No repo suites, commits,

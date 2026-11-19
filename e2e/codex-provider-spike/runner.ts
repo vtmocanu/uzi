@@ -9,13 +9,13 @@ import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js"
 import { parseLock, resolveArch } from "../codex-m4/provision.js";
 
 export const names = ["baseline", "wrong-key", "guard-removed", "env-key", "alternate-header", "unsupported-wire", "responses-control",
-  "receiver-control", "307-same", "308-same", "307-port", "308-port", "307-host", "308-host",
+  "receiver-control", "307-same", "308-same", "307-port", "307-port-stall", "308-port", "307-host", "308-host",
   "tls-no-ca", "tls-ssl", "tls-codex", "tls-combined", "tls-untrusted", "tls-stall"] as const;
 export type Name = typeof names[number];
 export function validateName(name: string): asserts name is Name {
   if (!(names as readonly string[]).includes(name)) throw new Error("invalid-case");
 }
-export type Row = { name: Name; outcome: "observed-supported" | "observed-failure" | "unverified"; path: "production-launcher" | "fixture-config";
+export type Row = { name: Name; outcome: "observed-supported" | "observed-failure" | "unverified"; path: "production-launcher" | "fixture-config" | "fixture-control";
   streamed: boolean; credentialReceived: boolean; responsePath: boolean; header: boolean; body: boolean; caSSL: boolean; caCodex: boolean; credentialEnv: boolean;
   config: Name; requestPaths: string[]; headerNames: string[]; elapsedMs: number; actualSSL: boolean; actualCodex: boolean; actualCredentialEnv: boolean; keyInConfig: boolean;
   held: boolean; reason: "completed" | "rejected" | "forwarded" | "config-or-runtime-failure" | "deadline" | "cross-host-bind" | "config-rejected" | "tls-refused" | "protocol-failure" | "harness-failure" };
@@ -25,7 +25,7 @@ export class Evidence {
   add(row: Row): void {
     validateName(row.name);
     if (!names.includes(row.config) || !["observed-supported", "observed-failure", "unverified"].includes(row.outcome)
-      || !["production-launcher", "fixture-config"].includes(row.path)
+      || !["production-launcher", "fixture-config", "fixture-control"].includes(row.path)
       || !["completed", "rejected", "forwarded", "config-or-runtime-failure", "deadline", "cross-host-bind", "config-rejected", "tls-refused", "protocol-failure", "harness-failure"].includes(row.reason)
       || !Number.isSafeInteger(row.elapsedMs) || row.elapsedMs < 0
       || row.requestPaths.some(p => !["/v1/responses", "/target"].includes(p))
@@ -88,7 +88,7 @@ async function main(): Promise<void> {
       let receiver: FakeProvider | undefined;
       let provider: FakeProvider | undefined;
       const fixture = ["env-key", "alternate-header", "unsupported-wire", "responses-control"].includes(name) || name.startsWith("tls-");
-      const row: Row = { name, outcome: "observed-failure", path: fixture ? "fixture-config" : "production-launcher",
+      const row: Row = { name, outcome: "observed-failure", path: name === "receiver-control" ? "fixture-control" : fixture ? "fixture-config" : "production-launcher",
         streamed: false, credentialReceived: false, responsePath: false, header: false, body: false, caSSL: false, caCodex: false, credentialEnv: false,
         config: name, requestPaths: [], headerNames: [], elapsedMs: 0, actualSSL: false, actualCodex: false, actualCredentialEnv: false, keyInConfig: name === "alternate-header",
         held: name === "env-key" || name === "alternate-header", reason: "rejected" };
@@ -97,8 +97,8 @@ async function main(): Promise<void> {
         const options: ServerOptions = { credential, guard: name !== "guard-removed", alternate: name === "alternate-header" };
         if (name.startsWith("tls-")) { options.tls = tls; options.stallConnect = name === "tls-stall"; }
         if (name.endsWith("-same")) options.sameOrigin = name.startsWith("307") ? 307 : 308;
-        if (name.endsWith("-port") || name.endsWith("-host") || name === "receiver-control") {
-          try { receiver = await FakeProvider.start({ credential, host: name.endsWith("-host") ? "127.0.0.2" : "127.0.0.1" }); }
+        if (name.endsWith("-port") || name === "307-port-stall" || name.endsWith("-host") || name === "receiver-control") {
+          try { receiver = await FakeProvider.start({ credential, stall: name === "307-port-stall", host: name.endsWith("-host") ? "127.0.0.2" : "127.0.0.1" }); }
           catch { if (name.endsWith("-host")) { row.outcome = "unverified"; row.reason = "cross-host-bind"; continue; } throw new Error("bind"); }
           owned.add(receiver!);
           const host = name.endsWith("-host") ? "127.0.0.2" : "127.0.0.1";
@@ -138,13 +138,9 @@ async function main(): Promise<void> {
             row.credentialEnv = Object.values(env).includes(credential); },
           grants: { role: "coder", phase: "implement", allowedTools: new Set(), allowedSkills: new Set(), isRoot: true },
           spawnCommand: async () => { throw new Error("unexpected-command"); }, fileop: { op: async () => ({ ok: false }) } });
-        row.credentialReceived = provider.credentialReceived;
-        row.responsePath = provider.responsePath;
         row.streamed = provider.streamed && result.turnStatus === "completed";
-        row.header = (receiver ?? provider).header; row.body = (receiver ?? provider).body;
-        const forwarding = row.header || row.body;
-        row.outcome = row.streamed && !forwarding ? "observed-supported" : "observed-failure";
-        row.reason = forwarding ? "forwarded" : row.streamed ? "completed" : name === "wrong-key" && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath ? "tls-refused" : "protocol-failure";
+        row.outcome = row.streamed ? "observed-supported" : "observed-failure";
+        row.reason = row.streamed ? "completed" : name === "wrong-key" && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath ? "tls-refused" : "protocol-failure";
       } catch (error) {
         row.reason = diagnosis ?? (caseAbort.signal.aborted || error instanceof Error && /deadline|timed out|timeout/i.test(error.message) ? "deadline" : "harness-failure");
         if (row.reason === "harness-failure") broken = true;
@@ -153,12 +149,20 @@ async function main(): Promise<void> {
         await Promise.all([provider?.close(), receiver?.close()]);
         if (provider) owned.delete(provider); if (receiver) owned.delete(receiver);
         clearTimeout(caseTimer); globalAbort.signal.removeEventListener("abort", abortCase);
+        row.credentialReceived = provider?.credentialReceived ?? false;
+        row.responsePath = provider?.responsePath ?? false;
+        row.header = (receiver ?? provider)?.header ?? false;
+        row.body = (receiver ?? provider)?.body ?? false;
+        if (name !== "receiver-control" && (row.header || row.body)) {
+          row.outcome = "observed-failure"; row.reason = "forwarded";
+        }
         row.elapsedMs = Date.now() - caseStarted;
         row.requestPaths = [...new Set([...(provider?.paths ?? []), ...(receiver?.paths ?? [])])];
         row.headerNames = [...new Set([...(provider?.headerNames ?? []), ...(receiver?.headerNames ?? [])])];
         evidence.add(row);
       }
       if (["baseline", "guard-removed", "responses-control"].includes(name) && row.outcome !== "observed-supported") broken = true;
+      if (name === "307-port-stall" && (!row.body || row.streamed || row.reason !== "forwarded" || row.outcome !== "observed-failure")) broken = true;
       if (name === "wrong-key" && (row.reason !== "rejected" || !row.responsePath || row.credentialReceived)) broken = true;
       if (name === "guard-removed" && row.credentialReceived) broken = true;
       if (name === "unsupported-wire" && (row.reason !== "config-rejected" || row.requestPaths.length !== 0)) broken = true;

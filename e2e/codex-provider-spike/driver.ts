@@ -176,6 +176,7 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { en
       if (split < 0) throw new Error("fixture-config");
       const table = opts.fixture.table(config.slice(split));
       validateFixtureTable(table);
+      if (table.split("\n")[0] !== config.slice(split).split("\n")[0]) throw new Error("fixture-config");
       validateFixtureEnv(opts.fixture.env);
       writeFileSync(configPath, config.slice(0, split) + table, { mode: 0o600 });
     }
@@ -525,7 +526,8 @@ export function validateFixtureEnv(env: NodeJS.ProcessEnv): void {
 }
 export function validateFixtureTable(table: string): void {
   // A transform may alter only one provider table, never append configuration sections.
-  if ((table.match(/^\[/gm) ?? []).length !== 1) throw new Error("fixture-config");
+  if (!/^\[model_providers\.(?:[A-Za-z0-9_-]+|"[A-Za-z0-9_-]+")\]\r?\n/.test(table)
+      || (table.match(/^[\t ]*\[/gm) ?? []).length !== 1) throw new Error("fixture-config");
   const urls = [...table.matchAll(/^base_url = "([^"]+)"$/gm)];
   if (urls.length !== 1) throw new Error("fixture-url");
   const url = new URL(urls[0][1]);

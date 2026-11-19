@@ -107,10 +107,14 @@ test("openssl resolves under sparse PATH", () => {
 test("fixture edits reject remote URLs, appended sections and env inheritance", () => {
   const table = '[model_providers.spike]\nbase_url = "http://127.0.0.1:1234/v1"\n';
   validateFixtureTable(table);
+  validateFixtureTable(table.replace("[model_providers.spike]", '[model_providers."uzi-m3b-openai"]'));
   for (const url of ["http://localhost:1234/v1", "https://example.com/v1", "http://127.0.0.1:1234/v1?x=1"]) {
     assert.throws(() => validateFixtureTable(table.replace("http://127.0.0.1:1234/v1", url)), /fixture-url/);
   }
-  assert.throws(() => validateFixtureTable(table + "[tools]\n"), /fixture-config/);
+  for (const section of ["[tools]", " [tools]", "\t[tools]", " [[tools]]", "\t[[tools]]", "[[model_providers.spike]]"]) {
+    assert.throws(() => validateFixtureTable(table + section + "\n"), /fixture-config/);
+  }
+  assert.throws(() => validateFixtureTable(table.replace("[model_providers.spike]", "[[model_providers.spike]]")), /fixture-config/);
   assert.throws(() => validateFixtureEnv({ NODE_TLS_REJECT_UNAUTHORIZED: "0" }), /fixture-env/);
   validateFixtureEnv({ SPIKE_KEY: "synthetic" });
 });
@@ -156,6 +160,7 @@ test("evidence rejects unsafe enum, path, elapsed and boolean values", () => {
     requestPaths: ["/v1/responses"], headerNames: ["authorization"],
   };
   new Evidence().add(row);
+  new Evidence().add({ ...row, name: "receiver-control", config: "receiver-control", path: "fixture-control" });
   for (const patch of [{ outcome: "secret" }, { reason: "secret" }, { config: "secret" }, { path: "secret" },
     { elapsedMs: Infinity }, { requestPaths: ["/secret"] }, { headerNames: ["secret value"] }, { headerNames: ["synthetic-canary-name"] }, { streamed: "secret" }]) {
     assert.throws(() => new Evidence().add({ ...row, ...patch } as Row), /invalid-evidence/);
