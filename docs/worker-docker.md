@@ -855,7 +855,7 @@ authorizes bypassing recovery custody or writer exclusion.
 
 A hosted Docker worker's `dind-data` PVC defaults per worker size: **20Gi** for `s` and
 `m`, **50Gi** for `l` and `l-highmem` (shipped defaults an admin can
-[edit per size](./hosted-workers.md#editing-sizes-admins); the editor checks the DinD disk against
+[edit per size](./hosted-workers.md#editing-sizes-admins); when the docker tier is enabled, the editor checks the DinD disk against
 `workers.docker.limitRange.maxPVCStorage` unless the override below is set). Setting the chart value `workers.docker.dindDataSize`
 (`UZI_WORKER_DIND_DATA_SIZE`) overrides every size, including a retained `20Gi`, an explicit
 `30Gi`, or a value kept by `helm upgrade --reuse-values`: an explicit `30Gi` does not become

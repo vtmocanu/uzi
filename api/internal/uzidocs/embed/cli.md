@@ -3060,7 +3060,7 @@ reason means.
 a hosted worker's size name (`s`, `m`, `l`, `l-highmem`), or `-` for an external
 worker or one without a size. `--json` carries `hosted_size` (the name) and
 `hosted_size_spec` (its CPU, memory and disk quantities; absent when no size of
-that name exists). An admin can [edit the quantities](./hosted-workers.md#editing-sizes-admins).
+that name exists or the size table cannot be read). An admin can [edit the quantities](./hosted-workers.md#editing-sizes-admins).
 
 ### Upgrade status
 

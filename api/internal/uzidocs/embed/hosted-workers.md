@@ -102,18 +102,20 @@ memory request and limit, data disk and DinD disk of each shipped size (`s`, `m`
 `l`, `l-highmem`). **Reset** on a customized size returns it to its shipped values.
 Adding and removing sizes is not available yet.
 
-- **What an edit reaches.** The provision form and size labels show the new
-  numbers at once. Existing idle workers pick up CPU and memory changes through the
+- **What an edit reaches.** The selectors on Admin → Workers update right after a
+  save; a provision form that is already open keeps its numbers until you reopen or
+  reload it. Existing idle workers pick up CPU and memory changes through the
   controller's paced roll; a busy worker rolls once it is idle. A disk-only edit
   rolls nothing: claims grow in place where the StorageClass allows expansion.
   Lowering a disk only affects new workers, because claims never shrink (the editor
-  warns before you save).
+  warns before saving an edit or reset that lowers a disk).
 - **Chart ceilings.** A value above the namespace LimitRange ceilings is refused
   with a message naming the chart value to raise. The binding ceiling is the minimum
   over the enabled tiers: `workers.limitRange.max.cpu`, `.max.memory` and
   `.maxPVCStorage`; `workers.docker.limitRange.*`;
   `workers.isolatedLane.limitRange.max.*`. The DinD disk is checked against
-  `workers.docker.limitRange.maxPVCStorage` unless `workers.docker.dindDataSize`
+  `workers.docker.limitRange.maxPVCStorage` only when the docker tier is enabled
+  (`workers.docker.enabled`), and not when `workers.docker.dindDataSize`
   overrides it. ResourceQuota is advisory only: an edit that does not fit shows a
   warning but saves, a quota of zero is accepted, and quota values the api cannot
   read show as "quota check unavailable", never as unlimited or as fitting.
