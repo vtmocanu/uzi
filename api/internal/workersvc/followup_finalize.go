@@ -18,7 +18,7 @@ import (
 const stateFollowupFinalize = "followup_finalize"
 
 // followupFinalizingSQLState is the SQLSTATE raised by the run_user_inputs_followup_finalize_trg
-// trigger (migration 00491) when a follow_up is inserted for a run whose finalize admission is
+// trigger (migration 00492) when a follow_up is inserted for a run whose finalize admission is
 // live. It follows the UZ413/UZ414 convention of dedicated guard codes.
 const followupFinalizingSQLState = "UZ415"
 

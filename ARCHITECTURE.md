@@ -1427,7 +1427,7 @@ chain in the diagram above, with no intervening `running`.
     instead of recreating a park. The park sequence and admission stamp stay
     unchanged; the worker still needs the explicit admission replay ACK before
     finalizing. An unadmitted park still restores `awaiting_followup`.
-  - **Triggers (migration 00491).** They bind every writer, old api pods
+  - **Triggers (migration 00492).** They bind every writer, old api pods
     included:
     - `runs_followup_park_identity_trg` numbers each logical park. A retried
       report, or a same-generation snapshot re-adopt of a numbered park, keeps
