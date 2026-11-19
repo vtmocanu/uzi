@@ -1696,7 +1696,7 @@ for (const change of ["none", "remediation", "journal", "attempt", "lease", "tra
         assert.equal((f.cache as any).recoveryOperations.getStore().deadline, deadline);
         assert.deepEqual(args.slice(0, 7), ["-c", "protocol.file.allow=user", "fetch", "--refmap=",
           "--no-tags", "--no-write-fetch-head", "file://" + f.clone.path]);
-        assert.match(args[7]!, /^\+refs\/heads\/agent\/issue-3747:refs\/uzi-incoming\/[0-9a-f-]+$/);
+        assert.match(args[7]!, /^\+refs\/heads\/agent\/issue-3747:refs\/uzi-incoming\/(?:[A-Za-z0-9_-]+\/[1-9][0-9]*\/)?[0-9a-f-]+$/);
         started.release();
         await resume.promise;
         wall += 31_000; // Transport consumes its parent budget, not a fresh admission clock.
