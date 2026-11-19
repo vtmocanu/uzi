@@ -159,7 +159,7 @@ test("off: timeout without unhandled rejection", async () => {
 });
 
 // A child that hangs until killed; after the kill request it closes `closeDelayMs` later (never when undefined).
-function killableSpawn(events: string[], closeDelayMs: number | undefined) {
+function killableSpawn(events: string[], closeDelayMs: number | undefined, trigger?: "oversize" | "stdout_error") {
   let n = 0;
   return (): ChildProcess => {
     const mine = n++;
@@ -176,6 +176,8 @@ function killableSpawn(events: string[], closeDelayMs: number | undefined) {
         }
         return true;
       };
+      if (trigger === "oversize") setImmediate(() => child.stdout.emit("data", Buffer.alloc(65 * 1024, 0x78)));
+      if (trigger === "stdout_error") setImmediate(() => child.stdout.emit("error", new Error("EIO")));
     } else {
       setImmediate(() => { child.stdout.emit("data", Buffer.from(cmdOk())); child.emit("close", 0, null); });
     }
@@ -223,6 +225,25 @@ test("timeout: a child that never closes after kill resolves off after the join 
     process.off("unhandledRejection", onRej);
   }
 });
+
+for (const trigger of ["oversize", "stdout_error"] as const) {
+  test(`${trigger}: the probe waits for the killed child to close, and reports unjoined when it never does`, async () => {
+    const events: string[] = [];
+    const base = { split: true, getuid: () => 10001, getgid: () => 10001, timeoutMs: 5000, kill: () => {} };
+    const joined = await withSplitEnv(() => probeRunnerGroupTrust({
+      ...base, spawn: killableSpawn(events, 80, trigger), joinGraceMs: 2000,
+    }));
+    events.push("resolved");
+    assert.deepEqual(events, ["kill", "close", "resolved"]);
+    assert.deepEqual({ ...joined }, { state: "off", reason: `runner_${trigger}` });
+    const never: string[] = [];
+    const unjoined = await withSplitEnv(() => probeRunnerGroupTrust({
+      ...base, spawn: killableSpawn(never, undefined, trigger), joinGraceMs: 40,
+    }));
+    assert.deepEqual(never, ["kill"]);
+    assert.deepEqual({ ...unjoined }, { state: "off", reason: `runner_${trigger}_unjoined` });
+  });
+}
 
 test("off: oversize stdout", async () => {
   const { result } = await withSplitEnv(() => probe([{ stdout: runnerOk() + "x".repeat(65 * 1024) }, { stdout: cmdOk() }]));
