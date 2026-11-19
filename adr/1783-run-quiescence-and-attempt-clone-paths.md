@@ -2148,13 +2148,18 @@ real probe trusted.
 - **Whole proof:** about 53.2 s, against 51.1 s for a 0755 bare (n=3 each). Of the ~2.1 s
   difference, `getfacl` accounts for ~0.4 s. The rest is attributed to the S2 walk, which this run
   did not time; a host run of the walk measured about 0.5 s per snapshot.
-- **Limit usage per snapshot (host counters, same 3,000 loose objects):**
-  - The snapshot-wide directory-entry counter reached about 556 of `maxDirectoryEntries` (16,384),
-    about 3.4%. The S2 walk lists the objects root a second time.
-  - The loose-leaf counter reached 6,000 of `maxMetadataRecords` (131,072), about 4.6%, because
-    loose objects are charged twice.
-  - The physical-object occurrence count, which predates this change, is the binding one: about
-    68,000 of the same 131,072 cap, about 52%.
+- **Limit usage per snapshot (same 3,000 loose objects):**
+  - The snapshot-wide directory-entry counter (host run) reached about 556 of
+    `maxDirectoryEntries` (16,384), about 3.4%. S2 lists the bare's whole tree, including the
+    objects root a second time and the refs, hooks and logs.
+  - The loose-leaf counter (host run) reached 6,000 of `maxMetadataRecords` (131,072), about 4.6%,
+    because loose objects are charged twice.
+  - The physical-object occurrence count, derived from `count-objects` rather than logged, predates
+    this change. It is the tightest of these record and entry counters: about 68,000 of the same
+    131,072 cap, about 52%.
+  - The per-snapshot content byte budget (`maxObjectStoreBytes`, 4 GiB) is closer still. S2 does
+    not charge it. A derived lower bound for this bare is about 77% (the summed logical size of
+    the objects reachable from HEAD); it was not measured.
 
 Cost scales with paths. This is one measured point, not a worst case.
 
