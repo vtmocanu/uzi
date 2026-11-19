@@ -126,7 +126,7 @@ export function DockerAllowlistCard({
       )}
 
       <form onSubmit={save} className="space-y-4">
-        <fieldset className="space-y-1.5">
+        <fieldset className="min-w-0 space-y-1.5">
           <legend className="text-sm font-medium text-muted">Trusted repositories ({selectedKnown} selected)</legend>
           {reposError ? (
             <p className="text-sm text-warn">
@@ -148,11 +148,11 @@ export function DockerAllowlistCard({
                     checked={selectedIds.has(identity(r.id))}
                     disabled={locked}
                     onChange={() => toggle(r.id)}
-                    className="h-4 w-4 rounded border-edge accent-brand"
+                    className="h-4 w-4 shrink-0 rounded border-edge accent-brand"
                   />
-                  <span className="truncate text-fg">{maskRepoPath(displayLabel(r.path_with_namespace), demo)}</span>{" "}
-                  <span className="text-muted">{maskEmail(displayLabel(r.owner_email), demo)} · {r.forge_type} · {maskHost(displayLabel(r.base_url), demo)}</span>
-                  {!r.enabled && <span className="text-faint">Disabled</span>}
+                  <span className="min-w-0 truncate text-fg">{maskRepoPath(displayLabel(r.path_with_namespace), demo)}</span>{" "}
+                  <span className="min-w-0 truncate text-muted">{maskEmail(displayLabel(r.owner_email), demo)} · {r.forge_type} · {maskHost(displayLabel(r.base_url), demo)}</span>
+                  {!r.enabled && <span className="shrink-0 text-faint">Disabled</span>}
                 </label>
               ))}
             </div>
