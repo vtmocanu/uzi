@@ -557,6 +557,37 @@ type ClaimSecrets struct {
 	// key, not null, not empty; snapshot-tested). Only a worker advertising claude_provider_v1 is
 	// offered such a claim. Never logged: it carries the usable gateway key.
 	Provider *ClaimProviderBinding `json:"provider,omitempty"`
+	// RunEnv is the effective repository-variable set of a run that receives variables (PRD #4416
+	// M2): the enabled, live versions after precedence. omitempty is load-bearing: a run without
+	// variables emits no `run_env` key, so its claim JSON is byte-identical to today's wire. Never
+	// logged; secret entries carry usable values. The wire shape is pinned by
+	// fixtures/claims/run-env-claim.json.
+	RunEnv []ClaimRunEnvVar `json:"run_env,omitempty"`
+	// RunEnvRedact lists the secret versions the run holds a receipt for that are not in RunEnv,
+	// for redaction and scanning only. The worker never sets them in an environment or a prompt.
+	RunEnvRedact []ClaimRunEnvRedact `json:"run_env_redact,omitempty"`
+}
+
+// ClaimRunEnvVar is one delivered repository variable (PRD #4416). Scope is "repo" or "user".
+// Never logged: a secret entry's Value is the usable secret.
+type ClaimRunEnvVar struct {
+	VarID       uuid.UUID `json:"var_id"`
+	Scope       string    `json:"scope"`
+	Rev         int32     `json:"rev"`
+	Name        string    `json:"name"`
+	Value       string    `json:"value"`
+	Secret      bool      `json:"secret"`
+	Description string    `json:"description"`
+}
+
+// ClaimRunEnvRedact is a secret version delivered for redaction and scanning only (PRD #4416).
+// It carries no description and no secret flag: every entry is a secret. Never logged.
+type ClaimRunEnvRedact struct {
+	VarID uuid.UUID `json:"var_id"`
+	Scope string    `json:"scope"`
+	Rev   int32     `json:"rev"`
+	Name  string    `json:"name"`
+	Value string    `json:"value"`
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run

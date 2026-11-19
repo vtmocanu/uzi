@@ -4,90 +4,760 @@
     "codex": "0.167.0"
   },
   "denied_names": [
-    "HOME",
-    "PATH",
-    "TMPDIR",
-    "LANG",
-    "SHELL",
-    "ENV",
-    "IFS",
-    "PS4",
-    "PROMPT_COMMAND",
-    "SHELLOPTS",
-    "BASHOPTS",
-    "DOCKER_HOST",
-    "DOCKER_CONFIG",
-    "DOCKER_CONTEXT",
-    "DOCKER_TLS_VERIFY",
-    "DOCKER_CERT_PATH",
-    "BUILDKIT_HOST",
-    "GOMAXPROCS",
-    "GOFLAGS",
-    "GOTMPDIR",
-    "GOMODCACHE",
-    "GOCACHE",
-    "GOPROXY",
-    "GOSUMDB",
-    "GOENV",
-    "GOTOOLCHAIN",
-    "NPM_CONFIG_CACHE",
-    "npm_config_cache",
-    "NODE_OPTIONS",
-    "NODE_PATH",
-    "NODE_EXTRA_CA_CERTS",
-    "NODE_TLS_REJECT_UNAUTHORIZED",
-    "JAVA_TOOL_OPTIONS",
-    "_JAVA_OPTIONS",
-    "JDK_JAVA_OPTIONS",
-    "CURL_HOME",
-    "NETRC",
-    "WGETRC",
-    "CURL_CA_BUNDLE",
-    "REQUESTS_CA_BUNDLE",
-    "RUBYOPT",
-    "AGENT_BROWSER_ARGS",
-    "AGENT_BROWSER_EXECUTABLE_PATH",
-    "CHROME_PATH",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "UZI_SQLC_DIR",
-    "UZI_RUN_ATTEMPT",
-    "UZI_RUN_CLONE",
-    "UZI_RUN_CLONE_KEY",
-    "UZI_WORKER_SPAWN",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-    "API_TIMEOUT_MS",
-    "MAX_THINKING_TOKENS",
-    "MAX_MCP_OUTPUT_TOKENS"
+    {
+      "value": "HOME",
+      "invariant": "managed_dirs",
+      "note": "home directory the worker creates per run"
+    },
+    {
+      "value": "PATH",
+      "invariant": "process_loader",
+      "note": "command search path; the worker puts its tool profile and shims first"
+    },
+    {
+      "value": "TMPDIR",
+      "invariant": "managed_dirs",
+      "note": "temporary directory the worker manages"
+    },
+    {
+      "value": "TMP",
+      "invariant": "managed_dirs",
+      "note": "alias of TMPDIR read by the Claude CLI and Node; the worker manages the temporary directory"
+    },
+    {
+      "value": "TEMP",
+      "invariant": "managed_dirs",
+      "note": "alias of TMPDIR read by Node tools; the worker manages the temporary directory"
+    },
+    {
+      "value": "LANG",
+      "invariant": "shell_semantics",
+      "note": "locale the worker pins for deterministic command output"
+    },
+    {
+      "value": "SHELL",
+      "invariant": "shell_semantics",
+      "note": "login shell the harness spawns commands with"
+    },
+    {
+      "value": "ENV",
+      "invariant": "shell_semantics",
+      "note": "file sh sources at startup"
+    },
+    {
+      "value": "IFS",
+      "invariant": "shell_semantics",
+      "note": "changes word splitting of every worker shell snippet"
+    },
+    {
+      "value": "PS4",
+      "invariant": "shell_semantics",
+      "note": "xtrace prompt; command substitutions in it execute"
+    },
+    {
+      "value": "PROMPT_COMMAND",
+      "invariant": "shell_semantics",
+      "note": "bash runs it before every prompt"
+    },
+    {
+      "value": "SHELLOPTS",
+      "invariant": "shell_semantics",
+      "note": "bash options inherited by every shell"
+    },
+    {
+      "value": "BASHOPTS",
+      "invariant": "shell_semantics",
+      "note": "bash shopt options inherited by every shell"
+    },
+    {
+      "value": "CDPATH",
+      "invariant": "shell_semantics",
+      "note": "changes cd resolution and prints directories in worker shell snippets"
+    },
+    {
+      "value": "ZDOTDIR",
+      "invariant": "shell_semantics",
+      "note": "zsh startup-file directory read by the shell snapshot the Claude CLI sources"
+    },
+    {
+      "value": "DOCKER_HOST",
+      "invariant": "network_wiring",
+      "note": "the worker owns the Docker endpoint"
+    },
+    {
+      "value": "DOCKER_CONFIG",
+      "invariant": "network_wiring",
+      "note": "the worker owns the Docker client configuration directory"
+    },
+    {
+      "value": "DOCKER_CONTEXT",
+      "invariant": "network_wiring",
+      "note": "selects another Docker endpoint"
+    },
+    {
+      "value": "DOCKER_TLS_VERIFY",
+      "invariant": "network_wiring",
+      "note": "Docker endpoint TLS wiring"
+    },
+    {
+      "value": "DOCKER_CERT_PATH",
+      "invariant": "network_wiring",
+      "note": "Docker endpoint TLS material"
+    },
+    {
+      "value": "BUILDKIT_HOST",
+      "invariant": "network_wiring",
+      "note": "selects another BuildKit endpoint"
+    },
+    {
+      "value": "GOMAXPROCS",
+      "invariant": "harness_control",
+      "note": "CPU budget the worker sets for Go builds"
+    },
+    {
+      "value": "GOFLAGS",
+      "invariant": "process_loader",
+      "note": "can inject -toolexec and other flags into every go command"
+    },
+    {
+      "value": "GOTMPDIR",
+      "invariant": "managed_dirs",
+      "note": "Go temporary directory the worker manages"
+    },
+    {
+      "value": "GOMODCACHE",
+      "invariant": "managed_dirs",
+      "note": "Go module cache the worker manages"
+    },
+    {
+      "value": "GOCACHE",
+      "invariant": "managed_dirs",
+      "note": "Go build cache the worker manages"
+    },
+    {
+      "value": "GOPROXY",
+      "invariant": "network_wiring",
+      "note": "Go module routing the worker pins"
+    },
+    {
+      "value": "GOSUMDB",
+      "invariant": "network_wiring",
+      "note": "Go checksum database wiring the worker pins"
+    },
+    {
+      "value": "GOENV",
+      "invariant": "managed_dirs",
+      "note": "selects the Go environment file"
+    },
+    {
+      "value": "GOTOOLCHAIN",
+      "invariant": "process_loader",
+      "note": "can fetch and run another Go toolchain"
+    },
+    {
+      "value": "NPM_CONFIG_CACHE",
+      "invariant": "managed_dirs",
+      "note": "npm cache directory the worker manages"
+    },
+    {
+      "value": "npm_config_cache",
+      "invariant": "managed_dirs",
+      "note": "lower-case form the worker sets; refused by the name shape rule before this list is consulted"
+    },
+    {
+      "value": "NODE_OPTIONS",
+      "invariant": "process_loader",
+      "note": "preloads code and sets flags in every Node process, including the Claude CLI"
+    },
+    {
+      "value": "NODE_PATH",
+      "invariant": "process_loader",
+      "note": "module resolution path of every Node process"
+    },
+    {
+      "value": "NODE_EXTRA_CA_CERTS",
+      "invariant": "network_wiring",
+      "note": "adds trust roots for the harness's provider traffic"
+    },
+    {
+      "value": "NODE_TLS_REJECT_UNAUTHORIZED",
+      "invariant": "network_wiring",
+      "note": "disables certificate checks of the harness's provider traffic"
+    },
+    {
+      "value": "NODE_DEBUG",
+      "invariant": "harness_control",
+      "note": "enables Node internals debug logging (http, tls, net) read by the Claude CLI; can print request headers"
+    },
+    {
+      "value": "NODE_V8_COVERAGE",
+      "invariant": "managed_dirs",
+      "note": "makes Node write coverage files into a chosen directory at exit"
+    },
+    {
+      "value": "NODE_REDIRECT_WARNINGS",
+      "invariant": "managed_dirs",
+      "note": "redirects Node warnings into a chosen file"
+    },
+    {
+      "value": "NODE_ICU_DATA",
+      "invariant": "process_loader",
+      "note": "loads ICU data from a chosen path into the Node runtime"
+    },
+    {
+      "value": "NODE_USE_ENV_PROXY",
+      "invariant": "network_wiring",
+      "note": "makes Node honour proxy variables for the harness's provider traffic"
+    },
+    {
+      "value": "NODE_USE_SYSTEM_CA",
+      "invariant": "network_wiring",
+      "note": "changes the trust roots of the harness's provider traffic"
+    },
+    {
+      "value": "NODE_COMPILE_CACHE",
+      "invariant": "managed_dirs",
+      "note": "Node writes its compile cache into a chosen directory"
+    },
+    {
+      "value": "NODE_CHANNEL_FD",
+      "invariant": "harness_control",
+      "note": "makes Node treat a file descriptor as its parent IPC channel"
+    },
+    {
+      "value": "UV_THREADPOOL_SIZE",
+      "invariant": "harness_control",
+      "note": "libuv thread pool size of the Node and Bun runtime"
+    },
+    {
+      "value": "SSLKEYLOGFILE",
+      "invariant": "network_wiring",
+      "note": "writes the TLS session keys of the harness's provider traffic to a file"
+    },
+    {
+      "value": "OPENSSL_CONF",
+      "invariant": "process_loader",
+      "note": "OpenSSL configuration read at startup by Node and Bun; can load providers and engines"
+    },
+    {
+      "value": "OPENSSL_MODULES",
+      "invariant": "process_loader",
+      "note": "directory OpenSSL loads provider modules from"
+    },
+    {
+      "value": "OPENSSL_ENGINES",
+      "invariant": "process_loader",
+      "note": "directory OpenSSL loads engines from"
+    },
+    {
+      "value": "JAVA_TOOL_OPTIONS",
+      "invariant": "process_loader",
+      "note": "JVM agents and flags for every Java process"
+    },
+    {
+      "value": "_JAVA_OPTIONS",
+      "invariant": "process_loader",
+      "note": "JVM agents and flags for every Java process"
+    },
+    {
+      "value": "JDK_JAVA_OPTIONS",
+      "invariant": "process_loader",
+      "note": "JVM flags for the java launcher"
+    },
+    {
+      "value": "CURL_HOME",
+      "invariant": "managed_dirs",
+      "note": "directory curl reads .curlrc from"
+    },
+    {
+      "value": "NETRC",
+      "invariant": "network_wiring",
+      "note": "credential file for network clients"
+    },
+    {
+      "value": "WGETRC",
+      "invariant": "network_wiring",
+      "note": "wget configuration, including proxy and credentials"
+    },
+    {
+      "value": "CURL_CA_BUNDLE",
+      "invariant": "network_wiring",
+      "note": "trust roots of curl and Python requests"
+    },
+    {
+      "value": "REQUESTS_CA_BUNDLE",
+      "invariant": "network_wiring",
+      "note": "trust roots of Python requests"
+    },
+    {
+      "value": "RUBYOPT",
+      "invariant": "process_loader",
+      "note": "flags and requires for every Ruby process"
+    },
+    {
+      "value": "AGENT_BROWSER_ARGS",
+      "invariant": "harness_control",
+      "note": "flags of the browser the worker drives"
+    },
+    {
+      "value": "AGENT_BROWSER_EXECUTABLE_PATH",
+      "invariant": "process_loader",
+      "note": "browser binary the worker drives"
+    },
+    {
+      "value": "CHROME_PATH",
+      "invariant": "process_loader",
+      "note": "browser binary the worker discovers"
+    },
+    {
+      "value": "CLAUDE_CODE_OAUTH_TOKEN",
+      "invariant": "provider_auth",
+      "note": "the worker's Claude credential"
+    },
+    {
+      "value": "ANTHROPIC_API_KEY",
+      "invariant": "provider_auth",
+      "note": "the worker's Anthropic credential"
+    },
+    {
+      "value": "ANTHROPIC_AUTH_TOKEN",
+      "invariant": "provider_auth",
+      "note": "the worker's Anthropic credential"
+    },
+    {
+      "value": "UZI_SQLC_DIR",
+      "invariant": "managed_dirs",
+      "note": "worker-managed sqlc directory"
+    },
+    {
+      "value": "UZI_RUN_ATTEMPT",
+      "invariant": "harness_control",
+      "note": "run-attempt marker"
+    },
+    {
+      "value": "UZI_RUN_CLONE",
+      "invariant": "harness_control",
+      "note": "run-clone marker"
+    },
+    {
+      "value": "UZI_RUN_CLONE_KEY",
+      "invariant": "harness_control",
+      "note": "run-clone key marker"
+    },
+    {
+      "value": "UZI_WORKER_SPAWN",
+      "invariant": "harness_control",
+      "note": "worker spawn marker"
+    },
+    {
+      "value": "GIT_CONFIG_COUNT",
+      "invariant": "git_authority",
+      "note": "injects git configuration"
+    },
+    {
+      "value": "GIT_CONFIG_PARAMETERS",
+      "invariant": "git_authority",
+      "note": "injects git configuration"
+    },
+    {
+      "value": "API_TIMEOUT_MS",
+      "invariant": "harness_control",
+      "note": "request timeout of the Claude CLI"
+    },
+    {
+      "value": "API_FORCE_IDLE_TIMEOUT",
+      "invariant": "harness_control",
+      "note": "idle timeout of the Claude CLI's API stream"
+    },
+    {
+      "value": "MAX_THINKING_TOKENS",
+      "invariant": "harness_control",
+      "note": "thinking budget of the Claude CLI"
+    },
+    {
+      "value": "MAX_MCP_OUTPUT_TOKENS",
+      "invariant": "harness_control",
+      "note": "tool output bound of the Claude CLI"
+    },
+    {
+      "value": "CLAUDECODE",
+      "invariant": "harness_control",
+      "note": "nested-session marker the Claude CLI reads"
+    },
+    {
+      "value": "CLAUBBIT",
+      "invariant": "harness_control",
+      "note": "environment marker the Claude CLI reads"
+    },
+    {
+      "value": "IS_SANDBOX",
+      "invariant": "harness_control",
+      "note": "tells the Claude CLI it already runs in a sandbox, which relaxes its own permission checks"
+    },
+    {
+      "value": "SDK_NATIVE_BIN",
+      "invariant": "process_loader",
+      "note": "selects the Claude CLI binary the SDK spawns"
+    },
+    {
+      "value": "SESSION_INGRESS_URL",
+      "invariant": "network_wiring",
+      "note": "session ingress endpoint of the Claude CLI"
+    },
+    {
+      "value": "BETA_TRACING_ENDPOINT",
+      "invariant": "network_wiring",
+      "note": "trace export endpoint of the Claude CLI"
+    },
+    {
+      "value": "VOICE_STREAM_BASE_URL",
+      "invariant": "network_wiring",
+      "note": "voice stream endpoint of the Claude CLI"
+    },
+    {
+      "value": "USE_LOCAL_OAUTH",
+      "invariant": "provider_auth",
+      "note": "switches the Claude CLI to a local OAuth endpoint"
+    },
+    {
+      "value": "USE_STAGING_OAUTH",
+      "invariant": "provider_auth",
+      "note": "switches the Claude CLI to the staging OAuth endpoint"
+    },
+    {
+      "value": "DEBUG_AUTH",
+      "invariant": "harness_control",
+      "note": "authentication debug logging of the Claude CLI"
+    },
+    {
+      "value": "DEBUG_SDK",
+      "invariant": "harness_control",
+      "note": "SDK debug logging"
+    },
+    {
+      "value": "DEBUG_CLAUDE_AGENT_SDK",
+      "invariant": "harness_control",
+      "note": "Claude Agent SDK debug logging"
+    },
+    {
+      "value": "OTEL_LOG_RAW_API_BODIES",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry switch that exports raw API bodies"
+    },
+    {
+      "value": "OTEL_LOG_TOOL_CONTENT",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry switch that exports tool input and output"
+    },
+    {
+      "value": "OTEL_LOG_TOOL_DETAILS",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry switch that exports tool details"
+    },
+    {
+      "value": "OTEL_LOG_USER_PROMPTS",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry switch that exports prompts"
+    },
+    {
+      "value": "OTEL_LOG_ASSISTANT_RESPONSES",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry switch that exports model responses"
+    },
+    {
+      "value": "OTEL_LOG_MANAGED_SETTINGS",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry switch that exports managed settings"
+    },
+    {
+      "value": "FORCE_VCR",
+      "invariant": "harness_control",
+      "note": "Claude CLI HTTP record and replay switch"
+    },
+    {
+      "value": "VCR_RECORD",
+      "invariant": "harness_control",
+      "note": "Claude CLI switch that records HTTP traffic to disk"
+    },
+    {
+      "value": "MAX_STRUCTURED_OUTPUT_RETRIES",
+      "invariant": "harness_control",
+      "note": "retry bound of the Claude CLI"
+    },
+    {
+      "value": "FALLBACK_FOR_ALL_PRIMARY_MODELS",
+      "invariant": "harness_control",
+      "note": "model fallback selector of the Claude CLI"
+    },
+    {
+      "value": "FORCE_PROMPT_CACHING_5M",
+      "invariant": "harness_control",
+      "note": "prompt caching switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_PROMPT_CACHING_1H",
+      "invariant": "harness_control",
+      "note": "prompt caching switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_PROMPT_CACHING_1H_BEDROCK",
+      "invariant": "harness_control",
+      "note": "prompt caching switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_TOOL_SEARCH",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_CLAUDEAI_MCP_SERVERS",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_ENHANCED_TELEMETRY_BETA",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_BETA_TRACING_DETAILED",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_LSP_TOOL",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_MCP_LARGE_OUTPUT_FILES",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_SESSION_BACKGROUNDING",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_SESSION_PERSISTENCE",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_LOCKLESS_UPDATES",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ENABLE_PID_BASED_VERSION_LOCKING",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "FORCE_AUTOUPDATE_PLUGINS",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "TEST_ENABLE_SESSION_PERSISTENCE",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+      "invariant": "harness_control",
+      "note": "tool budget of the Claude CLI"
+    },
+    {
+      "value": "SYSTEM_REMINDER_MEMORY_CONTEXT",
+      "invariant": "harness_control",
+      "note": "prompt switch of the Claude CLI"
+    },
+    {
+      "value": "USE_API_CONTEXT_MANAGEMENT",
+      "invariant": "harness_control",
+      "note": "API feature switch of the Claude CLI"
+    },
+    {
+      "value": "USE_BUILTIN_RIPGREP",
+      "invariant": "process_loader",
+      "note": "selects which ripgrep binary the Claude CLI runs"
+    },
+    {
+      "value": "EMBEDDED_SEARCH_TOOLS",
+      "invariant": "process_loader",
+      "note": "selects the search tools the Claude CLI runs"
+    },
+    {
+      "value": "ALLOW_ANT_COMPUTER_USE_MCP",
+      "invariant": "harness_control",
+      "note": "feature switch of the Claude CLI"
+    },
+    {
+      "value": "ULTRAPLAN_PROMPT_FILE",
+      "invariant": "harness_control",
+      "note": "prompt file of the Claude CLI"
+    },
+    {
+      "value": "ENVIRONMENT_SERVICE_KEY",
+      "invariant": "harness_control",
+      "note": "service key of the Claude CLI"
+    },
+    {
+      "value": "LOCAL_BRIDGE",
+      "invariant": "harness_control",
+      "note": "bridge switch of the Claude CLI"
+    },
+    {
+      "value": "VITALS_EMITTER_BIN",
+      "invariant": "process_loader",
+      "note": "binary the Claude CLI runs"
+    }
   ],
   "denied_prefixes": [
-    "UZI_",
-    "CLAUDE_",
-    "ANTHROPIC_",
-    "CODEX_",
-    "OPENAI_",
-    "MCP_",
-    "DISABLE_",
-    "GH_",
-    "GITHUB_",
-    "GITLAB_",
-    "GLAB_",
-    "GIT_",
-    "SSH_",
-    "LD_",
-    "DYLD_",
-    "BASH_",
-    "XDG_",
-    "SSL_CERT_",
-    "PYTHON",
-    "PERL5",
-    "NIX_",
-    "DEVBOX_"
+    {
+      "value": "UZI_",
+      "invariant": "worker_credentials",
+      "note": "worker and platform variables, including join and run credentials"
+    },
+    {
+      "value": "CLAUDE_",
+      "invariant": "provider_auth",
+      "note": "Claude CLI settings, including every provider selector (CLAUDE_CODE_USE_*)"
+    },
+    {
+      "value": "ANTHROPIC_",
+      "invariant": "provider_auth",
+      "note": "Anthropic endpoint, model and credential settings"
+    },
+    {
+      "value": "CODEX_",
+      "invariant": "provider_auth",
+      "note": "Codex settings and credentials"
+    },
+    {
+      "value": "OPENAI_",
+      "invariant": "provider_auth",
+      "note": "OpenAI endpoint and credential settings"
+    },
+    {
+      "value": "MCP_",
+      "invariant": "harness_control",
+      "note": "MCP client settings of the harness"
+    },
+    {
+      "value": "DISABLE_",
+      "invariant": "harness_control",
+      "note": "feature switches the Claude CLI reads"
+    },
+    {
+      "value": "GH_",
+      "invariant": "git_authority",
+      "note": "GitHub CLI authority"
+    },
+    {
+      "value": "GITHUB_",
+      "invariant": "git_authority",
+      "note": "GitHub authority and Actions context"
+    },
+    {
+      "value": "GITLAB_",
+      "invariant": "git_authority",
+      "note": "GitLab authority"
+    },
+    {
+      "value": "GLAB_",
+      "invariant": "git_authority",
+      "note": "GitLab CLI authority"
+    },
+    {
+      "value": "GIT_",
+      "invariant": "git_authority",
+      "note": "git authority and behaviour"
+    },
+    {
+      "value": "SSH_",
+      "invariant": "git_authority",
+      "note": "ssh authority and behaviour"
+    },
+    {
+      "value": "LD_",
+      "invariant": "process_loader",
+      "note": "dynamic loader"
+    },
+    {
+      "value": "DYLD_",
+      "invariant": "process_loader",
+      "note": "dynamic loader"
+    },
+    {
+      "value": "BASH_",
+      "invariant": "shell_semantics",
+      "note": "bash behaviour, including BASH_ENV and BASH_MAX_OUTPUT_LENGTH"
+    },
+    {
+      "value": "XDG_",
+      "invariant": "managed_dirs",
+      "note": "XDG base directories the worker manages"
+    },
+    {
+      "value": "SSL_CERT_",
+      "invariant": "network_wiring",
+      "note": "trust roots of OpenSSL-based clients and the harness"
+    },
+    {
+      "value": "PYTHON",
+      "invariant": "process_loader",
+      "note": "Python startup, path and hooks"
+    },
+    {
+      "value": "PERL5",
+      "invariant": "process_loader",
+      "note": "Perl startup, path and hooks"
+    },
+    {
+      "value": "NIX_",
+      "invariant": "process_loader",
+      "note": "Nix tool wiring"
+    },
+    {
+      "value": "DEVBOX_",
+      "invariant": "process_loader",
+      "note": "Devbox tool wiring"
+    },
+    {
+      "value": "BUN_",
+      "invariant": "process_loader",
+      "note": "Bun runtime controls: BUN_OPTIONS, BUN_BE_BUN, BUN_CONFIG_VERBOSE_FETCH (prints request headers), BUN_INSPECT and the BUN_FEATURE_FLAG_* family"
+    },
+    {
+      "value": "ANT_",
+      "invariant": "network_wiring",
+      "note": "ANT_OTEL_* telemetry export wiring of the Claude CLI"
+    },
+    {
+      "value": "AGENT_PROXY_",
+      "invariant": "network_wiring",
+      "note": "agent proxy wiring and credentials of the Claude CLI"
+    },
+    {
+      "value": "SELF_HOSTED_RUNNER_",
+      "invariant": "harness_control",
+      "note": "self-hosted runner controls and secrets of the Claude CLI"
+    },
+    {
+      "value": "CCR_",
+      "invariant": "harness_control",
+      "note": "remote-session proxy and controls of the Claude CLI"
+    }
   ],
   "denied_suffixes": [
-    "_PROXY"
+    {
+      "value": "_PROXY",
+      "invariant": "network_wiring",
+      "note": "changes network routing of the harness and of every command"
+    }
   ],
   "overlaps": [
     {
@@ -179,6 +849,78 @@
       "harness": "codex",
       "decision": "allowed",
       "reason": "read by commands the agent runs; the app-server environment never receives user variables"
+    },
+    {
+      "name": "NODE_ENV",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration; the Claude CLI and every Node tool read it only to select development or production behaviour, it carries no endpoint, credential or path"
+    },
+    {
+      "name": "DEBUG",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "read by the debug npm module in the CLI and by many application stacks; the CLI's own debug output goes through the worker's redacted log, and the dedicated switches (DEBUG_AUTH, DEBUG_SDK) are denied"
+    },
+    {
+      "name": "TZ",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration; changes timestamps only"
+    },
+    {
+      "name": "FORCE_COLOR",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration; changes terminal colour only"
+    },
+    {
+      "name": "AWS_BEARER_TOKEN_BEDROCK",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "read by the CLI only after the Bedrock selector, which the CLAUDE_ prefix denies"
+    },
+    {
+      "name": "AWS_CA_BUNDLE",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "cloud SDK trust roots used by builds and tests; the CLI reads it only on the Bedrock path"
+    },
+    {
+      "name": "PIP_CERT",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "package-manager configuration; package-manager names stay allowed"
+    },
+    {
+      "name": "NODE_AUTH_TOKEN",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "package-registry token read by npm; package-manager names stay allowed"
+    },
+    {
+      "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application telemetry configuration; the CLI exports nothing unless CLAUDE_CODE_ENABLE_TELEMETRY is set, which the CLAUDE_ prefix denies; the CLI-only content switches (OTEL_LOG_*) are denied"
+    },
+    {
+      "name": "EDITOR",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "interactive tool configuration; no effect on the provider, credentials, git authority or managed directories"
+    },
+    {
+      "name": "BROWSER",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "interactive tool configuration; used only to open login URLs"
+    },
+    {
+      "name": "UV_INDEX_URL",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "package-manager (uv) configuration; package-manager names stay allowed"
     }
   ]
 }

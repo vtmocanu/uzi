@@ -11,22 +11,56 @@ import {
 import { PROTECTED_ENV_KEYS } from "../src/sdk-env.js";
 import { COMMAND_ENV_PROTECTED_KEYS } from "../src/codex/codex-executor.js";
 
+interface RuleEntry {
+  value: string;
+  invariant: string;
+  note: string;
+}
+const INVARIANTS = [
+  "worker_credentials", "provider_auth", "harness_control", "git_authority",
+  "managed_dirs", "network_wiring", "process_loader", "shell_semantics",
+];
+
 // PRD 4416 "Name rules (shared fixture)": the agent copy of the run-env name rules must
 // equal fixtures/run-env/name-rules.json, which the api copy is also tested against.
 const fixture = JSON.parse(
   fs.readFileSync(new URL("../../fixtures/run-env/name-rules.json", import.meta.url), "utf8"),
 ) as {
   harness_versions: { claude_agent_sdk: string; codex: string };
-  denied_names: string[];
-  denied_prefixes: string[];
-  denied_suffixes: string[];
+  denied_names: RuleEntry[];
+  denied_prefixes: RuleEntry[];
+  denied_suffixes: RuleEntry[];
+  overlaps: { name: string; harness: string; decision: string; reason: string }[];
 };
+const values = (es: RuleEntry[]): string[] => es.map((e) => e.value);
+const deniedNames = values(fixture.denied_names);
+const deniedPrefixes = values(fixture.denied_prefixes);
+const deniedSuffixes = values(fixture.denied_suffixes);
 
 describe("run-env name rules match the shared fixture", () => {
   it("denied names, prefixes and suffixes are identical, in order", () => {
-    assert.deepEqual([...RUN_ENV_DENIED_NAMES], fixture.denied_names);
-    assert.deepEqual([...RUN_ENV_DENIED_PREFIXES], fixture.denied_prefixes);
-    assert.deepEqual([...RUN_ENV_DENIED_SUFFIXES], fixture.denied_suffixes);
+    assert.deepEqual([...RUN_ENV_DENIED_NAMES], deniedNames);
+    assert.deepEqual([...RUN_ENV_DENIED_PREFIXES], deniedPrefixes);
+    assert.deepEqual([...RUN_ENV_DENIED_SUFFIXES], deniedSuffixes);
+  });
+
+  it("every entry names a worker invariant from the closed set and carries a note", () => {
+    const all = [...fixture.denied_names, ...fixture.denied_prefixes, ...fixture.denied_suffixes];
+    for (const e of all) {
+      assert.ok(INVARIANTS.includes(e.invariant), `${e.value}: invariant ${e.invariant}`);
+      assert.ok(e.note.trim() !== "", `${e.value}: empty note`);
+    }
+    assert.equal(new Set(all.map((e) => e.value)).size, all.length, "duplicate fixture entry");
+    for (const inv of INVARIANTS) assert.ok(all.some((e) => e.invariant === inv), `no entry protects ${inv}`);
+  });
+
+  it("overlap decisions agree with the rules", () => {
+    assert.ok(fixture.overlaps.length > 0);
+    for (const o of fixture.overlaps) {
+      assert.ok(o.reason.trim() !== "", `${o.name}: empty reason`);
+      const denied = runEnvNameViolation(o.name) !== null;
+      assert.equal(denied, o.decision === "denied", `${o.name} is recorded as ${o.decision}`);
+    }
   });
 
   it("recorded harness versions are identical", () => {
@@ -53,18 +87,18 @@ describe("recorded harness versions track the pinned harnesses", () => {
 });
 
 describe("runEnvNameViolation", () => {
-  for (const name of fixture.denied_names) {
+  for (const name of deniedNames) {
     it(`denies name ${name}`, () => {
       assert.notEqual(runEnvNameViolation(name), null);
     });
   }
-  for (const prefix of fixture.denied_prefixes) {
+  for (const prefix of deniedPrefixes) {
     it(`denies prefix ${prefix}`, () => {
       const v = runEnvNameViolation(`${prefix}SOMETHING`);
       assert.ok(v !== null && v.includes(`denied prefix ${prefix}`), String(v));
     });
   }
-  for (const suffix of fixture.denied_suffixes) {
+  for (const suffix of deniedSuffixes) {
     it(`denies suffix ${suffix}`, () => {
       const v = runEnvNameViolation(`SOMETHING${suffix}`);
       assert.ok(v !== null && v.includes(`denied suffix ${suffix}`), String(v));
@@ -80,6 +114,13 @@ describe("runEnvNameViolation", () => {
     "GRADLE_OPTS",
     "DOCKER_AUTH_CONFIG",
     "TESTCONTAINERS_HOST_OVERRIDE",
+    "NODE_ENV",
+    "NPM_CONFIG_REGISTRY",
+    "PIP_INDEX_URL",
+    "MAVEN_OPTS",
+    "ORG_GRADLE_PROJECT_X",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AZURE_CLIENT_SECRET",
     "_LEADING_UNDERSCORE",
     "A",
     "A".repeat(128),
@@ -99,6 +140,18 @@ describe("runEnvNameViolation", () => {
   it("applies the shape rule before the denylist (npm_config_cache is lower-case)", () => {
     assert.ok(runEnvNameViolation("npm_config_cache")?.startsWith("must match "));
   });
+});
+
+describe("runtime controls found by the pinned-harness review are denied", () => {
+  for (const name of [
+    "BUN_BE_BUN", "BUN_CONFIG_VERBOSE_FETCH", "BUN_OPTIONS", "NODE_DEBUG", "NODE_V8_COVERAGE",
+    "NODE_REDIRECT_WARNINGS", "NODE_ICU_DATA", "NODE_USE_ENV_PROXY", "NODE_COMPILE_CACHE",
+    "UV_THREADPOOL_SIZE", "SSLKEYLOGFILE",
+  ]) {
+    it(`denies ${name}`, () => {
+      assert.notEqual(runEnvNameViolation(name), null);
+    });
+  }
 });
 
 describe("worker-protected keys are all denied", () => {

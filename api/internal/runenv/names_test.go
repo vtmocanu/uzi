@@ -11,14 +11,34 @@ import (
 
 const nameRulesFixture = "../../../fixtures/run-env/name-rules.json"
 
+// nameRuleInvariants is the closed set of worker invariants a denied entry may name.
+var nameRuleInvariants = []string{
+	"worker_credentials", "provider_auth", "harness_control", "git_authority",
+	"managed_dirs", "network_wiring", "process_loader", "shell_semantics",
+}
+
+type nameRuleEntry struct {
+	Value     string `json:"value"`
+	Invariant string `json:"invariant"`
+	Note      string `json:"note"`
+}
+
+func ruleValues(es []nameRuleEntry) []string {
+	out := make([]string, len(es))
+	for i, e := range es {
+		out[i] = e.Value
+	}
+	return out
+}
+
 type nameRulesFile struct {
 	HarnessVersions struct {
 		ClaudeAgentSDK string `json:"claude_agent_sdk"`
 		Codex          string `json:"codex"`
 	} `json:"harness_versions"`
-	DeniedNames    []string `json:"denied_names"`
-	DeniedPrefixes []string `json:"denied_prefixes"`
-	DeniedSuffixes []string `json:"denied_suffixes"`
+	DeniedNames    []nameRuleEntry `json:"denied_names"`
+	DeniedPrefixes []nameRuleEntry `json:"denied_prefixes"`
+	DeniedSuffixes []nameRuleEntry `json:"denied_suffixes"`
 	Overlaps       []struct {
 		Name     string `json:"name"`
 		Harness  string `json:"harness"`
@@ -50,12 +70,43 @@ func TestGoNameRulesEqualSharedFixture(t *testing.T) {
 		what      string
 		got, want []string
 	}{
-		{"denied names", deniedNames, fx.DeniedNames},
-		{"denied prefixes", deniedPrefixes, fx.DeniedPrefixes},
-		{"denied suffixes", deniedSuffixes, fx.DeniedSuffixes},
+		{"denied names", deniedNames, ruleValues(fx.DeniedNames)},
+		{"denied prefixes", deniedPrefixes, ruleValues(fx.DeniedPrefixes)},
+		{"denied suffixes", deniedSuffixes, ruleValues(fx.DeniedSuffixes)},
 	} {
 		if !slices.Equal(c.got, c.want) {
 			t.Errorf("%s differ from fixtures/run-env/name-rules.json:\n go:      %v\n fixture: %v", c.what, c.got, c.want)
+		}
+	}
+}
+
+// Every denied entry names the worker invariant it protects (from the closed set) and says why.
+func TestFixtureEntriesNameAnInvariantAndANote(t *testing.T) {
+	fx := loadNameRules(t)
+	seen := map[string]bool{}
+	for _, group := range [][]nameRuleEntry{fx.DeniedNames, fx.DeniedPrefixes, fx.DeniedSuffixes} {
+		for _, e := range group {
+			if !slices.Contains(nameRuleInvariants, e.Invariant) {
+				t.Errorf("entry %q has invariant %q, want one of %v", e.Value, e.Invariant, nameRuleInvariants)
+			}
+			if strings.TrimSpace(e.Note) == "" {
+				t.Errorf("entry %q has no note", e.Value)
+			}
+			if seen[e.Value] {
+				t.Errorf("entry %q appears twice", e.Value)
+			}
+			seen[e.Value] = true
+		}
+	}
+	for _, inv := range nameRuleInvariants {
+		found := false
+		for _, group := range [][]nameRuleEntry{fx.DeniedNames, fx.DeniedPrefixes, fx.DeniedSuffixes} {
+			for _, e := range group {
+				found = found || e.Invariant == inv
+			}
+		}
+		if !found {
+			t.Errorf("no entry protects invariant %q", inv)
 		}
 	}
 }
@@ -93,7 +144,8 @@ func TestFixtureHarnessVersionsMatchPins(t *testing.T) {
 
 func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 	fx := loadNameRules(t)
-	for _, n := range fx.DeniedNames {
+	for _, e := range fx.DeniedNames {
+		n := e.Value
 		if deniedBy(n) == "" {
 			t.Errorf("denied name %q is not denied by the lists", n)
 		}
@@ -101,13 +153,15 @@ func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 			t.Errorf("ValidateName(%q) accepted a denied name", n)
 		}
 	}
-	for _, p := range fx.DeniedPrefixes {
+	for _, e := range fx.DeniedPrefixes {
+		p := e.Value
 		n := p + "SOMETHING"
 		if err := ValidateName(n); err == nil {
 			t.Errorf("ValidateName(%q) accepted a name under denied prefix %q", n, p)
 		}
 	}
-	for _, s := range fx.DeniedSuffixes {
+	for _, e := range fx.DeniedSuffixes {
+		s := e.Value
 		n := "SOMETHING" + s
 		if err := ValidateName(n); err == nil {
 			t.Errorf("ValidateName(%q) accepted a name with denied suffix %q", n, s)
@@ -177,6 +231,24 @@ func TestValidateNameTable(t *testing.T) {
 		{"MAX_MCP_OUTPUT_TOKENS", "MAX_MCP_OUTPUT_TOKENS is set or reserved"},
 		{"DOCKER_HOST", "DOCKER_HOST is set or reserved"},
 		{"UZI_ANYTHING", "denied prefix UZI_"},
+		{"BUN_BE_BUN", "denied prefix BUN_"},
+		{"BUN_CONFIG_VERBOSE_FETCH", "denied prefix BUN_"},
+		{"NODE_DEBUG", "NODE_DEBUG is set or reserved"},
+		{"NODE_V8_COVERAGE", "NODE_V8_COVERAGE is set or reserved"},
+		{"NODE_REDIRECT_WARNINGS", "NODE_REDIRECT_WARNINGS is set or reserved"},
+		{"NODE_ICU_DATA", "NODE_ICU_DATA is set or reserved"},
+		{"NODE_USE_ENV_PROXY", "NODE_USE_ENV_PROXY is set or reserved"},
+		{"NODE_COMPILE_CACHE", "NODE_COMPILE_CACHE is set or reserved"},
+		{"UV_THREADPOOL_SIZE", "UV_THREADPOOL_SIZE is set or reserved"},
+		{"SSLKEYLOGFILE", "SSLKEYLOGFILE is set or reserved"},
+		{"NODE_ENV", ""},
+		{"DEBUG", ""},
+		{"NPM_CONFIG_REGISTRY", ""},
+		{"PIP_INDEX_URL", ""},
+		{"MAVEN_OPTS", ""},
+		{"AWS_REGION", ""},
+		{"GOOGLE_APPLICATION_CREDENTIALS", ""},
+		{"AZURE_CLIENT_SECRET", ""},
 	}
 	for _, tc := range tests {
 		err := ValidateName(tc.name)

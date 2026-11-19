@@ -13,6 +13,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { SanitizedPrDescriptionFields } from "./client.js";
 import type { SemanticGateAck } from "./semantic-gate-wire.js";
 import type { HarnessEffort } from "./harness.js";
+import type { RunEnvRedactEntry, RunEnvVar } from "./run-env-claim.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -1184,6 +1185,13 @@ export interface ClaimSecrets {
    *  omit it (not null, not empty) so their wire is byte-identical. Types only here: decoding the
    *  exclusivity and building the SDK env from it is a later milestone. See {@link ClaimProviderBinding}. */
   provider?: ClaimProviderBinding;
+  /** The effective repository variables of a run that receives them (PRD #4416 M2). Absent
+   *  otherwise. Secret entries carry usable values: never logged, never serialized. Decoded
+   *  (bounded, fail closed) by decodeRunEnv in run-env-claim.ts. */
+  run_env?: RunEnvVar[];
+  /** Secret versions the run holds a receipt for that are not in `run_env`: redaction and
+   *  scanning only, never set in an environment or a prompt. */
+  run_env_redact?: RunEnvRedactEntry[];
 }
 
 /** One mapped gateway model of a provider's model map: the gateway model name and an optional

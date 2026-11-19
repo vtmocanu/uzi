@@ -1,0 +1,26 @@
+{
+  "protected": true,
+  "versions": [
+    {
+      "var_id": "7a2e3d4b-1c5f-4d6e-9b8c-2f3a4b5c6d7e",
+      "rev": 3,
+      "scope": "repo",
+      "name": "SERVICE_PASSPHRASE",
+      "value": "dummy-passphrase-for-fixture"
+    },
+    {
+      "var_id": "7a2e3d4b-1c5f-4d6e-9b8c-2f3a4b5c6d7e",
+      "rev": 2,
+      "scope": "repo",
+      "name": "SERVICE_PASSPHRASE",
+      "value": "older-dummy-passphrase"
+    },
+    {
+      "var_id": "8b3f4e5c-2d6a-4e7f-8c9d-3a4b5c6d7e8f",
+      "rev": 3,
+      "scope": "user",
+      "name": "RETIRED_SECRET",
+      "value": "retired-dummy-value"
+    }
+  ]
+}

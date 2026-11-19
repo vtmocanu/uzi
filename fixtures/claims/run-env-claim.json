@@ -1,0 +1,38 @@
+{
+  "run_env": [
+    {
+      "var_id": "6f1d2c3a-0b4e-4c5d-8a7b-1e2f3a4b5c6d",
+      "scope": "repo",
+      "rev": 2,
+      "name": "SERVICE_URL",
+      "value": "http://stub.example.test:8080",
+      "secret": false,
+      "description": "Base URL of the stub service the tests call"
+    },
+    {
+      "var_id": "7a2e3d4b-1c5f-4d6e-9b8c-2f3a4b5c6d7e",
+      "scope": "repo",
+      "rev": 3,
+      "name": "SERVICE_PASSPHRASE",
+      "value": "dummy-passphrase-for-fixture",
+      "secret": true,
+      "description": "Passphrase the stub service requires"
+    }
+  ],
+  "run_env_redact": [
+    {
+      "var_id": "7a2e3d4b-1c5f-4d6e-9b8c-2f3a4b5c6d7e",
+      "scope": "repo",
+      "rev": 2,
+      "name": "SERVICE_PASSPHRASE",
+      "value": "older-dummy-passphrase"
+    },
+    {
+      "var_id": "8b3f4e5c-2d6a-4e7f-8c9d-3a4b5c6d7e8f",
+      "scope": "user",
+      "rev": 3,
+      "name": "RETIRED_SECRET",
+      "value": "retired-dummy-value"
+    }
+  ]
+}
