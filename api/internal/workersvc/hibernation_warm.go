@@ -163,10 +163,10 @@ func decideWarm(rows []poolRow, target uuid.UUID, now time.Time, stale, idleAfte
 	// (protected or not), while whether the DEK is cached is the in-memory vault.Vault cache of one
 	// api process (RequiresUnlock), so another replica serving a worker's claim may disagree with
 	// the sweeper's replica. A locked vault therefore only costs the existing demand-wake behaviour
-	// (a useless warm wake), never a wrong suppression. Because a vault-locked owner's claims return
-	// idle before the claim transaction, they stamp no memory-authority receipt, so a memory-capable
-	// pool of such an owner goes unknown (not ready) after the staleness window and can be
-	// warm-woken one sleeper per pass while the vault stays locked (PRD D20, accepted cost). The owner at the custody admission limit is
+	// (a useless warm wake), never a wrong suppression. A vault-locked owner's claims return idle
+	// before the claim transaction, but persistMemoryAuthorityVaultLocked (issue #4492) still
+	// records their memory-authority report (receipt or loss) on the worker row, so a locked
+	// owner's pool is judged on the same evidence as an unlocked one. The owner at the custody admission limit is
 	// likewise NOT a gate: ClaimRun exempts cross_check runs and continuation-exempt requeues, and
 	// ClaimChatRun has no custody predicate, so a warm worker is still useful at the limit.
 	if c.IntakePaused {

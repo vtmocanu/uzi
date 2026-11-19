@@ -146,19 +146,33 @@ func TestMemoryAuthorityLostPersistsOnEmptyPollLiveDB(t *testing.T) {
 	}
 }
 
-func TestMemoryAuthorityHeldClearsAndHeldToHeldWritesNothingLiveDB(t *testing.T) {
+func TestMemoryAuthorityHeldDoesNotClearLossLiveDB(t *testing.T) {
 	m := newMemAuthFix(t)
 	m.claim(t, "lost")
-	if _, ok := m.lostAt(t); !ok {
+	lost, ok := m.lostAt(t)
+	if !ok {
 		t.Fatal("setup: lost not persisted")
 	}
 	before := m.writeCount(t)
-	m.claim(t, "held")
-	if _, ok := m.lostAt(t); ok {
-		t.Fatal("held report did not clear memory_authority_lost_at")
+	for i := 0; i < 3; i++ {
+		m.claim(t, "held")
 	}
-	if n := m.writeCount(t); n != before+1 {
-		t.Fatalf("clearing wrote %d times, want 1", n-before)
+	if got, ok := m.lostAt(t); !ok || !got.Equal(lost) {
+		t.Fatalf("held reports changed the recorded loss: %v (set %t), want %v kept", got, ok, lost)
+	}
+	if _, ok := m.heldAt(t); ok {
+		t.Fatal("a held report after a loss stamped the receipt")
+	}
+	if n := m.writeCount(t); n != before {
+		t.Fatalf("held reports after a loss wrote memory_authority_lost_at %d times, want 0", n-before)
+	}
+	m.register(t)
+	if _, ok := m.lostAt(t); ok {
+		t.Fatal("Register did not clear the loss")
+	}
+	m.claim(t, "held")
+	if _, ok := m.heldAt(t); !ok {
+		t.Fatal("a held report after Register did not stamp the receipt")
 	}
 	before = m.writeCount(t)
 	for i := 0; i < 3; i++ {
@@ -205,7 +219,7 @@ func TestMemoryAuthorityStaleRegistrationReportsChangeNothingLiveDB(t *testing.T
 			t.Fatalf("Set with the old nonce: rows=%d err=%v, want 0", n, err)
 		}
 	})
-	t.Run("delayed held does not clear the new registration's column", func(t *testing.T) {
+	t.Run("delayed held does not change the new registration's column or receipt", func(t *testing.T) {
 		m := newMemAuthFix(t)
 		old := m.nonce
 		m.register(t)
@@ -220,11 +234,32 @@ func TestMemoryAuthorityStaleRegistrationReportsChangeNothingLiveDB(t *testing.T
 		if got, ok := m.lostAt(t); !ok || !got.Equal(set) {
 			t.Fatalf("a delayed held report from the old registration changed the column: %v %v", got, ok)
 		}
-		n, err := m.f.env.q.ClearWorkerMemoryAuthorityLost(m.f.env.ctx, store.ClearWorkerMemoryAuthorityLostParams{
-			ID: m.w.ID, RegisterNonce: pgconv.TextOrNull(old),
+		n, err := m.f.env.q.StampWorkerMemoryAuthorityHeld(m.f.env.ctx, store.StampWorkerMemoryAuthorityHeldParams{
+			ID: m.w.ID, RegisterNonce: pgconv.TextOrNull(old), HeldAt: pgconv.Time(time.Now()),
 		})
 		if err != nil || n != 0 {
-			t.Fatalf("Clear with the old nonce: rows=%d err=%v, want 0", n, err)
+			t.Fatalf("Stamp with the old nonce: rows=%d err=%v, want 0", n, err)
+		}
+		// SetWorkerSnapshotState with a receipt while the loss is recorded leaves the receipt NULL.
+		rows, err := m.f.env.q.SetWorkerSnapshotState(m.f.env.ctx, store.SetWorkerSnapshotStateParams{
+			ID: m.w.ID, SnapshotEpoch: 99, MemoryAuthorityHeldAt: pgconv.Time(time.Now()), HeldRegisterNonce: pgconv.TextOrNull(m.nonce),
+		})
+		if err != nil || rows != 1 {
+			t.Fatalf("SetWorkerSnapshotState rows=%d err=%v", rows, err)
+		}
+		if _, ok := m.heldAt(t); ok {
+			t.Fatal("SetWorkerSnapshotState stamped a receipt while a loss is recorded")
+		}
+		// StampWorkerMemoryAuthorityHeld under the CURRENT nonce while the loss is recorded also
+		// stamps nothing: its lost_at IS NULL fence, not only its nonce fence, refuses.
+		n, err = m.f.env.q.StampWorkerMemoryAuthorityHeld(m.f.env.ctx, store.StampWorkerMemoryAuthorityHeldParams{
+			ID: m.w.ID, RegisterNonce: pgconv.TextOrNull(m.nonce), HeldAt: pgconv.Time(time.Now()),
+		})
+		if err != nil || n != 0 {
+			t.Fatalf("Stamp with the current nonce under a loss: rows=%d err=%v, want 0", n, err)
+		}
+		if _, ok := m.heldAt(t); ok {
+			t.Fatal("StampWorkerMemoryAuthorityHeld stamped a receipt while a loss is recorded")
 		}
 	})
 }
