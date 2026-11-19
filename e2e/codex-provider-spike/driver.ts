@@ -3,7 +3,7 @@ import { ownChild } from "./ownership.js";
 import { ownedDeadline } from "./timers.js";
 import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, readdirSync, lstatSync, copyFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, opendirSync, lstatSync, openSync, closeSync, readSync, writeSync, fstatSync, constants } from "node:fs";
 import { readFileSync } from "node:fs";
 import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js";
 import type { CodexNotification } from "../../agent/src/codex/transport.js";
@@ -589,10 +589,32 @@ export function copySyntheticSessions(source: string, target: string): void {
     if (stat.isDirectory()) {
       if (++files > 128) throw new Error("session-copy-limit");
       mkdirSync(to, { recursive: true, mode: 0o700 });
-      for (const name of readdirSync(from)) visit(path.join(from, name), path.join(to, name), depth + 1);
+      const directory = opendirSync(from, { bufferSize: 1 });
+      try {
+        let entry;
+        while ((entry = directory.readSync()) !== null) {
+          if (files >= 128) throw new Error("session-copy-limit");
+          visit(path.join(from, entry.name), path.join(to, entry.name), depth + 1);
+        }
+      } finally { directory.closeSync(); }
     } else {
       if (!stat.isFile() || ++files > 128 || (bytes += stat.size) > 4 * 1024 * 1024) throw new Error("session-copy-limit");
-      copyFileSync(from, to);
+      // Charge actual reads too: a growing owned source cannot bypass the byte cap.
+      bytes -= stat.size;
+      const input = openSync(from, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let output: number | undefined;
+      try {
+        if (!fstatSync(input).isFile()) throw new Error("session-copy-limit");
+        output = openSync(to, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+        const buffer = Buffer.alloc(65536);
+        let length;
+        while ((length = readSync(input, buffer, 0, buffer.length, null)) !== 0) {
+          bytes += length;
+          if (bytes > 4 * 1024 * 1024) throw new Error("session-copy-limit");
+          let written = 0;
+          while (written < length) written += writeSync(output, buffer, written, length - written);
+        }
+      } finally { closeSync(input); if (output !== undefined) closeSync(output); }
     }
   };
   visit(source, target, 0);

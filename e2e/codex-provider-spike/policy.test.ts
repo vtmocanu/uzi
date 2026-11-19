@@ -1,9 +1,11 @@
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import { copySyntheticSessions, configProjection } from "./driver.js";
-import { allowedInventory } from "./fake-provider.js";
+import { allowedInventory, callbackResultMatches } from "./fake-provider.js";
 import { buildCodexLoopbackTestConfigToml } from "../../agent/src/codex/config.js";
 
 test("session adapter copies synthetic sessions and rejects symbolic links", () => {
@@ -37,4 +39,38 @@ test("inventory rejects native top level, namespace and nested declaration", () 
 
 test("inventory sees a second native function after an allowed member", () => {
   assert.equal(allowedInventory({ tools: [{ type: "custom", name: "exec", description: "declare const tools: { uzi_bash(args: {}): Promise<unknown>; apply_patch(args: {}): Promise<unknown>; }" }] }), false);
+});
+
+test("callback result requires matching call id and synthetic success content", () => {
+  const item = { type: "custom_tool_call_output", call_id: "spike-exec", output: [{ type: "text", text: 'Script completed: {"code":0,"stdout":"synthetic","stderr":""}' }] };
+  assert.equal(callbackResultMatches(item), true);
+  assert.equal(callbackResultMatches({ ...item, call_id: "wrong" }), false);
+  assert.equal(callbackResultMatches({ ...item, output: "" }), false);
+  assert.equal(callbackResultMatches({ ...item, output: '{"code":0,"stdout":"wrong"}' }), false);
+});
+
+test("session directory enumeration stops before bulk allocation", () => {
+  const base = mkdtempSync(path.resolve(__dirname, "../../.uzi/scratch/session-directory-test-"));
+  const source = path.join(base, "sessions"); mkdirSync(source);
+  for (let i = 0; i < 256; i++) writeFileSync(path.join(source, String(i)), "synthetic");
+  const bulk = fs.readdirSync; const incremental = fs.opendirSync;
+  let bulkEntries = 0, incrementalReads = 0;
+  fs.readdirSync = ((...args: any[]) => {
+    const entries = (bulk as any)(...args); bulkEntries += entries.length; return entries;
+  }) as typeof fs.readdirSync;
+  fs.opendirSync = ((...args: any[]) => {
+    const directory = (incremental as any)(...args);
+    const read = directory.readSync.bind(directory);
+    directory.readSync = () => { incrementalReads++; return read(); };
+    return directory;
+  }) as typeof fs.opendirSync;
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => copySyntheticSessions(source, path.join(base, "copy")), /session-copy-limit/);
+    assert.equal(bulkEntries, 0);
+    assert.ok(incrementalReads <= 128);
+  } finally {
+    fs.readdirSync = bulk; fs.opendirSync = incremental; syncBuiltinESMExports();
+    rmSync(base, { recursive: true, force: true });
+  }
 });

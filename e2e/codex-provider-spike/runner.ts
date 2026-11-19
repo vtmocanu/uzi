@@ -198,7 +198,7 @@ async function main(): Promise<void> {
         if (m2) {
           row.callbackSeen = result.callbacks.length > 0; if (!name.startsWith("restart-")) row.effect = effects > 0;
           row.denied = result.callbacks.some(c => !c.result.ok);
-          row.roundtrip = provider.callbackOutput; row.nativeSuppressed = !provider.nativeTools; row.nativeApplyPatch = provider.nativeApplyPatch; row.unknownInventory = provider.unknownInventory;
+          row.roundtrip = provider.callbackOutput && (name !== "callback" || provider.callbackResultMatched); row.nativeSuppressed = !provider.nativeTools; row.nativeApplyPatch = provider.nativeApplyPatch; row.unknownInventory = provider.unknownInventory;
           row.cancelled = name === "cancel-stream" && caseAbort.signal.aborted && result.turnStatus === undefined;
           if (!name.startsWith("restart-")) row.resumed = name === "resume" && provider.requests.length >= 2 && result.turnStatus === "completed";
           const valid = name === "callback" ? row.callbackSeen && row.effect && row.roundtrip && !row.denied
@@ -212,7 +212,7 @@ async function main(): Promise<void> {
         row.streamed = name === "restart-rebind" ? !!receiver?.streamed && result.turnStatus === "completed" : name === "restart-closed-a" ? false : provider.streamed && result.turnStatus === "completed";
         row.outcome = row.cancelled || row.streamed ? "observed-supported" : "observed-failure";
         row.reason = row.cancelled || row.streamed ? "completed" : name === "wrong-key" && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath ? "tls-refused" : "protocol-failure";
-        if (name === "unknown-model" && (!row.modelContextWindowOwn || !row.modelContextWindowNullableInteger || !row.streamed)) broken = true;
+        if (name === "unknown-model" && (!row.modelContextWindowOwn || !row.modelContextWindowNullableInteger || !row.fallbackWarningObserved || !row.streamed)) broken = true;
         if (provider.errors.length || provider.oversized || receiver?.errors.length || receiver?.oversized) broken = true;
       } catch (error) {
         row.reason = diagnosis ?? (caseAbort.signal.aborted || error instanceof Error && /deadline|timed out|timeout/i.test(error.message) ? "deadline" : "harness-failure");
@@ -220,7 +220,9 @@ async function main(): Promise<void> {
         if (row.reason === "harness-failure") broken = true;
         if (name === "restart-rebind") broken = true;
         if (name === "same-process-override" && row.reason === "deadline" && receiver && !receiver.responsePath) { row.resumed = false; row.effect = false; }
-        if (name === "restart-closed-a" && row.reason === "deadline" && receiver && receiver.requests.length === 1) {
+        if (name === "destination-control" && (row.outcome !== "observed-supported" || row.destinationMatched !== false || row.actualSSL || row.actualCodex || row.actualCredentialEnv)) broken = true;
+      if (name === "restart-rebind" && (!row.resumed || !row.effect || !row.streamed)) broken = true;
+      if (name === "restart-closed-a" && row.reason === "deadline" && receiver && receiver.requests.length === 1) {
           row.resumed = false; row.effect = false;
         }
       }
@@ -248,6 +250,8 @@ async function main(): Promise<void> {
       if (["baseline", "guard-removed", "responses-control", "restart-rebind", "rebind-observer-control"].includes(name) && !row.streamed) broken = true;
       if (["baseline", "guard-removed", "responses-control", "restart-rebind", "rebind-observer-control"].includes(name) && row.outcome !== "observed-supported") broken = true;
       if (["callback", "callback-disabled", "role-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume"].includes(name) && row.outcome !== "observed-supported") broken = true;
+      if (name === "destination-control" && (row.outcome !== "observed-supported" || row.destinationMatched !== false || row.actualSSL || row.actualCodex || row.actualCredentialEnv)) broken = true;
+      if (name === "restart-rebind" && (!row.resumed || !row.effect || !row.streamed)) broken = true;
       if (name === "restart-closed-a" && (row.deadlineObserved !== true || row.resumed !== false || row.effect !== false)) broken = true;
       if (name === "same-process-override" && (row.deadlineObserved !== true || row.resumed !== false || row.effect !== false || receiver?.responsePath)) broken = true;
       if (name === "307-port-stall" && (!row.body || row.streamed || row.reason !== "forwarded" || row.outcome !== "observed-failure")) broken = true;

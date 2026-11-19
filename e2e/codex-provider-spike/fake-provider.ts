@@ -53,6 +53,7 @@ export class FakeProvider {
   streamed = false;
   oversized = false;
   callbackOutput = false;
+  callbackResultMatched = false;
   nativeTools = false;
   nativeApplyPatch = false;
   unknownInventory = false;
@@ -125,6 +126,7 @@ export class FakeProvider {
           chunks.length = 0;
           const input = Array.isArray(body.input) ? body.input : [];
           this.callbackOutput ||= input.some((v: unknown) => v !== null && typeof v === "object" && ["custom_tool_call_output", "function_call_output"].includes(String((v as Record<string, unknown>).type)));
+          this.callbackResultMatched ||= input.some(callbackResultMatches);
           const inventory = inventoryProjection(body);
           this.nativeTools ||= !inventory.nativeSuppressed;
           this.nativeApplyPatch ||= inventory.nativeApplyPatch;
@@ -203,3 +205,12 @@ export function inventoryProjection(body: ResponsesBody) {
   return { nativeSuppressed: !nativeApplyPatch && !unknownInventory, nativeApplyPatch, unknownInventory };
 }
 export function allowedInventory(body: ResponsesBody): boolean { return inventoryProjection(body).nativeSuppressed; }
+
+export function callbackResultMatches(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (!["custom_tool_call_output", "function_call_output"].includes(String(v.type)) || v.call_id !== "spike-exec") return false;
+  const texts = typeof v.output === "string" ? [v.output] : Array.isArray(v.output)
+    ? v.output.flatMap(c => c && typeof c === "object" && typeof c.text === "string" ? [c.text] : []) : [];
+  return texts.some(output => /"stdout"\s*:\s*"synthetic"/.test(output) && /"code"\s*:\s*0/.test(output));
+}
