@@ -83,6 +83,8 @@ func consumerRunsOf(t *testing.T, env codexTestEnv, userID, source uuid.UUID) in
 // queue on the gate.
 func TestTerminalConsumerGatePositiveControlsLiveDB(t *testing.T) {
 	f, svc := raceFixture(t, raceFamily{})
+	bounds := retireTestBounds
+	f.svc.terminal.retireBounds = &bounds
 	g := newRaceGate(t)
 	f.svc.terminal.beforeRetiringCommit = g.pause
 	sweepDone := make(chan error, 1)
@@ -112,8 +114,8 @@ func TestTerminalConsumerGatePositiveControlsLiveDB(t *testing.T) {
 		g.release()
 		t.Fatalf("plain task run on the gated repository: %v", err)
 	}
-	// The retirement's idle bound (2s) ends the hold, so a gated create would succeed late: the
-	// elapsed time, not the error, is what shows the plain task did not queue on the gate.
+	// A delayed grant must not hide a wrongly gated task: check elapsed time as
+	// well as the error and the still-paused retirement below.
 	if d := time.Since(taskStart); d > time.Second {
 		g.release()
 		t.Fatalf("plain task run took %v while the gate was held: it queued on the gate", d)

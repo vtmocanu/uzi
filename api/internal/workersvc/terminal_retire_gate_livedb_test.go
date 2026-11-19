@@ -225,37 +225,40 @@ func TestTerminalRetireGateOtherLanesLiveDB(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		holdGateShared(t, f, f.e.repoID)
+		release := holdGateExclusive(f.e.ctx, t, f.e.pool, f.e.repoID)
 		f.shiftClock(terminalBoundGrace + time.Minute)
 		if n := f.sweep(); n != 1 {
-			t.Fatalf("changed %d rows, want 1", n)
+			t.Fatalf("changed %d rows, want 1 while the exclusive holder remains", n)
 		}
 		f.mustPres("not_published")
+		release()
 	})
 	t.Run("reconcile", func(t *testing.T) {
 		f := newSweepFix(t)
 		f.publishing("invoked")
-		holdGateShared(t, f, f.e.repoID)
+		release := holdGateExclusive(f.e.ctx, t, f.e.pool, f.e.repoID)
 		f.shiftClock(terminalReconcileGrace + time.Minute)
 		if n := f.sweep(); n != 1 {
-			t.Fatalf("changed %d rows, want 1", n)
+			t.Fatalf("changed %d rows, want 1 while the exclusive holder remains", n)
 		}
 		f.mustPres("live")
+		release()
 	})
 }
 
-// The production bounds keep every retirement hold strictly below the admission gate wait, and the
+// The production pre-commit budgets stay below the admission gate wait, and the
 // preservation row lock_timeout strictly below statement_timeout (so a contended row is busy, 55P03,
 // not a statement timeout). A change to either side of the inequality must fail here.
 func TestTerminalRetireBoundsInvariants(t *testing.T) {
 	ms := func(s string) time.Duration {
 		d, err := time.ParseDuration(s)
-		if err != nil {
-			t.Fatalf("bound %q: %v", s, err)
+		if err != nil || d <= 0 {
+			t.Fatalf("bound %q must be positive (parse error: %v)", s, err)
 		}
 		return d
 	}
 	pg17 := terminalRetireBoundsFor(terminalPG17)
+	_ = ms(pg17.idle) // The transaction budget does not make a disabled idle timeout valid.
 	if pg17.transaction == "" || ms(pg17.transaction) >= terminalConsumerGateWait {
 		t.Fatalf("PG17 transaction bound %q must be set and below the %v gate wait", pg17.transaction, terminalConsumerGateWait)
 	}

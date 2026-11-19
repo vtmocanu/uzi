@@ -1290,4 +1290,9 @@ func TestMRReworkTerminalConsumerGateBusyRetriesNextTick(t *testing.T) {
 	if len(st.upserts) != 1 {
 		t.Fatalf("the retried create must advance the ledger once, upserts=%d", len(st.upserts))
 	}
+	got := st.ledgers[mrwRef]
+	if got.RepoID != mrwRepoID || got.Ref != mrwRef || got.AttemptCount != 2 ||
+		mrwMarks(t, got)[forge.CommentNSReviewComment] != 140 {
+		t.Fatalf("retry recorded the wrong review identity or attempt: %+v", got)
+	}
 }

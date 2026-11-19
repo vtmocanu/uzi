@@ -901,4 +901,9 @@ func TestCIAutofixTerminalConsumerGateBusyRetriesNextTick(t *testing.T) {
 	if len(st.upserts) != 1 {
 		t.Fatalf("the retried create must advance the counter once, upserts=%d", len(st.upserts))
 	}
+	got := st.upserts[0]
+	if got.RepoID != cfRepoID || got.Ref != cfRef || !got.LastPipelineID.Valid || got.LastPipelineID.Int64 != 9001 ||
+		!got.LastSignature.Valid || got.LastSignature.String != workersvc.FailureSignature(runs.calls[1].snapshot) {
+		t.Fatalf("retry recorded the wrong pipeline identity or signature: %+v", got)
+	}
 }

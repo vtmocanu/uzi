@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -454,22 +455,37 @@ func TestTerminalPostCommitCombinedContentionLiveDB(t *testing.T) {
 
 	// While the reconcile holds the gate shared (before its commit), a second exclusive holder queues
 	// behind it: it is granted the moment the reconcile commits, ahead of the hook's gate request.
-	second := make(chan *lockHolder, 1)
+	secondTx, err := f.e.pool.Begin(f.e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &lockHolder{tx: secondTx}
+	waitCtx, cancelWait := context.WithCancel(f.e.ctx)
+	finished := make(chan struct{})
+	var startOnce sync.Once
+	var waitErr error
+	startSecond := func() {
+		startOnce.Do(func() {
+			go func() {
+				defer close(finished)
+				_, waitErr = secondTx.Exec(waitCtx, "SELECT pg_advisory_xact_lock($1, $2)", store.TerminalConsumerGateLockClass, store.TerminalConsumerGateObjID(f.e.repoID))
+			}()
+		})
+	}
+	// Own the transaction before any waiter starts. On failure, cancellation and
+	// joining precede rollback, including when the report never reaches the hook.
+	t.Cleanup(func() {
+		cancelWait()
+		startSecond()
+		<-finished
+		second.release()
+	})
 	svc.reconcileBeforeCommitHook = func(uuid.UUID) {
-		go func() {
-			tx, err := f.e.pool.Begin(f.e.ctx)
-			if err != nil {
-				t.Error(err)
-				second <- nil
+		startSecond()
+		for deadline := time.Now().Add(postWaitBound); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if waitCtx.Err() != nil {
 				return
 			}
-			h := &lockHolder{tx: tx}
-			if _, err = tx.Exec(f.e.ctx, "SELECT pg_advisory_xact_lock($1, $2)", store.TerminalConsumerGateLockClass, store.TerminalConsumerGateObjID(f.e.repoID)); err != nil {
-				t.Error(err)
-			}
-			second <- h
-		}()
-		for deadline := time.Now().Add(postWaitBound); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 			if gateLocks(t, f, f.e.repoID, "ExclusiveLock", false) > 0 {
 				return
 			}
@@ -485,14 +501,13 @@ func TestTerminalPostCommitCombinedContentionLiveDB(t *testing.T) {
 	time.Sleep(hold)
 	first()
 
-	h := raceAwait(t, second, "the second holder")
-	if h == nil {
-		t.FailNow()
+	raceAwait(t, finished, "the second holder")
+	if waitErr != nil {
+		t.Fatalf("the second holder: %v", waitErr)
 	}
-	t.Cleanup(h.release)
 	postWaitUntil(t, "the review hook to queue behind the second holder", func() bool { return gateWaiting(t, f) })
 	time.Sleep(hold)
-	h.release()
+	second.release()
 
 	rep := raceAwait(t, done, "the report")
 	if rep.err != nil {

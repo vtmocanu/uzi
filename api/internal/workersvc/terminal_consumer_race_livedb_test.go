@@ -28,10 +28,9 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
 const (
-	// raceHold bounds how long a paused side waits for its release. The pause must stay below the
-	// server-side hold bounds of tx-R1 (4s transaction_timeout on PostgreSQL 17, a 4.35s worst case
-	// on 16, see terminalRetireBounds), or the server would end the paused transaction itself.
-	raceHold = 3 * time.Second
+	// raceHold is a failure fallback longer than the observation window. Interleavings
+	// that require retirement to commit use retireTestBounds; timeout tests keep their short bounds.
+	raceHold = 10 * time.Second
 	// racePoll bounds the wait for the admission to show up in pg_locks as a queued waiter on the gate.
 	racePoll = 5 * time.Second
 	// raceWaitBound bounds every wait of the test goroutine.
@@ -232,6 +231,8 @@ func raceReached(t *testing.T, g *raceGate, what string) {
 // releases both sides and asserts the admission succeeded and the row never went back to live.
 func raceRetirementFirst(t *testing.T, f *sweepFix, probe func() bool, admit func() error) {
 	t.Helper()
+	bounds := retireTestBounds
+	f.svc.terminal.retireBounds = &bounds
 	g := newRaceGate(t)
 	f.svc.terminal.beforeRetiringCommit = g.pause
 	sweepDone := make(chan error, 1)
