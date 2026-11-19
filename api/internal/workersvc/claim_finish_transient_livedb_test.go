@@ -74,7 +74,7 @@ func TestClaimTransientRequeueQueuedLiveDB(t *testing.T) {
 	if len(r.CodexCapHash) != 0 || r.CodexClaimEpoch != assembled.CodexClaimEpoch+1 {
 		t.Fatalf("capability not revoked: hash=%x epoch=%d (assembly left %d)", r.CodexCapHash, r.CodexClaimEpoch, assembled.CodexClaimEpoch)
 	}
-	if r.WorkerID != pgconv.UUID(fx.workerB) || r.ClaimGeneration != assembled.ClaimGeneration || r.Health != "ok" {
+	if r.WorkerID != pgconv.UUID(fx.workerA) || r.ClaimGeneration != assembled.ClaimGeneration || r.Health != "ok" {
 		t.Fatalf("worker=%v gen=%d health=%s, want B/%d/ok", r.WorkerID, r.ClaimGeneration, r.Health, assembled.ClaimGeneration)
 	}
 	if !r.StatusSince.Time.After(assembled.StatusSince.Time) {
@@ -161,7 +161,7 @@ func TestFinishRunClaimPoolWaitArmLiveDB(t *testing.T) {
 			before.StartedAt, before.BudgetPausedSeconds)
 	}
 	payload, err := fx.svc.finishRunClaim(env.ctx, run, nil, errAutoPoolEmpty,
-		claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+		claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 	if err != nil || payload != nil {
 		t.Fatalf("finishRunClaim = (%v, %v), want idle", payload != nil, err)
 	}
@@ -175,7 +175,7 @@ func TestFinishRunClaimPoolWaitArmLiveDB(t *testing.T) {
 	if len(r.CodexCapHash) != 0 || r.CodexClaimEpoch != before.CodexClaimEpoch+1 {
 		t.Fatalf("capability not revoked: hash=%x epoch=%d (before %d)", r.CodexCapHash, r.CodexClaimEpoch, before.CodexClaimEpoch)
 	}
-	if r.WorkerID != pgconv.UUID(fx.workerB) || r.ClaimGeneration != run.ClaimGeneration {
+	if r.WorkerID != pgconv.UUID(fx.workerA) || r.ClaimGeneration != run.ClaimGeneration {
 		t.Fatalf("worker=%v gen=%d, want B/%d", r.WorkerID, r.ClaimGeneration, run.ClaimGeneration)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
@@ -236,7 +236,7 @@ func TestRequeueClaimAssemblyExactFenceLiveDB(t *testing.T) {
 			before := mustRun(t, env, fx.runID)
 			svc := New(skewedFinishStore{Store: env.q, pool: env.pool, skew: tc.skew}, env.box, testParams())
 			payload, err := svc.finishRunClaim(env.ctx, run, nil, tc.cause,
-				claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+				claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 			if payload != nil || !errors.Is(err, errClaimRecoveryStale) {
 				t.Fatalf("finishRunClaim = (%v, %v), want (nil, errClaimRecoveryStale)", payload != nil, err)
 			}
@@ -258,13 +258,13 @@ func TestFinishRunClaimJudgePoolWaitRefusedLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	fx := newCodexClaimFix(t, env, false)
 	env.exec(`UPDATE runs SET status = 'completed' WHERE id = $1`, fx.runID)
-	judgeID := env.seedCodexJudgeRun(t, fx.userID, fx.workerB, fx.runID)
+	judgeID := env.seedCodexJudgeRun(t, fx.userID, fx.workerA, fx.runID)
 	if err := fx.svc.FreezeCodexBinding(env.ctx, fx.userID, judgeID, fx.aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding on the judge: %v", err)
 	}
 	judge := mustRun(t, env, judgeID)
 	payload, err := fx.svc.finishRunClaim(env.ctx, judge, nil, errAutoPoolEmpty,
-		claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+		claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 	if payload != nil || !errors.Is(err, errClaimRecoveryStale) {
 		t.Fatalf("finishRunClaim = (%v, %v), want (nil, errClaimRecoveryStale)", payload != nil, err)
 	}

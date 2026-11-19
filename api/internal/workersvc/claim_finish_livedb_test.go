@@ -27,7 +27,8 @@ import (
 
 // codexClaimFix is the observed-case prelude: a subscription Codex run first claimed by worker A
 // at generation 1, then requeued by the sweeper with worker_id still A, started three hours ago
-// with banked pause, plus a Codex-capable claimant B. The owner ALSO holds a default Anthropic
+// with banked pause, plus a second Codex-capable worker B that is never recorded in the run's claim provenance, so a Codex run is
+// admitted only to A. The owner ALSO holds a default Anthropic
 // token, so any Claude fallback would be visible.
 type codexClaimFix struct {
 	env                codexTestEnv
@@ -51,7 +52,11 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 		WHERE user_secret_id = $1`, f.aliasID).Scan(&fx.accountID); err != nil {
 		t.Fatalf("read linked account: %v", err)
 	}
-	env.exec(`UPDATE runs SET claim_generation = 1, status = 'claimed', codex_cap_hash = NULL WHERE id = $1`, f.runID)
+	// One UPDATE from generation 0 is the run's first claim as the provenance trigger sees it:
+	// worker A holds generation 1 and is the only worker a Codex run at generation 1 admits.
+	env.exec(`UPDATE runs SET claim_generation = 1, status = 'claimed', codex_cap_hash = NULL,
+		worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 1
+		WHERE id = $1`, f.runID, fx.workerA)
 	if olderHold {
 		fx.holdA = claimRecoveryHold(t, env, f.runID, fx.workerA, 1)
 	}
@@ -63,6 +68,10 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 		recovery_retry_not_before = now() - interval '1 hour',
 		started_at = now() - interval '3 hours', budget_paused_seconds = 120,
 		updated_at = now() - interval '3 hours' WHERE id = $1`, f.runID, fx.workerA)
+	// A is the claimant now, so it is registered as a live Codex-capable worker (B's shape).
+	env.exec(`UPDATE workers SET protocol_capabilities = $2, last_heartbeat_at = now(),
+		snapshot_register_nonce = 'nonce-A', snapshot_epoch = 0 WHERE id = $1`, fx.workerA,
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
 	fx.workerB = uuid.New()
 	env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities,
 		last_heartbeat_at, snapshot_register_nonce, snapshot_epoch)
@@ -78,7 +87,7 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 // claimant returns worker B as Claim sees it; capable controls recovery_archive_v1.
 func (fx *codexClaimFix) claimant(t *testing.T, capable bool) store.Worker {
 	t.Helper()
-	w := wkrRow(t, fx.env, fx.workerB)
+	w := wkrRow(t, fx.env, fx.workerA)
 	w.ProtocolCapabilities = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
 	if capable {
 		w.ProtocolCapabilities = append(w.ProtocolCapabilities, capability.RecoveryArchiveV1)
@@ -91,13 +100,13 @@ func (fx *codexClaimFix) setAccount(t *testing.T, set string) {
 	fx.env.exec(`UPDATE codex_provider_account SET `+set+` WHERE id = $1`, fx.accountID)
 }
 
-// holdB returns worker B's hold at generation 2 (the one this claim opened), or uuid.Nil.
+// holdB returns the claimant (worker A) hold at generation 2 (the one this claim opened), or uuid.Nil.
 func (fx *codexClaimFix) holdB(t *testing.T) uuid.UUID {
 	t.Helper()
 	var id uuid.UUID
 	// original_worker_id is immutable provenance; a release nulls only the live FKs.
 	err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT id FROM recovery_custody_holds
-		WHERE run_id = $1 AND generation = 2 AND original_worker_id = $2`, fx.runID, fx.workerB).Scan(&id)
+		WHERE run_id = $1 AND generation = 2 AND original_worker_id = $2`, fx.runID, fx.workerA).Scan(&id)
 	if err != nil {
 		return uuid.Nil
 	}
@@ -225,7 +234,7 @@ func TestClaimPreMintQuarantineUsesSnapshotIdentityLiveDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	fx.assertNoClaudeFallback(t, payload)
-	r := fx.assertParked(t, before, fx.workerB)
+	r := fx.assertParked(t, before, fx.workerA)
 	if r.CodexClaimEpoch != claimed.CodexClaimEpoch+1 {
 		t.Fatalf("epoch = %d, want the snapshot epoch %d + 1 (no mint happened)", r.CodexClaimEpoch, claimed.CodexClaimEpoch)
 	}
@@ -255,7 +264,7 @@ func TestClaimQuarantineAfterSuccessfulAssemblyParksLiveDB(t *testing.T) {
 			}}
 			var snap *ActiveSnapshot
 			if withSnapshot {
-				snap = &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: "nonce-B", Active: []ActiveRunEntry{}}
+				snap = &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: "nonce-A", Active: []ActiveRunEntry{}}
 			}
 			payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), snap)
 			if err != nil {
@@ -345,7 +354,7 @@ func TestClaimSameWorkerRemintIsIdleLiveDB(t *testing.T) {
 			var wire string
 			mutate := func() {
 				if tc.remint {
-					wire = env.mintCap(t, fx.runID, fx.workerB)
+					wire = env.mintCap(t, fx.runID, fx.workerA)
 				}
 				fx.setAccount(t, "coord_state = 'quarantined'")
 			}
@@ -361,7 +370,7 @@ func TestClaimSameWorkerRemintIsIdleLiveDB(t *testing.T) {
 				t.Fatalf("Claim = (%v, %v), want idle", payload != nil, err)
 			}
 			if !tc.remint {
-				fx.assertParked(t, before, fx.workerB)
+				fx.assertParked(t, before, fx.workerA)
 				assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
 				return
 			}
@@ -399,7 +408,7 @@ func TestClaimStaleGenerationMintIsFencedLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimRun (generation G): %v", err)
 	}
-	if runAtG.ID != fx.runID || uuid.UUID(runAtG.WorkerID.Bytes) != fx.workerB {
+	if runAtG.ID != fx.runID || uuid.UUID(runAtG.WorkerID.Bytes) != fx.workerA {
 		t.Fatalf("ClaimRun claimed run %s for worker %v, want %s for B", runAtG.ID, runAtG.WorkerID, fx.runID)
 	}
 	// The claim is requeued the way the sweeper does it: status back to queued, worker_id kept.
@@ -500,7 +509,7 @@ func TestClaimAmbiguousMintNoMutationLiveDB(t *testing.T) {
 		wrapJudgeCodexClaimError(errCodexMintAmbiguous),
 	} {
 		payload, err := fx.svc.finishRunClaim(env.ctx, run, nil, cause,
-			claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+			claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 		if payload != nil || !errors.Is(err, errCodexMintAmbiguous) {
 			t.Fatalf("finishRunClaim = (%v, %v), want (nil, errCodexMintAmbiguous)", payload != nil, err)
 		}
@@ -763,13 +772,13 @@ func TestFinishRunClaimHoldCountMatrixLiveDB(t *testing.T) {
 			case tc.extra < 0:
 				env.exec(`DELETE FROM recovery_custody_holds WHERE run_id = $1 AND generation = $2`, fx.runID, run.ClaimGeneration)
 			case tc.extra > 0:
-				claimRecoveryHold(t, env, fx.runID, fx.workerB, run.ClaimGeneration)
+				claimRecoveryHold(t, env, fx.runID, fx.workerA, run.ClaimGeneration)
 			}
 			fx.setAccount(t, "coord_state = 'quarantined'")
 			before := mustRun(t, env, fx.runID)
 			payload, err := fx.svc.finishRunClaim(env.ctx, run, nil,
 				fmt.Errorf("%w: %w", errCredentialUnavailable, ErrCodexAccountQuarantined),
-				claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: tc.capable})
+				claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: tc.capable})
 			if payload != nil {
 				t.Fatal("finishRunClaim delivered a payload")
 			}
@@ -855,7 +864,7 @@ func TestParkedCodexRunRefusesCredentialOpsLiveDB(t *testing.T) {
 		t.Fatalf("Claim = (%v, %v), want idle (parked)", payload != nil, err)
 	}
 	r := mustRun(t, env, fx.runID)
-	if r.Status != "recovery_wait" || r.WorkerID != pgconv.UUID(fx.workerB) {
+	if r.Status != "recovery_wait" || r.WorkerID != pgconv.UUID(fx.workerA) {
 		t.Fatalf("status=%s worker=%v, want recovery_wait on B", r.Status, r.WorkerID)
 	}
 	// Recover the account, so only the revoked capability can explain a refusal.
