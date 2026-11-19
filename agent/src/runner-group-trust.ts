@@ -41,8 +41,19 @@ type Identity = { label: string; uid: number; gid: number };
 const RUNNER_ID: Identity = { label: "runner", uid: RUNNER_UID, gid: RUNNER_UID };
 const COMMAND_ID: Identity = { label: "runner_cmd", uid: COMMAND_UID, gid: COMMAND_UID };
 
+/** Every value this module issued. The brand is type-only, so a consumer that grants an allowance checks
+ *  membership here ({@link isIssuedManagedBareGroupTrust}): a cast object literal is never trusted. */
+const issued = new WeakSet<object>();
+
 function build(value: { state: "trusted"; gid: number } | { state: "off"; reason: string }): ManagedBareGroupTrust {
-  return Object.freeze({ ...value }) as unknown as ManagedBareGroupTrust;
+  const out = Object.freeze({ ...value });
+  issued.add(out);
+  return out as unknown as ManagedBareGroupTrust;
+}
+
+/** True only for a value built by this module (the probe or the test factory). */
+export function isIssuedManagedBareGroupTrust(value: unknown): value is ManagedBareGroupTrust {
+  return typeof value === "object" && value !== null && issued.has(value);
 }
 
 function off(reason: string): ManagedBareGroupTrust {

@@ -2052,7 +2052,8 @@ Class (a) is a worker-trusted launch of a trusted binary. Class (b) is an untrus
 
 | Site | Launches | Class | Wrapper |
 |---|---|---|---|
-| `runner-uid.ts` `runnerSpawn` | any runner command; its sole caller is `sdk-spawn.ts` `spawnDetached`, the SDK CLI for every executor | b | `runnerCommand` |
+| `runner-uid.ts` `runnerSpawn` | any runner command; callers `sdk-spawn.ts` `spawnDetached` (the SDK CLI for every executor) and `env-probe.ts` `spawnRunnerProbe` | b | `runnerCommand` |
+| `env-probe.ts` `spawnRunnerProbe` | run-start environment probe as the runner | b | `runnerSpawn` (`runnerCommand`) |
 | `runner-uid.ts` kill helpers | `setpriv … kill` | a | `setprivArgsForUid` |
 | `provision.ts` `defaultRun` | devbox/nix, provision hooks | b | `runnerCommand` |
 | `provision.ts` `defaultPathProbe` | fixed worker-authored PATH probe script | a | identity chosen by the caller |

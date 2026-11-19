@@ -703,15 +703,16 @@ async function mainBody(): Promise<void> {
   const memory = config.memoryGuard?.enabled
     ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
     : undefined;
-  // Issue #3404 M2 U3: the authority runtime over the W capability acquired at startup. Every
-  // production path that reaches a hooked GitCache effect opens its transaction through it.
-  const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
-  // Probed once per process, outside any epoch scope, before the GitCache is built and before
+  // Probed once per process, outside any epoch scope, before the authority runtime and GitCache are built (so the
+  // shutdown snapshot never sees an authority without its GitCache) and before
   // runPodEpochShadow. Never throws; anything unproven yields state "off".
   const managedBareGroupTrust = await probeRunnerGroupTrust();
   log.info("managed_bare_group_trust", managedBareGroupTrust.state === "trusted"
     ? { state: managedBareGroupTrust.state, gid: managedBareGroupTrust.gid }
     : { state: managedBareGroupTrust.state, reason: managedBareGroupTrust.reason });
+  // Issue #3404 M2 U3: the authority runtime over the W capability acquired at startup. Every
+  // production path that reaches a hooked GitCache effect opens its transaction through it.
+  const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
   const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority, managedBareGroupTrust);
   shutdownAuthority = authority;
   shutdownGit = git;

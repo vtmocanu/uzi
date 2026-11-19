@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import { managedBareGroupTrustForTest, probeRunnerGroupTrust, type RunnerGroupTrustDeps } from "../src/runner-group-trust.js";
+import { isIssuedManagedBareGroupTrust, managedBareGroupTrustForTest, probeRunnerGroupTrust, type RunnerGroupTrustDeps } from "../src/runner-group-trust.js";
 
 type Status = Partial<Record<string, string | null>>;
 
@@ -101,25 +101,28 @@ test("the test factory runs the same evaluator", () => {
   assert.equal(bad.state, "off");
 });
 
-for (const [name, runnerS, cmdS] of [
-  ["worker gid in runner Groups", runnerOk({ Groups: "10001 10002" }), cmdOk()],
-  ["worker gid in runner-cmd Groups", runnerOk(), cmdOk({ Groups: "10002 10001" })],
-  ["CapEff non-zero", runnerOk({ CapEff: "0000000000000080" }), cmdOk()],
-  ["CapPrm non-zero", runnerOk(), cmdOk({ CapPrm: "0000000000000001" })],
-  ["CapInh non-zero", runnerOk({ CapInh: "0000000000000040" }), cmdOk()],
-  ["CapAmb non-zero", runnerOk(), cmdOk({ CapAmb: "0000000000000040" })],
-  ["CapBnd other value", runnerOk({ CapBnd: "000001ffffffffff" }), cmdOk()],
-  ["NoNewPrivs 0", runnerOk(), cmdOk({ NoNewPrivs: "0" })],
-  ["fs uid mismatch", runnerOk({ Uid: "10002\t10002\t10002\t10001" }), cmdOk()],
-  ["fs gid mismatch", runnerOk(), cmdOk({ Gid: "10003\t10003\t10003\t10001" })],
-  ["gid field holds worker gid", runnerOk({ Gid: "10001\t10002\t10002\t10002" }), cmdOk()],
-  ["missing line", runnerOk({ NoNewPrivs: null }), cmdOk()],
-  ["duplicate line", runnerOk() + "NoNewPrivs:\t1\n", cmdOk()],
-  ["unparsable cap", runnerOk({ CapEff: "zz" }), cmdOk()],
+for (const [name, runnerS, cmdS, reason] of [
+  ["worker gid in runner Groups", runnerOk({ Groups: "10001 10002" }), cmdOk(), "runner_worker_gid_present"],
+  ["worker gid in runner-cmd Groups", runnerOk(), cmdOk({ Groups: "10002 10001" }), "runner_cmd_worker_gid_present"],
+  ["CapEff non-zero", runnerOk({ CapEff: "0000000000000080" }), cmdOk(), "runner_CapEff"],
+  ["CapPrm non-zero", runnerOk(), cmdOk({ CapPrm: "0000000000000001" }), "runner_cmd_CapPrm"],
+  ["CapInh non-zero", runnerOk({ CapInh: "0000000000000040" }), cmdOk(), "runner_CapInh"],
+  ["CapAmb non-zero", runnerOk(), cmdOk({ CapAmb: "0000000000000040" }), "runner_cmd_CapAmb"],
+  ["CapBnd other value", runnerOk({ CapBnd: "000001ffffffffff" }), cmdOk(), "runner_CapBnd"],
+  ["NoNewPrivs 0", runnerOk(), cmdOk({ NoNewPrivs: "0" }), "runner_cmd_NoNewPrivs"],
+  ["fs uid mismatch", runnerOk({ Uid: "10002\t10002\t10002\t10001" }), cmdOk(), "runner_uid"],
+  ["fs gid mismatch", runnerOk(), cmdOk({ Gid: "10003\t10003\t10003\t10001" }), "runner_cmd_gid"],
+  ["three-field Uid line", runnerOk({ Uid: "10002\t10002\t10002" }), cmdOk(), "runner_uid"],
+  ["five-field Gid line", runnerOk(), cmdOk({ Gid: "10003\t10003\t10003\t10003\t10003" }), "runner_cmd_gid"],
+  ["real gid field holds worker gid", runnerOk({ Gid: "10001\t10002\t10002\t10002" }), cmdOk(), "runner_gid"],
+  ["missing line", runnerOk({ NoNewPrivs: null }), cmdOk(), "runner_NoNewPrivs_missing"],
+  ["duplicate line", runnerOk() + "NoNewPrivs:\t1\n", cmdOk(), "runner_NoNewPrivs_duplicate"],
+  ["unparsable cap", runnerOk({ CapEff: "zz" }), cmdOk(), "runner_CapEff_unparsable"],
 ] as const) {
   test(`off: ${name}`, async () => {
     const { result } = await withSplitEnv(() => probe([{ stdout: runnerS }, { stdout: cmdS }]));
     assert.equal(result.state, "off");
+    assert.equal(result.state === "off" ? result.reason : undefined, reason);
   });
 }
 
@@ -182,4 +185,29 @@ test("off: worker gid is not 10001, nothing spawned", async () => {
 test("off: worker uid is not 10001", async () => {
   const { result } = await withSplitEnv(() => probe(clean(), { getuid: () => 0 }));
   assert.equal(result.state, "off");
+});
+
+test("only module-issued values are recognised; a cast literal is not", async () => {
+  const { result } = await withSplitEnv(() => probe([{ stdout: runnerOk() }, { stdout: cmdOk() }]));
+  assert.equal(isIssuedManagedBareGroupTrust(result), true);
+  assert.equal(isIssuedManagedBareGroupTrust({ state: "trusted", gid: 10001 }), false);
+  assert.equal(isIssuedManagedBareGroupTrust(Object.freeze({ ...result })), false);
+});
+
+test("no production module imports the test factory", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const root = new URL("../src/", import.meta.url).pathname;
+  const hits: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(ts|mts|mjs|js)$/.test(e.name) && !p.endsWith(path.join("src", "runner-group-trust.ts")) &&
+        fs.readFileSync(p, "utf8").includes("managedBareGroupTrustForTest")) hits.push(p);
+    }
+  };
+  walk(root);
+  assert.ok(fs.readFileSync(path.join(root, "runner-group-trust.ts"), "utf8").includes("managedBareGroupTrustForTest"), "scan target exists");
+  assert.deepEqual(hits, []);
 });
