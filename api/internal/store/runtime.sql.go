@@ -3393,7 +3393,7 @@ WHERE w.user_id = $1
 `
 
 // PRD #4320 module 5: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
-// 'claude_provider_v1' PROTOCOL capability. It drives the queued-reason resolver's provider rung
+// 'claude_provider_v1' PROTOCOL capability (the worker advertises it since #4505). It drives the queued-reason resolver's provider rung
 // (reasonNoProviderCapableWorker): a 0 here for a PROVIDER-BOUND queued run (model_provider_key_mode
 // set) means every online worker predates provider claims, so ClaimRun's NON-BYPASSABLE provider clause
 // ('claude_provider_v1' = ANY(@worker_protocol_caps)) can never be satisfied. Same filters as
@@ -16325,10 +16325,6 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
-  -- PRD #4320: provider execution is not activated: ephemeral images do not advertise
-  -- claude_provider_v1. Lift this exclusion when activation lands. Until then a pod
-  -- could never claim this run and would consume its unique slot and the owner's cap.
-  AND r.model_provider_key_mode IS NULL
   -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
   AND NOT COALESCE(
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
@@ -16373,7 +16369,10 @@ WHERE r.status = 'queued'
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   -- PRD #4173: a run on a LINKED repo is demand too: with no worker reporting issue_key_v1 online,
   -- only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
+  -- PRD #4320 / #4505: a provider-bound run (model_provider_key_mode set) is demand too. Provider
+  -- execution is activated, so a fresh ephemeral worker can claim it; fn_placement_admitting_workers'
+  -- provider clause (migration 00486) lets an online capable idle worker suppress it below.
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
 
   -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
   -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand

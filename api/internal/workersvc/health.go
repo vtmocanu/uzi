@@ -258,10 +258,11 @@ const (
 	// 'claude_provider_v1' protocol capability. Like reasonNoCodexCapableWorker it names a
 	// NON-BYPASSABLE block: ClaimRun's dedicated provider clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so the run waits until a worker that
-	// supports provider claims comes online (the hosted fleet is pinned separately from the app tier,
-	// so provider runs need the next worker roll). Maps to the SAME healthWaitingWorker enum
+	// supports provider claims comes online. Provider execution is activated (#4505): current worker
+	// images advertise the capability, so this names only a fleet of older images (the hosted fleet
+	// is pinned separately from the app tier). Maps to the SAME healthWaitingWorker enum
 	// (runs.health_reason is free text).
-	reasonNoProviderCapableWorker = "no worker that supports model providers is online; waiting for a worker roll"
+	reasonNoProviderCapableWorker = "no worker that supports model providers is online"
 	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a

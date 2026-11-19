@@ -106,9 +106,11 @@ func claimsAfterWake(fx *fleetFixture, worker, run uuid.UUID, allow []uuid.UUID,
 	var claimed store.Run
 	if chat {
 		claimed, err = fx.q.ClaimChatRun(fx.ctx, store.ClaimChatRunParams{
-			WorkerID:       pgtype.UUID{Bytes: worker, Valid: true},
-			UserID:         fx.userID,
-			AffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Hour), Valid: true},
+			WorkerID:           pgtype.UUID{Bytes: worker, Valid: true},
+			UserID:             fx.userID,
+			IsEphemeral:        wkr.Ephemeral,
+			WorkerProtocolCaps: wkr.ProtocolCapabilities,
+			AffinityCutoff:     pgtype.Timestamptz{Time: now.Add(-2 * time.Hour), Valid: true},
 		})
 	} else {
 		claimed, err = fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
@@ -206,6 +208,47 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 			}, want: true,
 		},
 		{name: "chat run", chat: true, setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedChat(fx) }, want: true},
+		// PRD #4320 / #4505: a provider-bound chat wakes only a worker advertising claude_provider_v1,
+		// mirroring ClaimChatRun's provider clause; a vendor chat is unchanged.
+		{
+			name: "provider-bound chat, capable hibernated worker", chat: true,
+			opts: wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := queuedChat(fx)
+				bindRunToProvider(fx, id, "wake-chat-capable")
+				return id
+			}, want: true,
+		},
+		{
+			name: "provider-bound chat, incapable hibernated worker", chat: true,
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := queuedChat(fx)
+				bindRunToProvider(fx, id, "wake-chat-incapable")
+				return id
+			}, want: false,
+		},
+		{
+			name: "vendor chat, capable hibernated worker", chat: true,
+			opts:  wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedChat(fx) }, want: true,
+		},
+		{
+			name: "provider-bound run, capable hibernated worker",
+			opts: wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := fx.queuedRun()
+				bindRunToProvider(fx, id, "wake-run-capable")
+				return id
+			}, want: true,
+		},
+		{
+			name: "provider-bound run, incapable hibernated worker",
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				id := fx.queuedRun()
+				bindRunToProvider(fx, id, "wake-run-incapable")
+				return id
+			}, want: false,
+		},
 		{
 			name: "cross-check child, legacy run-lane worker", opts: wakeWorkerOpts{protocol: checkerProtocol},
 			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedPlanChecker(fx) }, want: true,
