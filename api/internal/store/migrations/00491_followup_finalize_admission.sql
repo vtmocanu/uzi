@@ -30,6 +30,8 @@ ALTER TABLE runs
 --     snapshot re-adopt of a stale-requeued park (ReadoptRunsFromSnapshot /
 --     FrozenReadoptRunsFromSnapshot, status = a.phase), and the worker still holds the seq from that
 --     park's ACK, so the seq must survive the requeue like the other follow-up identity columns.
+--     A run never numbered yet (seq 0: a first park reported onto a stale-requeued row, or the
+--     re-adopt of one) still gets its first seq.
 -- Ordering: BEFORE UPDATE row triggers on runs fire in trigger-name order. Every BEFORE UPDATE
 -- trigger on runs only validates or normalizes NEW (none writes another row, PERFORMs or NOTIFYs),
 -- so skipping the row discards nothing but in-memory edits of the triggers that sorted before this
@@ -48,7 +50,8 @@ BEGIN
         RETURN NULL;
     ELSIF NEW.status = 'awaiting_followup'
           AND ((OLD.status <> 'awaiting_followup'
-                AND NOT (OLD.status = 'queued' AND NEW.claim_generation = OLD.claim_generation))
+                AND NOT (OLD.status = 'queued' AND NEW.claim_generation = OLD.claim_generation
+                         AND OLD.followup_park_seq > 0))
                OR COALESCE(NEW.open_followup_id, 0) > COALESCE(OLD.open_followup_id, 0)) THEN
         NEW.followup_park_seq := OLD.followup_park_seq + 1;
     END IF;

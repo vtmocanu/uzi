@@ -148,6 +148,27 @@ func TestFollowupParkSeqLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("a first park onto a stale-requeued row still gets a seq and admits", func(t *testing.T) {
+		id := f.ffNewTask()
+		f.exec(`UPDATE runs SET status = 'queued', stale_requeue_generation = claim_generation WHERE id = $1`, id)
+		run := f.ffPark(id, 1, nil)
+		if run.FollowupParkSeq <= 0 {
+			t.Fatalf("first park onto a queued row: seq = %d, want > 0", run.FollowupParkSeq)
+		}
+		if _, applied, err := f.ffFinalize(id, 1, run.FollowupParkSeq); err != nil || !applied {
+			t.Fatalf("finalize = (applied %v, err %v)", applied, err)
+		}
+	})
+
+	t.Run("a re-adopt of a never-numbered park allocates its first seq", func(t *testing.T) {
+		id := f.ffNewTask()
+		f.exec(`UPDATE runs SET status = 'queued' WHERE id = $1`, id)
+		f.exec(`UPDATE runs SET status = 'awaiting_followup' WHERE id = $1`, id)
+		if got := f.ffRow(id).parkSeq; got != 1 {
+			t.Fatalf("re-adopt of a never-numbered park: seq = %d, want 1", got)
+		}
+	})
+
 	t.Run("park allocates a positive seq; the same park retried keeps it", func(t *testing.T) {
 		id := f.ffNewTask()
 		first := f.ffPark(id, 1, nil)
