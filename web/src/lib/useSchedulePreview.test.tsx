@@ -110,7 +110,33 @@ describe("useSchedulePreview", () => {
     expect(result.current.status).toBe("ready");
   });
 
-  it("A to B to A within the debounce never shows a stale ready", async () => {
+  it("a superseded in-flight response for the same key does not publish after A to B to A", async () => {
+    const a1 = deferred<ScheduleSettingsPreview>();
+    const a2 = deferred<ScheduleSettingsPreview>();
+    previewScheduleSettings.mockReturnValueOnce(a1.promise).mockReturnValueOnce(new Promise(() => {})).mockReturnValueOnce(a2.promise);
+    const { result, rerender } = setup({ req: reqA });
+    await flush();
+    rerender({ req: reqB });
+    await flush();
+    rerender({ req: reqA });
+    await flush();
+    expect(previewScheduleSettings).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      a1.resolve(respB);
+      await Promise.resolve();
+    });
+    await flush();
+    expect(result.current.status).toBe("loading");
+    await act(async () => {
+      a2.resolve(respA);
+      await Promise.resolve();
+    });
+    await flush();
+    expect(result.current.status).toBe("ready");
+    expect(result.current.preview).toBe(respA);
+  });
+
+  it("A to B to A within the debounce window never shows a stale ready", async () => {
     previewScheduleSettings.mockResolvedValue(respA);
     const { result, rerender } = setup({ req: reqA }, 100);
     await flush(100);

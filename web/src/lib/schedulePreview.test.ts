@@ -104,6 +104,25 @@ describe("schedulePreviewView specifics", () => {
     expect(w.refusal).toBe(scheduleRefusalLabel("no_credential_for_harness"));
   });
 
+  it("schedule-only refusals use the shared wording", () => {
+    expect(scheduleRefusalLabel("invalid_model")).toBe("This model ID is not valid");
+    expect(scheduleRefusalLabel("codex_override_conflict")).toBe("A Codex run cannot use an Anthropic token override");
+    expect(scheduleRefusalLabel("codex_pool_unavailable")).toBe("No eligible Codex account in the auto-select pool");
+  });
+
+  it("server text in effort, credential kind and harness names is stripped", () => {
+    const bidi = "‮";
+    const p = fixture("default", "sweep pinned to claude with subagents following the lead");
+    p.worker_effort = { ...p.worker_effort!, mode: "explicit", resolved_effort: `hi${bidi}gh` };
+    p.credential = { ...p.credential!, kind: `x${bidi}y` } as typeof p.credential;
+    p.harness = { ...p.harness!, value: `cl${bidi}aude` } as typeof p.harness;
+    const v = schedulePreviewView(p);
+    expect(v.effort?.value).toBe("high");
+    expect(v.credential?.value.startsWith("Xy")).toBe(true);
+    expect(v.harness?.value).toBe("Claude");
+    expect(defaultModelChipSuffix(p)).toContain(" on Claude ");
+  });
+
   it("subagents: follow the lead and own pins", () => {
     const follow = schedulePreviewView(fixture("default", "sweep pinned to claude with subagents following the lead"));
     expect(follow.subagents).toMatchObject({ mode: "follow the lead", lead: "opus", pins: [], more: false });
@@ -164,6 +183,19 @@ describe("defaultModelChipSuffix", () => {
     );
     p.alternatives![0] = { ...a, worker_model: null, refusal: "no_usable_credential" };
     expect(defaultModelChipSuffix(p)).toBeNull();
+  });
+
+  it("a schedule-pinned model is not described as the Default", () => {
+    const p = fixture("default", "sweep pinned to claude with subagents following the lead");
+    p.worker_model!.source = "schedule_pin";
+    expect(defaultModelChipSuffix(p)).toBeNull();
+
+    const q = fixture("default", "unpinned sweep");
+    const [a, b] = q.alternatives!;
+    q.alternatives![0] = { ...a, worker_model: { ...a.worker_model!, source: "schedule_pin" } };
+    expect(defaultModelChipSuffix(q)).toBe(
+      `now ${b.worker_model!.resolved_model} on Codex (predicted, harness chosen when it fires)`,
+    );
   });
 
   it("refused or missing model gives null", () => {

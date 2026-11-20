@@ -25,10 +25,10 @@ type ScheduleRefusal = NonNullable<ScheduleSettingsPreview["refusal"]>;
 // union, so a new server token fails the typecheck here.
 const SCHEDULE_REFUSAL_LABELS: Record<ScheduleRefusal, string> = {
   ...REFUSAL_LABELS,
-  invalid_model: "This model is not valid for a schedule",
+  invalid_model: "This model ID is not valid",
   credential_override_lane_not_switchable: "This kind of run cannot use a different token",
-  codex_override_conflict: "The token choice conflicts with the Codex credential",
-  codex_pool_unavailable: "No Codex credential is available right now",
+  codex_override_conflict: "A Codex run cannot use an Anthropic token override",
+  codex_pool_unavailable: "No eligible Codex account in the auto-select pool",
 };
 
 export function scheduleRefusalLabel(refusal: ScheduleRefusal): string {
@@ -134,6 +134,11 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+// harnessName renders a server harness token as display text.
+function harnessName(h: string): string {
+  return capitalize(stripUnsafeChars(h));
+}
+
 function timingFor(source: string, fixedAt: string): string {
   if (source === "schedule_pin") return "pinned · fixed when it fires";
   if (fixedAt === "create") return "predicted · fixed when it fires";
@@ -166,7 +171,7 @@ function effortRow(cell: EffectiveEffortCell | null): ValueRow | null {
   if (cell.mode === "runtime_default" || cell.resolved_effort === null) {
     value = cell.harness === "codex" ? codexRuntimeDefaultLabel(cell) : "Runtime default";
   } else {
-    value = cell.resolved_effort;
+    value = stripUnsafeChars(cell.resolved_effort);
   }
   return {
     value,
@@ -177,7 +182,7 @@ function effortRow(cell: EffectiveEffortCell | null): ValueRow | null {
 
 function credentialRow(c: Credential | null): ValueRow | null {
   if (!c) return null;
-  const kind = c.kind === "anthropic" ? "Anthropic" : c.kind === "codex" ? "Codex" : capitalize(c.kind);
+  const kind = c.kind === "anthropic" ? "Anthropic" : c.kind === "codex" ? "Codex" : capitalize(stripUnsafeChars(c.kind));
   const mode = c.auth_mode === "subscription" ? " · subscription" : c.auth_mode === "api_key" ? " · API key" : "";
   return {
     value: `${kind}${mode}`,
@@ -198,7 +203,7 @@ function subagentsView(s: EffectiveSubagents | null): SubagentsView | null {
 }
 
 function branchView(a: ScheduleAlternative): ScheduleBranchView {
-  const harness = capitalize(a.harness);
+  const harness = harnessName(a.harness);
   if (a.refusal) {
     return { harness, refusal: scheduleRefusalLabel(a.refusal), model: null, effort: null, credential: null, subagents: null };
   }
@@ -218,7 +223,7 @@ export function schedulePreviewView(preview: ScheduleSettingsPreview): ScheduleP
   const hv = preview.harness;
   const harness: HarnessRow | null = hv
     ? {
-        value: hv.value === null ? null : capitalize(hv.value),
+        value: hv.value === null ? null : harnessName(hv.value),
         chosenAtCreate: hv.value === null,
         source: modelSettingSourceLabel("harness", hv.source),
         timing: timingFor(hv.source, hv.fixed_at),
@@ -230,7 +235,7 @@ export function schedulePreviewView(preview: ScheduleSettingsPreview): ScheduleP
     ignored && preview.worker_model
       ? {
           pin: stripUnsafeChars(ignored.value),
-          harness: hv?.value ?? null,
+          harness: hv?.value == null ? null : stripUnsafeChars(hv.value),
           fallback: model?.value ?? "",
           fallbackSource: model?.source ?? null,
         }
@@ -249,19 +254,21 @@ export function schedulePreviewView(preview: ScheduleSettingsPreview): ScheduleP
 }
 
 // defaultModelChipSuffix is the prediction appended to the "Default" model option, or null when
-// there is nothing to say (refused, or no model to show).
+// there is nothing to say (refused, no model to show, or the model is a schedule pin, which the
+// chip must not describe as the Default).
 export function defaultModelChipSuffix(preview: ScheduleSettingsPreview): string | null {
   if (preview.refusal || !preview.harness) return null;
   if (preview.harness.value !== null) {
+    if (preview.worker_model?.source === "schedule_pin") return null;
     const model = modelRow(preview.worker_model);
     if (!model) return null;
-    return `now ${model.value} on ${capitalize(preview.harness.value)} (predicted)`;
+    return `now ${model.value} on ${harnessName(preview.harness.value)} (predicted)`;
   }
   const parts: string[] = [];
   for (const a of preview.alternatives ?? []) {
-    if (a.refusal) continue;
+    if (a.refusal || a.worker_model?.source === "schedule_pin") continue;
     const model = modelRow(a.worker_model);
-    if (model) parts.push(`${model.value} on ${capitalize(a.harness)}`);
+    if (model) parts.push(`${model.value} on ${harnessName(a.harness)}`);
   }
   if (parts.length === 0) return null;
   return `now ${parts.join(" or ")} (predicted, harness chosen when it fires)`;

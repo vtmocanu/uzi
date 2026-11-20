@@ -44,6 +44,8 @@ export function useSchedulePreview(
     currentKey.current = key;
   }, [key]);
 
+  // Relies on the requestRef effect above having run first: passive effects run in declaration
+  // order, so requestRef.current is already this render's request here.
   useEffect(() => {
     const req = requestRef.current;
     if (key === null || !req) return;
