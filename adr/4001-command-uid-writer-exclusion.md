@@ -1,6 +1,6 @@
 # ADR-4001: command-uid writer exclusion for the retained predecessor FINAL — an opt-in, kube-rendered Docker-free, restricted-posture compound proof for Claude predecessors
 
-**Status**: Proposed contract, incomplete. Nine owner decisions (D1 to D9) are approved and recorded here. Five items (P-1 to P-5) are recommendations or open problems pending owner decision or a missing mechanism, and are NOT approved. The retained predecessor FINAL pass stays disabled in production (`command_uid_unproven`) until P-1 to P-5 are resolved and a separate implementation issue lands and is verified.
+**Status**: Proposed contract, incomplete. Nine owner decisions (D1 to D9) are approved and recorded here. Six items (P-1 to P-6) are recommendations or open problems pending owner decision or a missing mechanism, and are NOT approved. The retained predecessor FINAL pass stays disabled in production (`command_uid_unproven`) until P-1 to P-6 are resolved and a separate implementation issue lands and is verified.
 **Date**: 2026-11-20
 **Issue**: [vtmocanu/uzi#4001](https://github.com/vtmocanu/uzi/issues/4001)
 **Refs**: #2969, #3992, #3851, #3831, #3431, #1862, #4007, #4162, #4494, #1934
@@ -93,7 +93,7 @@ posture is needed.
 
 D1 to D9 were each answered by the owner through this run's ask_user
 gates on 2026-11-20, with the answer recorded as "owner decision via lead
-and buddy". The later checker-raised questions (P-1 to P-5) reached no human
+and buddy". The later checker-raised questions (P-1 to P-6) reached no human
 and are not decided.
 
 **D1. Opt-in posture approved.**
@@ -189,10 +189,12 @@ predecessors only.**
     posture. The controller refuses any non-posture render on it, or such a
     render invalidates the genesis row so every later container is refused.
     Stickiness is enforced by the controller branch only: a worker-side
-    history check cannot detect an incarnation whose record write failed,
-    because boundary records are read by name and nothing lists all
-    incarnations. The P-5 per-incarnation server registration, once built,
-    is the listing source a history check would need.
+    history check can enumerate the attestation directory (which first-
+    container eligibility and leftover-tmp recovery need), but a non-posture
+    incarnation writes no attestation, so its existence is not visible
+    there. The P-5 per-incarnation server registration, once built, is the
+    listing source for that. (Post-approval correction narrowing an overclaim
+    in D7's consequences; not new owner content.)
   - Missing, unreadable or contradictory history refuses pre-entry.
 
 **D8. ReadWriteOncePod.**
@@ -260,7 +262,10 @@ Recorded consequences:
 
 ### P-1. The runner-uid alias route
 
-**Recommendation:** attribute it to residual (e).
+**Recommendation:** an owner decision in two parts. (i) Accept other runs'
+marked runner-uid agents' direct writes to T into the runner-uid residual
+(row (e')). (ii) Accept the alias and rename routes below. Part (ii)'s
+argument depends on part (i).
 
 **The routes.**
 1. A runner-uid process outside T hardlinks a runner-owned T file into a live
@@ -289,7 +294,8 @@ process can already write T directly with the same effect. Adopting this
 recommendation explicitly overrides the issue's rule that the runner-uid
 residual "never exempts a command-uid writer" for these routes, and widens the
 residual's described scope to other runs' marked runner-uid agents. It is not
-a restatement of the existing residual.
+a restatement of the existing residual. For marked agents the "can already
+write T directly" argument holds only once part (i) is accepted.
 
 **Alternative.** Keep the gate until runner-uid processes can be confined.
 
@@ -424,16 +430,30 @@ established for this path, and it stays gated under D9's fallback.
   an owner decision:
   - the root entrypoint's writes, which run before any node code (TCB writes:
     root, fixed code, but B activity under D9.2);
-  - worker-uid startup passes in `agent/src/main.ts` that run before
-    registration (today in `worker.run()`): pod-epoch consume and reclaim,
-    HOME reclaim and the job-workspace reap.
+  - startup passes in `main()` (`agent/src/main.ts`) that run before
+    registration, which today happens inside `worker.run()`. A starting
+    point, not exhaustive: pod-epoch consume and reclaim, the boundary-record
+    write, outbox initialisation, HOME reclaim, the job-workspace reap, the
+    startup Codex orphan reaper (a uid-10003 launch) and the retire-scratch
+    reclaim.
+
+### P-6. Replication durability of the server fence
+
+The fence's durability claims hold only if no ACKed commit can be lost on
+failover. The API cannot verify replication topology or `fsync` by itself
+(see Server durability). Candidate mechanism: forced `synchronous_commit`,
+a post-commit, pre-ACK check that a synchronous standby has flushed past the
+commit LSN (ACK withheld otherwise), and controller or HA-manager evidence
+for the single-instance case and the promotion set, as named trust.
+**Recommendation:** adopt the mechanism and accept the topology and `fsync`
+trust as an owner decision. **Alternative:** keep the gate.
 
 ## Mechanism: the compound proof (requirement 1)
 
 **Invariant.** On an eligible worker, from pre-entry through the release ACK,
 no uid-10003 process can change the content, the tracked mode or the
 namespace (create, rename, unlink) of any entry of a Claude T. This is subject
-to P-1 to P-5. It rests on four facts:
+to P-1 to P-6. It rests on four facts:
 - **(i)** Confined uid-10003 domains have rule inodes that do not overlap T.
   This covers commands, fileop, checker fileop, and the app-server once it is
   confined.
@@ -640,9 +660,8 @@ which is availability, never an integrity loss.
   - compose and Docker-capable lanes are ineligible;
   - a single-uid worker has no command uid, which the implementation must
     establish, else the worker is ineligible.
-- Postgres `fsync=on` and `synchronous_commit=on`, plus a single instance
-  or synchronous replication covering every promotable standby (see Server
-  durability).
+- Postgres durability and replication topology as in Server durability,
+  resting on pending P-6.
 - CSI provisioning freshness (P-3, pending).
 
 ## Durability, serialization and recovery
@@ -741,33 +760,41 @@ lock.
   (`deploy/values/ci-render.yaml` sets three), and replication is
   asynchronous unless synchronous replicas are configured. With asynchronous
   replication a failover can lose a committed supersession, release or
-  genesis row after its ACK was sent. The posture therefore requires a single
-  instance or synchronous replication whose quorum covers every standby that
-  failover may promote (or failover limited to synchronous standbys).
-  A settings `SHOW` cannot verify this: async replicas and a single instance
-  both show an empty `synchronous_standby_names`, and a reload between the
-  `SHOW` and the commit reopens a check-then-commit window. So:
-  - topology is checked from replication state (`pg_stat_replication`
-    `sync_state`) or controller-read cluster evidence, not from settings;
-  - each fence transaction forces `SET LOCAL synchronous_commit = on` rather
-    than checking it;
-  - whether a quorum can still lose an ACKed commit on failover is a hosted
-    owner-acceptance item.
+  genesis row after its ACK was sent. The posture therefore requires that no
+  ACKed fence commit can be lost on failover: a single instance, or
+  synchronous replication whose quorum covers every standby that failover may
+  promote. The API cannot verify that by itself:
+  - a settings `SHOW` cannot tell async replicas from a single instance, and
+    `fsync` or `synchronous_standby_names` can change by reload after any
+    check;
+  - `pg_stat_replication` lists only connected standbys, so a disconnected or
+    lagging promotable standby, a cascading standby or storage-level
+    replication looks like a single instance;
+  - which standbys may be promoted is decided by the HA manager, not by
+    Postgres.
+
+  This is pending item P-6. The candidate mechanism: each fence transaction
+  forces `SET LOCAL synchronous_commit = on`; for the replicated case the API
+  confirms after commit and before the ACK that a synchronous standby's
+  `flush_lsn` has reached the commit LSN, and withholds the ACK otherwise;
+  single-instance or promotion-set evidence comes from the controller or HA
+  manager as named trust. `fsync` cannot be forced per transaction and is
+  covered only by that trust.
 - **Storage or power loss.**
   - This relies on Postgres `fsync=on` and `synchronous_commit=on`.
   - These are defaults: no override was found in the chart values, the compose
     file or the store package, though that search was not exhaustive.
-  - The implementation verifies `fsync` at API startup and forces
-    `synchronous_commit` per fence transaction, and otherwise refuses to
-    enable the posture.
+  - The implementation forces `synchronous_commit` per fence transaction. The
+    `fsync` setting and replication topology rest on P-6, and the posture
+    refuses where that evidence is missing.
 
 **Recovered state.**
 - **Before commit:** nothing changed.
 - **After commit, before ACK:** a retry keyed by pod UID, effect key, release
   key or PVC UID returns the stored result.
 
-**Verification:** crash-between-commit-and-ack injection, plus the settings
-check.
+**Verification:** crash-between-commit-and-ack injection, the forced
+`synchronous_commit`, and the P-6 post-commit standby-flush check.
 
 **Not claimed:** a process-crash test is not proof of power-loss durability.
 
@@ -835,7 +862,7 @@ Absence is never inferred.
 | Server generation | Superseded, not current |
 | Release fence | Refusal (STOP) |
 | Committed release replay | Returns the original ACK, never "custody kept" |
-| Postgres durability settings and replication topology | Not verified, or topology not single-instance or covered synchronous |
+| Replication durability (P-6) | Missing controller or HA evidence, or no synchronous standby flush past the commit LSN before ACK (the ACK is withheld) |
 | Unorderable lane or startup path | Gated |
 
 ## Authority (requirement 4)
@@ -851,8 +878,9 @@ Absence is never inferred.
   named.
 - **Server mechanisms.** The server fence, lease and genesis only add
   refusals and waits.
-- **Owner-approved:** D1 to D9 (those adding or bounding authority: D1, D2, D5, D7, D8, D9).
-- **Pending:** P-1 to P-5.
+- **Owner-approved:** D1 to D9. D8 requires a PV read whose authority is
+  pending under P-4.
+- **Pending:** P-1 to P-6.
 
 ## Authority interface (requirement 9)
 
@@ -958,7 +986,7 @@ under today's contracts. #4494 Direction 1 motivates it but supplies nothing.
   `clock_timestamp()`.
 - **Chosen:** the opt-in restricted posture with seccomp descriptor closure.
 
-D1 to D9 are owner-approved. P-1 to P-5 are recommendations or open
+D1 to D9 are owner-approved. P-1 to P-6 are recommendations or open
 problems, pending owner decision or a missing mechanism. The production gate
 stays.
 
@@ -1023,7 +1051,10 @@ may already hold on base.
 - A posture-off render on a genesis PVC refused, or invalidating genesis.
 - A non-tokened predecessor FINAL refused; a replay key with a different
   digest refused.
-- A fence transaction under changed `synchronous_commit` refused.
+- A fence transaction runs with `synchronous_commit = on` even when the
+  session, role or database default is off.
+- An ACK is withheld when no synchronous standby has flushed past the commit
+  LSN, including a topology change between check and commit (P-6).
 - The synchronized open-then-unlink alias race (P-1), documented per its
   outcome.
 - The synchronized row-lock races above, including a lock held across
@@ -1063,6 +1094,8 @@ literal leaves, `run.sh` invocations, and `lint:shell`.
 **Prerequisite.** Each pending item is closed and recorded as an amendment to
 this ADR:
 - P-1, P-3 and P-4 by owner decision;
+- P-6 by the post-commit standby-flush mechanism plus an owner decision on
+  the controller or HA-manager topology trust and on `fsync`;
 - P-2 by a proof that every local predecessor effect is non-authoritative and
   harmless with B running, plus an owner decision accepting that deviation, or
   by a local-write fence (none exists today);
@@ -1101,7 +1134,8 @@ Approval alone does not close P-2 or P-5.
     `clock_timestamp()` authorization via `LeaseClockNow`;
   - the lease, epoch fencing tokens, generations, superseded set, conditional
     release, replay precedence and conflict handling;
-  - Postgres settings verification;
+  - forced `synchronous_commit`, the post-commit standby-flush check and the
+    controller or HA topology evidence (P-6);
   - synchronized LiveDB race, lock-across-expiry and crash-point tests.
 
 **Controls and M4:** as specified above.
@@ -1125,7 +1159,8 @@ Approval alone does not close P-2 or P-5.
 - force-detach ordering;
 - CSI provisioning freshness;
 - storage honouring fsync;
-- database failover under synchronous replication.
+- database failover under synchronous replication, and the HA manager's
+  promotion set (P-6).
 
 **Deferred:**
 - Codex predecessor enablement (D3) and its positive M4 leaf;
