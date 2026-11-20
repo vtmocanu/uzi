@@ -1,0 +1,30 @@
+{
+  "request": {
+    "status": "followup_finalize",
+    "claim_generation": 1,
+    "followup_park_seq": 1
+  },
+  "park_ack": {
+    "http_status": 200,
+    "followup_park_seq": 1
+  },
+  "success": {
+    "http_status": 200,
+    "applied": true,
+    "disposition": "followup_finalize_admitted",
+    "run_status": "running"
+  },
+  "refusals": [
+    { "http_status": 409, "applied": false, "reason": "followup_pending" },
+    { "http_status": 409, "applied": false, "reason": "cancel_pending" },
+    { "http_status": 409, "applied": false, "reason": "followup_finalize_refused" }
+  ],
+  "stale_claim": {
+    "http_status": 409,
+    "disposition": "stale_claim"
+  },
+  "owner_followup_refusal": {
+    "http_status": 409,
+    "reason": "follow_up_finalizing"
+  }
+}

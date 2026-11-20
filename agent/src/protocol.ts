@@ -254,6 +254,11 @@ export type RunState =
    *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
    *  and `claim_generation`; requires the `clarification_revision_settlement_v1` feature. */
   | "clarification_settled"
+  /** Issue #4479: an interactive task run whose follow-up wait ended idle or stopped asks the
+   *  server to move it from awaiting_followup back to running before the worker finalizes.
+   *  Carries `claim_generation` and `followup_park_seq` (echoed from the park ACK); requires the
+   *  `followup_finalize_admission_v1` feature. */
+  | "followup_finalize"
   | "completed"
   | "failed";
 
@@ -3069,6 +3074,17 @@ export interface ClarificationSettlement {
   gate_revision: number;
 }
 
+/** Issue #4479: why the server refused a `followup_finalize` admission. */
+export type FollowupFinalizeRefusal = "followup_pending" | "cancel_pending" | "followup_finalize_refused";
+
+/** Issue #4479: the typed reply to a `followup_finalize` report. A thrown transport error is not a
+ *  result: callers read it as unconfirmed too. */
+export type FollowupFinalizeResult =
+  | { kind: "admitted" }
+  | { kind: "refused"; reason: FollowupFinalizeRefusal }
+  | { kind: "stale_claim" }
+  | { kind: "unconfirmed" };
+
 /** Issue #4257: negotiated feature for the `running` report's checkpoint-publication diagnostic. */
 export const CHECKPOINT_PUBLICATION_WITHHELD_FEATURE = "checkpoint_publication_withheld_v1";
 
@@ -3095,6 +3111,9 @@ export interface StateRequest {
   checkpoint_publication?: CheckpointPublicationReport;
   /** Issue #3985: present only on a `clarification_settled` report. */
   clarification_settlement?: ClarificationSettlement;
+  /** Issue #4479: the park sequence of the awaiting_followup ACK this worker is finalizing from;
+   *  present only on a `followup_finalize` report. */
+  followup_park_seq?: number;
   /** Issue #3859: set by the client alone, never by a caller. */
   registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
@@ -3710,6 +3729,14 @@ export interface StateAck {
   credentialSwitchUncertain?: boolean;
   /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
   clarificationSettled?: boolean;
+  /** Issue #4479: the TOP-LEVEL `followup_park_seq` of an applied `awaiting_followup` ACK. A positive
+   *  safe integer only; absent (older api, the run no longer parked, any other shape) means none. */
+  followupParkSeq?: number;
+  /** Issue #4479: the folded reply to a `followup_finalize` report, set on that report's ACK only.
+   *  `admitted` needs a 200 with `applied: true`, disposition `followup_finalize_admitted` and run
+   *  status `running`; `refused` needs a 409 with `applied: false` and a known reason; a
+   *  `stale_claim` disposition keeps its own result; any other answer is `unconfirmed`. */
+  followupFinalize?: FollowupFinalizeResult;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent

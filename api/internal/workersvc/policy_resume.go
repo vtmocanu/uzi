@@ -142,7 +142,7 @@ func (s *Service) ResumePolicyHold(ctx context.Context, userID, runID uuid.UUID,
 		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
 			RunID: runID, Kind: "follow_up", Body: pgtype.Text{String: req.Guidance, Valid: true},
 		}); err != nil {
-			return PolicyResumeResult{}, err
+			return PolicyResumeResult{}, mapFollowupFinalizingErr(err)
 		}
 	}
 	audit := policyResumeAudit{PolicyMode: req.Mode, EpisodeID: req.ExpectedEpisodeID.String(), GuidanceSHA256: guidanceHash}

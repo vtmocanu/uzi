@@ -29,6 +29,7 @@ func TestTranslateGateSubmitErr(t *testing.T) {
 		{"revise cap", workersvc.ErrReviseCapReached, slacksvc.ErrReviseCapReached},
 		{"approval milestones moved", workersvc.ErrApprovalMilestonesMoved, slacksvc.ErrGateRevisionMismatch},
 		{"invalid selection", workersvc.ErrInvalidSelection, slacksvc.ErrSelectionRejected},
+		{"follow-up finalizing", workersvc.ErrFollowUpFinalizing, slacksvc.ErrFollowUpFinalizing},
 		{"other passes through", other, other},
 	}
 	for _, tc := range cases {
@@ -59,5 +60,14 @@ func TestTranslateConfirmProposalErr(t *testing.T) {
 				t.Fatalf("translateConfirmProposalErr(%v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// Issue #4479: a steer card the finalizing run refuses tells the user so, instead of the generic
+// "try again" copy (retrying cannot succeed while the finalize admission is live).
+func TestSteerRunCardMessageFollowUpFinalizing(t *testing.T) {
+	got := steerRunCardMessage(fmt.Errorf("submit: %w", workersvc.ErrFollowUpFinalizing))
+	if got != "That run is finishing; your follow-up was not delivered." {
+		t.Fatalf("steer card copy = %q", got)
 	}
 }

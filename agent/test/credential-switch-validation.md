@@ -1180,8 +1180,8 @@ includes #4500's cross-worker Codex claim restriction; the remaining
 ADR-4201. Historical cross-worker traces below predate that restriction and
 remain uncredited; integrating #4500 adds no proof credit to them. Claude
 reclaim and the forge PAT remain separate gaps in ADR-4476. Landing renumbering
-puts the Codex epoch snapshot at 00495 and the pending switch at 00496, above
-main's 00494; earlier migration numbers in dated evidence describe those runs.
+puts the Codex epoch snapshot at 00496 and the pending switch at 00497, above
+main's 00495; earlier migration numbers in dated evidence describe those runs.
 
 Each unchecked item is carried from the ledger's Clause-accounting table
 (`agent/test/credential-switch-proof-ledger.md`, "Clause accounting"), the

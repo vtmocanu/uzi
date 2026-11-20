@@ -15,7 +15,7 @@ recorded revisions, not the integrated code. The remaining decision 11 gap is
 same-worker new-incarnation recovery; see ADR-4201 and the validation record's
 updated deferred checklist. Claude and forge-PAT gaps remain in ADR-4476.
 This integration grants no additional proof credit. Current migration numbers
-are 00495 (Codex epoch snapshot) and 00496 (pending switch); dated numeric
+are 00496 (Codex epoch snapshot) and 00497 (pending switch); dated numeric
 references below remain historical evidence.
 The earlier [validation record](credential-switch-validation.md) retains
 positive execution, review and migration evidence. Passing positive tests

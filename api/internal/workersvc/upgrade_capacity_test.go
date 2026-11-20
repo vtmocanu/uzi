@@ -178,6 +178,79 @@ func TestCapacitySummaryAttentionAndMutes(t *testing.T) {
 	}
 }
 
+// TestSummaryHibernationParity pins #4514: the attention badge classifies a podless worker
+// exactly as the list does (ClassifyUpgrade fed the row's hibernation_state), while fresh
+// size_refused / pvc_rejected refusals still count and mutes still subtract.
+func TestSummaryHibernationParity(t *testing.T) {
+	now := time.Now()
+	text := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
+	fresh := pgtype.Timestamptz{Time: now, Valid: true}
+	behind := func(state string) store.GetWorkerUpgradeSummaryForUserRow {
+		return store.GetWorkerUpgradeSummaryForUserRow{
+			Kind: "hosted", Status: "online", Version: text("0.11.0"),
+			LastHeartbeatAt: fresh, HibernationState: state,
+		}
+	}
+	stuck := func(state, kind, reason string) store.GetWorkerUpgradeSummaryForUserRow {
+		r := behind(state)
+		r.Version = text("0.11.7")
+		r.Phase, r.ObservedAt, r.PodPhase = text(PhaseStuck), fresh, text("Pending")
+		r.BlockingReason = text(reason)
+		r.WorkerImageTag = text("0.11.7")
+		if kind != "" {
+			r.BlockingKind = text(kind)
+		}
+		return r
+	}
+	muted := stuck("hibernated", BlockingKindSizeRefused, "size refused")
+	muted.Muted = true
+	for _, tc := range []struct {
+		name string
+		row  store.GetWorkerUpgradeSummaryForUserRow
+		want int
+	}{
+		{"preparing behind", behind("preparing"), 0},
+		{"hibernated behind", behind("hibernated"), 0},
+		{"hibernated ordinary stuck", stuck("hibernated", "", "CrashLoopBackOff"), 0},
+		{"hibernated size refused", stuck("hibernated", BlockingKindSizeRefused, "size refused"), 1},
+		{"preparing pvc rejected", stuck("preparing", BlockingKindPVCRejected, "pvc rejected"), 1},
+		{"muted size refused", muted, 0},
+		{"awake behind", behind("none"), 1},
+		{"awake ordinary stuck", stuck("none", "", "CrashLoopBackOff"), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const cp, pinned = "0.11.7", "0.11.7"
+			started := now.Add(-24 * time.Hour)
+			st := &capacitySummaryStore{rows: []store.GetWorkerUpgradeSummaryForUserRow{tc.row}}
+			svc := &Service{q: st, now: func() time.Time { return now }}
+			got, err := svc.UpgradeSummaryForUser(context.Background(), uuid.New(), cp, pinned, started, UpgradeParams{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The list path's view of the same row (handler/workers.go passes HibernationState).
+			var sig *RollSignal
+			if tc.row.Phase.Valid {
+				sig = &RollSignal{
+					BlockingKind: tc.row.BlockingKind.String, Phase: tc.row.Phase.String,
+					ObservedAt: tc.row.ObservedAt.Time, PodPhase: tc.row.PodPhase.String,
+					BlockingReason: tc.row.BlockingReason.String, RolledTag: tc.row.WorkerImageTag.String,
+				}
+			}
+			status, _ := ClassifyUpgrade(UpgradeInput{
+				Reported: tc.row.Version.String, Kind: tc.row.Kind, CPVersion: cp, PinnedWorkerVersion: pinned,
+				Signal: sig, Now: now, APIStartedAt: started, Hibernation: tc.row.HibernationState,
+			}, UpgradeParams{})
+			list := 0
+			if InUpgradeAttentionSet(status) && !tc.row.Muted {
+				list = 1
+			}
+			if got.Attention != tc.want || got.Attention != list {
+				t.Fatalf("summary attention=%d want=%d list=%d (status %s)", got.Attention, tc.want, list, status)
+			}
+		})
+	}
+}
+
 type capacitySummaryStore struct {
 	Store
 	rows []store.GetWorkerUpgradeSummaryForUserRow
