@@ -653,15 +653,16 @@ it("shutdown during the terminal refusal-release fetch still aborts it after an 
 
 // --- Issue #4481 item E: real later claims of one run across worker restarts ------------------------------------
 // Every generation is a real gitlabClaim of the SAME run executed through the real failing work and the real
-// terminal hook. A restart is a brand new GitCache over the same data dir (restartGitCache): no admission,
-// closed-generation, recording-failure or import-stage state survives, and it has its own process nonce. The fake
-// api and client stay, as a restarted worker meets the same server.
+// terminal hook. A restart is a brand new GitCache over the same data dir (restartGitCache) with its own process
+// nonce: none of the GitCache's in-process refusal state survives (closed generations, recording failures, live or
+// finished import stages), while on-disk records such as admission files do. The WorkerClient, the fake api and
+// module-level state persist, so this is not a full process restart.
 //
-// A later claim of a run whose earlier generation still has local custody never reaches the terminal gate: it
-// adopts the retained source (see the lost-report case below). The gate is reached by a later claim only after the
-// earlier generation released and its local clone and recovery journal are gone. An OLD worker's released
-// generation is therefore modelled by what such a worker leaves behind: the generation released, then its clone,
-// journal key and (since an old worker never wrote one) its admission file are removed.
+// A later claim of a run whose earlier generation still has local custody does not reach that generation's terminal
+// gate: it adopts the retained source (see the lost-report case below). History 1 therefore models an OLD worker's
+// released generation by what it leaves behind: the generation released, then its clone, journal key and (since an
+// old worker never wrote one) its admission file are removed. History 2's old middle generation is this build with
+// admitRefusalProvenance stubbed to "failed"; its end state is modelled by removing its clone and journal key.
 
 interface GateSeen { generation: number; result: RefusalReleaseGate }
 interface Gens { runId: string; iid: number; servers: HeldServer[]; gates: GateSeen[]; work: Partial<Work>; logs: unknown[]; last?: ReturnType<typeof runner> }
@@ -774,7 +775,7 @@ it("updated, then old (real displacement), then a restarted updated worker keeps
   assert.equal(command(bare(), ["rev-parse", "--verify", `refs/uzi-owed/${g.runId}/${gen1Head}`]), gen1Head,
     "the displacement preserved generation 1's tracking head as an owed ref");
   assert.ok(!refusalFiles().includes(`admission-${g.runId}-2.json`), "the old worker wrote no admission");
-  // The old worker's own custody handling is its code, not this build's: model what it leaves once finished.
+  // This build's terminal hook ran for generation 2 and kept its hold; model the state a finished old worker leaves.
   fs.rmSync(g.work.clone!, { recursive: true, force: true });
   command(bare(), ["config", "--unset-all", `uzi-recovery.agent/issue-${g.iid}.clone`]);
   await claimGeneration(g, 3, { process: "worker-process-p3" });
