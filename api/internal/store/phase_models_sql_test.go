@@ -15,10 +15,10 @@ import (
 // the planning-column EXISTS, all on the same run alias.
 var phaseModelsKindList = regexp.MustCompile(`(\w+)\.harness = 'claude'\s+AND\s+(\w+)\.kind IN \(([^)]*)\)\s+AND\s+(\w+)\.review_target_run_id IS NULL\s+AND\s+(\w+)\.egress_profile_id IS NULL\s+AND\s+EXISTS \(SELECT 1 FROM users pu WHERE pu\.id = (\w+)\.user_id AND \(pu\.planning_claude_model IS NOT NULL OR pu\.planning_claude_effort IS NOT NULL\)\)`)
 
-// phaseModelsExpectedKinds is the explicit planning set; the registry-derived oracle below must
-// agree with it, so a new lead-lane kind fails here until every SQL site is updated.
 var sqlLineCommentRE = regexp.MustCompile(`--[^\n]*`)
 
+// phaseModelsExpectedKinds is the explicit planning set; the registry-derived oracle below must
+// agree with it, so a new lead-lane kind fails here until every SQL site is updated.
 var phaseModelsExpectedKinds = []string{"ci_fix", "issue", "mr_rework", "prompt", "self_improve", "task"}
 
 func phaseModelsSiteKinds(t *testing.T, label, text string, wantSites int) {

@@ -29,6 +29,7 @@ type phaseMatrixCase struct {
 	effort   any // users.planning_claude_effort
 	required bool
 	noCaps   bool // required_capabilities '{}' and no docker preference: a phase-only run (PRD example 5)
+	egress   any  // runs.egress_profile_id (immutable after insert); honoured for issue and self_improve only
 }
 
 func phaseMatrixCases() []phaseMatrixCase {
@@ -66,8 +67,8 @@ func phaseRun(fx *fleetFixture, c phaseMatrixCase) uuid.UUID {
 		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, branch, review_target_run_id, dispatched_at, issue_title, issue_description, status, harness, required_capabilities, status_since)
 		    VALUES ($1, $2, $3, 'task', $4, $5, now(), 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, "uzi/task/"+id.String(), target, c.harness, docker)
 	case c.kind == "issue" || c.kind == "self_improve":
-		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, harness, required_capabilities, status_since)
-		    VALUES ($1, $2, $3, $4, $5, 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, c.kind, fx.nextIID(), c.harness, docker)
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, harness, required_capabilities, status_since, egress_profile_id)
+		    VALUES ($1, $2, $3, $4, $5, 't', 'd', 'queued', $6, $7, now() - interval '1 hour', $8)`, id, fx.userID, fx.repoID, c.kind, fx.nextIID(), c.harness, docker, c.egress)
 	case c.kind == "ci_fix":
 		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, pipeline_id, pipeline_ref, issue_title, issue_description, status, harness, required_capabilities, status_since)
 		    VALUES ($1, $2, $3, 'ci_fix', $4, $5, 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, fx.nextIID(), "ref-"+id.String(), c.harness, docker)
@@ -292,17 +293,37 @@ func TestPhaseModelsGapTriggerDemandGateEmptyFleetLiveDB(t *testing.T) {
 		harness string
 		model   any
 		listed  bool
+		review  bool // a task review run (review_target_run_id set)
+		egress  bool // the run carries an egress profile (the query also excludes these at its top level, so only removing both guards turns this case red)
 	}{
-		{"claude lead-lane, no planning value, no caps: not demand", "claude", nil, false},
-		{"codex harness, planning value set, no caps: not demand", "codex", "opus", false},
-		{"control: claude lead-lane, planning value set, no caps: demand", "claude", "opus", true},
+		{"claude lead-lane, no planning value, no caps: not demand", "claude", nil, false, false, false},
+		{"codex harness, planning value set, no caps: not demand", "codex", "opus", false, false, false},
+		{"control: claude lead-lane, planning value set, no caps: demand", "claude", "opus", true, false, false},
+		{"task review run, planning value set, no caps: not demand", "claude", "opus", false, true, false},
+		{"egress-profiled run, planning value set, no caps: not demand", "claude", "opus", false, false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			fx := newFleetFixture(t)
 			optInEphemeral(fx)
 			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_claude_model = $2 WHERE id = $1`, fx.userID, c.model)
-			run := phaseRun(fx, phaseMatrixCase{kind: "issue", harness: c.harness, noCaps: true})
+			kind := "issue"
+			if c.review {
+				kind = "task"
+			}
+			var egress any
+			if c.egress {
+				profile := uuid.New()
+				mustExec(fx.ctx, t, fx.pool, `INSERT INTO egress_profiles (id, name, hosts) VALUES ($1, $2, '{docs.example.com}')`,
+					profile, "pm-"+profile.String()[:20])
+				// Registered after the fixture's cleanup, so it runs first: the profile is RESTRICTed while a run uses it.
+				t.Cleanup(func() {
+					_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM runs WHERE egress_profile_id = $1`, profile)
+					_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM egress_profiles WHERE id = $1`, profile)
+				})
+				egress = profile
+			}
+			run := phaseRun(fx, phaseMatrixCase{kind: kind, review: c.review, harness: c.harness, noCaps: true, egress: egress})
 			if n := fx.onlineWorkerCount(); n != 0 {
 				t.Fatalf("fixture user has %d workers, want an empty fleet", n)
 			}
