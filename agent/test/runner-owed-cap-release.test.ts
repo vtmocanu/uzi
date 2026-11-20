@@ -7,7 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { RunContext } from "../src/executor.js";
-import { client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { randomUUID } from "node:crypto";
+import type { RefusalReleaseGate } from "../src/git.js";
+import { recordingLogger } from "./helpers.js";
+import { api, client, fakeGitlab, git, gitlabClaim, installHarness, restartGitCache, runnerWith, runner } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, bare, command, commit, failedStates, failingWork,
   deferTerminalEvidence, frozenRecords, heldServer, packObjects, redrive, skipCheckpoints, type HeldServer, type Work,
@@ -647,3 +650,139 @@ it("shutdown during the terminal refusal-release fetch still aborts it after an 
   assert.ok(probe.transfers.length > 0 && probe.transfers.every(h => h === null), "the shut-down transfer released nothing");
   assert.equal(server.heldCalls.length, 0, "no held publication");
 });
+
+// --- Issue #4481 item E: real later claims of one run across worker restarts ------------------------------------
+// Every generation is a real gitlabClaim of the SAME run executed through the real failing work and the real
+// terminal hook. A restart is a brand new GitCache over the same data dir (restartGitCache): no admission,
+// closed-generation, recording-failure or import-stage state survives, and it has its own process nonce. The fake
+// api and client stay, as a restarted worker meets the same server.
+//
+// A later claim of a run whose earlier generation still has local custody never reaches the terminal gate: it
+// adopts the retained source (see the lost-report case below). The gate is reached by a later claim only after the
+// earlier generation released and its local clone and recovery journal are gone. An OLD worker's released
+// generation is therefore modelled by what such a worker leaves behind: the generation released, then its clone,
+// journal key and (since an old worker never wrote one) its admission file are removed.
+
+interface GateSeen { generation: number; result: RefusalReleaseGate }
+interface Gens { runId: string; iid: number; servers: HeldServer[]; gates: GateSeen[]; work: Partial<Work>; logs: unknown[]; last?: ReturnType<typeof runner> }
+
+const newGens = (iid: number): Gens => ({ runId: randomUUID(), iid, servers: [], gates: [], work: {}, logs: [] });
+const lastServer = (g: Gens): HeldServer => g.servers[g.servers.length - 1]!;
+
+/** One real claim of the run; `restart` first replaces the GitCache with a fresh one under `process`. */
+async function claimGeneration(g: Gens, generation: number, how: { process?: string; lostReport?: boolean } = {}): Promise<void> {
+  if (how.process) restartGitCache({ maxOwedCandidates: CAP, processNonce: how.process });
+  const gate = git.refusalReleaseGate.bind(git);
+  git.refusalReleaseGate = async (...a: Parameters<typeof gate>) => {
+    const result = await gate(...a);
+    g.gates.push({ generation: a[2], result });
+    return result;
+  };
+  const claim = gitlabClaim(g.iid, { run_id: g.runId, claim_generation: generation, inventory_guarded: true });
+  g.servers.push(heldServer(claim));
+  skipCheckpoints();
+  const stop = how.lostReport ? api.dropStatesWhen(g.runId, b => b.status === "failed") : undefined;
+  const rec = recordingLogger();
+  g.logs = rec.lines;
+  const r = runnerWith(() => ({ executor: failingWork(g.work) }), fakeGitlab().gitlab, JOIN_TOKEN, rec.logger, { checkpointIntervalMs: 1 });
+  // A restarted worker recovers its boot-time state before it takes the next claim.
+  if (how.process && g.last) await r.resumePendingRecoveries(undefined, await r.snapshotBootRecoveries());
+  try { await r.execute(claim); } finally { stop?.(); }
+  g.last = r;
+}
+
+/** The generation released through the held V2 publication and FINAL, as a worker that has finished with it leaves things. */
+async function releaseGeneration(g: Gens, generation: number, label: string, oldWorker: boolean): Promise<void> {
+  await redrive(g.last!);
+  const server = lastServer(g);
+  assert.equal(server.heldCalls.length, 1, `${label}: the held publication was created`);
+  assert.equal(server.finals.length, 1, `${label}: the FINAL was sent`);
+  assert.equal(server.acked(), 1, `${label}: the release was ACKed`);
+  fs.rmSync(g.work.clone!, { recursive: true, force: true });
+  command(bare(), ["config", "--unset-all", `uzi-recovery.agent/issue-${g.iid}.clone`]);
+  if (oldWorker) fs.rmSync(path.join(refusalDir(), `admission-${g.runId}-${generation}.json`));
+}
+
+const gateAt = (g: Gens, generation: number): RefusalReleaseGate[] => g.gates.filter(x => x.generation === generation).map(x => x.result);
+
+/** The custody-retention assertions for the generation that must not release. */
+function assertRetained(g: Gens, generation: number, reason: string): void {
+  const gates = gateAt(g, generation);
+  assert.ok(gates.length >= 1, `the real terminal hook consulted the gate at generation ${generation}`);
+  assert.deepEqual(gates.filter(x => x.kind === "eligible"), [], "no gate call was eligible");
+  assert.deepEqual(gates[0], { kind: "ineligible", reason }, "the gate refused for the distinguishing reason");
+  const server = lastServer(g);
+  assert.equal(server.holdOpen(), true, "the guarded hold stays open");
+  assert.equal(server.heldCalls.length, 0, "no held publication POST");
+  assert.equal(server.finals.length, 0, "no FINAL, archive or held");
+  assert.equal(server.archiveUploads(), 0, "no archive upload");
+  assert.equal(server.archiveReserves(), 0, "no archive capture");
+  assert.equal(server.acked(), 0, "nothing was released");
+  assert.equal(command(bare(), ["for-each-ref", `refs/uzi-owed/${g.runId}/`]).split("\n").filter(Boolean).length, CAP, "the owed evidence is still pinned");
+  assert.ok(refusalFiles().includes(`owedpath-${g.runId}-${generation}.json`), "the at-cap marker is still present");
+  assert.ok(fs.existsSync(g.work.clone!), "the runner clone is retained");
+}
+
+it("positive control: every generation updated in one process releases at the later generation", opts, async () => {
+  const g = newGens(44850);
+  await claimGeneration(g, 1, { process: "worker-process-p1" });
+  await releaseGeneration(g, 1, "generation 1", false);
+  await claimGeneration(g, 2);
+  await releaseGeneration(g, 2, "generation 2", false);
+  assert.deepEqual(gateAt(g, 2).filter(x => x.kind !== "eligible"), [], "the generation 2 gate was eligible every time");
+  assert.ok(gateAt(g, 2).length >= 1);
+  assert.equal(lastServer(g).holdOpen(), false);
+});
+
+it("an old worker's released generation, then a restarted updated worker's claim, keeps custody", opts, async () => {
+  const g = newGens(44851);
+  await claimGeneration(g, 1, { process: "worker-process-p1" });
+  await releaseGeneration(g, 1, "generation 1", true);
+  await claimGeneration(g, 2, { process: "worker-process-p2" });
+  await redrive(g.last!);
+  assertRetained(g, 2, "admission for generation 1 absent");
+});
+
+it("updated, then old, then a restarted updated worker (generation 1 head preserved) keeps custody", opts, async () => {
+  const g = newGens(44852);
+  await claimGeneration(g, 1, { process: "worker-process-p1" });
+  const trackingRef = `refs/uzi-runner/agent/issue-${g.iid}`;
+  const gen1Head = command(bare(), ["rev-parse", "--verify", trackingRef]);
+  await releaseGeneration(g, 1, "generation 1", false);
+  await claimGeneration(g, 2);
+  const heldElsewhere = command(bare(), ["for-each-ref", "--format=%(objectname) %(refname)", `refs/uzi-owed/${g.runId}/`, "refs/uzi-recovery-pin/"])
+    .split("\n").filter(l => l.startsWith(gen1Head + " "));
+  assert.ok(heldElsewhere.length >= 1, "generation 1's tracking head is preserved by an owed ref or a pin");
+  await releaseGeneration(g, 2, "generation 2", true);
+  await claimGeneration(g, 3, { process: "worker-process-p3" });
+  await redrive(g.last!);
+  assertRetained(g, 3, "admission for generation 1 is from another process");
+});
+
+for (const old of [true, false]) {
+  it(`${old ? "an old" : "an updated"} worker's refusal with a lost terminal report: the next claim adopts the retained source and releases nothing`, opts, async () => {
+    const g = newGens(old ? 44853 : 44854);
+    Reflect.set(git, "maxOwedCandidates", CAP);
+    if (old) git.admitRefusalProvenance = async () => "failed";
+    await claimGeneration(g, 1, { lostReport: true });
+    assert.equal(failedStates(g.runId).length, 0, "the terminal report was lost");
+    assert.equal(refusalFiles().includes(`admission-${g.runId}-1.json`), !old,
+      old ? "the old worker wrote no admission" : "the updated worker wrote its admission");
+    await claimGeneration(g, 2, { process: "worker-process-p2" });
+    await redrive(g.last!);
+    const logs = g.logs as { msg: string; blocker?: string }[];
+    assert.ok(logs.some(l => l.msg === "Retained recovery blocked: budget exhausted; local work and custody retained" && l.blocker === "budget_exhausted"),
+      "the retained-recovery adoption exhausted its budget");
+    assert.deepEqual(gateAt(g, 2), [], "the terminal gate was never consulted at generation 2: the retention is not the admission check");
+    for (const s of g.servers) {
+      assert.equal(s.heldCalls.length, 0, "no held publication POST");
+      assert.equal(s.finals.length, 0, "no FINAL");
+      assert.equal(s.holdOpen(), true, "the guarded hold stays open");
+    }
+    // The admission does show at generation 1: the updated worker's gate is eligible and it captured and uploaded the
+    // archive (its FINAL was never sent, the report being lost); the old worker's gate refuses before any capture.
+    assert.equal(g.servers[0]!.archiveUploads(), old ? 0 : 1, "only the updated worker's generation 1 uploaded an archive");
+    assert.equal(g.servers[1]!.archiveUploads(), 0, "generation 2 uploaded nothing");
+    assert.ok(command(bare(), ["for-each-ref", `refs/uzi-owed/${g.runId}/`]).length > 0, "the owed evidence is still pinned");
+  });
+}

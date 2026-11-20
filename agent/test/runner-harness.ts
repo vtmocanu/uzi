@@ -13,7 +13,7 @@ import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, type GitCacheOptions } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import {
   type Executor,
@@ -93,6 +93,17 @@ export function installHarness(
 
 // PRD #51 M3 (b): the run's working tree is the RUNNER CLONE under runner/, not a
 // linked worktree under worktrees/.
+/**
+ * A worker restart over the same data dir: a brand new GitCache (so no in-process refusal state
+ * survives: closed generations, recording failures, import stages, mocks) with its own process
+ * nonce. The fake api and the client stay, as a restarted worker meets the same server.
+ */
+export function restartGitCache(opts: GitCacheOptions = {}): GitCache {
+  git = new GitCache(fx.dataDir, nullLogger(), undefined,
+    testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), ...opts }));
+  return git;
+}
+
 export function worktreeDirFor(iid: number): string {
   const repoDir = path
     .basename(git.barePathFor(fx.originPath))
