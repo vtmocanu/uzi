@@ -21,7 +21,7 @@
 - No implementation or validation writes under `.github/workflows/`.
 - Migration `00355_user_planning_codex.sql` is a draft number (main ends at `00346`; Q-claude drafts `00353`). Renumber at landing with `task migration:renumber`, then fix any migration number hard-coded in a test (dba 17).
 - LiveDB tests need Docker.
-- **Dispatch check:** D1 records positive live cold-epoch model-switch evidence, but the first probe lost the applied-effort distinction needed for case 5. **Do not dispatch until the corrected effort report is complete and the Q-claude dependency's guard redesign is reviewed.** A fresh-conversation fallback also requires design and review.
+- **Dispatch check:** D1 selects same-conversation switching at the cold approval epoch and closes the live effort decision. **Do not dispatch until the Q-claude dependency's guard redesign is reviewed and the other listed prerequisites hold.** This proof does not authorize a warm-epoch alternative or an unreviewed fresh-conversation fallback.
 
 ## Problem
 
@@ -40,7 +40,7 @@ On Codex the naive switch would misattribute usage. The usage accountant binds e
 | Accountant | `CodexUsageAccountant` (`agent/src/codex/token-accounting.ts`): `registerThread`, `record`, `aggregateByModel`, `markIncomplete` | See the details below this table. |
 | Server fold | ADR-0195, `api/internal/workersvc/usage_fold.go` | MAX per (run, model, lineage); two models on one claim fold independently. |
 | Roles | `resolveRoleModel` and per-role effort (`agent/src/codex/render.ts`) | Unpinned roles take the request model; every role takes the request effort. |
-| Effort persistence | `TurnStartParams.effort` (openai/codex source at `092d3acd`, `thread.rs`) | "Override the reasoning effort for subsequent turns." A single `Option`, so `null` cannot reset it. Q-spike case 5 confirms this on 0.162.1. |
+| Effort persistence (Q-spike refresh, 2026-11-20) | `TurnStartParams.effort` (openai/codex `086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a`, `codex-rs/app-server-protocol/src/protocol/v2/turn.rs`) | Omission/null preserves an explicit override warm. Live 0.167.0 cold resume resets the override to Runtime default (`effort: null` present); see D1 for the observations and policy scope. |
 | Custom-model mirrors | the `codex_custom_model_v1` CASE in `ClaimRun` (claimant and fleet-spread peer clauses), `ListActiveRunsForHealth` (`CodexCustomRoot`), `CountOnlineWorkersClaimableForRun`, `ListUnplaceableQueuedRunsForEphemeral`, both `ListSaturationQueuedRunsForEphemeral` sites (`queries/runtime.sql`); `CountOnlineWorkersSatisfyingCustomCodex`; `reasonNoCustomCodexCapableWorker` and the docker-probe filter (`health.go`); `errCustomModelCapabilityMissing` (`service.go`) | The effective root is a cross-check pin, a curated frozen `runs.model`, or `users.default_codex_model`. No planning model is considered. |
 | Capability advertising | `codexHarness?.advertise` block in `agent/src/worker.ts` | Codex protocol capabilities, `codex_custom_model_v1` included, are pushed here. |
 | Q-claude pieces (after it lands) | `resolvePlanPhase` (`claim_phase.go`), called from inside H's `resolveLeadSettings` (`LeadSettingsInput.PlanningModel`/`PlanningEffort`, result `LeadSettings.Plan`); `ClaimConfig.PlanPhase`; the phase-capability predicate in every mirror; `enterPhaseSwitchHold` and `SetRunPhaseSwitchHold` (`phase_switch_unavailable`); the effort write function with the combination rule; the `planning_models` / `planning_efforts` cells; the Planning card; H `resolveLeadRequest` with `phase` and plan cases in `request_cases` (`fixtures/lead-config/contract.json`); ADR 3252-phase-model-switch | Claude only. |
@@ -92,7 +92,7 @@ Acceptance examples (each one a test):
    - Trigger: the implement epoch's `thread/resume` response `model` differs from the intended implementation model. That covers the planning model, any other model, a missing field or an unrecognized value.
    - The worker sends no `turn/start` and makes no segment cut. It takes Q-claude's hold (`phase_switch_unavailable`) from `awaiting_approval`.
    - Resume and Cancel both work. No implementation turn runs on the planning pair.
-7. **Runtime-default combination.** With Q-spike case 5 recording "keeps" for Codex, the combination "planning effort `high` and Codex effort `runtime`" is rejected at save in both orders, through Q-claude's locked write function, with the Codex fields named. Persisted settings violating the active combination rule cause a visible, non-retrying configuration error before a claim is delivered. The configured planning effort is never silently replaced. Ordinary saves prevent this state through Q-claude's locked settings-write function.
+7. **Runtime-default combination.** For D1's cold approval epoch, explicit planning effort plus Runtime default implementation effort is accepted at save in both orders. The implementation epoch omits effort, and the runtime reports a present null default rather than retaining the planning override. Do not silently supply a numeric effort. A warm alternative would retain the override and requires new design/proof before dispatch; it is not covered by this allowance. Ordinary model/effort validation and Q-claude's locked settings-write function still apply.
 
 ## Out of scope
 
@@ -106,7 +106,7 @@ Acceptance examples (each one a test):
 ### 1. Settings, claim and mirrors for Codex
 
 - **Migration** (draft `00355_user_planning_codex.sql`): `ALTER TABLE users ADD COLUMN planning_codex_model text, ADD COLUMN planning_codex_effort text;`. Down drops them. Same conventions as Q-claude D11.
-- **Store:** `SetUserPlanningCodex` and a strict `GetUserPlanningCodex`. Writes go through Q-claude's locked effort write function, so the combination rule covers `planning_codex_effort` and `default_codex_effort` (B's Codex `runtime` setter included).
+- **Store:** `SetUserPlanningCodex` and a strict `GetUserPlanningCodex`. Writes go through Q-claude's locked effort write function. D1's cold mechanism has no forbidden explicit-planning/Runtime-default combination; accept it for `planning_codex_effort` and `default_codex_effort` in either save order (B's Codex `runtime` setter included).
 - **Settings DTO and cells:**
   - `planning_codex_model` and `planning_codex_effort` on `userSettingsDTO` and `apitypes.UserSettingsDTO`.
   - Codex entries in the `planning_models` (C's `ModelSettingCellDTO`) and `planning_efforts` (B's `EffortSettingCellDTO`) arrays.
@@ -273,7 +273,7 @@ If F lands later, F's line covers it.
 - **Server (LiveDB):**
   - `plan_phase` on Codex lead-lane claims;
   - the mixed fleet (X: phase without custom; Y: both) through every mirror, the satisfier counts and health; follow the custom-model cases in `api/internal/store/ephemeral_lease_protocol_livedb_test.go`;
-  - the combination rule for the Codex fields, both orders, under the row lock;
+  - the D1 Runtime-default combination allowance for the Codex fields, both save orders, under the row lock;
   - `SetRunPhaseSwitchHold` from `awaiting_approval` on a Codex run of each kind;
   - settings handler and store tests.
 - **Through H.** A Codex run with a planning pair yields plan and implement rows with the expected sources.
@@ -303,13 +303,15 @@ If F lands later, F's line covers it.
 
 ## Decision Log
 
-- **D1. Same conversation at the cold approval epoch is supported for model switching; live effort decision pending corrected reporting (#3246, 2026-11-20).** User-run native ChatGPT-login probe on Codex 0.167.0, spike code `1b2f933a27842ffa4b01112ef030abba2c428a93`. All twelve live turns completed and returned the nonce; the selected auth file's mtime did not change. This is not dispatch approval while case 5 and the Q-claude guard dependency remain unresolved.
+- **D1. Mechanism: same conversation at the cold approval epoch (#3246, live evidence 2026-11-20).** User-run native ChatGPT-login probes on Codex 0.167.0: the full matrix at `1b2f933a27842ffa4b01112ef030abba2c428a93` and corrected effort-only report at `bc61cd21202ddca685fe8d2897fcfc3e050919a3`. All twelve original and eight focused turns completed and returned the nonce. Both probes reported unchanged auth-file mtime; credentials were subsequently removed by the operator. The model/effort mechanism is established for this cold shape; the Q-claude guard dependency still blocks dispatch.
   - **Switch/re-plan/reclaim:** the warm process ran `gpt-6-astra`/high -> `gpt-6.1-sol`/medium -> Astra/high. A second process sharing the same selected CODEX_HOME resumed the recorded thread with Sol, returned `model=gpt-6.1-sol`, and completed the retained-nonce control without another turn-level model override. The credential-free pinned test independently checked actual provider model B in that no-override control and zero provider requests before `turn/start`.
   - **Warm and cold reports differ.** Warm `thread/resume(model=B)` reported A/high. The independent no-turn-model control also sent A, showing that warm resume did not apply B; an explicit B on `turn/start` switched the request. Cold resume reported B and sent B without a repeated model override. The model-verification mechanism is the cold epoch, not a warm-resume echo or the subsequent `turn/start` override.
   - **Model omission is not a production setting:** `buildRunRequest` uses `leadRequestFor` / `resolveLeadRequest` (`agent/src/lead-config-report.ts`) and always supplies the provider/model fallback. Model omission above is a test-only resume-effectiveness control.
-  - **Case 5 remains open for live evidence.** The real pinned offline runtime retained high for omitted/null effort warm and reset to its low fixture default cold, preserving each group's own nonce history. The first live probe reported only requested effort and collapsed both null and absent resume effort into `unreported`; zero reasoning tokens do not resolve that ambiguity. A focused corrected probe must preserve effort-field presence/null and capture `thread/settings/updated` model/effort. Do not select the save-time combination rule or call the live default low from the older report. Those notifications are post-dispatch observations, not a new admission barrier.
+  - **Case 5, closed by the corrected live report:** after Astra/high, warm Sol turns with omitted effort and explicit null both reported `effortPresent=true, effort=high`. After resetting to Astra/high and restarting the app-server, cold Sol resume reported `resumeEffortPresent=true, resumeEffort=null`; the subsequent omitted/null Sol turns both reported `effortPresent=true, effort=null`. Thus warm omission keeps the override; cold omission resets it to Runtime default. The live numeric default is not reported and must not be called low; low was observed only on the offline provider wire. Settings notifications are post-dispatch observations, not an admission barrier. The older report's `unreported` conflation is superseded.
+  - **Save-time decision:** the explicit-planning/Runtime-default implementation combination needs no rejection for this cold approval-epoch mechanism. Preserve omission on `turn/start`; do not replace it with a guessed numeric effort. A warm alternative is outside this decision and needs fresh proof/review.
   - **Current attribution is still wrong, as expected:** every adopted switched live usage note was attributed to Astra, including cold post-replay Sol work. The passing characterization pins that current behavior for this PRD to invert when adding segments; Q-spike changes no accountant behavior. Totals are cumulative and replay must not be charged again.
   - **Provider acceptance/cache:** the initial Astra switch-group turn reported 32 reasoning tokens; subsequent Sol and cold resumed turns completed without rejection. Raw live reasoning-item forwarding was not inspected. The first warm Sol response reported last input 14,275, cache read/write 0 and output 30; the first cold Sol response reported last input 23,058, cache read/write 0 and output 30, with complete pricing-field evidence. Use `last`, not cumulative totals, for those observations. Other Astra turns had cache hits; this one probe does not establish a general cross-model cache rule.
+  - Sanitized full and corrected live observations: [Q-spike evidence](https://github.com/vtmocanu/uzi/issues/3246#issuecomment-7038584349).
 - **D2. Segments are cut only at an epoch's first-turn replay boundary; any later change gets a typed refusal.** This keeps the shared accountant's cross-epoch baseline and dedup. Rejected:
   - a new accountant per epoch, which loses the retained baseline and duplicate protection;
   - re-registering under a new key, which breaks the thread identity ADR-2555 relies on;
@@ -317,7 +319,7 @@ If F lands later, F's line covers it.
 - **D3. Reconciliation and pricing are per segment.** Per-thread reconciliation would push both models to `unreported` on every split thread.
 - **D4. With no adopted usage the cut rebinds in place; quarantine sticks across segments.** Neither state has a cumulative to cut at.
 - **D5. Codex roles follow their phase's request model and effort.** Pinned roles keep their pins.
-- **D6. The runtime-default combination is rejected at save when Q-spike proves effort persists** (user decision 2026-10-21); a persisted violation is a visible, non-retrying configuration error. Rejected: the r2 claim-time drop as the primary rule.
+- **D6. Runtime default is allowed for the selected cold mechanism.** D1's live evidence shows that the planning override is cleared on cold resume, so the user decision of 2026-10-21 does not activate a save-time rejection here. The same evidence shows warm persistence; changing to a warm mechanism requires new proof and review of its reset/rejection rule. Rejected: silently substituting a numeric default or dropping the planning effort at claim time.
 - **D7. The custom planning model joins every custom-model mirror.** Rejected: an assembly-only check, which can loop.
 - **D8. Hold visibly through Q-claude's active-run hold, never implement on the planning pair.** User decision 2026-10-21 (buddy Q2); fold-r3.
 - **D9. Split.** User decision 2026-10-21: this PRD is separate from Q-claude because the accountant is a billing-integrity seam that needs its own run and review wave.
