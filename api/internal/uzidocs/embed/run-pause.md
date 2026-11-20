@@ -347,9 +347,13 @@ worker itself posts. Neither
 the old nor the new token is used again until you act.
 
 To continue, **Resume** it (`uzi run resume <id>`, or the run page's
-**Resume**). Resume re-resolves the token from the run's current choice, so the
-token you last set is the one the run spends; to pick a different one first,
-run `uzi run set-token <id> <label>`. Cancel works as always.
+**Resume**). On Claude, Resume re-resolves the token from the run's current
+choice; to pick a different one first, run `uzi run set-token <id> <label>`.
+Codex uses its database-committed binding when a new claim is admitted;
+set-token refuses the paused state (422), so it cannot select a replacement
+here. Neither credential executes while the switch outcome is unresolved.
+See [Codex switch and recovery limits](codex-credentials.md#switching-a-live-run).
+Cancel works as always.
 
 This is different from a held switch (`credential_switch_settling` then
 `credential_switch_unsettled`), which means the worker could **not prove its

@@ -1004,9 +1004,11 @@ Logging in with a different ChatGPT account does not resume the run: it
 fails with `credential_unavailable` and a reason naming the change. The
 same happens if the credential is deleted while the run waits, or if the
 account's credential revision no longer matches the one the run started
-with. `uzi run set-token` does not accept Codex credentials; a Codex subscription run whose
-credential is gone cannot be re-pointed at a different one, only
-cancelled and re-created.
+with. `uzi run set-token` refuses Codex runs in `recovery_wait` (422),
+including worker-held parks. A waiting run whose credential is gone cannot
+be re-pointed here; cancel it and create a new run. The separate
+[live owner switch](codex-credentials.md#switching-a-live-run) does not
+bypass this hold or turn a re-login into consent to change identity.
 
 ### Where you'll see it
 

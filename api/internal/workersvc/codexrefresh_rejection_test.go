@@ -24,7 +24,8 @@ import (
 // rejection codes) may reach the rejector; everything else must stay the ambiguous outcome.
 
 // rejFakeStore is the in-memory store for the matrix: an idle account at generation 0 with
-// no prior intent, a lease that is always acquired, and every write recorded as a no-op. It
+// no prior intent and a lease that is always acquired. Intent and lease writes are
+// published by the admission transaction; material writes remain unexpected. It
 // embeds the (nil) broad Store only so it can sit in Service.q; the narrow surfaces the
 // refresh and poll paths use are all implemented here, so the nil embed is never reached.
 type rejFakeStore struct {
@@ -32,6 +33,8 @@ type rejFakeStore struct {
 	Store
 	acct       store.CodexProviderAccount
 	markReauth int
+	admission  *rejectionAdmissionBeginner
+	boundTx    *refreshAdmissionTx
 }
 
 func (f *rejFakeStore) GetCodexProviderAccountByID(context.Context, store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
@@ -47,8 +50,30 @@ func (f *rejFakeStore) GetCodexRefreshIntent(context.Context, store.GetCodexRefr
 	return store.CodexRefreshIntent{}, pgx.ErrNoRows
 }
 
-func (f *rejFakeStore) InsertCodexRefreshIntent(context.Context, store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
-	return store.CodexRefreshIntent{}, nil
+func (f *rejFakeStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	f.admission.t.Helper()
+	if q == nil || f.admission.tx == nil || f.admission.tx.closed {
+		f.admission.t.Fatal("invalid rejection admission binding")
+	}
+	bound := *f
+	bound.boundTx = f.admission.tx
+	return &bound
+}
+
+func (f *rejFakeStore) admissionWrite(name string) {
+	f.admission.t.Helper()
+	if f.boundTx == nil || f.boundTx != f.admission.tx || f.boundTx.closed {
+		f.admission.t.Fatal("rejection fixture write outside open bound admission transaction")
+	}
+	if strings.Join(f.boundTx.events, ",") != "begin,read committed,account lock" {
+		f.admission.t.Fatal("admission write before READ COMMITTED account lock")
+	}
+	f.boundTx.pending = append(f.boundTx.pending, name)
+}
+
+func (f *rejFakeStore) InsertCodexRefreshIntent(_ context.Context, arg store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
+	f.admissionWrite("intent")
+	return store.CodexRefreshIntent{OperationID: arg.OperationID}, nil
 }
 
 func (f *rejFakeStore) SetCodexRefreshIntentState(context.Context, store.SetCodexRefreshIntentStateParams) (int64, error) {
@@ -68,6 +93,7 @@ func (f *rejFakeStore) ListUnresolvedCodexRefreshIntents(context.Context, store.
 }
 
 func (f *rejFakeStore) AcquireCodexRefreshLease(context.Context, store.AcquireCodexRefreshLeaseParams) (int64, error) {
+	f.admissionWrite("lease")
 	return 1, nil
 }
 
@@ -108,10 +134,16 @@ func (f *rejFakeStore) MarkCodexReauthRequired(context.Context, store.MarkCodexR
 type rejFakeRefresh struct {
 	calls     int
 	err       error
+	admission *rejectionAdmissionBeginner
 	onRefresh func()
 }
 
 func (f *rejFakeRefresh) Refresh(context.Context, string) (codexauth.RefreshResult, error) {
+	f.admission.t.Helper()
+	tx := f.admission.tx
+	if tx == nil || !tx.closed || len(tx.committed) != 2 || tx.committed[0] != "intent" || tx.committed[1] != "lease" {
+		f.admission.t.Fatal("provider called before intent and lease admission committed")
+	}
 	f.calls++
 	if f.onRefresh != nil {
 		f.onRefresh()
@@ -154,11 +186,12 @@ func newRejHarness(t *testing.T, providerErr error, rejector *recordingRejector)
 	acct.ID = accountID
 	acct.UserID = userID
 	acct.CoordState = codexCoordIdle
-	st := &rejFakeStore{acct: acct}
-	client := &rejFakeRefresh{err: providerErr}
+	admission := &rejectionAdmissionBeginner{t: t, userID: userID, accountID: accountID, available: true}
+	st := &rejFakeStore{acct: acct, admission: admission}
+	client := &rejFakeRefresh{err: providerErr, admission: admission}
 	svc := newOffModeService(st, box, Params{})
 	svc.codexRefresh = client
-	svc.SetTxBeginner(rejectionNoMaterialWriteBeginner{})
+	svc.SetTxBeginner(admission)
 	if rejector != nil {
 		svc.codexRejector = rejector
 	}
@@ -166,10 +199,12 @@ func newRejHarness(t *testing.T, providerErr error, rejector *recordingRejector)
 }
 
 func (h rejHarness) refresh(ctx context.Context, op uuid.UUID) (CodexRefreshResult, error) {
+	h.st.admission.available = true
 	return h.svc.coordinatedRefresh(ctx, h.userID, h.accountID, op, 0, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
 }
 
 func (h rejHarness) poll() *CodexUsageFailure {
+	h.st.admission.available = true
 	principal := codexPollPrincipal{userID: h.userID, accountID: h.accountID, generation: 0}
 	_, _, f := h.svc.handleCodexUsageUnauthorized(context.Background(), h.st, nil, principal)
 	return f
@@ -401,7 +436,7 @@ func TestCodexRefreshRejectionSurvivesCancelledContext(t *testing.T) {
 }
 
 // TestCodexRefreshRejectionUnwiredIsAmbiguous proves the fail-closed default: with no
-// injected rejector and no transaction beginner, a material rejection applies nothing and
+// injected rejector and no material-write transaction, a material rejection applies nothing and
 // stays ambiguous.
 func TestCodexRefreshRejectionUnwiredIsAmbiguous(t *testing.T) {
 	h := newRejHarness(t, refreshAuthErr(http.StatusUnauthorized, codexauth.OAuthCodeRefreshTokenReused), nil)
@@ -449,9 +484,21 @@ func TestCodexRefreshPhaseLogOAuthErrorOnlyWhenPresent(t *testing.T) {
 	}
 }
 
-// Rejection must finish without opening a material-write transaction.
-type rejectionNoMaterialWriteBeginner struct{}
+// Each harness entry permits one admission transaction. Subsequent transactions
+// cannot persist material, so the unwired rejector still fails closed. A new
+// refresh/poll entry rearms admission for tests that reuse the harness.
+type rejectionAdmissionBeginner struct {
+	t                 *testing.T
+	userID, accountID uuid.UUID
+	available         bool
+	tx                *refreshAdmissionTx
+}
 
-func (rejectionNoMaterialWriteBeginner) Begin(context.Context) (pgx.Tx, error) {
-	return nil, errors.New("rejection fixture: unexpected material-write transaction")
+func (b *rejectionAdmissionBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	if !b.available {
+		return nil, errors.New("rejection fixture: unexpected material-write transaction")
+	}
+	b.available = false
+	b.tx = &refreshAdmissionTx{t: b.t, userID: b.userID, accountID: b.accountID}
+	return (refreshAdmissionBeginner{tx: b.tx}).Begin(ctx)
 }

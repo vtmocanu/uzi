@@ -16,7 +16,7 @@ import (
 // points at a throwaway Postgres; run via ./e2e/run-store-it.sh. Every name ends LiveDB so the
 // store-IT sweep selects it.
 
-// countRunCredentialEpochs is the raw row count for run_credential_epochs, used to prove a
+// countRunCredentialEpochs counts non-Codex attribution rows, used to prove a
 // Codex claim writes NO Anthropic attribution row (mirrors the pattern in
 // credential_switch_message_livedb_test.go).
 func (e codexTestEnv) countRunCredentialEpochs(t *testing.T, runID uuid.UUID) int {
@@ -73,7 +73,7 @@ func seedDefaultAnthropicToken(t *testing.T, env codexTestEnv, userID uuid.UUID)
 // TestAssembleClaimCodexOnlyFullAssemblySucceedsLiveDB (D4, success criterion 3): a Codex-only
 // user's run assembles a FULL claim through assembleClaim: it carries Secrets.Codex and an
 // EMPTY AnthropicOAuthToken (the harness-first branch never opens an Anthropic credential for
-// a Codex run), and writes no run_credential_epochs row.
+// a Codex run), and writes no Anthropic attribution row.
 func TestAssembleClaimCodexOnlyFullAssemblySucceedsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	f := newSubscriptionFixture(t, env) // seeds a fully-bound, claimed subscription Codex run
@@ -103,7 +103,7 @@ func TestAssembleClaimCodexOnlyFullAssemblySucceedsLiveDB(t *testing.T) {
 
 // TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB (D4): a Codex run for a user who
 // ALSO holds a default Anthropic token still carries NO anthropic_oauth_token and writes NO
-// run_credential_epochs row — the harness-first branch is unconditional, not merely "no
+// Anthropic attribution row. The harness-first branch is unconditional, not merely "no
 // Anthropic token present".
 func TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
@@ -113,6 +113,7 @@ func TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing.T) {
 
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
+	svc.SetTxBeginner(env.pool)
 	run := mustRun(t, env, f.runID)
 
 	payload, err := svc.assembleClaim(env.ctx, f.wkr, run)
@@ -128,7 +129,8 @@ func TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing.T) {
 	if n := env.countRunCredentialEpochs(t, f.runID); n != 0 {
 		t.Fatalf("run_credential_epochs rows = %d, want 0 (a Codex claim must never attribute the Anthropic token, even when one exists)", n)
 	}
-	// Issue #4201: the Codex claim journals its own binding epoch, once, and a re-assembly is idempotent.
+	// Issue #4202: assembly alone must not journal an undelivered mint. The exact-claim
+	// finisher commits the Codex binding baseline before delivering the payload.
 	codexRows := func() (n int, secret *uuid.UUID) {
 		t.Helper()
 		if err := env.pool.QueryRow(env.ctx, `SELECT count(*), max(secret_id::text)::uuid FROM run_credential_epochs
@@ -137,14 +139,30 @@ func TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing.T) {
 		}
 		return n, secret
 	}
+	if n, _ := codexRows(); n != 0 {
+		t.Fatalf("codex_binding epoch rows before finish = %d, want 0", n)
+	}
+	finish := func(assembled *ClaimPayload) {
+		t.Helper()
+		delivered, err := svc.finishRunClaim(env.ctx, run, assembled, nil, claimRecoveryIdentity{workerID: f.workerID})
+		if err != nil || delivered == nil || delivered.Secrets.Codex == nil {
+			t.Fatalf("finishRunClaim did not deliver the Codex claim: %v", err)
+		}
+		if delivered.Secrets.AnthropicOAuthToken != "" || env.countRunCredentialEpochs(t, f.runID) != 0 {
+			t.Fatal("finishing a Codex claim attributed an Anthropic credential")
+		}
+	}
+	finish(payload)
 	if n, secret := codexRows(); n != 1 || secret == nil || *secret != uuid.UUID(run.CodexSecretID.Bytes) {
 		t.Fatalf("codex_binding epoch rows = %d secret %v, want exactly one for the bound Codex secret", n, secret)
 	}
-	if _, err := svc.assembleClaim(env.ctx, f.wkr, run); err != nil {
+	payload, err = svc.assembleClaim(env.ctx, f.wkr, run)
+	if err != nil {
 		t.Fatalf("second assembleClaim: %v", err)
 	}
+	finish(payload)
 	if n, _ := codexRows(); n != 1 {
-		t.Fatalf("codex_binding epoch rows after a re-assembly = %d, want 1 (idempotent)", n)
+		t.Fatalf("codex_binding epoch rows after re-assembly and finish = %d, want 1 (idempotent)", n)
 	}
 	if got := mustRun(t, env, f.runID); got.AnthropicSecretID.Valid && got.AnthropicSecretID != run.AnthropicSecretID {
 		t.Fatalf("a Codex claim must not touch runs.anthropic_secret_id: %v", got.AnthropicSecretID)

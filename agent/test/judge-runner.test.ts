@@ -193,6 +193,23 @@ function replyingQueryFnWithUsage(text: string): SdkQueryFn {
 }
 
 describe("JudgeRunner", () => {
+  for (const capability of [undefined, null, 42, {}, ""]) {
+    it(`malformed subscription capability ${JSON.stringify(capability)} lands deterministic fallback`, async () => {
+      const { client, calls } = fakeClient(emptyTrace);
+      let modelCalls = 0;
+      const queryFn: SdkQueryFn = (() => { modelCalls++; throw new Error("unexpected Claude call"); }) as unknown as SdkQueryFn;
+      const codexAdviceHarnessFactory = (async () => { modelCalls++; throw new Error("unexpected Codex call"); }) as never;
+      const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, codexAdviceHarnessFactory });
+      await runner.execute(judgeClaim({ secrets: { forge_pat: "", anthropic_oauth_token: "claude-fallback-forbidden",
+        codex: { auth_mode: "subscription", access_token: "fixture-access", capability,
+          generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null } } as never }));
+      assert.equal(modelCalls, 0);
+      assert.equal(calls.review?.review.status, "failed");
+      assert.equal(calls.review?.review.recommendations[0]?.target, "jq");
+      assert.equal(calls.states.at(-1)?.body.status, "completed");
+    });
+  }
+
   for (const failure of ["transient", "stale"] as const) {
     it(`Judge usage post failure: ${failure}`, async () => {
       const { client, calls } = fakeClient(emptyTrace);

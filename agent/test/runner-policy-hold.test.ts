@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
 import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -272,7 +272,7 @@ describe("policy admission on every production claim", () => {
       const outbox = await pendingOutbox();
       const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
       const claim = gitlabClaim(3710, { claim_generation: 3, plan_approved: true, plan_md: "approved",
-        secrets: { forge_pat: "fixture-pat", codex: { auth_mode: "subscription", access_token: "fixture-access" } } });
+        secrets: { forge_pat: "fixture-pat", codex: { auth_mode: "subscription", access_token: "fixture-access", capability: "policy-fixture-capability" } } });
       let fail = delayed;
       const journal = outbox.journalPolicyHold.bind(outbox);
       t.mock.method(outbox, "journalPolicyHold", async (...args: Parameters<typeof journal>) => {
@@ -294,7 +294,8 @@ describe("policy admission on every production claim", () => {
         source_generation: body.source_generation, observed_status: "paused", observed_generation: 3,
         hold_reason: "codex_policy_hold" });
       const r = runnerWith(() => ({ executor: { run: async () => {
-        companion = acquireCodexOperationScope(client, claim.run_id, 3);
+        companion = acquireCodexOperationScope(client, claim.run_id, 3, {}, undefined, undefined, undefined,
+          codexOperationAuthorityIdentity(claim.secrets.codex!.capability));
         permit = await companion.prepare("root", new AbortController().signal, () => {});
         assert.equal(permit(), true);
         assert.equal(admissionLeases, 1, "the negotiated operation acquired a real admission lease");

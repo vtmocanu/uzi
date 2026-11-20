@@ -329,6 +329,7 @@ audited_prd_refs = %w[
   agent/templates/jvm/Dockerfile.dockerignore
   agent/test/chat-executor.test.ts
   agent/test/codex-pins.ts
+  agent/test/credential-switch-validation.md
   agent/test/executor.test.ts
   agent/test/fixtures/repoagents/.claude/agents/researcher.md
   agent/test/git-read-bare.test.ts

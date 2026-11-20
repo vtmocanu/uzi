@@ -2403,12 +2403,23 @@ SET secret_id     = EXCLUDED.secret_id,
     select_reason = EXCLUDED.select_reason,
     applied_at    = EXCLUDED.applied_at;
 
+-- name: GetCodexClaimBaseline :one
+-- Bounded attribution validation under the current run lock, not a history scan.
+SELECT e.* FROM run_credential_epochs e JOIN runs r ON r.id = e.run_id
+WHERE e.run_id = @run_id AND e.claim_generation = @claim_generation AND r.user_id = @user_id;
+
+-- name: GetLatestCodexClaimSwitchEpoch :one
+SELECT e.* FROM run_credential_switch_epochs e JOIN runs r ON r.id = e.run_id
+WHERE e.run_id = @run_id AND e.claim_generation = @claim_generation AND r.user_id = @user_id
+ORDER BY e.ordinal DESC LIMIT 1;
+
 -- name: ListRunCredentialEpochs :many
 -- The applied-switch history for one run (PRD #1247 M1, D7): every claim's credential
 -- epoch, oldest generation first, for the run-detail DTO's credential_epochs and for the
 -- M1 live-DB attribution test. Owner-scoped through the run join so a caller cannot read
 -- another user's journal.
-SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at
+SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at,
+       e.codex_auth_mode, e.codex_material_revision, e.codex_account_key, e.codex_account_id, e.codex_claim_epoch
 FROM run_credential_epochs e
 JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = @run_id AND r.user_id = @user_id
@@ -2439,11 +2450,18 @@ ORDER BY claim_generation DESC, ordinal DESC
 LIMIT 1;
 
 -- name: RecordCodexCredentialEpoch :exec
--- Issue #4201: the Codex claim's journal row without RecordRunCredentialEpoch's settled_switch CTE
--- (Codex never takes the Claude held-switch path, so it must not clear a Claude switch stamp).
--- Idempotent on the claim.
-INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
-VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
+-- Called under the exact-mint run lock, before the claim payload is released.
+-- Reuse the base epoch (ordinal 0); never touch the Anthropic switch stamp.
+INSERT INTO run_credential_epochs (
+    run_id, claim_generation, secret_id, label, select_reason, applied_at,
+    codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch)
+SELECT @run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'),
+       sqlc.narg('select_reason'), now(), r.codex_auth_mode, r.codex_material_revision,
+       r.codex_account_key,
+       CASE WHEN r.codex_auth_mode = 'subscription'
+            THEN r.codex_account_key::jsonb ->> 1 END,
+       r.codex_claim_epoch
+FROM runs r WHERE r.id = @run_id AND r.harness = 'codex'
 ON CONFLICT (run_id, claim_generation) DO NOTHING;
 
 -- name: InsertRunCredentialSwitchEpoch :one
@@ -2460,11 +2478,37 @@ SELECT @run_id, @claim_generation::bigint,
        @op_id, sqlc.narg('worker_id'), sqlc.narg('secret_id'), @secret_enablement_rev,
        sqlc.narg('label'), sqlc.narg('select_reason'), @message_seq, sqlc.narg('old_cumulative')
 RETURNING run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
-          label, select_reason, message_seq, old_cumulative, applied_at;
+          label, select_reason, message_seq, old_cumulative, applied_at,
+          codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch;
+
+-- name: InsertCodexRunCredentialSwitchEpoch :one
+-- Snapshot the exact post-mint binding, never plaintext or capability hash.
+INSERT INTO run_credential_switch_epochs (
+ run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+ label, select_reason, message_seq, old_cumulative, codex_auth_mode,
+ codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch)
+SELECT r.id, r.claim_generation,
+ (SELECT COALESCE(max(e.ordinal), 0) + 1 FROM run_credential_switch_epochs e
+  WHERE e.run_id = r.id AND e.claim_generation = r.claim_generation),
+ @op_id::uuid, r.worker_id, r.codex_secret_id, s.enablement_rev,
+ r.codex_secret_label, 'pinned', @message_seq, sqlc.narg('old_cumulative')::jsonb,
+ r.codex_auth_mode, r.codex_material_revision, r.codex_account_key,
+ CASE WHEN r.codex_auth_mode = 'subscription' THEN (r.codex_account_key::jsonb ->> 1) END,
+ r.codex_claim_epoch
+FROM runs r JOIN user_secrets s ON s.id = r.codex_secret_id AND s.user_id = r.user_id
+WHERE r.id = @run_id AND r.user_id = @user_id AND r.worker_id = @worker_id::uuid
+ AND r.claim_generation = @claim_generation::bigint
+ AND r.codex_claim_epoch = @capability_epoch::bigint AND r.codex_cap_hash IS NOT NULL
+ AND r.harness = 'codex' AND r.claim_released_at IS NULL
+ AND r.status IN ('running','awaiting_approval','awaiting_input','awaiting_followup')
+ AND r.credential_switch_op_id = @op_id::uuid
+ AND r.credential_switch_requested_at IS NOT NULL
+RETURNING *;
 
 -- name: GetRunCredentialSwitchEpochByOp :one
 SELECT run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
-       label, select_reason, message_seq, old_cumulative, applied_at
+       label, select_reason, message_seq, old_cumulative, applied_at,
+       codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch
 FROM run_credential_switch_epochs
 WHERE op_id = @op_id AND run_id = @run_id;
 
@@ -2499,7 +2543,8 @@ UPDATE workers SET credential_switch_apply_nonce = @nonce WHERE id = @id;
 -- name: ListRunCredentialSwitchEpochs :many
 -- Owner-scoped child epochs for one run, oldest first (the sibling of ListRunCredentialEpochs).
 SELECT e.run_id, e.claim_generation, e.ordinal, e.op_id, e.worker_id, e.secret_id,
-       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at
+       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at,
+       e.codex_auth_mode, e.codex_material_revision, e.codex_account_key, e.codex_account_id, e.codex_claim_epoch
 FROM run_credential_switch_epochs e
 JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = @run_id AND r.user_id = @user_id
@@ -11153,7 +11198,7 @@ WITH candidates AS MATERIALIZED (
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
 SELECT runs.id, runs.kind, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
-       runs.credential_switch_generation, runs.egress_profile_id
+       runs.credential_switch_generation, runs.egress_profile_id, runs.harness
 FROM runs WHERE runs.id = @run_id
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
 FOR UPDATE OF runs;
@@ -13881,3 +13926,25 @@ UPDATE runs SET
 WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
   AND recovery_wait_cause = 'codex_idle_stall'
 RETURNING *;
+
+-- name: StampHeldCodexCredentialSwitch :execrows
+-- Pending-only: no credential_override or codex binding columns are written.
+UPDATE runs SET
+    credential_switch_requested_at = GREATEST(clock_timestamp(),
+        COALESCE(credential_switch_requested_at, '-infinity'::timestamptz) + interval '1 microsecond'),
+    credential_switch_generation = sqlc.narg('generation')::bigint
+WHERE id = @id AND user_id = @user_id AND worker_id = sqlc.narg('worker_id')::uuid
+  AND harness = 'codex' AND kind NOT IN ('job', 'cross_check')
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND claim_generation = sqlc.narg('generation')::bigint AND claim_released_at IS NULL;
+
+-- name: SetPendingCodexSwitchTarget :execrows
+UPDATE runs SET codex_switch_target_secret_id = sqlc.narg('secret_id')::uuid,
+    codex_switch_target_generation = credential_switch_generation,
+    codex_switch_target_op_id = credential_switch_op_id,
+    codex_switch_target_auth_mode = @auth_mode::text,
+    codex_switch_target_material_revision = @material_revision::bigint,
+    codex_switch_target_account_key = sqlc.narg('account_key')::text,
+    codex_switch_target_account_revision = sqlc.narg('account_revision')::bigint
+WHERE id = @id AND user_id = @user_id AND credential_switch_requested_at IS NOT NULL
+  AND credential_switch_generation = sqlc.narg('generation')::bigint AND harness = 'codex';

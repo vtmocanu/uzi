@@ -182,7 +182,7 @@ func TestInPlaceSwitchDrainsNeedsBothCapabilities(t *testing.T) {
 		{[]string{capability.CredentialSwitchInPlaceV1}, false},
 		{[]string{capability.CredentialSwitchInPlaceV1, capability.InputReceiptsV1}, true},
 	} {
-		if got := inPlaceSwitchDrains(store.Worker{ProtocolCapabilities: tc.caps}); got != tc.want {
+		if got := inPlaceSwitchDrains(store.Worker{ProtocolCapabilities: tc.caps}, harnessClaude); got != tc.want {
 			t.Fatalf("%v: got %v want %v", tc.caps, got, tc.want)
 		}
 	}

@@ -1,4 +1,4 @@
-# ADR-4201: In-place Claude credential switch
+# ADR-4201: In-place credential switch
 
 **Status**: Accepted (issue #4201; the worker, the apply route, the epoch journal, the worker-side holds, the m3a release-path server gate, the nonce fence on the op-carrying failed report, the in-place input ACK during a pending switch and the `old_cumulative` reading have landed; m3b is not done, blocked by the fleet capability cutoff)
 **Date**: 2026-11-13
@@ -12,7 +12,117 @@ A live Claude run's owner can switch its Anthropic token **in place**. On a work
 
 Workers without the capability (v1) keep the release/reclaim path of ADR-1247 until the fleet cutoff. Removing that path is **m3b**, a later PR under #4201 that is blocked by the fleet cutoff. It has not been done; the checklist at the end of this ADR is its scope.
 
-Not shipped: m3b (the removal of the v1 release path and its tests), a durability claim beyond Postgres defaults, an epoch field on the `/usage` side channel, and anything for Codex runs beyond journaling their binding epoch.
+Not shipped: m3b (the removal of the v1 release path and its tests), a durability claim beyond Postgres defaults, an epoch field on the `/usage` side channel, and real cross-account Codex provider acceptance. The Codex extension below
+is implemented with fake-provider evidence; owner two-account acceptance remains
+pending and non-closing.
+
+## Codex live owner switch (2026-11-15)
+
+This amendment extends in-place switching to eligible live Codex runs and
+amends [ADR-1590](1590-codex-binding-same-identity-readmission.md). The sole
+identity-changing exception to its write-once binding is a separately
+owner-authorized, fenced live switch. Re-login, automatic selection and
+park promotion do not authorize identity changes; other identity changes
+remain terminal `credential_unavailable`.
+
+The owner explicitly chooses an enabled owner-owned Codex subscription or
+OpenAI API-key label through CLI set-token or the web picker. Auto, default,
+inherit and the Anthropic selection ladder are not Codex switch modes.
+Running and worker-held awaiting_approval/input/followup apply at the next
+safe boundary; claimed returns 409, queued and every park return 422,
+including worker-held limit_wait/recovery_wait. Unresolved policy episodes
+reject request and apply. Busy refresh leases/intents refuse with retry
+guidance.
+
+Success keeps worker, generation and worktree, with zero attempt, custody
+or reclaim transitions. B authority is immutable, worker-owned and issued
+into a fresh CODEX_HOME; sessions alone are copied, never auth.json. Resume
+attempts the saved ID. Confirmed provider refusal alone permits a fresh
+thread with explicit lineage, subject to preservation holds.
+
+A failed persistence before teardown permits proven A to continue only when
+an exact-operation acknowledgement establishes non-application and the worker
+proves it still owns the run. Unknown teardown retains the
+settling/unsettled fence. An uncertain apply takes the plain owner pause
+with credential_switch_uncertain; neither A nor B executes until resolved.
+This extension adds no release/reclaim fallback.
+
+Actual worker-loss recovery may use a new claim and checkout. Its authority
+comes from the database-committed Codex binding, with a new capability and
+ordinal 0, not Claude claimSecretID resolution. The candidate session is
+claim.session_id, subject to path, rollout and provider checks; fresh cwd
+requires explicit lineage, and missing IDs produce an explicit retained-
+recovery notice. Preservation refuses fresh cwd or a missing conversation.
+
+Recovery after a crash is two separate guarantees (decision 11). **uzi-operation
+fencing (server):** a fresh claim increments the generation, remints the
+capability and records the baseline, and stale applies and stale capabilities
+are refused. A failed fence check (`codexSwitchFence` in
+`api/internal/workersvc/credential_switch_codex.go`) returns
+`Outcome: ApplyOutcomeFenced`; the apply's zero-row writes
+(`credential_switch_codex_apply.go`) return `ErrStaleClaim`. Settlement does not
+prove the run's processes stopped (`settleCredentialSwitchHold`), and fencing
+refuses stale uzi operations only.
+**Predecessor stop (worker):** `recoverRetainedClaimBody` (`agent/src/runner.ts`)
+runs the `predecessor_capture` quiescence proof before `executor.run`. The
+design property is that, on same-worker retained recovery, delivered Codex
+material (A or B) is not used for login, provider start, refresh, release or
+any other credential operation before that proof passes. The evidence is
+narrower: same-worker retained recovery for API-key A to subscription B, with
+release and refresh controlled before the proof (ledger U21). Request bodies,
+launches and requests before the proof are asserted only, and other auth
+directions are uncredited. If the proof reports survivors or is unverified, the
+material stays unused and the run ends as a terminal `failed` with the
+`quiescence_failed` blocker (`worker_residue_blocked`), clone and custody kept.
+That is not an owner pause. Claim-payload delivery of the material may remain;
+delivery is not evidence of quiescence.
+
+**Crash point 5 (predecessor host unreachable)** is an owner-recorded scope
+decision (2026-11-18): unvalidated and uncredited, an environmental limitation.
+Fencing refuses stale uzi operations, but neither a different B credential nor
+revoking A's uzi capability stops a provider credential an unreachable
+predecessor already holds. The owner's stated requirement is that B is never
+used while predecessor quiescence is unproven, with the run held for the owner
+instead (on the same-worker path that means terminal `failed`,
+`worker_residue_blocked`, with clone and custody kept; not an owner pause).
+**Landing amendment (2026-11-20):** #4476, landed by #4500, closes the
+cross-worker Codex reclaim path with a server-side claim-provenance gate
+([ADR-4476](4476-codex-claim-provenance.md)). Once claimed, a Codex run admits
+a fresh claim only from its recorded worker with provenance matching the current
+generation, subject to existing fences. Affinity expiry, stale-worker grace,
+worker deletion and the cross-check bypass cannot admit a peer. Legacy or stale
+provenance refuses every fresh claim; existing-flight readoption remains subject
+to its existing fences, otherwise the owner must cancel. Cancellation alone does
+not release custody. This restriction supplies no quiescence proof and does not
+revoke credentials already delivered to the old host.
+
+**The remaining Codex nonconformance is the same-worker new-incarnation path.**
+Provenance binds a worker id and generation, not a process or pod incarnation.
+A replacement under the same worker id may therefore claim while the previous
+incarnation still runs. Its local `predecessor_capture` cannot observe that
+other pod, so full decision 11 remains unmet. This residual stays unvalidated
+and uncredited; the worker-id restriction must not be called positive takeover
+proof. Claude cross-worker reclaim and the predecessor's forge PAT remain
+separate, unfixed gaps recorded in ADR-4476. Continuation is never justified by
+"the host is gone". No new credential-delivery protocol was started.
+
+Residuals recorded as unvalidated and uncredited, never as proven, including:
+token-absence surfaces with no guard to remove (outside the stopped route),
+stopped-route binding identity, positive X/Y withdrawn-switch settlement credit,
+Now's gate during B publication (masked) and summary gating (untested),
+suspension of B's startup refresh before finish (its red was a timeout), the
+explicit-request refusals the ledger lists as unvalidated (pool_wait, terminal
+statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and
+foreign-subscription), and crash point 5. Every residue the ledger's "Clause
+accounting" table marks unvalidated or not controlled is recorded as
+unvalidated and uncredited; the table in
+`agent/test/credential-switch-proof-ledger.md` is the source of truth.
+
+Real cross-account provider acceptance remains UNPROVEN; fake-provider
+evidence does not settle it. Owner two-account acceptance is pending and
+non-closing. Neither universal crash-resume nor storage durability is claimed. The Claude legacy release
+compatibility paths, D6 claim-resolution description and residuals remain
+Claude scope.
 
 ## Context
 
@@ -42,7 +152,7 @@ The fresh path therefore takes `FOR SHARE NOWAIT` (`LockAnthropicSecretForApply`
 
 ### D3. Epoch attribution and the delta (telescoping) rule
 
-The in-generation switch is a child of the claim's credential epoch. `run_credential_switch_epochs` stores one row per applied switch: ordinal `1..n` within the generation, the op id (unique, which makes a retried apply idempotent), the credential, and the `message_seq` at which it took effect. Codex claims journal their binding epoch with select reason `codex_binding` in `run_credential_epochs` (the claim-epoch table, not `run_credential_switch_epochs`); Codex runs never switch in place.
+The in-generation switch is a child of the claim's credential epoch. `run_credential_switch_epochs` stores one row per applied switch: ordinal `1..n` within the generation, the op id (unique, which makes a retried apply idempotent), the credential, and the `message_seq` at which it took effect. Codex claims journal their binding epoch with select reason `codex_binding` in `run_credential_epochs` (the claim-epoch table, not `run_credential_switch_epochs`); Codex live switches use the separate fenced extension above.
 
 Every frame the worker sends carries `credential_epoch_ordinal`, fenced at append under the same run lock the apply holds: a frame is stored at its sent ordinal only when that epoch is already committed for the run's current generation, otherwise at the permanent **-1** (unattributed, with a warning). Absent or 0 means the claim's base epoch.
 
@@ -57,7 +167,7 @@ Before each apply the worker runs the same proof the retained path of #3181 uses
 
 ### D5. Proven quiescence with an uncertain outcome is a plain owner pause (option A)
 
-When quiescence is proven but the apply's outcome is not (`refused_committed`, a reply lost past the retries, or a swap that failed after the server committed), the worker reports `credential_switch_uncertain` with the op id. The run goes `paused` with **no** hold reason (so it is an ordinary owner pause and Resume works), keeping the worker, session and open question, and a `credential_switch_uncertain` message explains it. The **worker** posts that feed line itself, through its own message stream (`inPlaceOptionA` in `agent/src/runner.ts`), once per uncertain outcome and only after the state report is confirmed (a refused or unconfirmed report posts nothing, so the line never announces a pause that did not happen); the server does not write it, because a server-written message raced the worker's seq space. The owner sees it in the run feed. Neither token is used again. **Resume re-resolves the token from the override**, so the owner's current choice wins whichever side of the commit the lost reply was on. A pending wall or reserve pause is left alone and the server answers 409 `park_pending`; that park belongs to the worker's own park path.
+When quiescence is proven but the apply's outcome is not (`refused_committed`, a reply lost past the retries, or a swap that failed after the server committed), the worker reports `credential_switch_uncertain` with the op id. The run goes `paused` with **no** hold reason (so it is an ordinary owner pause and Resume works), keeping the worker, session and open question, and a `credential_switch_uncertain` message explains it. The **worker** posts that feed line itself, through its own message stream (`inPlaceOptionA` in `agent/src/runner.ts`), once per uncertain outcome and only after the state report is confirmed (a refused or unconfirmed report posts nothing, so the line never announces a pause that did not happen); the server does not write it, because a server-written message raced the worker's seq space. The owner sees it in the run feed. Neither token is used again. **Claude Resume re-resolves the token from the override**, so the owner's current choice wins whichever side of the commit the lost reply was on. A pending wall or reserve pause is left alone and the server answers 409 `park_pending`; that park belongs to the worker's own park path.
 
 **Report retries (the in-place held and uncertain reports).** Unlike the v1 (op-less) hold report, which keeps one identical retry and an ownership read, the op-carrying report retries transient failures (transport errors, 5xx, 408, 429; an unparseable ack just leaves the report unconfirmed and is retried, an oversized ack is not transient) on a capped exponential backoff, with an ownership read from the fifth attempt (a lost reply that did land confirms there), until it is confirmed, refused, the claim goes stale or ownership is lost, or a lifecycle stop arrives (cancel, claim fence or shutdown surface as the lifecycle guard's throw). Any other failure, such as a non-transient `RequestError`, an oversized ack or the client's own local precondition refusal (`ReportPreconditionError`), ends it unconfirmed: the flight stops retained, with work and custody kept and no feed line.
 
@@ -70,7 +180,7 @@ The worker keeps a write-ahead ledger at `<dataDir>/credential-switch-ops/<runId
 - A transient `credential_busy` or `vault_locked` after an ambiguous send goes straight to the owner pause; it is not retried into a possible second commit (residual 4 below).
 - The ledger is one instance per worker data directory. It is cleaned at a run's terminal state and pruned below a newer claim generation (`pruneGenerationsBelow`), and it never drops a `sending` or `ambiguous` entry of the current generation, because that entry is the only memory that a send may have committed.
 - **The ledger is live-flight memory.** It decides the same-op retries and re-entries of one flight of one claim generation. It is never a cross-restart resend path: once an apply commits, the stamp is cleared, and a flight that finds no pending op gives up without an apply (`runner.ts`, after `settleSwitchQuiescence`). The prune at a new claim is fire-and-forget (`void ...pruneGenerationsBelow`), so it may finish after the new flight's first model turn. That is harmless: entries are looked up only by `(runId, opId)`, and a new generation's switches carry new op ids (the claim clears the old stamp; the op-id trigger mints a fresh id on every stamp change). A late or failed prune only delays disk cleanup.
-- **Recovery after a worker process crash.** The restarted worker re-registers, which rotates the registration nonce. From then on, the dead flight's apply and its op-carrying held, failed and uncertain reports commit nothing (all of them are fenced on the registration nonce). Then, by the state the crash left:
+- **Claude recovery after a worker process crash.** The restarted worker re-registers, which rotates the registration nonce. From then on, the dead flight's apply and its op-carrying held, failed and uncertain reports commit nothing (all of them are fenced on the registration nonce). Then, by the state the crash left:
   - **The run was active** (`claimed`, `running`, `awaiting_*`): register requeues it, and the next claim opens a new generation. Register requeues an active run only within the requeue cap; over the cap the run takes the exhaustion path instead. Its credential is the **current claim resolution** (`claimSecretID`: the run's override, else the worker's binding, which is auto-ranked when the worker is auto-bound and otherwise its pinned secret or the default, all under the weekly-reserve gate), and `RecordRunCredentialEpoch` clears any leftover stamp. A pinned switch is the override, so the pinned token is spent. On the auto lane, the next claim may rank to a different token than the one the lost apply committed.
   - **The uncertain pause had committed** (`paused`, no hold reason): the requeue skips paused runs, so the run waits for the owner's Resume, which re-resolves the token.
   - **A settling or unsettled hold had committed:** it keeps its #3181 rules.
@@ -83,7 +193,7 @@ Every model pass snapshots the credential holder at the start of the call, so a 
 
 When the worker's current registration negotiated in-place apply, the api refuses the v1 `credential_switch` release report with a 409 (`credential_switch_release_retired`); a v1 release with no `claim_generation` is an invalid report and gets 400 before that 409. A settling hold is admitted only with the pending op id, or as a replay of the persisted hold identity (the `credential_switch_hold_*` columns of migration 00442). An older api replica mid-roll still accepts v1 reports, so a rolling deploy cannot strand an in-place worker on the release path. v1 workers are unaffected.
 
-On the worker, a negotiated Claude flight with a pending op whose in-place route is closed (a restore-route predecessor, a completed retained successor, or no ledger or holder) never takes the v1 release: it gets the escaped-arm treatment (`closedInPlaceSwitch` and `escapedInPlaceSwitch` in `agent/src/runner.ts`), that is the quiescence proof, then option A (D5) or the op-fenced hold (D4). Codex flights are excluded and keep their earlier behaviour. A restore-route predecessor always gets the op-fenced hold and goes straight to it without any settlement, because its processes, clone and HOME belong to another incarnation until the successor is seeded (issue #3644 plan 3.4 (b)). A worker whose registration the api counts as negotiated still takes the v1 release in three cases, all mid-roll: the clean `route_absent` of D6 (an api without the route), a switch signal that carries no op id for the current generation (an older api replica's poll or ack; an older stamp with no minted op id also omits it, `api/internal/workersvc/credential_switch_signal.go`; the flight first waits up to `switchSupersedeWaitMs`, 30 s by default, for a poll to name the op id, and takes the in-place route if one does), and a feature cache that an old replica's heartbeat dropped `credential_switch_apply_v1` from (Residual 5). In each case, if a new replica answers, it refuses the release with the 409, and the flight stops non-terminal with its work and custody kept (Residual 5).
+On the worker, a negotiated Claude flight with a pending op whose in-place route is closed (a restore-route predecessor, a completed retained successor, or no ledger or holder) never takes the v1 release: it gets the escaped-arm treatment (`closedInPlaceSwitch` and `escapedInPlaceSwitch` in `agent/src/runner.ts`), that is the quiescence proof, then option A (D5) or the op-fenced hold (D4). These Claude compatibility paths do not apply to the Codex extension above. A restore-route predecessor always gets the op-fenced hold and goes straight to it without any settlement, because its processes, clone and HOME belong to another incarnation until the successor is seeded (issue #3644 plan 3.4 (b)). A worker whose registration the api counts as negotiated still takes the v1 release in three cases, all mid-roll: the clean `route_absent` of D6 (an api without the route), a switch signal that carries no op id for the current generation (an older api replica's poll or ack; an older stamp with no minted op id also omits it, `api/internal/workersvc/credential_switch_signal.go`; the flight first waits up to `switchSupersedeWaitMs`, 30 s by default, for a poll to name the op id, and takes the in-place route if one does), and a feature cache that an old replica's heartbeat dropped `credential_switch_apply_v1` from (Residual 5). In each case, if a new replica answers, it refuses the release with the 409, and the flight stops non-terminal with its work and custody kept (Residual 5).
 
 **Wire rule for the failed and uncertain reports.** An op-carrying `credential_switch_failed` or `credential_switch_uncertain` report must carry the current `register_nonce`: a missing or malformed one, like a stale one (a superseded registration), changes nothing and gets the ordinary not-applied 409. A missing `claim_generation` and a malformed `op_id` remain 400. The op-less v1 failed report is unchanged.
 
@@ -105,7 +215,7 @@ On the worker, a negotiated Claude flight with a pending op whose in-place route
 4. **Transient `credential_busy` or `vault_locked` after an ambiguous send goes straight to an owner pause** (D6), at the cost of an owner Resume that a retry might have avoided.
 5. **Mixed-replica rollout window.** The api decides "negotiated" once, at registration, from the worker's capability. The worker decides per call, from the capability and the feature cache that each heartbeat refreshes. While old and new api replicas serve the same fleet, three things can leave the worker with no report a new replica accepts, so the flight stops non-terminal with its work and custody kept and the switch completes only through a later claim: a heartbeat answered by an old replica (it drops `credential_switch_apply_v1`), a signal without an op id, or a clean `route_absent`. Accepted as a rollout boundary. It closes once every replica serves the feature.
 6. **Per-credential usage across a switch is approximate; `old_cumulative` is the last known reading and omits the aborted turn.** The apply request has an optional `old_cumulative` field (stored in `run_credential_switch_epochs.old_cumulative`, informational, never used to decide anything). The worker sends the last-known `modelUsage` reading of the old credential's session: the batcher keeps it from the most recent session-cumulative result frame (success or error shape, `usage_basis: session_cumulative`) and resets it when a fresh-session init frame passes. It is read once, after the quiescence proof and the drain and before the apply loop, and is sent unchanged on every same-op retry and for the newer op after a `superseded` answer; it is omitted when there is none. A session-cumulative result whose `modelUsage` yields nothing (absent, `{}` or all invalid) clears the reading, so that switch sends no `old_cumulative`. Keys are `<model>.<field>` for the four token counters, kept only as non-negative safe integers, at most 200 UTF-8 bytes and free of C0 control characters and DEL (a longer or control-bearing key is skipped, never truncated), sorted and capped at 64, within the server's `validateOldCumulative` limits. The batcher spans the switch and Claude's cumulative reading is session-wide, so from the second switch on (ordinal 2 or later), or after a resumed session, `old_cumulative` includes the earlier epochs' usage; a per-credential reader must take differences between consecutive epochs' readings. The in-flight turn that the switch aborts emits no result frame, so the reading omits that turn's tail. A resumed session's cumulative reading on the new token continues from the whole session, so part of an aborted old-token turn can be attributed to the new epoch. Any future per-credential usage reader must disclose this limit and must not treat epoch boundaries as exact usage boundaries.
-7. **A claim after a crash does not replay the committed binding.** It spends the current claim resolution (D6, "Recovery after a worker process crash"). That equals the committed switch when the owner pinned a token, and may differ on the auto lane.
+7. **A Claude claim after a crash does not replay the committed binding.** It spends the current claim resolution (D6, "Recovery after a worker process crash"). That equals the committed switch when the owner pinned a token, and may differ on the auto lane.
 8. **A stripped `op_id` makes the failed report the unfenced v1 form.** When an old replica's heartbeat drops `credential_switch_apply_v1` from the worker's feature cache (Residual 5), the client strips `op_id`, so a `credential_switch_failed` report sent then is the op-less v1 form with no nonce fence. A delayed one from a dead process could clear a same-generation stamp. Accepted as part of the same rollout boundary as Residual 5.
 9. **The first in-place trip can be op-less when the stamp lands between an ACK and its APPLIED.** The steering poll skips its GET while a batch is held, so a stamp that lands in that window is first seen through the APPLIED refusal, which has no op id. With no op pending and no live settled window (the window opens at `settleCredentialSwitch`, whether applied, gave_up or cleared, at the current claim generation, and closes at the next switch signal or a signal-less poll), that refusal trips the generation-only (op-less) switch. A bounded wait closes the common case: before choosing the in-place or the escaped path, the runner (`awaitPendingSwitchOpId`, bounded by `switchSupersedeWaitMs`) polls steering for the op id, which the next inputs GET carries and which fills in the op-less pending switch; the batch the refusal dropped is still unapplied, so the same claim's next GET re-holds it and its APPLIED lands after the settle. What remains is only the case where no op id arrives within the bound (for example a stamp cleared in between, or a GET that keeps failing): the runner then takes the D8 op-less path, which an api that serves the feature refuses, so the flight stops non-terminal with its work and custody kept. This is older than the receipt changes (identical at e4665f117). A second, narrower case of the same class: a ready-lane APPLIED (gate inputs) sent just before an apply commits can have its switch_pending refusal arrive after a signal-less poll has already closed the settled window; the same bounded wait applies when that refusal trips an op-less switch, but no test reproduces this ordering. Both fail safe (non-terminal stop, work and custody kept, nothing lost).
 

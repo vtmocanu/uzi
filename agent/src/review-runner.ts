@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 // The ReviewRunner (PRD #400 M4b): the WORKER-side executor for a handoff `--review`
 // run. A review run is a `task`-kind claim carrying a non-null `review_target_run_id`
 // (the reviewed target task run's id). Structurally it mirrors JudgeRunner — a slim
@@ -142,7 +142,7 @@ export class ReviewRunner {
    *  worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     scope?.own();
     // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
     const providerKey = claim.secrets?.provider?.credential;
@@ -196,7 +196,7 @@ export class ReviewRunner {
         if (registration === undefined || operation.kind !== "advice") return undefined;
         const token = this.activeRuns?.setAccountCooldown(reviewRunId, claim.claim_generation ?? 0, operation, registration);
         return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(reviewRunId, claim.claim_generation ?? 0, token);
-      }, ["advice"], this.log) : undefined;
+      }, ["advice"], this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;

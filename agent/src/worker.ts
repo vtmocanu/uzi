@@ -998,6 +998,8 @@ export class Worker {
           // keeps draining /inputs while a switch is pending, which only a worker that handles the
           // switch in place can take.
           "credential_switch_in_place_v1",
+          "codex_credential_switch_v1",
+          "codex_switch_stopped_v1",
           // #2944: generation-stamped checkpoint/input/memory requests and fresh-transcript
           // checkpoint restoration. Distinct from the API feature milestone_reconciliation_v1.
           "milestone_reconciliation_claim_v1",

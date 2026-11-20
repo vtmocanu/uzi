@@ -540,6 +540,24 @@ describe("ReviewRunner", () => {
     assert.equal(gitCalls.pushBranch, 0);
   });
 
+  for (const capability of [undefined, null, 42, {}, ""]) {
+    it(`malformed subscription capability ${JSON.stringify(capability)} lands deterministic fallback`, async () => {
+      const { client, calls } = fakeClient();
+      let modelCalls = 0;
+      const queryFn: SdkQueryFn = (() => { modelCalls++; throw new Error("unexpected Claude call"); }) as unknown as SdkQueryFn;
+      const codexAdviceHarnessFactory = (async () => { modelCalls++; throw new Error("unexpected Codex call"); }) as never;
+      const { git } = fakeGit("diff --git a/x b/x\n+one\n");
+      const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, codexAdviceHarnessFactory });
+      await runner.execute(reviewClaim({ secrets: { forge_pat: "", anthropic_oauth_token: "claude-fallback-forbidden",
+        codex: { auth_mode: "subscription", access_token: "fixture-access", capability,
+          generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null } } as never }));
+      assert.equal(modelCalls, 0);
+      assert.equal(calls.review?.review.status, "failed");
+      assert.deepEqual(calls.review?.review.findings, []);
+      assert.equal(calls.states.at(-1)?.body.status, "completed");
+    });
+  }
+
   it("posts status failed and still completes the run when no Anthropic token is present", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/x b/x\n+one\n");
@@ -836,7 +854,7 @@ describe("ReviewRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
 
 it("stale initial subscription review releases its operation scope and active registration", async () => {
   const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
-  const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
+  const { acquireCodexOperationScope, codexOperationAuthorityIdentity } = await import("../src/codex-operation-scope.js");
   let retained = 0;
   const client = {
     hasFeature: () => true, codexOperationNegotiation: 1,
@@ -845,11 +863,12 @@ it("stale initial subscription review releases its operation scope and active re
   } as unknown as WorkerClient;
   const activeRuns = new ActiveRunRegistry();
   const claim = { run_id: "review-stale", claim_generation: 7, review_target_run_id: "target",
-    branch: "topic", secrets: { codex: { auth_mode: "subscription" } } } as ClaimResponse;
+    branch: "topic", secrets: { codex: { auth_mode: "subscription", capability: "review-stale-capability" } } } as ClaimResponse;
   await new ReviewRunner(client, {} as never, nullLogger(), { activeRuns }).execute(claim);
   assert.equal(retained, 0, "stale review must release its operation flight");
   assert.equal(activeRuns.size, 0, "stale review must clear its active registration");
-  const next = acquireCodexOperationScope(client, claim.run_id, 7);
+  const next = acquireCodexOperationScope(client, claim.run_id, 7, {}, undefined, undefined, undefined,
+    codexOperationAuthorityIdentity(claim.secrets.codex!.capability));
   try {
     assert.doesNotThrow(() => next.bind(async () => () => true), "reacquisition must get a fresh scope");
   } finally { next.close(); }

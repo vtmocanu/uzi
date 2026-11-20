@@ -498,12 +498,12 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   Codex completion capture therefore stops and retains after runner.shutdown;
   the typed #3109 graceful-shutdown checkpoint path remains separate and unchanged.
 
-  Both direct and retained Codex credential-switch entries retain/refuse before
-  capture or credential work. Codex per-run overrides remain unsupported under D9
-  ([override refusal](../api/internal/workersvc/credential_override.go) and
-  [run creation](../api/internal/workersvc/service.go)); only the
-  [Claude executor](../agent/src/sdk-executor.ts) invokes the switch callback.
-  Claude behavior is unchanged. Codex recovery-park
+  These legacy direct and retained Codex capture-switch entries retain/refuse
+  before capture or credential work. The separate owner-authorized live Codex
+  switch applies within the same claim without release/reclaim; see
+  [ADR-4201](4201-in-place-credential-switch.md#codex-live-owner-switch-2026-11-15).
+  Anthropic-only override inputs still reject Codex at run creation. Claude
+  capture behavior is unchanged. Codex recovery-park
   cleanup skips its post-scope clone diagnostic at the original cleanup site, after
   the original guards, preserving sourceExitDenied and retention latches. Claude
   and stale reasons retain their prior paths; subsequent C defers release-capable

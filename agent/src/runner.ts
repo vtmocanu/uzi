@@ -81,7 +81,7 @@ import type {
 } from "./executor.js";
 import { PlanRejectedError, SecretRemediationStoppedError } from "./executor.js";
 import type { InPlaceSwitchSite } from "./executor.js";
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
 import { transientOwnershipReadCause } from "./ownership-read-transient.js";
@@ -246,6 +246,7 @@ import {
 } from "./residue-quarantine.js";
 import { SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
+import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
@@ -2779,6 +2780,8 @@ interface RunFlight {
   policyFreshAllowance?: { remaining: number };
   forgeCloneSuccess?: AbortController;
   defaultBranchTip?: string;
+  codexAuthority?: Readonly<import("./codex-switch-coordinator.js").CodexSwitchBundle>;
+  codexSecrets?: NonNullable<ClaimResponse["secrets"]["codex"]>;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
@@ -2880,8 +2883,10 @@ interface RunFlight {
    *  `held`: the server confirmed the switch hold, so the finally joins this executor's owned
    *  operations and then acknowledges the hold settled. `hold_pending`: a report may have applied
    *  without local confirmation, so the same post-join acknowledgement is owed (a server no-op if
-   *  no hold applied). `unproven`: no hold report is outstanding; join without acknowledging. */
-  retainedSwitchSettlement?: "held" | "hold_pending" | "unproven";
+   *  no hold applied). `unproven`: no hold report is outstanding; join without acknowledging.
+   *  `stopped_unconfirmed`: A is reaped, but the captured stopped tuple is not acknowledged;
+   *  retain custody and join without sending a hold-settled acknowledgement. */
+  retainedSwitchSettlement?: "held" | "hold_pending" | "unproven" | "stopped_unconfirmed";
   completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
   /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
@@ -6323,7 +6328,7 @@ export class RunRunner {
             this.snapshotRegistry?.setAccountCooldown(runId, flight.claimGeneration, operation, registration);
           return token === undefined ? undefined :
             () => this.snapshotRegistry?.clearAccountCooldown(runId, flight.claimGeneration, token);
-      }, ["root", "child"], flight.runLog);
+      }, ["root", "child"], flight.runLog, codexOperationAuthorityIdentity(claim.secrets.codex.capability));
       flight.operationScope.own();
       flight.operationAdmission = flight.operationScope.controller;
       flight.releaseOperationAdmission = () => flight.operationScope?.close();
@@ -7152,6 +7157,16 @@ export class RunRunner {
         });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchSignal) {
+        // The Codex executor has unwound: neither continuation A nor Claude release is safe.
+        if (claim.secrets.codex) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          runLog.warn("Codex switch escaped its live boundary; retaining work without release", { run_id: flight.runId });
+          await batcher.close().catch(() => undefined);
+          return;
+        }
         // PRD #1247 M5b (data-integrity fix): a SAFETY NET. The switch is now handled IN PLACE by the
         // executor via ctx.attemptCredentialSwitch — the implement loop's turn catch and each idle
         // held-state waiter (plan gate / question / follow-up) call it and, on a give-up, CONTINUE the
@@ -13327,9 +13342,11 @@ export class RunRunner {
     // Issue #4201: the editor pass reads the credential ONCE, here at the publication's start: it uses that
     // token and its usage frame carries that epoch ordinal, whatever an in-place switch does meanwhile.
     const descCredential = flight.credential?.current();
+    const codexOrdinal = flight.codexAuthority?.ordinal;
+    const currentClaim = this.claimWithCodexAuthority(claim, flight);
     const descClaim = descCredential
       ? { ...claim, secrets: { ...claim.secrets, anthropic_oauth_token: descCredential.token } }
-      : claim;
+      : currentClaim;
     const publisher = new PrDescriptionPublisher({
       forge,
       api: this.client,
@@ -13343,7 +13360,7 @@ export class RunRunner {
       emitUsage: (u) => {
         if (flight.steering.claimFence() !== undefined) return;
         batcher.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "pr_description", model_usage: u },
-          ...(descCredential && descCredential.ordinal > 0 ? { credentialEpochOrdinal: descCredential.ordinal } : {}) });
+          ...((descCredential?.ordinal ?? codexOrdinal ?? 0) > 0 ? { credentialEpochOrdinal: descCredential?.ordinal ?? codexOrdinal } : {}) });
       },
       forgeRetry,
       headLagRetryMs: this.prDescriptionHeadLagMs,
@@ -13848,7 +13865,7 @@ export class RunRunner {
         generation: claim.claim_generation ?? 0,
         // Issue #4201: a frame's credential epoch ordinal reaches the wire only on an api that
         // negotiated the apply feature (an older api strict-decodes unknown fields).
-        credentialEpochsNegotiated: () => this.client.hasFeature("credential_switch_apply_v1"),
+        credentialEpochsNegotiated: () => this.client.hasFeature("credential_switch_apply_v1") || this.client.supportsInPlaceCodexCredentialSwitch(),
         ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
         ...(this.outboxSpillBufferBytes !== undefined
           ? { spillBufferBytes: this.outboxSpillBufferBytes }
@@ -15747,6 +15764,16 @@ export class RunRunner {
           reason: "cwd_changed_attempt_path",
         },
       });
+    } else if (!sessionId && claim.secrets.codex && flight.retainedEpisode) {
+      // Retained work proves a predecessor existed, but its conversation id was
+      // never reported. Do not imply that the recovered work carries its context.
+      runLog.info("retained Codex conversation id unavailable; starting a fresh thread", {
+        event: RESUME_LINEAGE_BREAK_EVENT, reason: "session_id_unavailable",
+      });
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: "this run was picked up again without its earlier conversation id — continuing WITHOUT its earlier context; its retained work is preserved",
+        event: RESUME_LINEAGE_BREAK_EVENT, reason: "session_id_unavailable",
+      } });
     }
     if (
       sessionId &&
@@ -16935,6 +16962,7 @@ export class RunRunner {
     // or a claim that is not an issue run (on the Claude harness with a token, or on the Codex
     // harness with a valid binding and a wired advice factory) ⇒ no summary call. The controller only reads steering state and the frames the run
     // already emits; everything it does is advisory and swallowed (now-summary.ts).
+    const codexSwitchRegistrationNonce = this.client.registrationNonce();
     const nowSummary =
       this.nowSummaryOpts !== undefined
         ? new NowSummaryController({
@@ -16942,7 +16970,12 @@ export class RunRunner {
             claim: {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.provider),
-              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex,
+                claim.secrets.codex && this.nowSummaryOpts.codexAdviceHarnessFactory
+                  ? executor.bindCodexSummaryFactory?.(this.nowSummaryOpts.codexAdviceHarnessFactory)
+                    ?? this.nowSummaryOpts.codexAdviceHarnessFactory
+                  : this.nowSummaryOpts.codexAdviceHarnessFactory,
+                claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
@@ -16998,6 +17031,64 @@ export class RunRunner {
         if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
       }
     }
+    const prepareDispatch = (scope: RunFlight["operationScope"], assertAdmission?: () => void): RunContext["prepareCodexRootDispatch"] => {
+      const controller = scope?.controller;
+      return scope?.bind(async (signal, localCheck, kind = "root") => {
+        assertAdmission?.();
+        if (!controller?.active())
+          return () => !controller?.active();
+        const source = revisionRecovery?.dispatchSource();
+        const control = new AbortController();
+        const operationSignal = AbortSignal.any([
+          signal, control.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
+        ]);
+        const check = (): void => {
+          assertAdmission?.();
+          localCheck();
+          operationSignal.throwIfAborted();
+          if (steering.isCancelled()) throw new Error("run cancelled");
+          if (steering.claimFence() !== undefined || flight.claimGeneration !== (claim.claim_generation ?? 0))
+            throw new StaleClaimError();
+          if (flight.active?.shuttingDown || this.shuttingDownGlobal)
+            throw new Error("worker shutdown during Codex operation admission");
+          try { revisionRecovery?.assertDispatchSource(source, kind === "root"); }
+          catch (error) {
+            // A lead check can consume a replacement verdict. Preserve
+            // that control outcome when the admission catch rechecks currency.
+            control.abort(error);
+            throw error;
+          }
+        };
+        check();
+        const unsubscribe = steering.observeRevisionDispatchControl(() => {
+          try { check(); } catch (error) { control.abort(error); }
+        });
+        let permit!: () => boolean;
+        try {
+          permit = await controller.admit({ operation_id: randomUUID(), kind,
+            ...(source ? { source } : {}) }, operationSignal, check,
+          async () => { await revisionRecovery?.proveDispatchSource(source, check, kind === "root"); check(); });
+        } catch (error) {
+          check();
+          if (error instanceof CodexOperationAdmissionError) {
+            if (error.reason === "authority_lost") throw new StaleClaimError();
+            if (error.reason === "stale_source")
+              throw new PlanRevisionRecoveryStoppedError("plan revision dispatch lost its source");
+          }
+          throw error;
+        } finally { unsubscribe(); }
+        permit();
+        check();
+        return () => { const valid = permit(); check(); return valid; };
+      });
+    };
+    const epochEmitter = (ordinal: number): RunContext["emit"] => m => {
+      if (claim.secrets.codex && (flight.codexAuthority?.ordinal ?? 0) !== ordinal)
+        throw new Error("Codex epoch callback retired");
+      const frame = { ...m, ...(ordinal > 0 ? { credentialEpochOrdinal: ordinal } : {}) };
+      batcher.emit(frame);
+      nowSummary?.observeFrame(frame);
+    };
     // Issue #4420: the run-owned TMPDIR leaf. Same Claude-only gate as above; any failure launches with
     // today's shared TMPDIR and logs a fixed reason token only.
     if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
@@ -17104,10 +17195,7 @@ export class RunRunner {
       // threaded to prompt-build time so both builders name it on a run with a published
       // floor. Absent (fresh branch) ⇒ no note.
       publishedTip: flight.publishedTip,
-      emit: (m) => {
-        batcher.emit(m);
-        nowSummary?.observeFrame(m);
-      },
+      emit: epochEmitter(flight.codexAuthority?.ordinal ?? 0),
       // Issue #2686: the same predicate the Now summary checks before a usage-only emit.
       claimFenced: () => flight.steering.claimFence() !== undefined,
       // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
@@ -17285,11 +17373,466 @@ export class RunRunner {
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
+      attemptCodexCredentialSwitch: async (opts) => {
+        const retain = (): never => {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          throw new CredentialSwitchRetainedStop();
+        };
+        const nonce = codexSwitchRegistrationNonce;
+        const generation = claim.claim_generation;
+        // One monotonic budget includes drains, persistence and every preflight successor.
+        let deadline = performance.now() + 10_000;
+        let timeout = new AbortController();
+        let timer = setTimeout(() => timeout.abort(), 10_000);
+        let signal = AbortSignal.any([timeout.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+        const guard = (): void => {
+          if (steering.cancelCommittedUnderWithheldSwitch() || steering.isCancelled()) throw new Error("run cancelled");
+          this.retainedTerminalGuard(flight);
+          for (const lifecycle of this.retainedLifecycleSignals(flight)) {
+            if (lifecycle.aborted && !(lifecycle.reason instanceof CredentialSwitchSignal)) throw new RetainedRecoveryStop();
+          }
+          if (steering.claimFence() !== undefined || this.client.registrationNonce() !== nonce ||
+              flight.claimGeneration !== generation) throw new StaleClaimError();
+          if (signal.aborted || performance.now() >= deadline) retain();
+        };
+        const bounds = { get signal() { return signal; }, get deadline() { return deadline; }, guard };
+        const remaining = () => Math.max(0, Math.floor(deadline - performance.now()));
+        const effect = async <T,>(fn: () => Promise<T>): Promise<T> => {
+          guard();
+          let abort!: () => void;
+          const stopped = new Promise<never>((_, reject) => {
+            abort = () => reject(new CredentialSwitchRetainedStop());
+            signal.addEventListener("abort", abort, { once: true });
+          });
+          try { const value = await Promise.race([fn(), stopped]); guard(); return value; }
+          finally { signal.removeEventListener("abort", abort); }
+        };
+        const ownedEffect = async <T,>(fn: () => Promise<T>): Promise<T> => {
+          let raw: Promise<T> | undefined;
+          try {
+            return await effect(() => { raw = fn(); return raw; });
+          } finally {
+            // The lease operation retains sink custody until its owned work settles,
+            // even if effect's guard has already interrupted the caller.
+            if (raw) await raw.catch(() => {});
+          }
+        };
+        let revision = 0;
+        let lastOp: string | undefined;
+        const reconcile = async (afterTeardown = false): Promise<CodexSwitchAuthority> => {
+          const own = await effect(() => this.getObservedRunOwnership(flight,
+            { signal, deadline: Date.now() + remaining() }));
+          if (own.cancellation_requested) { this.observeCancellation(flight); guard(); }
+          const inputs = await effect(() => this.client.getInputs(runId, generation, signal, 1024 * 1024));
+          if (inputs.terminalCancelled) { this.observeCancellation(flight); guard(); }
+          if (inputs.staleObservation) retain();
+          const p = inputs.credentialSwitch;
+          let pending: CodexSwitchOperation | undefined;
+          if (p) {
+            if (p.generation !== generation || !p.op_id || !p.target_secret_id) retain();
+            if (lastOp !== p.op_id) { revision++; lastOp = p.op_id; }
+            // Recheck each successor too: a crash-left sending/apply record cannot be cleared.
+            if (!this.credentialSwitchLedger || (!afterTeardown &&
+                await effect(() => this.credentialSwitchLedger!.stateOf(runId, p.op_id!)))) retain();
+            pending = { claimGeneration: p.generation, registerNonce: nonce!, opId: p.op_id!,
+              targetSecretId: p.target_secret_id!, revision };
+          }
+          // Separate reads are not a DB snapshot; preflight/clear supply the final locked fences.
+          return { owned: own.claim_generation === generation && own.claim_released === false && own.hold_reason == null &&
+              ["running", "awaiting_approval", "awaiting_input", "awaiting_followup"].includes(own.status),
+            claimGeneration: own.claim_generation ?? 0, registerNonce: this.client.registrationNonce() ?? "",
+            routeAvailable: this.client.supportsCodexSwitchStopped(),
+            ledgerAvailable: !!this.credentialSwitchLedger, pending };
+        };
+        const confirmClear = async (operation: CodexSwitchOperation, reason: string): Promise<boolean> => {
+          const before = await reconcile();
+          if (!before.owned || before.pending?.opId !== operation.opId ||
+              before.pending.targetSecretId !== operation.targetSecretId) return false;
+          // Call directly after the guard: capture this registration nonce before any report queue can yield.
+          const ack = await effect(() => this.client.reportState(runId, {
+            status: "credential_switch_failed", claim_generation: generation, op_id: operation.opId, failure_reason: reason,
+          }, signal));
+          if (ack.applied !== true) return false;
+          const after = await reconcile();
+          return after.owned && after.registerNonce === nonce && !after.pending;
+        };
+        try {
+          return await this.runGatedSink(flight, async () => {
+            guard();
+            if (!claim.secrets.codex || !Number.isSafeInteger(generation) || !generation || generation < 0 ||
+                !nonce || !opts.laneSettled || !this.client.supportsCodexSwitchStopped() ||
+                !this.credentialSwitchLedger || !executor.suspendCodexEpoch) retain();
+            const initial = await reconcile();
+            if (!initial.owned) throw new StaleClaimError();
+            if (!initial.pending) retain();
+            const operation = initial.pending!;
+            guard();
+            const nowLease = nowSummary?.suspendCodexSwitch({ signal, remainingMs: remaining() });
+            if (nowLease && (await effect(() => nowLease.drained)).kind !== "drained") retain();
+            const a = await effect(() => executor.suspendCodexEpoch!(bounds));
+            if ((await effect(() => a.reconcileA(bounds, remaining()))).kind !== "ready") retain();
+            guard();
+            const hold = batcher.holdForCredentialSwitch();
+            if (!(await effect(() => hold.prepare(remaining(), signal))).prepared) retain();
+            const oldCumulative = batcher.lastSessionCumulative();
+            const reopen = async (op: CodexSwitchOperation, reason: Extract<import("./codex-switch-preflight.js").CodexSwitchPreflightDecision, { kind: "continued_A" }>["reason"] | "rollout_persist_failed"): Promise<"continued_A"> => {
+              guard(); hold.cancel(); guard();
+              await effect(() => a.reopenA(bounds));
+              guard();
+              if (nowLease && !nowLease.reopenA()) retain();
+              guard(); steering.settleCredentialSwitch(op.opId, "gave_up"); guard();
+              steering.rearmLifecycle(); guard();
+              batcher.emit({ kind: "status", agent: "worker", payload: {
+                event: "credential_switch_failed", reason, text: `Credential switch declined (${reason}); continuing with the current credential.`,
+              } });
+              return "continued_A";
+            };
+            let saved: import("./executor.js").UsableSavedRollout;
+            try { saved = await effect(() => a.persistRollout(bounds)); }
+            catch { guard(); saved = { kind: "failed" }; }
+            if (saved.kind !== "usable" || !saved.sessionId) {
+              if (await confirmClear(operation, "rollout_persist_failed")) return await reopen(operation, "rollout_persist_failed");
+              retain();
+            }
+            const savedSessionId = saved.kind === "usable" ? saved.sessionId : "";
+            const decision = await coordinateCodexSwitchPreflight({
+              initial: operation, signal, now: () => performance.now(), reconcile: () => reconcile(),
+              probe: op => effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal)),
+              confirmFailedClear: confirmClear,
+              delay: ms => effect(() => new Promise<void>((resolve, reject) => {
+                const done = () => { clearTimeout(wait); signal.removeEventListener("abort", aborted); };
+                const aborted = () => { done(); reject(new CredentialSwitchRetainedStop()); };
+                const wait = setTimeout(() => { done(); resolve(); }, Math.min(ms, remaining()));
+                signal.addEventListener("abort", aborted, { once: true });
+              })),
+            });
+            guard();
+            if (decision.kind === "continued_A") return await reopen(decision.operation, decision.reason);
+            if (decision.kind === "fenced") throw new StaleClaimError();
+            if (decision.kind !== "ready") return retain();
+            const expectedEpoch = decision.expectedEpoch;
+            let selected = decision.operation;
+            const current = await reconcile();
+            if (!current.owned) throw new StaleClaimError();
+            if (!current.routeAvailable || current.pending?.opId !== selected.opId || current.registerNonce !== nonce ||
+                current.pending.targetSecretId !== selected.targetSecretId) return retain();
+            // Only a confirmed pass starts the separate cleanup/apply/hold budget.
+            // The same sink gate and terminal claim nonce remain held.
+            clearTimeout(timer);
+            deadline = performance.now() + this.codexBoundaryDeadlineMs;
+            timeout = new AbortController();
+            signal = AbortSignal.any([timeout.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+            timer = setTimeout(() => timeout.abort(), this.codexBoundaryDeadlineMs);
+            let possibleApply = false;
+            const ownerHold = async (opId: string, reason: string): Promise<never> => {
+              if (possibleApply) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+              else hold.cancel(); // Reporting only: A is never reopened after teardown.
+              // Identical reports retry serially within the cleanup deadline. No status-only proof.
+              for (let attempt = 0; ; attempt++) {
+                guard();
+                if (attempt) await effect(() => this.waitRecoveryRetry(flight, true,
+                  this.inPlaceReportBackoffMs(attempt), signal));
+                try {
+                  const ack = await effect(() => this.client.reportState(runId, {
+                    status: "credential_switch_uncertain", claim_generation: generation,
+                    op_id: opId, failure_reason: reason,
+                  }, signal));
+                  if (ack.credentialSwitchUncertain === true) {
+                    flight.parked = true;
+                    batcher.emit({ kind: "credential_switch_uncertain", agent: "worker",
+                      payload: { op_id: opId, generation, reason, text: reason === "not_applied_after_teardown"
+                        ? "Credential switch was not applied; the previous process is stopped. Owner action required."
+                        : "Credential switch outcome requires owner action; model execution remains stopped." } });
+                    return retain();
+                  }
+                  if (ack.applied === false) return retain();
+                } catch (error) {
+                  guard();
+                  if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+                  if (!this.inPlaceReportRetryable(error)) return retain();
+                }
+              }
+            };
+            const pauseCurrent = async (reason: string): Promise<never> => {
+              const latest = await reconcile(true);
+              if (latest.claimGeneration !== generation || latest.registerNonce !== nonce)
+                throw new StaleClaimError();
+              if (latest.pending) {
+                if (!latest.owned) throw new StaleClaimError();
+                return await ownerHold(latest.pending.opId, reason);
+              }
+              if (!latest.owned) {
+                if (possibleApply) throw new StaleClaimError();
+                // Private stopped-only replay observation. Never grants B publication authority.
+                const stopped = await effect(() => this.getObservedRunOwnership(flight,
+                  { signal, deadline: Date.now() + remaining() }));
+                if (stopped.status !== "paused" || stopped.claim_generation !== generation ||
+                    stopped.claim_released !== false || stopped.hold_reason != null)
+                  throw new StaleClaimError();
+              }
+              if (possibleApply) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+              else hold.cancel();
+              // Possible commits require op evidence; a stopped report cannot settle them.
+              if (possibleApply) return await ownerHold(selected.opId, "apply_uncertain");
+              const stoppedTuple = Object.freeze({
+                claimGeneration: generation!, registerNonce: nonce!, expectedEpoch,
+              });
+              // Three serial attempts share the cleanup deadline; every refusal retains the
+              // same tuple. A lost successful response can only settle through an explicit replay ACK.
+              for (let attempt = 0; attempt < 3; attempt++) {
+                const ack = await effect(() => this.client.settleCodexSwitchStopped(runId, stoppedTuple, signal));
+                if (ack.kind === "fenced") throw new StaleClaimError();
+                if (ack.kind === "confirmed") {
+                  flight.parked = true;
+                  flight.retainedSwitchSettlement = undefined;
+                  return retain();
+                }
+              }
+              return retain();
+            };
+            let reaped = false;
+            // Register the obligation before teardown can start or the effect guard can throw.
+            flight.retainedSwitchSettlement = "unproven";
+            let rawTeardown: Promise<boolean> | undefined;
+            try {
+              reaped = await effect(() => {
+                rawTeardown = a.teardown(bounds);
+                return rawTeardown;
+              });
+            } catch { guard(); }
+            finally {
+              // The lease promise itself owns cleanup; the executor may have no join hook.
+              // Keep sink custody through cancellation, fencing and deadline interruption.
+              if (rawTeardown) await rawTeardown.catch(() => {});
+            }
+            if (!reaped) {
+              flight.retainedSwitchSettlement = "unproven";
+              hold.cancel();
+              await effect(() => this.holdRetainedSwitch(flight, runLog, signal, guard,
+                "codex_teardown_unproven", "unverified", { opId: selected.opId }));
+              return retain();
+            }
+            flight.retainedSwitchSettlement = "stopped_unconfirmed";
+            guard();
+            // Required Now/executor users drained before preflight, and teardown proved the root gone.
+            // Preflight refusal must never close this scope.
+            flight.operationScope?.close();
+            const seenSuccessors = new Set([selected.opId]);
+            let priorAmbiguous = false;
+            let result: LedgerApplyResult;
+            // Successors run serially under the existing cleanup deadline, with at most
+            // 32 outer iterations (the preflight helper also probes internally).
+            // A refusal stops the chain; A remains reaped throughout.
+            for (let attempt = 0; ; attempt++) {
+              const beforeApply = await reconcile(true);
+              if (!beforeApply.owned && !possibleApply && !beforeApply.pending)
+                return await pauseCurrent("not_applied_after_teardown");
+              if (!beforeApply.owned || beforeApply.claimGeneration !== generation ||
+                  beforeApply.registerNonce !== nonce) throw new StaleClaimError();
+              if (attempt >= 32 || !beforeApply.routeAvailable || !beforeApply.ledgerAvailable)
+                return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+              const next = beforeApply.pending;
+              if (!next) return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+              if (next.opId !== selected.opId || next.targetSecretId !== selected.targetSecretId ||
+                  next.revision !== selected.revision) {
+                if (next.claimGeneration !== generation || next.registerNonce !== nonce ||
+                    !Number.isSafeInteger(next.revision) || next.revision <= selected.revision ||
+                    seenSuccessors.has(next.opId))
+                  return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+                seenSuccessors.add(next.opId);
+                selected = next;
+                const observedSuccessors = new Set<string>();
+                const successor = await coordinateCodexSwitchPreflight({
+                  initial: selected, signal, now: () => performance.now(),
+                  reconcile: async () => {
+                    if (priorAmbiguous) throw new Error("successor ledger uncertain");
+                    const authority = await reconcile(true);
+                    const p = authority.pending;
+                    if (p && p.opId !== selected.opId && seenSuccessors.has(p.opId))
+                      throw new Error("successor cycle");
+                    if (p) observedSuccessors.add(p.opId);
+                    return authority;
+                  },
+                  probe: async op => {
+                    try {
+                      if (await effect(() => this.credentialSwitchLedger!.stateOf(runId, op.opId)))
+                        throw new Error("successor ledger already contains an operation");
+                    } catch (error) {
+                      possibleApply = priorAmbiguous = true;
+                      throw error;
+                    }
+                    return effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal));
+                  },
+                  // A is irreversibly stopped: a refusal can only hold the current op.
+                  confirmFailedClear: async () => false,
+                  delay: ms => effect(() => new Promise<void>((resolve, reject) => {
+                    const done = () => { clearTimeout(wait); signal.removeEventListener("abort", aborted); };
+                    const aborted = () => { done(); reject(new CredentialSwitchRetainedStop()); };
+                    const wait = setTimeout(() => { done(); resolve(); }, Math.min(ms, remaining()));
+                    signal.addEventListener("abort", aborted, { once: true });
+                  })),
+                });
+                guard();
+                if (priorAmbiguous) return await pauseCurrent("apply_uncertain");
+                if (successor.kind === "fenced") throw new StaleClaimError();
+                if (successor.kind !== "ready" || successor.expectedEpoch !== expectedEpoch)
+                  return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+                if (successor.operation.opId !== selected.opId) {
+                  if (seenSuccessors.has(successor.operation.opId) ||
+                      successor.operation.revision <= selected.revision)
+                    return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+                  seenSuccessors.add(successor.operation.opId);
+                }
+                for (const opId of observedSuccessors) seenSuccessors.add(opId);
+                selected = successor.operation;
+                // Reconcile once more after readonly preflight, before the fenced send.
+                continue;
+              }
+              possibleApply = true;
+              try {
+                result = await effect(() => applyThroughLedger({
+                  applyCredentialSwitch: (id, request) => {
+                    guard();
+                    return this.client.applyCredentialSwitch(id, request, signal);
+                  },
+                }, this.credentialSwitchLedger!, runId, {
+                  claimGeneration: selected.claimGeneration, registerNonce: nonce, opId: selected.opId, oldCumulative,
+                }));
+              } catch (error) {
+                guard();
+                if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+                return await ownerHold(selected.opId, "apply_uncertain");
+              }
+              if (result.kind === "fenced") throw new StaleClaimError();
+              priorAmbiguous ||= "priorAmbiguous" in result && result.priorAmbiguous === true;
+              if (result.kind !== "superseded") break;
+              possibleApply = priorAmbiguous;
+              const latest = await reconcile(true);
+              if (!latest.owned || latest.claimGeneration !== generation || latest.registerNonce !== nonce)
+                throw new StaleClaimError();
+              if (!latest.pending || latest.pending.opId === selected.opId)
+                return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+            }
+            const clean = !priorAmbiguous &&
+              ["not_applied", "route_absent", "ledger_unavailable"].includes(result.kind);
+            if (clean) possibleApply = false;
+            if (result.kind !== "codex_applied")
+              return await ownerHold(selected.opId, clean ? "not_applied_after_teardown" : "apply_uncertain");
+            let binding: ReturnType<typeof selectCodexBinding>;
+            try { binding = selectCodexBinding({ codex: result.codex }); }
+            catch { return await ownerHold(selected.opId, "apply_uncertain"); }
+            if (binding.kind !== "codex" || result.ordinal !== (flight.codexAuthority?.ordinal ?? 0) + 1 ||
+                !Number.isSafeInteger(result.ordinal) || !Number.isSafeInteger(result.capabilityEpoch) ||
+                result.capabilityEpoch <= 0 || !Number.isSafeInteger(result.messageSeq) ||
+                result.messageSeq <= 0 || result.replay)
+              return await ownerHold(selected.opId, "apply_uncertain");
+            const bundle = Object.freeze({ binding: Object.freeze(binding.binding),
+              ordinal: result.ordinal, capabilityEpoch: result.capabilityEpoch, messageSeq: result.messageSeq });
+            const appliedAuthority = async (): Promise<void> => {
+              // A settled ledger entry is expected here; do not use the pre-apply ledger check.
+              const current = await reconcile(true);
+              if (!current.owned || current.registerNonce !== nonce) throw new StaleClaimError();
+              if (current.pending) throw new Error("pending operation after Codex apply");
+            };
+            try {
+              await appliedAuthority();
+              guard();
+              for (const token of [bundle.binding.accessToken, bundle.binding.capability]) {
+                flight.secrets.add(token); this.log.addSecret(token); flight.runScopedSecrets.push(token);
+              }
+              flight.codexAuthority = bundle;
+              flight.codexSecrets = Object.freeze({ ...result.codex });
+              flight.operationScope = undefined;
+              flight.operationAdmission = undefined;
+              if (bundle.binding.authMode === "subscription") {
+                const scope = acquireCodexOperationScope(this.client, runId, generation!,
+                  this.codexOperationWaitPolicy, operation => {
+                    const token = flight.registrationToken === undefined ? undefined :
+                      this.snapshotRegistry?.setAccountCooldown(runId, generation!, operation, flight.registrationToken);
+                    return token === undefined ? undefined :
+                      () => this.snapshotRegistry?.clearAccountCooldown(runId, generation!, token);
+                  }, ["root", "child"], runLog, codexOperationAuthorityIdentity(bundle.binding.capability));
+                scope.own();
+                flight.operationScope = scope;
+                flight.operationAdmission = scope.controller;
+                flight.releaseOperationAdmission = () => flight.operationScope?.close();
+              }
+              let replacementAdmissionOpen = false;
+              ctx.prepareCodexRootDispatch = prepareDispatch(flight.operationScope, () => {
+                if (!replacementAdmissionOpen || flight.codexAuthority !== bundle)
+                  throw new Error("Codex replacement operation admission closed or retired");
+              });
+              ctx.emit = epochEmitter(bundle.ordinal);
+              await ownedEffect(() => a.publishB(bundle, bounds));
+              if (nowLease && !nowLease.publishB(bundle)) throw new Error("Now publication refused");
+              await appliedAuthority();
+              const started = await ownedEffect(() => a.restartAndResume(savedSessionId, bounds));
+              let fresh = false;
+              if (started.kind === "confirmed_resume_refusal") {
+                if (ctx.preserveConversation) {
+                  // The credential operation committed, but B must never admit model work.
+                  // Revalidate after provider I/O, then retire only this operation's stop
+                  // so the existing policy capture can run. An ordinary pause here would
+                  // make the policy endpoint ineligible; other stop causes stay sticky.
+                  await appliedAuthority();
+                  guard();
+                  if (!hold.release({ messageSeq: bundle.messageSeq }) &&
+                      !hold.release({ messageSeq: Math.max(bundle.messageSeq, batcher.currentSeq()) }))
+                    throw new Error("Codex preserving resume sequence hold release refused");
+                  steering.settleCredentialSwitch(selected.opId, "applied");
+                  steering.rearmLifecycle();
+                  // No await or admission opening between settlement and rejection.
+                  // Keep the separate retained process-join obligation through cleanup.
+                  throw new PolicyContinuationRejected("provider_resume_rejected");
+                }
+                await appliedAuthority();
+                await ownedEffect(() => a.startFreshLineage(bounds));
+                fresh = true;
+              } else if (started.kind !== "resumed") throw new Error("Codex resume uncertain");
+              await appliedAuthority();
+              await ownedEffect(() => a.finishB(bounds));
+              guard();
+              if (nowLease && !nowLease.finishB()) throw new Error("Now finish refused");
+              if (!hold.release({ messageSeq: bundle.messageSeq }) &&
+                  !hold.release({ messageSeq: Math.max(bundle.messageSeq, batcher.currentSeq()) }))
+                throw new Error("Codex sequence hold release refused");
+              flight.retainedSwitchSettlement = undefined;
+              steering.settleCredentialSwitch(selected.opId, "applied");
+              steering.rearmLifecycle();
+              replacementAdmissionOpen = true;
+              return fresh ? "fresh_B" : "resumed_B";
+            } catch (error) {
+              guard();
+              if (error instanceof PolicyContinuationRejected || error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+              return await ownerHold(selected.opId, "initialization_failed");
+            }
+          }, { stop: { signal }, deadlineAt: Date.now() + remaining() });
+        } catch (error) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          guard();
+          if (error instanceof PolicyContinuationRejected || error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+          return retain();
+        } finally { clearTimeout(timer); }
+      },
       attemptCredentialSwitch: async (opts) => {
         // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
         // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
         // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
         if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
+        // This hook belongs to Claude, including its give-up and v1 release outcomes.
+        if (claim.secrets.codex) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          throw new CredentialSwitchRetainedStop();
+        }
         if (batcher.hasCandidateReservation()) {
           // Invariant guard: no capture, report, clear or continuation. Not a checked lifecycle
           // control, so it reaches dispatchFailure's generic branch (reportGenericFailure closes
@@ -17382,52 +17925,7 @@ export class RunRunner {
         } }
         : {}),
       codexRootAdmissionActive: () => flight.operationAdmission?.active() ?? false,
-      prepareCodexRootDispatch: flight.operationScope?.bind(async (signal, localCheck, kind = "root") => {
-        if (!flight.operationAdmission?.active())
-          return () => !flight.operationAdmission?.active();
-        const source = revisionRecovery?.dispatchSource();
-        const control = new AbortController();
-        const operationSignal = AbortSignal.any([
-          signal, control.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
-        ]);
-        const check = (): void => {
-          localCheck();
-          operationSignal.throwIfAborted();
-          if (steering.isCancelled()) throw new Error("run cancelled");
-          if (steering.claimFence() !== undefined || flight.claimGeneration !== (claim.claim_generation ?? 0))
-            throw new StaleClaimError();
-          if (flight.active?.shuttingDown || this.shuttingDownGlobal)
-            throw new Error("worker shutdown during Codex operation admission");
-          try { revisionRecovery?.assertDispatchSource(source, kind === "root"); }
-          catch (error) {
-            // A lead check can consume a replacement verdict. Preserve
-            // that control outcome when the admission catch rechecks currency.
-            control.abort(error);
-            throw error;
-          }
-        };
-        check();
-        const unsubscribe = steering.observeRevisionDispatchControl(() => {
-          try { check(); } catch (error) { control.abort(error); }
-        });
-        let permit!: () => boolean;
-        try {
-          permit = await flight.operationAdmission.admit({ operation_id: randomUUID(), kind,
-            ...(source ? { source } : {}) }, operationSignal, check,
-          async () => { await revisionRecovery?.proveDispatchSource(source, check, kind === "root"); check(); });
-        } catch (error) {
-          check();
-          if (error instanceof CodexOperationAdmissionError) {
-            if (error.reason === "authority_lost") throw new StaleClaimError();
-            if (error.reason === "stale_source")
-              throw new PlanRevisionRecoveryStoppedError("plan revision dispatch lost its source");
-          }
-          throw error;
-        } finally { unsubscribe(); }
-        permit();
-        check();
-        return () => { const valid = permit(); check(); return valid; };
-      }),
+      prepareCodexRootDispatch: prepareDispatch(flight.operationScope),
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
@@ -27439,6 +27937,12 @@ export class RunRunner {
     return { branch: `agent/issue-${claim.issue_iid}`, key: `issue-${claim.issue_iid}`, issueIid: claim.issue_iid };
   }
 
+  /** Capture current credential authority once for a later capture, restore or delivery call. */
+  private claimWithCodexAuthority(claim: ClaimResponse, flight: RunFlight): ClaimResponse {
+    const codex = flight.codexSecrets;
+    return codex ? { ...claim, secrets: { ...claim.secrets, codex } } : claim;
+  }
+
   private bindWorkerMemory(claim: ClaimResponse, flight: RunFlight): void {
     if (!this.memoryRuntime) return;
     const incarnation = this.client.memoryIncarnation;
@@ -27922,7 +28426,7 @@ export class RunRunner {
         identity();
         // The server's accepted-park binding, carried out of the held callback for the witness below.
         const carried: { binding?: MemoryParkWitness["binding"] } = {};
-        const result = await this.runFreeCapture(memory.claim, flight, deadline, signal, async held => {
+        const result = await this.runFreeCapture(this.claimWithCodexAuthority(memory.claim, flight), flight, deadline, signal, async held => {
           const check = async () => {
             this.assertHeldFreeCapture(flight, held);
             identity();
@@ -27948,7 +28452,7 @@ export class RunRunner {
           // Three attempts share one deadline. Failure holds this flight; siblings continue.
           for (let attempt = 0; attempt < 3 && !captured.verified; attempt++) {
             await check();
-            captured = await this.captureRecoveryRestorePoint(memory.claim, flight, flight.runLog, "recovery_capture", {
+            captured = await this.captureRecoveryRestorePoint(this.claimWithCodexAuthority(memory.claim, flight), flight, flight.runLog, "recovery_capture", {
               credentialFree: true, heldCapture: held, publish: true, signal: held.signal, beforeMutation: check,
             });
           }
@@ -28635,7 +29139,7 @@ export class RunRunner {
    * gets no proof and goes straight to the op-fenced hold, #3644 3.4(b)). Closed-route cases handled:
    * a restore-route predecessor, a completed retained successor, and a flight lacking a ledger, holder,
    * registration nonce or claim generation. `undefined` for: no negotiated capability, no pending op on this
-   * generation, an open route, and a Codex flight (Codex never switches in place and keeps its prior behaviour).
+   * generation, an open route, and a Codex flight (which uses its separate live-switch path).
    */
   private closedInPlaceSwitch(claim: ClaimResponse, flight: RunFlight): { opId: string; retained: boolean } | undefined {
     const pending = flight.steering.pendingCredentialSwitchOp();
@@ -30187,7 +30691,7 @@ export class RunRunner {
   private async swapRestoreExecutor(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const generation = flight.claimGeneration;
     const initialHome = flight.runHome;
-    const built = this.makeExecutor(flight.runId, claim.secrets.codex, { generation });
+    const built = this.makeExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation });
     if (initialHome !== undefined && built.homeDir === initialHome) throw new Error("the successor executor was built on the predecessor's HOME");
     const next = publicationOnlyExecutor(claim, built.executor);
     const prior = flight.executor;
@@ -31038,7 +31542,7 @@ export class RunRunner {
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal);
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
-            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, claim.secrets.codex).executor);
+            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex).executor);
             this.registerEvidenceExecutor(flight);
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.

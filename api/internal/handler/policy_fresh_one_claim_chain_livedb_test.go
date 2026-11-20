@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // workerClaim posts the real worker claim route and returns the decoded claim payload as a raw map.
@@ -159,7 +160,7 @@ func TestPolicyFreshRestoredOrdinaryResumeLiveDB(t *testing.T) {
 		Error string `json:"error"`
 	}
 	if rec.Code != http.StatusUnprocessableEntity || json.Unmarshal(rec.Body.Bytes(), &msg) != nil ||
-		msg.Error != "a credential override is not supported on the codex harness" {
+		msg.Error != workersvc.ErrCodexSwitchIneligible.Error() {
 		t.Fatalf("set-token on the restored run = %d %s", rec.Code, rec.Body.String())
 	}
 

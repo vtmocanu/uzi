@@ -15,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
-	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -116,8 +115,8 @@ func (f applyFx) snap(t *testing.T, run uuid.UUID) string {
 	var s string
 	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT jsonb_build_object(
 	    'run', (SELECT to_jsonb(r) FROM runs r WHERE r.id = $1),
-	    'switch_epochs', (SELECT count(*) FROM run_credential_switch_epochs WHERE run_id = $1),
-	    'base_epochs', (SELECT count(*) FROM run_credential_epochs WHERE run_id = $1),
+	    'switch_epochs', (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.claim_generation, e.ordinal), '[]'::jsonb) FROM run_credential_switch_epochs e WHERE e.run_id = $1),
+	    'base_epochs', (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.claim_generation), '[]'::jsonb) FROM run_credential_epochs e WHERE e.run_id = $1),
 	    'messages', (SELECT coalesce(jsonb_agg(to_jsonb(m) ORDER BY m.seq), '[]'::jsonb) FROM run_messages m WHERE m.run_id = $1)
 	)::text`, run).Scan(&s); err != nil {
 		t.Fatal(err)
@@ -1291,11 +1290,16 @@ func TestReceiptsForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
 func TestRecordCodexEpochIdempotentLiveDB(t *testing.T) {
 	f := newApplyFx(t)
 	run, op := f.run(t, "running")
-	codexSecret := f.env.seedAnthropicSecret(t, f.o.userID, "codex-alias", false)
+	codexSecret := f.env.seedStaticAPIKey(t, f.o.userID, "codex-alias", "test-api-key")
+	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, codexSecret, codexAuthModeAPIKey); err != nil {
+		t.Fatal(err)
+	}
 	r := mustRun(t, f.env, run)
-	r.CodexSecretID = pgconv.UUID(codexSecret)
-	f.svc.recordCodexEpoch(context.Background(), r)
-	f.svc.recordCodexEpoch(context.Background(), r)
+	for range 2 {
+		if err := f.svc.recordCodexEpoch(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var n int
 	var reason, label string
 	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*), max(select_reason), max(label) FROM run_credential_epochs WHERE run_id = $1 AND claim_generation = $2 AND secret_id = $3`, run, f.gen, codexSecret).Scan(&n, &reason, &label); err != nil || n != 1 || reason != "codex_binding" || label != "codex-alias" {

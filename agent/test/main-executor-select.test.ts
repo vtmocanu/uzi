@@ -95,6 +95,11 @@ it("2833 forwards shared advice factory to Codex summary runner while stub stays
   assert.equal(builds[0]!.runId, "run-summary");
   assert.equal(builds[0]!.binding.authMode, "subscription");
   assert.equal(builds[0]!.refresh, "deny");
+  assert.equal(await executor.summaryRunner.generateIntentSummary({
+    claim: { run_id: "run-summary", secrets: { codex: { ...rawCodex, access_token: "fixture-other-access" } } },
+    token: "", model: "unused", issueTitle: "Wrong binding", issueBody: "Must stay refused",
+  }), null);
+  assert.equal(builds.length, 1, "a different binding cannot borrow the owned factory's initial authority");
 });
 
 describe("buildRunExecutor — the stub-before-codex reorder (PRD #1429 M6)", () => {

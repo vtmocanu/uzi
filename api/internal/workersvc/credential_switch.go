@@ -120,9 +120,13 @@ func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, 
 		// cannot fence to an exact claim, so this is an invalid report (→ 400), not a silent no-op.
 		return store.Run{}, false, fmt.Errorf("%w: credential_switch requires claim_generation", ErrInvalidState)
 	}
+	// Codex switching never releases/reclaims, including version-skewed registrations.
+	if owned.Harness == harnessCodex {
+		return owned, false, ErrCredentialSwitchReleaseRetired
+	}
 	// Issue #4201 m3a: a worker whose CURRENT registration negotiated in-place apply never releases
 	// a claim for a switch; the v1 release is refused with nothing written.
-	if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
+	if retired, err := s.applyNegotiated(ctx, wkr.ID, owned.Harness); err != nil {
 		return store.Run{}, false, err
 	} else if retired {
 		return owned, false, ErrCredentialSwitchReleaseRetired
@@ -313,14 +317,15 @@ var ErrCredentialSwitchReleaseRetired = errors.New("credential switch release is
 const CredentialSwitchApplyFeature = "credential_switch_apply_v1" //nolint:gosec // G101: a protocol feature VOCABULARY name, not a credential.
 
 // stampApplyNonce stamps workers.credential_switch_apply_nonce with the registration nonce when the
-// worker advertised credential_switch_in_place_v1 and this api serves CredentialSwitchApplyFeature
+// worker advertised Claude or Codex in-place apply and this api serves the matching feature
 // (always, so only the capability is checked). It returns the column value for the registered row.
 // An older api replica's registration rewrites snapshot_register_nonce without stamping, which
 // leaves the two differing, so applyNegotiated reads false and the v1 reports stay accepted.
 func (s *Service) stampApplyNonce(ctx context.Context, q interface {
 	StampWorkerCredentialSwitchApplyNonce(ctx context.Context, arg store.StampWorkerCredentialSwitchApplyNonceParams) error
 }, workerID uuid.UUID, protocolCaps []string, nonce string) (pgtype.Text, error) {
-	if !slices.Contains(protocolCaps, capability.CredentialSwitchInPlaceV1) {
+	if !slices.Contains(protocolCaps, capability.CredentialSwitchInPlaceV1) &&
+		!slices.Contains(protocolCaps, capability.CodexCredentialSwitchV1) {
 		return pgtype.Text{}, nil
 	}
 	v := pgconv.TextOrNull(nonce)
@@ -332,13 +337,16 @@ func (s *Service) stampApplyNonce(ctx context.Context, q interface {
 
 // applyNegotiated reports whether the worker's CURRENT registration negotiated in-place apply:
 // credential_switch_apply_nonce equals snapshot_register_nonce.
-func (s *Service) applyNegotiated(ctx context.Context, workerID uuid.UUID) (bool, error) {
+func (s *Service) applyNegotiated(ctx context.Context, workerID uuid.UUID, harness string) (bool, error) {
 	w, err := s.q.GetWorkerByID(ctx, workerID)
 	if err != nil {
 		return false, err
 	}
-	return w.CredentialSwitchApplyNonce.Valid && w.SnapshotRegisterNonce.Valid &&
-		w.CredentialSwitchApplyNonce.String == w.SnapshotRegisterNonce.String, nil
+	if harness == harnessCodex {
+		return codexSwitchNegotiated(w), nil
+	}
+	return slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) &&
+		currentSwitchApplyRegistration(w), nil
 }
 
 // holdCredentialSwitch applies the credential_switch_held report (issue #3181): the worker could
@@ -368,7 +376,10 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 	// and the replay branch only when the persisted hold identity matches (holdIdentityMatches), so
 	// the one shape left to refuse here is the un-fenced v1 hold. Nothing is written.
 	if !opID.Valid {
-		if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
+		if owned.Harness == harnessCodex {
+			return owned, false, ErrCredentialSwitchReleaseRetired
+		}
+		if retired, err := s.applyNegotiated(ctx, wkr.ID, owned.Harness); err != nil {
 			return store.Run{}, false, err
 		} else if retired {
 			return owned, false, ErrCredentialSwitchReleaseRetired

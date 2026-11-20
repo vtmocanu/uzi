@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Logger } from "./log.js";
 import type { WorkerClient } from "./client.js";
 import { CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
@@ -34,14 +34,21 @@ interface Scope {
 }
 const scopes = new WeakMap<Client, Map<string, Scope>>();
 
+/** Stable opaque identity for one credential authority; never retain the capability in a key. */
+export function codexOperationAuthorityIdentity(capability: unknown): string | undefined {
+  // Raw claims reach this helper before selectCodexBinding rejects malformed authority.
+  if (typeof capability !== "string" || capability.length === 0) return undefined;
+  return createHash("sha256").update(capability).digest("hex");
+}
+
 /** Leases live for the owning flight or whole advice/checker call. Independent
  * operations share scheduling and negotiation history, never an admitted reply. */
 export function acquireCodexOperationScope(client: Client, runId: string, generation: number,
   policy: CodexOperationWaitPolicy = {}, waiting: (operation: CodexOperationIdentity) => (() => void) | undefined = () => undefined,
-  requiredKinds: readonly Kind[] = ["root"], logger?: Logger) {
+  requiredKinds: readonly Kind[] = ["root"], logger?: Logger, authorityIdentity?: string) {
   let runs = scopes.get(client);
   if (!runs) { runs = new Map(); scopes.set(client, runs); }
-  const key = JSON.stringify([runId, generation]);
+  const key = JSON.stringify([runId, generation, authorityIdentity]);
   let scope = runs.get(key);
   if (!scope) {
     const created: Scope = { controller: undefined!, users: 0, ownerClosed: new AbortController(), waiters: new Set() };

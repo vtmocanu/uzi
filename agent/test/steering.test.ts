@@ -2776,7 +2776,7 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
   it("a poll carrying op_id records the pair; a repeated poll for the same op trips once", async () => {
     const cancel = new AbortController();
     const client = withReceipts({
-      getInputs: async () => ({ inputs: [], credentialSwitch: { generation: GEN, op_id: "op-poll" } }),
+      getInputs: async () => ({ inputs: [], credentialSwitch: { generation: GEN, op_id: "op-poll", target_secret_id: "poll-target" } }),
     } as unknown as WorkerClient);
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
     let interrupts = 0;
@@ -2784,7 +2784,7 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     ch.start();
     for (let n = 0; n < 300 && ch.pendingCredentialSwitchOp() === undefined; n++) await tick();
     await tick(30);
-    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-poll" });
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-poll", targetSecretId: "poll-target" });
     assert.equal(ch.pendingCredentialSwitch(), GEN);
     assert.equal(interrupts, 1);
     await ch.stop();
@@ -2806,6 +2806,15 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     assert.equal(interrupts(), 1);
   });
 
+  it("fills a missing same-op target from a later signal without changing a known target", () => {
+    const { ch, interrupts } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    ch.tripCredentialSwitch(GEN, "op-1", "target-1");
+    ch.tripCredentialSwitch(GEN, "op-1", "other-target");
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-1", targetSecretId: "target-1" });
+    assert.equal(interrupts(), 1);
+  });
+
   it("a newer op replaces a pending one without aborting again", () => {
     const { ch, interrupts } = make();
     ch.tripCredentialSwitch(GEN, "op-1");
@@ -2814,6 +2823,50 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-2" });
     assert.equal(interrupts(), 1, "replacement does not re-abort");
     assert.equal(ch.checkpointAuthoritySignal(), authority);
+  });
+
+  it("keeps targets bound to their op and ignores delayed settlement of a replaced op", () => {
+    const { ch, interrupts } = make();
+    ch.tripCredentialSwitch(GEN, "op-1", "target-1");
+    const stale = ch.pendingCredentialSwitchOp()!;
+    ch.tripCredentialSwitch(GEN, "op-2", "target-2");
+    ch.tripCredentialSwitch(GEN, "op-2", "stale-target");
+    ch.tripCredentialSwitch(GEN - 1, "op-1", "target-1");
+    for (const outcome of ["applied", "gave_up", "cleared"] as const) {
+      ch.settleCredentialSwitch(stale.opId!, outcome);
+      assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-2", targetSecretId: "target-2" });
+    }
+    ch.tripCredentialSwitch(GEN, stale.opId, stale.targetSecretId);
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-2", targetSecretId: "target-2" });
+    ch.settleCredentialSwitch("op-2", "applied");
+    assert.equal(ch.pendingCredentialSwitchOp(), undefined);
+    ch.tripCredentialSwitch(GEN, "op-3");
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-3" });
+    assert.equal(interrupts(), 2);
+  });
+
+  it("preserves known held targets and fills missing held targets for the same op", () => {
+    for (const first of [undefined, "target-1"]) {
+      const { ch } = make();
+      const hold = ch.holdCredentialSwitch();
+      ch.tripCredentialSwitch(GEN, "op-held", first);
+      ch.tripCredentialSwitch(GEN, "op-held", "target-1");
+      ch.tripCredentialSwitch(GEN, "op-held");
+      ch.tripCredentialSwitch(GEN, "op-held", "other-target");
+      hold.close({ service: true });
+      assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-held", targetSecretId: "target-1" });
+    }
+  });
+
+  it("carries a held target through service and discards it on non-service close", () => {
+    const { ch } = make();
+    const discarded = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN, "op-discard", "discarded-target");
+    discarded.close({ service: false });
+    const held = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN, "op-held", "held-target");
+    held.close({ service: true });
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-held", targetSecretId: "held-target" });
   });
 
   // An applied-phase switch_pending refusal belongs to the in-place switch when the pending op has an op id or the flight

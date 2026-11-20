@@ -1,6 +1,7 @@
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
-import { summaryOwnership } from "../src/codex/summary-ownership.js";
+import { ownedSummaryFactories, summaryCallDeadlines, summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { provisionRunTools } from "../src/provision-run.js";
 import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
@@ -17,15 +18,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
+import syncFs from "node:fs";
+import vm from "node:vm";
 import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { CodexSessionStore } from "../src/codex/session-state.js";
+import { CodexSessionStore, DEFAULT_SESSION_STORE_BOUNDS } from "../src/codex/session-state.js";
 import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
-import { newRunAttempt } from "../src/run-quiescence.js";
+import { newRunAttempt, quiesceRunAttempt } from "../src/run-quiescence.js";
 
 const HAS_PROCFS = process.platform === "linux";
 // The real runner path opens the Codex session store and quiescence proofs through /proc/self/fd
@@ -34,6 +37,8 @@ const NEEDS_PROCFS = !HAS_PROCFS ? "needs Linux procfs (/proc/self/fd in src/cod
 
 import {
   CodexExecutor,
+  createCodexEpochAuthority,
+  createRunLaneInstallerReconcile,
   makeProductionLaunchAdviceRoot,
   FailClosedExecutor,
   CodexAdviceCredentialBridge,
@@ -102,7 +107,7 @@ import type { OutgoingMessage, WorkerRunMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
-import { PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import * as m2Runner from "./runner-harness.js";
 import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
@@ -143,7 +148,7 @@ import type {
   DisposeEvidence,
   DisposeOutcome,
 } from "../src/codex/launcher.js";
-import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
+import { SupervisedChildExitTimeoutError, SUPERVISOR_BIN } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { renderCodexRun } from "../src/codex/render.js";
@@ -5369,16 +5374,20 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal(emitted.filter((m) => m.payload.event === "resume_lineage_break").length, 0);
   });
 
-  it("falls back when thread/resume returns no thread id", async () => {
+  it("retains lineage when thread/resume returns no thread id", async () => {
     const rig = makeRig();
     rig.transport.requestOverride = (c) => c.method === "thread/resume"
       ? Promise.resolve({ thread: {} })
       : undefined;
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume without id fallback");
-    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 1);
-    assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "incomplete resume reply"),
+      /codex thread\/resume returned no thread id/,
+    );
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 0);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 0);
+    assert.equal(emitted.filter((m) => m.payload.event === "resume_lineage_break").length, 0);
   });
 
   for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
@@ -21321,7 +21330,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
           assert.equal(parks, 1);
         } else await assert.rejects(running, (error: unknown) => {
           if (control === "source") assert.equal(error, sourceError);
-          else if (control === "claim") assert.ok(error instanceof CodexRequestFailure && error.kind === "parent_abort");
+          else if (control === "claim" && (boundary === "credential" || boundary === "effect"))
+            assert.ok(error instanceof CodexRequestFailure && error.kind === "parent_abort");
           else if (control === "pause") assert.ok(error instanceof PauseNowSignal);
           else assert.equal((error as Error).message, "run cancelled");
           return true;
@@ -21329,7 +21339,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         assert.equal(rig.providerLaunches(), 1);
         assert.equal(released, boundary === "credential" || boundary === "effect" ? 2 : 1);
         assert.equal(effects, 1, "no replacement effect root after lost authority");
-        assert.equal(retries, boundary === "teardown" && control !== "source" && control !== "claim" ? 0 : 1);
+        assert.equal(retries, boundary === "teardown" && control !== "source" ? 0 : 1);
       } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
     });
 
@@ -24686,6 +24696,32 @@ describe("2833 Codex inline summaries", () => {
     };
   }
 
+  it("M2 external Now wrapper joins raw root disposal before its run settles", async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const executor = makeExecutor(makeRig(), a.binding);
+    (executor as unknown as { currentCodexAuthority: typeof a }).currentCodexAuthority = a;
+    const factory = executor.bindCodexSummaryFactory(ownedAdvice(true, entered, release));
+    assert.ok(ownedSummaryFactories.has(factory));
+    const params = { runId: "run-1", binding: a.binding };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    const harness = await factory(params);
+    let settled = false;
+    const running = harness.run({
+      label: "now", systemPrompt: "", prompt: "Summarize", output: { kind: "text" },
+      signal: new AbortController().signal, timeoutMs: 10000,
+    }, { onTerminal() {} }).finally(() => { settled = true; });
+    try {
+      await entered.promise;
+      await drain();
+      assert.equal(settled, false, "raw disposal remains joined through the external wrapper");
+    } finally {
+      release.resolve();
+      await running;
+    }
+    assert.equal(settled, true);
+  });
+
   for (const primary of [undefined, new CodexCredentialDeferredError()]) {
     it(`A summary cleanup preserves ${primary ? "exact primary object and type" : "standalone cleanup refusal"}`, async () => {
       const entered = m1Barrier(), release = m1Barrier(), body = m1Barrier();
@@ -25626,8 +25662,8 @@ describe("2833 Codex inline summaries", () => {
     });
   }
 
-  it("2833 forwards original subscription claim identity to intent and plan summaries", async () => {
-    const rawCodex = { ...SUBSCRIPTION, claim_metadata: "original subscription claim" };
+  it("M2 derives intent and plan credentials from captured authority despite competing raw claim", async () => {
+    const rawCodex = { ...API_KEY, claim_metadata: "competing raw claim" };
     const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
       t.push(toolCall(98, "submit_plan", { plan_md: "Raw claim plan" }, th, tn, "plan"))
         .push(turnCompleted("completed", th, tn)));
@@ -25649,46 +25685,93 @@ describe("2833 Codex inline summaries", () => {
       summaryRunner, summaryClaimCodex: rawCodex,
     }).run(ctx);
     assert.equal(inputs.length, 2);
-    for (const input of inputs) assert.equal(input.claim?.secrets.codex, rawCodex);
+    for (const input of inputs) {
+      assert.deepEqual(input.claim?.secrets.codex, SUBSCRIPTION);
+      assert.ok(Object.isFrozen(input.claim?.secrets.codex));
+    }
     assert.equal((inputs[1] as PlanSummaryInput).planMd, "Raw claim plan");
   });
 
-  for (const rawCodex of [null, { ...SUBSCRIPTION, chatgpt_plan_type: "unsupported" }]) {
-    it(`2833 present malformed raw claim ${JSON.stringify(rawCodex)} fails closed with valid executor binding`, async () => {
-      const { rig, intents, plans } = summaryRig();
-      let adviceCalls = 0;
-      let fallbackCalls = 0;
-      const runner = new SummaryRunner(noopLog, {
-        homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 1000,
-        queryFn: (() => { fallbackCalls++; throw new Error("unexpected Claude fallback"); }) as
-          import("../src/sdk-executor.js").SdkQueryFn,
-        codexAdviceHarnessFactory: (async () => { adviceCalls++; throw new Error("unexpected advice"); }) as
-          import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
+  it("M2 installer reconcile keeps each explicit authority and fences old closures", async () => {
+    const first = createCodexEpochAuthority(bindingOf(API_KEY));
+    const second = createCodexEpochAuthority(bindingOf({ ...API_KEY, capability: "second-capability" }));
+    const seen: string[] = [];
+    const client = {
+      refreshCodex: async () => { throw new Error("API-key reconcile must not refresh"); },
+      releaseCodex: async (_run: string, request: { capability: string }) => {
+        seen.push(request.capability);
+        return { auth_mode: "api_key" as const, access_token: "released-key" };
+      },
+    };
+    const credentials = (authority: typeof first) => ({
+      runId: "run", client, binding: authority.binding,
+      committed: authority.committedGeneration, assertCurrent: authority.assertCurrent,
+      registerToken: () => {},
+    });
+    const installer = createRunLaneInstallerReconcile(new AbortController().signal, credentials(first));
+    const next = installer.forCredentials(credentials(second));
+    const signal = new AbortController().signal;
+    assert.equal((await next(RECONCILE_REQ, signal)).kind, "ready");
+    assert.equal((await installer.reconcile(RECONCILE_REQ, signal)).kind, "ready");
+    assert.deepEqual(seen, [second.binding.capability, first.binding.capability]);
+    first.retire();
+    await assert.rejects(installer.reconcile(RECONCILE_REQ, signal), /credential authority retired/);
+    assert.equal((await next(RECONCILE_REQ, signal)).kind, "ready");
+    assert.deepEqual(seen, [second.binding.capability, first.binding.capability, second.binding.capability]);
+  });
+
+  for (const claim of [API_KEY, SUBSCRIPTION]) {
+    it(`M2 ${claim.auth_mode} retirement denies a pending credential response without losing its join`, async () => {
+      const authority = createCodexEpochAuthority(bindingOf(claim));
+      const originalGeneration = authority.committedGeneration.value;
+      const registered: string[] = [];
+      let calls = 0;
+      let resolveResponse!: (value: { access_token: string; generation: number; outcome: string }) => void;
+      const response = new Promise<{ access_token: string; generation: number; outcome: string }>(resolve => {
+        resolveResponse = resolve;
       });
-      const results: unknown[] = [];
-      const summaryRunner = {
-        generateIntentSummary: async (input: IntentSummaryInput) => {
-          const intent = await runner.generateIntentSummary(input);
-          results.push(intent);
-          results.push(await runner.generatePlanSummary({ ...input, planMd: "Plan." }));
-          return intent;
-        },
-        generatePlanSummary: runner.generatePlanSummary.bind(runner),
-      };
-      const { ctx } = makeCtx({ reportIteration: async () => {
-        await waitForSummary(() => results.length === 2, "fail-closed summary passes");
-      } });
-      const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
-        summaryRunner, summaryClaimCodex: rawCodex,
-      }).run(ctx);
-      assert.equal(result.branch, ctx.branch);
-      assert.deepEqual(results, [null, null]);
-      assert.equal(adviceCalls, 0);
-      assert.equal(fallbackCalls, 0);
-      assert.deepEqual(intents, []);
-      assert.deepEqual(plans, []);
+      let started!: () => void;
+      const entered = new Promise<void>(resolve => { started = resolve; });
+      const exchange = async () => { calls++; started(); return response; };
+      const installer = createRunLaneInstallerReconcile(new AbortController().signal, {
+        runId: "run", client: { releaseCodex: exchange, refreshCodex: exchange } as never,
+        binding: authority.binding, committed: authority.committedGeneration,
+        assertCurrent: authority.assertCurrent, registerToken: token => registered.push(token),
+      });
+      let settled = false;
+      const pending = installer.reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+      const rejected = assert.rejects(pending, /credential authority retired/);
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+      await entered;
+      authority.retire();
+      await Promise.resolve();
+      assert.equal(settled, false, "retirement retains the in-flight provider join");
+      assert.equal(calls, 1);
+      resolveResponse({ access_token: "late-credential", generation: 99, outcome: "advanced" });
+      await rejected;
+      assert.deepEqual(registered, [], "late credentials never enter the redactor");
+      assert.equal(authority.committedGeneration.value, originalGeneration, "late response never advances authority");
+      await assert.rejects(installer.reconcile(RECONCILE_REQ, RECONCILE_SIGNAL), /credential authority retired/);
+      assert.equal(calls, 1, "retired authority never sends a retry or another exchange");
     });
   }
+
+  it("M2 authority freezes explicit identity, isolates generation cells and fences retirement", () => {
+    const first = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const second = createCodexEpochAuthority(bindingOf(API_KEY));
+    assert.deepEqual(first.claim, SUBSCRIPTION);
+    assert.deepEqual(second.claim, API_KEY);
+    assert.ok(Object.isFrozen(first));
+    assert.ok(Object.isFrozen(first.binding));
+    assert.ok(Object.isFrozen(first.claim));
+    first.committedGeneration.value = 99;
+    assert.equal(second.committedGeneration.value, undefined);
+    first.retire();
+    assert.equal(first.isCurrent(), false);
+    assert.throws(first.assertCurrent, /credential authority retired/);
+    second.assertCurrent();
+    assert.deepEqual(first.claim, SUBSCRIPTION);
+  });
 
   for (const raw of [SUBSCRIPTION, API_KEY]) {
     it(`2833 ${raw.auth_mode} real SummaryRunner reaches advice factory with fixed pins`, async () => {
@@ -25865,11 +25948,41 @@ describe("2833 Codex inline summaries", () => {
       let fenced = false;
       let abandoned = false;
       const teardown: { aborted: boolean; abandoned: boolean }[] = [];
+      const disposal: { aborted: boolean; abandoned: boolean }[] = [];
+      const effectCleanup: { aborted: boolean; abandoned: boolean }[] = [];
+      const fileopCleanup: { aborted: boolean; abandoned: boolean }[] = [];
+      const wireFileop = rig.deps.wireFileop!;
+      const launchEffect = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, wireFileop: spec => {
+        const handle = wireFileop(spec);
+        const dispose = handle.dispose.bind(handle);
+        handle.dispose = async (...args) => {
+          fileopCleanup.push({ aborted: input?.signal?.aborted === true, abandoned });
+          input?.onUsage?.(usage);
+          return dispose(...args);
+        };
+        return handle;
+      }, launchEffectRoot: async (...args) => {
+        const root = await launchEffect(...args);
+        const dispose = root.dispose.bind(root);
+        root.dispose = async (...rest) => {
+          effectCleanup.push({ aborted: input?.signal?.aborted === true, abandoned });
+          input?.onUsage?.(usage);
+          return dispose(...rest);
+        };
+        return root;
+      } };
       const reap = rig.root.reap.bind(rig.root);
       rig.root.reap = async (...args) => {
         teardown.push({ aborted: input?.signal?.aborted === true, abandoned });
         input?.onUsage?.(usage);
         return reap(...args);
+      };
+      const dispose = rig.root.dispose.bind(rig.root);
+      rig.root.dispose = async (...args) => {
+        disposal.push({ aborted: input?.signal?.aborted === true, abandoned });
+        input?.onUsage?.(usage);
+        return dispose(...args);
       };
       const log = { ...noopLog, warn: (message: string) => {
         if (message === "intent summary did not settle within the bound") abandoned = true;
@@ -25897,6 +26010,7 @@ describe("2833 Codex inline summaries", () => {
         },
       });
       if (close === "capture" || close === "cancel") await assert.rejects(executor.run(ctx), /capture-ended-run/);
+      else if (close === "fence") await assert.rejects(executor.run(ctx), /run cancelled/);
       else assert.equal((await executor.run(ctx)).branch, ctx.branch);
       assert.equal(input?.signal?.aborted, true);
       input?.onUsage?.(usage);
@@ -25905,8 +26019,24 @@ describe("2833 Codex inline summaries", () => {
       assert.equal(emitted.filter(m => m.kind === "summary_usage").length, 0);
       assert.equal(abandoned, true, "intent reached bounded abandonment");
       if (close === "terminal" || close === "fence") {
-        assert.deepEqual(teardown, [{ aborted: true, abandoned: true }], "abort and bounded abandonment precede provider reap");
-        assert.ok(rig.disposed() > 0);
+        if (close === "fence") {
+          // The iteration fence precedes the lazy provider launch. Existing
+          // effect roots still clean up only after advisory abandonment.
+          assert.equal(rig.providerLaunches(), 0);
+          assert.deepEqual(teardown, []);
+          assert.deepEqual(disposal, []);
+        } else {
+          assert.deepEqual(teardown, [{ aborted: true, abandoned: true }]);
+          assert.deepEqual(disposal, [{ aborted: true, abandoned: true }]);
+          assert.ok(rig.disposed() > 0);
+        }
+        assert.ok(effectCleanup.length > 0, "existing effect roots clean up after the advisory");
+        assert.ok(effectCleanup.every(observed => observed.aborted && observed.abandoned),
+          "abort and bounded abandonment precede effect cleanup");
+        assert.ok(fileopCleanup.length > 0);
+        assert.ok(fileopCleanup.every(observed => observed.aborted && observed.abandoned),
+          "abort and bounded abandonment precede fileop client disposal");
+        assert.ok(rig.fileopDisposed() > 0);
       }
     });
   }
@@ -26038,13 +26168,14 @@ describe("2833 Codex inline summaries", () => {
         },
       });
       if (invalidation === "cancel") await assert.rejects(executor.run(ctx));
+      else if (invalidation === "fence") await assert.rejects(executor.run(ctx), /run cancelled/);
       else {
         const result = await executor.run(ctx);
         assert.equal(result.summaryPlan, invalidation === "none" ? "accepted summary" : undefined);
       }
       accept(); await pendingHook;
-      // A late HTTP acceptance after terminal cleanup cannot affect a reused executor.
-      if (invalidation === "obsolete") {
+      // Late or fenced HTTP acceptance cannot contaminate a reused executor.
+      if (invalidation === "obsolete" || invalidation === "fence") {
         const result = await executor.run(makeCtx({ summaryIntentPresent: true }).ctx);
         assert.equal(result.summaryPlan, undefined);
       }
@@ -29698,6 +29829,59 @@ it("M3 actual child send retries final permits and leaves the root demux running
   assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 2);
 });
 
+it("M3 unit guard proof: closure after child thread creation blocks turn/start and unregisters its sink", async () => {
+  // Inject only the gate state: this is not actualRunner, real-lease or protocol proof.
+  const rig = makeRig();
+  const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  const gate = executor as unknown as { switchAdmissionClosed: boolean };
+  const registered = installerBarrier(), unregistered = installerBarrier(), replied = installerBarrier();
+  let requestsAtClosure = -1;
+  const sinks = new Set<string>();
+  const register = CodexHarness.prototype.registerChildSink;
+  const unregister = CodexHarness.prototype.unregisterChildSink;
+  const registerProbe = mock.method(CodexHarness.prototype, "registerChildSink", function (
+    this: CodexHarness, ...args: Parameters<typeof register>
+  ) {
+    register.apply(this, args);
+    sinks.add(args[0]);
+    assert.equal(args[0], "th-child");
+    assert.equal(rig.transport.threadStartCount, 2, "real child thread/start already returned");
+    requestsAtClosure = rig.transport.requests.length;
+    gate.switchAdmissionClosed = true;
+    registered.resolve();
+  });
+  const unregisterProbe = mock.method(CodexHarness.prototype, "unregisterChildSink", function (
+    this: CodexHarness, ...args: Parameters<typeof unregister>
+  ) {
+    unregister.apply(this, args);
+    assert.equal(sinks.delete(args[0]), true, "the registered child sink is removed");
+    unregistered.resolve();
+  });
+  const respond = rig.transport.respond.bind(rig.transport);
+  rig.transport.respond = (id, response) => {
+    respond(id, response);
+    if (id === 1) replied.resolve();
+  };
+  const { ctx } = makeCtx({ agents: [
+    { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+    { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+  ] });
+  rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "closed-child"));
+  const running = executor.run(ctx);
+  try {
+    await withTimeout(Promise.all([registered.promise, unregistered.promise, replied.promise]), 3000, "closed child cleanup");
+    assert.equal(sinks.size, 0);
+    assert.equal(gate.switchAdmissionClosed, true);
+    assert.equal(rig.transport.requests.length, requestsAtClosure, "no provider request while admission is closed");
+    assert.equal(rig.transport.turnStartCount, 1, "only the root turn was sent");
+  } finally {
+    gate.switchAdmissionClosed = false;
+    rig.transport.push(signalDone()).push(turnCompleted()).end();
+    try { await withTimeout(running, 3000, "unit guard root cleanup"); }
+    finally { registerProbe.mock.restore(); unregisterProbe.mock.restore(); }
+  }
+});
+
 for (const stop of ["deadline", "parent terminal", "parent cancel"] as const) {
   it(`M3 child admission settles on ${stop} without sending its turn`, async () => {
     const rig = makeRig();
@@ -31118,6 +31302,4277 @@ it("policy initial planning refuses a backlog that could exclude the latest Resu
   }
 });
 
+describe("CodexExecutor: strict saved rollout seam", () => {
+  for (const mode of ["present", "empty", "mismatch", "unavailable", "fault", "missing-inspector"] as const) {
+    it(`strict save ${mode} keeps the live provider untouched`, async () => {
+      const entered = installerBarrier();
+      const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+      let saves = 0;
+      const inspected: string[] = [];
+      rig.deps = { ...rig.deps, sessionStore: {
+        ...rig.deps.sessionStore!,
+        persist: async () => {
+          saves++;
+          if (mode === "fault") throw new Error("injected copy failure");
+          return { files: mode === "empty" ? 0 : 1, bytes: 20 };
+        },
+        inspectSession: mode === "missing-inspector" ? undefined : async (_dir, id) => {
+          inspected.push(id);
+          return mode === "present" ? "present" : mode === "unavailable" ? "unknown" : "absent";
+        },
+      } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      assert.equal((await exec.saveUsableRollout()).kind, "failed");
+      const { ctx } = makeCtx();
+      const running = exec.run(ctx);
+      try {
+        await entered.promise;
+        const requests = rig.transport.requests.length;
+        const result = await exec.saveUsableRollout();
+        assert.deepEqual(result.kind === "usable" ? result : { kind: result.kind },
+          mode === "present" ? { kind: "usable", sessionId: "th-current" } : { kind: "failed" });
+        assert.equal(saves, 1);
+        assert.deepEqual(inspected, mode === "fault" || mode === "missing-inspector" ? [] : ["th-current"]);
+        assert.equal(rig.reaped(), 0);
+        assert.equal(rig.disposed(), 0);
+        assert.equal(rig.transport.closes, 0);
+        assert.equal(rig.transport.requests.length, requests, "save performs no auth apply or provider RPC");
+      } finally {
+        rig.transport.push(signalDone("th-current", "tn-1")).push(turnCompleted("completed", "th-current", "tn-1"));
+        await running;
+      }
+      assert.equal((await exec.saveUsableRollout()).kind, "failed");
+    });
+  }
+
+  it("strict save queued before pre-reap copy waits for the current generation", async () => {
+    const entered = installerBarrier(), inspecting = installerBarrier(), releaseInspection = installerBarrier();
+    const copying = installerBarrier(), releaseCopy = installerBarrier();
+    const parked = installerBarrier(), releasePark = installerBarrier();
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+    let saves = 0, inspections = 0, generation = "old", worked = false;
+    rig.deps = { ...rig.deps, sessionStore: {
+      ...rig.deps.sessionStore!,
+      persist: async () => {
+        if (++saves === 2) {
+          copying.resolve();
+          await releaseCopy.promise;
+          generation = "current";
+        }
+        return { files: 1, bytes: 20 };
+      },
+      inspectSession: async (_dir, id) => {
+        assert.equal(id, "th-current");
+        if (++inspections === 1) {
+          inspecting.resolve();
+          await releaseInspection.promise;
+        } else {
+          assert.equal(generation, "current", "exact inspection must wait for true pre-reap copy settlement");
+        }
+        return "present";
+      },
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({
+      reportIteration: async () => ({ pauseRequested: worked }),
+      parkForPause: async () => { parked.resolve(); await releasePark.promise; return true; },
+    });
+    const running = exec.run(ctx);
+    let first: ReturnType<typeof exec.saveUsableRollout> | undefined;
+    let queued: ReturnType<typeof exec.saveUsableRollout> | undefined;
+    try {
+      await entered.promise;
+      first = exec.saveUsableRollout();
+      await inspecting.promise;
+      queued = exec.saveUsableRollout();
+      worked = true;
+      rig.transport.push(agentMessage("work", "th-current")).push(turnCompleted("completed", "th-current", "tn-1"));
+      await copying.promise;
+      releaseInspection.resolve();
+      let settled = false;
+      void queued.then(() => { settled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(inspections, 1, "queued exact inspection cannot read the previous generation");
+      assert.equal(settled, false, "queued save must join the current copy");
+      releaseCopy.resolve();
+      assert.deepEqual(await queued, { kind: "usable", sessionId: "th-current" });
+      assert.equal((await first).kind, "failed", "a copy started during inspection invalidates that observation");
+      assert.equal(inspections, 2, "the queued save performs its own exact inspection after settlement");
+      assert.equal(saves, 2, "never overwrite the pre-reap generation from a drained source");
+      await parked.promise;
+    } finally {
+      releaseInspection.resolve();
+      releaseCopy.resolve();
+      releasePark.resolve();
+      await first;
+      await queued;
+      await running;
+    }
+  });
+
+  it("strict save inspects the pre-reap generation without overwriting it", async () => {
+    let worked = false;
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
+      worked = true;
+      t.push(agentMessage("work", th)).push(turnCompleted("completed", th, tn));
+    }) });
+    let saves = 0;
+    let checked = false;
+    rig.deps = { ...rig.deps, sessionStore: {
+      ...rig.deps.sessionStore!,
+      persist: async () => { saves++; return { files: 1, bytes: 20 }; },
+      inspectSession: async (_dir, id) => { assert.equal(id, "th-current"); return "present"; },
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({ reportIteration: async () => ({ pauseRequested: worked }), parkForPause: async () => {
+      const count = saves;
+      assert.ok(count > 0);
+      assert.deepEqual(await exec.saveUsableRollout(), { kind: "usable", sessionId: "th-current" });
+      assert.equal(saves, count, "pre-reap save owns the saved generation");
+      checked = true;
+      return true;
+    } });
+    await exec.run(ctx);
+    assert.equal(checked, true);
+  });
+});
+
+describe("CodexExecutor: strict rollout real session store", () => {
+  for (const mode of ["present", "empty", "mismatch", "fault"] as const) {
+    it(`strict real store ${mode}`, async () => {
+      const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/strict-rollout-"));
+      const source = path.join(dir, "source"), store = path.join(dir, "store");
+      const sessionId = "12345678-1234-1234-1234-123456789abc";
+      const otherId = "12345678-1234-1234-1234-123456789def";
+      await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+      if (mode !== "empty") await fs.writeFile(path.join(source, "sessions", `rollout-${mode === "mismatch" ? otherId : sessionId}.jsonl`), "{}\n");
+      await fs.writeFile(path.join(source, "auth.json"), "provider-material-canary");
+      const entered = installerBarrier();
+      const rig = makeRig({ responder: epochResponder(sessionId, "tn-1", () => entered.resolve()) });
+      rig.deps = { ...rig.deps, sessionStore: {
+        ...rig.deps.sessionStore!,
+        persist: () => CodexSessionStore.persist(source, store, mode === "fault" ? { bounds: { ...DEFAULT_SESSION_STORE_BOUNDS, maxFileBytes: 1 } } : undefined),
+        inspectSession: (_dir, id) => CodexSessionStore.inspectSession(store, id),
+      } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const { ctx } = makeCtx();
+      const running = exec.run(ctx);
+      try {
+        await entered.promise;
+        const result = await exec.saveUsableRollout();
+        assert.equal(result.kind, mode === "present" ? "usable" : "failed");
+        assert.equal(rig.reaped(), 0);
+        assert.equal(rig.transport.closes, 0);
+        if (mode === "present") {
+          const adopted = path.join(dir, "adopted");
+          await fs.mkdir(adopted);
+          await CodexSessionStore.adopt(store, adopted);
+          await assert.rejects(fs.access(path.join(adopted, "auth.json")));
+          assert.equal(await fs.readFile(path.join(adopted, "sessions", `rollout-${sessionId}.jsonl`), "utf8"), "{}\n");
+        }
+      } finally {
+        rig.transport.push(signalDone(sessionId, "tn-1")).push(turnCompleted("completed", sessionId, "tn-1"));
+        await running;
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("CodexExecutor: strict rollout currency", () => {
+  it("rejects inspection completed after the captured authority is fenced", async () => {
+    const entered = installerBarrier(), inspecting = installerBarrier(), release = installerBarrier();
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+    let fenced = false;
+    rig.deps = { ...rig.deps, sessionStore: {
+      ...rig.deps.sessionStore!,
+      inspectSession: async () => { inspecting.resolve(); await release.promise; return "present"; },
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({ claimFenced: () => fenced });
+    const running = exec.run(ctx);
+    try {
+      await entered.promise;
+      const saving = exec.saveUsableRollout();
+      await inspecting.promise;
+      fenced = true;
+      release.resolve();
+      assert.equal((await saving).kind, "failed");
+      assert.equal(rig.reaped(), 0);
+    } finally {
+      fenced = false;
+      release.resolve();
+      rig.transport.push(signalDone("th-current", "tn-1")).push(turnCompleted("completed", "th-current", "tn-1"));
+      await running;
+    }
+  });
+});
+
+
+describe("CodexExecutor: suspended A boundary", () => {
+  for (const claim of [API_KEY, SUBSCRIPTION]) {
+    it(`reconciles captured A credentials while suspended (${claim.auth_mode})`, async () => {
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([plan]);
+      const exec = makeExecutor(rig, bindingOf(claim));
+      const stop = new Error("held after reconcile");
+      // The caller's deadline uses a monotonic clock, not epoch time.
+      const bounds = { signal: new AbortController().signal, deadline: 400, guard() {} };
+      const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        gatePlan: async () => {
+          const lease = await exec.suspendCodexEpoch(bounds);
+          const releases = rig.client.releaseCalls.length;
+          const refreshes = rig.client.refreshCalls.length;
+          await assert.rejects(lease.reconcileA(bounds, 0), /remaining duration/);
+          const transport = rig.epochs[0]!.transport;
+          const requests = transport.requests.length;
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal(rig.client.releaseCalls.length - releases, claim.auth_mode === "api_key" ? 1 : 0);
+          assert.equal(rig.client.refreshCalls.length - refreshes, claim.auth_mode === "subscription" ? 1 : 0);
+          assert.equal(transport.requests.length, requests, "reconciliation does not start a model turn");
+          assert.equal(rig.epochs[0]!.reaped(), 0);
+          await lease.reopenA(bounds);
+          await assert.rejects(lease.reconcileA(bounds, 1000), /retired Codex switch boundary/);
+          throw stop;
+        },
+      });
+      await assert.rejects(exec.run(ctx), error => error === stop);
+    });
+  }
+
+  for (const timing of ["before-suspend", "during-drain", "before-reopen"] as const) {
+    it(`retains the gate when live auth fails ${timing}`, async () => {
+      const rig = makeMultiEpochRig([epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)))]);
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const entered = installerBarrier();
+      let fail!: () => void;
+      const failed = new Promise<never>((_resolve, reject) => { fail = () => reject(new Error("bridge failed")); });
+      rig.client.refreshCodex = async () => { entered.resolve(); return failed; };
+      const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+      const stop = new Error("retained test stop");
+      const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => {
+        const transport = rig.epochs[0]!.transport;
+        const turns = transport.turnStartCount;
+        if (timing === "during-drain") {
+          transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+            requestId: 91, params: { reason: "unauthorized", previousAccountId: null } });
+          await entered.promise;
+          const suspension = exec.suspendCodexEpoch(bounds);
+          transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+            requestId: 93, params: { invalid: true } });
+          fail();
+          await assert.rejects(suspension, error => error instanceof TrustedExecutionRefusal);
+        } else {
+          const suspended = timing === "before-reopen" ? await exec.suspendCodexEpoch(bounds) : undefined;
+          transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+            requestId: 92, params: { invalid: true } });
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (suspended) await assert.rejects(suspended.reopenA(bounds), error => error instanceof TrustedExecutionRefusal);
+          else await assert.rejects(exec.suspendCodexEpoch(bounds), error => error instanceof TrustedExecutionRefusal);
+        }
+        await assert.rejects(exec.suspendCodexEpoch(bounds), /settled live boundary/);
+        assert.equal(transport.turnStartCount, turns);
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(rig.epochs[0]!.reaped(), 0);
+        throw stop;
+      } });
+      await assert.rejects(exec.run(ctx), error => error === stop);
+    });
+  }
+  it("refuses suspension while the provider reap is still pending", async () => {
+    let worked = false;
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
+      if (worked) t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      else {
+        worked = true;
+        t.push(agentMessage("work", th)).push(turnCompleted("completed", th, tn));
+      }
+    }) });
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const reaping = new Promise<void>(resolve => { entered = resolve; });
+    const reap = rig.root.reap.bind(rig.root);
+    rig.root.reap = async ms => { entered(); await pending; return reap(ms); };
+
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+      persist: async () => ({ files: 1, bytes: 20 }),
+      inspectSession: async () => "present",
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+    let checked = false;
+    const stop = new Error("pending reap refusal observed");
+    const { ctx } = makeCtx({ reportIteration: async () => ({ pauseRequested: worked && !checked }), parkForPause: async () => {
+      const boundary = exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      await reaping;
+      try {
+        await assert.rejects(exec.suspendCodexEpoch(bounds), error => error instanceof TrustedExecutionRefusal);
+      } finally { release(); await boundary; }
+      assert.equal(rig.providerLaunches(), 1, "refusal never starts another A root");
+      assert.ok(rig.reaped() > 0);
+      checked = true;
+      throw stop;
+    } });
+    await assert.rejects(exec.run(ctx), error => error === stop);
+    assert.equal(checked, true);
+    assert.equal(rig.providerLaunches(), 1);
+  });
+  it("reopens a verified ordinary-reaped held epoch without overwriting the saved home", async (t) => {
+    let authJoins = 0;
+    let releaseAuthJoin!: () => void;
+    let enteredAuthJoin!: () => void;
+    const blockedAuthJoin = new Promise<void>(resolve => { releaseAuthJoin = resolve; });
+    const authJoinEntered = new Promise<void>(resolve => { enteredAuthJoin = resolve; });
+    const settle = CodexHarness.prototype.settleReapedAuth;
+    t.mock.method(CodexHarness.prototype, "settleReapedAuth", async function(this: CodexHarness) {
+      authJoins++;
+      enteredAuthJoin();
+      await blockedAuthJoin;
+      return settle.call(this);
+    });
+    let worked = false;
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
+      if (worked) t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      else {
+        worked = true;
+        t.push(agentMessage("work", th)).push(turnCompleted("completed", th, tn));
+      }
+    }) });
+    let saves = 0;
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+      persist: async () => { saves++; return { files: 1, bytes: 20 }; },
+      inspectSession: async () => "present",
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+    let checked = false;
+    const { ctx } = makeCtx({ reportIteration: async () => ({ pauseRequested: worked && !checked }), parkForPause: async () => {
+      await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      const count = saves;
+      assert.equal(rig.providerLaunches(), 1);
+      const internals = exec as unknown as { captureRevision: number };
+      const revision = internals.captureRevision;
+      assert.ok(rig.reaped() > 0);
+      let suspensionReturned = false;
+      const suspending = exec.suspendCodexEpoch(bounds).then(value => { suspensionReturned = true; return value; });
+      let suspended!: Awaited<typeof suspending>;
+      await authJoinEntered;
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(suspensionReturned, false, "suspension must await the auth owner join");
+      } finally {
+        releaseAuthJoin();
+        suspended = await suspending;
+      }
+      assert.equal(authJoins, 1, "completed root reap must still join authentication ownership");
+      assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-current" });
+      await suspended.reopenA(bounds);
+      assert.equal(internals.captureRevision, revision);
+      assert.equal(saves, count);
+      assert.equal(rig.providerLaunches(), 1, "preflight never starts another A root");
+      checked = true;
+      return false;
+    } });
+    await exec.run(ctx);
+    assert.equal(checked, true);
+    assert.equal(rig.providerLaunches(), 2, "reopened A uses normal epoch recreation");
+  });
+
+  for (const claim of [API_KEY, SUBSCRIPTION]) {
+    it(`holds and reopens the same ${claim.auth_mode} root without capture`, async () => {
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([plan, epochResponder("th-work", "tn-work", (t, th, tn) =>
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)))]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(claim));
+      let guards = 0;
+      const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000,
+        guard: () => { guards++; } };
+      const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        gatePlan: async () => {
+          const transport = rig.epochs[0]!.transport;
+          const count = transport.requests.length;
+          const reaped = rig.epochs[0]!.reaped();
+          const suspended = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-plan" });
+          assert.equal(rig.epochs[0]!.reaped(), reaped);
+          assert.equal(transport.closes, 0);
+          assert.equal(transport.requests.length, count);
+          await suspended.reopenA(bounds);
+          await assert.rejects(suspended.reopenA(bounds), /retired Codex switch boundary/);
+          assert.equal(transport.closes, 0);
+          assert.ok(guards > 5);
+          return { kind: "approve", selection: { status: "absent" } };
+        },
+      });
+      await exec.run(ctx);
+      await assert.rejects(exec.suspendCodexEpoch(bounds), /inactive Codex switch boundary/);
+    });
+  }
+
+  it("refuses suspension while a model turn owns the epoch", async () => {
+    const entered = installerBarrier();
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx();
+    const running = exec.run(ctx);
+    try {
+      await entered.promise;
+      await assert.rejects(exec.suspendCodexEpoch({ signal: new AbortController().signal,
+        deadline: Date.now() + 60_000, guard() {} }), /settled live boundary/);
+      assert.equal(rig.transport.closes, 0);
+      assert.equal(rig.reaped(), 0);
+    } finally {
+      rig.transport.push(signalDone("th-current", "tn-1")).push(turnCompleted("completed", "th-current", "tn-1"));
+      await running;
+    }
+  });
+});
+
+
+it("suspended A teardown requires strict save and prevents reopening retired auth", async () => {
+  const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+    t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn)));
+  const rig = makeMultiEpochRig([plan]);
+  rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+  const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+  const heldStop = new Error("test retained stop");
+  const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+    gatePlan: async () => {
+      const suspended = await exec.suspendCodexEpoch(bounds);
+      await assert.rejects(suspended.teardown(bounds), /exact saved rollout/);
+      assert.equal(rig.epochs[0]!.reaped(), 0);
+      assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-plan" });
+      assert.equal(await suspended.teardown(bounds), true);
+      assert.ok(rig.epochs[0]!.reaped() > 0);
+      assert.ok(rig.epochs[0]!.transport.closes > 0);
+      await assert.rejects(suspended.reopenA(bounds), /credential authority retired/);
+      assert.equal(rig.providerLaunches(), 1);
+      throw heldStop;
+    },
+  });
+  await assert.rejects(exec.run(ctx), error => error === heldStop);
+});
+
+it("suspended A denies expired inspection and reopening without closing the old root", async () => {
+  const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+    t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn)));
+  const rig = makeMultiEpochRig([plan]);
+  let expired = false;
+  rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+    inspectSession: async () => { expired = true; return "present"; },
+  } };
+  const exec = makeExecutor(rig, bindingOf(API_KEY));
+  const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000,
+    guard() { if (expired) throw new Error("expired switch"); } };
+  const heldStop = new Error("test retained stop");
+  const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+    gatePlan: async () => {
+      const suspended = await exec.suspendCodexEpoch(bounds);
+      await assert.rejects(suspended.persistRollout(bounds), /expired switch/);
+      await assert.rejects(suspended.reopenA(bounds), /expired switch/);
+      assert.equal(rig.epochs[0]!.transport.closes, 0);
+      assert.equal(rig.epochs[0]!.reaped(), 0);
+      throw heldStop;
+    },
+  });
+  await assert.rejects(exec.run(ctx), error => error === heldStop);
+});
+
+describe("CodexExecutor: replacement B boundary", () => {
+  for (const oldClaim of [SUBSCRIPTION, API_KEY]) {
+    for (const outcome of ["resume", "refuse-fresh", "refuse-preserve", "partial-init", "invalid-metadata", "post-construction-guard"] as const) {
+      it(`${oldClaim.auth_mode} to B: ${outcome}`, async () => {
+        const binding = bindingOf({ ...(oldClaim.auth_mode === "subscription" ? API_KEY : SUBSCRIPTION),
+          capability: "B-capability", access_token: "B-token",
+          ...(oldClaim.auth_mode === "api_key" ? { generation: 20, chatgpt_account_id: "B-account" } : {}) });
+        const events: string[] = [];
+        const savedId = "12345678-1234-1234-1234-123456789abc";
+        const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/replacement-B-"));
+        const source = path.join(dir, "source"), store = path.join(dir, "store");
+        await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+        await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
+        await fs.writeFile(path.join(source, "auth.json"), "A-auth-canary");
+        await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
+        await CodexSessionStore.persist(source, store);
+        const adoptedHomes: string[] = [];
+        const adoptedDestinations: string[] = [];
+        const plan = epochResponder(savedId, "tn-plan", (t, th, tn) =>
+          t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+            .push(turnCompleted("completed", th, tn)));
+        const rig = makeMultiEpochRig([plan, epochResponder(savedId, "tn-B", () => {})]);
+        const a = rig.epochs[0]!, b = rig.epochs[1]!;
+        const reap = a.root.reap;
+        a.root.reap = async ms => { const result = await reap(ms); events.push("A-reaped"); return result; };
+        rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+          inspect: async () => "present",
+          inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+          persist: async () => CodexSessionStore.persist(source, store),
+          adopt: async (_dir, home) => {
+            // The injected provider owns synthetic homes. Map each to an isolated real
+            // destination to exercise the production store's allowlist at the launch seam.
+            const dest = path.join(dir, `adopted-${adoptedHomes.length}`);
+            adoptedHomes.push(home);
+            adoptedDestinations.push(dest);
+            await fs.mkdir(dest);
+            return CodexSessionStore.adopt(store, dest);
+          },
+        } };
+        const release = rig.client.releaseCodex.bind(rig.client);
+        let bReleases = 0;
+        rig.client.releaseCodex = async (run, req) => {
+          if (req.capability === binding.capability) {
+            assert.ok(events.includes("A-reaped"), "B release follows A reap"); bReleases++;
+            return { access_token: "B-released-token" };
+          }
+          return release(run, req);
+        };
+        const refresh = rig.client.refreshCodex.bind(rig.client);
+        const observedB: number[] = [];
+        rig.client.refreshCodex = async (run, req) => {
+          if (req.capability === binding.capability) {
+            assert.ok(events.includes("A-reaped"), "B refresh follows A reap");
+            observedB.push(req.observed_generation);
+            return { access_token: "B-refreshed-token", generation: 21 + observedB.length,
+              chatgpt_account_id: "B-account", outcome: "advanced" };
+          }
+          return refresh(run, req);
+        };
+        const resumeEntered = installerBarrier(), resumeContinue = installerBarrier();
+        const freshEntered = installerBarrier(), freshContinue = installerBarrier();
+        let constructedB = false, fileops = 0;
+        const fileopHandles: ReturnType<typeof fakeFileopHandle>[] = [];
+        const effectCleanup: { disposes: number }[] = [];
+        const launchEffectRoot = rig.deps.launchEffectRoot!;
+        rig.deps = { ...rig.deps,
+          launchEffectRoot: async (...args) => {
+            const root = await launchEffectRoot(...args);
+            const cleanup = { disposes: 0 };
+            effectCleanup.push(cleanup);
+            const dispose = root.dispose.bind(root);
+            root.dispose = async (...disposeArgs) => {
+              const result = await dispose(...disposeArgs);
+              cleanup.disposes++;
+              return result;
+            };
+            return root;
+          },
+          wireFileop: () => {
+            const fileop = fakeFileopHandle();
+            fileopHandles.push(fileop);
+            if (++fileops === 2) constructedB = true;
+            return fileop.handle;
+          },
+        };
+        const request = b.transport.request.bind(b.transport);
+        b.transport.request = async (method, params, opts) => {
+          events.push(method);
+          if (method === "account/login/start") {
+            assert.ok(events.includes("A-reaped"));
+            assert.equal(rec(params).type, binding.authMode === "api_key" ? "apiKey" : "chatgptAuthTokens");
+            assert.equal(rec(params)[binding.authMode === "api_key" ? "apiKey" : "accessToken"], "B-released-token");
+            if (binding.authMode === "subscription") assert.equal(rec(params).chatgptAccountId, "B-account");
+          }
+          if (method === "thread/start") {
+            freshEntered.resolve();
+            await freshContinue.promise;
+          }
+          if (method === "thread/resume") {
+            resumeEntered.resolve();
+            await resumeContinue.promise;
+            assert.equal(rec(params).threadId, savedId);
+            if (outcome === "partial-init") return { thread: {} } as never;
+            if (outcome.startsWith("refuse")) throw new CodexTransportError({
+              category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+            });
+          }
+          return request(method, params, opts);
+        };
+        const exec = makeExecutor(rig, bindingOf(oldClaim));
+        const guardStop = new Error("B post-construction guard failed");
+        const bounds = { signal: new AbortController().signal, deadline: 60_000,
+          guard() { if (outcome === "post-construction-guard" && constructedB) throw guardStop; } };
+        const stop = new Error("B held proof complete");
+        const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, sessionId: savedId,
+          preserveConversation: outcome === "refuse-preserve",
+          gatePlan: async () => {
+            const lease = await exec.suspendCodexEpoch(bounds);
+            assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+            assert.deepEqual(await lease.persistRollout(bounds), { kind: "usable", sessionId: savedId });
+            assert.equal(await lease.teardown(bounds), true);
+            await assert.rejects(lease.reopenA(bounds), /retired/);
+            await assert.rejects(lease.reconcileA(bounds, 1000), /retired/);
+            const bundle = { binding, capabilityEpoch: 41, ordinal: 1, messageSeq: 7 };
+            await assert.rejects(lease.finishB(bounds), /admission refused/);
+            if (outcome === "invalid-metadata") {
+              for (const invalid of [{ ...bundle, ordinal: 41 }, { ...bundle, capabilityEpoch: 0 }])
+                await assert.rejects(lease.publishB(invalid, bounds), /metadata invalid/);
+              assert.equal(rig.providerLaunches(), 1);
+              await assert.rejects(lease.restartAndResume(savedId, bounds), /preparation refused/);
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              throw stop;
+            }
+            await lease.publishB(bundle, bounds);
+            await assert.rejects(lease.publishB(bundle, bounds), /publication refused/);
+            await assert.rejects(exec.suspendCodexEpoch(bounds), /settled live boundary/);
+            await assert.rejects(lease.restartAndResume("wrong-thread", bounds), /preparation refused/);
+            if (outcome === "post-construction-guard") {
+              await assert.rejects(lease.restartAndResume(savedId, bounds), error => error === guardStop);
+              assert.equal(constructedB, true, "B fileop root exists before guard failure");
+              assert.equal(rig.providerLaunches(), 1, "B provider remains lazy");
+              throw stop;
+            }
+            const preparing = lease.restartAndResume(savedId, bounds);
+            const preparedResult = preparing.then(value => ({ value }), error => ({ error }));
+            await resumeEntered.promise;
+            const launches = rig.providerLaunches(), releasesAtEntry = bReleases;
+            const rejectRepeat = async () => {
+              await assert.rejects(lease.restartAndResume(savedId, bounds), /preparation refused/);
+              assert.equal(rig.providerLaunches(), launches, "no extra provider launch");
+              assert.equal(bReleases, releasesAtEntry, "no extra credential release");
+            };
+            try { await rejectRepeat(); } finally { resumeContinue.resolve(); }
+            const result = await preparedResult;
+            if (outcome === "partial-init") {
+              assert.ok("error" in result);
+              assert.match(String(result.error), /returned no thread id/);
+              await rejectRepeat();
+              await assert.rejects(lease.finishB(bounds), /admission refused/);
+              assert.equal(b.transport.turnStartCount, 0);
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              throw stop;
+            }
+            assert.ok("value" in result);
+            assert.deepEqual(result.value,
+              { kind: outcome === "resume" ? "resumed" : "confirmed_resume_refusal" });
+            await rejectRepeat();
+            assert.notEqual(rig.launchRoots[0], rig.launchRoots[1], "B has fresh CODEX_HOME root");
+            assert.equal(adoptedHomes.length, 2);
+            assert.notEqual(adoptedHomes[0], adoptedHomes[1], "distinct adoption homes");
+            assert.notEqual(a.transport, b.transport);
+            assert.equal(b.transport.turnStartCount, 0, "preparation sends no model turn");
+            assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
+            await assert.rejects(lease.reconcileA(bounds, 1000), /retired/);
+            await assert.rejects(lease.reopenA(bounds), /retired/);
+            if (outcome !== "resume") {
+              await assert.rejects(lease.finishB(bounds), /admission refused/);
+              assert.equal(b.transport.threadStartCount, 0, "refusal requires explicit fallback");
+              if (outcome === "refuse-preserve") {
+                await assert.rejects(lease.startFreshLineage(bounds), /provider_resume_rejected/);
+                await assert.rejects(lease.startFreshLineage(bounds), /preparation refused/);
+                assert.equal(rig.providerLaunches(), launches);
+                assert.equal(bReleases, releasesAtEntry);
+                assert.equal(b.transport.threadStartCount, 0);
+                assert.equal(b.transport.turnStartCount, 0);
+                throw stop;
+              }
+              const fresh = lease.startFreshLineage(bounds);
+              await freshEntered.promise;
+              try {
+                await assert.rejects(lease.startFreshLineage(bounds), /preparation refused/);
+              } finally { freshContinue.resolve(); }
+              await fresh;
+              await assert.rejects(lease.startFreshLineage(bounds), /preparation refused/);
+              assert.equal(rig.providerLaunches(), launches);
+              assert.equal(bReleases, releasesAtEntry);
+              assert.equal(b.transport.threadStartCount, 1);
+              assert.ok(emitted.some(m => m.payload.event === "resume_lineage_break"));
+            }
+            assert.equal(b.transport.turnStartCount, 0, "fresh fallback also stays gated");
+            await lease.finishB(bounds);
+            const next = await exec.suspendCodexEpoch(bounds);
+            const oldRequests = a.transport.requests.length;
+            const releases = bReleases, refreshes = observedB.length;
+            assert.deepEqual(await next.reconcileA(bounds, 1000), { kind: "ready" });
+            assert.equal(a.transport.requests.length, oldRequests);
+            if (binding.authMode === "subscription") {
+              assert.equal(observedB.length, refreshes + 1);
+              assert.equal(observedB[0], 20, "B starts with its own generation");
+              for (let i = 1; i < observedB.length; i++)
+                assert.equal(observedB[i], 21 + i, "B reconciliation retains the committed generation");
+            } else assert.equal(bReleases, releases + 1);
+            await assert.rejects(lease.reconcileA(bounds, 1000), /retired/);
+            await assert.rejects(lease.publishB(bundle, bounds), /publication refused/);
+            assert.equal(b.transport.turnStartCount, 0);
+            throw stop;
+          },
+        });
+        try {
+          await assert.rejects(exec.run(ctx), error => error === stop);
+          const constructed = outcome === "invalid-metadata" ? 1 : 2;
+          assert.equal(fileops, constructed, "no extra constructed epoch");
+          assert.equal(adoptedDestinations.length, outcome === "post-construction-guard" ? 1 : constructed,
+            "admission loss before B adoption copies only A; other constructed epochs adopt sessions");
+          // Adoption errors are deliberately swallowed by production; assertions must live here.
+          for (const dest of adoptedDestinations) {
+            assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+            await assert.rejects(fs.access(path.join(dest, "auth.json")));
+            await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+          }
+          assert.ok(effectCleanup.length >= constructed, "constructed epochs own effect roots");
+          for (const cleanup of effectCleanup)
+            assert.ok(cleanup.disposes > 0, "finally disposes each constructed effect root");
+          for (const fileop of fileopHandles)
+            assert.ok(fileop.disposed() > 0, "finally disposes each constructed fileop handle");
+          for (const epoch of rig.epochs.slice(0, rig.providerLaunches())) {
+            assert.ok(epoch.reaped() > 0, "finally reaps each launched provider root");
+            assert.ok(epoch.disposed() > 0, "finally disposes each launched provider root");
+          }
+        } finally { await fs.rm(dir, { recursive: true, force: true }); }
+      });
+    }
+  }
+});
+
+describe("CodexExecutor credential switch continuation", () => {
+  for (const cancel of [false, true]) {
+    it("repair held revision gate preserves candidate and settlement; cancel=" + cancel, async () => {
+      let gates = 0, switches = 0, cancelled = false;
+      const seen: unknown[][] = [];
+      let plans = 0;
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (t, th, tn) =>
+        t.push(toolCall(++plans, "submit_plan", { plan_md: "candidate " + plans }, th, tn, "plan-" + plans))
+          .push(turnCompleted("completed", th, tn))) });
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        cancelRequested: () => cancelled,
+        gatePlan: async (...args) => {
+          if (++gates === 1) return { kind: "revise", feedback: "tighten", inputId: 77 };
+          seen.push(args);
+          if (gates === 2) throw new CredentialSwitchSignal();
+          return { kind: "reject", reason: "revision proof complete" };
+        },
+        attemptCodexCredentialSwitch: async request => {
+          assert.equal(request.site, "plan_gate_revision");
+          switches++; cancelled = cancel; return "continued_A";
+        },
+      });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+        cancel ? /cancel/ : /revision proof complete/);
+      assert.equal(switches, 1);
+      assert.equal(seen.length, cancel ? 1 : 2);
+      assert.equal(seen[0]![3], 77);
+      if (!cancel) {
+        assert.strictEqual(seen[0]![0], seen[1]![0]);
+        assert.strictEqual(seen[0]![1], seen[1]![1]);
+        assert.equal(seen[1]![3], 77);
+        assert.strictEqual(seen[0]![4], seen[1]![4]);
+      }
+    });
+
+    it("repair held park callback retains exact boundary; cancel=" + cancel, async () => {
+      let calls = 0, cancelled = false, switches = 0;
+      const seen: unknown[] = [];
+      const fixture = dependencyWaitCallbacks({ eligible: true });
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (t, th, tn) =>
+        t.push(toolCall(1, "park_run", {}, th, tn, "park")).push(turnCompleted("completed", th, tn))) });
+      const { ctx } = makeCtx({
+        ...fixture.callbacks, kind: "issue", completionInterlock: true, parkRunSupported: true,
+        cancelRequested: () => cancelled,
+        requestParkRun: async at => {
+          seen.push(at);
+          if (++calls === 1) throw new CredentialSwitchSignal();
+          return { kind: "paused" };
+        },
+        attemptCodexCredentialSwitch: async () => { switches++; cancelled = cancel; return "continued_A"; },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (cancel) await assert.rejects(run, /cancel/);
+      else assert.ok((await run).pausedAt);
+      assert.equal(switches, 1);
+      assert.equal(calls, cancel ? 1 : 2);
+      if (!cancel) assert.strictEqual(seen[0], seen[1]);
+    });
+  }
+
+  it("repair first trip retains a switch arriving during turn settlement", async () => {
+    let interrupt!: () => void;
+    let handlers = 0, second = false;
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/interrupt" && !second) { second = true; interrupt(); }
+      if (c.method === "turn/start") {
+        if (c.turnStartCount > 1) {
+          assert.equal(handlers, 2, "both switches handled before another turn");
+          c.transport.push(signalDone()).push(turnCompleted("completed"));
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const { ctx } = makeCtx({
+      onCredentialSwitch: cb => { interrupt = cb; },
+      attemptCodexCredentialSwitch: async () => { handlers++; return "continued_A"; },
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount === 1, "A turn");
+    interrupt();
+    await withTimeout(run, 5000, "settling switch");
+    assert.equal(second, true);
+    assert.equal(handlers, 2);
+  });
+
+  for (const branch of ["lead", "stall"] as const) {
+    for (const fresh of [false, true]) {
+    it("repair completion " + branch + " preserves prepared " + (fresh ? "fresh_B" : "resumed_B"), async () => {
+      let questions = 0, attempts = 0, switches = 0;
+      const candidates: unknown[] = [];
+      const fixture = dependencyWaitCallbacks({ eligible: true });
+      const a: Responder = c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (branch === "lead") c.transport.push(toolCall(1, "signal_done",
+            { owner_decision_requested: { reason: "Need decision" } }, "th-1", "tn-1", "done"));
+          else if (c.turnStartCount === 1) c.transport.push(toolCall(1, "report_progress", dependencyWaitProgress, "th-1", "tn-1", "progress"));
+          else c.transport.push(agentMessage("waiting"));
+          c.transport.push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      };
+      const baseB = epochResponder("th-1", "tn-B", (t, th, tn) =>
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)));
+      const b: Responder = c => {
+        if (fresh && c.method === "thread/resume") throw new CodexTransportError({
+          category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+        });
+        if (c.method === "turn/start") assert.match(JSON.stringify(c.params), /OWNER-REPAIR/);
+        return baseB(c);
+      };
+      const rig = makeMultiEpochRig([a, b]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const { ctx } = makeCtx({
+        ...fixture.callbacks, kind: "issue", interactive: false, completionInterlock: true,
+        checkpoint: async opts => { if (opts?.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {}); },
+        recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
+        askCompletionQuestion: async unmet => {
+          candidates.push(unmet);
+          if (++questions === 1) throw new CredentialSwitchSignal();
+          return { outcome: "continue", guidance: "OWNER-REPAIR" };
+        },
+        attemptCodexCredentialSwitch: async () => {
+          switches++;
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          await lease.persistRollout(bounds);
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          const resumed = await lease.restartAndResume("th-1", bounds);
+          if (fresh) {
+            assert.equal(resumed.kind, "confirmed_resume_refusal");
+            await lease.startFreshLineage(bounds);
+          }
+          await lease.finishB(bounds);
+          return fresh ? "fresh_B" : "resumed_B";
+        },
+      });
+      await withTimeout(exec.run(ctx), 5000, "completion B");
+      assert.equal(questions, 2);
+      assert.strictEqual(candidates[0], candidates[1]);
+      assert.equal(switches, 1);
+      assert.equal(attempts, 2);
+      assert.equal(rig.providerLaunches(), 2);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+    });
+    }
+  }
+
+  for (const hooked of [false, true]) {
+    it(hooked ? "continues A on the same implement epoch" : "preserves an unhandled switch signal", async () => {
+      let interrupt: (() => void) | undefined;
+      const controller = new AbortController();
+      const original = new CredentialSwitchSignal();
+      let calls = 0;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount > 1) c.transport.push(signalDone()).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const { ctx } = makeCtx({
+        signal: controller.signal,
+        onCredentialSwitch: cb => { interrupt = cb; },
+        ...(hooked ? { attemptCodexCredentialSwitch: async () => { calls++; return "continued_A" as const; } } : {}),
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const outcome = running.then(value => ({ value }), error => ({ error }));
+      await waitFor(() => rig.transport.turnStartCount === 1, "first turn");
+      controller.abort(original);
+      interrupt?.(); // SteeringChannel emits this paired notification for the same request.
+      const settled = await withTimeout(outcome, 3000, "switch settles");
+      if (hooked) {
+        assert.ok("value" in settled);
+        assert.equal(calls, 1);
+        assert.equal(rig.transport.turnStartCount, 2);
+      } else {
+        assert.ok("error" in settled);
+        assert.strictEqual(settled.error, original);
+      }
+    });
+  }
+  for (const mode of ["rearm", "during", "terminal"] as const) {
+    it(`handles switch generation race: ${mode}`, async () => {
+      let interrupt!: () => void;
+      let controller = new AbortController();
+      const terminal = new AbortController();
+      let calls = 0;
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount > (mode === "rearm" ? 2 : 1))
+            c.transport.push(signalDone()).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const { ctx } = makeCtx({
+        get signal() { return controller.signal; },
+        terminalLifecycleSignal: terminal.signal,
+        onCredentialSwitch: cb => { interrupt = cb; },
+        attemptCodexCredentialSwitch: async () => {
+          calls++;
+          if (calls === 1 && mode !== "rearm") await held;
+          controller = new AbortController();
+          return "continued_A";
+        },
+      });
+      // makeCtx spreads overrides, so restore the Runner's rearmable getter.
+      Object.defineProperty(ctx, "signal", { get: () => controller.signal });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const outcome = run.then(value => ({ value }), error => ({ error }));
+      await waitFor(() => rig.transport.turnStartCount === 1, "first turn");
+      controller.abort(new CredentialSwitchSignal()); interrupt();
+      await waitFor(() => calls === 1, "first handler");
+      if (mode === "rearm") await waitFor(() => rig.transport.turnStartCount === 2, "second turn");
+      if (mode === "terminal") terminal.abort(new Error("terminal fixture"));
+      else interrupt();
+      release();
+      const result = await withTimeout(outcome, 3000, "race settles");
+      if (mode === "terminal") assert.ok("error" in result);
+      else {
+        assert.ok("value" in result);
+        assert.equal(calls, 2, "a newer generation must get its own handler");
+      }
+    });
+  }
+
+  for (const site of ["question", "gate"] as const) {
+    it(`re-presents the same held ${site} after confirmed A continuation`, async () => {
+      const original = new CredentialSwitchSignal();
+      let calls = 0;
+      let switches = 0;
+      const candidates: unknown[] = [];
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) c.transport.push(toolCall(1,
+            site === "question" ? "ask_user" : "submit_plan",
+            site === "question" ? { questions: [{ question: "Which target?" }] } : { plan_md: "held candidate" },
+            "th-1", "tn-1", "held")).push(turnCompleted("completed"));
+          else c.transport.push(signalDone()).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const { ctx } = makeCtx({
+        ...(site === "gate" ? { planApproved: false, approvedPlan: undefined } : {}),
+        attemptCodexCredentialSwitch: async () => { switches++; return "continued_A"; },
+        askUser: async questions => {
+          candidates.push(questions);
+          if (++calls === 1) throw original;
+          return { kind: "answer", answers: ["target A"] };
+        },
+        gatePlan: async plan => {
+          candidates.push(plan);
+          if (++calls === 1) throw original;
+          return { kind: "reject", reason: "fixture finished" };
+        },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (site === "gate") await assert.rejects(run, /fixture finished/);
+      else await run;
+      assert.equal(switches, 1);
+      assert.equal(calls, 2);
+      assert.strictEqual(candidates[0], candidates[1]);
+    });
+  }
+
+  for (const replacement of [false, true]) {
+    it(replacement ? "adopts actual suspended B without recreating it again" : "continues the active plan prompt on A", async () => {
+      let interrupt!: () => void;
+      const controller = new AbortController();
+      const quiet: Responder = c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount > 1) c.transport.push(toolCall(2, "submit_plan", { plan_md: "continued plan" },
+            "th-1", "tn-1", "plan")).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      };
+      const rig = makeMultiEpochRig([quiet, epochResponder("th-1", "tn-B", (t, th, tn) =>
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)))]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const { ctx } = makeCtx({
+        signal: controller.signal,
+        ...(replacement ? {} : { planApproved: false, approvedPlan: undefined }),
+        onCredentialSwitch: cb => { interrupt = cb; },
+        attemptCodexCredentialSwitch: async () => {
+          if (!replacement) return "continued_A";
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          const saved = await lease.persistRollout(bounds);
+          assert.equal(saved.kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          await lease.restartAndResume("th-1", bounds);
+          await lease.finishB(bounds);
+          return "resumed_B";
+        },
+        gatePlan: async () => ({ kind: "reject", reason: "continued plan reached gate" }),
+      });
+      const running = exec.run(ctx);
+      const outcome = running.then(value => ({ value }), error => ({ error }));
+      await waitFor(() => rig.epochs[0]!.transport.turnStartCount === 1, "active A turn");
+      controller.abort(new CredentialSwitchSignal()); interrupt();
+      const result = await withTimeout(outcome, 5000, "plan or B continuation");
+      if (replacement) {
+        assert.ok("value" in result, "B completed the retried implement prompt");
+        assert.equal(rig.providerLaunches(), 2);
+        assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      } else {
+        assert.ok("error" in result);
+        assert.match(String(result.error), /continued plan reached gate/);
+        assert.equal(rig.providerLaunches(), 1);
+      }
+    });
+  }
+
+});
+
+describe("M2 external Now owned composition", () => {
+  for (const phase of ["before run", "during run"] as const) {
+    it(`M2 external Now rejects retired authority ${phase}`, async () => {
+      const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+      const executor = makeExecutor(makeRig(), a.binding);
+      const state = executor as unknown as { currentCodexAuthority: typeof a };
+      state.currentCodexAuthority = a;
+      let entered!: () => void, release!: () => void;
+      const ready = new Promise<void>(resolve => { entered = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      let runs = 0;
+      const factory = executor.bindCodexSummaryFactory(async () => ({
+        run: async () => { runs++; entered(); await held; return {}; },
+      }) as never);
+      const params = { runId: "run-1", binding: a.binding };
+      summaryCallDeadlines.set(params, Date.now() + 10000);
+      const harness = await factory(params);
+      const retire = () => {
+        a.retire();
+        state.currentCodexAuthority = createCodexEpochAuthority(bindingOf({ ...SUBSCRIPTION, capability: "next-capability" }));
+      };
+      if (phase === "before run") retire();
+      const running = harness.run({
+        label: "now", systemPrompt: "", prompt: "", output: { kind: "text" },
+        signal: new AbortController().signal, timeoutMs: 10000,
+      }, { onTerminal() {} });
+      const rejected = assert.rejects(running, /authority/);
+      try {
+        if (phase === "during run") { await ready; retire(); }
+      } finally { release(); await rejected; }
+      assert.equal(runs, phase === "during run" ? 1 : 0);
+    });
+  }
+
+  it("M2 external Now rejects a mismatched subscription generation", async () => {
+    const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const executor = makeExecutor(makeRig(), a.binding);
+    (executor as unknown as { currentCodexAuthority: typeof a }).currentCodexAuthority = a;
+    let builds = 0;
+    const factory = executor.bindCodexSummaryFactory(async () => {
+      builds++;
+      return { run: async () => ({}) } as never;
+    });
+    const params = { runId: "run-1", binding: bindingOf({ ...SUBSCRIPTION, generation: SUBSCRIPTION.generation + 1 }) };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    await assert.rejects(factory(params), /authority/);
+    assert.equal(builds, 0);
+  });
+
+  it("M2 external Now factory captures authority and denies old binding before and after await", async () => {
+    const executor = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+    const state = executor as unknown as { currentCodexAuthority?: ReturnType<typeof createCodexEpochAuthority> };
+    const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const b = createCodexEpochAuthority(bindingOf({ ...SUBSCRIPTION, capability: "next-capability" }));
+    const barrier = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      return { resolve, promise };
+    };
+    const entered = barrier(), release = barrier();
+    let builds = 0;
+    const factory = executor.bindCodexSummaryFactory(async () => {
+      builds++; entered.resolve(); await release.promise;
+      return { run: async () => ({}) } as never;
+    });
+    assert.ok(ownedSummaryFactories.has(factory));
+    const params = { runId: "run-1", binding: a.binding };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    // A delayed A call cannot borrow an executor already constructed for B, even before run().
+    const before = makeExecutor(makeRig(), b.binding);
+    let beforeBuilds = 0;
+    const beforeFactory = before.bindCodexSummaryFactory(async () => {
+      beforeBuilds++;
+      return { run: async () => ({}) } as never;
+    });
+    await assert.rejects(beforeFactory(params), /authority/);
+    assert.equal(beforeBuilds, 0, "old binding is refused before the raw factory");
+    state.currentCodexAuthority = a;
+    const pending = factory(params);
+    try {
+      await Promise.race([entered.promise, pending.then(() => {
+        throw new Error("summary factory settled before the entry barrier");
+      })]);
+      a.retire(); state.currentCodexAuthority = b;
+      release.resolve();
+      await assert.rejects(pending, /authority/);
+      await assert.rejects(factory(params), /authority/);
+      assert.equal(builds, 1, "old binding never enters raw factory again");
+    } finally {
+      release.resolve();
+      await Promise.allSettled([pending]);
+    }
+  });
+});
+
+describe("M2 actualRunner credential replacement", () => {
+  m2Runner.installHarness();
+  for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
+    [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
+    for (const phase of ["factory", "already-running-body"] as const) {
+      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "tool-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+        if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
+        if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
+        if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const resumeRefusal = publication === "resume-refuse-fresh";
+        const resumeUncertain = publication === "resume-uncertain";
+        const preservePending = publication === "resume-preserve-pending";
+        const preserveNonce = publication === "resume-preserve-nonce";
+        const preserveSequenceRefused = publication === "resume-preserve-sequence-refused";
+        const preserveNegative = preservePending || preserveNonce || preserveSequenceRefused;
+        const policyAckLost = publication === "resume-policy-ack-lost";
+        const policyAckPending = publication === "resume-policy-ack-pending";
+        const policyDeliveryUnknown = policyAckLost || policyAckPending;
+        const preserveCleanupCancel = publication === "resume-cleanup-cancel";
+        const preserveCleanupShutdown = publication === "resume-cleanup-shutdown";
+        const preserveCleanupFollowup = publication === "resume-cleanup-followup";
+        const preserveCleanup = preserveCleanupCancel || preserveCleanupShutdown || preserveCleanupFollowup;
+        const resumePreserve = publication === "resume-refuse-preserve" || preserveNegative || policyDeliveryUnknown || preserveCleanup;
+        const resumeVariant = resumeRefusal || resumeUncertain || resumePreserve;
+        if (resumeVariant && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const successorEpochAdvance = publication === "clean-successor-epoch-advance";
+        const cleanApplyUncertain = publication === "clean-apply-uncertain";
+        const cleanAllUnconfirmed = publication === "clean-stopped-unconfirmed" || publication === "clean-stopped-unsupported";
+        const cleanPendingDisappears = publication === "clean-pending-disappears" || publication.startsWith("clean-stopped-");
+        const cleanRetainedStop = cleanApplyUncertain || cleanPendingDisappears || successorEpochAdvance;
+        if (cleanRetainedStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const rootReapUnproven = publication === "root-reap-unproven";
+        // A's provider root reaps clean; a registered tool root of A (registry roots are shared) fails instead.
+        const toolReapUnproven = publication === "tool-reap-unproven";
+        const reapUnproven = rootReapUnproven || toolReapUnproven;
+        if (reapUnproven && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const preflightRefusal = publication === "preflight-target-mismatch" || publication === "preflight-foreign-op";
+        const targetMismatch = publication === "preflight-target-mismatch";
+        const preflightRetry = publication === "preflight-busy-ready" || publication === "preflight-transport-ready";
+        if ((preflightRefusal || preflightRetry) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const inspectFailure = publication === "inspect-missing-clear-confirmed" || publication === "inspect-unknown-clear-confirmed";
+        const clearOwnerLost = publication === "persist-clear-owner-lost";
+        const clearNonceChanged = publication === "persist-clear-nonce-changed";
+        const clearAuthorityLost = clearOwnerLost || clearNonceChanged;
+        const confirmedClear = publication === "persist-clear-confirmed" || inspectFailure;
+        // Pre-clear refusals: the first reconcile inside confirmClear (after the persist failure) is the only
+        // observation that differs, so exactly one pre-clear guard refuses and no clear is ever sent.
+        const clearOpChangedBefore = publication === "persist-clear-op-changed-before";
+        const clearTargetChangedBefore = publication === "persist-clear-target-changed-before";
+        const clearOwnerLostBefore = publication === "persist-clear-owner-lost-before";
+        const clearRefusedBefore = clearOpChangedBefore || clearTargetChangedBefore || clearOwnerLostBefore;
+        const persistFailure = publication === "persist-clear-confirmed" || clearAuthorityLost || clearRefusedBefore ||
+          publication === "persist-clear-rejected" || publication === "persist-clear-lost-reply" ||
+          publication === "persist-clear-empty-reply" || publication === "persist-clear-pending" || inspectFailure;
+        if (persistFailure && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const injectedStage = ["before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false"].includes(publication) ? publication : undefined;
+        const scopeClearFailure = injectedStage === "before-scope-clear" || injectedStage === "after-scope-clear";
+        if (injectedStage && (phase !== "factory" || (scopeClearFailure
+          ? oldClaim !== SUBSCRIPTION || target !== API_KEY
+          : oldClaim !== API_KEY || target !== SUBSCRIPTION))) continue;
+        const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
+        const probeEpochConsumers = publication === "baseline" && oldClaim === API_KEY && phase === "factory";
+        const probeBInitialCredential = publication === "baseline" && phase === "factory";
+        const probeScopeIdentity = publication === "baseline" && phase === "factory" &&
+          oldClaim.auth_mode === "subscription" && target.auth_mode === "subscription";
+        const aRefreshSubscription = "generation" in oldClaim ? oldClaim : undefined;
+        const probeARefreshDrain = publication === "baseline" && phase === "factory" && oldClaim.auth_mode === "subscription";
+        const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
+        const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
+          publication === "crash-apply-reply-lost-recovery" || publication === "crash-apply-ack-recovery" ||
+          publication === "crash-login-recovery";
+        const crashStage = publication === "crash-after-a-teardown-recovery" ? "before-apply"
+          : publication === "crash-apply-reply-lost-recovery" ? "apply-reply-lost"
+          : publication === "crash-apply-ack-recovery" ? "before-publish" : "login";
+        const expectedApplies = publication === "crash-after-a-teardown-recovery" ? 0 : 1;
+        if ((queuedRefreshStop || crashRecovery) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        for (const recoveryMode of ["normal", "ordinary missing persisted ID", "ordinary missing retained rollout",
+          "preserve saved conversation", "preserve missing persisted ID", "preserve missing retained rollout",
+          "quiescence survivors", "quiescence unverified"] as const) {
+          if (!crashRecovery && recoveryMode !== "normal") continue;
+          const forcedQuiescence = recoveryMode === "quiescence survivors" ? "survivors" as const
+            : recoveryMode === "quiescence unverified" ? "unverified" as const : undefined;
+          const preservingRecovery = recoveryMode.startsWith("preserve");
+          const missingRecoveryId = recoveryMode.endsWith("missing persisted ID");
+          const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
+      it((publication === "baseline"
+        ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
+        : preserveCleanupCancel ? "Codex real Runner cancellation during B cleanup takes precedence over preserve-only policy hold"
+        : preserveCleanupShutdown ? "Codex real Runner shutdown during B cleanup retains a nonterminal preserve-only source"
+        : preserveCleanupFollowup ? "Codex real Runner follow-up during B cleanup routes without model delivery before policy re-hold"
+        : resumeRefusal ? "Codex real Runner confirmed B resume refusal starts exactly one fresh lineage"
+        : preserveNegative ? `Codex real Runner preserve-only B resume fences handoff (${publication})`
+        : policyDeliveryUnknown ? `Codex real Runner preserves B resume refusal with unknown policy delivery (${publication})`
+        : resumePreserve ? "Codex real Runner wire preserve-only claim re-holds confirmed B saved-thread resume refusal"
+        : resumeUncertain ? "Codex real Runner uncertain B resume failure pauses without fresh fallback"
+        : successorEpochAdvance ? "Codex real Runner rejects successor READY epoch 12 after latching epoch 11"
+        : cleanApplyUncertain ? "Codex real Runner clean A teardown then uncertain apply parks ownership without custody hold"
+        : cleanPendingDisappears ? `Codex real Runner pending op disappears after clean A teardown (${publication})`
+        : rootReapUnproven ? "Codex real Runner holds API-key A to subscription B when the registered A root reap is unproven"
+        : toolReapUnproven ? "Codex real Runner holds API-key A to subscription B when an A tool root reap is unproven"
+        : publication === "preflight-busy-ready" ? "Codex real Runner retries credential_busy then exact ready for the same operation"
+        : publication === "preflight-transport-ready" ? "Codex real Runner retries uncertain transport then exact ready for the same operation"
+        : targetMismatch ? "Codex real rollout preflight target_mismatch clears the exact operation and continues A"
+        : publication === "preflight-foreign-op" ? "Codex real rollout preflight foreign ready op retains A without reopening"
+        : persistFailure ? `Codex real rollout ${inspectFailure ? "inspection unavailable" : "persist failure"} before teardown (${publication})`
+        : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work${positiveBChild ? "; finished B preparation broker dispatches an actual child" : ""}`
+        : crashRecovery ? publication === "crash-after-a-teardown-recovery"
+          ? "Codex switch crash after A teardown before apply recovers committed A without switching"
+          : publication === "crash-apply-reply-lost-recovery"
+          ? "Codex switch crash after apply commit loses auth response and recovers committed B"
+          : publication === "crash-apply-ack-recovery"
+          ? "Codex switch crash after apply acknowledgement before B login recovers committed B"
+          : "Codex switch crash during B login retains committed B"
+        : publication === "subscription-refresh" ? "Codex subscription startup refresh stays deferred until B finish"
+        : publication === "subscription-refresh-prepare-failure" ? "Codex queued subscription refresh settles on B preparation failure"
+        : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
+        : publication === "api-key-refresh" ? "Codex API-key B refuses subscription refresh and retains the workspace"
+        : `Codex ${oldClaim.auth_mode} to ${target.auth_mode} partial B publication never reopens A (${publication})`) +
+        (recoveryMode === "normal" ? "" : `; recovery ${recoveryMode}`), async t => {
+        const { api, client } = m2Runner;
+        const next = { ...target, access_token: "M2-B-access", capability: "M2-B-capability" } as import("../src/protocol.js").ClaimCodexSecrets;
+        if ("chatgpt_account_id" in oldClaim && next.auth_mode === "subscription")
+          assert.notEqual(oldClaim.chatgpt_account_id, next.chatgpt_account_id);
+        const claim: ClaimResponse = { ...m2Runner.gitlabClaim(4202, {
+          plan_md: "Approved integration proof", plan_approved: true, plan_source: "seeded",
+        }), claim_generation: 7 };
+        claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
+        api.setOwnershipStatus(claim.run_id, "running", 7);
+        let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
+        let baselineProofFinished = publication !== "baseline";
+        let pendingOp = "M2-op";
+        const forbiddenSuccessorApply = installerBarrier();
+        let predecessorFenced = false, applyAcknowledgements = 0;
+        let committedCodex = claim.secrets.codex!;
+        let context!: RunContext;
+        let retainedPrepareRootDispatch: RunContext["prepareCodexRootDispatch"];
+        let clockOffset = 0;
+        const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
+        const executorSuspensionEntered = installerBarrier();
+        const nowSuspensionEntered = installerBarrier();
+        let nowDrainCompleted = false;
+        const executorEntryNowDrain: { completed: boolean; raw: boolean }[] = [];
+        const summaryDisposeEntered = installerBarrier(), summaryDisposeContinue = installerBarrier();
+        const summaryRoots: ReturnType<typeof trackedRoot>[] = [];
+        let summaryDisposeCalls = 0;
+        const nowBuilds: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams[] = [];
+        const nowRuns: string[] = [];
+        const owners: import("../src/codex/summary-ownership.js").SummaryOwnership[] = [];
+        let retiredADenied = false, liveBAdmitted = false;
+        let retiredADenial: { refusal: boolean; message: string } | undefined;
+        const triggerNow = async (id: string) => {
+          await context.reportProgress!({ completed: [], in_progress: [id] }, [{ id, title: `Inspect ${id}` }] as never);
+          context.emit({ kind: "tool_use", agent: "lead", payload: { id, name: "Bash", input: { command: "true", description: `Inspect ${id}` } } });
+        };
+        const switchSettled = installerBarrier(), continuedATurn = installerBarrier();
+        const forbiddenUnprovenApply = installerBarrier();
+        const forbiddenUncertainFresh = installerBarrier();
+        let switchResult: Awaited<ReturnType<NonNullable<RunContext["attemptCodexCredentialSwitch"]>>> | undefined;
+        let switchError: unknown;
+        let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
+        let persistedCopies = 0, unavailableInspections = 0;
+        const usableSaves: import("../src/executor.js").UsableSavedRollout[] = [];
+        const persistBoundObserved = installerBarrier();
+        let persistBoundKind: string | undefined;
+        const deliveredPreflightReplies: import("../src/client.js").CodexSwitchPreflightResult[] = [];
+        const retryScheduled = installerBarrier();
+        let retryArmed = false, retryCallbacks = 0;
+        let releaseRetry: (() => void) | undefined;
+        let preflightStorePresence: string | undefined;
+        const preflightRequests: { runId: string; claimGeneration: number; registerNonce: string; opId: string; targetSecretId: string }[] = [];
+        const failedClearRequests: { runId: string; generation?: number; opId?: string; reason?: string }[] = [];
+        let clearAcknowledged = false;
+        const postAckOwnership: { claim_generation: number; claim_released: boolean }[] = [];
+        const postAckNonces: string[] = [];
+        const originalRegistrationNonce = client.registrationNonce;
+        let registrationNonce = "M2-original-nonce";
+        const reports: string[] = [];
+        const holdReports: { runId: string; status: string; generation?: number; opId?: string }[] = [];
+        let holdReason: "credential_switch_settling" | "credential_switch_unsettled" | null = null;
+        // Explicit fake ownership, separate from pending target and simulated committed binding.
+        // These transitions model server ACKs, not DB durability or worker-crash recovery.
+        const cleanOwnership = { status: "running", claim_generation: 7, claim_released: false, hold_reason: null };
+        const cleanReports: { runId: string; generation?: number; opId?: string; reason?: string }[] = [];
+        const cleanPauseRequests: { runId: string; generation: number }[] = [];
+        const stoppedTuples: { claimGeneration: number; registerNonce: string; expectedEpoch: number }[] = [];
+        let switchAdvertised = true;
+        let releasesAtCleanTeardown = 0;
+        const cleanPausedObservations: typeof cleanOwnership[] = [];
+        const teardownResults: boolean[] = [];
+        const failedRootReaps: Awaited<ReturnType<ReturnType<typeof trackedRoot>["root"]["reap"]>>[] = [];
+        const failedToolDisposals: { identity: string }[] = [];
+        const reapFailureCount = () => failedRootReaps.length + failedToolDisposals.length;
+        const dispositions: { status: string; failure_reason?: string }[] = [];
+        const scopeIdentityUncertain = installerBarrier();
+        const unexpectedPreservePause = installerBarrier();
+        const report = client.reportState.bind(client);
+        client.reportState = async (id, body, ...args) => {
+          reports.push(body.status);
+          dispositions.push({ status: body.status, failure_reason: body.failure_reason });
+          if (probeScopeIdentity && body.status === "credential_switch_uncertain") {
+            scopeIdentityUncertain.resolve();
+            // ACK only the failure path so the driver can diagnose a scope collision and join cleanup.
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(id, "paused", 7);
+            return { applied: true, credentialSwitchUncertain: true };
+          }
+          if (preserveNegative && body.status === "credential_switch_uncertain") {
+            assert.ok(!preserveNonce, "registration fence cannot report through the old owner");
+            assert.equal(body.op_id, "M2-op");
+            assert.equal(body.claim_generation, 7);
+            assert.equal(body.failure_reason, "initialization_failed");
+            assert.equal(policyHolds.length, 0);
+            if (preservePending) {
+              assert.equal(pendingOp, "M2-successor");
+              assert.equal(pending, true);
+              // The old operation cannot ACK a pause over the successor; leave it pending.
+              return { applied: false };
+            }
+            // Transport failure may legitimately take the ordinary owner-pause fallback.
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(id, "paused", 7);
+            return { applied: true, credentialSwitchUncertain: true };
+          }
+          if (resumePreserve && !preserveNegative && body.status === "credential_switch_uncertain") {
+            // Observe outside the callback too: Runner may catch the tripwire assertion.
+            unexpectedPreservePause.resolve();
+            assert.fail("preserving refusal cannot pause before the policy endpoint");
+          }
+          if (resumeUncertain && body.status === "credential_switch_uncertain") {
+            assert.equal(id, claim.run_id);
+            assert.equal(body.claim_generation, 7);
+            assert.equal(body.op_id, "M2-op");
+            assert.equal(body.failure_reason, "initialization_failed");
+            assert.deepEqual(teardownResults, [true]);
+            assert.ok(a.reaped() > 0, "owner pause follows joined A teardown");
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(id, "paused", 7);
+            return { applied: true, credentialSwitchUncertain: true };
+          }
+          if (cleanRetainedStop && body.status === "credential_switch_uncertain") {
+            assert.ok(cleanApplyUncertain || successorEpochAdvance);
+            assert.deepEqual(teardownResults, [true], "owner ACK follows the joined real teardown");
+            assert.ok(events.includes("A-reaped"));
+            assert.ok(events.includes("A-effect-disposed"));
+            assert.ok(events.includes("lease-teardown-returned"));
+            cleanReports.push({ runId: id, generation: body.claim_generation, opId: body.op_id, reason: body.failure_reason });
+            assert.deepEqual(cleanReports, [{ runId: claim.run_id, generation: 7,
+              opId: successorEpochAdvance ? "M2-successor" : "M2-op",
+              reason: successorEpochAdvance ? "not_applied_after_teardown" : "apply_uncertain" }]);
+            if (successorEpochAdvance) {
+              assert.equal(applies, 1, "advanced successor epoch never reaches a second apply");
+              assert.equal(pending, true, "keep successor pending through the actual Runner epoch comparison");
+              assert.equal(committedCodex, claim.secrets.codex);
+              assert.deepEqual(deliveredPreflightReplies, [
+                { kind: "ready", expectedEpoch: 11, claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" },
+                { kind: "ready", expectedEpoch: 12, claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-successor" },
+              ]);
+            }
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(id, "paused", 7);
+            events.push("clean-owner-ACK");
+            return { applied: true, credentialSwitchUncertain: true };
+          }
+          if (reapUnproven && (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")) {
+            assert.equal(id, claim.run_id);
+            assert.equal(body.claim_generation, 7);
+            assert.deepEqual(teardownResults, [false], "hold ACK is independent of the real failed teardown proof");
+            assert.ok(reapFailureCount() > 0);
+            holdReports.push({ runId: id, status: body.status, generation: body.claim_generation, opId: body.op_id });
+            events.push(body.status);
+            if (body.status === "credential_switch_held") {
+              assert.equal(body.op_id, "M2-op");
+              assert.equal(holdReason, null);
+              holdReason = "credential_switch_settling";
+              assert.deepEqual(await client.getRunOwnership(id), { status: "paused", claim_generation: 7,
+                claim_released: false, hold_reason: "credential_switch_settling" });
+              assert.equal(b.transport.requests.length, 0);
+              return { applied: true, credentialSwitchHeld: true };
+            }
+            assert.equal(body.op_id, undefined, "production settlement is generation-scoped");
+            assert.equal(holdReason, "credential_switch_settling");
+            // CodexExecutor has no optional joinOwnedOperations hook. The real switch
+            // already joined rawTeardown before reporting held; settlement adds no reap proof.
+            assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf("credential_switch_held"));
+            holdReason = "credential_switch_unsettled";
+            return { applied: true, credentialSwitchHoldSettled: true };
+          }
+          if (targetMismatch && body.status === "credential_switch_failed") {
+            failedClearRequests.push({ runId: id, generation: body.claim_generation, opId: body.op_id, reason: body.failure_reason });
+            assert.deepEqual(failedClearRequests, [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "target_mismatch" }]);
+            assert.equal(pending, true, "exact target operation is still pending before acknowledged clear");
+            pending = false;
+            return { applied: true };
+          }
+          if (publication === "preflight-foreign-op" && body.status === "credential_switch_failed") {
+            failedClearRequests.push({ runId: id, generation: body.claim_generation, opId: body.op_id, reason: body.failure_reason });
+            throw new Error("foreign preflight must not clear the pending operation");
+          }
+          if (persistFailure && body.status === "credential_switch_failed") {
+            failedClearRequests.push({ runId: id, generation: body.claim_generation, opId: body.op_id, reason: body.failure_reason });
+            if (publication === "persist-clear-rejected") return { applied: false };
+            if (publication === "persist-clear-pending") return { applied: true };
+            pending = false; // Empty and lost replies commit the clear without acknowledging it.
+            // Fault injection: a malformed transport acknowledgment must fail closed.
+            if (publication === "persist-clear-empty-reply") return {} as unknown as Awaited<ReturnType<typeof client.reportState>>;
+            if (publication === "persist-clear-lost-reply") throw new Error("lost failed-clear reply");
+            clearAcknowledged = true;
+            if (clearNonceChanged) registrationNonce = "M2-replacement-nonce";
+            return { applied: true };
+          }
+          if (cleanRetainedStop && body.status === "paused") {
+            const ack = await report(id, body, ...args);
+            // Observe a real acknowledged park transition, never a request-only ACK.
+            if (ack.applied === true && ack.status === "paused") {
+              cleanOwnership.status = ack.status;
+              api.setOwnershipStatus(id, ack.status, body.claim_generation);
+            }
+            return ack;
+          }
+          return report(id, body, ...args);
+        };
+        client.registrationNonce = () => {
+          if (clearAcknowledged) postAckNonces.push(registrationNonce);
+          return registrationNonce;
+        };
+        client.supportsInPlaceCodexCredentialSwitch = () => switchAdvertised;
+        client.supportsCodexSwitchStopped = () => switchAdvertised;
+        const feature = client.hasFeature.bind(client);
+        client.hasFeature = name => name === "credential_switch_hold" || feature(name);
+        if (cleanRetainedStop) t.mock.method(client, "settleCodexSwitchStopped", async (runId: string, tuple: { claimGeneration: number; registerNonce: string; expectedEpoch: number }) => {
+          const generation = tuple.claimGeneration;
+          assert.deepEqual(tuple, { claimGeneration: 7, registerNonce: "M2-original-nonce", expectedEpoch: 11 });
+          cleanPauseRequests.push({ runId, generation });
+          assert.equal(cleanPendingDisappears, true);
+          assert.ok(cleanPauseRequests.length <= (cleanAllUnconfirmed ? 3 : publication === "clean-stopped-lost-reply" ? 2 : 1));
+          assert.ok(Object.isFrozen(tuple));
+          stoppedTuples.push(tuple);
+          assert.equal(tuple, stoppedTuples[0], "replay uses the identical frozen tuple");
+          assert.ok(actualFlight);
+          assert.equal(actualFlight.parked, false, "status alone never proves a park");
+          assert.equal(actualFlight.executor, executor);
+          assert.equal(actualFlight.runId, claim.run_id);
+          assert.equal(actualFlight.claimGeneration, 7);
+          if (publication === "clean-stopped-already-paused") {
+            assert.equal(cleanOwnership.status, "paused");
+            assert.ok(cleanPausedObservations.length > 0);
+          }
+          if (publication === "clean-stopped-withdrawn") assert.equal(switchAdvertised, false);
+          assert.deepEqual(teardownResults, [true], "pause ACK follows the joined real teardown");
+          assert.ok(events.includes("lease-teardown-returned"));
+          assert.ok(events.includes("A-reaped"));
+          assert.ok(events.includes("A-effect-disposed"));
+          assert.equal(pending, false);
+          assert.equal(applies, 0);
+          // Simulate a committed pause with a lost reply separately from refusals.
+          // This fake exercises Runner settlement; it does not prove DB predicates.
+          if (!cleanAllUnconfirmed) {
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(runId, "paused", generation);
+          }
+          // Model the client result for a lost reply or unsupported response.
+          if (cleanAllUnconfirmed || (publication === "clean-stopped-lost-reply" && cleanPauseRequests.length === 1)) {
+            events.push("clean-pause-unconfirmed");
+            return { kind: "unconfirmed" as const };
+          }
+          events.push("clean-pause-ACK");
+          return { kind: "confirmed" as const };
+        });
+        client.getRunOwnership = async () => {
+          if (cleanRetainedStop || resumeUncertain || resumePreserve) {
+            if (cleanOwnership.status === "paused") cleanPausedObservations.push({ ...cleanOwnership });
+            return { ...cleanOwnership };
+          }
+          const ownership: Awaited<ReturnType<typeof client.getRunOwnership>> = { status: holdReason ? "paused" : "running", claim_generation: predecessorFenced ? 8 : 7,
+            claim_released: (clearOwnerLost && clearAcknowledged) || (clearOwnerLostBefore && persistFailures > 0), hold_reason: holdReason };
+          if (clearAcknowledged) postAckOwnership.push({ claim_generation: ownership.claim_generation ?? 0, claim_released: ownership.claim_released === true });
+          return ownership;
+        };
+        const originalGetInputs = client.getInputs.bind(client);
+        const followupId = 4202001;
+        const followupApplied = installerBarrier();
+        let followupDeliveredBefore: number | undefined;
+        if (preserveCleanupFollowup) {
+          api.setInputClaimGeneration(claim.run_id, 7);
+          const applyInputs = client.applyInputs.bind(client);
+          t.mock.method(client, "applyInputs", async (...args: Parameters<typeof applyInputs>) => {
+            const receipt = await applyInputs(...args);
+            if (args[0] === claim.run_id && args[1].includes(followupId) && receipt.active &&
+                receipt.inputs.some(input => input.id === followupId)) followupApplied.resolve();
+            return receipt;
+          });
+        }
+        client.getInputs = async (...args) => ({ ...(preserveCleanupFollowup
+          ? await originalGetInputs(...args) : { inputs: [] }), nowSummary: true, ...((cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B")))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+          ...(pending ? { credentialSwitch: { generation: 7,
+            op_id: clearOpChangedBefore && persistFailures > 0 ? "M2-changed-op" : pendingOp,
+            target_secret_id: clearTargetChangedBefore && persistFailures > 0 ? "M2-changed-target" : "M2-target" } } : {}) });
+        client.preflightCodexCredentialSwitch = async (runId, req) => {
+          preflights++; events.push("preflight");
+          preflightRequests.push({ runId, claimGeneration: req.claimGeneration, registerNonce: req.registerNonce,
+            opId: req.opId, targetSecretId: req.targetSecretId });
+          if (preflightRefusal || preflightRetry || reapUnproven)
+            preflightStorePresence = await CodexSessionStore.inspectSession(store, savedId);
+          if (preflightRetry && preflights === 1) {
+            const reply = publication === "preflight-busy-ready"
+              ? { kind: "not_applied" as const, reason: "credential_busy", claimGeneration: 7,
+                registerNonce: "M2-original-nonce", opId: "M2-op" }
+              : { kind: "uncertain" as const, detail: "transport" as const };
+            deliveredPreflightReplies.push(reply);
+            retryArmed = true;
+            return reply;
+          }
+          const reply = targetMismatch ? { kind: "not_applied" as const, reason: "target_mismatch",
+            claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }
+            : { kind: "ready" as const, expectedEpoch: successorEpochAdvance && pendingOp === "M2-successor" ? 12 : 11,
+              claimGeneration: 7, registerNonce: "M2-original-nonce",
+              opId: publication === "preflight-foreign-op" ? "M2-FOREIGN-op" : pendingOp };
+          if (successorEpochAdvance) {
+            assert.equal(runId, claim.run_id);
+            assert.equal(req.claimGeneration, 7);
+            assert.equal(req.registerNonce, "M2-original-nonce");
+            assert.equal(req.opId, pendingOp);
+            assert.equal(req.targetSecretId, "M2-target");
+            assert.equal(preflights, pendingOp === "M2-op" ? 1 : 2);
+          }
+          if (preflightRefusal || preflightRetry || reapUnproven || successorEpochAdvance) deliveredPreflightReplies.push(reply);
+          return reply;
+        };
+        const applyRequests: { claimGeneration: number; opId: string }[] = [];
+        client.applyCredentialSwitch = async (_id, req) => {
+          if (crashRecovery) await publicationBoundary("before-apply");
+          if (cleanRetainedStop) {
+            assert.equal(_id, claim.run_id);
+            assert.deepEqual(teardownResults, [true]);
+            assert.ok(events.includes("lease-teardown-returned"));
+          }
+          applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
+          applies++;
+          if (reapUnproven) forbiddenUnprovenApply.resolve();
+          if (publication === "baseline") {
+            events.push("apply");
+            aCredentialAtApply = { ...aCredentialCalls };
+          }
+          if (successorEpochAdvance) {
+            if (applies > 1) forbiddenSuccessorApply.resolve();
+            assert.equal(applies, 1, "successor apply is forbidden after READY advances the latched epoch");
+            assert.equal(req.opId, "M2-op");
+            assert.equal(pending, true);
+            pendingOp = "M2-successor";
+            events.push("apply-superseded");
+            return { kind: "superseded" };
+          }
+          pending = false;
+          if (preserveCleanupFollowup) api.clearCredentialSwitch(claim.run_id);
+          committedCodex = next; // Simulated committed row, not evidence of DB durability.
+          if (cleanApplyUncertain) return { kind: "uncertain", detail: "transport" };
+          if (crashRecovery) await publicationBoundary("apply-reply-lost");
+          applyAcknowledgements++;
+          return { kind: "codex_applied", codex: next, ordinal: 1,
+            capabilityEpoch: 42, messageSeq: 7, replay: false };
+        };
+        const savedId = "12345678-1234-1234-1234-123456789abc";
+        const bThreadId = resumeRefusal ? "M2-B-fresh-thread" : savedId;
+        const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/M2-actualRunner-"));
+        const source = path.join(dir, "source"), store = path.join(dir, "store");
+        await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+        await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
+        await fs.writeFile(path.join(source, "auth.json"), "M2-A-auth-canary");
+        await fs.writeFile(path.join(source, "sessions", "auth-canary.jsonl"), "M2-session-name-canary");
+        await fs.writeFile(path.join(source, "sessions", "unapproved.txt"), "not a session");
+        await fs.writeFile(path.join(source, "outside-rollout.jsonl"), "M2-subtree-canary\n");
+        await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
+        await CodexSessionStore.persist(source, store);
+        const policyHolds: PolicyHoldRequest[] = [];
+        const policyAttempts: PolicyHoldRequest[] = [];
+        let policyTransportReached = 0;
+        let custodyReleases = 0, sourceJournal: string | undefined, sourceBranch: string | undefined;
+        let releasesAtResume = 0, refreshesAtResume = 0;
+        const policyOutbox = resumePreserve ? new Outbox({ root: path.join(dir, "policy-outbox"), log: noopLog,
+          runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 }) : undefined;
+        if (resumePreserve) {
+          // A preserve-only CLAIM with no held-head requirement still requires a real saved ID and
+          // retained transcript at phaseResume admission; no owner Fresh allowance is supplied.
+          claim.session_id = savedId;
+          claim.policy_preserve_only = true;
+          claim.plan_source = "agent";
+          claim.auto_approve = true;
+          await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+          await policyOutbox!.init();
+          api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
+          await client.register("live-preserve", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+          client.reportPolicyHold = async (id, body) => {
+            policyAttempts.push(structuredClone(body));
+            assert.equal(preserveNegative, false, "fenced preserve handoff must never POST policy");
+            assert.equal(id, claim.run_id);
+            assert.equal(cleanOwnership.status, "running", "policy POST requires server-eligible ownership");
+            const serverOwnership = await WorkerClient.prototype.getRunOwnership.call(client, id);
+            assert.equal(serverOwnership.status, "running", "the fake server has not accepted an ordinary pause");
+            assert.equal(serverOwnership.claim_generation, 7);
+            assert.ok(!reports.includes("credential_switch_uncertain"));
+            assert.ok(switchError instanceof PolicyContinuationRejected, "actual switch rejection reaches policy reporting");
+            for (const epoch of rig.epochs) {
+              assert.ok(epoch.reaped() > 0, "provider root joins before policy POST");
+              assert.ok(epoch.disposed() > 0, "provider transport joins before policy POST");
+            }
+            assert.equal(disposedEffects.size, effects, "effect roots join before policy POST");
+            for (const handle of fileops) assert.ok(handle.disposed() > 0, "file operations join before policy POST");
+            policyTransportReached++;
+            // Unknown policy delivery after the known B credential commit; no policy DB commit is modeled.
+            if (policyAckLost) throw new Error("policy acknowledgement transport lost");
+            if (policyAckPending) return { disposition: "pending", outcome_id: body.outcome_id,
+              source_generation: body.source_generation, reason: "ownership_unconfirmed" };
+            policyHolds.push(structuredClone(body));
+            return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+              observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
+          };
+          t.mock.method(client, "releaseRecoveryCustody", async () => {
+            custodyReleases++;
+            return { run_id: claim.run_id, released: true, holds_released: 1 };
+          });
+          const attach = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "createOrAttachRunnerClone", async (...args: Parameters<typeof attach>) => {
+            const clone = await attach(...args);
+            // Keep the real clone's source journal before Runner admission, without fabricating
+            // clone recovery results or changing the executor's preserveConversation context.
+            await m2Runner.git.markRecoveryCapture(args[0], clone.path, clone.branch, claim.run_id, clone.attemptId);
+            sourceBranch = clone.branch;
+            sourceJournal = spawnSync("git", ["-C", args[0], "config", `uzi-recovery.${clone.branch}.clone`],
+              { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+            assert.ok(sourceJournal);
+            return clone;
+          });
+        }
+        // Observe production entrypoints and delegate to their current implementations.
+        const allocationCalls = { claimRun: 0, reserveRecoveryCapture: 0, releaseRecoveryCustody: 0, settleRecoveryHold: 0, settleRecoveryHoldLive: 0, createOrAttachRunnerClone: 0, runnerCloneForBranch: 0, seedRunnerClone: 0 };
+        if (publication === "baseline") {
+          const claimRun = client.claimRun.bind(client);
+          t.mock.method(client, "claimRun", (...args: Parameters<typeof claimRun>) => {
+            allocationCalls.claimRun++;
+            return claimRun(...args);
+          });
+          const reserveRecoveryCapture = client.reserveRecoveryCapture.bind(client);
+          t.mock.method(client, "reserveRecoveryCapture", (...args: Parameters<typeof reserveRecoveryCapture>) => {
+            allocationCalls.reserveRecoveryCapture++;
+            return reserveRecoveryCapture(...args);
+          });
+          const releaseRecoveryCustody = client.releaseRecoveryCustody.bind(client);
+          t.mock.method(client, "releaseRecoveryCustody", (...args: Parameters<typeof releaseRecoveryCustody>) => {
+            allocationCalls.releaseRecoveryCustody++;
+            return releaseRecoveryCustody(...args);
+          });
+          const settleRecoveryHold = client.settleRecoveryHold.bind(client);
+          t.mock.method(client, "settleRecoveryHold", (...args: Parameters<typeof settleRecoveryHold>) => {
+            allocationCalls.settleRecoveryHold++;
+            return settleRecoveryHold(...args);
+          });
+          const settleRecoveryHoldLive = client.settleRecoveryHoldLive.bind(client);
+          t.mock.method(client, "settleRecoveryHoldLive", (...args: Parameters<typeof settleRecoveryHoldLive>) => {
+            allocationCalls.settleRecoveryHoldLive++;
+            return settleRecoveryHoldLive(...args);
+          });
+          const createOrAttachRunnerClone = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "createOrAttachRunnerClone", (...args: Parameters<typeof createOrAttachRunnerClone>) => {
+            allocationCalls.createOrAttachRunnerClone++;
+            return createOrAttachRunnerClone(...args);
+          });
+          const runnerCloneForBranch = m2Runner.git.runnerCloneForBranch.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "runnerCloneForBranch", (...args: Parameters<typeof runnerCloneForBranch>) => {
+            allocationCalls.runnerCloneForBranch++;
+            return runnerCloneForBranch(...args);
+          });
+          const seedOwner = m2Runner.git as unknown as { seedRunnerClone(...args: unknown[]): Promise<unknown> };
+          const seed = seedOwner.seedRunnerClone.bind(seedOwner);
+          t.mock.method(seedOwner, "seedRunnerClone", (...args: unknown[]) => {
+            allocationCalls.seedRunnerClone++;
+            return seed(...args);
+          });
+        }
+        const aEntered = installerBarrier(), bEntered = installerBarrier();
+        const publicationStages = crashRecovery
+          ? ["before-apply", "apply-reply-lost", "before-publish", "after-publish", "before-prepare", "login", "prepared"] as const
+          : resumeVariant
+          ? ["before-publish", "after-publish", "before-prepare", "login", "resume", ...(resumeRefusal ? ["fresh"] as const : []), "prepared"] as const
+          : ["before-publish", "after-publish", "before-prepare", "login", "prepared"] as const;
+        const publicationBarriers = publicationStages.map(stage => ({ stage, entered: installerBarrier(), proceed: installerBarrier() }));
+        const injectedFailures: string[] = [];
+        const publicationBoundary = async (stage: typeof publicationStages[number]) => {
+          if (publication === "baseline") return;
+          const barrier = publicationBarriers.find(candidate => candidate.stage === stage)!;
+          barrier.entered.resolve();
+          await barrier.proceed.promise;
+          if ((injectedStage === "before-executor-publication" && stage === "before-publish") ||
+              (injectedStage === "before-B-preparation" && stage === "before-prepare") ||
+              (publication === "publish-failure" && stage === "after-publish") ||
+              (publication === "login-failure" && stage === "login") ||
+              (crashRecovery && stage === crashStage) ||
+              (publication === "subscription-refresh-prepare-failure" && stage === "prepared")) {
+            if (injectedStage) injectedFailures.push(injectedStage);
+            throw new Error(`injected ${stage} failure`);
+          }
+        };
+        const cleanupEntered = installerBarrier(), cleanupContinue = installerBarrier();
+        const bCleanupEntered = installerBarrier(), bCleanupContinue = installerBarrier();
+        const events: string[] = [];
+        let cleanupStarts = 0;
+        const fileops: ReturnType<typeof fakeFileopHandle>[] = [];
+        const aResponder = epochResponder(savedId, "M2-A-turn", () => {
+          aEntered.resolve();
+          if ((persistFailure || preflightRefusal) && switchResult === "continued_A") continuedATurn.resolve();
+        });
+        let bTurns = 0;
+        const triggers: Promise<void>[] = [];
+        const rig = makeMultiEpochRig([
+          c => {
+            if (c.method === "turn/interrupt")
+              c.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+            return aResponder(c);
+          },
+          c => {
+            if (resumeUncertain && c.method === "thread/start") forbiddenUncertainFresh.resolve();
+            if (positiveBChild && c.method === "thread/start") return { thread: { id: "M3-B-child" } };
+            if (positiveBChild && c.method === "turn/start" && rec(c.params).threadId === "M3-B-child") {
+              assert.equal(bFinished, true, "actual child turn follows finishB");
+              c.transport.push(turnCompleted("completed", "M3-B-child", "M3-B-child-turn"));
+              return { turn: { id: "M3-B-child-turn" } };
+            }
+            if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: bThreadId } };
+            if (c.method === "turn/interrupt")
+              c.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+            if (c.method === "turn/start") {
+              bTurns++;
+              if (bTurns === 1) {
+                const completeRoot = async () => {
+                  if (positiveBChild) {
+                    assert.equal(bFinished, true);
+                    assert.ok(bPreparationBroker);
+                    const child = await bPreparationBroker.handleToolCall(
+                      { threadId: bThreadId, turnId: "M2-B-turn", callId: "finished-B-child" },
+                      "spawn_agent", { role: "coder", prompt: "work after finishB" }, "root");
+                    assert.equal(child.ok, true, "real B preparation broker and child runner admit valid work after finishB");
+                    assert.equal(b.transport.requests.filter(r => r.method === "thread/start").length, 1);
+                    assert.equal(b.transport.requests.filter(r => r.method === "turn/start" && rec(r.params).threadId === "M3-B-child").length, 1);
+                  }
+                  // Pinned cold-resume replay precedes the matching inbound turn boundary.
+                  if (!resumeRefusal) c.transport.push(tokenUsageUpdated(bThreadId, "M2-historical", { totalTokens: 0 }));
+                  c.transport.push({ kind: "turn_started", method: "turn/started", threadId: bThreadId,
+                    turnId: "M2-B-turn", params: { threadId: bThreadId, turn: { id: "M2-B-turn" } } });
+                  c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, bThreadId));
+                  c.transport.push(tokenUsageUpdated(bThreadId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
+                  c.transport.push(turnCompleted("completed", bThreadId, "M2-B-turn"));
+                  clockOffset += 300001;
+                  triggers.push(triggerNow("B"));
+                  bEntered.resolve();
+                };
+                triggers.push(completeRoot());
+              }
+              return { turn: { id: bTurns === 1 ? "M2-B-turn" : "M2-B-idle" } };
+            }
+            return {};
+          },
+        ]);
+        const a = rig.epochs[0]!, b = rig.epochs[1]!;
+        const bReap = b.root.reap.bind(b.root);
+        b.root.reap = async ms => {
+          if (preserveCleanup) {
+            bCleanupEntered.resolve();
+            await bCleanupContinue.promise;
+          }
+          return bReap(ms);
+        };
+        const reap = a.root.reap.bind(a.root);
+        a.root.reap = async ms => {
+          cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise;
+          if (rootReapUnproven) {
+            const result = { ok: false as const, error: { category: "tool" as const, message: "M2 reap unproven" } };
+            failedRootReaps.push(result); events.push("A-reap-failed"); return result;
+          }
+          const result = await reap(ms); events.push("A-reaped"); return result;
+        };
+        const launch = rig.deps.launchEffectRoot!;
+        const launchProvider = rig.deps.launchProviderRoot!;
+        const providerAdmissions: { cwd: string; ownedDataRoot: string }[] = [];
+        let effects = 0;
+        const disposedEffects = new Set<number>();
+        const adoptedDestinations: string[] = [];
+        rig.deps = { ...rig.deps,
+          launchProviderRoot: async (spec, mode) => {
+            providerAdmissions.push({ cwd: spec.cwd, ownedDataRoot: spec.ownedDataRoot });
+            return launchProvider(spec, mode);
+          },
+          wireFileop: () => { const handle = fakeFileopHandle(); fileops.push(handle); return handle.handle; },
+          launchEffectRoot: async (...args) => {
+            const root = await launch(...args), epoch = effects++;
+            const dispose = root.dispose.bind(root);
+            root.dispose = async (...disposeArgs) => {
+              if (epoch === 0) { cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise; }
+              if (toolReapUnproven && epoch === 0) {
+                // The rig's injected command-kind effect root reports an unclean disposal; the real executor's registeredRoot turns this into a failed reap.
+                const result = { ...(await dispose(...disposeArgs)), clean: false as const, reason: "M2 tool reap unproven" };
+                failedToolDisposals.push({ identity: (args[0] as CodexEffectLaunchSpec).identity });
+                events.push("A-reap-failed");
+                return result;
+              }
+              const result = await dispose(...disposeArgs);
+              if (result.clean) disposedEffects.add(epoch);
+              if (epoch === 0) events.push("A-effect-disposed");
+              return result;
+            };
+            return root;
+          },
+          sessionStore: { ...rig.deps.sessionStore!,
+            inspect: async () => "present",
+            inspectSession: async (_dir, id) => {
+              if (failingPersist && inspectFailure) {
+                assert.equal(id, savedId, "real lease inspects the exact saved thread");
+                assert.equal(persistedCopies, 1, "real copy completes before unavailable inspection");
+                assert.equal(await CodexSessionStore.inspectSession(store, id), "present",
+                  "injected unavailability follows an actual usable persisted copy");
+                unavailableInspections++;
+                return publication === "inspect-missing-clear-confirmed" ? "absent" : "unknown";
+              }
+              return CodexSessionStore.inspectSession(store, id);
+            },
+            persist: async () => {
+              if (failingPersist && !inspectFailure) {
+                persistFailures++;
+                if (publication === "persist-clear-confirmed") {
+                  return CodexSessionStore.persist(source, store,
+                    { bounds: { ...DEFAULT_SESSION_STORE_BOUNDS, maxFileBytes: 1 } });
+                }
+                throw new Error("injected real rollout persist failure");
+              }
+              const result = await CodexSessionStore.persist(source, store);
+              if (failingPersist) persistedCopies++;
+              return result;
+            },
+            adopt: async () => {
+              const dest = path.join(dir, `adopted-${adoptedDestinations.length}`);
+              adoptedDestinations.push(dest);
+              await fs.mkdir(dest);
+              return CodexSessionStore.adopt(store, dest);
+            },
+          },
+        };
+        const release = rig.client.releaseCodex.bind(rig.client);
+        let credentialReleases = 0, credentialRefreshes = 0, bCredentialReleases = 0;
+        // A-capability credential API calls; the drain probe's armed refresh is a worker callback, not counted.
+        const aCredentialCalls = { releases: 0, refreshes: 0 };
+        type ACredentialCalls = typeof aCredentialCalls;
+        let aCredentialInReconcile: ACredentialCalls | undefined;
+        let aCredentialAtTeardown: ACredentialCalls | undefined;
+        let aCredentialAtApply: ACredentialCalls | undefined;
+        let aCredentialAfterReconcile: ACredentialCalls | undefined;
+        const assertNoACredentialCallBetweenTeardownAndApply = () => {
+          assert.deepEqual(aCredentialAtApply, aCredentialAtTeardown,
+            "no A credential call between teardown entry and apply");
+        };
+        let retainedAReconcile: import("../src/codex/safety.js").ReconcileBeforeBoundary | undefined;
+        let retainedBoundaryActive = false, retainedBoundaryReleasedA = false;
+        const retiredBoundaries: { result: string; releaseCalls: number; releasedA: boolean }[] = [];
+        let staleSummaryCapture: string | undefined;
+        const bInitialCredentialObserved = installerBarrier();
+        let bInitialCredentialRequest: { capability: boolean; mode: boolean; account: boolean; floor: boolean;
+          rootReaped: boolean; effectDisposed: boolean; fileopDisposed: boolean } | undefined;
+        rig.client.releaseCodex = async (id, req, expected?: Parameters<WorkerClient["releaseCodex"]>[2]) => {
+          if (probeBInitialCredential && applies > 0 && !retainedBoundaryActive && !bInitialCredentialRequest) {
+            bInitialCredentialRequest = {
+              capability: req.capability === next.capability,
+              mode: expected?.authMode === next.auth_mode,
+              account: next.auth_mode === "subscription"
+                ? expected?.authMode === "subscription" && expected.chatgptAccountId === next.chatgpt_account_id
+                : expected?.authMode === "api_key" && !("chatgptAccountId" in expected),
+              floor: next.auth_mode === "subscription"
+                ? expected?.authMode === "subscription" && expected.minimumGeneration === next.generation
+                : expected?.authMode === "api_key" && !("minimumGeneration" in expected),
+              rootReaped: events.includes("A-reaped"), effectDisposed: events.includes("A-effect-disposed"),
+              fileopDisposed: (fileops[0]?.disposed() ?? 0) > 0,
+            };
+            bInitialCredentialObserved.resolve();
+          }
+          if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "A auth never revives after apply");
+          credentialReleases++;
+          if (req.capability === oldClaim.capability) aCredentialCalls.releases++;
+          if (retainedBoundaryActive && req.capability === oldClaim.capability) retainedBoundaryReleasedA = true;
+          if (req.capability === next.capability) bCredentialReleases++;
+          return req.capability === next.capability ? { access_token: next.access_token } : release(id, req);
+        };
+        const refresh = rig.client.refreshCodex.bind(rig.client);
+        const aRefreshEntered = installerBarrier(), aRefreshRelease = installerBarrier();
+        const aRefreshCheckpoint = installerBarrier(), aRefreshContinue = installerBarrier();
+        const aRefreshReturned = installerBarrier();
+        let aRefreshArmed = false, aRefreshWindow = false, aRefreshTaken = false;
+        let aRefreshExchanges = 0, aRefreshRawCompleted = false, aSuspendReturned = false;
+        let aRefreshRequest: { runId: string; capability: string; generation: number;
+          expected: Parameters<WorkerClient["refreshCodex"]>[2] | undefined } | undefined;
+        const aRefreshResponses: { id: number | string; response: Parameters<FakeTransport["respond"]>[1] }[] = [];
+        const aRespond = a.transport.respond.bind(a.transport);
+        a.transport.respond = (id, response) => {
+          aRespond(id, response);
+          if (id === 191 || id === 193) aRefreshResponses.push({ id, response });
+        };
+        const aRefreshSnapshot = () => ({ returned: aSuspendReturned, raw: aRefreshRawCompleted,
+          exchanges: aRefreshExchanges, responses: [...aRefreshResponses] });
+        let aRefreshHeldSnapshot: ReturnType<typeof aRefreshSnapshot> | undefined;
+        let aRefreshReturnSnapshot: ReturnType<typeof aRefreshSnapshot> | undefined;
+        let aSuspendOwned: ReturnType<CodexExecutor["suspendCodexEpoch"]> | undefined;
+        let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
+        let aRefreshesAfterFinish = 0;
+        let retiredATransportCounts: { before: number[]; after: number[] } | undefined;
+        let bRefreshExpectedAtFinish: typeof bRefreshExpected | undefined;
+        let bRefreshAnsweredBeforeFinish: boolean | undefined;
+        let ordinaryBRefreshesBeforeFinish: number | undefined;
+        let retiredAAfterFinish: unknown;
+        const bRefreshExpected: (Parameters<WorkerClient["refreshCodex"]>[2] | undefined)[] = [];
+        const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
+        const respond = b.transport.respond.bind(b.transport);
+        const refreshRefusals: Parameters<FakeTransport["respond"]>[1][] = [];
+        b.transport.respond = (id, response) => {
+          if (id === 91 && queuedRefreshStop) {
+            refreshRefusals.push(response);
+            refreshResponded.resolve();
+          }
+          respond(id, response);
+          if (id === 91) refreshResponded.resolve();
+        };
+        rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
+          if (bFinished && req.capability === oldClaim.capability) aRefreshesAfterFinish++;
+          if (aRefreshWindow && req.capability === oldClaim.capability) aRefreshExchanges++;
+          if (aRefreshArmed && !aRefreshTaken && req.capability === oldClaim.capability) {
+            aRefreshTaken = true;
+            aRefreshRequest = { runId: id, capability: req.capability, generation: req.observed_generation, expected };
+            aRefreshEntered.resolve();
+            await aRefreshRelease.promise;
+            aRefreshRawCompleted = true;
+            return { access_token: "M2-A-refresh-access", generation: req.observed_generation + 1,
+              chatgpt_account_id: aRefreshSubscription?.chatgpt_account_id ?? "unused",
+              outcome: "advanced" };
+          }
+          if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "no A refresh after apply");
+          credentialRefreshes++;
+          if (req.capability === oldClaim.capability) aCredentialCalls.refreshes++;
+          if (req.capability !== next.capability) return refresh(id, req);
+          ordinaryBRefreshes++;
+          bRefreshExpected.push(expected);
+          assert.equal(bFinished, true, "ordinary B refresh requires full initialization and finishB reopen");
+          return { access_token: next.access_token, generation: req.observed_generation + 1,
+            chatgpt_account_id: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account", outcome: "advanced" };
+        };
+        const request = b.transport.request.bind(b.transport);
+        const loginObservations: { params: Record<string, unknown>; reaped: boolean; effectDisposed: boolean; fileopDisposed: number }[] = [];
+        const resumedThreads: unknown[] = [];
+        b.transport.request = async (method, params, opts) => {
+          events.push(method);
+          if (method === "account/login/start") {
+            if (probeEpochConsumers) {
+              const before = credentialReleases;
+              let result = "missing";
+              retainedBoundaryActive = true;
+              try {
+                if (retainedAReconcile) {
+                  const outcome = await withTimeout(retainedAReconcile(
+                    { boundary: "checkpoint", deadlineMs: 5000 }, new AbortController().signal),
+                  5000, "retained A boundary probe");
+                  result = outcome.kind;
+                }
+              } catch (error) {
+                result = error instanceof TrustedExecutionRefusal && error.message === "codex credential authority retired"
+                  ? "retired" : error instanceof Error && error.message.includes("retained A boundary probe")
+                    ? "timeout" : "unexpected-error";
+              } finally { retainedBoundaryActive = false; }
+              retiredBoundaries.push({ result, releaseCalls: credentialReleases - before, releasedA: retainedBoundaryReleasedA });
+            }
+            loginObservations.push({ params: rec(params), reaped: events.includes("A-reaped"),
+              effectDisposed: events.includes("A-effect-disposed"), fileopDisposed: fileops[0]!.disposed() });
+            await publicationBoundary("login");
+          }
+          if (method === "thread/resume") {
+            resumedThreads.push(rec(params).threadId);
+            if (resumeVariant) {
+              releasesAtResume = credentialReleases;
+              refreshesAtResume = credentialRefreshes;
+              await publicationBoundary("resume");
+              throw new CodexTransportError({ category: "protocol", message: resumeRefusal || resumePreserve
+                ? "codex app-server returned a JSON-RPC error (code -32602)"
+                : "codex app-server returned an unclassifiable protocol failure" });
+            }
+          }
+          if (resumeRefusal && method === "thread/start") await publicationBoundary("fresh");
+          return request(method, params, opts);
+        };
+        const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
+        if (probeEpochConsumers) {
+          // Retain the production-created A credential boundary, not its retired safety facade.
+          const original = Reflect.get(executor, "startProviderEpoch") as (...args: unknown[]) => unknown;
+          Reflect.set(executor, "startProviderEpoch", function (this: CodexExecutor, ...args: unknown[]) {
+            retainedAReconcile ??= (args[1] as { reconcile: import("../src/codex/safety.js").ReconcileBeforeBoundary }).reconcile;
+            return Reflect.apply(original, this, args);
+          });
+        }
+        let reopenAttempts = 0, publishAttempts = 0, restartAttempts = 0;
+        let aReconcileCalls = 0;
+        const aReconcileOutcomes: string[] = [];
+        const aTeardownEntered = installerBarrier();
+        let aReconcileAtTeardown: { calls: number; outcomes: string[] } | undefined;
+        const assertAReconcileBeforeTeardown = () => {
+          assert.deepEqual(aReconcileAtTeardown, { calls: 1, outcomes: ["ready"] },
+            "real A credential reconcile completes ready exactly once before teardown can revoke A");
+          // Executor reconcileA calls the run-lane reconcile once: a subscription A sends one refreshCodex
+          // (retained operation_id), an api_key A one fresh releaseCodex; neither mode does the other's call.
+          const expectedInReconcile = oldClaim.auth_mode === "subscription"
+            ? { releases: 0, refreshes: 1 } : { releases: 1, refreshes: 0 };
+          assert.deepEqual(aCredentialInReconcile, expectedInReconcile,
+            `real A credential reconcile (${oldClaim.auth_mode === "subscription" ? "subscription refresh" : "api_key release"}) runs inside reconcileA before teardown`);
+          assert.deepEqual(aCredentialAtTeardown, aCredentialAfterReconcile,
+            "no A credential call between reconcileA completion and teardown entry");
+          const order = ["A-reconcile-start", "A-reconcile-ready", "A-persist", "preflight", "A-teardown-entry"];
+          for (const [index, event] of order.entries()) {
+            assert.ok(events.includes(event), `observed ${event}`);
+            if (index > 0) assert.ok(events.indexOf(order[index - 1]!) < events.indexOf(event),
+              `${order[index - 1]} precedes ${event}`);
+          }
+        };
+        const suspend = executor.suspendCodexEpoch.bind(executor);
+        executor.suspendCodexEpoch = async bounds => {
+          executorSuspensionEntered.resolve();
+          executorEntryNowDrain.push({ completed: nowDrainCompleted, raw: events.includes("A-Now-drained") });
+          if (probeARefreshDrain) {
+            aRefreshArmed = true; aRefreshWindow = true;
+            a.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+              requestId: 191, params: { reason: "unauthorized", previousAccountId: null } });
+            await withTimeout(aRefreshEntered.promise, 5000, "armed A worker refresh entry");
+          }
+          const suspension = suspend(bounds);
+          aSuspendOwned = suspension;
+          // Keep assertions outside Runner's switch catch paths.
+          void suspension.then(() => { aSuspendReturned = true; }, () => {});
+          if (probeARefreshDrain) {
+            try {
+              a.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+                requestId: 193, params: { reason: "unauthorized", previousAccountId: null } });
+              await new Promise<void>(resolve => setImmediate(resolve));
+              aRefreshHeldSnapshot = aRefreshSnapshot();
+              aRefreshCheckpoint.resolve();
+              await aRefreshContinue.promise;
+            } finally { aRefreshRelease.resolve(); }
+          }
+          const lease = await suspension;
+          if (probeARefreshDrain) {
+            aRefreshReturnSnapshot = aRefreshSnapshot();
+            aRefreshWindow = false; aRefreshArmed = false;
+            aRefreshReturned.resolve();
+          }
+          return { ...lease,
+            // Observe only the real switch lease, never the separate retained-A stale probe in B.
+            reconcileA: publication === "baseline" ? async function (this: unknown, ...args: Parameters<typeof lease.reconcileA>) {
+              aReconcileCalls++;
+              events.push("A-reconcile-start");
+              const before = { ...aCredentialCalls };
+              const result = await Reflect.apply(lease.reconcileA, this, args);
+              aCredentialInReconcile = { releases: aCredentialCalls.releases - before.releases,
+                refreshes: aCredentialCalls.refreshes - before.refreshes };
+              aCredentialAfterReconcile = { ...aCredentialCalls };
+              aReconcileOutcomes.push(result.kind);
+              events.push(`A-reconcile-${result.kind}`);
+              return result;
+            } : lease.reconcileA,
+            persistRollout: async bounds => {
+              if (publication === "baseline") events.push("A-persist");
+              failingPersist = persistFailure;
+              try {
+                const saved = await lease.persistRollout(bounds);
+                if (publication === "persist-clear-confirmed") persistBoundKind = saved.kind;
+                if (preflightRefusal || preflightRetry || reapUnproven) usableSaves.push(saved);
+                return saved;
+              }
+              finally {
+                failingPersist = false;
+                if (publication === "persist-clear-confirmed") persistBoundObserved.resolve();
+              }
+            },
+            teardown: async bounds => {
+              if (publication === "baseline") {
+                // Snapshot before the production lease retires authority; assert outside Runner's catch paths.
+                aReconcileAtTeardown = { calls: aReconcileCalls, outcomes: [...aReconcileOutcomes] };
+                aCredentialAtTeardown = { ...aCredentialCalls };
+                events.push("A-teardown-entry");
+                aTeardownEntered.resolve();
+              }
+              teardownAttempts++;
+              const result = await lease.teardown(bounds);
+              teardownResults.push(result);
+              if (reapUnproven || cleanRetainedStop) events.push("lease-teardown-returned");
+              // Remove only the pending target after the real lease joins; A remains committed.
+              if (cleanPendingDisappears) {
+                pending = false;
+                releasesAtCleanTeardown = credentialReleases;
+                if (publication === "clean-stopped-withdrawn" || publication === "clean-stopped-unsupported") {
+                  assert.equal(switchAdvertised, true, "withdraw only after admission and joined teardown");
+                  switchAdvertised = false;
+                }
+                if (publication === "clean-stopped-already-paused") {
+                  cleanOwnership.status = "paused";
+                  api.setOwnershipStatus(claim.run_id, "paused", 7);
+                }
+              }
+              return result;
+            },
+            reopenA: async nextBounds => { reopenAttempts++; return lease.reopenA(nextBounds); },
+            publishB: async (...args) => {
+              publishAttempts++;
+              await publicationBoundary("before-publish");
+              await lease.publishB(...args);
+              await publicationBoundary("after-publish");
+            },
+            restartAndResume: async (...args) => {
+              restartAttempts++;
+              await publicationBoundary("before-prepare");
+              const result = await lease.restartAndResume(...args);
+              // Failure fixtures must expose fallback instead of waiting on a success-only latch.
+              if (!resumeVariant) await publicationBoundary("prepared");
+              return result;
+            },
+            startFreshLineage: async (...args) => {
+              await lease.startFreshLineage(...args);
+              if (resumeRefusal) await publicationBoundary("prepared");
+            },
+            finishB: async (...args) => {
+              ordinaryBRefreshesBeforeFinish = ordinaryBRefreshes;
+              if (publication === "subscription-refresh") {
+                await withTimeout(refreshDelivered.promise, 5000, "B startup refresh delivered to auth owner");
+                assert.equal(refreshDeliveries, 1);
+                // Recorded here and asserted in the final block: a throw inside this
+                // production-called hook would only retain the switch.
+                bRefreshAnsweredBeforeFinish = b.transport.responses.some(response => response.requestId === 91);
+              }
+              await lease.finishB(...args);
+              bFinished = true;
+              if (publication === "gated" && oldClaim.auth_mode === "subscription") {
+                // Retired A's real bridge callback, called after B is fully live, with a live signal.
+                assert.ok(retiredARefresh, "real A auth bridge captured before teardown");
+                const sends = [a.transport.requests.length, b.transport.requests.length];
+                try { await retiredARefresh({ operationId: "retired-A-after-finishB", signal: new AbortController().signal }); }
+                catch (error) { retiredAAfterFinish = error; }
+                // Assert in the final block: a throw inside this production-called hook would fail the switch instead.
+                retiredATransportCounts = { before: sends, after: [a.transport.requests.length, b.transport.requests.length] };
+              }
+              if (publication === "subscription-refresh") {
+                await withTimeout(refreshResponded.promise, 5000, "deferred B refresh settlement after finish");
+                const replies = b.transport.responses.filter(response => response.requestId === 91);
+                assert.equal(replies.length, 1);
+                assert.deepEqual(replies[0]!.response, { result: { accessToken: next.access_token,
+                  chatgptAccountId: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account",
+                  chatgptPlanType: null } });
+                assert.equal(ordinaryBRefreshes, 1, "delivered deferred request actually reaches B refresh bridge");
+                assert.equal(next.auth_mode, "subscription");
+                // Identity is asserted in the final block, outside this production-called hook.
+                bRefreshExpectedAtFinish = [...bRefreshExpected];
+              }
+            },
+          };
+        };
+        const run = executor.run.bind(executor);
+        let worktree = "";
+        executor.run = async ctx => {
+          ctx.agents = [
+            { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+            { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+          ];
+          if (resumePreserve) {
+            assert.equal(claim.policy_preserve_only, true);
+            assert.equal(ctx.preserveConversation, true, "Runner maps the CLAIM policy before executor entry");
+            assert.equal(ctx.policyFreshAllowance, undefined);
+            assert.equal(ctx.sessionId, savedId, "initial A admission retained the persisted conversation");
+          }
+          context = ctx;
+          retainedPrepareRootDispatch = ctx.prepareCodexRootDispatch;
+          worktree = ctx.worktreePath;
+          await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
+          const attempt = ctx.attemptCodexCredentialSwitch!;
+          ctx.attemptCodexCredentialSwitch = async (...args) => {
+            hooks++;
+            try { switchResult = await attempt(...args); return switchResult; }
+            catch (error) { switchError = error; throw error; }
+            finally { switchSettled.resolve(); }
+          };
+          return run(ctx);
+        };
+        const diagnostics = recordingLogger();
+        const loggedSecrets: string[] = [];
+        diagnostics.logger.addSecret = secret => { loggedSecrets.push(secret); };
+        const runner = m2Runner.runnerWith(() => { factories++; return { executor, homeDir: m2Runner.homeDir }; },
+          m2Runner.fakeGitlab().gitlab, undefined, diagnostics.logger, {
+            ...(policyOutbox ? { outbox: policyOutbox,
+              activeRuns: new ActiveRunRegistry(() => policyOutbox.listPendingTerminals(), () => 10) } : {}),
+            now: () => Date.now() + clockOffset,
+            nowSummary: { homeRoot: dir, queryFn: (() => { throw new Error("Codex Now reached Claude"); }) as never,
+              codexAdviceHarnessFactory: (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
+                nowBuilds.push(params);
+                const owner = summaryOwnership.get(params)!;
+                owners.push(owner);
+                const isA = params.binding.capability === oldClaim.capability;
+                if (isA && phase === "factory") {
+                  params.signal!.addEventListener("abort", () => nowAborted.resolve(), { once: true });
+                  nowEntered.resolve();
+                  await nowContinue.promise;
+                  events.push("A-Now-drained");
+                } else if (!isA) {
+                  try { owners[0]!.guard(); } catch (error) {
+                    retiredADenied = true;
+                    retiredADenial = { refusal: error instanceof TrustedExecutionRefusal,
+                      message: error instanceof Error ? error.message : String(error) };
+                  }
+                  if (probeEpochConsumers) {
+                    // Seed only a stale revision while exercising the actual B factory guard.
+                    // Restore synchronously before any other producer can observe the test input.
+                    const state = executor as unknown as { captureRevision: number };
+                    const revision = state.captureRevision;
+                    state.captureRevision = revision + 1;
+                    try { owner.guard(); staleSummaryCapture = "admitted"; }
+                    catch (error) {
+                      staleSummaryCapture = error instanceof TrustedExecutionRefusal && error.message === "codex epoch admission closed for capture"
+                        ? "capture-refused" : "unexpected-error";
+                    } finally { state.captureRevision = revision; }
+                  }
+                  owner.guard(); liveBAdmitted = true;
+                }
+                return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
+                  nowRuns.push(params.binding.capability);
+                  const tracked = trackedRoot();
+                  summaryRoots.push(tracked);
+                  const root: CodexRootHandle = {
+                    started: { event: "started", supervisorPid: 300, childPid: 301, subreaper: true,
+                      nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+                    supervisorPid: 300,
+                    transport: { stdin: null, stdout: null, stderr: null },
+                    snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+                    observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+                    waitChild: async () => ({ event: "child_exit", code: 0 }),
+                    dispose: async () => {
+                      summaryDisposeCalls++;
+                      await tracked.root.reap(5000);
+                      if (isA) {
+                        summaryDisposeEntered.resolve();
+                        await summaryDisposeContinue.promise;
+                      }
+                      await tracked.root.dispose(5000);
+                      if (isA) events.push("A-summary-disposed");
+                      return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+                    },
+                    failed: undefined,
+                    whenFailed: new Promise<Error>(() => undefined),
+                  };
+                  await owner.launch(async () => root);
+                  if (isA) {
+                    params.signal!.addEventListener("abort", () => nowAborted.resolve(), { once: true });
+                    nowEntered.resolve();
+                    await nowContinue.promise;
+                    events.push("A-Now-drained");
+                    return { text: "Late A advice must not publish", end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
+                  }
+                  request.usageObserver?.({ "gpt-6-luna": { inputTokens: 90, outputTokens: 12, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.000015 } });
+                  return { text: `Inspecting B ${next.access_token} ${next.capability}`, end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
+                } };
+              }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
+            },
+            credentialSwitchLedger: new (await import("../src/credential-switch-op-ledger.js")).CredentialSwitchOpLedger(dir),
+          });
+        // Wrap real leases and consumers; no replacement switch orchestration.
+        const { NowSummaryController } = await import("../src/now-summary.js");
+        const suspendNow = NowSummaryController.prototype.suspendCodexSwitch;
+        const nowPublicationProbes: string[] = [];
+        let startPublicationProbe: ((stage: string, assignment?: boolean) => void) | undefined;
+        const nowConsumerProbes: Promise<{ error?: unknown }>[] = [];
+        const nowConsumerStages: string[] = [];
+        const joinNowConsumerProbes = async () => {
+          const results = await Promise.all(nowConsumerProbes);
+          for (const result of results) {
+            if ("error" in result) throw result.error;
+          }
+        };
+        const nowProbe = mock.method(NowSummaryController.prototype, "suspendCodexSwitch", function (this: InstanceType<typeof NowSummaryController>, bounds: Parameters<typeof suspendNow>[0]) {
+          nowSuspensionEntered.resolve();
+          const lease = suspendNow.call(this, bounds);
+          const probe = (stage: string, assignment = false): void => {
+            const builds = nowBuilds.length;
+            const releases = credentialReleases, refreshes = credentialRefreshes;
+            const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
+            this.observeProgress({ completed: [], in_progress: [stage] }, [{ id: stage, title: stage }]);
+            this.observeFrame({ kind: "tool_use", agent: "lead", payload: { id: stage, name: "Bash", input: { command: "true", description: stage } } });
+            assert.equal(nowBuilds.length, builds, stage);
+            assert.equal(a.transport.requests.length, aSends, stage);
+            assert.equal(b.transport.requests.length, bSends, stage);
+            if (!assignment) nowPublicationProbes.push(stage);
+            if (publication === "gated" || injectedStage) {
+              const probeConsumers = async () => {
+                assert.equal(bFinished, false, stage);
+                assert.ok(retainedRootDispatch);
+                assert.ok(retainedBroker);
+                const refresh = probeRetiredRefresh(stage).then(() => ({}), error => ({ error }));
+                const root = assert.rejects(retainedRootDispatch.prepare(),
+                  `retired A root dispatch refuses work at ${stage}`);
+                const child = retainedBroker.handleToolCall(
+                  { threadId: savedId, turnId: "M2-A-turn", callId: `Now-child-${stage}` },
+                  "spawn_agent", { role: "coder", prompt: "work" }, "root").then(result => {
+                    assert.equal(result.ok, false, `retired real A broker refuses child work at ${stage}`);
+                    assert.notEqual(result.ok ? undefined : result.code, "unknown_role", stage);
+                    assert.notEqual(result.ok ? undefined : result.code, "bad_args", stage);
+                  });
+                // Attach rejection handlers to every invocation before yielding.
+                const results = await Promise.allSettled([refresh, root, child]);
+                for (const result of results) {
+                  if (result.status === "rejected") throw result.reason;
+                }
+                const refreshed = await refresh;
+                if ("error" in refreshed) throw refreshed.error;
+                assert.equal(a.transport.requests.length, aSends, `no A sends at ${stage}`);
+                assert.equal(b.transport.requests.length, bSends, `no B sends at ${stage}`);
+                assert.equal(nowBuilds.length, builds, stage);
+                assert.equal(credentialReleases, releases, stage);
+                assert.equal(credentialRefreshes, refreshes, stage);
+                nowConsumerStages.push(stage);
+              };
+              // Now publishB is synchronous; join these at the executor barrier.
+              nowConsumerProbes.push(probeConsumers().then(() => ({}), error => ({ error })));
+            }
+          };
+          startPublicationProbe = probe;
+          return { ...lease, drained: lease.drained.then(result => {
+            nowDrainCompleted = result.kind === "drained";
+            return result;
+          }), publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
+            probe("before-Now-publish");
+            if (injectedStage === "before-Now-publication") {
+              injectedFailures.push(injectedStage);
+              throw new Error("injected before Now publication");
+            }
+            const published = lease.publishB(bundle);
+            probe("after-Now-publish");
+            assert.equal(published, true, "real Now lease publishes synchronously");
+            if (injectedStage === "after-Now-publication") {
+              injectedFailures.push(injectedStage);
+              throw new Error("injected after Now publication");
+            }
+            return publication === "now-publish-failure" ? false : published;
+          }, finishB: () => {
+            if (injectedStage !== "Now-finish-false") return lease.finishB();
+            injectedFailures.push(injectedStage);
+            assert.equal(bFinished, true, "executor finish precedes Now finish refusal");
+            assert.ok(!reports.some(status => status.startsWith("credential_switch")), "probe precedes owner hold");
+            const prepare = context.prepareCodexRootDispatch;
+            assert.ok(prepare, "probe the real B context root guard");
+            const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
+            const releases = credentialReleases, refreshes = credentialRefreshes;
+            nowConsumerProbes.push((async () => {
+              await assert.rejects(prepare(context.terminalLifecycleSignal!, () => {}, "root"),
+                "B context root stays closed after executor finish until Now finish and hold release");
+              assert.equal(a.transport.requests.length, aSends);
+              assert.equal(b.transport.requests.length, bSends);
+              assert.equal(credentialReleases, releases);
+              assert.equal(credentialRefreshes, refreshes);
+            })().then(() => ({}), error => ({ error })));
+            return false;
+          } };
+        });
+        let retainedRootDispatch: import("../src/harness.js").RunTurnRequest["rootDispatch"];
+        let retainedBroker: import("../src/codex/broker.js").CodexCallbackBroker | undefined;
+        type PreparationEpoch = {
+          harness: CodexHarness;
+          buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => import("../src/codex/broker.js").CodexCallbackBroker;
+        };
+        const epochBuilder = executor as unknown as { startProviderEpoch(...args: unknown[]): Promise<PreparationEpoch> };
+        const startProviderEpoch = epochBuilder.startProviderEpoch.bind(executor);
+        let epochBuilds = 0;
+        type RefreshBridge = import("../src/codex/appserver-auth.js").CodexSubscriptionRefreshBridge;
+        let retiredARefresh: RefreshBridge["refresh"] | undefined;
+        let bRefresh: RefreshBridge["refresh"] | undefined;
+        const refreshProbeStages: string[] = [];
+        const probeRetiredRefresh = async (stage: string) => {
+          const releases = credentialReleases, refreshes = credentialRefreshes;
+          const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
+          assert.equal(bFinished, false, stage);
+          assert.equal(bRefresh, undefined, `B refresh bridge does not exist at ${stage}`);
+          assert.equal(bHarness, undefined, `B epoch has not been prepared at ${stage}`);
+          if (oldClaim.auth_mode === "subscription") {
+            assert.ok(retiredARefresh, "capture the real A auth bridge before teardown");
+            // Bypass the retired auth session delivery fence to exercise the worker
+            // callback itself, with a live signal rather than cancellation as the refusal.
+            await assert.rejects(retiredARefresh({ operationId: `retired-A-${stage}`,
+              signal: new AbortController().signal }), `retired A refresh refuses at ${stage}`);
+          } else assert.equal(retiredARefresh, undefined, "API-key A has no subscription refresh callback");
+          assert.equal(credentialReleases, releases, `no credential release at ${stage}`);
+          assert.equal(credentialRefreshes, refreshes, `no worker refresh API call at ${stage}`);
+          assert.equal(a.transport.requests.length, aSends, `no A sends at ${stage}`);
+          assert.equal(b.transport.requests.length, bSends, `no B sends at ${stage}`);
+          assert.equal(reopenAttempts, 0, `A authority stays retired at ${stage}`);
+          refreshProbeStages.push(stage);
+        };
+        let bHarness: CodexHarness | undefined;
+        let bPreparationBroker: import("../src/codex/broker.js").CodexCallbackBroker | undefined;
+        let bPreparationObserved = false, bRootObserved = false;
+        let bRootPrepares = 0, bRootChecks = 0;
+        const bChildProbes: string[] = [];
+        const epochProbe = mock.method(epochBuilder, "startProviderEpoch", async (...args: unknown[]) => {
+          const epoch = await startProviderEpoch(...args);
+          const epochIndex = epochBuilds++;
+          if (publication === "gated" || injectedStage || preserveCleanup) {
+            // Read the actual auth owner retained by the returned harness. Its config
+            // retains the same bridge object that the read-path auth interceptor calls.
+            const auth = (epoch.harness as unknown as { appServerAuth?: {
+              config: import("../src/codex/appserver-auth.js").CodexAppServerAuthConfig;
+            } }).appServerAuth;
+            assert.ok(auth, "real provider epoch owns app-server auth");
+            const callback = auth.config.mode === "subscription" ? auth.config.bridge.refresh : undefined;
+            if (epochIndex === 0) retiredARefresh = callback;
+            else bRefresh = callback;
+          }
+          if (epochIndex === 1) {
+            bHarness = epoch.harness;
+            const buildPhaseBroker = epoch.buildPhaseBroker.bind(epoch);
+            epoch.buildPhaseBroker = (...brokerArgs) => {
+              const broker = buildPhaseBroker(...brokerArgs);
+              bPreparationBroker ??= broker;
+              return broker;
+            };
+            // Use the returned epoch's real builder before login, without publishing
+            // a root dispatcher or changing the harness's seeded PLAN broker.
+            epoch.buildPhaseBroker("implement");
+          }
+          return epoch;
+        });
+        const prepareRootAndThread = CodexHarness.prototype.prepareRootAndThread;
+        const preparationProbe = mock.method(CodexHarness.prototype, "prepareRootAndThread", function (
+          this: CodexHarness, ...args: Parameters<typeof prepareRootAndThread>
+        ) {
+          if (this === bHarness && !bFinished) {
+            assert.equal(args[0].rootDispatch, undefined, "B preparation has no ordinary root dispatcher");
+            assert.equal(bFinished, false);
+            bPreparationObserved = true;
+          }
+          return prepareRootAndThread.apply(this, args);
+        });
+        const startTurn = CodexHarness.prototype.startTurn;
+        const useBroker = CodexHarness.prototype.useBroker;
+        const startTurnProbe = mock.method(CodexHarness.prototype, "startTurn", function (this: CodexHarness, request: import("../src/harness.js").RunTurnRequest) {
+          if (this === bHarness && !bRootObserved) {
+            assert.equal(bFinished, true, "first B work turn follows finishB");
+            assert.ok(bPreparationObserved);
+            const dispatch = request.rootDispatch;
+            assert.ok(dispatch, "first B work turn carries the actual root dispatcher");
+            bRootObserved = true;
+            request.rootDispatch = {
+              prepare: async () => { await dispatch.prepare(); bRootPrepares++; },
+              check: () => {
+                const admitted = dispatch.check();
+                assert.notEqual(admitted, false, "finished B root check admits work");
+                bRootChecks++;
+                return admitted;
+              },
+            };
+          } else if (!bRootObserved) retainedRootDispatch ??= request.rootDispatch;
+          return startTurn.call(this, request);
+        });
+        const brokerProbe = mock.method(CodexHarness.prototype, "useBroker", function (this: CodexHarness, broker: import("../src/codex/broker.js").CodexCallbackBroker) {
+          retainedBroker ??= broker;
+          return useBroker.call(this, broker);
+        });
+        const consumerProbes: string[] = [];
+        type ObservedFlight = {
+          runId: string;
+          claimGeneration: number;
+          executor: typeof executor;
+          worktreePath?: string;
+          attemptId?: string;
+          runnerClone?: { path: string; attemptId?: string };
+          operationScope?: ReturnType<typeof acquireCodexOperationScope>;
+          parked: boolean;
+          keepGuardedInventoryOpen: boolean;
+          preserveRecoveryClone: boolean;
+          preserveSession: boolean;
+          retainedLocalCustody: boolean;
+          policyHold?: { outcomeId: string };
+          batcher: MessageBatcher;
+          steering: SteeringChannel;
+          active?: { shuttingDown: boolean };
+        };
+        const flightBuilder = runner as unknown as { buildFlight(...args: unknown[]): ObservedFlight };
+        const buildFlight = flightBuilder.buildFlight;
+        let actualFlight: ObservedFlight | undefined;
+        const runFlights: ObservedFlight[] = [];
+        let admission: { flight: ObservedFlight; generation: number; worktree: string; attemptId?: string;
+          clone?: ObservedFlight["runnerClone"]; cloneAttemptId?: string; directory: string; members: string[];
+          calls: typeof allocationCalls; flightCount: number; reportCount: number;
+          custody: { parked: boolean; keepGuardedInventoryOpen: boolean; preserveRecoveryClone: boolean;
+            preserveSession: boolean; retainedLocalCustody: boolean; policyHold?: { outcomeId: string } } } | undefined;
+        const custodySnapshot = (flight: ObservedFlight) => ({
+          parked: flight.parked, keepGuardedInventoryOpen: flight.keepGuardedInventoryOpen,
+          preserveRecoveryClone: flight.preserveRecoveryClone, preserveSession: flight.preserveSession,
+          retainedLocalCustody: flight.retainedLocalCustody, policyHold: flight.policyHold,
+        });
+        let resumeFenceArmed = false;
+        const preserveReleases: { messageSeq: number; currentSeq: number }[] = [];
+        const preserveSettlements: string[] = [];
+        let preserveRearms = 0;
+        let heldLifecycle: AbortSignal | undefined, heldCheckpoint: AbortSignal | undefined;
+        let preserveCaptures = 0;
+        if (preserveNegative) {
+          const captureOwner = runner as unknown as { captureRecoveryRestorePoint(...args: unknown[]): Promise<unknown> };
+          const capture = captureOwner.captureRecoveryRestorePoint.bind(captureOwner);
+          t.mock.method(captureOwner, "captureRecoveryRestorePoint", (...args: Parameters<typeof capture>) => {
+            if (resumeFenceArmed) preserveCaptures++;
+            return capture(...args);
+          });
+        }
+        const flightProbe = mock.method(flightBuilder, "buildFlight", function (this: typeof flightBuilder, ...args: unknown[]) {
+          const flight = buildFlight.apply(this, args);
+          if (flight.runId === claim.run_id) runFlights.push(flight);
+          if (flight.runId === claim.run_id && flight.claimGeneration === claim.claim_generation &&
+              flight.executor === executor) {
+            assert.equal(actualFlight, undefined, "capture exactly one matching real flight");
+            actualFlight = flight;
+            if (preserveNegative) {
+              const takeHold = flight.batcher.holdForCredentialSwitch.bind(flight.batcher);
+              t.mock.method(flight.batcher, "holdForCredentialSwitch", () => {
+                const hold = takeHold();
+                return { ...hold, release: (opts: Parameters<typeof hold.release>[0]) => {
+                  if (resumeFenceArmed) preserveReleases.push({ messageSeq: opts.messageSeq, currentSeq: flight.batcher.currentSeq() });
+                  return preserveSequenceRefused ? false : hold.release(opts);
+                } };
+              });
+              const settle = flight.steering.settleCredentialSwitch.bind(flight.steering);
+              t.mock.method(flight.steering, "settleCredentialSwitch", (...args: Parameters<typeof settle>) => {
+                if (resumeFenceArmed) preserveSettlements.push(args[0]);
+                return settle(...args);
+              });
+              const rearm = flight.steering.rearmLifecycle.bind(flight.steering);
+              t.mock.method(flight.steering, "rearmLifecycle", () => {
+                if (resumeFenceArmed) preserveRearms++;
+                return rearm();
+              });
+            }
+          }
+          return flight;
+        });
+        const expectedAssignmentStages = next.auth_mode === "subscription"
+          ? ["before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install"]
+          : ["before-scope-clear", "after-scope-clear"];
+        const assignmentStages: string[] = [];
+        let scopeDescriptor: PropertyDescriptor | undefined;
+        let scopeBacking: ObservedFlight["operationScope"];
+        let scopeIntercepted = false, scopeProbesArmed = false;
+        const probeAssignment = (stage: string) => {
+          assignmentStages.push(stage);
+          assert.equal(context.prepareCodexRootDispatch, retainedPrepareRootDispatch,
+            `context dispatcher still retains A at ${stage}`);
+          assert.equal(bRefresh, undefined, stage);
+          assert.equal(bHarness, undefined, stage);
+          assert.equal(bPreparationBroker, undefined, stage);
+          assert.equal(bRootObserved, false, stage);
+          assert.equal(rig.providerLaunches(), 1, `B provider work root absent at ${stage}`);
+          assert.ok(startPublicationProbe, "retain the actual Now controller probe");
+          startPublicationProbe(stage, true);
+          if (injectedStage === stage) {
+            injectedFailures.push(injectedStage);
+            scopeProbesArmed = false; // Cleanup must never inject a second assignment failure.
+            throw new Error(`injected ${stage} failure`);
+          }
+        };
+        const nativeSetTimeout = globalThis.setTimeout;
+        const nativeClearTimeout = globalThis.clearTimeout;
+        const retryTimer = preflightRetry ? t.mock.method(globalThis, "setTimeout",
+          (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+            if (!retryArmed || ms !== 250) return nativeSetTimeout(callback, ms, ...args);
+            retryArmed = false; // Only the first probe's production retry delay is intercepted.
+            const handle = nativeSetTimeout(() => {}, 0);
+            nativeClearTimeout(handle);
+            releaseRetry = () => {
+              releaseRetry = undefined;
+              retryCallbacks++;
+              callback(...args);
+            };
+            retryScheduled.resolve();
+            return handle;
+          }) : undefined;
+        let retainedAScope: ReturnType<typeof acquireCodexOperationScope> | undefined;
+        let bLookupScope: ReturnType<typeof acquireCodexOperationScope> | undefined;
+        let actualAController: ReturnType<typeof acquireCodexOperationScope>["controller"] | undefined;
+        const running = runner.execute(claim);
+        const joinExecution = async () => {
+          const settled = await Promise.allSettled([running, ...triggers]);
+          for (const result of settled) {
+            if (result.status === "rejected") throw result.reason;
+          }
+        };
+        try {
+          await withTimeout(aEntered.promise, 5000, "M2 A turn");
+          if (probeScopeIdentity) {
+            assert.ok(actualFlight?.operationScope, "actual Runner publishes A subscription scope");
+            actualAController = actualFlight.operationScope.controller;
+            retainedAScope = acquireCodexOperationScope(client, claim.run_id, claim.claim_generation!,
+              undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(oldClaim.capability));
+            assert.ok(retainedAScope.controller === actualAController, "nonowning A reference retains the actual Runner entry");
+          }
+          if (publication === "gated" || injectedStage) {
+            assert.ok(actualFlight, "capture the real run/generation/executor flight");
+            scopeDescriptor = Object.getOwnPropertyDescriptor(actualFlight, "operationScope");
+            assert.ok(!scopeDescriptor || ("value" in scopeDescriptor && scopeDescriptor.configurable),
+              "intercept only a configurable data property");
+            scopeBacking = actualFlight.operationScope;
+            const initialScope = scopeBacking;
+            assert.equal(initialScope !== undefined, oldClaim.auth_mode === "subscription");
+            scopeProbesArmed = true;
+            Object.defineProperty(actualFlight, "operationScope", {
+              configurable: true, enumerable: scopeDescriptor?.enumerable ?? true,
+              get: () => scopeBacking,
+              set: (value: ObservedFlight["operationScope"]) => {
+                if (!scopeProbesArmed) { scopeBacking = value; return; }
+                const installing = assignmentStages.length === 2;
+                assert.equal(value === undefined, !installing, "clear precedes subscription installation");
+                if (installing) assert.notEqual(value, initialScope, "B owns a distinct scope");
+                probeAssignment(installing ? "before-scope-install" : "before-scope-clear");
+                scopeBacking = value;
+                probeAssignment(installing ? "after-scope-install" : "after-scope-clear");
+                if (assignmentStages.length === expectedAssignmentStages.length) scopeProbesArmed = false;
+              },
+            });
+            scopeIntercepted = true;
+          }
+          await triggerNow("A");
+          await withTimeout(nowEntered.promise, 5000, "M2 active A Now factory");
+          if (publication === "baseline") {
+            assert.ok(actualFlight);
+            assert.equal(actualFlight.worktreePath, worktree);
+            const directory = path.dirname(actualFlight.worktreePath);
+            const runnerRoot = (m2Runner.git as unknown as { runnerRoot: string }).runnerRoot;
+            assert.equal(path.dirname(directory), path.resolve(runnerRoot), "snapshot the actual runner repo directory");
+            admission = { flight: actualFlight, generation: actualFlight.claimGeneration, worktree,
+              attemptId: actualFlight.attemptId, clone: actualFlight.runnerClone,
+              cloneAttemptId: actualFlight.runnerClone?.attemptId, directory,
+              members: (await fs.readdir(directory)).sort(), calls: { ...allocationCalls },
+              flightCount: runFlights.length, reportCount: reports.length, custody: custodySnapshot(actualFlight) };
+            assert.ok(admission.calls.createOrAttachRunnerClone > 0, "real admission reached the clone observer");
+            assert.ok(admission.calls.runnerCloneForBranch > 0, "real admission reached the branch clone observer");
+            assert.ok(admission.calls.seedRunnerClone > 0, "real admission reached the production seed observer");
+          }
+          pending = true;
+          const firstSuspension = await withTimeout(Promise.race([
+            nowSuspensionEntered.promise.then(() => "Now suspension"),
+            executorSuspensionEntered.promise.then(() => "executor suspension"),
+          ]), 5000, "M2 Now switch cancellation or executor entry");
+          assert.equal(firstSuspension, "Now suspension", "Now switch suspension precedes executor suspension");
+          await withTimeout(nowAborted.promise, 5000, "M2 Now switch cancellation");
+          assert.equal(preflights, 0, "preflight waits for the raw A Now factory");
+          assert.equal(applies, 0);
+          assert.equal(cleanupStarts, 0, "A teardown waits for Now drain");
+          assert.equal(events.length, 0);
+          assert.equal(b.transport.requests.length, 0);
+          nowContinue.resolve();
+          if (phase === "already-running-body") {
+            await withTimeout(summaryDisposeEntered.promise, 5000, "M2 A summary disposal");
+            assert.ok(events.includes("A-Now-drained"), "raw body settled before owned root disposal");
+            assert.equal(summaryRoots.length, 1);
+            assert.equal(summaryRoots[0]!.reaped(), 1);
+            assert.equal(summaryRoots[0]!.disposed(), 0);
+            assert.equal(preflights, 0, "preflight joins summary disposal");
+            assert.equal(applies, 0);
+            assert.equal(cleanupStarts, 0, "epoch teardown joins summary disposal");
+            assert.equal(b.transport.requests.length, 0);
+            summaryDisposeContinue.resolve();
+          }
+          await withTimeout(executorSuspensionEntered.promise, 5000, "M2 executor after Now drain");
+          assert.deepEqual(executorEntryNowDrain, [{ completed: true, raw: true }],
+            "executor suspension begins only after Now joins its raw work");
+          if (probeARefreshDrain) {
+            assert.ok(aRefreshSubscription);
+            try {
+              await withTimeout(aRefreshCheckpoint.promise, 5000, "A refresh suspension checkpoint");
+              assert.deepEqual(aRefreshHeldSnapshot, { returned: false, raw: false, exchanges: 1, responses: [] },
+                "suspension joins the admitted raw exchange while the second valid request stays queued");
+              assert.ok(aRefreshRequest);
+              assert.equal(aRefreshRequest.runId, claim.run_id);
+              assert.equal(aRefreshRequest.capability, oldClaim.capability);
+              assert.ok(oldClaim.auth_mode === "subscription");
+              assert.ok(aRefreshRequest.generation >= aRefreshSubscription.generation,
+                "bridge generation includes any startup advance");
+              assert.deepEqual(aRefreshRequest.expected,
+                { authMode: "subscription", chatgptAccountId: aRefreshSubscription.chatgpt_account_id });
+            } finally { aRefreshRelease.resolve(); aRefreshContinue.resolve(); }
+            await withTimeout(aRefreshReturned.promise, 5000, "healthy A suspension returns after refresh");
+            assert.deepEqual(aRefreshReturnSnapshot, { returned: true, raw: true, exchanges: 1,
+              // The raw worker succeeds, but the existing post-response admission guard
+              // refuses A delivery after closure without poisoning this healthy auth owner.
+              responses: [{ id: 191, response: { error: { code: -32001,
+                message: "codex authentication refresh unavailable" } } }] },
+            "suspend return joins successful worker completion and fenced delivery; queued 193 stays unstarted");
+          }
+          if (persistFailure) {
+            if (publication === "persist-clear-confirmed") {
+              await withTimeout(persistBoundObserved.promise, 5000, "real bounded rollout persistence returns");
+              assert.equal(persistBoundKind, "failed", "oversized rollout fails before switch teardown");
+            }
+            await withTimeout(switchSettled.promise, 5000, "real pre-teardown persist refusal settles");
+            assert.equal(failingPersist, false, "persistRollout injection is restored before continuation or final cleanup");
+            assert.equal(persistFailures, inspectFailure ? 0 : 1, "real lease reaches the session-store copy");
+            assert.equal(persistedCopies, inspectFailure ? 1 : 0, "inspection refusal follows a successful real copy");
+            assert.equal(unavailableInspections, inspectFailure ? 1 : 0, "inspection injection runs only inside real persistRollout");
+            assert.deepEqual(failedClearRequests, clearRefusedBefore ? []
+              : [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "rollout_persist_failed" }]);
+            assert.equal(preflights, 0, "unproven rollout never reaches preflight");
+            assert.equal(teardownAttempts, 0, "switch lease never tears down A");
+            assert.equal(applies, 0);
+            assert.equal(b.transport.requests.length, 0, "no B auth or ordinary work");
+            assert.equal(rig.providerLaunches(), 1);
+            assert.equal(factories, 1);
+            if (confirmedClear) {
+              assert.equal(switchError, undefined);
+              assert.equal(switchResult, "continued_A");
+              assert.equal(pending, false);
+              assert.equal(reopenAttempts, 1);
+              await withTimeout(continuedATurn.promise, 5000, "owned A sends another real turn after confirmed clear");
+              assert.equal(a.transport.turnStartCount, 2);
+              assert.equal(cleanupStarts, 0, "continued A retains its live roots");
+              assert.equal(a.reaped(), 0);
+            } else {
+              assert.equal(switchResult, undefined);
+              assert.ok(switchError instanceof Error);
+              assert.equal(switchError.name, clearNonceChanged ? "StaleClaimError" : "CredentialSwitchRetainedStop");
+              if (clearAuthorityLost) {
+                assert.equal(clearAcknowledged, true);
+                assert.equal(pending, false, "exact acknowledged operation was cleared");
+                if (clearOwnerLost) {
+                  assert.ok(postAckOwnership.some(own => own.claim_generation === 7 && own.claim_released),
+                    "production reconciliation actually observes same-generation ownership loss after ACK");
+                } else {
+                  assert.ok(postAckNonces.includes("M2-replacement-nonce"),
+                    "production guard actually reads the changed nonce after ACK");
+                  assert.equal(client.registrationNonce(), "M2-replacement-nonce");
+                }
+              }
+              assert.equal(reopenAttempts, 0);
+              assert.equal(a.transport.turnStartCount, 1, "clear without continuing authority cannot admit another A turn");
+              assert.equal(pending, publication === "persist-clear-rejected" || publication === "persist-clear-pending" || clearRefusedBefore);
+            }
+            assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+            cancelled = true;
+            cleanupContinue.resolve();
+            a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+            await withTimeout(running, 5000, "pre-teardown refusal execution stops");
+            assert.equal(teardownAttempts, 0);
+            assert.equal(applies, 0);
+            assert.equal(b.transport.requests.length, 0);
+            assert.equal(a.transport.turnStartCount, confirmedClear ? 2 : 1);
+            if (clearAuthorityLost) {
+              assert.equal(reopenAttempts, 0);
+              assert.equal(preflights, 0);
+              assert.equal(bCredentialReleases, 0);
+              assert.equal(ordinaryBRefreshes, 0);
+              assert.equal(rig.providerLaunches(), 1);
+              assert.ok(!reports.some(status => ["completed", "failed", "credential_switch_held", "credential_switch_hold_settled"].includes(status)),
+                "lost authority cannot publish completion or manufacture an owner hold");
+            }
+            if (!confirmedClear && !clearAuthorityLost) {
+              assert.ok(!reports.some(status => ["completed", "failed", "cancelled", "credential_switch"].includes(status)),
+                "unconfirmed clear retains custody without terminal or release reporting");
+              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work",
+                "retained execution preserves the actual Runner worktree");
+            }
+            return;
+          }
+          if (preflightRetry) {
+            await withTimeout(retryScheduled.promise, 5000, "real preflight retry scheduled");
+            assert.equal(preflights, 1);
+            assert.equal(retryArmed, false);
+            assert.equal(retryCallbacks, 0);
+            assert.equal(preflightStorePresence, "present");
+            assert.equal(usableSaves.length, 1);
+            assert.equal(usableSaves[0]!.kind, "usable");
+            if (usableSaves[0]!.kind === "usable") assert.equal(usableSaves[0]!.sessionId, savedId);
+            assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
+            assert.deepEqual(deliveredPreflightReplies, [publication === "preflight-busy-ready"
+              ? { kind: "not_applied", reason: "credential_busy", claimGeneration: 7,
+                registerNonce: "M2-original-nonce", opId: "M2-op" }
+              : { kind: "uncertain", detail: "transport" }]);
+            assert.equal(teardownAttempts, 0);
+            assert.equal(cleanupStarts, 0);
+            assert.equal(applies, 0);
+            assert.equal(b.transport.requests.length, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.equal(reopenAttempts, 0);
+            assert.ok(retainedRootDispatch);
+            await assert.rejects(retainedRootDispatch.prepare(), "A dispatch stays closed while retry is scheduled");
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.ok(releaseRetry);
+            releaseRetry();
+          }
+          if (preflightRefusal) {
+            await withTimeout(switchSettled.promise, 5000, "real preflight refusal settles");
+            assert.equal(preflights, 1);
+            assert.equal(preflightStorePresence, "present", "usable rollout observed before delivering the reply");
+            assert.deepEqual(deliveredPreflightReplies, [{ kind: targetMismatch ? "not_applied" : "ready",
+              ...(targetMismatch ? { reason: "target_mismatch" } : { expectedEpoch: 11 }), claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: targetMismatch ? "M2-op" : "M2-FOREIGN-op" }]);
+            assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
+            assert.equal(usableSaves.length, 1);
+            assert.equal(usableSaves[0]!.kind, "usable");
+            if (usableSaves[0]!.kind === "usable") assert.equal(usableSaves[0]!.sessionId, savedId);
+            assert.equal(teardownAttempts, 0);
+            assert.equal(cleanupStarts, 0);
+            assert.equal(applies, 0);
+            assert.equal(b.transport.requests.length, 0, "no B auth or ordinary requests");
+            assert.equal(rig.providerLaunches(), 1);
+            assert.equal(factories, 1);
+            if (targetMismatch) {
+              assert.equal(switchError, undefined);
+              assert.equal(switchResult, "continued_A");
+              assert.deepEqual(failedClearRequests, [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "target_mismatch" }]);
+              assert.equal(pending, false);
+              assert.equal(reopenAttempts, 1);
+              await withTimeout(continuedATurn.promise, 5000, "A sends a real second turn after preflight clear");
+              assert.equal(a.transport.turnStartCount, 2);
+              assert.equal(a.reaped(), 0);
+              assert.equal(cleanupStarts, 0);
+            } else {
+              assert.equal(switchResult, undefined);
+              assert.ok(switchError instanceof Error);
+              assert.equal(switchError.name, "CredentialSwitchRetainedStop");
+              assert.deepEqual(failedClearRequests, []);
+              assert.equal(pending, true);
+              assert.equal(reopenAttempts, 0);
+              assert.equal(a.transport.turnStartCount, 1);
+            }
+            cancelled = true;
+            cleanupContinue.resolve();
+            a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+            await withTimeout(running, 5000, "preflight refusal execution stops");
+            assert.equal(teardownAttempts, 0);
+            assert.equal(applies, 0);
+            assert.equal(b.transport.requests.length, 0);
+            assert.equal(preflights, 1);
+            assert.equal(a.transport.turnStartCount, targetMismatch ? 2 : 1);
+            if (!targetMismatch) {
+              assert.deepEqual(failedClearRequests, []);
+              assert.ok(!reports.some(status => ["completed", "failed", "cancelled", "credential_switch"].includes(status)));
+              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+            }
+            return;
+          }
+          if (publication === "baseline") {
+            await withTimeout(aTeardownEntered.promise, 5000, "M2 real lease teardown entry");
+            assertAReconcileBeforeTeardown();
+          }
+          await withTimeout(cleanupEntered.promise, 5000, "M2 A teardown");
+          if (preflightRetry) {
+            assert.equal(retryCallbacks, 1);
+            assert.equal(preflights, 2);
+            assert.deepEqual(preflightRequests, Array.from({ length: 2 }, () => ({ runId: claim.run_id,
+              claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" })));
+            assert.deepEqual(deliveredPreflightReplies[1], { kind: "ready", expectedEpoch: 11, claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op" });
+            assert.equal(deliveredPreflightReplies.length, 2);
+            assert.deepEqual(failedClearRequests, []);
+            assert.equal(applies, 0);
+            assert.equal(reopenAttempts, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.ok(retainedRootDispatch);
+            await assert.rejects(retainedRootDispatch.prepare(), "A dispatch stays closed after retry timer clears");
+          }
+          assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
+          if (reapUnproven) {
+            const releasesBeforeRootFailure = credentialReleases;
+            assert.equal(teardownAttempts, 1);
+            assert.deepEqual(teardownResults, []);
+            assert.deepEqual(failedRootReaps, []);
+            assert.deepEqual(failedToolDisposals, []);
+            assert.equal(applies, 0);
+            assert.equal(preflightStorePresence, "present");
+            assert.equal(usableSaves.length, 1);
+            assert.equal(usableSaves[0]!.kind, "usable");
+            if (usableSaves[0]!.kind === "usable") assert.equal(usableSaves[0]!.sessionId, savedId);
+            assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
+            assert.deepEqual(deliveredPreflightReplies, [{ kind: "ready", expectedEpoch: 11, claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op" }]);
+            assert.equal(holdReason, null);
+            cleanupContinue.resolve();
+            await withTimeout(Promise.race([switchSettled.promise, forbiddenUnprovenApply.promise]), 5000, "unproven real lease switch stops");
+            assert.equal(applies, 0, "unproven A reap cannot apply a switch");
+            await withTimeout(running, 5000, "unproven real lease hold joins and settles");
+            assert.deepEqual(teardownResults, [false], "actual lease reports failure outside its callback");
+            assert.ok(reapFailureCount() > 0);
+            if (rootReapUnproven) {
+              assert.deepEqual(failedToolDisposals, []);
+              for (const result of failedRootReaps)
+                assert.deepEqual(result, { ok: false, error: { category: "tool", message: "M2 reap unproven" } });
+            } else {
+              assert.deepEqual(failedRootReaps, [], "provider root reap stays clean");
+              assert.ok(events.includes("A-reaped"), "A provider root reaped clean");
+              assert.ok(failedToolDisposals.length > 0, "an A tool root disposal failed");
+            }
+            assert.equal(providerAdmissions.length, 1, "no B provider launch while A reap is unproven");
+            assert.equal(switchResult, undefined);
+            assert.ok(switchError instanceof Error);
+            assert.equal(switchError.name, "CredentialSwitchRetainedStop");
+            assert.deepEqual(holdReports, [
+              { runId: claim.run_id, status: "credential_switch_held", generation: 7, opId: "M2-op" },
+              { runId: claim.run_id, status: "credential_switch_hold_settled", generation: 7, opId: undefined },
+            ]);
+            const order = ["A-Now-drained", "preflight", "A-cleanup-start", "A-reap-failed",
+              "lease-teardown-returned", "credential_switch_held", "credential_switch_hold_settled"];
+            for (let i = 1; i < order.length; i++)
+              assert.ok(events.indexOf(order[i - 1]!) >= 0 && events.indexOf(order[i - 1]!) < events.lastIndexOf(order[i]!),
+                `${order[i - 1]} precedes ${order[i]}`);
+            assert.deepEqual(await client.getRunOwnership(claim.run_id), { status: "paused", claim_generation: 7,
+              claim_released: false, hold_reason: "credential_switch_unsettled" });
+            assert.equal(pending, true);
+            assert.equal(applies, 0);
+            assert.deepEqual(applyRequests, []);
+            assert.equal(applyAcknowledgements, 0);
+            assert.equal(reopenAttempts, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.equal(b.transport.requests.length, 0, "B auth and work stay absent even after settlement ACK");
+            assert.equal(rig.providerLaunches(), 1);
+            assert.equal(factories, 1);
+            assert.equal(epochBuilds, 1);
+            assert.equal(credentialRefreshes, 0);
+            assert.equal(credentialReleases, releasesBeforeRootFailure, "hold ACKs cause no credential release");
+            assert.equal(bCredentialReleases, 0, "B auth is never released");
+            assert.deepEqual(failedClearRequests, []);
+            assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")),
+              ["credential_switch_held", "credential_switch_hold_settled"]);
+            assert.ok(!reports.some(status => ["completed", "failed", "cancelled"].includes(status)));
+            assert.ok(!dispositions.some(body => body.failure_reason === "apply_uncertain"));
+            assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+            return;
+          }
+          cleanupContinue.resolve();
+          if (cleanRetainedStop) {
+            await withTimeout(successorEpochAdvance
+              ? Promise.race([switchSettled.promise, forbiddenSuccessorApply.promise])
+              : switchSettled.promise, 5000, "clean real lease switch retains execution");
+            if (successorEpochAdvance) assert.equal(applies, 1, "advanced successor epoch reached a forbidden second apply");
+            await withTimeout(running, 5000, "clean real lease retained execution joins");
+            assert.deepEqual(teardownResults, [true]);
+            assert.equal(teardownAttempts, 1);
+            assert.equal(switchResult, undefined);
+            assert.ok(switchError instanceof Error);
+            assert.equal(switchError.name, "CredentialSwitchRetainedStop");
+            const expectedOwnership = { status: cleanAllUnconfirmed ? "running" : "paused", claim_generation: 7, claim_released: false, hold_reason: null };
+            assert.deepEqual(cleanOwnership, expectedOwnership, "fake ownership is independent of local park evidence");
+            if (cleanPendingDisappears) {
+              assert.equal(cleanOwnership.status, expectedOwnership.status);
+              for (const observed of cleanPausedObservations) assert.deepEqual(observed, expectedOwnership);
+            }
+            assert.deepEqual(await client.getRunOwnership(claim.run_id), expectedOwnership);
+            assert.ok(a.reaped() > 0);
+            assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf(cleanApplyUncertain || successorEpochAdvance ? "clean-owner-ACK"
+              : cleanAllUnconfirmed ? "clean-pause-unconfirmed" : "clean-pause-ACK"));
+            if (cleanPendingDisappears) {
+              assert.ok(actualFlight);
+              assert.equal(actualFlight.parked, !cleanAllUnconfirmed);
+              if (cleanAllUnconfirmed) assert.equal(actualFlight.keepGuardedInventoryOpen, true);
+              assert.equal(credentialReleases, releasesAtCleanTeardown);
+            }
+            assert.equal(holdReason, null);
+            assert.equal(pending, successorEpochAdvance);
+            if (successorEpochAdvance) {
+              assert.equal(pendingOp, "M2-successor");
+              assert.equal(preflights, 2);
+              assert.ok(actualFlight);
+              assert.equal(actualFlight.parked, true, "explicit owner ACK confirms retained pause");
+              assert.equal(actualFlight.worktreePath, worktree, "retain the same claim worktree");
+              assert.equal(publishAttempts, 0);
+              assert.equal(restartAttempts, 0);
+              assert.equal(actualFlight.executor, executor);
+              assert.equal(actualFlight.runId, claim.run_id);
+              assert.equal(actualFlight.claimGeneration, 7);
+              assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf("apply-superseded"));
+              assert.ok(events.indexOf("apply-superseded") < events.lastIndexOf("preflight"));
+              assert.equal(bFinished, false);
+              assert.deepEqual(resumedThreads, []);
+              assert.deepEqual(loginObservations, []);
+            }
+            assert.equal(committedCodex, cleanApplyUncertain ? next : claim.secrets.codex,
+              "simulated committed binding is independent of pending target; not DB proof");
+            assert.deepEqual(applyRequests, cleanApplyUncertain || successorEpochAdvance ? [{ claimGeneration: 7, opId: "M2-op" }] : []);
+            assert.equal(applies, cleanApplyUncertain || successorEpochAdvance ? 1 : 0);
+            assert.equal(applyAcknowledgements, 0);
+            assert.deepEqual(cleanReports, successorEpochAdvance
+              ? [{ runId: claim.run_id, generation: 7, opId: "M2-successor", reason: "not_applied_after_teardown" }]
+              : cleanApplyUncertain ? [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "apply_uncertain" }] : []);
+            const expectedStoppedAttempts = !cleanPendingDisappears ? 0 : cleanAllUnconfirmed ? 3
+              : publication === "clean-stopped-lost-reply" ? 2 : 1;
+            assert.deepEqual(cleanPauseRequests, Array.from({ length: expectedStoppedAttempts },
+              () => ({ runId: claim.run_id, generation: 7 })));
+            assert.equal(events.filter(event => event === "clean-pause-ACK").length,
+              cleanPendingDisappears && !cleanAllUnconfirmed ? 1 : 0);
+            assert.deepEqual(holdReports, []);
+            assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")),
+              cleanApplyUncertain || successorEpochAdvance ? ["credential_switch_uncertain"] : []);
+            assert.ok(!reports.some(status => ["completed", "failed", "cancelled"].includes(status)));
+            assert.equal(reopenAttempts, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.equal(b.transport.requests.length, 0, "no B material is sent");
+            assert.equal(rig.providerLaunches(), 1);
+            assert.equal(factories, 1);
+            assert.equal(epochBuilds, 1);
+            assert.equal(bCredentialReleases, 0);
+            assert.deepEqual(failedClearRequests, []);
+            assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+            assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+            return;
+          }
+          if (publication !== "baseline") {
+            const failureBoundaryCount = !injectedStage ? undefined
+              : scopeClearFailure || injectedStage === "before-scope-install" || injectedStage === "after-scope-install" ? 0
+              : injectedStage === "before-executor-publication" ? 1
+              : injectedStage === "before-Now-publication" || injectedStage === "after-Now-publication" ? 2
+              : injectedStage === "before-B-preparation" ? 3 : 5;
+            for (const barrier of publicationBarriers.slice(0, failureBoundaryCount)) {
+              await withTimeout(barrier.entered.promise, 5000, barrier.stage);
+              const builds = nowBuilds.length;
+              const aRequests: number = a.transport.requests.length;
+              const bRequests: number = b.transport.requests.length;
+              try {
+                if (injectedStage) await joinNowConsumerProbes();
+                if (publication === "gated" && barrier.stage === "before-publish") {
+                  await joinNowConsumerProbes();
+                  assert.deepEqual(assignmentStages, expectedAssignmentStages);
+                  assert.deepEqual([...nowConsumerStages].sort(), [...expectedAssignmentStages].sort());
+                  assert.equal(scopeProbesArmed, false, "cleanup is not replacement publication");
+                }
+                if (publication === "gated" && barrier.stage === "before-prepare") {
+                  await joinNowConsumerProbes();
+                  assert.deepEqual([...nowConsumerStages].sort(), [...expectedAssignmentStages, "after-Now-publish", "before-Now-publish"].sort());
+                  assert.equal(nowConsumerProbes.length, expectedAssignmentStages.length + 2, "assignment and Now callbacks invoke retained A consumers");
+                }
+                if (publication === "gated" && (barrier.stage === "before-publish" ||
+                    barrier.stage === "after-publish" || barrier.stage === "before-prepare")) {
+                  await probeRetiredRefresh(barrier.stage);
+                  if (barrier.stage === "before-prepare")
+                    assert.deepEqual([...refreshProbeStages].sort(), [...expectedAssignmentStages, "after-Now-publish", "after-publish",
+                      "before-Now-publish", "before-prepare", "before-publish"].sort());
+                }
+                if (publication === "gated" && barrier.stage === "before-publish") {
+                  assert.equal(bFinished, false);
+                  const prepare = context.prepareCodexRootDispatch;
+                  if (next.auth_mode === "subscription") {
+                    assert.ok(prepare, "replacement subscription scope installs a context dispatcher before executor publication");
+                    assert.notEqual(prepare, retainedPrepareRootDispatch, "probe uses the newly installed B dispatcher");
+                    assert.ok(context.terminalLifecycleSignal);
+                    await assert.rejects(prepare(context.terminalLifecycleSignal, () => {}, "root"),
+                      "new context dispatcher must refuse ordinary root admission before finishB");
+                  } else {
+                    assert.equal(prepare, undefined, "API-key replacement installs no account admission dispatcher");
+                  }
+                }
+                if (injectedStage || resumeVariant) {
+                  const prepare = context.prepareCodexRootDispatch;
+                  assert.ok(prepare, "real subscription B context dispatcher installed");
+                  const releases = credentialReleases, refreshes = credentialRefreshes;
+                  await assert.rejects(prepare(context.terminalLifecycleSignal!, () => {}, "root"),
+                    "ordinary B context root stays closed throughout partial publication and preparation");
+                  assert.equal(credentialReleases, releases);
+                  assert.equal(credentialRefreshes, refreshes);
+                }
+                assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                await triggerNow(`held-${barrier.stage}`);
+                assert.ok(retainedRootDispatch);
+                await assert.rejects(retainedRootDispatch.prepare(), "retired A root dispatch is refused");
+                assert.ok(retainedBroker);
+                const child = await retainedBroker.handleToolCall({ threadId: savedId, turnId: "M2-A-turn", callId: `held-child-${barrier.stage}` },
+                  "spawn_agent", { role: "coder", prompt: "work" }, "root");
+                assert.equal(child.ok, false, "retired real broker denies child work");
+                consumerProbes.push(barrier.stage);
+                assert.equal(bRootObserved, false, "no B work-turn root dispatcher exists during preparation");
+                if (barrier.stage === "login" || barrier.stage === "prepared" || barrier.stage === "resume" || barrier.stage === "fresh") {
+                  assert.ok(bPreparationObserved);
+                  assert.ok(bPreparationBroker, "returned B epoch builder constructed the preparation broker");
+                  const child = await withTimeout(bPreparationBroker.handleToolCall(
+                    { threadId: savedId, turnId: "M2-B-preparation", callId: `held-B-child-${barrier.stage}` },
+                    "spawn_agent", { role: "coder", prompt: "work" }, "root"), 3000, `B child refusal at ${barrier.stage}`)
+                    .finally(() => {
+                      assert.equal(b.transport.requests.length, bRequests,
+                        `B preparation child sends no ordinary request at ${barrier.stage}`);
+                    });
+                  assert.equal(child.ok, false, `real B preparation broker refuses child work at ${barrier.stage}`);
+                  assert.notEqual(child.ok ? undefined : child.code, "unknown_role", "B probe must reach the real child seam");
+                  assert.notEqual(child.ok ? undefined : child.code, "bad_args", "B probe carries valid child instructions");
+                  bChildProbes.push(barrier.stage);
+                } else {
+                  assert.equal(bHarness, undefined, `B harness unavailable at ${barrier.stage}`);
+                  assert.equal(bPreparationBroker, undefined, `B preparation broker not constructed at ${barrier.stage}`);
+                  assert.equal(bPreparationObserved, false);
+                }
+                if ((publication === "subscription-refresh" || publication === "api-key-refresh" || queuedRefreshStop) && barrier.stage === "login") {
+                  // push() only feeds notifications; startup auth requests use the read-path interceptor.
+                  b.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+                    params: { reason: "unauthorized", previousAccountId: null } });
+                  refreshDeliveries++;
+                  refreshDelivered.resolve();
+                  await withTimeout(refreshDelivered.promise, 5000, "B auth interceptor delivery");
+                  assert.equal(refreshDeliveries, 1);
+                  if (publication === "subscription-refresh" || queuedRefreshStop)
+                    assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
+                      "auth owner defers refresh while login is held");
+                }
+                if (queuedRefreshStop && barrier.stage === "prepared") {
+                  assert.equal(refreshDeliveries, 1);
+                  assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
+                    "queued refresh remains unsettled until preparation failure or cancellation teardown");
+                  assert.equal(ordinaryBRefreshes, 0);
+                }
+                if (publication === "subscription-refresh-cancel" && barrier.stage === "prepared") {
+                  assert.ok(context.terminalLifecycleSignal);
+                  const signal: AbortSignal = context.terminalLifecycleSignal;
+                  const stopped = installerBarrier();
+                  signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+                  cancelled = true;
+                  if (signal.aborted) stopped.resolve();
+                  await withTimeout(stopped.promise, 5000, "Runner observes terminal cancellation while B preparation is held");
+                  assert.equal(signal.aborted, true);
+                }
+                if (publication === "api-key-refresh" && barrier.stage === "login") {
+                  await withTimeout(refreshResponded.promise, 3000, "API-key refresh refusal");
+                  const replies = b.transport.responses.filter(response => response.requestId === 91);
+                  assert.equal(replies.length, 1);
+                  assert.deepEqual(replies[0]!.response, { error: {
+                    code: -32600, message: "codex authentication protocol violation",
+                  } });
+                  assert.equal(bFinished, false, "API-key auth owner refuses before B finish");
+                }
+                if (crashRecovery && barrier.stage === crashStage) {
+                  predecessorFenced = true;
+                  assert.equal(applies, expectedApplies);
+                  assert.equal(applyAcknowledgements,
+                    crashStage === "before-publish" || crashStage === "login" ? 1 : 0,
+                    "commit with a lost reply exposes no applied auth response");
+                  assert.ok(a.reaped() > 0 && a.disposed() > 0, "A teardown precedes every crash point");
+                  assert.ok(events.includes("A-effect-disposed"));
+                  assert.ok(fileops[0]!.disposed() > 0);
+                  assert.equal(committedCodex, expectedApplies === 0 ? oldClaim : next);
+                  assert.equal(loginObservations.length, crashStage === "login" ? 1 : 0);
+                }
+                if (preserveNegative && barrier.stage === "resume") {
+                  assert.equal(pending, false, "the original apply settled before B resume");
+                  assert.equal(client.registrationNonce(), "M2-original-nonce");
+                  assert.equal(actualFlight!.claimGeneration, 7);
+                  heldLifecycle = actualFlight!.steering.lifecycleSignal();
+                  heldCheckpoint = actualFlight!.steering.checkpointAuthoritySignal();
+                  assert.equal(heldLifecycle.aborted, true);
+                  assert.equal(heldCheckpoint.aborted, true);
+                  resumeFenceArmed = true;
+                  if (preservePending) { pendingOp = "M2-successor"; pending = true; }
+                  if (preserveNonce) registrationNonce = "M2-replacement-nonce";
+                }
+                // Join the event queue without a wall-clock sleep.
+                await new Promise<void>(resolve => setImmediate(resolve));
+                assert.equal(nowBuilds.length, builds, "ordinary Now cannot construct a half-published harness");
+                assert.equal(a.transport.requests.length, aRequests, "retired A receives no ordinary sends");
+                assert.equal(b.transport.requests.length, bRequests, "held B receives no ordinary sends");
+                assert.equal(b.transport.turnStartCount, 0, "initialization never admits a work turn");
+                assert.equal(reopenAttempts, 0);
+                assert.equal(ordinaryBRefreshes, 0, `ordinary subscription refresh remains deferred at ${barrier.stage}`);
+                if (barrier.stage === "before-prepare")
+                  assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
+              } finally { barrier.proceed.resolve(); }
+              if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
+                  ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
+                  (crashRecovery && barrier.stage === crashStage) ||
+                  ((resumeUncertain || resumePreserve) && barrier.stage === "resume") ||
+                  (queuedRefreshStop && barrier.stage === "prepared") ||
+                  (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
+            }
+            assert.equal(consumerProbes.length, resumeVariant ? resumeUncertain || resumePreserve ? 5 : 7 : injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
+            if (preserveNegative) {
+              await withTimeout(running, 5000, "fenced preserving refusal retains the flight");
+              await joinNowConsumerProbes();
+              assert.ok(switchError instanceof Error);
+              assert.equal(switchError instanceof PolicyContinuationRejected, false);
+              assert.equal(policyAttempts.length, 0, "negative handoff never attempts policy delivery outside production catch");
+              assert.equal(policyHolds.length, 0, "negative handoff never reaches the policy callback");
+              assert.equal(preserveCaptures, 0, "no policy source capture after the fenced refusal");
+              assert.equal(actualFlight!.policyHold, undefined, "no false policy ACK");
+              assert.deepEqual(preserveSettlements, [], "the old switch stop is not retired");
+              assert.equal(preserveRearms, 0);
+              assert.equal(actualFlight!.steering.lifecycleSignal(), heldLifecycle);
+              assert.equal(actualFlight!.steering.checkpointAuthoritySignal(), heldCheckpoint);
+              assert.equal(heldLifecycle!.aborted, true);
+              assert.equal(heldCheckpoint!.aborted, true);
+              if (preserveSequenceRefused) {
+                // Two preserving handoff attempts, then one reporting-only owner-pause release.
+                // All fail at the actual batcher hold, without fabricating an executor result.
+                assert.equal(preserveReleases.length, 3);
+                assert.equal(preserveReleases[0]!.messageSeq, 7);
+                assert.equal(preserveReleases[1]!.messageSeq, Math.max(7, preserveReleases[1]!.currentSeq));
+                assert.equal(preserveReleases[2]!.messageSeq, preserveReleases[2]!.currentSeq + 1);
+                assert.equal(actualFlight!.parked, true, "ordinary owner-pause ACK is distinct from policy ACK");
+              } else if (preservePending) {
+                assert.equal(pending, true);
+                assert.equal(pendingOp, "M2-successor");
+                assert.equal(client.registrationNonce(), "M2-original-nonce");
+                assert.equal(actualFlight!.claimGeneration, 7);
+                // Only ownerHold's reporting release is allowed. Removing the post-resume
+                // appliedAuthority check instead releases the known bundle and settles steering.
+                assert.equal(preserveReleases.length, 1);
+                assert.equal(actualFlight!.parked, false, "old-op report did not ACK over the successor");
+                assert.equal(cleanOwnership.status, "running");
+              } else {
+                assert.equal(client.registrationNonce(), "M2-replacement-nonce");
+                assert.deepEqual(preserveReleases, []);
+                assert.equal(reports.includes("credential_switch_uncertain"), false);
+              }
+              assert.equal(actualFlight!.preserveRecoveryClone, true);
+              assert.equal(actualFlight!.preserveSession, true);
+              assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
+              assert.equal(actualFlight!.retainedLocalCustody, true);
+              assert.equal(actualFlight!.worktreePath, worktree);
+              assert.equal(custodyReleases, 0);
+              assert.ok(sourceJournal);
+              assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
+                `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
+              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
+              assert.equal(committedCodex, next);
+              assert.equal(applies, 1);
+              assert.equal(applyAcknowledgements, 1);
+              assert.deepEqual(teardownResults, [true]);
+              assert.equal(reopenAttempts, 0);
+              assert.equal(bFinished, false);
+              assert.equal(factories, 1);
+              assert.equal(rig.providerLaunches(), 2);
+              assert.deepEqual(resumedThreads, [savedId]);
+              assert.equal(a.transport.threadStartCount, 0);
+              assert.equal(a.transport.turnStartCount, 1);
+              assert.equal(b.transport.threadStartCount, 0);
+              assert.equal(b.transport.turnStartCount, 0);
+              assert.equal(ordinaryBRefreshes, 0);
+              const releases = credentialReleases, refreshes = credentialRefreshes;
+              assert.ok(context.prepareCodexRootDispatch);
+              await assert.rejects(context.prepareCodexRootDispatch(context.terminalLifecycleSignal!, () => {}, "root"));
+              assert.ok(retainedRootDispatch);
+              await assert.rejects(retainedRootDispatch.prepare());
+              assert.equal(credentialReleases, releases, "closed gates perform no credential work");
+              assert.equal(credentialRefreshes, refreshes);
+              assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
+              assert.equal(api.messages(claim.run_id).some(message => rec(message.payload).event === "resume_lineage_break"), false);
+              for (const epoch of rig.epochs) {
+                assert.ok(epoch.reaped() > 0);
+                assert.ok(epoch.disposed() > 0);
+              }
+              assert.equal(disposedEffects.size, effects);
+              for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              return;
+            }
+            if (preserveCleanup) {
+              await withTimeout(switchSettled.promise, 5000, "preserving switch rejection observed");
+              assert.ok(switchError instanceof PolicyContinuationRejected);
+              assert.equal(switchError.cause, "provider_resume_rejected");
+              await withTimeout(bCleanupEntered.promise, 5000, "real B provider cleanup held");
+              assert.equal(b.reaped(), 0, "B reap remains unjoined when cancellation arrives");
+              assert.equal(policyAttempts.length, 0);
+              assert.ok(actualFlight);
+              assert.equal(actualFlight.steering.claimFence(), undefined);
+              assert.equal(actualFlight.steering.lifecycleSignal().aborted, false,
+                "selected switch stop was rearmed before the preserving rejection");
+              assert.equal(credentialReleases, releasesAtResume, "no material release before cleanup probes");
+              assert.ok(bRefresh);
+              await assert.rejects(bRefresh({ operationId: "preserve-cleanup-refresh",
+                signal: new AbortController().signal }), "B refresh stays closed after lifecycle reset");
+              assert.equal(credentialReleases, releasesAtResume, "refresh probe releases no material");
+              assert.equal(credentialRefreshes, refreshesAtResume, "B refresh callback must not reach the API while cleanup admission is closed");
+              assert.ok(context.prepareCodexRootDispatch);
+              await assert.rejects(context.prepareCodexRootDispatch(context.terminalLifecycleSignal!, () => {}, "root"));
+              assert.ok(retainedRootDispatch);
+              await assert.rejects(retainedRootDispatch.prepare());
+              assert.ok(retainedBroker);
+              assert.ok(bPreparationBroker);
+              const sends = [a.transport.requests.length, b.transport.requests.length];
+              for (const broker of [retainedBroker, bPreparationBroker]) {
+                const child = await broker.handleToolCall(
+                  { threadId: savedId, turnId: "M2-cleanup", callId: "cleanup-child" },
+                  "spawn_agent", { role: "coder", prompt: "work" }, "root");
+                assert.equal(child.ok, false);
+                assert.notEqual(child.ok ? undefined : child.code, "unknown_role");
+                assert.notEqual(child.ok ? undefined : child.code, "bad_args");
+              }
+              await triggerNow("preserve-cleanup");
+              assert.equal(credentialReleases, releasesAtResume, "dispatch/Now probes release no material");
+              assert.deepEqual([a.transport.requests.length, b.transport.requests.length], sends);
+              assert.ok(context.terminalLifecycleSignal);
+              if (preserveCleanupFollowup) {
+                followupDeliveredBefore = actualFlight.steering.getLastDeliveredFollowUpId();
+                api.appendInputs(claim.run_id, [{ id: followupId, kind: "follow_up", body: "Keep the saved conversation and inspect the retained work." }]);
+                await withTimeout(followupApplied.promise, 5000, "real follow-up ACK routes before active APPLIED");
+                assert.equal(api.isAcked(claim.run_id, followupId), true);
+                assert.equal(api.isApplied(claim.run_id, followupId), true);
+                for (const kind of ["ack", "applied"] as const)
+                  assert.ok(api.inputReceiptCalls.some(call => call.runId === claim.run_id &&
+                    call.kind === kind && call.generation === 7 && call.ids.includes(followupId)));
+                assert.ok(actualFlight.steering.operatorConstraints()?.includes("Keep the saved conversation and inspect the retained work."),
+                  "active ACK routed the actual follow-up body");
+                assert.equal(actualFlight.steering.getLastDeliveredFollowUpId(), followupDeliveredBefore,
+                  "routing and APPLIED do not prove model delivery");
+                assert.equal(api.inclusionCalls.some(call => call.runId === claim.run_id && call.ids.includes(followupId)), false);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(policyAttempts.length, 0);
+                assert.equal(credentialReleases, releasesAtResume);
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                bCleanupContinue.resolve();
+              } else {
+                const signal = context.terminalLifecycleSignal;
+                const stopped = installerBarrier();
+                signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+                if (preserveCleanupShutdown) {
+                  assert.ok(actualFlight.active, "observe the active record installed by buildContext");
+                  assert.equal(actualFlight.active.shuttingDown, false);
+                  runner.shutdown();
+                  assert.equal(actualFlight.active.shuttingDown, true);
+                  assert.equal(actualFlight.steering.isCancelled(), false);
+                  assert.equal(actualFlight.steering.claimFence(), undefined);
+                  const checkpoint = actualFlight.steering.workerShutdownCheckpoint();
+                  assert.ok(checkpoint);
+                  const lifecycle = actualFlight.steering.lifecycleSignal();
+                  assert.equal(lifecycle.aborted, true);
+                  assert.equal(actualFlight.steering.terminalLifecycleSignal().aborted, true);
+                  actualFlight.steering.rearmLifecycle();
+                  assert.equal(actualFlight.steering.lifecycleSignal(), lifecycle);
+                  assert.equal(actualFlight.steering.workerShutdownCheckpoint(), checkpoint);
+                } else {
+                  cancelled = true; // getInputs delivers the committed terminal cancellation.
+                }
+                if (signal.aborted) stopped.resolve();
+                await withTimeout(stopped.promise, 5000, "Runner observes stop during B cleanup");
+                assert.equal(actualFlight.steering.claimFence(), preserveCleanupShutdown ? undefined : "terminal_cancelled");
+                assert.equal(signal.aborted, true);
+                bCleanupContinue.resolve();
+                await withTimeout(running, 5000, "stopped preserving refusal joins cleanup");
+                await joinNowConsumerProbes();
+                assert.deepEqual(policyAttempts, [], "stop wins before policy selection");
+                assert.equal(actualFlight.policyHold, undefined);
+                assert.ok(!reports.some(status => ["completed", "failed", ...(preserveCleanupShutdown ? ["cancelled", "paused"] : [])].includes(status)));
+                if (preserveCleanupShutdown) {
+                  assert.equal(actualFlight.steering.isCancelled(), false);
+                  assert.equal(actualFlight.preserveRecoveryClone, true);
+                  assert.equal(actualFlight.preserveSession, true);
+                  assert.equal(actualFlight.keepGuardedInventoryOpen, true);
+                  assert.equal(actualFlight.worktreePath, worktree);
+                  assert.equal(cleanOwnership.status, "running");
+                  assert.deepEqual(policyHolds, []);
+                  assert.ok(sourceJournal);
+                  assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
+                    `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
+                  assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+                  assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+                  assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
+                  assert.equal(committedCodex, next);
+                  assert.equal(applies, 1);
+                  assert.equal(applyAcknowledgements, 1);
+                  assert.deepEqual(teardownResults, [true]);
+                }
+                assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
+                assert.equal(custodyReleases, 0);
+                assert.equal(credentialReleases, releasesAtResume);
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                assert.equal(ordinaryBRefreshes, 0);
+                assert.equal(reopenAttempts, 0);
+                assert.equal(bFinished, false);
+                assert.equal(factories, 1);
+                assert.equal(rig.providerLaunches(), 2);
+                assert.equal(a.transport.turnStartCount, 1);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(a.transport.threadStartCount, 0);
+                assert.equal(b.transport.threadStartCount, 0);
+                assert.deepEqual(resumedThreads, [savedId]);
+                assert.equal(nowBuilds.length, 1);
+                assert.equal(nowRuns.length, 0);
+                for (const epoch of rig.epochs) {
+                  assert.ok(epoch.reaped() > 0, "provider root joined after stop");
+                  assert.ok(epoch.disposed() > 0, "provider transport joined after stop");
+                }
+                assert.equal(disposedEffects.size, effects, "all effect roots joined");
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+                return;
+              }
+            }
+            if (resumePreserve) {
+              await withTimeout(Promise.race([running, unexpectedPreservePause.promise]), 5000,
+                "preserving refusal reaches policy retention or a forbidden pause");
+              assert.equal(reports.includes("credential_switch_uncertain"), false,
+                "preserving refusal never sends an ordinary owner pause before policy retention");
+              await withTimeout(running, 5000, "confirmed B refusal reaches policy re-hold").catch(error => {
+                throw new Error(JSON.stringify({ switchError: switchError instanceof Error ? { name: switchError.name, message: switchError.message } : switchError,
+                  policyHoldCount: policyHolds.length, reports, dispositions,
+                  diagnostics: diagnostics.lines.slice(-8).map(line => JSON.stringify(line).slice(0, 1200)) }), { cause: error });
+              });
+              await joinNowConsumerProbes();
+              assert.ok(switchError instanceof PolicyContinuationRejected);
+              assert.equal(switchError.cause, "provider_resume_rejected");
+              const policyFlight = actualFlight as unknown as { policyReservation?: symbol; cancel: AbortController; steering: SteeringChannel };
+              const assertRetainedPolicy = async (held: PolicyHoldRequest) => {
+                if (preserveCleanupFollowup) {
+                  assert.notEqual(followupDeliveredBefore, undefined);
+                  assert.equal(actualFlight!.steering.getLastDeliveredFollowUpId(), followupDeliveredBefore);
+                  assert.equal(api.inclusionCalls.some(call => call.runId === claim.run_id && call.ids.includes(followupId)), false);
+                  assert.equal(api.isAcked(claim.run_id, followupId), true);
+                  assert.equal(api.isApplied(claim.run_id, followupId), true);
+                }
+                assert.equal(held.cause, "provider_resume_rejected");
+                assert.equal(held.detail, "resume_rejected");
+                assert.equal(held.continuation_mode, "same_conversation");
+                assert.equal(held.claim_generation, 7);
+                assert.equal(held.session_id, savedId);
+                assert.equal(actualFlight!.policyHold?.outcomeId, held.outcome_id);
+                assert.equal(actualFlight!.preserveRecoveryClone, true);
+                assert.equal(actualFlight!.preserveSession, true);
+                assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
+                assert.equal(actualFlight!.retainedLocalCustody, true);
+                assert.equal(actualFlight!.worktreePath, worktree);
+                assert.equal(actualFlight!.runId, claim.run_id);
+                assert.equal(actualFlight!.claimGeneration, 7);
+                assert.equal(custodyReleases, 0);
+                assert.equal(credentialReleases, releasesAtResume, "re-hold cannot release more credentials");
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                assert.ok(sourceJournal, "real source journal was seeded before A admission");
+                assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
+                  `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
+                assert.ok(context.prepareCodexRootDispatch);
+                await assert.rejects(context.prepareCodexRootDispatch(context.terminalLifecycleSignal!, () => {}, "root"),
+                  "B ordinary preparation remains closed after policy hold");
+                assert.ok(retainedRootDispatch);
+                await assert.rejects(retainedRootDispatch.prepare(), "A remains retired after policy hold");
+                assert.equal(credentialReleases, releasesAtResume);
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+                assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+                assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
+                assert.equal(committedCodex, next);
+                assert.equal(applies, 1);
+                assert.equal(applyAcknowledgements, 1);
+                assert.deepEqual(teardownResults, [true]);
+                assert.equal(reopenAttempts, 0);
+                assert.equal(factories, 1, "no new claim/executor flight");
+                assert.equal(rig.providerLaunches(), 2);
+                assert.equal(a.transport.threadStartCount, 0, "A resumed the persisted CLAIM session");
+                assert.equal(a.transport.turnStartCount, 1, "A work ran and never revived");
+                assert.deepEqual(resumedThreads, [savedId]);
+                assert.equal(b.transport.threadStartCount, 0);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(bFinished, false);
+                assert.deepEqual(bChildProbes, ["login", "resume"]);
+                assert.equal(loginObservations.length, 1);
+                const login = loginObservations[0]!;
+                assert.equal(login.params.accessToken, next.access_token);
+                assert.equal(login.reaped, true);
+                assert.equal(login.effectDisposed, true);
+                assert.ok(login.fileopDisposed > 0);
+                assert.equal(ordinaryBRefreshes, 0);
+                assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
+                assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
+                assert.equal(api.messages(claim.run_id).some(message => rec(message.payload).event === "resume_lineage_break"), false);
+                for (const epoch of rig.epochs) {
+                  assert.ok(epoch.reaped() > 0);
+                  assert.ok(epoch.disposed() > 0);
+                }
+                assert.equal(disposedEffects.size, effects);
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              };
+              if (policyDeliveryUnknown) {
+                assert.equal(policyAttempts.length, 1, "one bounded policy delivery attempt");
+                assert.equal(policyTransportReached, 1, "ownership and join assertions reached the transport outcome");
+                assert.equal(policyHolds.length, 0, "no confirmed policy ACK");
+                const attempted = policyAttempts[0]!;
+                const journal = await policyOutbox!.readTerminalJournal(claim.run_id, 7);
+                assert.ok(journal);
+                assert.equal(journal.outcome_kind, "policy_hold");
+                assert.notEqual(journal.server_settled, true);
+                assert.deepEqual(journal.body, attempted);
+                assert.equal(attempted.source_generation, 7);
+                assert.equal(attempted.session_id, savedId);
+                // Process-memory-loss model with retained local data only; not power-loss proof.
+                const reloaded = new Outbox({ root: path.join(dir, "policy-outbox"), log: noopLog,
+                  runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+                await reloaded.init();
+                const pendingEntries = reloaded.listPendingTerminals();
+                assert.equal(pendingEntries.length, 1);
+                assert.equal(pendingEntries[0]!.run_id, claim.run_id);
+                assert.equal(pendingEntries[0]!.claim_generation, 7);
+                assert.equal(pendingEntries[0]!.outcome_kind, "policy_hold");
+                assert.notEqual(pendingEntries[0]!.server_settled, true);
+                const persisted = await reloaded.readTerminalJournal(claim.run_id, 7);
+                assert.ok(persisted);
+                assert.equal(persisted.outcome_kind, "policy_hold");
+                assert.notEqual(persisted.server_settled, true);
+                assert.deepEqual(persisted.body, attempted);
+                assert.equal(persisted.body.outcome_id, attempted.outcome_id);
+                assert.equal(persisted.body.source_generation, attempted.source_generation);
+                assert.equal(persisted.body.session_id, savedId);
+                assert.doesNotMatch(JSON.stringify({ journal, pendingEntries, persisted, attempted }),
+                  /M2-B-access|M2-B-capability|M2-A-auth-canary/);
+                await assertRetainedPolicy(attempted);
+                return;
+              }
+              assert.equal(policyHolds.length, 1, JSON.stringify({ expected: "policy reporting, not only the generic owner pause",
+                negotiated: client.supportsPolicyHold, reservation: !!policyFlight.policyReservation,
+                cancelAborted: policyFlight.cancel.signal.aborted, cancelReason: policyFlight.cancel.signal.reason?.name,
+                lifecycleAborted: policyFlight.steering.lifecycleSignal().aborted,
+                lifecycleReason: policyFlight.steering.lifecycleSignal().reason?.name,
+                logs: diagnostics.lines.slice(-4) }));
+              const held = policyHolds[0]!;
+              await assertRetainedPolicy(held);
+              return;
+            }
+            if (publication !== "gated" && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
+              if (resumeUncertain) {
+                await withTimeout(Promise.race([running, forbiddenUncertainFresh.promise]), 5000, "uncertain resume retains execution or attempts forbidden fresh");
+                assert.equal(b.transport.threadStartCount, 0, "unclassified resume failure cannot send thread/start");
+              }
+              await withTimeout(running, 5000, "failed publication retained stop");
+              await joinNowConsumerProbes();
+              assert.equal(reopenAttempts, 0);
+              if (resumeUncertain) {
+                assert.deepEqual(resumedThreads, [savedId]);
+                assert.equal(b.transport.threadStartCount, 0, "unclassified failure cannot start a fresh lineage");
+                assert.equal(bFinished, false);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(a.transport.turnStartCount, 1, "A never revives");
+                assert.equal(factories, 1);
+                assert.equal(actualFlight!.runId, claim.run_id);
+                assert.equal(actualFlight!.claimGeneration, 7);
+                assert.equal(actualFlight!.worktreePath, worktree);
+                assert.equal(actualFlight!.parked, true, "owner acknowledged the op-fenced pause");
+                assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
+                assert.deepEqual(bChildProbes, ["login", "resume"]);
+                assert.equal(loginObservations.length, 1);
+                assert.equal(loginObservations[0]!.params.accessToken, next.access_token);
+                assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" && body.failure_reason === "initialization_failed"));
+                assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
+                assert.equal(api.messages(claim.run_id).some(message => message.kind === "status" &&
+                  rec(message.payload).event === "resume_lineage_break"), false);
+                for (const epoch of rig.epochs) {
+                  assert.ok(epoch.reaped() > 0);
+                  assert.ok(epoch.disposed() > 0);
+                }
+                assert.equal(disposedEffects.size, effects);
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              }
+              if (injectedStage) {
+                assert.deepEqual(injectedFailures, [injectedStage], "the requested real boundary failed exactly once");
+                assert.equal(committedCodex, next, "simulated committed row remains B after publication failure");
+                assert.equal(applyAcknowledgements, 1);
+                assert.deepEqual(assignmentStages, expectedAssignmentStages.slice(0,
+                  injectedStage === "before-scope-clear" ? 1 : injectedStage === "after-scope-clear" ? 2
+                    : injectedStage === "before-scope-install" ? 3 : expectedAssignmentStages.length));
+                assert.deepEqual(nowPublicationProbes,
+                  scopeClearFailure || injectedStage === "before-scope-install" || injectedStage === "after-scope-install" ||
+                  injectedStage === "before-executor-publication" ? []
+                  : injectedStage === "before-Now-publication" ? ["before-Now-publish"]
+                  : ["before-Now-publish", "after-Now-publish"]);
+                assert.equal(rig.providerLaunches(), injectedStage === "Now-finish-false" ? 2 : 1,
+                  "B auth initialization starts only after all publication stages");
+                assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" &&
+                  body.failure_reason === "initialization_failed"), "partial publication requires owner action");
+                assert.ok(!reports.includes("failed") && !reports.includes("completed"));
+                assert.equal(bFinished, injectedStage === "Now-finish-false");
+                assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                assert.equal(b.transport.threadStartCount, 0, "no ordinary B child root");
+                for (const epoch of rig.epochs.slice(0, rig.providerLaunches())) {
+                  assert.ok(epoch.reaped() > 0, "every launched provider root reaped");
+                  assert.ok(epoch.disposed() > 0, "every launched provider root disposed");
+                }
+                assert.equal(disposedEffects.size, effects, "every launched effect root disposed");
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+                for (const root of summaryRoots) {
+                  assert.equal(root.reaped(), 1);
+                  assert.equal(root.disposed(), 1);
+                }
+                assert.equal(nowBuilds.length, 1, "no half-published B Now harness");
+                assert.equal(nowRuns.length, 0, "factory A aborted and B Now never ran");
+                assert.equal(scopeProbesArmed, false, "assignment failure cannot recur in cleanup");
+              }
+              assert.equal(applies, expectedApplies, "apply count matches the injected crash boundary");
+              assert.equal(b.transport.turnStartCount, 0);
+              assert.equal(ordinaryBRefreshes, 0);
+              if (queuedRefreshStop) {
+                await withTimeout(refreshResponded.promise, 5000, "queued subscription refresh refuses on B teardown");
+                // A closed transport cannot deliver a reply. The attempted refusal
+                // and joined Runner completion prove the auth task settled anyway.
+                assert.equal(refreshDeliveries, 1);
+                assert.equal(refreshRefusals.length, 1, "queued refresh refuses exactly once");
+                assert.deepEqual(refreshRefusals[0], { error: {
+                  code: -32001, message: "codex authentication refresh unavailable",
+                } }, "teardown refuses rather than releases credentials");
+                assert.equal(bFinished, false);
+                assert.equal(ordinaryBRefreshes, 0, "teardown never calls the refresh bridge");
+              }
+              if (publication === "now-publish-failure") {
+                assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
+                assert.equal(loginObservations.length, 0, "Now refusal prevents B preparation");
+              }
+              if (publication === "subscription-refresh-cancel") {
+                // getInputs has already reported a committed terminal cancellation.
+                // Cleanup must not publish success or a replacement owner hold.
+                assert.equal(context.terminalLifecycleSignal?.aborted, true);
+                assert.ok(!reports.includes("completed") && !reports.some(status => status.startsWith("credential_switch")));
+              } else if (!crashRecovery) {
+                assert.ok(reports.some(status => status.startsWith("credential_switch")), "Runner reports owner hold");
+                if (publication === "subscription-refresh-prepare-failure") {
+                  assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" && body.failure_reason === "initialization_failed"),
+                    "acknowledged B preparation failure requires owner action");
+                  assert.ok(!reports.includes("failed") && !reports.includes("completed"));
+                }
+              }
+              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              if (crashRecovery) {
+                // Model worker loss by fencing generation 7 at the held crash point, then
+                // join its cleanup. The injected transport failure is NOT an abrupt
+                // process crash. LiveDB tests separately prove commit/remint authority.
+                assert.equal(predecessorFenced, true);
+                const launchedPredecessors = rig.epochs.slice(0, rig.providerLaunches());
+                assert.equal(launchedPredecessors.length, crashStage === "login" ? 2 : 1,
+                  "only actually launched provider epochs require quiescence");
+                for (const epoch of launchedPredecessors) {
+                  assert.ok(epoch.reaped() > 0, "predecessor provider root quiescent before recovery");
+                  assert.ok(epoch.disposed() > 0);
+                }
+                if (crashStage !== "login") {
+                  assert.equal(b.transport.requests.length, 0, "B never launches before preparation");
+                  assert.equal(loginObservations.length, 0);
+                }
+                assert.ok(effects >= launchedPredecessors.length, "launched predecessors own tool roots");
+                assert.equal(disposedEffects.size, effects, "every launched predecessor effect root proved disposal");
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+                assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                const predecessorSends = [a.transport.requests.length, b.transport.requests.length];
+                // Simulated claim/last_seq/remint projection only; no actual DB proof.
+                const recoveryHead = spawnSync("git", ["-C", worktree, "rev-parse", "HEAD"],
+                  { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+                assert.match(recoveryHead, /^[0-9a-f]{40}$/);
+                const recoveryBranch = spawnSync("git", ["-C", worktree, "symbolic-ref", "--short", "HEAD"],
+                  { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+                assert.ok(recoveryBranch);
+                const recoveryBare = m2Runner.git.barePathFor(m2Runner.fx.originPath);
+                const readRecoveryJournal = () => spawnSync("git", ["-C", recoveryBare, "config",
+                  `uzi-recovery.${recoveryBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+                const recoveryJournal = readRecoveryJournal();
+                assert.ok(recoveryJournal, "the interrupted flight has a retained source journal");
+                const recoveryHolds: PolicyHoldRequest[] = [];
+                const recoveryRigs: ReturnType<typeof makeRig>[] = [];
+                const recoveryReportStart = dispositions.length;
+                if (preservingRecovery) {
+                  api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
+                  await client.register("crash-preserve", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+                  client.reportPolicyHold = async (_id, body) => {
+                    recoveryHolds.push(structuredClone(body));
+                    return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+                      observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
+                  };
+                }
+                const recovered: ClaimResponse = { ...claim, claim_generation: 8, session_id: missingRecoveryId ? null : savedId,
+                  // These are the wire claim fields used by the real preserving-continuation fixture.
+                  // A RunContext-only boolean would not exercise Runner admission.
+                  ...(preservingRecovery ? { policy_preserve_only: true, policy_expected_head: recoveryHead,
+                    plan_source: "agent" as const, auto_approve: true } : {}),
+                  last_seq: api.messages(claim.run_id).reduce((seq, message) => Math.max(seq, message.seq), 0),
+                  secrets: { ...claim.secrets, codex: { ...committedCodex, capability: "M3-reminted-capability" } } };
+                api.setOwnershipStatus(claim.run_id, "running", 8);
+                client.getRunOwnership = async () => ({ status: "running", claim_generation: 8,
+                  claim_released: false, hold_reason: null });
+                let recoveryWorkSent = false;
+                client.getInputs = async () => ({ inputs: [], ...(recoveryWorkSent
+                  ? { terminalCancelled: { run_id: recovered.run_id, generation: 8 } } : {}) });
+                client.applyCredentialSwitch = async () => { throw new Error("recovery must not replay apply"); };
+                await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+                if (missingRecoveryRollout) {
+                  // Remove only the retained transcript; unfinished source bytes and the journal stay intact.
+                  await fs.rm(path.join(source, "sessions"), { recursive: true, force: true });
+                  await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+                  // Publish empty generations through the real store API, including its current pointer.
+                  await CodexSessionStore.persist(source, store);
+                  await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+                  assert.equal(await CodexSessionStore.inspectSession(store, savedId), "absent");
+                }
+                let executedRecoveryRig: ReturnType<typeof makeRig> | undefined;
+                let executedRecoveryExecutor: CodexExecutor | undefined;
+                let recoveryBodies = 0, recoveryFactories = 0;
+                let readinessLaunches = 0, readinessWaits = 0, readinessDisposals = 0;
+                const readinessResults: string[] = [];
+                const releases: unknown[] = [];
+                const buildRecovery = () => {
+                  assert.equal(rig.providerLaunches(), launchedPredecessors.length, "predecessor launches stay fenced");
+                  for (const epoch of launchedPredecessors) {
+                    assert.ok(epoch.reaped() > 0 && epoch.disposed() > 0, "no provider overlap with recovery");
+                  }
+                  assert.equal(disposedEffects.size, effects, "no predecessor effect overlap with recovery");
+                  const recoveryRig = makeRig({ responder: c => {
+                    if (c.method === "thread/start") return { thread: { id: "M3-recovered-fresh-thread" } };
+                    if (c.method === "thread/resume") throw new Error("fresh-checkout recovery must disclose a lineage break");
+                    if (c.method === "turn/start") {
+                      const tn = "M3-recovery-turn";
+                      recoveryWorkSent = true;
+                      return { turn: { id: tn } };
+                    }
+                    return {};
+                  } });
+                  recoveryRigs.push(recoveryRig);
+                  const adopted = path.join(dir, `recovery-adopted-${recoveryFactories++}`);
+                  const launchRecoveryEffect = recoveryRig.deps.launchEffectRoot!;
+                  recoveryRig.deps = { ...recoveryRig.deps, deferRegistryTeardown: true,
+                    launchEffectRoot: async (spec, deadline) => forwardCredentialFreeGitRoot(spec, deadline,
+                      await launchRecoveryEffect(spec, deadline)), sessionStore: {
+                    ...recoveryRig.deps.sessionStore!,
+                    inspect: async () => "present",
+                    inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+                    adopt: async () => { await fs.mkdir(adopted, { recursive: true }); return CodexSessionStore.adopt(store, adopted); },
+                    persist: async () => CodexSessionStore.persist(source, store),
+                  } };
+                  recoveryRig.client.releaseCodex = async (_id, req) => {
+                    releases.push(req.capability);
+                    assert.equal(req.capability, recovered.secrets.codex!.capability);
+                    return { access_token: committedCodex.access_token };
+                  };
+                  const recoveryExecutor = makeExecutor(recoveryRig, bindingOf(recovered.secrets.codex!), noopLog,
+                    undefined, provider, m2Runner.homeDir);
+                  const recoveryRun = recoveryExecutor.run.bind(recoveryExecutor);
+                  recoveryExecutor.run = async ctx => {
+                    executedRecoveryRig = recoveryRig; executedRecoveryExecutor = recoveryExecutor;
+                    recoveryBodies++;
+                    assert.ok(readinessLaunches > 0, "retained readiness ran before model admission");
+                    assert.equal(readinessWaits, readinessLaunches);
+                    assert.equal(readinessDisposals, readinessLaunches, "readiness disposed before recovered executor body");
+                    assert.equal(recovered.session_id, missingRecoveryId ? null : savedId, "claim carries the persisted availability fact");
+                    assert.notEqual(ctx.worktreePath, worktree, "retained recovery selects a fresh checkout");
+                    assert.equal(ctx.sessionId, undefined, "retained recovery drops the persisted candidate when cwd changes");
+                    if (preservingRecovery) {
+                      assert.equal(ctx.preserveConversation, true, "the wire policy claim must reach the executor as preserving");
+                      assert.equal(ctx.policyFreshAllowance, undefined, "recovery grants no owner Fresh authorization");
+                    }
+                    assert.equal(await fs.readFile(path.join(ctx.worktreePath, "M2-retained.txt"), "utf8"), "A work");
+                    const result = await recoveryRun(ctx);
+                    if (!missingRecoveryRollout)
+                      assert.equal(await fs.readFile(path.join(adopted, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+                    else await assert.rejects(fs.stat(path.join(adopted, "sessions", `rollout-${savedId}.jsonl`)), { code: "ENOENT" });
+                    await assert.rejects(fs.access(path.join(adopted, "auth.json")));
+                    return result;
+                  };
+                  return { executor: recoveryExecutor, homeDir: m2Runner.homeDir };
+                };
+                // A distinct Runner/flight and executor consume the recovered claim.
+                const recoveryLog = recordingLogger();
+                const recoveryOutbox = new Outbox({ root: path.join(dir, "recovery-outbox"), log: noopLog,
+                  runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+                if (preservingRecovery) await recoveryOutbox.init();
+                const predecessorProofs: string[] = [];
+                // Credential operations on the recovery Runner's own client. The executor's provider
+                // client is recoveryRig.client: its releases are counted in `releases` and its
+                // refreshes in `refreshCalls`.
+                const runnerCredentialOps: string[] = [];
+                client.releaseCodex = async () => { runnerCredentialOps.push("releaseCodex"); return { access_token: committedCodex.access_token } as never; };
+                client.refreshCodex = async () => { runnerCredentialOps.push("refreshCodex"); throw new Error("recovery refresh before proof"); };
+                const recoveryRunner = m2Runner.runnerWith(buildRecovery,
+                  m2Runner.fakeGitlab().gitlab, undefined, recoveryLog.logger, {
+                    ...(preservingRecovery ? {
+                      outbox: recoveryOutbox,
+                      activeRuns: new ActiveRunRegistry(() => recoveryOutbox.listPendingTerminals(), () => 10),
+                    } : {}),
+                    // Decision 11: the predecessor proof is the gate before any use of delivered material.
+                    quiesceRun: async req => {
+                      if (req.site === "predecessor_capture") {
+                        predecessorProofs.push(`releases=${releases.length} refreshes=${recoveryRigs.reduce((n, r) => n + r.client.refreshCalls.length, 0)} runner=${runnerCredentialOps.length} bodies=${recoveryBodies} launches=${recoveryRigs.reduce((n, r) => n + r.providerLaunches(), 0)} requests=${recoveryRigs.reduce((n, r) => n + r.transport.requests.length, 0)}`);
+                        if (forcedQuiescence) return {
+                          process: { state: forcedQuiescence, processes: [], killed: [], detail: "fixture predecessor not proven stopped" },
+                          docker: { state: "not_wired", removed: [], detail: "not wired" },
+                        };
+                      }
+                      return quiesceRunAttempt(req);
+                    },
+                  });
+                // Fake UID metadata and supervisor lifecycle only: this is not a real
+                // abrupt crash or kernel confinement/security proof. The supplied helper
+                // runs unchanged against real descriptors, bytes, modes and alternates;
+                // production worker-side attribution/revalidation remains in place.
+                const readinessProbe = mock.method(m2Runner.git as unknown as {
+                  retainedReadinessLaunch: typeof import("../src/codex/launcher.js").launchCodexEffectRoot;
+                }, "retainedReadinessLaunch", async (spec: CodexEffectLaunchSpec) => {
+                  readinessLaunches++;
+                  assert.equal(spec.identity, "command");
+                  assert.equal(spec.command, process.execPath);
+                  assert.equal(spec.cwd, "/");
+                  assert.equal(spec.supervisorBin, SUPERVISOR_BIN);
+                  assert.deepEqual(spec.env, { LANG: "C" });
+                  assert.equal(spec.args[0], "-e");
+                  assert.equal(spec.args.length, 3);
+                  const program = spec.args[1]!;
+                  const payload = spec.args[2]!;
+                  const { roots, identities, deadline } = JSON.parse(payload) as {
+                    roots: string[]; identities: string[]; deadline: number;
+                  };
+                  assert.deepEqual(roots.slice(0, 3), [worktree, path.join(worktree, ".git"), path.join(worktree, ".git/objects")]);
+                  assert.equal(roots.length, 5);
+                  assert.equal(roots[4], path.join(roots[3]!, "objects"));
+                  assert.equal(identities.length, 5);
+                  assert.ok(deadline > Date.now());
+                  roots.forEach((root, i) => {
+                    const st = syncFs.lstatSync(root);
+                    assert.ok(st.isDirectory() && !st.isSymbolicLink());
+                    assert.equal(identities[i], `${st.dev}:${st.ino}`);
+                  });
+                  const rootIds = new Set(identities.slice(0, 2));
+                  const objectId = identities[2];
+                  const adapter = {
+                    ...syncFs,
+                    fstatSync(fd: number) {
+                      const st = syncFs.fstatSync(fd);
+                      const id = `${st.dev}:${st.ino}`;
+                      // Only identity fields are synthetic; type, modes, link count,
+                      // inode stability and all filesystem operations remain real.
+                      const uid = rootIds.has(id) ? 10003
+                        : id === objectId && st.uid !== 10003 ? 10002 : 10003;
+                      Object.assign(st, { uid, gid: 10002 });
+                      return st;
+                    },
+                  };
+                  const stdout = new PassThrough(), stderr = new PassThrough();
+                  let waited = false, disposed = false;
+                  return {
+                    started: { uid: 10003, liveCapsZero: true, noNewPrivs: true },
+                    transport: { stdin: new PassThrough(), stdout, stderr },
+                    async waitChild() {
+                      assert.equal(waited, false); waited = true; readinessWaits++;
+                      let output = "";
+                      vm.runInNewContext(program, {
+                        require(name: string) { assert.equal(name, "node:fs"); return adapter; },
+                        process: { argv: ["node", payload], platform: "linux",
+                          getuid: () => 10003, getgroups: () => [10002],
+                          stdout: { write(text: string) { output += text; } } },
+                        Buffer, Date,
+                      }, { timeout: 5000 });
+                      readinessResults.push(output);
+                      stdout.end(output); stderr.end();
+                      return { code: 0 };
+                    },
+                    async dispose() {
+                      assert.equal(waited, true);
+                      assert.equal(disposed, false); disposed = true; readinessDisposals++;
+                      return { clean: true };
+                    },
+                  } as unknown as CodexRootHandle;
+                });
+                const recoveryFlight = recoveryRunner.execute(recovered);
+                try {
+                  await withTimeout(recoveryFlight, 10000, "distinct committed-credential recovery flight").catch(error => {
+                    throw new Error(JSON.stringify({ readinessLaunches, readinessWaits, readinessDisposals, readinessResults,
+                      recoveryBodies, recoveryFactories, releases: releases.length, logs: recoveryLog.lines.slice(-12) }), { cause: error });
+                  });
+                } finally {
+                  try {
+                    try { recoveryRunner.shutdown(); }
+                    finally { await recoveryFlight; }
+                  } finally {
+                    readinessProbe.mock.restore();
+                  }
+                }
+                assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work",
+                  "recovery refusal/fallback retains unfinished source work");
+                assert.deepEqual([a.transport.requests.length, b.transport.requests.length], predecessorSends,
+                  "recovery never revives predecessor auth or sends");
+                assert.equal(applies, expectedApplies, "no recovery mode replays apply");
+                assert.equal(applyRequests.length, expectedApplies);
+                assert.equal(rig.providerLaunches(), launchedPredecessors.length);
+                assert.ok(predecessorProofs.length > 0, "recovery runs the predecessor proof");
+                assert.equal(predecessorProofs[0], "releases=0 refreshes=0 runner=0 bodies=0 launches=0 requests=0",
+                  "no delivered Codex material is used before the first predecessor proof");
+                if (forcedQuiescence) {
+                  assert.equal(recoveryBodies, 0, "unproven predecessor never reaches the executor body");
+                  assert.deepEqual(releases, [], "unproven predecessor consumes no capability (no releaseCodex/refreshCodex)");
+                  assert.deepEqual(runnerCredentialOps, [], "the recovery Runner performs no credential operation");
+                  assert.ok(recoveryRigs.length > 0, "the recovery executor (and its provider client) was built");
+                  for (const recoveryRig of recoveryRigs)
+                    assert.deepEqual(recoveryRig.client.refreshCalls, [], "unproven predecessor never refreshes through the executor client");
+                  assert.equal(recoveryWorkSent, false);
+                  for (const recoveryRig of recoveryRigs) {
+                    assert.equal(recoveryRig.providerLaunches(), 0, "unproven predecessor starts no provider");
+                    assert.deepEqual(recoveryRig.transport.requests, [], "no account/login/start or other provider request");
+                  }
+                  assert.equal((JSON.parse(readRecoveryJournal()) as { recovery?: { blocker?: string } }).recovery?.blocker,
+                    "quiescence_failed", "an unproven predecessor takes the quiescence_failed blocker");
+                  assert.ok(dispositions.slice(recoveryReportStart).some(body => body.status === "failed" &&
+                    String(body.failure_reason).startsWith("worker_residue_blocked")), "the run reports the residue block with custody kept");
+                  return;
+                }
+                if (preservingRecovery) {
+                  assert.equal(readinessWaits, readinessLaunches, "every launched readiness root was joined on refusal");
+                  assert.equal(readinessDisposals, readinessLaunches, "every launched readiness root was disposed on refusal");
+                  assert.equal(readinessResults.length, readinessLaunches);
+                  for (const output of readinessResults) assert.match(output, /^ok [1-9][0-9]* [0-9]+\n$/);
+                  const retainedJournal = JSON.parse(readRecoveryJournal()) as {
+                    retainedSources?: { runId: string; clonePath: string }[];
+                    recovery?: { source: { runId: string; clonePath: string } };
+                  };
+                  assert.equal(retainedJournal.recovery?.source.runId, claim.run_id);
+                  assert.equal(retainedJournal.recovery?.source.clonePath, worktree);
+                  assert.ok(retainedJournal.retainedSources?.some(source =>
+                    source.runId === claim.run_id && source.clonePath === worktree), "preservation refusal retains the original source in the advanced journal");
+                  assert.equal(recoveryWorkSent, false, "preservation refusal sends no provider turn");
+                  for (const recoveryRig of recoveryRigs) {
+                    assert.equal(recoveryRig.providerLaunches(), 0, "preservation refusal launches no provider root");
+                    assert.deepEqual(recoveryRig.transport.requests, [], "no login, fresh thread, resume or work on refusal");
+                  }
+                  assert.deepEqual(releases, [], "refusal consumes no auth capability, including stale A auth");
+                  assert.equal(recoveryHolds.length, 1, JSON.stringify(recoveryLog.lines.slice(-12)));
+                  const hold = recoveryHolds[0]!;
+                  assert.equal(hold.cause, "attempt_path", "retained recovery must refuse even when a saved ID and rollout exist");
+                  assert.equal(hold.detail, "resume_rejected");
+                  assert.equal(hold.continuation_mode, "fresh_from_saved_work");
+                  assert.equal(hold.published, false);
+                  assert.equal(dispositions.slice(recoveryReportStart).some(body => body.status === "failed" || body.status === "completed"), false,
+                    "a policy re-hold never terminalizes retained work");
+                  assert.equal(api.messages(claim.run_id).some(message => message.kind === "status" &&
+                    rec(message.payload).event === "resume_lineage_break"), false, "preserve refusal never takes ordinary lineage fallback");
+                  if (!missingRecoveryRollout)
+                    assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present", "refusal retains the saved rollout");
+                  return;
+                }
+                assert.ok(readinessLaunches > 0);
+                assert.equal(readinessWaits, readinessLaunches);
+                assert.equal(readinessDisposals, readinessLaunches);
+                assert.equal(readinessResults.length, readinessLaunches);
+                for (const output of readinessResults) assert.match(output, /^ok [1-9][0-9]* [0-9]+\n$/);
+                assert.equal(recoveryBodies, 1, JSON.stringify(recoveryLog.lines.slice(-12)));
+                assert.ok(releases.length > 0, "real recovery auth bridge consumed reminted capability");
+                assert.ok(executedRecoveryExecutor && executedRecoveryRig);
+                const authority = (executedRecoveryExecutor as unknown as {
+                  currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+                }).currentCodexAuthority;
+                assert.equal(authority.binding.capability, recovered.secrets.codex!.capability);
+                assert.equal(authority.ordinal, 0, "new flight starts its server-owned usage baseline");
+                assert.equal(authority.capabilityEpoch, undefined, "never inherits predecessor switch metadata");
+                const requests = executedRecoveryRig.transport.requests;
+                const login = requests.find(r => r.method === "account/login/start");
+                assert.ok(login);
+                assert.equal(rec(login.params).type, committedCodex.auth_mode === "subscription" ? "chatgptAuthTokens" : "apiKey");
+                assert.equal(rec(login.params)[committedCodex.auth_mode === "subscription" ? "accessToken" : "apiKey"],
+                  committedCodex.access_token);
+                assert.equal(rec(login.params).chatgptAccountId,
+                  committedCodex.auth_mode === "subscription" ? committedCodex.chatgpt_account_id : undefined);
+                assert.deepEqual(requests.filter(r => r.method === "thread/start" || r.method === "thread/resume")
+                  .map(r => [r.method, rec(r.params).threadId]), [["thread/start", undefined]]);
+                assert.ok(api.messages(claim.run_id).some(message => message.kind === "status" &&
+                  rec(message.payload).event === "resume_lineage_break" &&
+                  rec(message.payload).reason === (missingRecoveryId ? "session_id_unavailable" : "cwd_changed_attempt_path")),
+                  "changed-cwd recovery visibly discloses the path lineage break");
+                assert.ok(requests.some(r => r.method === "turn/start"), "recovered executor actually sends work");
+                assert.deepEqual([a.transport.requests.length, b.transport.requests.length], predecessorSends,
+                  "fenced predecessor never sends during recovery");
+                assert.equal(applies, expectedApplies, "recovery never replays predecessor apply");
+                assert.equal(applyRequests.length, expectedApplies);
+                assert.equal(rig.providerLaunches(), launchedPredecessors.length, "recovery cannot relaunch predecessor roots");
+              }
+              return;
+            }
+          }
+          if (probeScopeIdentity) {
+            const wake = await withTimeout(Promise.race([
+              switchSettled.promise.then(() => "settled" as const),
+              scopeIdentityUncertain.promise.then(() => "uncertain" as const),
+            ]), 5000, "credential scope identity switch disposition");
+            assert.ok(!dispositions.some(body => body.status === "credential_switch_uncertain"),
+              "retaining A scope must not force an uncertain credential switch hold");
+            assert.equal(wake, "settled");
+            assert.equal(switchError, undefined);
+            assert.equal(switchResult, "resumed_B");
+            assert.ok(actualFlight?.operationScope, "actual Runner publishes B subscription scope");
+            assert.ok(actualFlight.operationScope.controller !== actualAController,
+              "B uses a distinct controller while the nonowning A reference is retained");
+            bLookupScope = acquireCodexOperationScope(client, claim.run_id, claim.claim_generation!,
+              undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(next.capability));
+            assert.ok(bLookupScope.controller === actualFlight.operationScope.controller,
+              "replacement authority lookup finds the actual Runner B controller");
+          }
+          if (probeBInitialCredential) {
+            await withTimeout(bInitialCredentialObserved.promise, 5000, "B initial credential request observed");
+            assert.deepEqual(bInitialCredentialRequest, { capability: true, mode: true, account: true, floor: true,
+              rootReaped: true, effectDisposed: true, fileopDisposed: true },
+            "B provider credential release uses replacement authority after A reap");
+          }
+          await withTimeout(bEntered.promise, 5000, "M2 B turn").catch(error => {
+            throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
+          });
+          if (publication === "baseline") {
+            // After the switch, B's material is registered with the Runner's run-message
+            // redactor (flight.secrets / redactText) and its log redactor.
+            const redaction = actualFlight as unknown as { secrets: { values(): readonly string[] }; redactText: (text: string) => string };
+            for (const secret of [next.access_token, next.capability]) {
+              assert.ok(loggedSecrets.includes(secret), "Codex switch registers B material with the log redactor");
+              assert.ok(redaction.secrets.values().includes(secret) && !redaction.redactText(`B ${secret} end`).includes(secret),
+                "Codex switch redacts B material from run messages");
+            }
+            assertAReconcileBeforeTeardown();
+            assertNoACredentialCallBetweenTeardownAndApply();
+            assert.equal(aReconcileCalls, 1, "B stale-boundary probe does not count as switch reconciliation");
+            assert.deepEqual(aReconcileOutcomes, ["ready"]);
+            assert.ok(events.includes("apply"));
+            assert.ok(events.indexOf("A-teardown-entry") < events.indexOf("apply"));
+            assert.ok(events.indexOf("apply") < events.indexOf("account/login/start"));
+            await withTimeout(Promise.all(triggers), 5000, "B ordinary work before allocation proof");
+            if (probeEpochConsumers) {
+              assert.deepEqual(retiredBoundaries, [{ result: "retired", releaseCalls: 0, releasedA: false }],
+                "retained A credential boundary rejects before credential release");
+            }
+            assert.ok(admission);
+            assert.equal(bRootObserved, true, "ordinary B work precedes the allocation proof");
+            assert.ok(bRootPrepares > 0);
+            assert.ok(bRootChecks > 0);
+            assert.ok(actualFlight === admission.flight, "same observed flight identity");
+            assert.equal(runFlights.length, admission.flightCount, "no new flight at any generation/executor");
+            assert.equal(runFlights.length, 1);
+            assert.ok(runFlights[0] === admission.flight, "same original flight identity");
+            assert.equal(actualFlight!.claimGeneration, admission.generation);
+            assert.equal(actualFlight!.claimGeneration, 7);
+            assert.equal(actualFlight!.worktreePath, admission.worktree);
+            assert.equal(context.worktreePath, admission.worktree);
+            assert.equal(actualFlight!.attemptId, admission.attemptId);
+            assert.ok(actualFlight!.runnerClone === admission.clone, "same original clone identity");
+            assert.equal(actualFlight!.runnerClone?.attemptId, admission.cloneAttemptId);
+            assert.equal(actualFlight!.runnerClone?.path, admission.worktree);
+            assert.deepEqual(custodySnapshot(actualFlight!), admission.custody, "same custody state before cleanup");
+            assert.deepEqual((await fs.readdir(admission.directory)).sort(), admission.members,
+              "no new attempt directory in the actual runner repo directory");
+            assert.deepEqual(allocationCalls, admission.calls,
+              "no clone seed, claim, custody reservation/release or hold settlement during switch");
+            assert.ok(!reports.slice(admission.reportCount).some(status =>
+              status.startsWith("credential_switch") || ["queued", "claimed", "paused"].includes(status)),
+              "no release/reclaim/hold transition before terminal cleanup");
+            assert.deepEqual(providerAdmissions.map(entry => entry.cwd), [admission.worktree, admission.worktree],
+              "actual A and B provider launch seams receive the same worktree");
+            assert.notEqual(providerAdmissions[0]!.ownedDataRoot, providerAdmissions[1]!.ownedDataRoot,
+              "B provider uses a distinct owned HOME root");
+            assert.equal(adoptedDestinations.length, 2);
+            assert.notEqual(adoptedDestinations[0], adoptedDestinations[1]);
+            baselineProofFinished = true;
+          }
+          await withTimeout(running, 5000, "M2 B usage and ordinary cancellation");
+          await Promise.all(triggers);
+          assert.equal(bRootObserved, true, "actual B root dispatch reached the first post-finish work turn");
+          assert.ok(bRootPrepares > 0, "actual B root prepare succeeded after finishB");
+          assert.ok(bRootChecks > 0, "actual B root check succeeded after finishB");
+          if (publication !== "baseline") assert.deepEqual(bChildProbes, resumeRefusal ? ["login", "resume", "fresh", "prepared"] : ["login", "prepared"]);
+          assert.equal(nowBuilds.length, 2, "real owned composition constructs A then B Now");
+          assert.equal(retiredADenied, true, "A guard rejected during live B construction");
+          if (publication === "gated" && oldClaim.auth_mode === "subscription") {
+            assert.ok(retiredAAfterFinish instanceof TrustedExecutionRefusal,
+              `retired A refresh refused by a trusted-execution guard, got: ${String(retiredAAfterFinish)}`);
+            assert.equal(retiredAAfterFinish.message, "codex credential authority retired", "retired A bridge refused by the retired-authority guard");
+            assert.ok(retiredATransportCounts);
+            assert.deepEqual(retiredATransportCounts.after, retiredATransportCounts.before, "retired A refresh sends nothing on A or B transport");
+          }
+          if (publication === "subscription-refresh") {
+            assert.equal(bRefreshAnsweredBeforeFinish, false, "startup refresh remains deferred through full B preparation");
+            assert.ok(next.auth_mode === "subscription");
+            assert.deepEqual(bRefreshExpectedAtFinish, [{ authMode: "subscription", chatgptAccountId: next.chatgpt_account_id }],
+              "B refresh expectation names B's account");
+          }
+          assert.equal(aRefreshesAfterFinish, 0, "no refreshCodex call carries A's capability after finishB");
+          assert.equal(ordinaryBRefreshesBeforeFinish, 0, "no ordinary refresh before finishB");
+          assert.ok(retiredADenial);
+          assert.equal(retiredADenial.refusal, true, "retired A summary guard refuses with TrustedExecutionRefusal");
+          assert.ok(["summary credential authority changed", "codex credential authority retired"].includes(retiredADenial.message),
+            `retired A summary guard refuses for authority replacement, got: ${retiredADenial.message}`);
+          assert.equal(liveBAdmitted, true, "B guard accepted before executor shutdown");
+          if (probeEpochConsumers) assert.equal(staleSummaryCapture, "capture-refused", "B summary rejects stale capture revision");
+          assert.deepEqual(nowRuns, phase === "factory" ? [next.capability] : [oldClaim.capability, next.capability]);
+          assert.equal(summaryRoots.length, phase === "factory" ? 1 : 2);
+          assert.equal(summaryDisposeCalls, summaryRoots.length, "each actual owned summary handle disposed once");
+          for (const root of summaryRoots) {
+            assert.equal(root.reaped(), 1);
+            assert.equal(root.disposed(), 1);
+          }
+          if (phase === "already-running-body") {
+            for (const event of ["preflight", "A-cleanup-start", "account/login/start"])
+              assert.ok(events.indexOf("A-summary-disposed") < events.indexOf(event), `summary disposal precedes ${event}`);
+          }
+          assert.equal(nowBuilds[1]!.binding.authMode, next.auth_mode);
+          assert.equal(nowBuilds[1]!.binding.capability, next.capability);
+          assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i, "retired A callback cannot borrow B authority");
+          for (const event of ["A-cleanup-start", "preflight", "A-reaped"]) {
+            assert.ok(events.includes(event), `observed ${event}`);
+            assert.ok(events.indexOf("A-Now-drained") < events.indexOf(event), `raw Now drain precedes ${event}`);
+          }
+          assert.equal(preflights, preflightRetry ? 2 : 1);
+          assert.equal(applies, 1);
+          assert.deepEqual(applyRequests, [{ claimGeneration: 7, opId: "M2-op" }]);
+          assert.equal(loginObservations.length, 1);
+          const login = loginObservations[0]!;
+          assert.equal(login.reaped, true);
+          assert.equal(login.effectDisposed, true);
+          assert.ok(login.fileopDisposed > 0, "A tool handle disposed before B auth");
+          assert.equal(login.params.type, next.auth_mode === "api_key" ? "apiKey" : "chatgptAuthTokens");
+          assert.equal(login.params[next.auth_mode === "api_key" ? "apiKey" : "accessToken"], next.access_token);
+          if (next.auth_mode === "subscription") assert.equal(login.params.chatgptAccountId, next.chatgpt_account_id);
+          assert.deepEqual(resumedThreads, [savedId]);
+          assert.equal(factories, 1, "no reclaim or second executor");
+          assert.ok(!reports.some(status => status.startsWith("credential_switch")), "no switch hold or release transition");
+
+          assert.equal(adoptedDestinations.length, 2, "A and B both adopted sessions");
+          // Check the replacement first so sensitivity failures name the switch transfer.
+          for (const dest of [adoptedDestinations[1]!, adoptedDestinations[0]!]) {
+            assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+            await assert.rejects(fs.access(path.join(dest, "auth.json")));
+            await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+            await assert.rejects(fs.access(path.join(dest, "sessions", "auth-canary.jsonl")),
+              "switch adoption excludes auth-named session artifacts");
+            await assert.rejects(fs.access(path.join(dest, "sessions", "unapproved.txt")),
+              "switch adoption excludes non-session extensions");
+            await assert.rejects(fs.access(path.join(dest, "outside-rollout.jsonl")),
+              "switch adoption excludes artifacts outside sessions subtree");
+          }
+          const feed = api.messages(claim.run_id);
+          if (resumeRefusal) {
+            assert.equal(feed.filter(message => message.kind === "status" &&
+              rec(message.payload).event === "resume_lineage_break").length, 1);
+            assert.equal(reopenAttempts, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.equal(actualFlight!.runId, claim.run_id);
+            assert.equal(actualFlight!.claimGeneration, 7);
+            assert.equal(actualFlight!.worktreePath, worktree);
+            const threadStarts = b.transport.requests.filter(r => r.method === "thread/start");
+            assert.equal(threadStarts.length, 1);
+            const turns = b.transport.requests.filter(r => r.method === "turn/start");
+            assert.ok(turns.length > 0);
+            for (const turn of turns) assert.equal(rec(turn.params).threadId, bThreadId);
+          }
+          assert.ok(!feed.some(m => String(m.payload.text).includes("Late A advice")), "aborted body never publishes late A advice");
+          const notes = feed.filter(m => m.kind === "progress_note" && String(m.payload.text).startsWith("Inspecting B"));
+          assert.equal(notes.length, 1, "future B Now emits one note through Runner");
+          assert.equal(notes[0]!.credential_epoch_ordinal, 1);
+          assert.deepEqual(rec(notes[0]!.payload.model_usage)["gpt-6-luna"], {
+            inputTokens: 90, outputTokens: 12, cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.000015,
+          });
+          const bMessage = feed.find(m => String(m.payload.text).startsWith("M2 B output"));
+          assert.ok(bMessage, "B output reaches real Runner feed");
+
+          const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
+          assert.equal(authority.ordinal, 1);
+          assert.equal(authority.capabilityEpoch, 42, "capability counter is distinct from the usage ordinal");
+          assert.equal(authority.binding.capability, next.capability);
+          const usage = feed.filter(m => m.payload.event === "codex_response_usage");
+          assert.equal(usage.length, 1, "only B emitted provider usage");
+          assert.deepEqual({ output: bMessage.credential_epoch_ordinal, usage: usage[0]!.credential_epoch_ordinal },
+            { output: authority.ordinal, usage: authority.ordinal }, "B output and usage carry the replacement ordinal");
+          assert.equal(rec(usage[0]!.payload.usage).input_tokens, 200);
+          assert.equal(rec(usage[0]!.payload.usage).output_tokens, 100);
+          assert.doesNotMatch(JSON.stringify({ feed, diagnostics: diagnostics.lines }), /M2-B-access|M2-B-capability|M2-A-auth-canary/);
+          assert.ok(hooks > 0, "real Executor invoked Runner switch hook");
+          for (const method of ["account/login/start", "thread/resume", "turn/start"])
+            assert.ok(events.includes(method), `B sent ${method}`);
+          assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
+          assert.ok(events.indexOf("thread/resume") < events.indexOf("turn/start"));
+          assert.equal(b.transport.threadStartCount, positiveBChild || resumeRefusal ? 1 : 0);
+          assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+        } finally {
+          try {
+            scopeProbesArmed = false;
+            aRefreshRelease.resolve(); aRefreshContinue.resolve();
+            releaseRetry?.();
+            retryTimer?.mock.restore();
+            cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
+            bCleanupContinue.resolve();
+            for (const barrier of publicationBarriers) barrier.proceed.resolve();
+            a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+            b.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+            try {
+              await joinExecution();
+            } finally {
+              await aSuspendOwned?.catch(() => {});
+              try { await joinNowConsumerProbes(); }
+              finally {
+                scopeProbesArmed = false;
+                try {
+                  if (scopeIntercepted && actualFlight) {
+                    // Preserve Runner's latest backing value, including terminal cleanup.
+                    Object.defineProperty(actualFlight, "operationScope", scopeDescriptor
+                      ? { ...scopeDescriptor, value: scopeBacking }
+                      : { configurable: true, enumerable: true, writable: true, value: scopeBacking });
+                  }
+                } finally { flightProbe.mock.restore(); }
+                preparationProbe.mock.restore();
+                epochProbe.mock.restore();
+                startTurnProbe.mock.restore();
+                brokerProbe.mock.restore();
+                nowProbe.mock.restore();
+                client.registrationNonce = originalRegistrationNonce;
+                await fs.rm(dir, { recursive: true, force: true });
+              }
+            }
+          } finally {
+            try { bLookupScope?.close(); }
+            finally { retainedAScope?.close(); }
+          }
+        }
+      });
+        }
+      }
+    }
+  }
+});
+
 // ── issue #4258 — the scoped mid-run seam under the real CodexExecutor ───────────────────────────
 //
 // A real CodexExecutor (fake provider transport) inside a real RunRunner. A tick arms the mid-run
@@ -31688,5 +36143,471 @@ describe("issue #4313 real CodexExecutor + RunRunner over the done gate and resu
     assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
     assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
     assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
+  });
+});
+
+describe("Codex repeated actualRunner switching", () => {
+  m2Runner.installHarness();
+
+  it("Codex real Runner switches A to B to C without a new claim or attempt", async t => {
+    const { api, client } = m2Runner;
+    const aClaim = { ...API_KEY, auth_mode: "api_key" as const, capability: "repeat-A-capability" };
+    const bClaim = { ...SUBSCRIPTION, auth_mode: "subscription" as const, generation: 52, capability: "repeat-B-capability",
+      access_token: "repeat-" + "B-access", chatgpt_account_id: "repeat-B-account" };
+    const cClaim = { ...API_KEY, auth_mode: "api_key" as const, capability: "repeat-C-capability",
+      access_token: "repeat-" + "C-access" };
+    const claim: ClaimResponse = { ...m2Runner.gitlabClaim(4202, {
+      plan_md: "Approved repeated-switch proof", plan_approved: true, plan_source: "seeded",
+    }), claim_generation: 7 };
+    claim.secrets = { ...claim.secrets, codex: aClaim };
+    api.setOwnershipStatus(claim.run_id, "running", 7);
+    const savedId = "12345678-1234-1234-1234-123456789abc";
+    const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/M3-repeat-"));
+    const source = path.join(dir, "source"), store = path.join(dir, "store");
+    await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+    await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
+    await CodexSessionStore.persist(source, store);
+
+    const aEntered = installerBarrier(), bObserved = installerBarrier(), cObserved = installerBarrier();
+    const ySeen = installerBarrier(), allowBEnd = installerBarrier(), allowCEnd = installerBarrier();
+    const bReapEntered = installerBarrier(), finishBReap = installerBarrier();
+    let bReapCompleted = false, bDisposeCompleted = false, cMaterialReads = 0;
+    const jobs: Promise<void>[] = [];
+    let cancelled = false;
+    let pending: "opX" | "opY" | undefined;
+    let applies = 0, factories = 0, hooks = 0, reconciledB = 0, fresh = 0;
+    const reports: string[] = [];
+    const report = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+      reports.push(args[1].status);
+      return report(...args);
+    });
+    const preflights: { op: string; epoch: number }[] = [];
+    const results: { ordinal: number; epoch: number; seq: number }[] = [];
+    const releases: { seq: number; ok: boolean }[] = [];
+    const switches: string[] = [];
+    const files: ReturnType<typeof fakeFileopHandle>[] = [];
+    const disposedEffects = new Set<number>();
+    const admissions: { cwd: string; home: string }[] = [];
+    const adopted: string[] = [];
+    const rig = makeMultiEpochRig(["A", "B", "C"].map((label, index): Responder => c => {
+      const turn = `repeat-${label}-turn`;
+      if (c.method === "thread/start" || c.method === "thread/resume")
+        return { thread: { id: savedId } };
+      if (c.method === "turn/interrupt") {
+        if (index === 1) {
+          // A steering interrupt may arrive before the outer assertion releases B.
+          // Keep the safe boundary closed until opY is actually pending.
+          jobs.push((async () => {
+            await allowBEnd.promise;
+            c.transport.push(turnCompleted("interrupted", savedId, turn));
+          })());
+        } else c.transport.push(turnCompleted("interrupted", savedId, turn));
+      }
+      if (c.method === "turn/start") {
+        if (index === 0) {
+          c.transport.push(threadStarted(savedId));
+          aEntered.resolve();
+        } else {
+          // Cold-resume historical usage is followed by a matching live turn.
+          c.transport.push(tokenUsageUpdated(savedId, "repeat-historical", { totalTokens: 0 }));
+          c.transport.push({ kind: "turn_started", method: "turn/started", threadId: savedId,
+            turnId: turn, params: { threadId: savedId, turn: { id: turn } } });
+          c.transport.push(agentMessage(`repeat ${label} output`, savedId));
+          c.transport.push(tokenUsageUpdated(savedId, turn,
+            { inputTokens: index * 200, outputTokens: index * 100, totalTokens: index * 300 }));
+          // Neither successor naturally completes before the proof window closes.
+          if (index === 2) jobs.push((async () => {
+            await allowCEnd.promise;
+            c.transport.push(turnCompleted("completed", savedId, turn));
+          })());
+        }
+        return { turn: { id: turn } };
+      }
+      return {};
+    }));
+    const bReap = rig.epochs[1]!.root.reap.bind(rig.epochs[1]!.root);
+    rig.epochs[1]!.root.reap = async (...args) => {
+      bReapEntered.resolve();
+      await finishBReap.promise;
+      const result = await bReap(...args);
+      bReapCompleted = true;
+      return result;
+    };
+    const bDispose = rig.epochs[1]!.root.dispose.bind(rig.epochs[1]!.root);
+    rig.epochs[1]!.root.dispose = async (...args) => {
+      await bDispose(...args);
+      bDisposeCompleted = true;
+    };
+    const launchProvider = rig.deps.launchProviderRoot!;
+    const launchEffect = rig.deps.launchEffectRoot!;
+    let effectIndex = 0;
+    rig.deps = { ...rig.deps,
+      launchProviderRoot: async (spec, mode) => {
+        if (admissions.length === 2) {
+          assert.equal(reconciledB, 1);
+          assert.ok(rig.epochs[1]!.reaped() > 0, "B root joined before C provider/auth");
+          assert.ok(rig.epochs[1]!.disposed() > 0);
+          assert.ok(files[1]!.disposed() > 0, "B file operations joined before C auth");
+          assert.ok(disposedEffects.has(1), "B effects joined before C auth");
+          assert.equal(mode, "api_key");
+        }
+        admissions.push({ cwd: spec.cwd, home: spec.ownedDataRoot });
+        return launchProvider(spec, mode);
+      },
+      wireFileop: () => { const f = fakeFileopHandle(); files.push(f); return f.handle; },
+      launchEffectRoot: async (...args) => {
+        const root = await launchEffect(...args), index = effectIndex++;
+        const dispose = root.dispose.bind(root);
+        root.dispose = async (...rest) => {
+          const result = await dispose(...rest);
+          if (result.clean) disposedEffects.add(index);
+          return result;
+        };
+        return root;
+      },
+      sessionStore: { ...rig.deps.sessionStore!,
+        inspect: async () => "present",
+        inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+        persist: async () => CodexSessionStore.persist(source, store),
+        adopt: async () => {
+          const dest = path.join(dir, `adopted-${adopted.length}`);
+          adopted.push(dest);
+          await fs.mkdir(dest);
+          return CodexSessionStore.adopt(store, dest);
+        },
+      },
+    };
+    const releaseCodex = rig.client.releaseCodex.bind(rig.client);
+    rig.client.releaseCodex = async (id, req) => {
+      if (req.capability === cClaim.capability) {
+        cMaterialReads++;
+        assert.equal(bReapCompleted, true, "C material follows completed B reap");
+        assert.equal(bDisposeCompleted, true, "C material follows completed B transport disposal");
+        assert.equal(applies, 2);
+        return { access_token: cClaim.access_token };
+      }
+      if (req.capability === bClaim.capability) return { access_token: bClaim.access_token };
+      return releaseCodex(id, req);
+    };
+    const refreshCodex = rig.client.refreshCodex.bind(rig.client);
+    rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
+      if (req.capability !== bClaim.capability) return refreshCodex(id, req);
+      assert.equal(id, claim.run_id);
+      assert.equal(req.observed_generation, bClaim.generation, "B reconcile uses its committed generation");
+      assert.deepEqual(expected, { authMode: "subscription", chatgptAccountId: bClaim.chatgpt_account_id });
+      return { access_token: bClaim.access_token, generation: req.observed_generation + 1,
+        chatgpt_account_id: bClaim.chatgpt_account_id, outcome: "advanced" };
+    };
+
+    type Flight = {
+      runId: string; claimGeneration: number; executor: CodexExecutor;
+      worktreePath?: string; attemptId?: string;
+      runnerClone?: { path: string; attemptId?: string };
+      operationScope?: { prepare(kind: "root", signal: AbortSignal, check: () => void): Promise<() => boolean | void> };
+      batcher: MessageBatcher; steering: SteeringChannel;
+    };
+    let flight: Flight | undefined, worktree = "";
+    const flights: Flight[] = [];
+    const executor = makeExecutor(rig, bindingOf(aClaim), noopLog, undefined, provider, m2Runner.homeDir);
+    const suspend = executor.suspendCodexEpoch.bind(executor);
+    executor.suspendCodexEpoch = async bounds => {
+      const lease = await suspend(bounds), index = applies;
+      return { ...lease,
+        reconcileA: async (...args) => {
+          const before = bRefreshCalls;
+          const result = await lease.reconcileA(...args);
+          if (index === 1) {
+            assert.equal(result.kind, "ready");
+            assert.equal(applies, 1, "B reconciliation precedes C apply");
+            assert.equal(bRefreshCalls, before + 1, "real reconcile invokes B subscription refresh");
+            reconciledB++;
+          }
+          return result;
+        },
+        startFreshLineage: async (...args) => { fresh++; return lease.startFreshLineage(...args); },
+      };
+    };
+    let bRefreshCalls = 0;
+    const refreshBridge = rig.client.refreshCodex.bind(rig.client) as (id: string,
+      req: Parameters<WorkerClient["refreshCodex"]>[1], expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => ReturnType<WorkerClient["refreshCodex"]>;
+    rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
+      if (req.capability === bClaim.capability) bRefreshCalls++;
+      return refreshBridge(id, req, expected);
+    };
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      ctx.agents = [{ name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] }];
+      worktree = ctx.worktreePath;
+      await fs.writeFile(path.join(worktree, "repeat-retained.txt"), "A retained work");
+      const attempt = ctx.attemptCodexCredentialSwitch!;
+      ctx.attemptCodexCredentialSwitch = async (...args) => {
+        hooks++;
+        const result = await attempt(...args);
+        switches.push(result);
+        return result;
+      };
+      return run(ctx);
+    };
+    const runner = m2Runner.runnerWith(() => {
+      factories++;
+      return { executor, homeDir: m2Runner.homeDir };
+    }, m2Runner.fakeGitlab().gitlab, undefined, noopLog, {
+      credentialSwitchLedger: new (await import("../src/credential-switch-op-ledger.js")).CredentialSwitchOpLedger(dir),
+    });
+    const builder = runner as unknown as { buildFlight(...args: unknown[]): Flight };
+    const build = builder.buildFlight;
+    t.mock.method(builder, "buildFlight", function (this: typeof builder, ...args: unknown[]) {
+      const built = build.apply(this, args);
+      if (built.runId === claim.run_id) {
+        flights.push(built); flight = built;
+        const take = built.batcher.holdForCredentialSwitch.bind(built.batcher);
+        t.mock.method(built.batcher, "holdForCredentialSwitch", () => {
+          const hold = take();
+          return { ...hold, release: (opts: Parameters<typeof hold.release>[0]) => {
+            const ok = hold.release(opts);
+            releases.push({ seq: opts.messageSeq, ok });
+            return ok;
+          } };
+        });
+        const steering = built.steering as unknown as {
+          maybeTripCredentialSwitch(generation: number, op?: string, target?: string): void;
+        };
+        const trip = steering.maybeTripCredentialSwitch.bind(steering);
+        t.mock.method(steering, "maybeTripCredentialSwitch", (...args: Parameters<typeof trip>) => {
+          trip(...args);
+          if (built.steering.pendingCredentialSwitchOp()?.opId === "opY") ySeen.resolve();
+        });
+      }
+      return built;
+    });
+
+    // All probes delegate to production methods; admission must prove clone probes fire.
+    const calls = { claim: 0, reserve: 0, release: 0, settle: 0, settleLive: 0,
+      attach: 0, branch: 0, seed: 0 };
+    const claimRun = client.claimRun.bind(client);
+    t.mock.method(client, "claimRun", (...args: Parameters<typeof claimRun>) => { calls.claim++; return claimRun(...args); });
+    const reserve = client.reserveRecoveryCapture.bind(client);
+    t.mock.method(client, "reserveRecoveryCapture", (...args: Parameters<typeof reserve>) => { calls.reserve++; return reserve(...args); });
+    const release = client.releaseRecoveryCustody.bind(client);
+    t.mock.method(client, "releaseRecoveryCustody", (...args: Parameters<typeof release>) => { calls.release++; return release(...args); });
+    const settle = client.settleRecoveryHold.bind(client);
+    t.mock.method(client, "settleRecoveryHold", (...args: Parameters<typeof settle>) => { calls.settle++; return settle(...args); });
+    const settleLive = client.settleRecoveryHoldLive.bind(client);
+    t.mock.method(client, "settleRecoveryHoldLive", (...args: Parameters<typeof settleLive>) => { calls.settleLive++; return settleLive(...args); });
+    const attach = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+    t.mock.method(m2Runner.git, "createOrAttachRunnerClone", (...args: Parameters<typeof attach>) => { calls.attach++; return attach(...args); });
+    const branch = m2Runner.git.runnerCloneForBranch.bind(m2Runner.git);
+    t.mock.method(m2Runner.git, "runnerCloneForBranch", (...args: Parameters<typeof branch>) => { calls.branch++; return branch(...args); });
+    const seedOwner = m2Runner.git as unknown as { seedRunnerClone(...args: unknown[]): Promise<unknown> };
+    const seed = seedOwner.seedRunnerClone.bind(seedOwner);
+    t.mock.method(seedOwner, "seedRunnerClone", (...args: unknown[]) => { calls.seed++; return seed(...args); });
+
+    t.mock.method(client, "registrationNonce", () => "repeat-registration");
+    t.mock.method(client, "supportsInPlaceCodexCredentialSwitch", () => true);
+    t.mock.method(client, "supportsCodexSwitchStopped", () => true);
+    const hasFeature = client.hasFeature.bind(client);
+    t.mock.method(client, "hasFeature", (name: string) => name === "credential_switch_hold" || hasFeature(name));
+    t.mock.method(client, "getRunOwnership", async () => ({
+      status: "running", claim_generation: 7, claim_released: false, hold_reason: null,
+    }));
+    t.mock.method(client, "getInputs", async () => ({ inputs: [], nowSummary: false,
+      ...(pending ? { credentialSwitch: { generation: 7, op_id: pending,
+        target_secret_id: pending === "opX" ? "repeat-B-target" : "repeat-C-target" } } : {}),
+      ...(cancelled ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+    }));
+    t.mock.method(client, "preflightCodexCredentialSwitch", async (...args: Parameters<WorkerClient["preflightCodexCredentialSwitch"]>) => {
+      const [id, req] = args;
+      const ordinal = applies + 1;
+      assert.equal(id, claim.run_id);
+      assert.equal(req.claimGeneration, 7);
+      assert.equal(req.registerNonce, "repeat-registration");
+      assert.equal(req.opId, ordinal === 1 ? "opX" : "opY");
+      assert.equal(req.targetSecretId, ordinal === 1 ? "repeat-B-target" : "repeat-C-target");
+      const epoch = 40 + ordinal;
+      preflights.push({ op: req.opId, epoch });
+      return { kind: "ready", expectedEpoch: epoch, claimGeneration: 7,
+        registerNonce: req.registerNonce, opId: req.opId };
+    });
+    // Reuse FakeAPI's actual feed insertion and ordinal accounting, without
+    // pretending its token-only HTTP apply route returns Codex credentials.
+    const applyServer = api as unknown as {
+      applySwitch(id: string, op: string, token: string): { ordinal: number; messageSeq: number; replay: boolean };
+    };
+    t.mock.method(client, "applyCredentialSwitch", async (...args: Parameters<WorkerClient["applyCredentialSwitch"]>) => {
+      const [id, req] = args;
+      const ordinal = applies + 1;
+      assert.equal(req.claimGeneration, 7);
+      assert.equal(req.registerNonce, "repeat-registration");
+      assert.equal(req.opId, ordinal === 1 ? "opX" : "opY");
+      if (ordinal === 2) {
+        assert.equal(reconciledB, 1);
+        assert.ok(bRefreshCalls > 0, "subscription B bridge reconciled before C apply");
+      }
+      const predecessor = rig.epochs[ordinal - 1]!;
+      assert.ok(predecessor.reaped() > 0);
+      assert.ok(predecessor.disposed() > 0);
+      assert.ok(files[ordinal - 1]!.disposed() > 0);
+      assert.ok(disposedEffects.has(ordinal - 1));
+      const ack = applyServer.applySwitch(id, req.opId, "");
+      assert.equal(ack.ordinal, ordinal);
+      assert.equal(ack.replay, false);
+      pending = undefined;
+      applies++;
+      results.push({ ordinal, epoch: 41 + ordinal, seq: ack.messageSeq });
+      return { kind: "codex_applied", codex: ordinal === 1 ? bClaim : cClaim,
+        ordinal: ack.ordinal, capabilityEpoch: 41 + ordinal, messageSeq: ack.messageSeq, replay: false };
+    });
+    const post = client.postMessages.bind(client);
+    t.mock.method(client, "postMessages", async (...args: Parameters<typeof post>) => {
+      const reply = await post(...args);
+      const feed = api.messages(claim.run_id);
+      for (const [label, ordinal, barrier] of [["B", 1, bObserved], ["C", 2, cObserved]] as const) {
+        if (feed.some(m => m.payload.text === `repeat ${label} output` && m.credential_epoch_ordinal === ordinal) &&
+            feed.some(m => m.payload.event === "codex_response_usage" && m.credential_epoch_ordinal === ordinal))
+          barrier.resolve();
+      }
+      return reply;
+    });
+
+    const stopOwnedRun = () => {
+      pending = undefined;
+      cancelled = true;
+      allowBEnd.resolve(); finishBReap.resolve(); allowCEnd.resolve();
+      runner.shutdown();
+      for (let i = 0; i < rig.epochs.length; i++)
+        rig.epochs[i]!.transport.push(turnCompleted("interrupted", savedId, `repeat-${["A", "B", "C"][i]}-turn`));
+    };
+    t.signal.addEventListener("abort", stopOwnedRun, { once: true });
+    const running = runner.execute(claim);
+    // Attach a rejection handler immediately; finally still joins the original promise.
+    void running.catch(() => undefined);
+    let cleanupResults: PromiseSettledResult<unknown>[] = [];
+    try {
+      await awaitOwnerExecutorEntry(aEntered.promise, running, t.signal,
+        () => JSON.stringify({ applies, factories, launches: rig.providerLaunches() }));
+      assert.ok(flight);
+      const admitted = flight;
+      const identity = { attempt: admitted.attemptId, clone: admitted.runnerClone };
+      assert.ok(identity.clone, "real admitted clone has a physical identity");
+      assert.equal(identity.clone.path, worktree);
+      const allocation = { ...calls }, reportStart = reports.length;
+      assert.ok(allocation.attach > 0 && allocation.branch > 0 && allocation.seed > 0);
+      const directory = path.dirname(worktree), members = (await fs.readdir(directory)).sort();
+      pending = "opX";
+      await withTimeout(bObserved.promise, 5000, "B output and live usage delivered before Y").catch(error => {
+        throw new Error(JSON.stringify({ applies, hooks, switches, preflights, releases,
+          launches: rig.providerLaunches(), reports, pending,
+          methods: rig.epochs.map(epoch => epoch.transport.requests.slice(-10).map(request => request.method)),
+          messages: api.messages(claim.run_id).slice(-8).map(message => ({ kind: message.kind,
+            ordinal: message.credential_epoch_ordinal, event: rec(message.payload).event })),
+        }), { cause: error });
+      });
+      assert.equal(applies, 1);
+      assert.deepEqual(releases, [{ seq: results[0]!.seq, ok: true }],
+        "first result really releases the held B publication");
+      assert.equal(results[0]!.epoch, 42);
+      const bAuthority = (executor as unknown as {
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+      }).currentCodexAuthority;
+      assert.equal(bAuthority.ordinal, 1);
+      assert.equal(bAuthority.capabilityEpoch, 42);
+      assert.equal(bAuthority.binding.capability, bClaim.capability);
+      const bScope = flight.operationScope;
+      assert.ok(bScope, "subscription B owns an operation scope");
+      pending = "opY";
+      await withTimeout(ySeen.promise, 5000, "production steering records Y before B ends");
+      assert.equal(flight.steering.pendingCredentialSwitchOp()?.opId, "opY");
+      allowBEnd.resolve();
+      await withTimeout(bReapEntered.promise, 5000, "B reap begins before C apply");
+      await tick(); // Let already-runnable continuations observe the held reap, without a clock wait.
+      assert.equal(bReapCompleted, false);
+      assert.equal(applies, 1, "C apply stays gated while B reap is unresolved");
+      assert.equal(cMaterialReads, 0, "C material stays gated while B reap is unresolved");
+      assert.equal(rig.providerLaunches(), 2);
+      finishBReap.resolve();
+      await withTimeout(cObserved.promise, 5000, "C output and live usage delivered").catch(error => {
+        throw new Error(JSON.stringify({ applies, hooks, switches, preflights, releases, reconciledB, bRefreshCalls,
+          launches: rig.providerLaunches(), reports, pending,
+          methods: rig.epochs.map(epoch => epoch.transport.requests.slice(-10).map(request => request.method)),
+          messages: api.messages(claim.run_id).slice(-8).map(message => ({ kind: message.kind,
+            ordinal: message.credential_epoch_ordinal, event: rec(message.payload).event })),
+        }), { cause: error });
+      });
+      assert.equal(cancelled, false, "owner cancellation stays disabled throughout the proof");
+      assert.deepEqual(preflights, [{ op: "opX", epoch: 41 }, { op: "opY", epoch: 42 }]);
+      assert.deepEqual(results.map(r => [r.ordinal, r.epoch]), [[1, 42], [2, 43]]);
+      assert.equal(releases.length, 2);
+      assert.ok(releases.every((r, i) => r.ok && r.seq === results[i]!.seq));
+      assert.ok(results[1]!.seq > results[0]!.seq);
+      assert.equal(factories, 1);
+      assert.equal(applies, 2);
+      assert.equal(hooks, 2);
+      assert.equal(switches.length, 2);
+      assert.equal(fresh, 0);
+      assert.equal(flights.length, 1);
+      assert.ok(flights[0] === admitted, "same original flight identity");
+      assert.ok(flight === admitted, "same observed flight identity");
+      assert.equal(flight.claimGeneration, 7);
+      assert.equal(flight.attemptId, identity.attempt);
+      assert.ok(flight.runnerClone === identity.clone, "same original clone identity");
+      assert.equal(flight.runnerClone?.path, worktree);
+      assert.deepEqual(calls, allocation, "no extra claim, clone, custody or settlement in the window");
+      assert.equal(reports.slice(reportStart).some(status => status.startsWith("credential_switch") ||
+        ["queued", "claimed", "paused"].includes(status)), false, "no release/reclaim/hold state transition");
+      assert.deepEqual((await fs.readdir(directory)).sort(), members);
+      assert.equal(await fs.readFile(path.join(worktree, "repeat-retained.txt"), "utf8"), "A retained work");
+      assert.equal(rig.providerLaunches(), 3);
+      assert.deepEqual(admissions.map(a => a.cwd), [worktree, worktree, worktree]);
+      assert.equal(new Set(admissions.map(a => a.home)).size, 3);
+      assert.equal(adopted.length, 3);
+      assert.equal(new Set(adopted).size, 3);
+      for (const index of [1, 2]) {
+        const requests = rig.epochs[index]!.transport.requests;
+        assert.deepEqual(requests.filter(r => r.method === "thread/resume").map(r => rec(r.params).threadId), [savedId]);
+        assert.equal(requests.some(r => r.method === "thread/start"), false);
+        const login = requests.find(r => r.method === "account/login/start");
+        assert.ok(login);
+        assert.equal(rec(login.params).type, index === 1 ? "chatgptAuthTokens" : "apiKey");
+        assert.equal(rec(login.params)[index === 1 ? "accessToken" : "apiKey"],
+          index === 1 ? bClaim.access_token : cClaim.access_token);
+        assert.equal(rec(login.params).chatgptAccountId, index === 1 ? bClaim.chatgpt_account_id : undefined);
+      }
+      const feed = api.messages(claim.run_id);
+      for (const ordinal of [1, 2]) {
+        const usage = feed.filter(m => m.payload.event === "codex_response_usage" && m.credential_epoch_ordinal === ordinal);
+        assert.equal(usage.length, 1);
+        assert.equal(rec(usage[0]!.payload.usage).input_tokens, ordinal * 200);
+        assert.equal(rec(usage[0]!.payload.usage).output_tokens, ordinal * 100);
+      }
+      assert.equal(feed.some(m => m.payload.event === "resume_lineage_break"), false);
+      const authority = (executor as unknown as {
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+      }).currentCodexAuthority;
+      assert.equal(authority.ordinal, 2);
+      assert.equal(authority.capabilityEpoch, 43);
+      assert.equal(authority.binding.capability, cClaim.capability);
+      assert.ok(authority !== bAuthority, "C has a distinct immutable authority");
+      assert.throws(() => bAuthority.assertCurrent(), /retired/);
+      await assert.rejects(bScope.prepare("root", new AbortController().signal, () => {}), /closed/,
+        "retained B scope refuses dispatch after C publication");
+      assert.equal(flight.operationScope, undefined, "API-key C carries no subscription scope");
+    } finally {
+      stopOwnedRun();
+      try {
+        cleanupResults = await Promise.allSettled([running]);
+        // The run has joined: consume every continuation, including jobs appended during shutdown.
+        let joinedJobs = 0;
+        while (joinedJobs < jobs.length) {
+          const batch = jobs.slice(joinedJobs);
+          joinedJobs += batch.length;
+          cleanupResults.push(...await Promise.allSettled(batch));
+        }
+      } finally {
+        t.signal.removeEventListener("abort", stopOwnedRun);
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+    for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
 });

@@ -22,6 +22,7 @@ import { isTerminalRun } from "../lib/runStatus";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useSeededCredential } from "../lib/useSeededCredential";
 import { TokenPicker } from "./TokenPicker";
+import { CodexCredentialSwitch } from "./CodexCredentialSwitch";
 import { Alert, Badge, Button } from "./ui";
 
 // overrideText renders the chosen override's mode plus, for a pin, its snapshotted
@@ -119,7 +120,7 @@ export function SwitchTokenAction({
   canSteer,
   tokens,
   onSwitched,
-  triggerLabel = "Switch token",
+  triggerLabel,
 }: {
   run: Run;
   canSteer: boolean;
@@ -150,11 +151,11 @@ export function SwitchTokenAction({
   const [error, setError] = useState("");
   const [warning, setWarning] = useState("");
 
-  // The refused lanes 409 server-side; a terminal run cannot switch; a Codex run 422s
-  // (Fix 2, M4a review — D5: a Codex run cannot carry an Anthropic-only override, so
-  // there is no token to switch). Hide the control rather than render a button that
-  // fails. (Checked after the hooks so hook order is stable across renders.)
-  if (isCredentialSwitchRefusedLane(run) || isTerminalRun(run.status) || run.harness === "codex") return null;
+  if (run.harness === "codex") return <CodexCredentialSwitch run={run} canSteer={canSteer} tokens={tokens} triggerLabel={triggerLabel} onSwitched={onSwitched} />;
+
+  // Anthropic refused lanes and terminal runs remain hidden. Check after hooks
+  // so hook order stays stable when the harness changes.
+  if (isCredentialSwitchRefusedLane(run) || isTerminalRun(run.status)) return null;
 
   if (!canSteer) {
     return <span className="text-xs text-muted">Only the run&rsquo;s owner can switch its token.</span>;
@@ -210,7 +211,7 @@ export function SwitchTokenAction({
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        {triggerLabel}
+        {triggerLabel ?? "Switch token"}
       </Button>
       {open && (
         <div className="w-72 max-w-full space-y-2 rounded-lg border border-edge bg-surface p-3">

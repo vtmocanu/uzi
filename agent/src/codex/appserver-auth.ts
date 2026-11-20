@@ -67,6 +67,16 @@ export type CodexAppServerAuthConfig =
       readonly assertRefreshAdmission?: () => void;
     };
 
+/** A secret-free, single-owner reversible admission fence. */
+export interface CodexAuthSuspensionLease {
+  /** Join exchanges started before suspension, including raw bridge settlement. */
+  drain(): Promise<void>;
+  /** Assert the session can still authorize live execution; drain alone only joins owners. */
+  assertHealthy(): void;
+  /** Idempotent; cannot reopen a closed or poisoned session. */
+  resume(): void;
+}
+
 /** Minimal composition seam consumed by run and advice harnesses. */
 export interface CodexAppServerAuthSession {
   readonly mode: CodexAppServerAuthMode;
@@ -80,6 +90,10 @@ export interface CodexAppServerAuthSession {
   ): Promise<boolean>;
   /** Wait for every auth request already accepted by the read-path interceptor. */
   drainInterceptedRequests(): Promise<void>;
+  /** Synchronously suspend new exchanges. Overlapping leases are refused. */
+  suspendRefreshAdmission(): CodexAuthSuspensionLease;
+  /** After root reap proof, close admission without cancelling shared refresh and join all owners. */
+  settleReapedAuth(): Promise<void>;
   /** Permanently close auth admission and cancel an active refresh. Drain separately,
    *  after the owner closes transport and rejects any pending startup RPC. */
   closeAdmissionAndCancel(): void;
@@ -141,6 +155,9 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
   private retainedOperationId?: string;
   private activeRefresh?: ActiveRefresh;
   private readonly interceptedTasks = new Set<Promise<void>>();
+  private readonly exchangeTasks = new Set<Promise<void>>();
+  private suspension?: object;
+  private readonly admissionWaiters = new Set<() => void>();
   private interceptedCount = 0;
   private interceptedBytes = 0;
   private interceptedClosed = false;
@@ -208,7 +225,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       this.poisonAndRespond(transport, note.requestId, "codex api-key session received a subscription refresh request");
     }
     this.validateRefreshParams(transport, note.requestId, note.params);
-    const task = this.handleRefresh(transport, note.requestId, signal);
+    const task = this.dispatchRefresh(transport, note.requestId, signal);
     const owned = task.catch((error: unknown) => {
       if (error instanceof CodexAppServerAuthError && error.poisoned) this.recordInterceptedFailure(error);
     });
@@ -226,8 +243,79 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     if (this.interceptedFailure !== undefined) throw this.interceptedFailure;
   }
 
+  suspendRefreshAdmission(): CodexAuthSuspensionLease {
+    if (this.interceptedClosed || this.state === "poisoned") {
+      throw transportError("codex authentication request admission is closed");
+    }
+    // One lease avoids one preflight accidentally resuming another owner's fence.
+    if (this.suspension !== undefined) throw transportError("codex authentication admission is already suspended");
+    const token = {};
+    this.suspension = token;
+    const started = [...this.exchangeTasks];
+    return {
+      drain: async () => { await Promise.all(started); },
+      assertHealthy: () => {
+        if (this.interceptedClosed || this.state === "poisoned" || this.interceptedFailure !== undefined)
+          throw transportError("codex authentication request admission is closed");
+      },
+      resume: () => {
+        if (this.suspension !== token) return;
+        this.suspension = undefined;
+        this.wakeAdmissionWaiters();
+      },
+    };
+  }
+
+  async settleReapedAuth(): Promise<void> {
+    this.interceptedClosed = true;
+    this.wakeAdmissionWaiters();
+    // Startup may itself add raw bridge ownership. Join it before the final owner
+    // drain. Closure wakes queued callbacks to refuse rather than start exchanges.
+    await Promise.allSettled([this.startup]);
+    // Admission is permanently closed; only already-started owners can remain.
+    // Failures do not skip sibling owners, and raw bridges retain actual settlement.
+    while (this.interceptedTasks.size > 0 || this.exchangeTasks.size > 0) {
+      await Promise.allSettled([...this.interceptedTasks, ...this.exchangeTasks]);
+    }
+  }
+
+  private wakeAdmissionWaiters(): void {
+    for (const wake of this.admissionWaiters) wake();
+  }
+
+  private async dispatchRefresh(
+    transport: CodexTransport,
+    requestId: number | string,
+    signal?: AbortSignal,
+    queuedAtAdmission = false,
+  ): Promise<void> {
+    // Validate at the call sites before waiting; queued frames retain no auth hints.
+    const queued = queuedAtAdmission || this.suspension !== undefined;
+    while (this.suspension !== undefined && !this.interceptedClosed && this.state !== "poisoned" && !signal?.aborted) {
+      await new Promise<void>((resolve) => {
+        const wake = (): void => {
+          this.admissionWaiters.delete(wake);
+          signal?.removeEventListener("abort", wake);
+          resolve();
+        };
+        this.admissionWaiters.add(wake);
+        signal?.addEventListener("abort", wake, { once: true });
+      });
+    }
+    if (this.interceptedClosed || this.state === "poisoned" || (queued && signal?.aborted)) {
+      this.safeErrorResponse(transport, requestId, REFRESH_FAILED_CODE, "codex authentication refresh unavailable");
+      return;
+    }
+    const task = this.handleRefresh(transport, requestId, signal);
+    const owned = task.then(() => {}, () => {});
+    this.exchangeTasks.add(owned);
+    try { await task; }
+    finally { this.exchangeTasks.delete(owned); }
+  }
+
   closeAdmissionAndCancel(): void {
     this.interceptedClosed = true;
+    this.wakeAdmissionWaiters();
     this.activeRefresh?.abort();
   }
 
@@ -419,13 +507,14 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
   }
 
   private async handlePumpedRefresh(transport: CodexTransport, requestId: number | string): Promise<void> {
+    const queuedAtAdmission = this.suspension !== undefined;
     const startup = this.startup;
     if (startup === undefined) throw protocolError("codex authentication startup is unavailable");
     await startup;
     if (this.state !== "ready" || this.transport !== transport) {
       throw protocolError("codex authentication refresh arrived outside the active session");
     }
-    await this.handleRefresh(transport, requestId);
+    await this.dispatchRefresh(transport, requestId, undefined, queuedAtAdmission);
   }
 
   private getOrStartRefresh(signal?: AbortSignal): ActiveRefresh {
@@ -490,8 +579,10 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       let owned!: Promise<void>;
       owned = bridgeWork.then(() => {}, () => {}).finally(() => {
         this.interceptedTasks.delete(owned);
+        this.exchangeTasks.delete(owned);
       });
       this.interceptedTasks.add(owned);
+      this.exchangeTasks.add(owned);
       const value = await Promise.race([
         bridgeWork,
         deadline,
@@ -547,6 +638,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
 
   private poison(): void {
     this.state = "poisoned";
+    this.wakeAdmissionWaiters();
     this.activeRefresh?.abort();
   }
 
