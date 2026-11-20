@@ -174,7 +174,17 @@ for the unavailable reason:
   maintenance owner-hold window is in force by its clock, and nudges once when
   that window ends. If the condition that made the run pinnable ends early (the
   drain is cleared, or the worker row is deleted or replaced), the single nudge
-  comes at `updated_at + WORKER_AFFINITY_CEILING`. If the hold began through
+  comes at `updated_at + WORKER_AFFINITY_CEILING`. (Amended by #4507: when the
+  health detector observes the owner hold in force during the episode, it persists
+  a per-episode marker on the run, `runs.health_owner_hold_since`, valid only for
+  the current episode, and the single nudge then waits for that ceiling even if the
+  stale-requeue grace expired earlier and the drain then cleared. An episode held
+  only by the stale pin still nudges once at grace expiry. Only owner holds the
+  detector observed and committed are remembered: a hold that starts and clears
+  between two health ticks, or whose marker write fails, falls back to the earlier
+  timing, the stale-grace end when the stale pin covered the episode, otherwise the
+  affinity ceiling. Notification timing only; admission, custody, credentials and
+  run state are unaffected.) If the hold began through
   another quiet transition (leaving a maintenance intake pause, a Codex admission
   wait, or a reserve), it also nudges once at that point, and never if that ceiling
   had already passed when the episode began (the same as other `waiting_worker`
@@ -184,12 +194,6 @@ for the unavailable reason:
 - The **unavailable** reason never resolves on its own, so it nudges on entry from
   any state (the nudge cooldown still applies). This is a deliberate exception to
   D12.
-
-Known timing limitation, deferred from #4500: if stale-requeue grace overlaps an
-owner hold and that hold clears after grace expires, the expired stale window
-can trigger the nudge before the intended ceiling fallback. Distinguishing that
-history from a stale-only episode needs a follow-up design. Admission, custody
-and run state are unaffected.
 
 Alarm effect: `queue.waiting` and `fleet.capacity` exclude only reasons `LIKE
 'waiting until %'`, and their code is unchanged. Held runs therefore now count as
