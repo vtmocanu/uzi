@@ -67,9 +67,11 @@ function renderRun(run: ReturnType<typeof aRun>, now = NOW) {
 
 describe("OverviewRunRow title and badges", () => {
   it("strips bidi and zero-width characters out of the forge-supplied title (#124)", () => {
-    const { container } = renderRun(aRun({ issue_title: "Fix the \u202Eparser\u200B bug" }));
+    const { container } = renderRun(aRun({ issue_title: "Fix the \u202Eparser\u200B bug", issue_iid: 7 }));
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+    // The link's accessible name is a separate sink for the same untrusted title.
+    expect(screen.getByRole("link").getAttribute("aria-label")).toBe("Open run for issue #7: Fix the parser bug");
   });
 
   it("shows a compact M{done}/{total} badge on a milestone-structured run (PRD #122)", () => {
