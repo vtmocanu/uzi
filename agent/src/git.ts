@@ -29432,10 +29432,13 @@ try {
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
   private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed",
     runId?: string): Promise<void> {
+    if (directoryName === REFUSAL_DIRECTORY && (typeof runId !== "string" || !OWED_RUN_ID.test(runId))) {
+      throw new Error("refusal metadata writes need a valid run id");
+    }
     const dir = await this.ensureOwedDirectory(barePath, directoryName);
     // issue #4481: a refusal-directory temp carries its run, so a stranded temp of one run never blocks another;
     // the uzi-owed validator accepts only `.tmp-<uuid>`, so that directory keeps the untagged name.
-    const temp = path.join(dir, directoryName === REFUSAL_DIRECTORY && runId !== undefined
+    const temp = path.join(dir, directoryName === REFUSAL_DIRECTORY
       ? `.tmp-${runId}-${randomUUID()}` : `.tmp-${randomUUID()}`);
     const file = await fs.open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT |
       fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
@@ -29507,8 +29510,9 @@ try {
 
   /** Caller MUST hold the bare lock: the count-then-pin below is only atomic under it. Every
    *  pin-producing path (fetchAgentBranch, promoteTrackingUnderLock, clearConflictingAncestorTrackingRefs,
-   *  retainCurrentOwedCandidate) funnels through here. The check precedes every write, so a refusal
-   *  leaves the existing pins, metadata and refs untouched. */
+   *  retainCurrentOwedCandidate) funnels through here. At the cap a NEW pin is refused with
+   *  OwedCandidateLimitError after the refusal evidence is recorded (recordRefusalUnderLock); no pin, candidate
+   *  record or context is written, and the existing pins and refs are left untouched. */
   private async pinOwedUnderLock(c: StoredOwedContext, sha: string, refusalPath: RefusalPath): Promise<void> {
     await this.assertBareClear(c.barePath, "owed-pin");
     await this.requireOwedCommit(c.barePath, sha);
@@ -29609,7 +29613,9 @@ try {
     const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
     for (const item of config.split("\0")) {
       const nl = item.indexOf("\n");
-      if ((nl < 0 ? item : item.slice(0, nl)).toLowerCase() === "extensions.refstorage") throw new Error("refusal stages: non-files ref backend");
+      // Only an explicit `files` is the files backend; an empty or absent value is not.
+      if ((nl < 0 ? item : item.slice(0, nl)).toLowerCase() === "extensions.refstorage" &&
+          (nl < 0 ? "" : item.slice(nl + 1)).trim().toLowerCase() !== "files") throw new Error("refusal stages: non-files ref backend");
     }
     try {
       await fs.lstat(path.join(barePath, "reftable"));
@@ -29873,13 +29879,8 @@ try {
         const cleanup = read.value;
         if (cleanup.runId !== R || cleanup.generation !== G || cleanup.branch !== context.branch ||
             cleanup.barePath !== barePath || (final && final.evidenceDigest !== cleanup.finalDigest)) return retain;
-        // A listed (generation, head) pair that is gone from the ledger while the same head sits at ANOTHER
-        // generation was rebound (also to G+1). A row of the same head at another generation that coexists with the
-        // listed pair is a different row and does not retain G.
-        for (const x of cleanup.ledgerEntries) {
-          const rows = (ledger?.entries ?? []).filter((e) => e.sha === x.sha);
-          if (rows.length && !rows.some((e) => e.generation === x.generation)) return retain;
-        }
+        // The ledger is keyed by (generation, sha): a row of the same head at another generation is a different row,
+        // never touched by this intent (deletions are exact pairs and listed stages are <= G, tip-checked).
         // The intent must still prove itself: its own lists hash to the sealed digest, and every listed stage
         // is a ref of this run at a generation <= G whose tip the intent's ledger entries cover.
         const stageRef = new RegExp(`^refs/uzi-incoming/${R}/(0|[1-9][0-9]*)/[A-Za-z0-9._-]+$`);

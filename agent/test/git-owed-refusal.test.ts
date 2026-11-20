@@ -675,13 +675,36 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     return state;
   }
 
-  it("F2: a listed ledger entry rebound to generation G+1 after the intent was written is retained", async () => {
+  it("F2: a head ledgered at G and again at G+1 after the intent was written: G's cleanup removes only the (G, head) row", async () => {
     const { cover, refused } = await intentWritten();
     const ledger = readJson(ledgerName);
-    writeRaw(ledgerName, { ...ledger, entries: ledger.entries.map((e: any) => e.sha === refused ? { ...e, generation: 2 } : e) });
-    const before = evidence() + JSON.stringify(pinRefs());
-    assert.equal(await cleanup(cover), "retained");
-    assert.equal(evidence() + JSON.stringify(pinRefs()), before, "nothing was deleted");
+    const row = ledger.entries.find((e: any) => e.sha === refused);
+    writeRaw(ledgerName, { ...ledger, entries: [...ledger.entries, { ...row, generation: 2 }] });
+    assert.equal(await cleanup(cover), "removed");
+    assert.deepEqual(incomingRefs(), [], "the listed stages are gone");
+    assert.deepEqual(readJson(ledgerName).entries.map((e: any) => [e.generation, e.sha]), [[2, refused]], "only (G, head) was removed");
+    assert.deepEqual(refusalFiles().filter((n) => n.startsWith("final-") || n.startsWith("cleanup-")), []);
+    // The later generation's evidence is untouched and its own gate still demands that head be covered.
+    assert.equal(await cache.admitRefusalProvenance({ ...ctx, generation: 2 }), "written");
+    const uncovered = await gate(base, 2);
+    assert.equal(uncovered.kind, "ineligible");
+    assert.match((uncovered as { reason: string }).reason, new RegExp(`refused head ${refused} is not covered`));
+    assert.match((await gate(coverOf([gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`])]), 2) as { reason: string }).reason, new RegExp(`refused head ${refused} is not covered`));
+    assert.equal((await gate(coverOf([gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]), refused]), 2)).kind, "eligible");
+  });
+
+  it("a crash in G's cleanup tail after the ledger rewrite is not permanent when the head is also ledgered at G+1", async () => {
+    const { cover, refused } = await intentWritten();
+    const ledger = readJson(ledgerName);
+    const row = ledger.entries.find((e: any) => e.sha === refused);
+    writeRaw(ledgerName, { ...ledger, entries: [...ledger.entries, { ...row, generation: 2 }] });
+    // The crashed pass got as far as the ledger rewrite: stages deleted, the (G, head) row removed, intent still on disk.
+    await cache["applyRefusalCleanup"](bare, readJson(`cleanup-${RUN}-1.json`), () => undefined);
+    assert.deepEqual(readJson(ledgerName).entries.map((e: any) => [e.generation, e.sha]), [[2, refused]]);
+    assert.ok(fs.existsSync(path.join(refDir(), `cleanup-${RUN}-1.json`)));
+    assert.equal(await cleanup(cover), "removed", "the resumed G cleanup completes");
+    assert.deepEqual(readJson(ledgerName).entries.map((e: any) => [e.generation, e.sha]), [[2, refused]], "the G+1 row is intact");
+    assert.deepEqual(refusalFiles().filter((n) => n.startsWith("final-") || n.startsWith("cleanup-")), []);
   });
 
   it("F5: an unrelated ref appended to the cleanup intent is retained and not deleted", async () => {
@@ -1028,10 +1051,80 @@ describe("issue4481 refusal stage listing is cross-checked against loose refs", 
     fs.symlinkSync("/does/not/exist", path.join(looseDir(), "link"));
     assert.equal((await gate(cover)).kind, "ineligible");
     fs.rmSync(path.join(looseDir(), "link"));
-    putLoose("unlisted", `${base}\n`);
-    assert.equal((await gate(cover)).kind, "ineligible", "a well-formed loose ref the listing does not show");
-    fs.rmSync(path.join(looseDir(), "unlisted"));
+    putLoose("extra", `${base}\n`);
+    assert.equal((await gate(cover)).kind, "ineligible", "a well-formed loose stage that git lists but no ledger entry covers");
+    fs.rmSync(path.join(looseDir(), "extra"));
     assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  /** Wrap the one git listing of the run's stage refs so a test can shape what git "said". */
+  const stubListing = (shape: (out: { stdout: string; stderr: string }) => { stdout: string; stderr: string }): (() => void) => {
+    const internals = cache as unknown as { execScoped: (cmd: string, args: string[], ...rest: unknown[]) => Promise<{ stdout: string; stderr: string }> };
+    const original = internals.execScoped;
+    internals.execScoped = async function (this: unknown, cmd, args, ...rest) {
+      const out = await original.call(cache, cmd, args, ...rest);
+      return Array.isArray(args) && args.includes("for-each-ref") && args.some((a) => String(a).startsWith(`refs/uzi-incoming/${RUN}/`)) ? shape(out) : out;
+    };
+    return () => { internals.execScoped = original; };
+  };
+
+  it("a stderr line from the stage listing alone makes the gate ineligible", async () => {
+    const { cover } = await eligibleState();
+    assert.equal((await gate(cover)).kind, "eligible");
+    const restore = stubListing((out) => ({ stdout: out.stdout, stderr: "warning: ignoring broken ref\n" }));
+    try { assert.equal((await gate(cover)).kind, "ineligible"); } finally { restore(); }
+    assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  it("a listing oid that differs from the loose ref file alone makes the gate ineligible", async () => {
+    const kept = await atCap();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    const h0 = await refuse("refused-a"), h1 = await refuse("refused-b");
+    const cover = coverOf([...kept, h0, h1]);
+    assert.equal((await gate(cover)).kind, "eligible");
+    // Both heads stay ledgered and covered; only the listed oids are swapped against the files on disk.
+    const swap = (line: string): string => line.replace(h0, "@").replace(h1, h0).replace("@", h1);
+    const restore = stubListing((out) => ({ stdout: out.stdout.split("\n").map(swap).join("\n"), stderr: out.stderr }));
+    try { assert.equal((await gate(cover)).kind, "ineligible"); } finally { restore(); }
+    assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  describe("only the files ref backend is trusted", () => {
+    const configPath = (): string => path.join(bare, "config");
+    const withConfig = async (extra: string, expected: "eligible" | "ineligible", formatVersion1 = false): Promise<void> => {
+      const { cover } = await eligibleState();
+      assert.equal((await gate(cover)).kind, "eligible");
+      const original = fs.readFileSync(configPath());
+      // Git only honours a v1 extension in a version 1 repository, so the guard cases keep version 0 and git itself stays quiet.
+      fs.writeFileSync(configPath(), (formatVersion1 ? original.toString().replace("repositoryformatversion = 0", "repositoryformatversion = 1") : original.toString()) + extra);
+      try { assert.equal((await gate(cover)).kind, expected); } finally { fs.writeFileSync(configPath(), original); }
+      assert.equal((await gate(cover)).kind, "eligible");
+    };
+
+    // Real git rejects most refstorage configs itself, so the guard is isolated by reporting the value to it alone.
+    const reportingConfig = async (value: string, expected: "eligible" | "ineligible"): Promise<void> => {
+      const { cover } = await eligibleState();
+      const internals = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+      const original = internals.runGit;
+      internals.runGit = async function (cwd, args, ...rest) {
+        const out = await original.call(cache, cwd, args, ...rest);
+        return args[0] === "config" && args.includes("--list") ? `${out}extensions.refstorage\n${value}\0` : out;
+      };
+      try { assert.equal((await gate(cover)).kind, expected); } finally { internals.runGit = original; }
+    };
+    it("a reported non-files refstorage value is ineligible", () => reportingConfig("reftable", "ineligible"));
+    it("a reported refstorage value of files is accepted", () => reportingConfig("files", "eligible"));
+
+    it("a reftable directory in the bare is ineligible", async () => {
+      const { cover } = await eligibleState();
+      fs.mkdirSync(path.join(bare, "reftable"));
+      assert.equal((await gate(cover)).kind, "ineligible");
+      fs.rmdirSync(path.join(bare, "reftable"));
+      assert.equal((await gate(cover)).kind, "eligible");
+    });
+    it("extensions.refstorage=reftable in the config file is ineligible", () => withConfig("[extensions]\n\trefstorage = reftable\n", "ineligible"));
+    it("an unset-looking extensions.refstorage value is ineligible", () => withConfig("[extensions]\n\trefstorage\n", "ineligible"));
+    it("an explicit extensions.refstorage=files is accepted (git itself rejects other spellings of the value)", () => withConfig("[extensions]\n\trefStorage = files\n", "eligible", true));
   });
 
   it("a broken loose stage makes the cleanup plan retain", async () => {

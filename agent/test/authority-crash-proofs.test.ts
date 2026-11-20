@@ -1239,10 +1239,18 @@ for (const nth of [1, 2, 3, 4]) {
     assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`));
     assertNoLoss(w, `after delete ${nth}`, true);
 
+    // The refusal-stage delete is a registered bare mutation (git-authority-hooks.ts "refusal-cleanup-delete-ref"). Its
+    // owner died before settling it, and no production path resolves a dead owner's running bare record by read-back
+    // (the same contract as proofs 2 and the recovery-cleanup-delete-ref records above): it stays running and fences every
+    // later writer on the bare until an operator discard. So the resumed cleanup is REFUSED, never completed on top of the
+    // unconfirmed delete, and it deletes no head's coverage.
     const s = await refusalSuccessor(w);
-    assert.equal(await resume(w, s, w.cover), "removed");
-    await allGone(w, "resumed");
-    assertNoLoss(w, "resumed", true);
+    assert.equal((await slotOf(s.rt, w.bare))?.pending?.status, "running", "the dead owner's delete is durable and unresolved");
+    await assert.rejects(resume(w, s, w.cover), /unresolved pending footprint/);
+    assert.equal((await slotOf(s.rt, w.bare))?.pending?.status, "running", "the refused resume settled nothing");
+    assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`) && rfFiles(w).includes(`final-${RF_RUN}-1.json`), "the sealed intent is kept");
+    assert.ok(incomingRefs(w).length <= 4 - nth, "the refused resume deleted no further stage");
+    assertNoLoss(w, "refused resume", true);
   });
 }
 
@@ -1316,7 +1324,8 @@ test("refusal proof 12b: SIGKILL after the cleanup intent is deleted; resuming k
   const [h] = w.heads as [string];
   await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
     { op: 3, kind: "unlink-after", match: "^cleanup-" });
-  assert.deepEqual(rfFiles(w), [`admission-${RF_RUN}-1.json`]);
+  // The owed-path marker is removed last (after the final and the intent), so it is still present at this crash point.
+  assert.deepEqual(rfFiles(w), [`admission-${RF_RUN}-1.json`, `owedpath-${RF_RUN}-1.json`]);
   assertNoLoss(w, "intent deleted", true);
   const s = await refusalSuccessor(w);
   assert.equal(await resume(w, s, w.cover), "removed");
