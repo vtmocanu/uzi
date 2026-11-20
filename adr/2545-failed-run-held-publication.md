@@ -335,7 +335,7 @@ release it because nothing proved the refused head was kept.
 - The head stays alive under a refused ref
   `refs/uzi-incoming/<run>/<generation>/refused-<sha>`. Only the fetch paths
   (P1, P2) also leave a run-attributed stage ref
-  `refs/uzi-incoming/<run>/<generation>/<uuid>`; P3-P7 leave only the
+  `refs/uzi-incoming/<run>/<generation>/import-<processNonce>-<uuid>`; P3-P7 leave only the
   refused ref.
 - It is recorded in a durable ledger under `<bare>/info/uzi-refusals/`.
   That directory is deliberate: older workers throw on unknown names in
@@ -368,7 +368,8 @@ no refusal for it was noted, an eighth direct recording call. A recording
 failure never changes what is thrown and claims nothing. The `refused-<sha>`
 ref write and the ledger append are independent steps: a failed ref write
 still attempts the ledger append. If either write fails, or the seal listing
-fails, or the ledger is invalid, unbound or full, the run is latched in-process
+fails, or the ledger is invalid, unbound or full, or the owed-path marker write
+fails, the run is latched in-process
 (`refusalRecordingFailed`) and its gate and seal are ineligible ("refusal
 recording failed in this process") for the worker process lifetime. The same
 failure (seal-directory read, refused-ref write or ledger write) also writes a
@@ -424,7 +425,7 @@ an ancestor of, or equal to, the release source (or pinned under
 refusal evidence, the pin count below the cap and no owed-path marker at or
 below G: the ordinary path, unchanged.
 The gate is consulted on every inventory-guarded release but is a no-op
-(`none`) for a run with no refusal evidence below the cap; a run with earlier
+(`none`) for a run with no refusal evidence below the cap and no owed-path marker; a run with earlier
 recorded refusals, or exactly at the cap, needs complete admissions even if its
 terminal fetch succeeded. The gate runs before the freeze, before archive capture or upload, before the
 held publish, and inside the coverage proof before every guarded FINAL.
@@ -486,9 +487,8 @@ itself: the digest recomputed from the intent's own lists must equal the
 seal's, every listed stage must be a ref in this run's namespace whose
 generation matches its ref path, is at most the releasing generation and
 whose tip a listed ledger entry covers, and no listed ledger entry may be at a
-later generation. Any current ledger entry for a listed head rebound to a
-different generation than the intent recorded (including a later one) retains.
-Any change in the evidence retains
+later generation. Cleanup matches exact (generation, sha) pairs, so a later
+generation's row for the same head survives. Any change in the evidence retains
 everything locally; this never undoes an already acknowledged release.
 
 **Census.** `info/uzi-refusals` entries named `refusals-`, `final-`, `cleanup-`,
@@ -508,8 +508,11 @@ recovery` or `uzi run discard`):
   `incomplete-<run>.json` marker) keeps the gate from answering `none`. A
   generation an older worker filled to the cap has no owed-path marker unless a
   refusal later happens on the new worker. Unguarded runs: a cap-filling pin
-  is refused on a bare lacking `info/` (default bares have it) and hibernation
-  is blocked from cap-fill until cleanup.
+  is refused on a bare lacking `info/` (default bares have it), and the
+  owed-path marker keeps the bare a refusal-records bare for the census until
+  generation cleanup removes it; for a run that never reaches recovery
+  generation cleanup (for example an unguarded run) it stays until the bare is
+  removed.
 - A refusal under a legacy or no-generation context keeps that run's hold and
   its cleanup closed permanently.
 - Older workers in a mixed fleet may treat a bare holding the new records as
@@ -528,7 +531,7 @@ recovery` or `uzi run discard`):
 
 **Owner-decided residual (2026-11-19).** Provenance gates only the automatic
 cap release (the gate itself is consulted on every inventory-guarded release but
-is a no-op without refusal evidence below the cap). An old worker's refused head
+is a no-op without refusal evidence below the cap and without an owed-path marker). An old worker's refused head
 that old code deleted leaves no trace; the ordinary release proceeds as today.
 This is pre-existing and accepted. Releases with no refusal evidence below the
 cap and no owed-path marker are not gated on admission records. The restart
@@ -549,10 +552,12 @@ residual that earlier text left open is closed by the owed-path marker above.
   than exactly `files`), or a loose ref under `refs/uzi-incoming/<run>/` that
   is a symlink, non-regular, malformed (including a symbolic `ref:`) or that
   disagrees with the listing makes the gate ineligible and cleanup retain.
-- **Authority for deletes.** Refusal-ref deletes (refused refs and import
-  stages) go through the registered bare-mutation authority, op
+- **Authority for deletes.** Sealed-cleanup deletes of refused refs and import
+  stages go through the registered bare-mutation authority, op
   `refusal-cleanup-delete-ref`, with read-back settlement
   (`agent/src/git-authority-hooks.ts`, `agent/src/bare-refusal-diagnostic.ts`).
+  Failed-acquisition and promotion-time stage deletes remain plain CAS
+  `update-ref -d`, as before.
 - **Import stages.** Import stages are named
   `refs/uzi-incoming/<run>/<gen>/import-<processNonce>-<uuid>`; evidence refs
   stay `refused-<sha>`. An import stage whose tip has a refused ref at the same
@@ -567,8 +572,8 @@ residual that earlier text left open is closed by the owed-path marker above.
   the sole anchor of a ledgered head, or on a boundary stop.
 - **Soft deadline.** The incoming head's refusal is recorded before the
   checkpoint soft-deadline return.
-- **Recovery.** A saved FINAL the api already accepted is acknowledged before
-  the refusal gate and sends nothing: an archive through an accepted-only
+- **Recovery.** When the refusal gate is ineligible, a saved FINAL the api
+  already accepted is acknowledged without sending a release: an archive through an accepted-only
   reconcile answer with an exact receipt; a settled or held release through an
   observed released hold whose receipt equals the saved request, with source
   proof and inactivity. New releases and mismatches stay gated. The residue
