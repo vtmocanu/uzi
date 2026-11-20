@@ -76,6 +76,15 @@ const pinRefs = (): string[] => gitIn(bare, ["for-each-ref", "--format=%(refname
 const gate = (head: string, g = 1, c: GitCache = cache, branch?: string): Promise<RefusalReleaseGate> => c.refusalReleaseGate(bare, RUN, g, head, branch);
 const evidence = (): string => JSON.stringify({ files: refusalFiles().map((n) => [n, fs.readFileSync(path.join(refDir(), n), "utf8")]), refs: incomingRefs() });
 const filesSnapshot = (): string => JSON.stringify(refusalFiles().map((n) => [n, fs.readFileSync(path.join(refDir(), n), "utf8")]));
+/** Every candidate, context and other owed metadata file (bare/uzi-owed), so a retain that writes owed metadata is seen. */
+const owedSnapshot = (): string => {
+  const dir = path.join(bare, "uzi-owed");
+  if (!fs.existsSync(dir)) return "[]";
+  return JSON.stringify(fs.readdirSync(dir).sort().map((n) => {
+    const full = path.join(dir, n);
+    return [n, fs.statSync(full).isFile() ? fs.readFileSync(full, "utf8") : "<dir>"];
+  }));
+};
 const withContext = (generation: number): FetchAgentBranchOptions => ({ ...opts, context: { ...opts.context, generation } as FetchAgentBranchOptions["context"] });
 
 async function rewriteTimes(n: number): Promise<string[]> {
@@ -1481,6 +1490,8 @@ describe("issue4481 a failed import deletes its own attributed stage", { timeout
     it("the real import is a live import between its two lock sections and not after it completes", async () => {
       scommit("next head");
       const gateAt = (): Promise<RefusalReleaseGate> => cache.refusalReleaseGate(sbare, SRUN, 1, sbase);
+      const finished = (cache as unknown as { finishedImportStages: Set<string> }).finishedImportStages;
+      const finishedBefore = [...finished];
       let between: RefusalReleaseGate | undefined;
       let phases = 0;
       const observing: FetchAgentBranchOptions = { ...sopts, withSourceAuthority: async <T>(action: () => Promise<T>) => {
@@ -1493,6 +1504,7 @@ describe("issue4481 a failed import deletes its own attributed stage", { timeout
       assert.equal(live.size, 0, "the entry is removed when the import completes");
       // Asserted before the gate runs: the gate itself reconciles a finished import stage, so after it a surviving stage would be gone.
       assert.deepEqual(sincoming(), [], "the completed import's stage is deleted by the import, not by the gate");
+      assert.deepEqual([...finished], finishedBefore, "a stage the import deleted is not recorded as a finished producer");
       assert.deepEqual(await gateAt(), { kind: "none" });
     });
 
@@ -1791,20 +1803,22 @@ describe("issue4481 retainCurrentOwedCandidate is fenced by the seal of the gene
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, coverOf([...kept, refused])), "sealed");
     assert.ok(refusalFiles().includes(`final-${RUN}-1.json`));
     dropTrackingPin(kept);
-    const pins = pinRefs(), files = filesSnapshot();
+    const pins = pinRefs(), files = filesSnapshot(), owed = owedSnapshot();
     assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "ownership_unknown" });
     assert.deepEqual(pinRefs(), pins);
     assert.equal(filesSnapshot(), files);
+    assert.equal(owedSnapshot(), owed, "no candidate or context metadata is written");
   });
 
   it("a generation-2 caller observing a generation-1 head is refused by generation 1's seal", async () => {
     const { kept, refused } = await eligibleState();
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, coverOf([...kept, refused])), "sealed");
     dropTrackingPin(kept);
-    const pins = pinRefs(), files = filesSnapshot();
+    const pins = pinRefs(), files = filesSnapshot(), owed = owedSnapshot();
     assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, withContext(2)), { kind: "not_updated", reason: "ownership_unknown" });
     assert.deepEqual(pinRefs(), pins);
     assert.equal(filesSnapshot(), files);
+    assert.equal(owedSnapshot(), owed, "no candidate or context metadata is written");
   });
 
   it("pre-freeze control: the in-process fence alone does not stop P7", async () => {

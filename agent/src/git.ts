@@ -9081,6 +9081,13 @@ export class GitCache {
       ? `refs/uzi-incoming/${opts.context.runId}/${stageGeneration}/import-${this.processNonce}-${randomUUID()}`
       : `refs/uzi-incoming/${randomUUID()}`;
     const attributedStage = stage.startsWith(`refs/uzi-incoming/${opts.context.runId}/`);
+    // issue #4481: set once this import's own CAS delete of its stage succeeded, so a deleted stage is never
+    // recorded as a finished producer (only a surviving stage consumes the bounded completion record).
+    let stageDeleted = false;
+    const deleteStage = async (oid: string): Promise<void> => {
+      await this.runGit(barePath, ["update-ref", "-d", stage, oid]);
+      stageDeleted = true;
+    };
     /** The stage's oid by a raw exact-ref read, before any validation; undefined when it cannot be read. */
     const rawStageOid = async (): Promise<string | undefined> => {
       try {
@@ -9111,7 +9118,7 @@ export class GitCache {
       if (!attributedStage || expected === undefined || this.boundaryAbortError(cause)) return;
       try {
         if (await stageIsSoleAnchor(expected)) return;
-        await this.runGit(barePath, ["update-ref", "-d", stage, expected]);
+        await deleteStage(expected);
       } catch { /* the original failure is the one reported */ }
     };
     const closedResult: TrackingUpdateResult = { kind: "not_updated", reason: "ownership_unknown" };
@@ -9144,7 +9151,7 @@ export class GitCache {
     const promoteIncoming = async (incoming: string, authenticated = true): Promise<TrackingUpdateResult> => {
       if (this.refusalGenerationClosed(opts.context)) {
         // Closed after the stage was fetched: drop only our own private stage, pin and promote nothing.
-        await this.runGit(barePath, ["update-ref", "-d", stage, incoming]).catch(() => undefined);
+        await deleteStage(incoming).catch(() => undefined);
         return closedResult;
       }
       // No observation survives an unlocked phase: preservation and CAS use current B custody.
@@ -9196,9 +9203,9 @@ export class GitCache {
         // Delete it only after an independently verified durable anchor exists.
         try {
           if (result.kind === "updated" && await this.checkedTrackingSha(barePath, branch) === incoming) {
-            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            await deleteStage(incoming);
           } else if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
-            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            await deleteStage(incoming);
           } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
             // issue #4481: at the cap the stage is the refused head's evidence and is kept. Only a duplicate
             // of an already-ledgered head (the refusal ledger and its refused ref anchor it) is released.
@@ -9207,10 +9214,10 @@ export class GitCache {
             const note = incomingNote ?? { sealed: false, alreadyLedgered: false };
             // An attributed duplicate is released only when its refused ref is verified at the incoming head;
             // an absent, mismatched or unreadable ref (checkedRefSha throws) keeps the stage.
-            if (!attributedStage) await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            if (!attributedStage) await deleteStage(incoming);
             else if (note.alreadyLedgered && !note.sealed &&
               await this.checkedRefSha(barePath, `refs/uzi-incoming/${opts.context.runId}/${opts.context.generation}/refused-${incoming}`) === incoming) {
-              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+              await deleteStage(incoming);
             }
           }
         } catch (cause) {
@@ -9239,7 +9246,7 @@ export class GitCache {
             const authenticated = await authenticate();
             const incoming = await acquireIncoming();
             return incoming === undefined ? closedResult : await promoteIncoming(incoming, authenticated);
-          } finally { this.finishImportStage(stage, attributedStage); }
+          } finally { this.finishImportStage(stage, attributedStage && !stageDeleted); }
         };
         return opts.checkpointImportMode === "milestone"
           ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -9273,7 +9280,7 @@ export class GitCache {
           }
           return promoteIncoming(incoming, authenticated);
         }));
-      } finally { this.finishImportStage(stage, attributedStage); }
+      } finally { this.finishImportStage(stage, attributedStage && !stageDeleted); }
     };
     return opts.checkpointImportMode === "milestone"
       ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
