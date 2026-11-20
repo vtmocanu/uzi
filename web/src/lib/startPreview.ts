@@ -24,7 +24,7 @@ type Refusal = NonNullable<StartPreview["refusal"]>;
 
 // startRefusalLabel is the closed map from a server refusal token to user-facing text. It is
 // a Record over the contract's union, so a new server token fails the typecheck here.
-const REFUSAL_LABELS: Record<Refusal, string> = {
+export const REFUSAL_LABELS: Record<Refusal, string> = {
   no_credential_for_harness: "No usable credential for this harness",
   no_usable_credential: "No usable credential",
   credential_disabled: "The chosen token is disabled",
