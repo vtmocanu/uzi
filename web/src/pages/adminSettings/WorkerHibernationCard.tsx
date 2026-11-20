@@ -1,5 +1,5 @@
 import { useId, useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
@@ -40,7 +40,7 @@ export function WorkerHibernationCard({
   onSaved,
 }: {
   settings: AppSettings;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const currentEnabled = settings.worker_hibernation_enabled ?? "false";
   const currentAuto = settings.worker_hibernation_auto ?? "false";
@@ -75,14 +75,15 @@ export function WorkerHibernationCard({
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({
+      const payload: UpdateSettingsPayload = {
         worker_hibernation_enabled: String(enabled),
         worker_hibernation_auto: String(auto),
         worker_hibernation_idle_after: idleAfter,
         worker_hibernation_surplus: String(surplus),
         worker_hibernation_surplus_idle_after: surplusIdleAfter,
-      });
-      onSaved(resp);
+      };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setEnabled(resp.settings.worker_hibernation_enabled === "true");
       setAuto(resp.settings.worker_hibernation_auto === "true");
       setIdleAfter(resp.settings.worker_hibernation_idle_after ?? DEFAULT_IDLE_AFTER);

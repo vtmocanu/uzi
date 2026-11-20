@@ -6,7 +6,14 @@
 
 import { useLocation } from "react-router-dom";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type AdminWorkerSizes, type AppSettings, type SettingSource, type SettingsResponse } from "../lib/api";
+import {
+  api,
+  type AdminWorkerSizes,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Skeleton } from "../components/ui";
@@ -29,11 +36,36 @@ export function AdminWorkers() {
   const [sources, setSources] = useState<Record<string, SettingSource>>({});
   const [defaults, setDefaults] = useState<Record<string, string> | undefined>(undefined);
 
-  // Same load shape as AdminSettings: every card save returns the full settings map.
-  const applyResponse = useCallback((resp: SettingsResponse) => {
+  // Same shape as AdminSettings. seedAll replaces saved, sources and defaults wholesale from
+  // the initial GET; it is the only wholesale path. Card saves go through applySaved.
+  const seedAll = useCallback((resp: SettingsResponse) => {
     setSaved(resp.settings);
     setSources(resp.sources ?? {});
     setDefaults(resp.defaults);
+  }, []);
+
+  // applySaved merges a card's PUT response, but only for the keys that request sent: a
+  // save response confirms exactly those keys. Cards save independently, so a slower, older
+  // response must not revert keys a sibling card has since confirmed. Ownership is by key
+  // rather than by a sequence number because an older response is still the authority for
+  // its own keys. Values come from the response, never from `sent`; defaults are untouched.
+  const applySaved = useCallback((resp: SettingsResponse, sent: UpdateSettingsPayload) => {
+    const keys = Object.keys(sent);
+    const respSettings = resp.settings as unknown as Record<string, string>;
+    setSaved(cur => {
+      if (cur === null) return cur;
+      const next = { ...cur } as unknown as Record<string, string>;
+      for (const k of keys) if (k in respSettings) next[k] = respSettings[k];
+      return next as unknown as AppSettings;
+    });
+    const from = resp.sources;
+    if (from) {
+      setSources(prev => {
+        const next = { ...prev };
+        for (const k of keys) if (k in from) next[k] = from[k];
+        return next;
+      });
+    }
   }, []);
 
   // The worker sizes (PRD #4213) are read once here and re-read whenever the sizes editor
@@ -65,9 +97,9 @@ export function AdminWorkers() {
   const { loading, error: loadError } = useAsyncData(
     async ({ isCurrent }) => {
       const resp = await api.getSettings();
-      if (isCurrent()) applyResponse(resp);
+      if (isCurrent()) seedAll(resp);
     },
-    [applyResponse],
+    [seedAll],
     { fallback: "Failed to load settings" },
   );
 
@@ -158,25 +190,25 @@ export function AdminWorkers() {
       {loaded && saved && (
         <>
           <section id="docker-allowlist" className="scroll-mt-6">
-            <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
+            <DockerAllowlistCard settings={saved} sources={sources} onSaved={applySaved} />
           </section>
           <section id="worker-sizes" className="scroll-mt-6">
             <WorkerSizesCard data={sizes} loadError={sizesError} onChanged={loadSizes} />
           </section>
           <section id="hosted-worker-quota" className="scroll-mt-6">
-            <HostedWorkerQuotaCard settings={saved} sources={sources} defaults={defaults} sizeOptions={sizeOptions} onSaved={applyResponse} />
+            <HostedWorkerQuotaCard settings={saved} sources={sources} defaults={defaults} sizeOptions={sizeOptions} onSaved={applySaved} />
           </section>
           <section id="custody-hold-limit" className="scroll-mt-6">
-            <CustodyHoldLimitCard settings={saved} onSaved={applyResponse} />
+            <CustodyHoldLimitCard settings={saved} onSaved={applySaved} />
           </section>
           <section id="ephemeral-workers" className="scroll-mt-6">
-            <EphemeralWorkersCard settings={saved} sources={sources} defaults={defaults} sizeOptions={sizeOptions} onSaved={applyResponse} />
+            <EphemeralWorkersCard settings={saved} sources={sources} defaults={defaults} sizeOptions={sizeOptions} onSaved={applySaved} />
           </section>
           <section id="worker-hibernation" className="scroll-mt-6">
-            <WorkerHibernationCard settings={saved} onSaved={applyResponse} />
+            <WorkerHibernationCard settings={saved} onSaved={applySaved} />
           </section>
           <section id="capability-scheduling" className="scroll-mt-6">
-            <CapabilitySchedulingCard settings={saved} sources={sources} onSaved={applyResponse} />
+            <CapabilitySchedulingCard settings={saved} sources={sources} onSaved={applySaved} />
           </section>
         </>
       )}

@@ -52,6 +52,32 @@ describe("SettingControl", () => {
     expect(input.value).toBe("2");
   });
 
+  it("passes the response and the sent payload to onSaved", async () => {
+    const resp = response({ ephemeral_max_per_user: "5" });
+    mockApi.updateSettings.mockResolvedValue(resp);
+    const onSaved = vi.fn();
+    render(
+      <SettingControl
+        settingKey="ephemeral_max_per_user"
+        label="Per-user cap"
+        kind="number"
+        value="2"
+        source="db"
+        defaultValue="2"
+        helper="Maximum ephemeral workers per user."
+        min={0}
+        max={20}
+        onSaved={onSaved}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Per-user cap"), { target: { value: "5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Per-user cap" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(onSaved.mock.calls[0][0]).toBe(resp);
+    expect(onSaved.mock.calls[0][1]).toBe(mockApi.updateSettings.mock.calls[0][0]);
+    expect(onSaved.mock.calls[0][1]).toEqual({ ephemeral_max_per_user: "5" });
+  });
+
   it("keeps the draft and shows the error when a reset fails", async () => {
     mockApi.updateSettings.mockRejectedValue(new ApiError(500, "storage unavailable"));
     const input = renderControl("db");

@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
@@ -20,7 +20,7 @@ function displayLimit(value: string): string {
 
 export function CustodyHoldLimitCard({ settings, onSaved }: {
   settings: AppSettings;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const savedValue = displayLimit(settings.custody_hold_limit);
   const [value, setValue] = useState(savedValue);
@@ -37,8 +37,9 @@ export function CustodyHoldLimitCard({ settings, onSaved }: {
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ custody_hold_limit: value });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { custody_hold_limit: value };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setValue(displayLimit(resp.settings.custody_hold_limit));
       setNotice("Custody hold limit saved.");
     } catch (err) {

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, type SettingSource, type SettingsResponse } from "../../lib/api";
+import { api, type SettingSource, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Field, Input, Select } from "../../components/ui";
 import { BUILTIN_WORKER_SIZE_NAMES, sizeLabel, sizeOptionLabel, type NamedWorkerSize } from "../../lib/workerSizes";
@@ -47,7 +47,7 @@ export function SettingControl({
    *  (PRD #4213). Absent while that list is loading or after it failed: the builtin names
    *  are offered bare then, because a quantity this control cannot vouch for would mislead. */
   sizeOptions?: readonly NamedWorkerSize[];
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const id = `setting-${settingKey}`;
   const [draft, setDraft] = useState(value);
@@ -74,8 +74,9 @@ export function SettingControl({
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ [settingKey]: next });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { [settingKey]: next };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       // A reset whose saved value already equalled the default leaves `value` unchanged, so
       // the effect above would not drop a dirty draft; resync it from the response here.
       setDraft(resp.settings[settingKey as keyof typeof resp.settings] ?? value);

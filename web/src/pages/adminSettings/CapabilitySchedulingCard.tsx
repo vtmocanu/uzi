@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 
@@ -16,7 +16,7 @@ export function CapabilitySchedulingCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.capability_aware_scheduling === "true");
   const [busy, setBusy] = useState(false);
@@ -34,10 +34,11 @@ export function CapabilitySchedulingCard({
     if (isEnv || !dirty) return;
     setBusy(true);
     try {
-      const resp = await api.updateSettings({
+      const payload: UpdateSettingsPayload = {
         capability_aware_scheduling: enabled ? "true" : "false",
-      });
-      onSaved(resp);
+      };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setEnabled(resp.settings.capability_aware_scheduling === "true");
       setNotice("Capability-aware scheduling setting saved.");
     } catch (err) {
