@@ -279,3 +279,45 @@ func TestPhaseModelsMirrorMatrixLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// TestPhaseModelsGapTriggerDemandGateEmptyFleetLiveDB pins the demand gate of the capability-gap
+// trigger (ListUnplaceableQueuedRunsForEphemeral) in isolation. The matrix above always has an
+// online worker that admits a non-required run, so a gate that wrongly admitted every phase-free run
+// would still pass there. Each case here runs on its own freshly created user with NO worker at all,
+// so nothing but the demand gate decides whether a '{}' run is listed.
+func TestPhaseModelsGapTriggerDemandGateEmptyFleetLiveDB(t *testing.T) {
+	iv := leaseInterval(leaseTwoHours)
+	cases := []struct {
+		name    string
+		harness string
+		model   any
+		listed  bool
+	}{
+		{"claude lead-lane, no planning value, no caps: not demand", "claude", nil, false},
+		{"codex harness, planning value set, no caps: not demand", "codex", "opus", false},
+		{"control: claude lead-lane, planning value set, no caps: demand", "claude", "opus", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			optInEphemeral(fx)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_claude_model = $2 WHERE id = $1`, fx.userID, c.model)
+			run := phaseRun(fx, phaseMatrixCase{kind: "issue", harness: c.harness, noCaps: true})
+			if n := fx.onlineWorkerCount(); n != 0 {
+				t.Fatalf("fixture user has %d workers, want an empty fleet", n)
+			}
+			if gap := phaseListedUnplaceable(fx, iv); gap[run] != c.listed {
+				t.Fatalf("capability-gap trigger listed = %v, want %v", gap[run], c.listed)
+			}
+		})
+	}
+}
+
+func (fx *fleetFixture) onlineWorkerCount() int {
+	fx.t.Helper()
+	var n int
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM workers WHERE user_id = $1`, fx.userID).Scan(&n); err != nil {
+		fx.t.Fatalf("count workers: %v", err)
+	}
+	return n
+}

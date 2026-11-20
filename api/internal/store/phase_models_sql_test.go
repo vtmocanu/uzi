@@ -17,6 +17,8 @@ var phaseModelsKindList = regexp.MustCompile(`(\w+)\.harness = 'claude'\s+AND\s+
 
 // phaseModelsExpectedKinds is the explicit planning set; the registry-derived oracle below must
 // agree with it, so a new lead-lane kind fails here until every SQL site is updated.
+var sqlLineCommentRE = regexp.MustCompile(`--[^\n]*`)
+
 var phaseModelsExpectedKinds = []string{"ci_fix", "issue", "mr_rework", "prompt", "self_improve", "task"}
 
 func phaseModelsSiteKinds(t *testing.T, label, text string, wantSites int) {
@@ -68,7 +70,8 @@ func TestPhaseModelsPredicateKindListMatchesLeadLane(t *testing.T) {
 			t.Fatalf("%s not found", name)
 		}
 		phaseModelsSiteKinds(t, name, body, sites)
-		if !strings.Contains(body, "claude_phase_models_v1") && name != "ListActiveRunsForHealth" && name != "ListUnplaceableQueuedRunsForEphemeral" {
+		// Strip SQL comments first so a comment naming the capability cannot satisfy the pairing check.
+		if !strings.Contains(sqlLineCommentRE.ReplaceAllString(body, ""), "claude_phase_models_v1") && name != "ListActiveRunsForHealth" && name != "ListUnplaceableQueuedRunsForEphemeral" {
 			t.Errorf("%s does not test the claude_phase_models_v1 capability", name)
 		}
 	}
