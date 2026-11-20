@@ -1,5 +1,4 @@
-// Shared fixtures for the Overview page tests (Dashboard.overviewData.test.tsx and
-// OverviewNext.test.tsx). Mirrors the wire shapes Dashboard.test.tsx builds locally.
+// Shared fixtures for the Overview tests (OverviewNext.test.tsx, useOverviewData.test.tsx).
 
 import { vi } from "vitest";
 import type { useAuth } from "../auth/AuthContext";

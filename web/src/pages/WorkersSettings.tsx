@@ -433,7 +433,7 @@ export function WorkersSettings() {
     // Resolved #200 (the M3 exhaustive-deps review): `announce` is now listed rather
     // than suppressed. Because it is stable its only effect is lint compliance — no
     // added churn, so the M3 concern (a dep re-creating this callback on churn the
-    // paragraph argues cannot happen) does not arise. Same treatment as Dashboard's
+    // paragraph argues cannot happen) does not arise. Same treatment as the Overview hook's
     // first-load effect; the exhaustive-deps disable directive is gone.
     [pooledCount, announce, acquire, release, acceptWorker],
   );

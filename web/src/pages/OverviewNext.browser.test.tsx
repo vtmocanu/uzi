@@ -8,7 +8,6 @@ import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
-import { Dashboard } from "./Dashboard";
 import { AppShell } from "../components/AppShell";
 import { api, type AgentTemplate } from "../lib/api";
 import { healthySilentDoc, incidentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
@@ -126,14 +125,13 @@ describe("compact Overview header (#4366)", () => {
       </MemoryRouter>,
     );
     const title = await screen.findByRole("heading", { name: /Welcome/ });
-    const back = screen.getByRole("link", { name: "Back to the old Overview" });
     const health = await screen.findByRole("button", { name: /^System health:/ });
     const people = await screen.findByRole("button", { name: /^People:/ });
     const repos = await screen.findByRole("button", { name: /^Repos:/ });
     const agents = await screen.findByRole("button", { name: /^Agents:/ });
     const search = screen.getByRole("button", { name: /^Search/ });
     await document.fonts.ready;
-    return { title, back, chips: [health, people, repos, agents, search] };
+    return { title, chips: [health, people, repos, agents, search] };
   }
 
   const populatedLabels = [
@@ -156,20 +154,18 @@ describe("compact Overview header (#4366)", () => {
     }
   }
 
-  it("keeps populated chips on the title row at 1440px without truncation, with Back first in tab order", async () => {
-    const { title, back, chips } = await mountHeader(1440);
+  it("keeps populated chips on the title row at 1440px without truncation, in tab order", async () => {
+    const { title, chips } = await mountHeader(1440);
     setPopulatedLabels(chips);
     const titleRect = title.getBoundingClientRect();
-    const backRect = back.getBoundingClientRect();
-    expect(backRect.top).toBeGreaterThan(titleRect.top);
     for (const chip of chips) {
       const rect = chip.getBoundingClientRect();
       expect(rect.top, chip.getAttribute("aria-label") ?? chip.textContent ?? "chip").toBeLessThan(titleRect.bottom + 2);
     }
     expectFullLabels(chips);
-    back.focus();
-    expect(document.activeElement).toBe(back);
-    for (const chip of chips) {
+    chips[0].focus();
+    expect(document.activeElement).toBe(chips[0]);
+    for (const chip of chips.slice(1)) {
       await userEvent.tab();
       expect(document.activeElement).toBe(chip);
     }
@@ -199,10 +195,8 @@ describe("compact Overview header (#4366)", () => {
   });
 
   it("wraps the chips below the title at 400px without horizontal page overflow", async () => {
-    const { title, back, chips } = await mountHeader(400);
-    const backRect = back.getBoundingClientRect();
-    expect(backRect.top).toBeGreaterThan(title.getBoundingClientRect().top);
-    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(backRect.bottom);
+    const { title, chips } = await mountHeader(400);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
     for (const chip of chips) {
       const rect = chip.getBoundingClientRect();
       expect(rect.left).toBeGreaterThanOrEqual(0);
@@ -363,7 +357,7 @@ describe("sticky Overview chips (#4370)", () => {
   });
 });
 
-describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
+describe("Overview route in the real shell (PRD #3877)", () => {
   const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 
   async function mountAt(path: string) {
@@ -372,7 +366,6 @@ describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
         <AppShell>
           <Routes>
             <Route path="/dashboard" element={<OverviewNext />} />
-            <Route path="/overview/classic" element={<Dashboard />} />
           </Routes>
         </AppShell>
       </MemoryRouter>,
@@ -382,17 +375,13 @@ describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
     return { header, banner };
   }
 
-  it("places the banner after the default header and before the classic header", async () => {
+  it("places the banner after the header and before the page content", async () => {
     await page.viewport(1280, 900);
     mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
 
     const promoted = await mountAt("/dashboard");
     expect(follows(promoted.header, promoted.banner)).toBe(true);
     expect(follows(promoted.banner, screen.getByRole("region", { name: "Issue work" }))).toBe(true);
-
-    cleanup();
-    const classic = await mountAt("/overview/classic");
-    expect(follows(classic.banner, classic.header)).toBe(true);
     expect(screen.getByRole("link", { name: "Overview", current: "page" })).toBeTruthy();
   });
 });
@@ -2092,8 +2081,8 @@ describe("OverviewNext health chip popover", () => {
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await document.fonts.ready;
     const before = chip.getBoundingClientRect().left;
-    // #4366 moved Back under the title; 720px then moved this chip only 378px.
-    // 800px still forces the >400px reflow that discriminates a stale placement.
+    // A 720px preceding item moved this chip only 378px (#4366);
+    // 800px forces the >400px reflow that discriminates a stale placement.
     preceding.style.width = "800px";
     await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
     // Re-placed against the chip's new position: attached to it and inside the viewport.

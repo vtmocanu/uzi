@@ -1,10 +1,8 @@
-// The default Overview at /dashboard (PRD #3877 M1): the same data as the classic page through
-// the shared useOverviewData hook, with a compact header (and, for an
-// admin, the health chip) above the app-wide banner stack. The classic page stays linked
-// at /overview/classic until M2 retires it.
+// The Overview at /dashboard (PRD #3877): the data from the useOverviewData hook, with a
+// compact header (and, for an admin, the health chip) above the app-wide banner stack. The
+// old Overview is retired; /overview/classic and /overview/next redirect here (App.tsx).
 
 import { useRef, useState } from "react";
-import { Link } from "react-router-dom";
 import { agentSourceChipModel } from "../lib/agentSourceChip";
 import { AgentsChip } from "../components/AgentsChip";
 import { overviewScope, ISSUE_WORK_SCOPE_KEY, USAGE_SCOPE_KEY } from "../lib/prefs";
@@ -146,11 +144,6 @@ function OverviewNextPage() {
           title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
           titleRef={titleRef}
           actionsClassName="max-w-full"
-          description={
-            <Link to="/overview/classic" className="font-medium text-brand hover:text-brand-hover">
-              Back to the old Overview
-            </Link>
-          }
           actions={
             <OverviewStickyActions titleRef={titleRef}>
               {isAdmin && <HealthChip />}
@@ -211,7 +204,7 @@ function OverviewNextPage() {
         />
       )}
 
-      {/* Same inputs as Dashboard: the viewer's own runs, never the admin rows. */}
+      {/* The viewer's own runs, never the admin rows. */}
       <HealthPlatformLine isAdmin={isAdmin} runs={ownRuns} workers={data?.workers ?? []} />
 
       {/* Runs on the left, the right-hand rail beside it; the rail stacks below at narrow widths. */}

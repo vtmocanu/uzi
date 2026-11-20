@@ -1,4 +1,4 @@
-// Pure helpers shared by the default and classic Overview pages (PRD #3878, #3877).
+// Pure helpers for the Overview page (PRD #3878, #3877).
 // Nothing here fetches or renders.
 
 import {
@@ -14,7 +14,7 @@ import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause, NON_C
 import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
-export const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
+const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
   running: "running",
   awaiting_approval: "needsYou",
   awaiting_input: "needsYou",
@@ -37,7 +37,7 @@ export interface OverviewCounts {
 }
 
 // Executing, queued and parked counts over the non-terminal runs. Buckets on the RAW
-// status, as Dashboard's tile always has, with an account cooldown counted as waiting;
+// status, with an account cooldown counted as waiting;
 // feeding it effective statuses would drop runs. Runs that need the owner (the
 // needsYou bucket) are deliberately not counted here: the decision card covers them.
 export function overviewCounts(runs: ReadonlyArray<Pick<RunSummaryItem, "status" | "health">>): OverviewCounts {

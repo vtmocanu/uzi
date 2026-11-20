@@ -8,10 +8,9 @@ import type { RunOutcomes, SelfUsage } from "../lib/api";
 import { failOriginLabel } from "../lib/failOriginLabel";
 import type { aggregateDisclosure } from "../lib/costStatus";
 import { cx } from "./ui";
-import type { UsageWindow } from "./UsageCards";
+import type { UsageWindow } from "../lib/usageByUser";
 
-// Presentation pieces shared by the classic Overview's UsageCard (UsageCards.tsx) and the
-// default Overview's OverviewUsageCard during the bounded #3877 soak.
+// Presentation pieces for the Overview's OverviewUsageCard.
 
 // Issue #4209: run counts and failure rates cover primary work; tokens and cost also include
 // helper runs. One literal for both Usage cards, rendered under the KPI grid.
@@ -108,7 +107,7 @@ export function FailedRunsBlock({ outcomes, personal, framed = true }: { outcome
   );
 }
 
-// "inline" is the classic Overview's one-line summary; "list" is the default page's top-3 rows
+// "inline" is a one-line summary; "list" is the top-3 rows
 // with a bar per cause and an "other causes" total.
 export function TopCauses({ outcomes, personal, variant = "inline" }: { outcomes: RunOutcomes; personal: boolean; variant?: "inline" | "list" }) {
   const causes = Object.entries(outcomes.fail_origins)
@@ -239,9 +238,8 @@ export function WindowToggle({ value, onChange, className, steadyWidth }: { valu
   return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} steadyWidth={steadyWidth} />;
 }
 
-// Table cells for both per-user tables. "current" is the classic Overview's PerUserUsageTable
-// (unchanged markup); "preview" is the default Overview's By user table (PRD #3881), whose
-// first column names its row.
+// Table cells for the per-user table. "preview" is the Overview's By user table (PRD #3881),
+// whose first column names its row; "current" is the older cell markup.
 type TableVariant = "current" | "preview";
 
 // `start` (preview only) left-aligns a column header or cell without making it a row header,
