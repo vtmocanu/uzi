@@ -127,7 +127,8 @@ async function main(): Promise<void> {
       if (note.kind === "turn_started") replay = false;
       if (note.kind === "token_usage_updated" && note.threadId === thread) {
         const attributed = accountant.record(thread, note.usage, replay);
-        usage.push({ total: note.usage.total, last: note.usage.last, replay, attributedModel: attributed?.model });
+        usage.push({ total: note.usage.total, last: note.usage.last, replay,
+          pricingEvidenceComplete: note.usage.pricingEvidenceComplete ?? null, attributedModel: attributed?.model });
       }
     }
     return { requestedModel: model ?? "omitted-resume-effectiveness-control", requestedEffort: effort === undefined ? "omitted" : effort, status: "completed", usage, nonceObserved: result.text.includes(nonce) };
