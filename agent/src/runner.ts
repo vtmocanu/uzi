@@ -4406,18 +4406,22 @@ export class RunRunner {
 
   /** The wait for A of the terminal refusal-release fetch after an owed-limit stop (issue #4481). The stop
    *  aborts the flight's cancel, lifecycle and terminal lifecycle signals itself, so none of them can
-   *  gate the release (the same reasoning as {@link cleanupAuthorityWait}). A cancel or claim fence that
-   *  is already recorded, shutdown, and the boundary deadline (and maintenance budget) still refuse; the
-   *  terminal lifecycle signal joins only while the stop has not aborted it. A cancel that arrives only
-   *  after the transfer began is not observed by this wait. */
+   *  gate the release (the same reasoning as {@link cleanupAuthorityWait}, whose shutdown, maintenance
+   *  budget and boundary deadline this wait keeps). A cancel or claim fence already recorded when the wait
+   *  is built refuses; fetchTracking builds it at each source-authority acquisition, so the check is
+   *  re-evaluated there (no polling). The terminal lifecycle signal joins only while the stop has not
+   *  aborted it. While owedLimitStop is latched but the flight was not stopped, a credential switch or
+   *  PauseNow no longer aborts this acquisition (matching {@link credentialSwitchCaptureWait}). A late
+   *  cancel or claim fence is not observed, because the steering poller stops after the terminal
+   *  lifecycle abort; later steps (settleGuardedInventory guards, freezeInventory cancel observation, the
+   *  reportState claim fence, the server's generation fences) still catch it. */
   private owedStopReleaseWait(flight: RunFlight): AuthorityWait {
-    const budget = MaintenanceBudget.current();
+    const base = this.cleanupAuthorityWait();
     const terminal = flight.steering.terminalLifecycleSignal();
     const refused = flight.steering.isCancelled() || flight.steering.claimFence() !== undefined;
     return {
-      signal: AbortSignal.any([this.shutdownSignal.signal, ...(budget ? [budget.signal] : []),
-        ...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
-      timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, budget?.remainingMs() ?? Infinity)),
+      ...base,
+      signal: AbortSignal.any([base.signal!, ...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
     };
   }
 
@@ -19704,7 +19708,7 @@ export class RunRunner {
     return sha;
   }
 
-  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action(), sourceAuthorityWait?: AuthorityWait): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
+  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action(), sourceAuthorityWait?: AuthorityWait | (() => AuthorityWait)): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
     if (flight.wipMarkerUnsafe || flight.wipUnsafeMarkers?.size) {
       const safeTip = await this.wipSafeTip(flight, worktreePath, branch);
       if (safeTip === null || (options.expectedCandidateSha !== undefined && options.expectedCandidateSha !== safeTip))
@@ -19719,8 +19723,9 @@ export class RunRunner {
         barePath, worktreePath, branch, flight.runId, { ...owed, ...options,
           // Git invokes this only outside B, before transport and again before promotion.
           // The transport inherits the existing import scope and caller budget without A.
+          // A factory is evaluated at each acquisition, so its refusal state is read then, not once up front.
           withSourceAuthority: action => this.inFlightAuthority(flight, action,
-            sourceAuthorityWait ?? this.authorityWait(flight)),
+            (typeof sourceAuthorityWait === "function" ? sourceAuthorityWait() : sourceAuthorityWait) ?? this.authorityWait(flight)),
         },
       );
       if (result.kind === "not_updated") {
@@ -23353,9 +23358,9 @@ export class RunRunner {
     try {
       // issue #4481: stopForOwedLimit aborts the flight's cancel, lifecycle and terminal lifecycle signals,
       // so the default authority wait would reject the refused head's release fetch at once.
-      const sourceWait: AuthorityWait | undefined = heldCapture
+      const sourceWait: AuthorityWait | (() => AuthorityWait) | undefined = heldCapture
         ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) }
-        : flight.owedLimitStop !== undefined ? this.owedStopReleaseWait(flight) : undefined;
+        : flight.owedLimitStop !== undefined ? () => this.owedStopReleaseWait(flight) : undefined;
       fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined, sourceWait);
       check();
     } catch (e) {

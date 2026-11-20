@@ -605,6 +605,21 @@ it("a recorded cancel still aborts the terminal refusal-release fetch after an o
   assert.equal(server.heldCalls.length, 0, "no held publication");
 });
 
+it("a recorded claim fence still aborts the terminal refusal-release fetch after an owed-cap stop", opts, async t => {
+  const { claim, server, work } = setup(44834);
+  let probe!: AuthorityProbe;
+  // A fenced claim ends the flight quietly, so runFailed's failed-report assertion does not apply.
+  const r = runner(failingWork(work, midTurnStop), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  Reflect.set(r, "attemptPaths", true);
+  probe = authorityDuringTransfer(t, r, {
+    atStart: flight => Reflect.set((flight as { steering: object }).steering, "fence", "released"),
+  });
+  await r.execute(claim);
+  assert.ok(probe.transactions > 0, "the authority wait was exercised");
+  assert.ok(probe.transfers.length > 0 && probe.transfers.every(h => h === null), "the fenced transfer released nothing");
+  assert.equal(server.heldCalls.length, 0, "no held publication");
+});
+
 it("shutdown during the terminal refusal-release fetch still aborts it after an owed-cap stop", opts, async t => {
   const { claim, server, work } = setup(44832);
   let probe!: AuthorityProbe;
