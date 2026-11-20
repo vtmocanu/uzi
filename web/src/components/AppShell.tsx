@@ -508,8 +508,6 @@ export function NavItem({
         onNavigate?.();
         if (motionGlyph) motion.onClick();
       }}
-      onPointerEnter={motionGlyph ? motion.onPointerEnter : undefined}
-      onFocus={motionGlyph ? motion.onFocus : undefined}
       aria-current={active ? "page" : undefined}
       title={collapsed ? label : undefined}
       className={cx(
