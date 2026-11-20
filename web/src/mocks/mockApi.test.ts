@@ -239,6 +239,44 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     expect(restored.typeface).toBe("plex");
   });
 
+  it("sidebar_motion: defaults off, round-trips true/false, clears with null, rejects non-booleans", async () => {
+    installStorage();
+    let api = await reload();
+
+    const initial = (await api.getMySettings()).settings;
+    expect(initial.sidebar_motion).toBeNull();
+    expect(initial.effective_sidebar_motion).toBe(false);
+
+    await api.putMySettings({ sidebar_motion: true });
+    let s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBe(true);
+    expect(s.effective_sidebar_motion).toBe(true);
+
+    // Survives a hard reload.
+    api = await reload();
+    s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBe(true);
+
+    // An explicit false is stored as false (not collapsed to null).
+    await api.putMySettings({ sidebar_motion: false });
+    s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBe(false);
+    expect(s.effective_sidebar_motion).toBe(false);
+
+    await api.putMySettings({ sidebar_motion: true });
+    await api.putMySettings({ typeface: "plex" }); // absent keeps
+    expect((await api.getMySettings()).settings.sidebar_motion).toBe(true);
+
+    await api.putMySettings({ sidebar_motion: null });
+    s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBeNull();
+    expect(s.effective_sidebar_motion).toBe(false);
+
+    await expect(
+      api.putMySettings({ sidebar_motion: "yes" as unknown as boolean }),
+    ).rejects.toMatchObject({ status: 400, message: expect.stringContaining("sidebar_motion") });
+  });
+
   it("clears a single appearance field back to inherit with present-null, leaving the rest", async () => {
     installStorage();
     const api = await reload();
@@ -341,8 +379,15 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
       light_theme: "hall",
       dark_theme: "ember",
       typeface: "system",
-      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
-      defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+      sidebar_motion: false,
+      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: null },
+      defaults: {
+        mode: "dark",
+        light_theme: "hall",
+        dark_theme: "ember",
+        typeface: "system",
+        sidebar_motion: false,
+      },
     });
 
     // Set some overrides; the resolved values AND the raw overrides both move, while an
@@ -355,6 +400,13 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     expect(session.appearance.dark_theme).toBe("ember");
     expect(session.appearance.overrides.light_theme).toBe("dawn");
     expect(session.appearance.overrides.dark_theme).toBeNull();
+
+    // Sidebar motion resolves against the compiled off default and tracks the override.
+    await api.putMySettings({ sidebar_motion: true });
+    session = await api.me();
+    expect(session.appearance.sidebar_motion).toBe(true);
+    expect(session.appearance.overrides.sidebar_motion).toBe(true);
+    expect(session.appearance.defaults.sidebar_motion).toBe(false);
     // The deprecated trio stays coherent: resolved mode light → the resolved light slot.
     expect(session.theme).toBe("dawn");
   });

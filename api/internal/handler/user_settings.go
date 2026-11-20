@@ -84,6 +84,11 @@ type userSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
+	// SidebarMotion is the user's RAW opt-in for animated sidebar icons (issue #4510):
+	// null = not chosen. EffectiveSidebarMotion is the resolved boolean the web reads
+	// (the explicit choice, else the instance fallback).
+	SidebarMotion          *bool `json:"sidebar_motion"`
+	EffectiveSidebarMotion bool  `json:"effective_sidebar_motion"`
 	// DefaultHarness is the user's per-user default harness (PRD #1429 M1 / D3), nullable:
 	// null = "no preference", so implicit run creation falls through D11 rather than pinning.
 	// A non-null value is one of the closed claude|codex set (validateHarness gates the write).
@@ -218,6 +223,8 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
 			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
 			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
+			SidebarMotion:          boolPtrValue(s.SidebarMotion),
+			EffectiveSidebarMotion: theme.ResolveSidebarMotion(boolPtrValue(s.SidebarMotion), sidebarMotionDefault),
 			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 			JudgeRunsOn:            textPtrValue(s.JudgeRunsOn.Valid, s.JudgeRunsOn.String),
 			ClaudeProviderID:       uuidPtrValue(s.ClaudeProviderID),
@@ -321,6 +328,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		LightTheme     json.RawMessage `json:"light_theme"`
 		DarkTheme      json.RawMessage `json:"dark_theme"`
 		Typeface       json.RawMessage `json:"typeface"`
+		// sidebar_motion (issue #4510): absent keeps the stored value, true/false sets
+		// it, null clears to NULL (not chosen); any other JSON type is a 400.
+		SidebarMotion json.RawMessage `json:"sidebar_motion"`
 		// default_harness (PRD #1429 M1 / D3), same absent/null/value tri-state as the model
 		// fields: absent ⇒ column unchanged, null ⇒ clear to NULL ("no preference"), a
 		// claude|codex value ⇒ validated then set.
@@ -612,6 +622,21 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var motionVal pgtype.Bool
+	motionPresent := req.SidebarMotion != nil
+	if motionPresent {
+		// Same tri-state as now_summary_enabled: present-bool sets, present-null clears
+		// back to NULL (not chosen), a non-bool is a 400 before any write.
+		var raw *bool
+		if err := json.Unmarshal(req.SidebarMotion, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid sidebar_motion")
+			return
+		}
+		if raw != nil {
+			motionVal = pgtype.Bool{Bool: *raw, Valid: true}
+		}
+	}
+
 	var sidebarIDs []uuid.UUID
 	sidebarPresent := req.SidebarTokenIds != nil
 	if sidebarPresent {
@@ -857,7 +882,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if setMode || setLight || setDark || setTypeface {
+	if setMode || setLight || setDark || setTypeface || motionPresent {
 		if _, err := h.q.SetUserAppearance(r.Context(), store.SetUserAppearanceParams{
 			ID:             user.ID,
 			SetMode:        setMode,
@@ -868,6 +893,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			DarkTheme:      dark,
 			SetTypeface:    setTypeface,
 			Typeface:       typeface,
+
+			SetSidebarMotion: motionPresent,
+			SidebarMotion:    motionVal,
 		}); err != nil {
 			slog.Error("set user appearance", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

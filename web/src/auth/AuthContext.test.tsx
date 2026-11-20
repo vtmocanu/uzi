@@ -101,6 +101,30 @@ describe("AuthContext — uzi label (PRD #764)", () => {
   });
 });
 
+describe("AuthContext — sidebar motion stamp (#4510)", () => {
+  const withMotion = (value: boolean): SessionResponse => {
+    const s = baseSession();
+    return { ...s, appearance: { ...s.appearance, sidebar_motion: value } };
+  };
+
+  afterEach(() => {
+    document.documentElement.removeAttribute("data-motion");
+  });
+
+  it("stamps data-motion=on when the session appearance has sidebar_motion true", async () => {
+    mockApi.me.mockResolvedValue(withMotion(true));
+    renderProbe();
+    await waitFor(() => expect(document.documentElement.dataset.motion).toBe("on"));
+  });
+
+  it("stamps data-motion=off when the session appearance has sidebar_motion false", async () => {
+    document.documentElement.dataset.motion = "on";
+    mockApi.me.mockResolvedValue(withMotion(false));
+    renderProbe();
+    await waitFor(() => expect(document.documentElement.dataset.motion).toBe("off"));
+  });
+});
+
 describe("AuthContext — appearance fallback for an older API (PRD #1167)", () => {
   // Build a session as an older (pre-#1167) server sends it: the resolved theme
   // trio, but NO `appearance` object.

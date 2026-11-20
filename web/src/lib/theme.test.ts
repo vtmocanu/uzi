@@ -45,9 +45,10 @@ afterEach(() => {
   // Clear any live system-mode listener held module-level in theme.ts, so one
   // test's armed matchMedia subscription cannot bleed into the next. Switching to
   // an explicit mode tears it down (no matchMedia needed for an explicit mode).
-  applyAppearance({ mode: "dark", light: "hall", dark: "ember", typeface: "system" });
+  applyAppearance({ mode: "dark", light: "hall", dark: "ember", typeface: "system", sidebarMotion: false });
   document.documentElement.removeAttribute("data-theme");
   document.documentElement.removeAttribute("data-font");
+  document.documentElement.removeAttribute("data-motion");
 });
 
 describe("isTheme", () => {
@@ -218,62 +219,83 @@ function stubMatchMedia(mm: { matchMedia: unknown }) {
 describe("applyAppearance (PRD #1167 m5)", () => {
   it("stamps data-theme=light on mode=light regardless of the OS, plus data-font", () => {
     stubMatchMedia(makeMatchMedia(true)); // OS dark, but an explicit light wins
-    applyAppearance({ mode: "light", light: "dawn", dark: "ember", typeface: "plex" });
+    applyAppearance({ mode: "light", light: "dawn", dark: "ember", typeface: "plex", sidebarMotion: false });
     expect(document.documentElement.dataset.theme).toBe("dawn");
     expect(document.documentElement.dataset.font).toBe("plex");
   });
 
   it("stamps data-theme=dark (the dark slot) on mode=dark", () => {
     stubMatchMedia(makeMatchMedia(false));
-    applyAppearance({ mode: "dark", light: "dawn", dark: "mission", typeface: "system" });
+    applyAppearance({ mode: "dark", light: "dawn", dark: "mission", typeface: "system", sidebarMotion: false });
     expect(document.documentElement.dataset.theme).toBe("mission");
   });
 
   it("stamps per matchMedia on mode=system (light OS -> light slot, dark OS -> dark slot)", () => {
     stubMatchMedia(makeMatchMedia(false));
-    applyAppearance({ mode: "system", light: "hall", dark: "ember", typeface: "system" });
+    applyAppearance({ mode: "system", light: "hall", dark: "ember", typeface: "system", sidebarMotion: false });
     expect(document.documentElement.dataset.theme).toBe("hall");
 
     stubMatchMedia(makeMatchMedia(true));
-    applyAppearance({ mode: "system", light: "hall", dark: "ember", typeface: "system" });
+    applyAppearance({ mode: "system", light: "hall", dark: "ember", typeface: "system", sidebarMotion: false });
     expect(document.documentElement.dataset.theme).toBe("ember");
   });
 
   it("writes the uzi.appearance cache with the narrowed values", () => {
     stubMatchMedia(makeMatchMedia(false));
-    applyAppearance({ mode: "light", light: "dawn", dark: "mission", typeface: "plex" });
+    applyAppearance({ mode: "light", light: "dawn", dark: "mission", typeface: "plex", sidebarMotion: false });
     expect(window.localStorage.getItem("uzi.appearance")).toBe(
-      JSON.stringify({ mode: "light", light: "dawn", dark: "mission", typeface: "plex" }),
+      JSON.stringify({ mode: "light", light: "dawn", dark: "mission", typeface: "plex", sidebarMotion: false }),
     );
+  });
+
+  it("stamps data-motion on only for a strict true and caches sidebarMotion", () => {
+    stubMatchMedia(makeMatchMedia(false));
+    applyAppearance({ mode: "light", light: "dawn", dark: "ember", typeface: "system", sidebarMotion: true });
+    expect(document.documentElement.dataset.motion).toBe("on");
+    expect(JSON.parse(window.localStorage.getItem("uzi.appearance") ?? "{}").sidebarMotion).toBe(true);
+
+    applyAppearance({ mode: "light", light: "dawn", dark: "ember", typeface: "system", sidebarMotion: false });
+    expect(document.documentElement.dataset.motion).toBe("off");
+    expect(JSON.parse(window.localStorage.getItem("uzi.appearance") ?? "{}").sidebarMotion).toBe(false);
+
+    // A non-boolean that slipped past the types (stale/tampered data) is off, not truthy-on.
+    applyAppearance({
+      mode: "light",
+      light: "dawn",
+      dark: "ember",
+      typeface: "system",
+      sidebarMotion: "true" as unknown as boolean,
+    });
+    expect(document.documentElement.dataset.motion).toBe("off");
   });
 
   it("narrows bad fields to the compiled fallbacks before stamping/caching", () => {
     stubMatchMedia(makeMatchMedia(false));
-    applyAppearance({ mode: "auto", light: "ember", dark: "dawn", typeface: "comic" });
+    applyAppearance({ mode: "auto", light: "ember", dark: "dawn", typeface: "comic", sidebarMotion: false });
     // mode->dark (default), light->hall, dark->ember, typeface->system; painted dark slot.
     expect(document.documentElement.dataset.theme).toBe("ember");
     expect(document.documentElement.dataset.font).toBe("system");
     expect(window.localStorage.getItem("uzi.appearance")).toBe(
-      JSON.stringify({ mode: "dark", light: "hall", dark: "ember", typeface: "system" }),
+      JSON.stringify({ mode: "dark", light: "hall", dark: "ember", typeface: "system", sidebarMotion: false }),
     );
   });
 
   it("subscribes a change listener ONLY for system mode, and removes it on switch to explicit", () => {
     const mm = makeMatchMedia(false);
     stubMatchMedia(mm);
-    applyAppearance({ mode: "system", light: "hall", dark: "ember", typeface: "system" });
+    applyAppearance({ mode: "system", light: "hall", dark: "ember", typeface: "system", sidebarMotion: false });
     // Armed on this call's mql; its own remove spy has not fired yet.
     expect(mm.add).toHaveBeenCalledTimes(1);
     expect(mm.remove).not.toHaveBeenCalled();
     // Switching to an explicit mode tears the listener down.
-    applyAppearance({ mode: "dark", light: "hall", dark: "ember", typeface: "system" });
+    applyAppearance({ mode: "dark", light: "hall", dark: "ember", typeface: "system", sidebarMotion: false });
     expect(mm.remove).toHaveBeenCalledTimes(1);
   });
 
   it("the system listener restamps data-theme on a simulated OS change", () => {
     const mm = makeMatchMedia(false); // OS light initially
     stubMatchMedia(mm);
-    applyAppearance({ mode: "system", light: "dawn", dark: "mission", typeface: "system" });
+    applyAppearance({ mode: "system", light: "dawn", dark: "mission", typeface: "system", sidebarMotion: false });
     expect(document.documentElement.dataset.theme).toBe("dawn");
     // OS flips to dark; firing the change event restamps to the dark slot.
     mm.setMatches(true);

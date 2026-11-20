@@ -54,6 +54,7 @@ type fakeSettingsDB struct {
 	lightTheme      pgtype.Text
 	darkTheme       pgtype.Text
 	typeface        pgtype.Text
+	sidebarMotion   pgtype.Bool
 	defaultHarness  pgtype.Text
 	claudeModel     pgtype.Text
 	codexModel      pgtype.Text
@@ -177,11 +178,11 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if ids, ok := args[0].([]uuid.UUID); ok {
 			f.sidebarCodexIDs = ids
 		}
-	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 8:
+	case strings.Contains(sql, "SET appearance_mode") && len(args) >= 10:
 		// SetUserAppearance PATCHes the four columns in one conditional UPDATE
 		// (PRD #1167 M2): $1=set_mode(bool), $2=appearance_mode, $3=set_light,
 		// $4=light_theme, $5=set_dark, $6=dark_theme, $7=set_typeface, $8=typeface,
-		// $9=id. A field is written only when its set flag is true, mirroring the
+		// $9=set_sidebar_motion, $10=sidebar_motion (issue #4510), $11=id. A field is written only when its set flag is true, mirroring the
 		// SQL's CASE WHEN — so an unset field keeps its stored value.
 		if set, _ := args[0].(bool); set {
 			if m, ok := args[1].(pgtype.Text); ok {
@@ -201,6 +202,11 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if set, _ := args[6].(bool); set {
 			if tf, ok := args[7].(pgtype.Text); ok {
 				f.typeface = tf
+			}
+		}
+		if set, _ := args[8].(bool); set {
+			if m, ok := args[9].(pgtype.Bool); ok {
+				f.sidebarMotion = m
 			}
 		}
 	}
@@ -224,6 +230,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		lightTheme:      f.lightTheme,
 		darkTheme:       f.darkTheme,
 		typeface:        f.typeface,
+		sidebarMotion:   f.sidebarMotion,
 		defaultHarness:  f.defaultHarness,
 		claudeModel:     f.claudeModel,
 		codexModel:      f.codexModel,
@@ -250,6 +257,7 @@ type fakeSettingsRow struct {
 	lightTheme      pgtype.Text
 	darkTheme       pgtype.Text
 	typeface        pgtype.Text
+	sidebarMotion   pgtype.Bool
 	defaultHarness  pgtype.Text
 	claudeModel     pgtype.Text
 	codexModel      pgtype.Text
@@ -270,7 +278,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[0].(*string); ok {
 			*p = "default"
 		}
-	case 4:
+	case 5:
 		// SetUserAppearance RETURNING appearance_mode, light_theme, dark_theme,
 		// typeface (PRD #1167 M1). Discarded by the handler, captured here so the
 		// write is observable on a follow-up GetUserSettings.
@@ -286,7 +294,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 23: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here)
+		if p, ok := dest[4].(*pgtype.Bool); ok {
+			*p = r.sidebarMotion
+		}
+	case 24: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here)
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -364,6 +375,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		// judge_runs_on (PRD #3257) is the 22nd column.
 		if p, ok := dest[21].(*pgtype.Text); ok {
 			*p = r.judgeRunsOn
+		}
+		// sidebar_motion (issue #4510) is the 24th column, after claude_provider_id.
+		if p, ok := dest[23].(*pgtype.Bool); ok {
+			*p = r.sidebarMotion
 		}
 	}
 	return nil
@@ -1694,5 +1709,144 @@ func TestPutMySettingsJudgeRunsOn(t *testing.T) {
 	}
 	if db.judgeRunsOn.Valid {
 		t.Fatalf("stored after null = %+v, want NULL", db.judgeRunsOn)
+	}
+}
+
+// --- sidebar_motion (issue #4510): raw nullable choice + resolved effective flag ---
+
+// decodeSidebarMotion pulls the raw and effective sidebar-motion fields out of a
+// /me/settings response.
+func decodeSidebarMotion(t *testing.T, body []byte) (raw *bool, effective bool) {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			SidebarMotion          *bool `json:"sidebar_motion"`
+			EffectiveSidebarMotion bool  `json:"effective_sidebar_motion"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.SidebarMotion, resp.Settings.EffectiveSidebarMotion
+}
+
+func putSettingsBody(h *Handler, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	h.PutMySettings(rec, authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(body)))))
+	return rec
+}
+
+func getSettingsBody(h *Handler) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+	return rec
+}
+
+func TestSidebarMotionNullUserResolvesToInstanceDefault(t *testing.T) {
+	t.Parallel()
+	h := &Handler{q: store.New(&fakeSettingsDB{})}
+	rec := getSettingsBody(h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	raw, eff := decodeSidebarMotion(t, rec.Body.Bytes())
+	if raw != nil || eff {
+		t.Fatalf("NULL user: raw=%v effective=%v, want nil/false", raw, eff)
+	}
+}
+
+func TestSidebarMotionPutTrueThenFalse(t *testing.T) {
+	t.Parallel()
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	if rec := putSettingsBody(h, `{"sidebar_motion":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("put true: %d %s", rec.Code, rec.Body.String())
+	}
+	raw, eff := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw == nil || !*raw || !eff {
+		t.Fatalf("after true: raw=%v effective=%v", raw, eff)
+	}
+	if rec := putSettingsBody(h, `{"sidebar_motion":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("put false: %d %s", rec.Code, rec.Body.String())
+	}
+	raw, eff = decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw == nil || *raw || eff {
+		t.Fatalf("explicit false must be preserved on GET: raw=%v effective=%v", raw, eff)
+	}
+}
+
+func TestSidebarMotionPutNullClears(t *testing.T) {
+	t.Parallel()
+	db := &fakeSettingsDB{sidebarMotion: pgtype.Bool{Bool: true, Valid: true}}
+	h := &Handler{q: store.New(db)}
+	if rec := putSettingsBody(h, `{"sidebar_motion":null}`); rec.Code != http.StatusOK {
+		t.Fatalf("put null: %d %s", rec.Code, rec.Body.String())
+	}
+	if db.sidebarMotion.Valid {
+		t.Fatalf("stored sidebar_motion should be NULL, got %+v", db.sidebarMotion)
+	}
+	raw, _ := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw != nil {
+		t.Fatalf("raw after clear = %v, want nil", *raw)
+	}
+}
+
+func TestSidebarMotionOmittedFieldPreservesStoredValue(t *testing.T) {
+	t.Parallel()
+	db := &fakeSettingsDB{sidebarMotion: pgtype.Bool{Bool: true, Valid: true}}
+	h := &Handler{q: store.New(db)}
+	// An appearance-only save sends set_sidebar_motion=false and must keep the value.
+	if rec := putSettingsBody(h, `{"typeface":"plex"}`); rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body.String())
+	}
+	if !db.sidebarMotion.Valid || !db.sidebarMotion.Bool {
+		t.Fatalf("sidebar_motion must survive an appearance-only PUT, got %+v", db.sidebarMotion)
+	}
+	// A motion-only save keeps the appearance fields.
+	db.typeface = pgtype.Text{String: "plex", Valid: true}
+	if rec := putSettingsBody(h, `{"sidebar_motion":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body.String())
+	}
+	if !db.typeface.Valid || db.typeface.String != "plex" {
+		t.Fatalf("typeface must survive a motion-only PUT, got %+v", db.typeface)
+	}
+}
+
+func TestSidebarMotionRejectsNonBooleanBeforeAnyWrite(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{`"yes"`, `1`, `{}`, `[]`} {
+		t.Run(v, func(t *testing.T) {
+			t.Parallel()
+			db := &fakeSettingsDB{}
+			h := &Handler{q: store.New(db)}
+			rec := putSettingsBody(h, `{"typeface":"plex","sidebar_motion":`+v+`}`)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "invalid sidebar_motion") {
+				t.Fatalf("body %q should say invalid sidebar_motion", rec.Body.String())
+			}
+			if db.typeface.Valid || db.sidebarMotion.Valid {
+				t.Fatalf("nothing may be written on a rejected request: typeface=%+v motion=%+v", db.typeface, db.sidebarMotion)
+			}
+		})
+	}
+}
+
+// Not parallel: it flips the package-level sidebarMotionDefault seam.
+func TestSidebarMotionInstanceDefaultOnAppliesOnlyToUnchosen(t *testing.T) {
+	prev := sidebarMotionDefault
+	sidebarMotionDefault = true
+	t.Cleanup(func() { sidebarMotionDefault = prev })
+
+	h := &Handler{q: store.New(&fakeSettingsDB{})}
+	raw, eff := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw != nil || !eff {
+		t.Fatalf("NULL user with default on: raw=%v effective=%v, want nil/true", raw, eff)
+	}
+	h = &Handler{q: store.New(&fakeSettingsDB{sidebarMotion: pgtype.Bool{Bool: false, Valid: true}})}
+	raw, eff = decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw == nil || *raw || eff {
+		t.Fatalf("explicit false with default on: raw=%v effective=%v, want false/false", raw, eff)
 	}
 }

@@ -2009,6 +2009,7 @@ type User struct {
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
+	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
 }
 
 type UserCrossCheckPin struct {

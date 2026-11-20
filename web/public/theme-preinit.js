@@ -7,7 +7,9 @@
 // by the nginx CSP and the pre-paint would silently never run (see web/nginx.conf).
 //
 // Dependency-free. Reads the "uzi.appearance" localStorage key written by
-// applyAppearance: a JSON object { mode, light, dark, typeface }. The LITERAL
+// applyAppearance: a JSON object { mode, light, dark, typeface, sidebarMotion }.
+// data-motion is "on" only when sidebarMotion is strictly boolean true; every other
+// case (no cache, absent/non-boolean field, parse error) paints "off". The LITERAL
 // polarity map below (LIGHT/DARK) must track THEME_POLARITY in web/src/lib/theme.ts
 // — a new theme adds one entry here and one there. It stamps BOTH data-theme (the
 // painted polarity's theme id) and data-font (the typeface), and NEVER leaves
@@ -30,7 +32,7 @@
   // paint stamps data-theme/data-font for a resolved appearance. matchMedia is
   // guarded here so a "system" mode without matchMedia falls to the light polarity
   // rather than throwing (leaving data-theme unset).
-  function paint(mode, light, dark, typeface) {
+  function paint(mode, light, dark, typeface, motion) {
     var osDark = false;
     if (mode === "system") {
       try {
@@ -45,6 +47,7 @@
     var polarityDark = mode === "dark" || (mode === "system" && osDark);
     el.setAttribute("data-theme", polarityDark ? dark : light);
     el.setAttribute("data-font", typeface);
+    el.setAttribute("data-motion", motion === true ? "on" : "off");
   }
 
   try {
@@ -54,6 +57,7 @@
     var light = "hall";
     var dark = "ember";
     var typeface = "system";
+    var motion = false;
 
     var raw = localStorage.getItem("uzi.appearance");
     if (raw) {
@@ -63,6 +67,7 @@
         if (known(LIGHT, a.light)) light = a.light;
         if (known(DARK, a.dark)) dark = a.dark;
         if (a.typeface === "system" || a.typeface === "plex") typeface = a.typeface;
+        motion = a.sidebarMotion === true;
       }
     } else {
       // No uzi.appearance yet: migrate a stale pre-m5 "uzi.theme" cache. A dark id
@@ -74,16 +79,17 @@
       }
     }
 
-    paint(mode, light, dark, typeface);
+    paint(mode, light, dark, typeface, motion);
   } catch (e) {
     // Storage / JSON failure: stamp the compiled fallback (system → matchMedia →
     // hall/ember). paint guards matchMedia itself, so if that ALSO throws the
     // nested catch stamps the safe light default (light/hall).
     try {
-      paint("system", "hall", "ember", "system");
+      paint("system", "hall", "ember", "system", false);
     } catch (e2) {
       el.setAttribute("data-theme", "hall");
       el.setAttribute("data-font", "system");
+      el.setAttribute("data-motion", "off");
     }
   }
 })();
