@@ -443,8 +443,13 @@ successful terminal import of an inventory-guarded code-publishing run whose gat
 the run is at the cap; the path is re-proved through the cap transfer), an in-process fence
 (`closeRefusalGeneration`) refuses further producing fetches and tracking
 updates (P1-P6) for that run at generation at or below the closed one.
-`retainCurrentOwedCandidate` (P7) is not fenced; its refusals before the seal
-land in the seal's gate or make it ineligible. Once `final-`
+`retainCurrentOwedCandidate` (P7) is not fenced by the in-process fence; it stays
+open before the freeze, and its refusals before the seal land in the seal's gate
+or make it ineligible. P7 is fenced by the seal of the generation it would pin:
+under the bare lock it returns `ownership_unknown`, before any candidate,
+context or pin write, when a `final-` file exists at or above the producing
+context's generation or the caller's generation (a failed read of the names
+also returns `ownership_unknown`). Once `final-`
 exists the seal blocks recording on every path, including `retainCurrentOwedCandidate`.
 On these paths a second terminal pass for the same generation re-proves the
 released head instead of re-importing (this only stops the hook from
@@ -460,7 +465,7 @@ Ordinary below-cap runs with gate `none` take the unchanged path.
   authenticated as the generation's claim holder can have written the
   admission; an admission from another process is not trusted.
 - Exclusion: no producer records a refused head after the seal exists (every
-  path) or after the fence closes (P1-P6; P7 is not fenced, see above), so the evidence the seal covers cannot grow.
+  path) or after the fence closes (P1-P6; P7 is fenced by the seal of the generation it would pin, not by the in-process fence, see above), so the evidence the seal covers cannot grow.
 
 **Failure model.** Process crash, SIGKILL and injected faults. Files rely on
 fsync, rename, directory fsync and read-back. No storage or power-loss claim is

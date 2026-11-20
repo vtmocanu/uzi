@@ -9205,7 +9205,13 @@ export class GitCache {
             // The incoming head was recorded above. A flat (unattributed) stage is no evidence of any run: it is
             // deleted as before.
             const note = incomingNote ?? { sealed: false, alreadyLedgered: false };
-            if (!attributedStage || (note.alreadyLedgered && !note.sealed)) await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            // An attributed duplicate is released only when its refused ref is verified at the incoming head;
+            // an absent, mismatched or unreadable ref (checkedRefSha throws) keeps the stage.
+            if (!attributedStage) await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            else if (note.alreadyLedgered && !note.sealed &&
+              await this.checkedRefSha(barePath, `refs/uzi-incoming/${opts.context.runId}/${opts.context.generation}/refused-${incoming}`) === incoming) {
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            }
           }
         } catch (cause) {
           // An inconclusive owner with a successfully preserved incoming pin is
@@ -29629,7 +29635,8 @@ try {
   }
 
   /** In-process fence: after this, imports and tracking updates of `runId` at `generation` or below
-   *  refuse before any stage, pin or ref write. retainCurrentOwedCandidate is sealed by the chokepoint instead. */
+   *  refuse before any stage, pin or ref write. retainCurrentOwedCandidate is fenced by the seal of the generation
+   *  it would pin (a FINAL file), not by this fence. */
   closeRefusalGeneration(runId: string, generation: number): void {
     if (!refusalRun(runId) || !refusalGeneration(generation, 1)) throw new Error("invalid refusal generation");
     this.closedRefusalGenerations.set(runId, Math.max(this.closedRefusalGenerations.get(runId) ?? 0, generation));
@@ -30812,9 +30819,18 @@ try {
         return { kind: "not_updated", reason: "ownership_unknown" };
       }
       try {
+        const producing = await this.producingContext(barePath, opts.context.branch, observed.owner);
+        // issue #4481: P7 is fenced by the seal (FINAL) of the generation it would pin or of the caller's
+        // generation, not by the in-process fence, so it stays open before the freeze.
+        const sealed = refusalFileGenerations(await this.refusalNames(barePath), "final", opts.context.runId);
+        const pinned = producing.generation !== null && producing.generation > 0 ? producing.generation : opts.context.generation;
+        const callerGeneration = opts.context.generation ?? 0;
+        if (sealed.some((g) => g > 0 && ((pinned !== null && pinned > 0 && g >= pinned) || (callerGeneration > 0 && g >= callerGeneration)))) {
+          return { kind: "not_updated", reason: "ownership_unknown" };
+        }
         const retainedShas: string[] = [];
         if (!(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha))) {
-          await this.pinOwedUnderLock(await this.producingContext(barePath, opts.context.branch, observed.owner), observed.sha, "P7");
+          await this.pinOwedUnderLock(producing, observed.sha, "P7");
           retainedShas.push(observed.sha);
         }
         return { kind: "updated", trackingRef: runnerTrackingRef(opts.context.branch),

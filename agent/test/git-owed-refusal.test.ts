@@ -463,7 +463,7 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     assert.equal(await cache.admitRefusalProvenance(ctx), "written");
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, coverOf(kept)), "sealed");
     unpinTrackingHead(kept);
-    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "owed_limit" });
+    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "ownership_unknown" });
     assert.equal(fs.existsSync(path.join(refDir(), ledgerName)), false);
     assert.deepEqual(incomingRefs(), []);
   });
@@ -488,7 +488,7 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     const cover = coverOf([...kept, refused]);
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "sealed");
     const before = evidence();
-    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "owed_limit" });
+    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "ownership_unknown" });
     assert.equal(evidence(), before);
   });
 
@@ -1723,5 +1723,76 @@ describe("issue4481 reconciling proven-finished, independently anchored import s
       assert.deepEqual(await hooked.refusalReleaseGate(bare, RUN, 1, head, BRANCH), NOT_LEDGERED);
       assert.equal(stageLeft(stage), true);
     });
+  });
+});
+
+describe("issue4481 at-cap duplicate stage release requires a verified refused ref", { timeout: 300_000 }, () => {
+  const stubRefusedRefWrite = (): (() => void) => {
+    const c = cache as unknown as { runGit: (dir: string, args: string[]) => Promise<string> };
+    const original = c.runGit;
+    c.runGit = function (this: unknown, dir: string, args: string[]) {
+      if (args[0] === "update-ref" && args.length === 3 && /\/refused-[0-9a-f]{40}$/.test(args[1]!)) return Promise.reject(new Error("injected refused ref write failure"));
+      return original.call(this, dir, args);
+    } as typeof c.runGit;
+    return () => { c.runGit = original; };
+  };
+
+  it("regression: a duplicate of a ledgered head whose refused ref is missing and cannot be rewritten keeps its stage", async () => {
+    await atCap();
+    const refused = await refuse();
+    const first = importStageRefs();
+    assert.equal(first.length, 1);
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-incoming/${RUN}/1/refused-${refused}`]);
+    const restore = stubRefusedRefWrite();
+    try {
+      assert.deepEqual(await fetchHead(), { kind: "not_updated", reason: "owed_limit", refusedSha: refused });
+    } finally { restore(); }
+    assert.equal(importStageRefs().length, 2, "the duplicate's stage is kept: no verified refused ref anchors it");
+  });
+
+  it("positive control: a duplicate with a verified refused ref deletes its stage", async () => {
+    await atCap();
+    const refused = await refuse();
+    const first = importStageRefs();
+    assert.deepEqual(await fetchHead(), { kind: "not_updated", reason: "owed_limit", refusedSha: refused });
+    assert.deepEqual(importStageRefs(), first);
+    assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-incoming/${RUN}/1/refused-${refused}`]), refused);
+  });
+});
+
+describe("issue4481 retainCurrentOwedCandidate is fenced by the seal of the generation it would pin", { timeout: 300_000 }, () => {
+  const dropTrackingPin = (kept: string[]): void => {
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${kept[kept.length - 1]}`]);
+  };
+
+  it("a post-seal retain makes no pin and no candidate file", async () => {
+    const { kept, refused } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, coverOf([...kept, refused])), "sealed");
+    assert.ok(refusalFiles().includes(`final-${RUN}-1.json`));
+    dropTrackingPin(kept);
+    const pins = pinRefs(), files = filesSnapshot();
+    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "ownership_unknown" });
+    assert.deepEqual(pinRefs(), pins);
+    assert.equal(filesSnapshot(), files);
+  });
+
+  it("a generation-2 caller observing a generation-1 head is refused by generation 1's seal", async () => {
+    const { kept, refused } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, coverOf([...kept, refused])), "sealed");
+    dropTrackingPin(kept);
+    const pins = pinRefs(), files = filesSnapshot();
+    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, withContext(2)), { kind: "not_updated", reason: "ownership_unknown" });
+    assert.deepEqual(pinRefs(), pins);
+    assert.equal(filesSnapshot(), files);
+  });
+
+  it("pre-freeze control: the in-process fence alone does not stop P7", async () => {
+    const { kept } = await eligibleState();
+    dropTrackingPin(kept);
+    cache.closeRefusalGeneration(RUN, 1);
+    const pins = pinRefs();
+    const result = await cache.retainCurrentOwedCandidate(bare, opts);
+    assert.equal(result.kind, "updated");
+    assert.equal(pinRefs().length, pins.length + 1, "the tracking head is pinned again");
   });
 });
