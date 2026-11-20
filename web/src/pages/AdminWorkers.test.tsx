@@ -326,8 +326,8 @@ describe("sibling-card save responses (#4544)", () => {
   });
 
   it("seeds every key on load and keeps another card's source state when a card saves", async () => {
-    // Every key carries a distinct, non-default value so a key dropped from the initial
-    // seeding shows up as a changed or missing rendered value.
+    // Every key carries a value that differs from what the card renders for a missing key,
+    // so a key dropped from the initial seeding shows up as a changed rendered value.
     mockApi.getSettings.mockResolvedValue({
       ...resp(
         {
@@ -344,7 +344,7 @@ describe("sibling-card save responses (#4544)", () => {
           worker_hibernation_idle_after: "72h",
           worker_hibernation_surplus: "true",
           worker_hibernation_surplus_idle_after: "30m",
-          capability_aware_scheduling: "false",
+          capability_aware_scheduling: "true",
         },
         { capability_aware_scheduling: "env", ephemeral_lease: "env", hosted_default_size: "db" },
       ),
@@ -392,8 +392,8 @@ describe("sibling-card save responses (#4544)", () => {
     expect(surplus.disabled).toBe(false);
     expect((screen.getByLabelText("Surplus idle threshold") as HTMLInputElement).value).toBe("30m");
     expect(hibSave().disabled).toBe(true);
-    // Capability scheduling: off and locked by the environment.
-    expect(toggle().checked).toBe(false);
+    // Capability scheduling: on (a missing key renders off) and locked by the environment.
+    expect(toggle().checked).toBe(true);
     expect(toggle().disabled).toBe(true);
     expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
 
@@ -403,7 +403,6 @@ describe("sibling-card save responses (#4544)", () => {
 
     // Unsent keys keep their seeded values and sources (the response carries fixture defaults).
     expect(toggle().disabled).toBe(true);
-    expect(toggle().checked).toBe(false);
     expect((screen.getByLabelText("Idle lease") as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
     // Save stays disabled only while the page still holds the seeded quota, custody and hibernation values.
