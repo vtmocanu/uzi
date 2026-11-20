@@ -29,7 +29,7 @@ describe("OnboardingChecklist", () => {
     expect(classesOf("Add your Anthropic token")).not.toContain("line-through");
   });
 
-  it("strikes step 4 and counts it when a registered-but-offline fleet is passed as joined (PRD #1331)", () => {
+  it("strikes step 4 and counts it when workerJoined is true", () => {
     const { container } = mount({ workerJoined: true });
     expect(classesOf("Bring a worker online")).toContain("line-through");
     expect(container.textContent).toContain("1/4 done");

@@ -148,7 +148,9 @@ describe("OverviewNext for a non-admin", () => {
   it("offers no link back to the retired old Overview", async () => {
     await mount();
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
-    expect(screen.queryByRole("link", { name: "Back to the old Overview" })).toBeNull();
+    expect(screen.getAllByRole("link").some((l) => l.getAttribute("href") === "/overview/classic")).toBe(false);
+    // Paired positive: the page does render links, so the negative is not vacuous.
+    expect(screen.getAllByRole("link").length).toBeGreaterThan(0);
   });
 
   it("lists only the viewer's active runs, with the empty state when there are none", async () => {
@@ -173,6 +175,17 @@ describe("OverviewNext for a non-admin", () => {
     mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
+    await mount();
+    expect(screen.queryByText("Get the factory running")).toBeNull();
+  });
+
+  it("counts a registered-but-offline fleet as joined, so setup completes (PRD #1331)", async () => {
+    mockApi.listRepos.mockResolvedValue({ repos: [{ enabled: true } as never] });
+    mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ status: "offline", last_heartbeat_at: "2026-07-05T10:00:00Z" })],
+    });
     await mount();
     expect(screen.queryByText("Get the factory running")).toBeNull();
   });

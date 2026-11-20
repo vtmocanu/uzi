@@ -3165,7 +3165,7 @@ Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
 
 ### Admin in-app health (PRD #1484)
 
-An admin-only, read-only Health tab, Overview card and `uzi admin health`
+An admin-only, read-only Health tab, Overview header health chip and `uzi admin health`
 show the full closed registry of checks over worker rolls/capacity, the queue,
 the controller's own liveness, background loops, the database, integrations,
 and housekeeping. The app-wide Danger banner (with a per-admin 1h snooze)

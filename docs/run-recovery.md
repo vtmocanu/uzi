@@ -2094,7 +2094,7 @@ A run that was interrupted and requeued while it has 1 to limit-1 of its own ope
 holds keeps resuming; once that one run alone holds the limit, it is not started at all
 (a per-run bound that applies even when you are below the owner limit; discard or settle
 that run's own holds to free it).
-The new Overview's **Held work** card always shows your custody admission unit
+The Overview's **Held work** card always shows your custody admission unit
 use, how many held sources need a decision, and how many runs are blocked. When
 the owner limit is reached, or when a queued run reaches its own hold limit,
 the card shows the corresponding warning tone. When at least one hold needs a

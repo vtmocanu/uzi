@@ -1426,7 +1426,7 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/done/1484-admin-health-tab.md`.
 
 - An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping). Health, Overview, overall status/counts, attention pips, history and `uzi admin health` retain all checks; the app-wide Danger banner, snooze, episodes and admin notices follow the server's separate `blocking` field for instance danger. Owner-only danger remains visible and exits CLI code 8 without an episode, admin DM or banner. [AI-synced 2026-10-05, #2293]
-- Health is the **last** admin tab, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-10-03, #1484]
+- Health is the **last** admin tab, not the first; the sidebar pip and the Overview header's health chip are the entry points. [AI-synced 2026-10-03, #1484; AI-synced 2026-11-20, #3877 M2]
   - Admin tab order: Users, Rate limits, Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health. Site lists and Products follow Branding, with Health still last. (AI-synced 2026-10-03)
 - The Danger banner carries a "Snooze 1 h", per admin, per open episode; a new episode shows the banner again. [AI-synced 2026-09-20, #1484]
 - #3589 adds a separate admin-only attention banner for strict `attention_banner === true`, `scope: owner` and `severity: warn`, in server order. `recovery.storage` alone opts in from its final severity; false is omitted. It follows the Danger banner, shares the health poll, renders titles/summaries as text in a polite status named "Admin health attention", and offers Open health and per-check Dismiss. (AI-synced 2026-10-28)
@@ -1785,7 +1785,7 @@ PRD at `prds/done/1786-preserve-worker-only-work.md`.
 
 - Board titles use all remaining terminal columns before the reserved judge marker and worker column, with no fixed title cap. This supersedes the board-title cap recorded in frozen `specs/ai.md` §559. (AI-synced 2026-10-14, #2922)
 
-- The Dashboard Active runs tile counts every non-terminal run and lists non-zero state counts in order: running; owner action ("1 needs you" or "N need you" for approval, input or follow-up); queued (queued or claimed); waiting to resume (usage, pool, recovery holds or owner pause). An empty active set reads "nothing in flight". (AI-synced 2026-10-14, #2922)
+- The Dashboard's Runs card counts non-terminal runs by state: executing (running), queued (queued or claimed) and parked (usage, pool or recovery holds, owner pause, or an account cooldown). Runs that need the owner (approval, input or follow-up) are not counted there; the Needs your decision card covers them. The former Active runs tile ("N need you", "nothing in flight") was retired with the old Overview. (AI-synced 2026-10-14, #2922; AI-synced 2026-11-20, #3877 M2)
 
 ## Feature #2865 — Default-branch CI repair (`ci_watch` / `ci-repair`)
 

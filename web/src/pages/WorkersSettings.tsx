@@ -761,7 +761,7 @@ export function WorkersSettings() {
             {/* PRD #1349 M6 (D8): the durable custody resolution surface. Self-hides when
                 there is no held work; when present it leads the panel so held work that
                 blocks claims is the first thing the owner sees on the Workers page. It is the
-                deep-link target for the board alert's "Review held work" action. */}
+                deep-link target for the Held work card's "Review held work" action. */}
             <RecoveryHoldsSurface />
 
             <Card className="space-y-3">

@@ -81,7 +81,7 @@ export function ownRecoveryWaitCount(runs: ReadonlyArray<Pick<RunSummaryItem, "s
 // brought online if it is online now OR has ever registered (last_heartbeat_at is stamped
 // at register/heartbeat and never cleared by the offline sweep), so a fleet mid-roll
 // (every worker offline + upgrading) does not reopen the step. Live health stays on the
-// "Workers online N/M" tile.
+// Capacity rail (OverviewNext).
 export function workerJoined(workers: ReadonlyArray<Pick<Worker, "status" | "last_heartbeat_at">>): boolean {
   return workers.some((w) => w.status === "online" || w.last_heartbeat_at != null);
 }

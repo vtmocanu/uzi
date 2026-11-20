@@ -1323,7 +1323,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     // The ONE admin-health poll for the whole app (PRD #1484 M5). Mounted here, above both
-    // the sidebar (the Admin pip) and the main pane (the danger banner + Overview card + the
+    // the sidebar (the Admin pip) and the main pane (the danger banner + Overview HealthChip + the
     // Health page), so every consumer reads one provider and the isAdmin gate lives in one
     // place. A non-admin session never fetches the admin endpoint.
     <HealthStatusProvider>

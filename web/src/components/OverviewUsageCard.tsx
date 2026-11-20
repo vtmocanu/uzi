@@ -42,7 +42,7 @@ const LAST_FAILURE_TITLE =
 
 function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: boolean }) {
   return (
-    <Td variant="preview" total={total} title={`${outcomes.failed} of ${outcomes.finished} finished runs`}>
+    <Td total={total} title={`${outcomes.failed} of ${outcomes.finished} finished runs`}>
       {failRate(outcomes)}
       <span className="block text-[11px] font-normal text-faint">of {outcomes.finished.toLocaleString("en-US")} finished</span>
     </Td>
@@ -70,7 +70,7 @@ function CostChip({ count, short, full, detail }: { count: number; short: string
 
 function CostCell({ cost, subscription, unreported, total }: { cost: number; subscription: number; unreported: number; total?: boolean }) {
   return (
-    <Td variant="preview" total={total}>
+    <Td total={total}>
       <span className="font-mono">{summaryCost(cost)}</span>
       {(subscription > 0 || unreported > 0) && (
         <span className="mt-1 flex flex-wrap justify-end gap-1">
@@ -117,7 +117,7 @@ function ShareCell({ pct, ratio, runs, withHarness, total }: {
   let title = pct == null ? "No recorded factory cost in the selected period" : `${pct}% of factory cost`;
   if (split) title += `; runs ${split.claude}% Claude, ${split.codex}% Codex`;
   return (
-    <Td start variant="preview" total={total} title={title}>
+    <Td start total={total} title={title}>
       <span className="flex items-center gap-2">
         <span className="w-9 shrink-0 text-right">{pct == null ? "—" : `${pct}%`}</span>
         <span aria-hidden="true" className="flex h-1.5 w-[120px] shrink-0 overflow-hidden rounded-[3px] bg-raised">
@@ -181,14 +181,14 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
             <table aria-label="By user" className="w-full min-w-[860px] border-collapse text-[13px]">
               <thead>
                 <tr>
-                  <Th variant="preview" left>User</Th>
-                  <Th variant="preview" title="Primary work runs with recorded usage in the period">Runs</Th>
-                  <Th variant="preview">PRs</Th>
-                  <Th variant="preview">Failed</Th>
-                  <Th variant="preview" title="Failed of finished runs in the period">Fail rate</Th>
-                  <Th variant="preview" title={LAST_FAILURE_TITLE}>Last failure</Th>
-                  <Th variant="preview">Cost</Th>
-                  <Th variant="preview" start title={showHarness ? `${SHARE_TITLE}; Claude / Codex: ${HARNESS_NOTE}` : SHARE_TITLE}>
+                  <Th left>User</Th>
+                  <Th title="Primary work runs with recorded usage in the period">Runs</Th>
+                  <Th>PRs</Th>
+                  <Th>Failed</Th>
+                  <Th title="Failed of finished runs in the period">Fail rate</Th>
+                  <Th title={LAST_FAILURE_TITLE}>Last failure</Th>
+                  <Th>Cost</Th>
+                  <Th start title={showHarness ? `${SHARE_TITLE}; Claude / Codex: ${HARNESS_NOTE}` : SHARE_TITLE}>
                     {showHarness ? "Cost share · Claude / Codex" : "Cost share"}
                   </Th>
                 </tr>
@@ -196,15 +196,15 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
               <tbody>
                 {rows.map((u, i) => (
                   <tr key={u.user_id}>
-                    <Td variant="preview" left>
+                    <Td left>
                       {stripUnsafeChars(maskEmail(u.email, demo))}
                       {u.user_id === viewerId && <span className="font-normal text-faint"> (you)</span>}
                     </Td>
-                    <Td variant="preview">{u.selectedRuns.toLocaleString("en-US")}</Td>
-                    <Td variant="preview">{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
-                    <Td variant="preview">{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
+                    <Td>{u.selectedRuns.toLocaleString("en-US")}</Td>
+                    <Td>{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
+                    <Td>{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
                     <FailRateCell outcomes={u.selectedOutcomes} />
-                    <Td variant="preview">{failureAgo(u.outcomes, now)}</Td>
+                    <Td>{failureAgo(u.outcomes, now)}</Td>
                     <CostCell cost={u.b.cost} subscription={u.subscription} unreported={u.unreported} />
                     <ShareCell
                       pct={shares?.[i]}
@@ -217,12 +217,12 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
               </tbody>
               <tfoot>
                 <tr>
-                  <Td variant="preview" left total>Factory</Td>
-                  <Td variant="preview" total>{factoryRuns.toLocaleString("en-US")}</Td>
-                  <Td variant="preview" total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
-                  <Td variant="preview" total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
+                  <Td left total>Factory</Td>
+                  <Td total>{factoryRuns.toLocaleString("en-US")}</Td>
+                  <Td total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
+                  <Td total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
                   <FailRateCell outcomes={factoryOutcomes} total />
-                  <Td variant="preview" total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
+                  <Td total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
                   <CostCell cost={factory.cost} subscription={factorySubscription ?? 0} unreported={factoryUnreported ?? 0} total />
                   <ShareCell pct={shares ? 100 : undefined} ratio={shares ? 1 : undefined} runs={factoryHarness} withHarness={showHarness} total />
                 </tr>
@@ -341,13 +341,13 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
         {!hasRecordedUsage(usage) && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
         <div className="mt-5 grid gap-6 border-t border-edge pt-4 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
           <div className="min-w-0 space-y-3">
-            <FailedRunsBlock outcomes={outcomes} personal={personal} framed={false} />
+            <FailedRunsBlock outcomes={outcomes} personal={personal} />
             {outcomes.needs_landing > 0 && (
               <p className="text-[11px] text-muted">{outcomes.needs_landing.toLocaleString("en-US")} failed runs with recoverable work. May include work already landed.</p>
             )}
           </div>
           <div className="min-w-0 space-y-3">
-            <TopCauses outcomes={outcomes} personal={personal} variant="list" />
+            <TopCauses outcomes={outcomes} personal={personal} />
             <SinceLastFailedRun outcomes={lifetime} owner={owner} label="Latest failure (all time)" wrap />
           </div>
         </div>

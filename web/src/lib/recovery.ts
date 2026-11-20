@@ -162,13 +162,13 @@ export function sortedArchives(summary: RecoveryArchiveSummary): RecoveryArchive
 }
 
 // ── Owner custody surface (PRD #1349 M6, D6/D7/D8/D9) ─────────────────────────
-// Pure decision logic for the board alert and the Workers per-hold resolution surface.
+// Pure decision logic for the Overview Held work card and the Workers per-hold resolution surface.
 // The server derives each hold's `attention` (active | capturing | archive_ready |
 // needs_action | source_only | released | discarded) and the owner-wide aggregate; this
 // file maps the aggregate onto presentation, including alert severity from blocked_runs.
 // Admission and decision counts remain server-authoritative; raw hold rows do not drive them.
 
-// CustodyAlertView is the board alert's resolved presentation, or `null` to render nothing.
+// CustodyAlertView is the Held work card's resolved presentation, or `null` to render nothing.
 export interface CustodyAlertView {
   // danger = blocked_runs > 0; warning = every other visible case, including capacity.
   // Capacity alone does not establish that any run is currently blocked.
@@ -190,7 +190,7 @@ export interface CustodyAlertView {
   headline: string;
 }
 
-// custodyAlertView decides whether the board alert renders and, if so, how loud it is.
+// custodyAlertView decides whether the Held work card renders and, if so, how loud it is.
 //
 // SELF-HIDES unless there is an open hold AND a decision, a blocked run, or capacity
 // reached against a positive limit. Healthy protection below capacity stays hidden.
