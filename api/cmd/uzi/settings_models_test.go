@@ -340,6 +340,14 @@ func TestSettingsGetSummaryRowsUnknownSource(t *testing.T) {
 }
 
 func TestSettingsGetPlanningRows(t *testing.T) {
+	for _, effective := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stored-only", true: "effective"}[effective], func(t *testing.T) { settingsGetPlanningRows(t, effective) })
+	}
+}
+
+// settingsGetPlanningRows checks both table paths: an older server without the effective view, and a
+// current one serving it, where effectiveSettingsRows replaces settingsModelRows.
+func settingsGetPlanningRows(t *testing.T, effective bool) {
 	stored := "opus"
 	high := "high"
 	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
@@ -350,6 +358,9 @@ func TestSettingsGetPlanningRows(t *testing.T) {
 			{Harness: "claude", DefaultEffort: "medium", DefaultSource: "builtin", ResolvedEffort: &high, Source: "builtin", Mode: "explicit"},
 		},
 	}}
+	if effective {
+		fc.Effective = &apitypes.EffectiveSettingsDTO{}
+	}
 	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
@@ -394,7 +405,7 @@ func TestSettingsGetPlanningRowsBuiltinModelAndRuntimeEffort(t *testing.T) {
 		}
 	}
 	want := []string{
-		"planning model claude Default the SDK decides the SDK decides built-in",
+		"planning model claude Default SDK/account default SDK/account default built-in",
 		"planning effort claude Default runtime default runtime default (value not reported) your choice",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {

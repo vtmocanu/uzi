@@ -555,7 +555,7 @@ export interface UserSettings {
    *  older servers. */
   planning_claude_model?: string | null;
   planning_claude_effort?: string | null;
-  /** Read-only resolved planning cells (PRD #3252), claude then codex. Never sent on a PUT. */
+  /** Read-only resolved planning cells (PRD #3252), one claude cell each (Q-codex adds the codex cells). Never sent on a PUT. */
   planning_models?: ModelSettingCell[];
   planning_efforts?: EffortSettingCell[];
   theme: string | null;

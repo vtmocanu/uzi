@@ -214,13 +214,7 @@ func planningSettingRows(models []apitypes.ModelSettingCellDTO, efforts []apityp
 	var rows []settingRow
 	for _, c := range models[:min(len(models), 1)] {
 		// A built-in Claude model is empty: the SDK picks it, so say that rather than print nothing.
-		def, resolved := c.DefaultModel, c.ResolvedModel
-		if def == "" {
-			def = modelSettingSource("note", "sdk_default")
-		}
-		if resolved == "" {
-			resolved = modelSettingSource("note", "sdk_default")
-		}
+		def, resolved := orSDKDefault(c.DefaultModel), orSDKDefault(c.ResolvedModel)
 		rows = append(rows, settingRow{
 			Setting: "planning model", Harness: c.Harness, Stored: c.Model,
 			Default: def, Resolved: resolved,

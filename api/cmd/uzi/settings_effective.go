@@ -94,7 +94,9 @@ func effectiveSettingsRows(s apitypes.UserSettingsDTO, e *apitypes.EffectiveSett
 	}
 	rows = append(rows, modelSettingRows("summary", s.SummaryModels)...)
 	rows = append(rows, modelRows("task_review_model")...)
-	return append(rows, effortRows("task_review_effort")...)
+	rows = append(rows, effortRows("task_review_effort")...)
+	// PRD #3252: the Claude planning rows come from the settings read on both table paths.
+	return append(rows, planningSettingRows(s.PlanningModels, s.PlanningEfforts)...)
 }
 
 // effectiveStartRows renders the start choices: what a start with that harness choice resolves to
