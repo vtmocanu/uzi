@@ -54,6 +54,17 @@ export function providerKeyForms(key: string): string[] {
 }
 
 export type TextRedactor = (s: string) => string;
+/** The api bounds a non_closing reason to 1..500 code points. */
+const NON_CLOSING_REASON_MAX = 500;
+
+/** Redact a non_closing reason, then clamp it to the api's 500 code-point bound (the redaction
+ *  marker can lengthen a short secret). A non-empty reason stays non-empty. */
+export function redactNonClosingReason(redact: TextRedactor, reason: string): string {
+  const out = redact(reason);
+  const points = Array.from(out);
+  return points.length > NON_CLOSING_REASON_MAX ? points.slice(0, NON_CLOSING_REASON_MAX).join("") : out;
+}
+
 export type PayloadRedactor = (payload: Record<string, unknown>) => Record<string, unknown>;
 
 // usableSecrets keeps only strings at/above the length floor; below it an

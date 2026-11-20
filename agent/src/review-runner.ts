@@ -45,7 +45,15 @@ import type { ClaimProviderBinding, ClaimResponse, TaskReviewFinding, TaskReview
 // the API sweeper reaps it — and a stalled worker posts no fallback. On the cap we abort
 // the SDK query AND hard-reject the race, so runModel always settles within the budget
 // and review() falls back to a `failed` review.
-const REVIEW_MODEL_TIMEOUT_MS = 5 * 60 * 1000;
+/** An error-derived review summary, capped at 500 chars. The claim's provider key is redacted from
+ *  the error text BEFORE the cap, so a key straddling the cut cannot leave a readable prefix. */
+function boundedClaimError(claim: ClaimResponse, prefix: string, err: unknown): string {
+  const credential = claim.secrets?.provider?.credential;
+  const message = credential ? makeTextRedactor(providerKeyForms(credential))(errMessage(err)) : errMessage(err);
+  return `${prefix}${message}`.slice(0, 500);
+}
+
+const REVIEW_MODEL_TIMEOUT_MS =5 * 60 * 1000;
 
 // The prompt char budget for the diff. The git layer already caps the diff at 512 KiB
 // (REVIEW_DIFF_MAX_BYTES); this is a second, char-domain clamp so a diff of mostly
@@ -280,7 +288,7 @@ export class ReviewRunner {
         run_id: reviewRunId,
         error: errMessage(err),
       });
-      review = { status: "failed", summary: `Review could not be produced: ${errMessage(err)}`.slice(0, 500), findings: [] };
+      review = { status: "failed", summary: boundedClaimError(claim, "Review could not be produced: ", err), findings: [] };
     }
 
     try {
@@ -397,7 +405,7 @@ export class ReviewRunner {
         run_id: claim.run_id,
         error: errMessage(err),
       });
-      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+      return fallbackTaskReview(boundedClaimError(claim, "The reviewer model call did not complete: ", err));
     }
   }
 
@@ -441,7 +449,7 @@ export class ReviewRunner {
         run_id: claim.run_id,
         error: errMessage(err),
       });
-      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+      return fallbackTaskReview(boundedClaimError(claim, "The reviewer model call did not complete: ", err));
     }
   }
 

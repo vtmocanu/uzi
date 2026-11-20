@@ -4261,6 +4261,16 @@ describe("SdkExecutor prd_done_path (PRD #72 M4)", () => {
     assert.ok(result.prdDonePath!.startsWith("prds/done/aaa"));
   });
 
+  it("redacts the run's secrets BEFORE the clamp, so a key straddling the bound leaves no prefix", async () => {
+    const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const declared = "prds/done/" + "a".repeat(480) + key + ".md"; // the 512 cut falls inside the key
+    assert.ok(declared.slice(0, 512).includes(key.slice(0, 2)) && !declared.slice(0, 512).includes(key), "fixture straddles the cut");
+    const { result } = await runDeclaring({ prd_done_path: declared }, { redactText: (s: string) => s.split(key).join("[REDACTED]") });
+    assert.ok(result.prdDonePath!.length <= 512);
+    for (let n = 8; n <= key.length; n++) assert.ok(!result.prdDonePath!.includes(key.slice(0, n)), `prefix ${n} leaked`);
+    assert.ok(result.prdDonePath!.includes("[REDACTED]"));
+  });
+
   it("forwards a hostile path unchanged — validation is the api's job, not a second implementation", async () => {
     const hostile = "prds/../../../etc/passwd";
     const { result } = await runDeclaring({ prd_done_path: hostile });

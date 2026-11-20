@@ -4709,7 +4709,9 @@ export class SdkExecutor implements Executor {
       // shape every existing deepStrictEqual on this result asserts and blur the
       // wire distinction between "declared nothing" and "field present but empty".
       if (isIssueRun && declaredPrdPath !== undefined) {
-        result.prdDonePath = declaredPrdPath.slice(0, PRD_DONE_PATH_MAX_LEN);
+        // Redact BEFORE the clamp: a provider key straddling the cut would otherwise leave a prefix
+        // that no later whole-key redaction can match.
+        result.prdDonePath = (ctx.redactText?.(declaredPrdPath) ?? declaredPrdPath).slice(0, PRD_DONE_PATH_MAX_LEN);
       }
       // PRD #265 M1: forward the declared finished-milestone ids on `issue` runs only,
       // for the same reasons the PRD path is gated and OMITTED-not-undefined above. The

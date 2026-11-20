@@ -245,7 +245,7 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { providerKeyForms, SecretSet } from "./redact.js";
+import { providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
@@ -11239,7 +11239,7 @@ export class RunRunner {
                 claimGeneration: flight.claimGeneration,
                 nonClosing: (() => {
                   const declared = result.nonClosing ?? claim.config?.non_closing;
-                  return declared ? { ...declared, reason: flight.redactText(declared.reason) } : declared;
+                  return declared ? { ...declared, reason: redactNonClosingReason(flight.redactText, declared.reason) } : declared;
                 })(),
               }, fallbackSignal);
               recorded = true;
@@ -11850,7 +11850,7 @@ export class RunRunner {
             await this.client.recordCompletionAttempt(runId, {
               milestonesCompleted: [], head, worktreeFingerprint: null,
               claimGeneration: flight.claimGeneration,
-              ...(effectiveDeclared && this.client.hasFeature("completion_non_closing_v1") ? { nonClosing: { ...effectiveDeclared, reason: flight.redactText(effectiveDeclared.reason) } } : {}),
+              ...(effectiveDeclared && this.client.hasFeature("completion_non_closing_v1") ? { nonClosing: { ...effectiveDeclared, reason: redactNonClosingReason(flight.redactText, effectiveDeclared.reason) } } : {}),
             }, signal);
             break;
           } catch (error) {
@@ -19014,7 +19014,7 @@ export class RunRunner {
       recordCompletionAttempt: async ({ declared, head, worktreeFingerprint, nonClosing }) => {
         const result = await this.client.recordCompletionAttempt(runId, {
           milestonesCompleted: declared,
-          nonClosing: nonClosing === undefined ? undefined : { ...nonClosing, reason: flight.redactText(nonClosing.reason) },
+          nonClosing: nonClosing === undefined ? undefined : { ...nonClosing, reason: redactNonClosingReason(flight.redactText, nonClosing.reason) },
           head,
           worktreeFingerprint,
           // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
