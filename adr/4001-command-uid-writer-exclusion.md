@@ -441,12 +441,35 @@ established for this path, and it stays gated under D9's fallback.
 
 The fence's durability claims hold only if no ACKed commit can be lost on
 failover. The API cannot verify replication topology or `fsync` by itself
-(see Server durability). Candidate mechanism: forced `synchronous_commit`,
-a post-commit, pre-ACK check that a synchronous standby has flushed past the
-commit LSN (ACK withheld otherwise), and controller or HA-manager evidence
-for the single-instance case and the promotion set, as named trust.
-**Recommendation:** adopt the mechanism and accept the topology and `fsync`
-trust as an owner decision. **Alternative:** keep the gate.
+(see Server durability).
+
+**Candidate mechanism (not yet sufficient).**
+- Each fence transaction forces `synchronous_commit`.
+- After commit and before ANY ACK, the API checks that every standby in the
+  vouched promotion set (not merely one synchronous standby) has flushed past
+  the commit LSN. Under `ANY 1 (s1,s2)` a commit flushed only on s1 does not
+  pass when s2 may be promoted.
+- Single-instance or promotion-set evidence is operator-declared or read by
+  the controller. Reading an HA manager's state would be new controller read
+  authority of the same class as P-4, and is not approved.
+- `fsync` cannot be forced per transaction and rests only on that trust.
+
+**Open problems.**
+- Replay. A commit whose ACK was withheld is still committed. D9.4 (approved)
+  says a committed release replays its original ACK, so a retry would hand
+  out the withheld ACK. Closing this needs "committed" for replay to mean
+  committed and flushed to the promotion set, with every ACK path, replay
+  included, re-running the check. That is a reading of D9.4 the owner must
+  confirm.
+- A withheld ACK leaves A with an unknown release outcome. A STOPs with the
+  outcome unknown and retries replay later; it is never described as
+  "custody kept" (D9.4).
+- A synchronous wait cut short by the transaction's own timeout commits
+  locally. The check above treats it like any unflushed commit.
+
+**Recommendation:** adopt the mechanism once the replay reading is confirmed,
+and accept the topology and `fsync` trust as an owner decision.
+**Alternative:** keep the gate.
 
 ## Mechanism: the compound proof (requirement 1)
 
@@ -773,13 +796,9 @@ lock.
   - which standbys may be promoted is decided by the HA manager, not by
     Postgres.
 
-  This is pending item P-6. The candidate mechanism: each fence transaction
-  forces `SET LOCAL synchronous_commit = on`; for the replicated case the API
-  confirms after commit and before the ACK that a synchronous standby's
-  `flush_lsn` has reached the commit LSN, and withholds the ACK otherwise;
-  single-instance or promotion-set evidence comes from the controller or HA
-  manager as named trust. `fsync` cannot be forced per transaction and is
-  covered only by that trust.
+  This is pending item P-6, whose candidate mechanism and open problems
+  (replay of a withheld ACK, promotion-set coverage) are stated there. Until
+  it closes, the server fence's durability claims are not established.
 - **Storage or power loss.**
   - This relies on Postgres `fsync=on` and `synchronous_commit=on`.
   - These are defaults: no override was found in the chart values, the compose
@@ -794,7 +813,7 @@ lock.
   key or PVC UID returns the stored result.
 
 **Verification:** crash-between-commit-and-ack injection, the forced
-`synchronous_commit`, and the P-6 post-commit standby-flush check.
+`synchronous_commit`, and the P-6 promotion-set flush check on every ACK path.
 
 **Not claimed:** a process-crash test is not proof of power-loss durability.
 
@@ -862,7 +881,7 @@ Absence is never inferred.
 | Server generation | Superseded, not current |
 | Release fence | Refusal (STOP) |
 | Committed release replay | Returns the original ACK, never "custody kept" |
-| Replication durability (P-6) | Missing controller or HA evidence, or no synchronous standby flush past the commit LSN before ACK (the ACK is withheld) |
+| Replication durability (P-6) | Missing topology evidence, or the promotion set not flushed past the commit LSN before any ACK, replay included (pending P-6) |
 | Unorderable lane or startup path | Gated |
 
 ## Authority (requirement 4)
@@ -1053,8 +1072,11 @@ may already hold on base.
   digest refused.
 - A fence transaction runs with `synchronous_commit = on` even when the
   session, role or database default is off.
-- An ACK is withheld when no synchronous standby has flushed past the commit
-  LSN, including a topology change between check and commit (P-6).
+- An ACK is withheld unless every standby in the vouched promotion set has
+  flushed past the commit LSN, including a topology change between commit and
+  the flush check, and between the check and the ACK (P-6).
+- A replay after a withheld ACK, with the standby still behind, is withheld
+  again (P-6, subject to the owner's D9.4 reading).
 - The synchronized open-then-unlink alias race (P-1), documented per its
   outcome.
 - The synchronized row-lock races above, including a lock held across
@@ -1094,16 +1116,18 @@ literal leaves, `run.sh` invocations, and `lint:shell`.
 **Prerequisite.** Each pending item is closed and recorded as an amendment to
 this ADR:
 - P-1, P-3 and P-4 by owner decision;
-- P-6 by the post-commit standby-flush mechanism plus an owner decision on
-  the controller or HA-manager topology trust and on `fsync`;
+- P-6 by a promotion-set flush check on every ACK path including replay,
+  the owner's confirmation of that D9.4 reading, and an owner decision on the
+  topology evidence source and `fsync` trust;
 - P-2 by a proof that every local predecessor effect is non-authoritative and
   harmless with B running, plus an owner decision accepting that deviation, or
   by a local-write fence (none exists today);
 - P-5 by the per-incarnation superseding registration ordered before any
   activity that could write T, the live-A registry rule, and a disjointness
-  proof or owner decision for every pre-registration startup write (root
-  entrypoint and worker-uid startup passes).
-Approval alone does not close P-2 or P-5.
+  proof or owner decision for every pre-registration startup activity (root
+  entrypoint, worker-uid startup passes, and the startup uid-10003 Codex
+  orphan reaper).
+Approval alone does not close P-2, P-5 or P-6.
 
 **Dependencies:**
 - **External and records.**
@@ -1134,7 +1158,7 @@ Approval alone does not close P-2 or P-5.
     `clock_timestamp()` authorization via `LeaseClockNow`;
   - the lease, epoch fencing tokens, generations, superseded set, conditional
     release, replay precedence and conflict handling;
-  - forced `synchronous_commit`, the post-commit standby-flush check and the
+  - forced `synchronous_commit`, the promotion-set flush check on every ACK path and the
     controller or HA topology evidence (P-6);
   - synchronized LiveDB race, lock-across-expiry and crash-point tests.
 
