@@ -9,7 +9,7 @@ const nonce = `phase-${randomUUID()}`;
 const wire: Array<Record<string, unknown>> = [];
 let runtime: PhaseClaude;
 type Turn = Awaited<ReturnType<PhaseClaude["turn"]>>;
-let a: Turn, b: Turn, back: Turn, omitted: Turn;
+let a: Turn, b: Turn, back: Turn, omitted: Turn, runtimeDefault: Turn, runtimeDefaultAfter: Turn, explicitNondefault: Turn, omittedModel: Turn;
 let barrier: { beforePrompt: boolean; requestsAfterAbort: number; events: string[] };
 const fake = new FakeAnthropicApi(body => {
   runtime.events.push("request");
@@ -21,7 +21,14 @@ before(async () => {
   a = await runtime.turn({ model: "opus", effort: "high", prompt: `Remember ${nonce}. Say it.` });
   b = await runtime.turn({ model: "sonnet", effort: "medium", resume: a.session, prompt: "Repeat the nonce." });
   back = await runtime.turn({ model: "opus", effort: "high", resume: a.session, prompt: "Repeat it again." });
-  omitted = await runtime.turn({ resume: a.session, prompt: "Repeat it once more." });
+  omitted = await runtime.turn({ model: "opus", resume: a.session, prompt: "Repeat it once more." });
+  const clean = new PhaseClaude(runtime.providerEnv);
+  try {
+    runtimeDefault = await clean.turn({ prompt: "Default model control." });
+    explicitNondefault = await clean.turn({ model: "sonnet", effort: "high", prompt: `Remember ${nonce}.` });
+    omittedModel = await clean.turn({ resume: explicitNondefault.session, effort: "medium", prompt: "Repeat the nonce." });
+    runtimeDefaultAfter = await clean.turn({ prompt: "Fresh default control after the explicit model." });
+  } finally { await clean.close(); }
   for (const turn of [a, b, back, omitted]) assert.equal(turn.failure, undefined);
   const count = wire.length;
   const aborted = await runtime.turn({ model: "sonnet", effort: "medium", prompt: "Barrier abort control", abortOnInit: true });
@@ -68,8 +75,11 @@ test("Claude phase case 3: re-plan switches back on the same session", () => {
   assert.equal(back.effort, "high");
 });
 test("Claude phase case 4: omitted model retains the explicit planning model", () => {
-  assert.equal(omitted.model, a.model);
-  assert.equal(wire[3]?.model, a.model);
+  assert.notEqual(explicitNondefault.model, runtimeDefault.model, "the control distinguishes retention from vendor default");
+  assert.equal(omittedModel.session, explicitNondefault.session);
+  assert.equal(omittedModel.model, explicitNondefault.model);
+  assert.equal(wire[6]?.model, explicitNondefault.model);
+  assert.equal(runtimeDefaultAfter.model, runtimeDefault.model, "the explicit query did not change the fresh-session default");
 });
 test("Claude phase case 5: omitted effort reverts from high to the runtime medium default", () => {
   assert.equal(back.effort, "high");
@@ -86,5 +96,6 @@ test("Claude phase case 9: init precedes requests but is not a prompt or abort a
   assert.equal(barrier.requestsAfterAbort, 1);
   console.log(`PHASE_CLAUDE_EVIDENCE ${JSON.stringify({ sdk: "0.3.319", cli: a.cli,
     models: [a.model, b.model, back.model, omitted.model], efforts: [a.effort, b.effort, back.effort, omitted.effort],
-    switchedUsageModels: Object.keys(b.usage as object), barrier })}`);
+    runtimeDefaultModel: runtimeDefault.model, explicitNondefaultModel: explicitNondefault.model,
+    omittedModel: omittedModel.model, switchedUsageModels: Object.keys(b.usage as object), barrier })}`);
 });

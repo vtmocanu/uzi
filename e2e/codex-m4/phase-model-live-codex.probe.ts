@@ -56,9 +56,11 @@ async function main(): Promise<void> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cdx3246-live-"));
   let warm: PhaseCodex | undefined;
   let cold: PhaseCodex | undefined;
-  const soft = setTimeout(() => { void warm?.close(); void cold?.close(); }, Math.max(1, 295_000 - (Date.now() - startedAt)));
+  let stopped = false;
+  const check = () => { if (stopped) throw new Error("probe stopped"); };
+  const soft = setTimeout(() => stop(), Math.max(1, 295_000 - (Date.now() - startedAt)));
   const hard = setTimeout(() => process.exit(124), Math.max(1, 300_000 - (Date.now() - startedAt)));
-  const stop = () => { void warm?.close(); void cold?.close(); };
+  const stop = () => { stopped = true; void warm?.close(); void cold?.close(); };
   process.once("SIGINT", stop); process.once("SIGTERM", stop);
   const groups: Array<{ name: string; thread: string; omission?: null; turns: unknown[]; count: number }> = [];
   let failure: string | undefined;
@@ -66,12 +68,14 @@ async function main(): Promise<void> {
     console.log(JSON.stringify({ kind: "preflight", harness: "codex", evidence:
       offlineProof("../e2e/codex-m4/phase-model-switch.test.ts", "PHASE_CODEX_EVIDENCE ") }));
     const active = warm = await PhaseCodex.open(bin, home, root, undefined, undefined, args.modelA);
+    check();
     for (const name of ["switch-reclaim-replan", "omitted-effort", "null-effort"]) {
       const started = await active.thread(args.modelA);
       const group = { name, thread: started.thread.id, ...(name === "null-effort" ? { omission: null } : {}), turns: [] as unknown[], count: 0 };
       groups.push(group);
       accountant.registerThread(group.thread, args.modelA, false);
       const drive = async (model: string, effort?: string | null) => {
+        check();
         if (++group.count > 4) throw new Error("probe turn budget exceeded");
         const result = await active.turn(group.thread, model, group.count === 1
           ? `Think carefully about 137 times 293 internally, remember ${nonce}, and reply only with that nonce.`
@@ -88,13 +92,16 @@ async function main(): Promise<void> {
       await drive(args.modelA, args.effortA);
     }
     await active.close();
+    check();
     cold = await PhaseCodex.open(bin, home, root, undefined, undefined, args.modelA);
+    check();
     for (const group of groups) {
       const report = await cold.thread(args.modelB, group.thread);
       accountant.registerThread(group.thread, args.modelB, true);
       group.turns.push({ resumeModel: report.model, resumeEffort: report.reasoningEffort ?? "unreported", role: "cold" });
       if (++group.count > 4) throw new Error("probe turn budget exceeded");
       const effort = group.name === "switch-reclaim-replan" ? args.effortB : group.omission;
+      check();
       const observation = observe(await cold.turn(group.thread, args.modelB, "Repeat the remembered nonce exactly.", effort), group.thread, args.modelB, effort);
       group.turns.push(observation);
       if (!observation.nonceObserved) throw new Error("provider did not complete the cold nonce control");

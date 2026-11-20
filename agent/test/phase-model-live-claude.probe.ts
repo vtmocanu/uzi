@@ -7,42 +7,59 @@ async function main(): Promise<void> {
   if (args.variable !== "CLAUDE_CODE_OAUTH_TOKEN") throw new Error("Claude probe requires --credential-env CLAUDE_CODE_OAUTH_TOKEN");
   const nonce = `nonce-${randomUUID()}`;
   const runtime = new PhaseClaude({ CLAUDE_CODE_OAUTH_TOKEN: args.credential });
+  const runtimes = [runtime];
+  const models = new Map<string, string>();
   const groups: Array<{ name: string; turns: unknown[] }> = [];
   let failure: string | undefined;
-  const soft = setTimeout(() => { void runtime.close(); }, 295_000);
+  let stopped = false;
+  const soft = setTimeout(() => onSignal(), 295_000);
   const hard = setTimeout(() => process.exit(124), 300_000);
-  const onSignal = () => { void runtime.close(); };
+  const onSignal = () => { stopped = true; for (const r of runtimes) void r.close(); };
   process.once("SIGINT", onSignal); process.once("SIGTERM", onSignal);
   try {
     const barrier = offlineProof("test/phase-model-switch.integration.test.ts", "PHASE_CLAUDE_EVIDENCE ");
     console.log(JSON.stringify({ kind: "preflight", harness: "claude", barrier }));
     for (const name of ["switch-reclaim-replan", "omitted-model", "omitted-effort"]) {
+      const driver = name === "switch-reclaim-replan" ? runtime : new PhaseClaude(runtime.providerEnv);
+      if (driver !== runtime) runtimes.push(driver);
       const turns: Awaited<ReturnType<PhaseClaude["turn"]>>[] = [];
       const group = { name, turns: [] as unknown[] };
       groups.push(group);
-      const drive = async (model?: string, effort?: "high" | "medium") => {
+      const drive = async (model?: string, effort?: "high" | "medium", fresh = false) => {
+        if (stopped) throw new Error("probe stopped");
         if (turns.length >= 4) throw new Error("probe turn budget exceeded");
-        const prior = turns.at(-1);
-        const turn = await runtime.turn({ ...(model ? { model } : {}), ...(effort ? { effort } : {}),
+        const prior = fresh ? undefined : turns.at(-1);
+        const turn = await driver.turn({ ...(model ? { model } : {}), ...(effort ? { effort } : {}),
           ...(prior ? { resume: prior.session } : {}),
           prompt: prior ? "Repeat the remembered nonce exactly."
             : `Think carefully about 137 times 293 internally, remember ${nonce}, then reply only with that nonce. Use no tools.` });
         turns.push(turn);
+        if (model) models.set(model, turn.model);
         group.turns.push({ requestedModel: model ?? "omitted", requestedEffort: effort ?? "omitted",
-          model: turn.model, effort: turn.effort ?? "unreported", usage: turn.usage, thinkingBlocks: turn.thinkingBlocks, cli: turn.cli,
+          model: turn.model, effort: turn.effort ?? "unreported", usage: turn.usage, thinkingBlocks: turn.thinkingBlocks, cli: turn.cli, resumed: prior !== undefined,
           nonceObserved: turn.text.includes(nonce), failure: turn.failure ? probeError(turn.failure, args.credential) : undefined });
         if (turn.failure) throw new Error(turn.failure);
         if (prior && turn.session !== prior.session) throw new Error("runtime did not resume the same conversation");
         if (!turn.text.includes(nonce)) throw new Error("provider did not complete the nonce control");
       };
-      await drive(args.modelA, args.effortA);
-      if (name === "switch-reclaim-replan") { await drive(args.modelB, args.effortB); await drive(args.modelA, args.effortA); }
-      else if (name === "omitted-model") await drive(undefined, args.effortB);
-      else await drive(args.modelA);
+      if (name === "omitted-model") {
+        await drive(undefined, args.effortB, true);
+        const defaultModel = turns[0]!.model;
+        const explicit = [args.modelA, args.modelB].find(model => models.has(model) && models.get(model) !== defaultModel);
+        if (!explicit) throw new Error("model omission control cannot distinguish explicit model from runtime default");
+        await drive(explicit, args.effortA, true);
+        await drive(undefined, args.effortB);
+        await drive(undefined, args.effortB, true);
+        if (turns.at(-1)!.model !== defaultModel) throw new Error("explicit query changed the fresh-session default; omission result is ambiguous");
+      } else {
+        await drive(args.modelA, args.effortA);
+        if (name === "switch-reclaim-replan") { await drive(args.modelB, args.effortB); await drive(args.modelA, args.effortA); }
+        else await drive(args.modelA);
+      }
     }
   } catch (error) { failure = probeError(error, args.credential); process.exitCode = 1; }
   finally {
-    await runtime.close();
+    for (const r of runtimes) await r.close();
     clearTimeout(soft); clearTimeout(hard);
     process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal);
     const summary = JSON.stringify({ kind: "phase-model-live", harness: "claude", sdk: CLAUDE_PHASE_SDK,

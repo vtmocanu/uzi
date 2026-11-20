@@ -21,6 +21,11 @@ bounded to 64 KiB. Errors are redacted. No worker tool callbacks are exposed or
 serviced. Codex uses production native-disabled config overrides and empty
 execution environments; the accepted authority-free native exceptions remain.
 
+The omitted-model group first measures a fresh default and chooses an explicit
+nondefault model from the supplied A/B pair before omitting it on resume. This
+avoids mistaking an identical vendor default for session-model retention. Its
+fourth turn checks that a fresh session still has the original default.
+
 The macOS Codex entry uses the pinned Linux runner image and the locally prepared
 `cdx3246-deps` and `cdx3246-codex` volumes. Preparation uses the unchanged
 `install-codex.sh` SHA256/manifest checks, never Homebrew. Container names start
