@@ -392,8 +392,8 @@ Schedule rows and job catalog cards show a model chip: `model: default`, or
 `model: <value> · pinned` when the schedule pins a model. Rows add `+ agents`
 when the subagent toggle is on. Your own schedule rows with no model pin also
 append the server's prediction (see [Settings preview](#in-the-web-ui)).
-Catalog cards keep the plain `model: default` and never show a value specific
-to the viewer.
+Catalog cards keep their plain chip, with no prediction, and never show a
+value specific to the viewer.
 
 For **automatic issue starts**, exact forge labels `harness::codex` and
 `harness::claude` select the harness from the fresh issue-input capture,
@@ -605,15 +605,18 @@ now**. It calls the endpoint above for the draft after a short pause in
 typing, and a newer draft's result always replaces an older one. It shows
 the server's answer and applies no precedence of its own.
 
-- **Rows.** Harness, Model, Effort, Credential and Subagents. Each shows
-  the server's source and a timing label: `pinned · fixed when it fires`,
+- **Rows.** Harness, Model, Effort, Credential and Subagents. Harness,
+  Model, Effort and Credential show the server's source and a timing label:
+  `pinned · fixed when it fires`,
   `predicted · fixed when it fires` or `predicted · read when a worker picks
   the run up`. Credential shows the kind, source and timing, never which
   credential. Effort is read-only ("schedules can't change it") and links to
   **Run defaults (opens in new tab)** (`/settings/run-defaults`), where it is
-  set; the link opens in a new tab so the draft is kept.
+  set; the link opens in a new tab so the draft is kept. Subagents shows the
+  mode, the lead's model and any subagent pins, without a timing label.
 - **Harness chosen at fire.** When the harness is chosen when the schedule
-  fires, the preview shows one row group per harness alternative.
+  fires, the Harness row says so and the preview shows one row group per
+  harness alternative, each with its own values or refusal.
 - **Ignored model pin.** A model pin that does not apply to the resolved
   harness shows a warning naming the fallback the server returned. Pin the
   harness to the other harness when both are usable, otherwise pick a model
@@ -631,16 +634,20 @@ are decided then, from your settings and credentials at that moment; values
 marked "read when a worker picks the run up" can still change after the
 schedule fires, until a worker claims the run; and the preview is advisory.
 
-**Limitation.** A draft request carries no timing, so a new or changed
-one-time schedule previews without the one-time pre-fire hold (see the
+**Limitation.** A draft request carries no timing: the preview uses the
+saved schedule's timing. A new one-time schedule, or a recurring one being
+changed to one-time, previews without the one-time pre-fire hold, and a
+one-time schedule being changed to recurring still previews with it (see the
 timing note above).
 
 On the **Schedules** tab, a schedule with no model pin adds the prediction to
 its chip, for example `model: default · now <model> (Claude, predicted)`, or
 `now <model> (Claude) or <model> (Codex), predicted` when the harness is
-chosen at fire. Each such row asks the server once when shown; the suffix is
-absent while loading or if the request fails. A schedule that pins a model
-sends no request. Job catalog cards keep the plain `model: default`.
+chosen at fire. Each such row asks the server when shown and again when its
+saved harness, token, model or subagent setting changes. The suffix is absent
+while loading, if the request fails, or when the server refuses or names no
+model. A schedule that pins a model sends no request. Job catalog cards keep
+their plain chip.
 
 ### Running a schedule on several repos
 
