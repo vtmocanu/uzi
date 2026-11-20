@@ -44,9 +44,10 @@ const DATA_BASE = process.env.M3A_DATA_BASE ?? "/data/runner";
 const ENV_KEY = "FAKE_PROVIDER_API_KEY";
 
 /** The EXACT replacement-env allowlist a provider root delivers (mirrors the launcher's
- *  `buildReplacedEnv`). The provider credential var is the twelfth allowed key. */
+ *  `buildReplacedEnv`), including #4509's fixed CODEX_EXEC_SERVER_URL=none guard. The
+ *  provider credential var is the thirteenth allowed key. */
 const BASE_ALLOWLIST = [
-  "HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+  "HOME", "CODEX_HOME", "CODEX_EXEC_SERVER_URL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
   "XDG_STATE_HOME", "TMPDIR", "PATH", "SHELL", "LANG", "TERM",
 ] as const;
 
@@ -90,6 +91,9 @@ export function assertReplacementEnv(
     if ((env.get(k) ?? "").length === 0) throw new Error(`child env key ${k} is empty`);
   }
   if (env.get(opts.credentialKey) !== opts.credentialValue) throw new Error("provider credential mismatch in child env");
+  if (env.get("CODEX_EXEC_SERVER_URL") !== "none") {
+    throw new Error(`exec-server guard mismatch: child CODEX_EXEC_SERVER_URL=${String(env.get("CODEX_EXEC_SERVER_URL"))} (want none)`);
+  }
   if (env.get("HOME") !== opts.home) throw new Error(`child HOME=${String(env.get("HOME"))} is not the fresh owned tree`);
   if (env.get("CODEX_HOME") !== opts.codexHome) throw new Error(`child CODEX_HOME=${String(env.get("CODEX_HOME"))} is not the fresh owned tree`);
 }
@@ -205,6 +209,7 @@ test("C3 (mutation control): the replacement-env assertion fails a leaked/mutate
   ]);
   good.set("HOME", "/data/runner/x/home");
   good.set("CODEX_HOME", "/data/runner/x/codex");
+  good.set("CODEX_EXEC_SERVER_URL", "none");
   const args = { credentialKey: ENV_KEY, credentialValue: credential, home: "/data/runner/x/home", codexHome: "/data/runner/x/codex" };
   // The unmutated env passes (the assertion is real, not always-throwing).
   assertReplacementEnv(good, args);
@@ -219,6 +224,11 @@ test("C3 (mutation control): the replacement-env assertion fails a leaked/mutate
   assert.throws(() => assertReplacementEnv(missing, args), /missing allowlist keys/);
   const anthropic = new Map(good); anthropic.set("ANTHROPIC_API_KEY", "sk-ant");
   assert.throws(() => assertReplacementEnv(anthropic, args), /leaked into child/);
+  // #4509: the launcher's exec-server guard must be present AND exactly `none`.
+  const noGuard = new Map(good); noGuard.delete("CODEX_EXEC_SERVER_URL");
+  assert.throws(() => assertReplacementEnv(noGuard, args), /missing allowlist keys: CODEX_EXEC_SERVER_URL/);
+  const wrongGuard = new Map(good); wrongGuard.set("CODEX_EXEC_SERVER_URL", "http://x");
+  assert.throws(() => assertReplacementEnv(wrongGuard, args), /exec-server guard mismatch/);
 });
 
 // ── C4: malicious repo instructions/config cannot enter the launch construction ─────
