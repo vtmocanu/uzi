@@ -6,9 +6,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// The integrated default branch is at 493 (claim provenance). Only this
+// The integrated default branch is at 494 (health owner hold). Only this
 // fixture-owned database is downgraded; it must retain the default-branch
-// columns while Codex snapshot/target migrations 494 and 495 apply afterward.
+// columns while Codex snapshot/target migrations 495 and 496 apply afterward.
 func TestCodexSwitchMigrationUpgradeLiveDB(t *testing.T) {
 	env := isolatedCoordinateDatabase(t)
 	dsn := env.pool.Config().ConnString()
@@ -38,7 +38,7 @@ WHERE table_schema = 'public' AND table_name = $1 AND column_name = ANY($2::text
 		columns("runs", pending, len(pending))
 	}
 	assertHead() // Fresh installation.
-	if err := store.MigrateDownTo(env.ctx, dsn, 493); err != nil {
+	if err := store.MigrateDownTo(env.ctx, dsn, 494); err != nil {
 		t.Fatal(err)
 	}
 	columns("worker_upgrade_reports", marker, len(marker))
