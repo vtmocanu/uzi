@@ -73,6 +73,7 @@ type healthFakeStore struct {
 	// (issue #512 M2) so its claim-time count agrees with the claim path.
 	eligCalls []store.CountOnlineEligibleWorkersForRepoParams
 	writes    []store.SetRunHealthParams
+	marks     []store.MarkRunHealthOwnerHoldParams
 	// leftStatus marks run ids whose SetRunHealth returns 0 rows — the exit race,
 	// where the run changed status between the list read and the health write.
 	leftStatus map[uuid.UUID]bool
@@ -343,6 +344,13 @@ func (f *healthFakeStore) RunPriorityClassForRun(_ context.Context, arg store.Ru
 		return "", f.priorityErr
 	}
 	return f.priorityClass[arg.RunID], nil
+}
+func (f *healthFakeStore) MarkRunHealthOwnerHold(_ context.Context, arg store.MarkRunHealthOwnerHoldParams) (int64, error) {
+	f.marks = append(f.marks, arg)
+	if f.leftStatus[arg.ID] {
+		return 0, nil
+	}
+	return 1, nil
 }
 func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealthParams) (int64, error) {
 	f.writes = append(f.writes, arg)

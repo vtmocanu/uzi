@@ -1180,6 +1180,9 @@ type Store interface {
 	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
 	ListRunLeadToolWindow(ctx context.Context, arg store.ListRunLeadToolWindowParams) ([]store.ListRunLeadToolWindowRow, error)
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
+	// MarkRunHealthOwnerHold stamps the issue #4507 owner-hold marker on an existing health episode
+	// (guarded by the episode the detector read); it writes no other health column.
+	MarkRunHealthOwnerHold(ctx context.Context, arg store.MarkRunHealthOwnerHoldParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCaps backs PRD #84 M3: a queued run whose

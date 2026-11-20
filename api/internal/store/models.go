@@ -1410,6 +1410,7 @@ type Run struct {
 	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
 	ClaimProvenanceWorkerID           pgtype.UUID        `json:"claim_provenance_worker_id"`
 	ClaimProvenanceGeneration         pgtype.Int8        `json:"claim_provenance_generation"`
+	HealthOwnerHoldSince              pgtype.Timestamptz `json:"health_owner_hold_since"`
 }
 
 type RunCompletionAttempt struct {

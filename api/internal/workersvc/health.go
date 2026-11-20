@@ -545,13 +545,22 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	var changed int64
 	for _, r := range runs {
 		target, reason := s.healthTargetFor(ctx, now, r, th)
+		// Issue #4507: the draining/maintenance owner hold leaves no trace in the projection once it
+		// clears, so a quiet named Codex provenance hold observed under it is persisted as an
+		// episode-keyed marker (health_owner_hold_since). ownerHold is clock-bounded, never the
+		// pinnable flag alone.
+		_, ownerHeld := s.ownerHold(now, r)
+		ownerQuiet := isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText && ownerHeld
 		// Issue #4476: a provenance hold that began inside a quiet window (see quietCodexHold below)
 		// keeps the same reason text after the window ends, so the unchanged-reason skip would never
 		// nudge it. Once the window has passed and this episode was never nudged, re-evaluate it.
 		// Only the named reason can start quiet (the unavailable one nudges on entry), only an
 		// episode a window could have covered by time qualifies (quietWindowCoveredEpisode), the
 		// window must have ended (quietWindowEnded), and the cooldown gates it here too, so a
-		// cooled-down run is not rewritten every tick.
+		// cooled-down run is not rewritten every tick. Issue #4507: an owner hold the detector observed
+		// and committed (health_owner_hold_active, the episode-keyed marker) keeps the ceiling deadline
+		// even when the stale grace expired earlier; a hold that began and cleared between two ticks,
+		// or whose marker write failed, falls back to the stale-grace timing (quietWindowEnded).
 		quietHoldEnded := r.Health == target && textEq(r.HealthReason, reason) &&
 			isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText &&
 			!s.quietCodexHold(now, r, reason) && s.quietWindowCoveredEpisode(r) && s.quietWindowEnded(now, r) &&
@@ -559,6 +568,20 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		if r.Health == target && textEq(r.HealthReason, reason) && !quietHoldEnded &&
 			(target != healthPublicationWithheld || r.HealthSince.Valid && r.PublicationWithheldSince.Valid && r.HealthSince.Time.Equal(r.PublicationWithheldSince.Time)) {
+			// The owner hold may begin mid-episode: stamp the marker alone (no other health column, no
+			// broadcast, not counted). Guarded by the episode just read, so a changed episode matches
+			// zero rows; a failed write falls back to the stale-grace timing.
+			if ownerQuiet && !r.HealthOwnerHoldActive && r.HealthSince.Valid && r.HealthReason.Valid {
+				if _, err := s.q.MarkRunHealthOwnerHold(ctx, store.MarkRunHealthOwnerHoldParams{
+					ID:           r.ID,
+					Status:       r.Status,
+					Health:       r.Health,
+					HealthReason: r.HealthReason,
+					HealthSince:  r.HealthSince,
+				}); err != nil {
+					slog.Error("health: mark owner hold", "run_id", r.ID, "error", err)
+				}
+			}
 			continue // nothing changed — skip the write (and, later, its broadcast)
 		}
 		// Nudge-worthiness (Decision 7): only the ok→flagged transition (a new
@@ -700,6 +723,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			HealthReason:     pgconv.TextOrNull(reason),
 			HealthSince:      since,
 			HealthNotifiedAt: notifiedAt, // NULL → COALESCE preserves the existing stamp
+			MarkOwnerHold:    ownerQuiet,
 			ID:               r.ID,
 			Status:           r.Status, // exit-race scope: no-ops if the run left this status
 		})
@@ -2402,6 +2426,8 @@ func codexProvenanceHoldReason(name string, restart bool) string {
 // draining/maintenance window would also hold the run (a routine roll or a short stale return):
 // expected waiting, so not nudged. The unavailable-provenance reason never resolves on its own and
 // is never quiet. When the window ends, detectRunHealth nudges the episode once (quietHoldEnded).
+// Issue #4507: while the owner hold is in force the detector also persists the episode marker
+// (health_owner_hold_active) so the nudge waits for the ceiling even after the hold clears.
 func (s *Service) quietCodexHold(now time.Time, r store.ListActiveRunsForHealthRow, reason string) bool {
 	if !isCodexProvenanceHoldReason(reason) || reason == codexProvenanceUnavailableText {
 		return false
@@ -2427,9 +2453,13 @@ func (s *Service) quietWindowCoveredEpisode(r store.ListActiveRunsForHealthRow) 
 
 // quietWindowEnded reports whether the window that could have quieted the episode is over. With a
 // owner-hold flag still set (and quietCodexHold already false), the window ended by its own clock
-// (the ceiling end), so it is over. A stale-requeue flag proves nothing alone (it outlives the
-// grace): the pin end (min of status_since + grace and the ceiling end) must be after health_since
-// and passed. Otherwise the run waits for the affinity ceiling end (updated_at +
+// (the ceiling end), so it is over. Issue #4507: when the detector observed and committed an owner
+// hold in this episode (HealthOwnerHoldActive), the window runs to the ceiling end even if the
+// stale grace expired earlier; only holds so recorded are remembered, so one that began and cleared
+// between two ticks, or whose marker write failed, falls back to the stale-grace timing below. A
+// stale-only episode still ends at grace expiry. A stale-requeue flag proves nothing alone (it
+// outlives the grace): the pin end (min of status_since + grace and the ceiling end) must be after
+// health_since and passed. Otherwise the run waits for the affinity ceiling end (updated_at +
 // WorkerAffinityCeiling), the latest instant any window can run to. It is only meaningful together
 // with quietWindowCoveredEpisode.
 func (s *Service) quietWindowEnded(now time.Time, r store.ListActiveRunsForHealthRow) bool {
@@ -2440,6 +2470,9 @@ func (s *Service) quietWindowEnded(now time.Time, r store.ListActiveRunsForHealt
 		return false
 	}
 	ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling)
+	if r.HealthOwnerHoldActive {
+		return !now.Before(ceilingEnd)
+	}
 	// stale_requeue_pinnable has no time component in SQL and stays true long after the grace, so the
 	// flag alone proves nothing: the pin end must lie after health_since (it covered the episode)
 	// and have passed.
