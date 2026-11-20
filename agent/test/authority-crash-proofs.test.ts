@@ -1037,6 +1037,15 @@ async function refusalSuccessor(w: RefusalWorld): Promise<{ rt: AuthorityRuntime
 const deadWorkerReader = (w: RefusalWorld): GitCache =>
   new GitCache(w.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: RF_CAP, processNonce: RF_NONCE }));
 
+/** The dead worker's reader that also treats the import stages now on disk as finished imports of its process: a
+ *  crashed worker's imports are over, and the process-local finished record is what proves it. */
+const provenReader = (w: RefusalWorld): GitCache => {
+  const reader = deadWorkerReader(w);
+  const finished = (reader as unknown as { finishedImportStages: Set<string> }).finishedImportStages;
+  for (const line of incomingRefs(w)) if (/\/import-/.test(line.split(" ")[0]!)) finished.add(line.split(" ")[0]!);
+  return reader;
+};
+
 const gateOf = (w: RefusalWorld, git: GitCache, head: string) => git.refusalReleaseGate(w.bare, RF_RUN, 1, head);
 
 async function resume(w: RefusalWorld, s: { rt: AuthorityRuntime; git: GitCache }, covering: string): Promise<string> {
@@ -1094,7 +1103,9 @@ test("refusal proof 2: SIGKILL with the stage present and no ledger keeps the st
 
   const s = await refusalSuccessor(w);
   assert.equal((await gateOf(w, s.git, w.cover)).kind, "ineligible");
-  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal stage is not in the ledger" });
+  // Without a finished record of its own, a dead worker's leftover import stage is unproven (fail closed).
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  assert.deepEqual(await gateOf(w, provenReader(w), w.cover), { kind: "ineligible", reason: "refusal stage is not in the ledger" });
   assert.equal(stagesAt(w, h).length, 1, "reading the gate deleted nothing");
 });
 
@@ -1109,7 +1120,9 @@ test("refusal proof 3: SIGKILL with the refused ref written and no ledger keeps 
 
   const s = await refusalSuccessor(w);
   assert.equal((await gateOf(w, s.git, w.cover)).kind, "ineligible");
-  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal stage is not in the ledger" });
+  // Without a finished record of its own, a dead worker's leftover import stage is unproven (fail closed).
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  assert.deepEqual(await gateOf(w, provenReader(w), w.cover), { kind: "ineligible", reason: "refusal stage is not in the ledger" });
 
   // The successor's retry of the same refusal records the head (the refused ref write is idempotent).
   gitIn(w.clone, ["update-ref", `refs/heads/${RF_BR}`, h]);
@@ -1148,8 +1161,10 @@ test("refusal proof 5: SIGKILL after the ledger rename leaves the complete ledge
   const s = await refusalSuccessor(w);
   const verdict = await gateOf(w, s.git, w.cover);
   assert.equal(verdict.kind, "ineligible");
-  assert.match((verdict as { reason: string }).reason, /admission for generation 1 is from another process/);
-  const own = await gateOf(w, deadWorkerReader(w), w.cover);
+  // The dead worker's leftover import stage is unproven to the successor and holds the gate before the admission
+  // check (proof 1b covers the foreign admission with no stage on disk).
+  assert.deepEqual(verdict, { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  const own = await gateOf(w, provenReader(w), w.cover);
   assert.equal(own.kind, "eligible", "the evidence on disk (both heads ledgered, every stage ledgered) is complete");
   assert.deepEqual(rfLedgerShas(w), [h0, h1], "the successor's reads changed nothing");
 });
@@ -1162,7 +1177,7 @@ test("refusal proof 6a: SIGKILL before the duplicate stage delete keeps both sta
   assert.equal(refusedRefAt(w, h).length, 1);
   assert.deepEqual(rfLedgerShas(w), [h]);
   assertNoLoss(w, "duplicate pending");
-  const own = await gateOf(w, deadWorkerReader(w), w.cover);
+  const own = await gateOf(w, provenReader(w), w.cover);
   assert.equal(own.kind, "eligible", "a surplus ledgered stage never makes the evidence incomplete");
   assert.equal((await gateOf(w, (await refusalSuccessor(w)).git, w.cover)).kind, "ineligible");
 });
@@ -1175,7 +1190,7 @@ test("refusal proof 6b: SIGKILL after the duplicate stage delete leaves one stag
   assert.equal(refusedRefAt(w, h).length, 1);
   assert.deepEqual(rfLedgerShas(w), [h], "the head is ledgered, so the deletion was never an unledgered loss");
   assertNoLoss(w, "duplicate deleted");
-  assert.equal((await gateOf(w, deadWorkerReader(w), w.cover)).kind, "eligible");
+  assert.equal((await gateOf(w, provenReader(w), w.cover)).kind, "eligible");
 });
 
 test("refusal proof 7: a FINAL written with no POST, then restart: the successor's seal is ineligible and never sends; only the dead worker's own nonce matches", { timeout: 120_000 }, async (t) => {
@@ -1193,9 +1208,9 @@ test("refusal proof 7: a FINAL written with no POST, then restart: the successor
   const result = await s.git.sealRefusalRelease(w.bare, RF_RUN, 1, w.cover);
   assert.equal(result, "ineligible", "another process may never replay or re-seal the release (it would be a send)");
   assert.equal(rfRaw(w, name), before, "the successor did not rewrite the FINAL");
-  assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover), "matches");
-  assert.equal((await gateOf(w, deadWorkerReader(w), w.cover2)).kind, "eligible", "the other source covers every head, so only the existing FINAL can refuse it");
-  assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover2), "mismatch", "a different source is never sealed over the existing FINAL");
+  assert.equal(await provenReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover), "matches");
+  assert.equal((await gateOf(w, provenReader(w), w.cover2)).kind, "eligible", "the other source covers every head, so only the existing FINAL can refuse it");
+  assert.equal(await provenReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover2), "mismatch", "a different source is never sealed over the existing FINAL");
   assert.equal(rfRaw(w, name), before);
 });
 

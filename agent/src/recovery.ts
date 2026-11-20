@@ -3132,7 +3132,7 @@ export class RecoveryCoordinator {
     if (!this.git.refusalReleaseGate) return true;
     const context = record.coverageContext;
     if (!context || !Number.isSafeInteger(context.generation) || context.generation < 1) return true;
-    const gate = await ownedRecoveryIO(() => this.git.refusalReleaseGate!(context.barePath, record.runId, context.generation, record.sourceSha));
+    const gate = await ownedRecoveryIO(() => this.git.refusalReleaseGate!(context.barePath, record.runId, context.generation, record.sourceSha, context.branch));
     if (gate.kind === "ineligible") {
       this.log.warn("recovery: refusal release gate ineligible; custody retained", { run_id: record.runId, generation: context.generation, reason: gate.reason });
       return false;
@@ -3146,7 +3146,7 @@ export class RecoveryCoordinator {
     if (!this.git.sealRefusalRelease) return true;
     const context = record.coverageContext;
     if (!context || !Number.isSafeInteger(context.generation) || context.generation < 1) return true;
-    const sealed = await ownedRecoveryIO(() => this.git.sealRefusalRelease!(context.barePath, record.runId, context.generation, record.sourceSha));
+    const sealed = await ownedRecoveryIO(() => this.git.sealRefusalRelease!(context.barePath, record.runId, context.generation, record.sourceSha, context.branch));
     if (sealed === "none" || sealed === "sealed" || sealed === "matches") return true;
     this.log.warn("recovery: refusal release seal refused; custody retained", { run_id: record.runId, generation: context.generation, seal: sealed });
     return false;

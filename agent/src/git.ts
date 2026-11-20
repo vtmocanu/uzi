@@ -4410,6 +4410,10 @@ function refusalEvidenceDigest(entries: Array<{ generation: number; sha: string 
  *  Only this exact leaf shape is ever treated as an import stage; any other leaf besides `refused-<sha>` is plain evidence. */
 const REFUSAL_IMPORT_LEAF = /^import-[A-Za-z0-9-]{8,64}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const refusalLeaf = (ref: string): string => ref.slice(ref.lastIndexOf("/") + 1);
+/** Bound on the process-local record of finished import producers (see GitCache.finishedImportStages). */
+const FINISHED_IMPORT_STAGE_LIMIT = 4096;
+/** The process nonce embedded in an import stage leaf `import-<nonce>-<uuid>`; the uuid is the last 36 characters. */
+const importLeafNonce = (ref: string): string => { const leaf = refusalLeaf(ref); return leaf.slice("import-".length, leaf.length - 37); };
 const isRefusalImportRef = (ref: string): boolean => REFUSAL_IMPORT_LEAF.test(refusalLeaf(ref));
 /** The generations named by `<prefix><run>-<generation>.json` files for exactly this run. */
 function refusalFileGenerations(names: string[], prefix: string, runId: string): number[] {
@@ -6201,6 +6205,9 @@ export class GitCache {
   /** issue #4481: attributed import stages of fetchAgentBranch calls in flight in this process, from before their fetch
    *  until the whole import returns. The refusal gate and cleanup plan treat any as an import in progress. */
   private readonly liveImportStages = new Set<string>();
+  /** issue #4481: attributed import stages whose producing import returned (success or failure) in this process.
+   *  Bounded at {@link FINISHED_IMPORT_STAGE_LIMIT} by evicting the oldest; an evicted stage is simply unproven. */
+  private readonly finishedImportStages = new Set<string>();
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
   /** See {@link GitCacheOptions.wipCapture}; undefined in production. */
@@ -9226,7 +9233,7 @@ export class GitCache {
             const authenticated = await authenticate();
             const incoming = await acquireIncoming();
             return incoming === undefined ? closedResult : await promoteIncoming(incoming, authenticated);
-          } finally { this.liveImportStages.delete(stage); }
+          } finally { this.finishImportStage(stage, attributedStage); }
         };
         return opts.checkpointImportMode === "milestone"
           ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -9260,7 +9267,7 @@ export class GitCache {
           }
           return promoteIncoming(incoming, authenticated);
         }));
-      } finally { this.liveImportStages.delete(stage); }
+      } finally { this.finishImportStage(stage, attributedStage); }
     };
     return opts.checkpointImportMode === "milestone"
       ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -29745,6 +29752,94 @@ try {
     return { evidence, anchored };
   }
 
+  /** Ends the producer's liveness for an attributed stage and records it as finished, evicting the oldest record
+   *  beyond the bound. A flat (unattributed) stage is never recorded. */
+  private finishImportStage(stage: string, attributed: boolean): void {
+    this.liveImportStages.delete(stage);
+    if (!attributed) return;
+    this.finishedImportStages.delete(stage);
+    this.finishedImportStages.add(stage);
+    while (this.finishedImportStages.size > FINISHED_IMPORT_STAGE_LIMIT) {
+      const oldest = this.finishedImportStages.values().next().value;
+      if (oldest === undefined) break;
+      this.finishedImportStages.delete(oldest);
+    }
+  }
+
+  /** An import stage's producer is proven finished only when it was created by this process, its import returned,
+   *  and it is not live now. A foreign nonce, an evicted record or an injected stage is unproven (fail closed). */
+  private importProducerProven(ref: string): boolean {
+    return isRefusalImportRef(ref) && importLeafNonce(ref) === this.processNonce &&
+      this.finishedImportStages.has(ref) && !this.liveImportStages.has(ref);
+  }
+
+  /** The branch whose tracking ref may anchor an import stage: it must be the caller's hint, equal the ledger's
+   *  branch, and be owned by this run at a positive generation <= G whose producing context parses. Caller holds the
+   *  bare lock. Any failure means no tracking anchor; only a boundary abort propagates. */
+  private async trackingAnchorSha(barePath: string, runId: string, G: number, ledgerBranch: string | undefined,
+    branch: string | undefined): Promise<string | undefined> {
+    try {
+      if (!refusalText(branch) || (ledgerBranch !== undefined && ledgerBranch !== branch)) return undefined;
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      const owner = observed?.owner;
+      if (!observed?.sha || !owner || owner.runId !== runId || !refusalGeneration(owner.generation, 1) || owner.generation > G) return undefined;
+      await this.producingContext(barePath, branch, owner);
+      return observed.sha;
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return undefined;
+    }
+  }
+
+  /** issue #4481: removes attributed import stages whose producer is proven finished, whose exact tip has an
+   *  independent anchor (owed pin, recovery pin at a generation <= G, or the branch-hinted tracking ref) and whose tip
+   *  is covered. Object existence, ledger rows and the head alone never anchor. Each removal is the authority-registered
+   *  CAS delete; a refused or failed delete keeps the stage (the gate then holds). Caller holds the bare lock. */
+  private async reconcileFinishedImportStagesUnderLock(barePath: string, runId: string, G: number, headSha: string,
+    stages: RefusalStage[], ledgerBranch: string | undefined, branch: string | undefined): Promise<RefusalStage[]> {
+    const candidates = stages.filter((s) => s.generation >= 1 && this.importProducerProven(s.ref));
+    if (!candidates.length) return stages;
+    const removed = new Set<string>();
+    let recoveryPins: Map<string, string> | undefined;
+    let trackingSha: string | undefined | null = null;
+    for (const s of candidates) {
+      const tip = s.sha;
+      let anchored = await this.checkedRefSha(barePath, `refs/uzi-owed/${runId}/${tip}`) === tip;
+      const pinned = anchored;
+      if (!anchored) {
+        if (!recoveryPins) {
+          recoveryPins = new Map();
+          const prefix = recoveryPinRef(runId, 1).slice(0, -1);
+          const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", prefix]);
+          for (const line of out.split("\n").filter(Boolean)) {
+            const [ref, oid] = line.split(" ");
+            if (ref !== undefined && oid !== undefined) recoveryPins.set(ref, oid);
+          }
+        }
+        for (const [ref, oid] of recoveryPins) {
+          const g = Number(ref.slice(ref.lastIndexOf("/") + 1));
+          if (oid === tip && refusalGeneration(g, 1) && g <= G && ref === recoveryPinRef(runId, g)) { anchored = true; break; }
+        }
+      }
+      if (!anchored) {
+        if (trackingSha === null) trackingSha = await this.trackingAnchorSha(barePath, runId, G, ledgerBranch, branch);
+        anchored = trackingSha === tip;
+      }
+      if (!anchored) continue;
+      if (!pinned && await this.ancestry(barePath, tip, headSha) !== "ancestor") continue;
+      try {
+        await this.deleteRefusalStageRefs(barePath, [{ ref: s.ref, tip }], () => {});
+        this.finishedImportStages.delete(s.ref);
+        removed.add(s.ref);
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+      }
+    }
+    return stages.filter((s) => !removed.has(s.ref));
+  }
+
   /** Whether an import of this run at a generation <= G is in flight in this process. */
   private hasLiveImport(runId: string, G: number): boolean {
     const prefix = `refs/uzi-incoming/${runId}/`;
@@ -29846,18 +29941,18 @@ try {
   }
 
   /** Whether the run's refused heads, as of `generation`, are all provably covered by `headSha`. */
-  async refusalReleaseGate(barePath: string, runId: string, generation: number, headSha: string): Promise<RefusalReleaseGate> {
+  async refusalReleaseGate(barePath: string, runId: string, generation: number, headSha: string, branch?: string): Promise<RefusalReleaseGate> {
     try {
       if (typeof barePath !== "string" || !refusalRun(runId) || !refusalGeneration(generation, 1) || !refusalOid(headSha)) {
         return { kind: "ineligible", reason: "invalid gate arguments" };
       }
-      return await this.withLock(barePath, () => this.refusalGateUnderLock(barePath, runId, generation, headSha));
+      return await this.withLock(barePath, () => this.refusalGateUnderLock(barePath, runId, generation, headSha, branch));
     } catch (cause) {
       return { kind: "ineligible", reason: `gate unreadable: ${cause instanceof Error ? cause.message : "error"}` };
     }
   }
 
-  private async refusalGateUnderLock(barePath: string, runId: string, G: number, headSha: string): Promise<RefusalReleaseGate> {
+  private async refusalGateUnderLock(barePath: string, runId: string, G: number, headSha: string, branchHint?: string): Promise<RefusalReleaseGate> {
     const ineligible = (reason: string): RefusalReleaseGate => ({ kind: "ineligible", reason });
     if (this.refusalRecordingFailed.has(runId)) return ineligible("refusal recording failed in this process");
     const names = await this.refusalNames(barePath);
@@ -29870,15 +29965,22 @@ try {
     if (ledger && (ledger.runId !== runId || ledger.barePath !== barePath)) return ineligible("refusal ledger unbound");
     const entries = ledger?.entries.filter((e) => e.generation <= G) ?? [];
     const allStages = await this.refusalStages(barePath, runId);
-    const stages = allStages.filter((s) => s.generation <= G);
+    let stages = allStages.filter((s) => s.generation <= G);
     const pinned = new Set((await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${runId}/`]))
       .split("\n").filter(Boolean).map((r) => r.slice(r.lastIndexOf("/") + 1)));
     // An owed-path marker at or below G says the generation once stood at the cap, so an empty-looking run is
     // proven only by an admission of this process, never by the absence of evidence.
     const atCapBefore = refusalFileGenerations(names, "owedpath", runId).some((g) => g <= G);
-    if (!entries.length && !stages.length && pinned.size < this.maxOwedCandidates && !atCapBefore) return { kind: "none" };
+    const noEvidence = (): boolean => !entries.length && !stages.length && pinned.size < this.maxOwedCandidates && !atCapBefore;
+    if (noEvidence()) return { kind: "none" };
     if (allStages.length !== stages.length) return ineligible("refusal stage of a later generation");
     if (this.hasLiveImport(runId, G)) return ineligible("refusal import in progress");
+    // A proven-finished, independently anchored and covered import stage is leftover staging, not evidence.
+    stages = await this.reconcileFinishedImportStagesUnderLock(barePath, runId, G, headSha, stages, ledger?.branch, branchHint);
+    if (noEvidence()) return { kind: "none" };
+    if (stages.some((s) => isRefusalImportRef(s.ref) && !this.importProducerProven(s.ref))) {
+      return ineligible("refusal import stage producer unproven");
+    }
     const evidenceStages = this.splitImportStages(stages, entries).evidence;
     if (G > REFUSAL_MAX_GENERATIONS) return ineligible("too many generations to prove");
     let branch = ledger?.branch;
@@ -29913,11 +30015,11 @@ try {
   }
 
   /** The release seal: one lock section runs the gate, then writes (once) or compares the final record. */
-  async sealRefusalRelease(barePath: string, runId: string, generation: number, sourceSha: string): Promise<RefusalSealResult> {
+  async sealRefusalRelease(barePath: string, runId: string, generation: number, sourceSha: string, branch?: string): Promise<RefusalSealResult> {
     try {
       if (typeof barePath !== "string" || !refusalRun(runId) || !refusalGeneration(generation, 1) || !refusalOid(sourceSha)) return "ineligible";
       return await this.withLock(barePath, async () => {
-        const gate = await this.refusalGateUnderLock(barePath, runId, generation, sourceSha);
+        const gate = await this.refusalGateUnderLock(barePath, runId, generation, sourceSha, branch);
         if (gate.kind === "ineligible") return "ineligible" as const;
         const name = `final-${runId}-${generation}.json`;
         const existing = await this.readRefusalRecord(barePath, name, parseRefusalFinal);

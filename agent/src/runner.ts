@@ -44,7 +44,7 @@ import { writeRetainedHomeMarker } from "./retained-homes.js";
 import { evaluateRestoreRoute, restorePinStillSelected, type EligibilityDeps, type EligibilityInput, type EligibleVerdict, type RestoreKnown, type RestoreRouteOutcome } from "./restore-route.js";
 import { processBoundary, processBoundaryDisabledReason, readBoundaryRecord, readBoundaryRecordRaw, readLiveIdentity, runAttributionCensus, type LiveIdentityOptions, type RestoreUnsupported } from "./restore-boundary.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
-import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken } from "./git.js";
+import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken, RefusalReleaseGate } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
@@ -4343,7 +4343,8 @@ export class RunRunner {
    * Only a site whose call can reach a mutating hook (admitSourceUse, beginBareMutation,
    * beginDestructive) needs this. A site whose only hook is assertBareClear does not: that hook is a
    * read-only load that needs no transaction. Legacy imports, updateTrackingRef,
-   * retainCurrentOwedCandidate and anchorRecoveryHead run without A. Attempt-bound imports and
+   * retainCurrentOwedCandidate and anchorRecoveryHead run without A. The refusal release gate runs under A
+   * (refusalGateInAuthority): its reconciliation of finished import stages deletes through beginBareMutation. Attempt-bound imports and
    * remediation scans take A before B to authenticate their producing source. Attempt-bound
    * imports use short proof phases around their B-only transport.
    *
@@ -19424,7 +19425,14 @@ export class RunRunner {
         if (!currentSha) { flight.preserveRecoveryClone = true; return; }
         // issue #4481: a durable refusal ledger that does not prove completeness keeps custody open.
         // `none` (no refusals at or below the cap) and `eligible` proceed unchanged.
-        const gate = await this.git.refusalReleaseGate(barePath, claim.run_id, claim.claim_generation!, currentSha);
+        // The gate's reconciliation deletes through the shared-bare authority hook, so it needs A. This inline
+        // wait is shutdown plus the maintenance budget and boundary deadline only (no flight signal: a cancelled
+        // or parked flight settles here too).
+        const gateBudget = MaintenanceBudget.current();
+        const gate = await this.refusalGateInAuthority(barePath, claim.run_id, claim.claim_generation!, currentSha, branch, {
+          signal: AbortSignal.any([this.shutdownSignal.signal, ...(gateBudget ? [gateBudget.signal] : [])]),
+          timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, gateBudget?.remainingMs() ?? Infinity)),
+        });
         if (gate.kind === "ineligible") {
           flight.preserveRecoveryClone = true;
           flight.runLog.warn("recovery: refusal release gate ineligible; no freeze, custody retained", { reason: gate.reason });
@@ -23356,22 +23364,25 @@ export class RunRunner {
     // issue #4481: after a cap-path transfer the fence is closed, so a second terminal pass for this
     // generation (the hook runs again when the terminal is journaled and sent) re-proves the head the
     // first pass released instead of re-importing. Every other pass imports exactly as before.
+    // issue #4481: stopForOwedLimit aborts the flight's cancel, lifecycle and terminal lifecycle signals,
+    // so the default authority wait would reject the refused head's release fetch at once. The same choice
+    // bounds the wait for A of the refusal gate, which reconciles through the shared-bare authority hook.
+    const sourceWait: AuthorityWait | (() => AuthorityWait) | undefined = heldCapture
+      ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) }
+      : flight.owedLimitStop !== undefined ? () => this.owedStopReleaseWait(flight) : undefined;
+    const gateWait = (): AuthorityWait =>
+      (typeof sourceWait === "function" ? sourceWait() : sourceWait) ?? this.owedStopReleaseWait(flight);
     const prior = flight.terminalTransfer?.generation === generation ? flight.terminalTransfer : undefined;
-    if (prior) return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, prior.head, check);
+    if (prior) return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, prior.head, check, branch, gateWait);
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
-      // issue #4481: stopForOwedLimit aborts the flight's cancel, lifecycle and terminal lifecycle signals,
-      // so the default authority wait would reject the refused head's release fetch at once.
-      const sourceWait: AuthorityWait | (() => AuthorityWait) | undefined = heldCapture
-        ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) }
-        : flight.owedLimitStop !== undefined ? () => this.owedStopReleaseWait(flight) : undefined;
       fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined, sourceWait);
       check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
       if (e instanceof PreservationRefusedError && e.refusedSha !== undefined) {
         this.closeRefusalFence(runId, generation);
-        const head = await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, e.refusedSha, check);
+        const head = await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, e.refusedSha, check, branch, gateWait);
         if (head !== null) flight.terminalTransfer = { generation, head };
         return head;
       }
@@ -23407,12 +23418,12 @@ export class RunRunner {
     // re-importing, and an ineligible gate retains custody. Ordinary below-cap flights (gate none) and every
     // unguarded flight take the unchanged path below.
     if (generation >= 1 && flight.inventoryGuarded === true && isCodePublishingKind(flight.runKind)) {
-      const gate = await this.git.refusalReleaseGate(barePath, runId, generation, head);
+      const gate = await this.refusalGateInAuthority(barePath, runId, generation, head, branch, gateWait());
       check();
       if (gate.kind !== "none") {
         this.closeRefusalFence(runId, generation);
         flight.terminalTransfer = { generation, head };
-        return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, head, check);
+        return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, head, check, branch, gateWait);
       }
     }
     // Durably anchor the exact verified head under a run+generation-scoped pin ref, so it stays
@@ -23429,6 +23440,18 @@ export class RunRunner {
     return head;
   }
 
+  /** issue #4481: the refusal release gate under A. Its reconciliation deletes leftover import stages through the
+   *  shared-bare authority hook, which needs an active outer transaction. If A cannot be acquired (refusal, abort or
+   *  deadline) the gate is ineligible and the caller keeps custody. The branch hint enables the tracking anchor. */
+  private async refusalGateInAuthority(barePath: string, runId: string, generation: number, head: string,
+    branch: string, wait: AuthorityWait): Promise<RefusalReleaseGate> {
+    try {
+      return await this.inAuthority(() => this.git.refusalReleaseGate(barePath, runId, generation, head, branch), wait);
+    } catch (cause) {
+      return { kind: "ineligible", reason: `authority unavailable for the refusal gate: ${errMessage(cause)}` };
+    }
+  }
+
   /** issue #4481: closes the in-process refusal fence for this run and generation. Never throws. */
   private closeRefusalFence(runId: string, generation: number): void {
     if (!Number.isSafeInteger(generation) || generation < 1) return;
@@ -23441,7 +23464,7 @@ export class RunRunner {
    *  check is skipped: the refused head was never imported into tracking). Otherwise null, as before. */
   private async transferAtOwedCap(
     runLog: Logger, barePath: string, worktreePath: string, runId: string,
-    generation: number, refusedSha: string, check: () => void,
+    generation: number, refusedSha: string, check: () => void, branch: string, gateWait: () => AuthorityWait,
   ): Promise<string | null> {
     if (generation < 1) return null;
     const head = await this.git.worktreeHead(worktreePath);
@@ -23450,7 +23473,7 @@ export class RunRunner {
       runLog.warn("recovery: owed-cap refusal does not name the clone head; custody retained");
       return null;
     }
-    const gate = await this.git.refusalReleaseGate(barePath, runId, generation, head);
+    const gate = await this.refusalGateInAuthority(barePath, runId, generation, head, branch, gateWait());
     check();
     if (gate.kind !== "eligible") {
       runLog.warn("recovery: owed-cap release gate not eligible; custody retained", { gate: gate.kind === "ineligible" ? gate.reason : gate.kind });

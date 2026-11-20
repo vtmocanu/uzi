@@ -1323,7 +1323,22 @@ are kept by cleanup.
   a live import in this process. An import refused at an already-sealed
   generation leaves such a stage, which then blocks later gates until the owner
   acts (accepted). An import stage that is anchored is excluded from the
-  evidence and the seal digest, and cleanup deletes it first;
+  evidence and the seal digest, and cleanup deletes it first. The gate also
+  holds (`refusal import stage producer unproven`) on any import stage whose
+  producer this process cannot prove finished: a stage left by another or a
+  crashed process, or one whose process-local finished record was evicted;
+- a leftover import stage from an interrupted import followed by a successful
+  retry. The gate removes it only when its producer is proven finished (this
+  process's nonce, import returned, not live), an independent anchor sits at its
+  exact tip (the owed pin, a recovery pin at a generation at or below the
+  releasing one, or the branch's tracking ref when the caller names the branch
+  and this run owns it at a positive generation at or below it) and the tip is
+  covered (pinned, or an ancestor of the gate head). The removal runs under the
+  authority transaction and the registered `refusal-cleanup-delete-ref`
+  deletion; if the authority is unavailable or refuses, the stage stays and
+  custody is kept. This assumes process crash only: it makes no storage or
+  power-loss claim, and a crash between registration and settlement leaves a
+  `running` bare record that fences later writers on that bare (accepted);
 - a bare left with an unresolved bare-mutation record by a worker killed while
   deleting a refusal ref (op `refusal-cleanup-delete-ref`, read-back settled).
   That record fences later writers on the bare, and no in-product path resolves a

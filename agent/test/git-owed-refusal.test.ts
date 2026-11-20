@@ -63,8 +63,17 @@ const foreignImportStage = (tip: string, nonce = OTHER_NONCE, g = 1): string => 
   gitIn(bare, ["update-ref", ref, tip]);
   return ref;
 };
+const finishedSet = (c: GitCache = cache): Set<string> => (c as unknown as { finishedImportStages: Set<string> }).finishedImportStages;
+/** An import stage that looks like a finished import of the cache's own process (its nonce, recorded as finished). */
+const ownFinishedImportStage = (tip: string, g = 1, c: GitCache = cache): string => {
+  const nonce = (c as unknown as { processNonce: string }).processNonce;
+  const ref = `refs/uzi-incoming/${RUN}/${g}/import-${nonce}-${randomUUID()}`;
+  gitIn(bare, ["update-ref", ref, tip]);
+  finishedSet(c).add(ref);
+  return ref;
+};
 const pinRefs = (): string[] => gitIn(bare, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${RUN}/`]).split("\n").filter(Boolean).sort();
-const gate = (head: string, g = 1, c: GitCache = cache): Promise<RefusalReleaseGate> => c.refusalReleaseGate(bare, RUN, g, head);
+const gate = (head: string, g = 1, c: GitCache = cache, branch?: string): Promise<RefusalReleaseGate> => c.refusalReleaseGate(bare, RUN, g, head, branch);
 const evidence = (): string => JSON.stringify({ files: refusalFiles().map((n) => [n, fs.readFileSync(path.join(refDir(), n), "utf8")]), refs: incomingRefs() });
 const filesSnapshot = (): string => JSON.stringify(refusalFiles().map((n) => [n, fs.readFileSync(path.join(refDir(), n), "utf8")]));
 const withContext = (generation: number): FetchAgentBranchOptions => ({ ...opts, context: { ...opts.context, generation } as FetchAgentBranchOptions["context"] });
@@ -189,8 +198,9 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
   it("an import stage anchored only at an earlier generation is unanchored at its own generation, not excluded", async () => {
     const { cover, refused } = await eligibleState();
     assert.equal(await cache.admitRefusalProvenance({ ...ctx, generation: 2 }), "written");
-    // The refused ref and ledger row for this sha exist at generation 1 only; this stage sits at generation 2.
-    foreignImportStage(refused, OTHER_NONCE, 2);
+    // The refused ref and ledger row for this sha exist at generation 1 only; this stage sits at generation 2. It is a
+    // finished import of this process, so only its anchoring is in question.
+    ownFinishedImportStage(refused, 2);
     assert.deepEqual(await gate(cover, 2), { kind: "ineligible", reason: "refusal import stage is unanchored" });
   });
 
@@ -821,10 +831,10 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "matches");
   });
 
-  it("a foreign-process anchored import stage is excluded from the seal and deleted by the sealed cleanup", async () => {
+  it("a finished, anchored import stage left by this process is excluded from the seal and deleted by the sealed cleanup", async () => {
     const { cover, refused } = await sealed();
-    const foreign = foreignImportStage(refused);
-    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "matches", "the foreign stage is not evidence");
+    const foreign = ownFinishedImportStage(refused);
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "matches", "the leftover stage is not evidence");
     assert.equal(await cleanup(cover), "removed");
     assert.deepEqual(incomingRefs(), []);
     assert.equal(gitIn(bare, ["for-each-ref", foreign]), "");
@@ -1525,5 +1535,184 @@ describe("issue4481 the incoming head's refusal is recorded before a soft-deadli
     assert.deepEqual(entries.filter((e: any) => e.sha === next).map((e: any) => [e.generation, e.path]), [[2, "P2"]],
       "the incoming head is ledgered at its own generation before the soft-deadline return");
     assert.ok(incomingRefs().includes(`refs/uzi-incoming/${RUN}/2/refused-${next} ${next}`));
+  });
+});
+
+describe("issue4481 reconciling proven-finished, independently anchored import stages", { timeout: 300_000 }, () => {
+  const STAGE_RE = /\/import-/;
+  type Internals = { requireOwedCommit: (barePath: string, sha: string) => Promise<void> };
+  /** Below the cap: an import interrupted after its stage was fetched, then a successful retry of the same head.
+   *  Tracking at the head is the only anchor left (every owed pin is removed). */
+  async function interruptedThenRetried(c: GitCache = cache): Promise<{ head: string; stage: string }> {
+    const first = commitTree("first", true);
+    assert.equal((await c.fetchAgentBranch(bare, clone, BRANCH, RUN, opts)).kind, "updated");
+    const head = commitTree("interrupted", true);
+    const internals = c as unknown as Internals;
+    const original = internals.requireOwedCommit.bind(c);
+    let armed = true;
+    internals.requireOwedCommit = async (b, sha) => {
+      if (armed && sha === head) { armed = false; throw new CheckpointSoftDeadlineError(); }
+      return original(b, sha);
+    };
+    try { await assert.rejects(c.fetchAgentBranch(bare, clone, BRANCH, RUN, opts), (e: unknown) => e instanceof CheckpointSoftDeadlineError); }
+    finally { internals.requireOwedCommit = original; }
+    assert.equal(incomingRefs().length, 1, "the interrupted import left its attributed stage");
+    assert.equal((await c.fetchAgentBranch(bare, clone, BRANCH, RUN, opts)).kind, "updated");
+    for (const pin of pinRefs()) gitIn(bare, ["update-ref", "-d", pin]);
+    const [stage] = importStageRefs() as [string];
+    assert.equal(incomingRefs().length, 1, "only the interrupted stage is left");
+    assert.ok(stage && first);
+    return { head, stage };
+  }
+  const stageLeft = (stage: string): boolean => gitIn(bare, ["for-each-ref", stage]) !== "";
+  const UNPROVEN = { kind: "ineligible", reason: "refusal import stage producer unproven" } as const;
+  const NOT_LEDGERED = { kind: "ineligible", reason: "refusal stage is not in the ledger" } as const;
+
+  it("regression: the leftover stage of an interrupted below-cap import is reconciled when tracking is the sole anchor", async () => {
+    const { head, stage } = await interruptedThenRetried();
+    assert.deepEqual(await gate(head, 1, cache, BRANCH), { kind: "none" });
+    assert.equal(stageLeft(stage), false, "the stage is gone");
+    assert.equal(finishedSet().has(stage), false);
+  });
+
+  describe("negative controls keep the stage and give an exact verdict", () => {
+    it("a live producer", async () => {
+      const { head, stage } = await interruptedThenRetried();
+      (cache as unknown as { liveImportStages: Set<string> }).liveImportStages.add(stage);
+      assert.deepEqual(await gate(head, 1, cache, BRANCH), { kind: "ineligible", reason: "refusal import in progress" });
+      assert.equal(stageLeft(stage), true);
+    });
+
+    it("a foreign nonce", async () => {
+      const { head, stage } = await interruptedThenRetried();
+      gitIn(bare, ["update-ref", "-d", stage]);
+      const foreign = foreignImportStage(head);
+      finishedSet().add(foreign);
+      assert.deepEqual(await gate(head, 1, cache, BRANCH), UNPROVEN);
+      assert.equal(stageLeft(foreign), true);
+    });
+
+    it("a stage this process never recorded as finished", async () => {
+      const { head, stage } = await interruptedThenRetried();
+      finishedSet().delete(stage);
+      assert.deepEqual(await gate(head, 1, cache, BRANCH), UNPROVEN);
+      assert.equal(stageLeft(stage), true);
+    });
+
+    it("a sole anchor: tracking moved away, no pins", async () => {
+      const { stage } = await interruptedThenRetried();
+      assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+      const next = commitTree("moved on", true);
+      assert.equal((await fetchHead()).kind, "updated");
+      for (const pin of pinRefs()) gitIn(bare, ["update-ref", "-d", pin]);
+      assert.deepEqual(await gate(next, 1, cache, BRANCH), NOT_LEDGERED);
+      assert.equal(stageLeft(stage), true);
+    });
+
+    it("an uncovered tip", async () => {
+      const { stage } = await interruptedThenRetried();
+      assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+      assert.deepEqual(await gate(base, 1, cache, BRANCH), NOT_LEDGERED);
+      assert.equal(stageLeft(stage), true);
+    });
+
+    it("no branch, and a wrong branch", async () => {
+      const { head, stage } = await interruptedThenRetried();
+      assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+      assert.deepEqual(await gate(head), NOT_LEDGERED);
+      assert.deepEqual(await gate(head, 1, cache, "agent/issue-9999"), NOT_LEDGERED);
+      assert.equal(stageLeft(stage), true);
+    });
+
+    it("a ledger with a different branch than the hint", async () => {
+      const { head, stage } = await interruptedThenRetried();
+      assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+      fs.mkdirSync(refDir(), { recursive: true, mode: 0o700 });
+      writeRaw(ledgerName, { version: 1, runId: RUN, branch: "agent/other", barePath: bare, entries: [{ generation: 1, sha: base, path: "P2" }] });
+      assert.equal((await gate(head, 1, cache, BRANCH)).kind, "ineligible");
+      assert.equal(stageLeft(stage), true);
+    });
+  });
+
+  describe("with an exact refused ref, a ledger row, coverage and complete admissions", () => {
+    it("a foreign-nonce import stage holds the gate", async () => {
+      const { cover, refused } = await eligibleState();
+      assert.equal((await gate(cover)).kind, "eligible");
+      foreignImportStage(refused);
+      assert.deepEqual(await gate(cover), UNPROVEN);
+    });
+
+    it("a this-process stage absent from the finished set holds the gate", async () => {
+      const { cover } = await eligibleState();
+      const [stage] = importStageRefs() as [string];
+      assert.ok(finishedSet().has(stage), "the real import recorded its stage as finished");
+      finishedSet().delete(stage);
+      assert.deepEqual(await gate(cover), UNPROVEN);
+      finishedSet().add(stage);
+      assert.equal((await gate(cover)).kind, "eligible");
+    });
+
+    it("a real same-process at-cap refusal stays eligible and keeps its stages", async () => {
+      const { cover, refused } = await eligibleState();
+      const before = incomingRefs();
+      const verdict = await gate(cover, 1, cache, BRANCH);
+      assert.equal(verdict.kind, "eligible", JSON.stringify(verdict));
+      assert.deepEqual(incomingRefs(), before);
+      assert.ok(before.some((l) => STAGE_RE.test(l) && l.endsWith(` ${refused}`)));
+    });
+  });
+
+  it("positive control: an owed-pin anchor at the exact tip reconciles without a branch hint", async () => {
+    const { head, stage } = await interruptedThenRetried();
+    gitIn(bare, ["update-ref", `refs/uzi-owed/${RUN}/${head}`, head]);
+    assert.deepEqual(await gate(head), { kind: "none" });
+    assert.equal(stageLeft(stage), false);
+  });
+
+  it("positive control: a recovery pin at a generation <= G anchors; one above G does not", async () => {
+    const { head, stage } = await interruptedThenRetried();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    gitIn(bare, ["update-ref", `refs/uzi-recovery-pin/${RUN}/2`, head]);
+    assert.deepEqual(await gate(head), NOT_LEDGERED);
+    assert.equal(stageLeft(stage), true);
+    gitIn(bare, ["update-ref", `refs/uzi-recovery-pin/${RUN}/1`, head]);
+    assert.deepEqual(await gate(head), { kind: "none" });
+    assert.equal(stageLeft(stage), false);
+  });
+
+  describe("authority ordering", () => {
+    const hooks = (events: string[], probe: { refPresent: (ref: string) => boolean; ref: string }, refuse = false) => ({
+      admitSourceUse: async () => undefined,
+      assertBareClear: async () => undefined,
+      beginDestructive: async () => ({ settle: async () => undefined }),
+      beginBareMutation: async (_b: string, op: string, footprint: readonly string[]) => {
+        if (op !== "refusal-cleanup-delete-ref") return { settle: async () => undefined };
+        if (refuse) throw new Error("authority refused");
+        events.push(`register:${footprint.join(",")}:stage-present=${probe.refPresent(footprint[0]!)}`);
+        return { settle: async (outcome: unknown) => { events.push(`settle:${JSON.stringify(outcome)}:stage-present=${probe.refPresent(probe.ref)}`); } };
+      },
+    });
+    const probe = { refPresent: stageLeft, ref: "" };
+
+    it("registration precedes the delete child and the settlement follows the read-back", async () => {
+      const events: string[] = [];
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: CAP,
+        authority: hooks(events, probe) as never }));
+      const { head, stage } = await interruptedThenRetried(hooked);
+      probe.ref = stage;
+      assert.deepEqual(events, [], "the imports themselves registered no stage deletion");
+      assert.deepEqual(await hooked.refusalReleaseGate(bare, RUN, 1, head, BRANCH), { kind: "none" });
+      assert.deepEqual(events, [`register:${stage}:stage-present=true`, 'settle:{"ok":true}:stage-present=false']);
+      assert.equal(stageLeft(stage), false);
+    });
+
+    it("a refused registration keeps the stage", async () => {
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: CAP,
+        authority: hooks([], probe, true) as never }));
+      const { head, stage } = await interruptedThenRetried(hooked);
+      assert.equal(await hooked.admitRefusalProvenance(ctx), "written");
+      assert.deepEqual(await hooked.refusalReleaseGate(bare, RUN, 1, head, BRANCH), NOT_LEDGERED);
+      assert.equal(stageLeft(stage), true);
+    });
   });
 });

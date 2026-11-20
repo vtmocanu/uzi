@@ -574,6 +574,42 @@ residual that earlier text left open is closed by the owed-path marker above.
   timed-out source authority, failed second lock) keeps the stage: the head is
   unproven and the stage may be its only bare copy, so the run stays held
   (gate ineligible, cleanup retained) for the owner.
+- **Finished import stages (reconciliation).** An import interrupted after its
+  fetch leaves its attributed stage; a later successful retry of the same head
+  does not remove it, and without a refused ref and ledger row it would hold
+  the gate forever. The cache therefore records, process-locally and bounded at
+  4096 entries (oldest evicted, which only makes a stage unproven), the stages
+  whose producing import returned, success or failure. A stage's producer is
+  proven finished only when its leaf nonce equals this process's nonce, it is
+  in that record and it is not live. Under the bare lock, after the latch,
+  incomplete, temp and ledger checks, the later-generation check and the
+  live-import check, the gate (and so the seal) removes such a stage only when
+  an independent anchor sits at its exact tip and the tip is covered. Anchors:
+  the owed pin `refs/uzi-owed/<run>/<tip>`; a recovery pin
+  `refs/uzi-recovery-pin/<run>/<g'>` with g' at or below the releasing
+  generation; or the tracking ref `refs/uzi-runner/<branch>` at the tip, with
+  the branch hint described below. Covered means pinned, or an ancestor of the
+  gate head. Object existence, ledger rows and the head alone never anchor.
+  The removal is the registered CAS delete (op `refusal-cleanup-delete-ref`);
+  a refused registration, a moved ref or any non-abort failure keeps the stage
+  and the gate holds, and a boundary abort propagates. After removals the gate
+  recomputes: with no ledger rows, stages, owed-path marker or full cap it is
+  `none`. Any attributed import stage left at or below the generation whose
+  producer is not proven (a foreign or crashed process's stage, an evicted
+  record) returns `ineligible("refusal import stage producer unproven")`, even
+  when a refused ref and ledger row anchor it. Cleanup planning is unchanged.
+  The tracking anchor needs the caller's branch (an optional trailing argument
+  of the gate and seal). Under the bare lock the branch must equal the ledger's
+  branch when a ledger exists, the tracking ref must be owned by this run at a
+  positive generation at or below the releasing one, and its producing context
+  must parse; any failure means no tracking anchor and no admission is
+  required. Because the reconciliation deletes through the authority hook, the
+  runner takes the authority transaction (A) around the gate at its three
+  terminal and settle sites, with the wait of the owed-stop release path. If A
+  cannot be acquired the gate counts as ineligible and custody is kept. Failure
+  model: process crash only. The ref guarantees make no storage or power-loss
+  claim. A crash between registration and settlement leaves a `running` bare
+  record that fences later same-bare writers (the ADR-1783 residual above).
 - **Soft deadline.** The incoming head's refusal is recorded before the
   checkpoint soft-deadline return.
 - **Recovery.** When the refusal gate is ineligible, a saved FINAL the api
