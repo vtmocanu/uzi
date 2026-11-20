@@ -103,9 +103,11 @@ func TestPlanCrossCheckCandidateMilestoneAdmissibility(t *testing.T) {
 }
 
 func TestPlanCrossCheckCandidateMilestoneBytesAndDigestPin(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{`[]`, `[]`},
-		{`[{"title":"T","id":"m1"}]`, `[{"id":"m1","title":"T"}]`},
+	// The digests are fixed values computed on the pre-change service (base f69a76df0), so
+	// a change to any normalized field, not only to idempotence, reddens this pin.
+	for _, tc := range []struct{ in, want, digest string }{
+		{`[]`, `[]`, "9002775efcc82e4803c673d0a0de3e833eafab4dd174dba5b60526e295dea93d"},
+		{`[{"title":"T","id":"m1"}]`, `[{"id":"m1","title":"T"}]`, "64ce24efbae43587284cd9a5e71803491ac4651bb2ddb3f00acd36b7acc416a5"},
 	} {
 		c := PlanCrossCheckCandidate{PlanMd: "Plan", Milestones: json.RawMessage(tc.in),
 			RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s",
@@ -120,6 +122,9 @@ func TestPlanCrossCheckCandidateMilestoneBytesAndDigestPin(t *testing.T) {
 		digest, err := got.Digest()
 		if err != nil {
 			t.Fatal(err)
+		}
+		if hex.EncodeToString(digest) != tc.digest {
+			t.Fatalf("digest for %s = %x, want pre-change %s", tc.in, digest, tc.digest)
 		}
 		canonical := c
 		canonical.Milestones = json.RawMessage(tc.want)
