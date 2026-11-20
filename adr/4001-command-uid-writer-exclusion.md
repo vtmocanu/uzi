@@ -819,7 +819,8 @@ lock.
 **Recovered state.**
 - **Before commit:** nothing changed.
 - **After commit, before ACK:** a retry keyed by pod UID, effect key, release
-  key or PVC UID returns the stored result.
+  key or PVC UID returns the stored result (for a release, under pending
+  P-6, only once flushed to the promotion set).
 
 **Verification:** crash-between-commit-and-ack injection, the forced
 `synchronous_commit`, and the P-6 promotion-set flush check on every ACK path.
@@ -899,9 +900,11 @@ Absence is never inferred.
   seccomp are unprivileged self-restrictions.
 - **New controller read authority (pending P-4).** Reading the bound
   PersistentVolume (D8, P-3) needs a cluster-scoped `persistentvolumes` get
-  that the controller does not hold today. So would any controller read of
-  database topology (P-6). It is named here, justified in
+  that the controller does not hold today. The PV read is named here, justified in
   P-4, and not approved.
+- **New controller read authority (pending P-6).** Any controller read of
+  database topology would also be new read authority. It is named in P-6 and
+  not approved.
 - **Rendered fields.** New rendered fields travel the existing pod-spec and
   downward-API channel. The worker trusts the controller, and that trust is
   named.
