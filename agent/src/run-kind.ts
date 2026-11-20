@@ -33,15 +33,16 @@ export function resolveRunKind(kind: RunKind | undefined): RunKind {
 const RUN_ENV_KINDS: ReadonlySet<RunKind> = new Set(["issue", "prompt", "self_improve", "ci_fix", "mr_rework", "task"]);
 
 /** The claim's variables for the run lane's executors, or undefined when the claim has none or is not a
- *  receiving lead lane. Only name and value cross into the executor. */
+ *  receiving lead lane. Only what the environment and the prompt block need crosses into the executor:
+ *  name, value, secret flag, scope and description (never a var_id or revision). */
 export function claimRunEnv(
   claim: Pick<ClaimResponse, "kind" | "review_target_run_id"> & { secrets: Pick<ClaimResponse["secrets"], "run_env"> },
-): { name: string; value: string }[] | undefined {
+): { name: string; value: string; secret: boolean; scope: "repo" | "user"; description: string }[] | undefined {
   const vars = claim.secrets.run_env;
   if (!vars || vars.length === 0) return undefined;
   if (!RUN_ENV_KINDS.has(resolveRunKind(claim.kind))) return undefined;
   if (claim.review_target_run_id) return undefined;
-  return vars.map((v) => ({ name: v.name, value: v.value }));
+  return vars.map((v) => ({ name: v.name, value: v.value, secret: v.secret, scope: v.scope, description: v.description }));
 }
 
 /** Inline intent, plan and Now summaries share kind eligibility; missing kind defaults to issue. */

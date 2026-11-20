@@ -73,8 +73,9 @@ describe("claimRunEnv (lead-lane gate)", () => {
   const vars = [{ ...(live() as object), name: "A_VAR", value: "v" }] as never;
   const secrets = { run_env: vars };
   for (const kind of ["issue", "prompt", "self_improve", "ci_fix", "mr_rework", "task", undefined] as const) {
-    it(`passes name and value only for ${kind ?? "a missing kind"}`, () => {
-      assert.deepEqual(claimRunEnv({ kind, secrets }), [{ name: "A_VAR", value: "v" }]);
+    it(`passes name, value, secret flag, scope and description only for ${kind ?? "a missing kind"}`, () => {
+      const v = vars[0] as { secret: boolean; scope: "repo" | "user"; description: string };
+      assert.deepEqual(claimRunEnv({ kind, secrets }), [{ name: "A_VAR", value: "v", secret: v.secret, scope: v.scope, description: v.description }]);
     });
   }
   for (const kind of ["chat", "judge", "job", "cross_check"] as const) {

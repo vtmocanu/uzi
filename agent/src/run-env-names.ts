@@ -97,6 +97,12 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "NODE_COMPILE_CACHE", invariant: "managed_dirs", note: "Node compile-cache directory read by the Claude CLI runtime" },
   { value: "UV_THREADPOOL_SIZE", invariant: "process_loader", note: "libuv thread-pool size read by the Claude CLI runtime" },
   { value: "SSLKEYLOGFILE", invariant: "network_wiring", note: "TLS key log file read by the Node and Bun runtimes; would write session keys to a path the user picks" },
+  { value: "NODE_CHANNEL_FD", invariant: "process_loader", note: "Node child-process IPC channel descriptor read at start-up by the Claude CLI runtime" },
+  { value: "NODE_UNIQUE_ID", invariant: "process_loader", note: "Node cluster worker marker read at start-up by the Claude CLI runtime" },
+  { value: "NODE_CLUSTER_SCHED_POLICY", invariant: "process_loader", note: "Node cluster scheduling policy read at start-up by the Claude CLI runtime" },
+  { value: "NODE_TEST_CONTEXT", invariant: "process_loader", note: "Node test-runner child marker read at start-up by the Claude CLI runtime" },
+  { value: "NODE_REPL_EXTERNAL_MODULE", invariant: "process_loader", note: "Node REPL module loaded in place of the built-in REPL by the Claude CLI runtime" },
+  { value: "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", invariant: "network_wiring", note: "gRPC TLS root certificate file read by the pinned Claude CLI binary" },
 ];
 export const RUN_ENV_DENIED_PREFIXES: readonly RunEnvDeniedRule[] = [
   { value: "UZI_", invariant: "worker_credentials", note: "worker-owned variables" },
@@ -130,7 +136,7 @@ export const RUN_ENV_DENIED_SUFFIXES: readonly RunEnvDeniedRule[] = [
 ];
 
 /** The shape of a variable name. */
-const RUN_ENV_NAME_REGEXP = /^[A-Z_][A-Z0-9_]{0,127}$/;
+export const RUN_ENV_NAME_REGEXP = /^[A-Z_][A-Z0-9_]{0,127}$/;
 
 /** Returns the rule a name breaks, or null when it is allowed. Same order and
  *  semantics as ValidateName in api/internal/runenv/names.go: shape, then exact

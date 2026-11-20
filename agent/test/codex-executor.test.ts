@@ -36611,3 +36611,31 @@ describe("Codex repeated actualRunner switching", () => {
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
 });
+
+// PRD #4416 M2 (W2b): the Codex lead prompts name the run's environment variables.
+describe("CodexExecutor prompts: run environment variables block (PRD #4416)", () => {
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+  const secretValue = ["codex-", "secret-", "value-9"].join("");
+  const runEnv: NonNullable<RunContext["runEnv"]> = [
+    { name: "API_BASE_URL", value: "https://example.test/\u202ea", secret: false, scope: "repo", description: "base\r\nurl \u001b[31mred\u001b[0m\u2066x" },
+    { name: "DEPLOY_TOKEN", value: secretValue, secret: true, scope: "user", description: "deploy" },
+  ];
+  for (const phase of ["planPrompt", "implementPrompt"] as const) {
+    it(`${phase} carries the block with plain values and descriptions, never a secret value`, () => {
+      const prompt = builders[phase](makeCtx({ runEnv }).ctx);
+      assert.match(prompt, /<run_env_[0-9a-f]+>/);
+      assert.ok(prompt.includes("- API_BASE_URL (repo): base\ufffd\ufffdurl red\ufffdx; value \"https://example.test/\\u202ea\""));
+      assert.ok(prompt.includes("- DEPLOY_TOKEN (user, secret): deploy; value not shown"));
+      assert.ok(!prompt.includes(secretValue));
+      assert.ok(!prompt.includes("\u001b") && !prompt.includes("\u202e") && !prompt.includes("\u2066"));
+    });
+    it(`${phase} carries no block without variables`, () => {
+      assert.ok(!/run_env_[0-9a-f]+/.test(builders[phase](makeCtx().ctx)));
+      assert.ok(!/run_env_[0-9a-f]+/.test(builders[phase](makeCtx({ runEnv: [] }).ctx)));
+    });
+  }
+});

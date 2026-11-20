@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
   RUN_ENV_MAX_LIVE,
+  RUN_ENV_MAX_DESCRIPTION_BYTES,
   RUN_ENV_MAX_LIVE_BYTES,
   RUN_ENV_MAX_REDACT,
   RUN_ENV_MAX_REDACT_BYTES,
@@ -148,20 +149,62 @@ describe("decodeRunEnvSecrets", () => {
     decodeRunEnvSecrets({ run_env: four });
     assert.throws(() => decodeRunEnvSecrets({ run_env: [...four, live(5, { value: "x" })] }), RunEnvClaimError);
   });
-  it("redact count: 200 accepted, 201 rejected", () => {
-    const mk = (n: number) => Array.from({ length: n }, (_, i) => red(i + 1));
-    assert.equal(decodeRunEnvSecrets({ run_env_redact: mk(RUN_ENV_MAX_REDACT) }).runEnvRedact.length, RUN_ENV_MAX_REDACT);
-    assert.throws(() => decodeRunEnvSecrets({ run_env_redact: mk(RUN_ENV_MAX_REDACT + 1) }), RunEnvClaimError);
+  it("redact count is per scope: retired + live accepted, one more rejected", () => {
+    assert.equal(RUN_ENV_MAX_REDACT, 250);
+    const mk = (n: number, scope: string, base = 0) => Array.from({ length: n }, (_, i) => red(base + i + 1, { scope }));
+    const one = decodeRunEnvSecrets({ run_env_redact: mk(RUN_ENV_MAX_REDACT, "user") }).runEnvRedact;
+    assert.equal(one.length, RUN_ENV_MAX_REDACT);
+    // both scopes full at once is accepted: the cap is per scope
+    const both = decodeRunEnvSecrets({
+      run_env_redact: [...mk(RUN_ENV_MAX_REDACT, "user"), ...mk(RUN_ENV_MAX_REDACT, "repo", 1000)],
+    }).runEnvRedact;
+    assert.equal(both.length, 2 * RUN_ENV_MAX_REDACT);
+    assert.throws(() => decodeRunEnvSecrets({ run_env_redact: mk(RUN_ENV_MAX_REDACT + 1, "user") }), RunEnvClaimError);
+    assert.throws(
+      () => decodeRunEnvSecrets({ run_env_redact: [...mk(RUN_ENV_MAX_REDACT, "user"), ...mk(RUN_ENV_MAX_REDACT + 1, "repo", 1000)] }),
+      RunEnvClaimError,
+    );
   });
-  it("redact bytes: exactly 2 MiB accepted, one more rejected", () => {
+  it("redact bytes are per scope: retired + live accepted, one more rejected", () => {
     const full = RUN_ENV_MAX_VALUE_BYTES;
-    const n = RUN_ENV_MAX_REDACT_BYTES / full; // 32
-    const mk = (extra: number) => [
-      ...Array.from({ length: n }, (_, i) => red(i + 1, { value: "x".repeat(full) })),
-      ...(extra ? [red(n + 1, { value: "x".repeat(extra < RUN_ENV_MIN_SECRET_LEN ? RUN_ENV_MIN_SECRET_LEN : extra) })] : []),
+    assert.equal(RUN_ENV_MAX_REDACT_BYTES % full, 0);
+    const n = RUN_ENV_MAX_REDACT_BYTES / full; // 36
+    const mk = (scope: string, base: number, extra: number) => [
+      ...Array.from({ length: n }, (_, i) => red(base + i + 1, { scope, value: "x".repeat(full) })),
+      ...(extra ? [red(base + n + 1, { scope, value: "x".repeat(extra) })] : []),
     ];
-    decodeRunEnvSecrets({ run_env_redact: mk(0) });
-    assert.throws(() => decodeRunEnvSecrets({ run_env_redact: mk(RUN_ENV_MIN_SECRET_LEN) }), RunEnvClaimError);
+    decodeRunEnvSecrets({ run_env_redact: [...mk("user", 0, 0), ...mk("repo", 100, 0)] });
+    assert.throws(() => decodeRunEnvSecrets({ run_env_redact: mk("repo", 100, RUN_ENV_MIN_SECRET_LEN) }), RunEnvClaimError);
+  });
+  it("live caps are per scope", () => {
+    const mk = (n: number, scope: string, base: number) => Array.from({ length: n }, (_, i) => live(base + i + 1, { scope, name: `${scope.toUpperCase()}_${i}` }));
+    const d = decodeRunEnvSecrets({ run_env: [...mk(RUN_ENV_MAX_LIVE, "repo", 0), ...mk(RUN_ENV_MAX_LIVE, "user", 100)] });
+    assert.equal(d.runEnv.length, 2 * RUN_ENV_MAX_LIVE);
+    assert.throws(() => decodeRunEnvSecrets({ run_env: [...mk(RUN_ENV_MAX_LIVE, "repo", 0), ...mk(RUN_ENV_MAX_LIVE + 1, "user", 100)] }), RunEnvClaimError);
+  });
+  it("rejects two live entries with the same name", () => {
+    assert.throws(() => decodeRunEnvSecrets({ run_env: [live(1, { name: "SAME" }), live(2, { name: "SAME" })] }), /duplicate live name/);
+  });
+  it("bounds the description at 1024 bytes of UTF-8 and rejects NUL", () => {
+    decodeRunEnvSecrets({ run_env: [live(1, { description: "é".repeat(RUN_ENV_MAX_DESCRIPTION_BYTES / 2) })] });
+    rejectsLive(live(1, { description: "é".repeat(RUN_ENV_MAX_DESCRIPTION_BYTES / 2 + 1) }), /description/);
+    rejectsLive(live(1, { description: "a\u0000b" }), /description/);
+  });
+  it("rev must be a safe integer", () => {
+    rejectsLive(live(1, { rev: Number.MAX_SAFE_INTEGER + 1 }), /rev/);
+    decodeRunEnvSecrets({ run_env: [live(1, { rev: Number.MAX_SAFE_INTEGER })] });
+  });
+  it("limits equal fixtures/run-env/limits.json (the Go side is pinned to the same file)", () => {
+    const lim = JSON.parse(fs.readFileSync(new URL("../../fixtures/run-env/limits.json", import.meta.url), "utf8"));
+    assert.deepEqual(lim, {
+      max_vars_per_scope: RUN_ENV_MAX_LIVE,
+      max_value_bytes: RUN_ENV_MAX_VALUE_BYTES,
+      max_scope_value_bytes: RUN_ENV_MAX_LIVE_BYTES,
+      max_retired_versions: RUN_ENV_MAX_REDACT - RUN_ENV_MAX_LIVE,
+      max_retired_bytes: RUN_ENV_MAX_REDACT_BYTES - RUN_ENV_MAX_LIVE_BYTES,
+      min_secret_len: RUN_ENV_MIN_SECRET_LEN,
+      max_description_bytes: RUN_ENV_MAX_DESCRIPTION_BYTES,
+    });
   });
   it("rejects a duplicate (var_id, rev) within a list and across live and redact", () => {
     assert.throws(() => decodeRunEnvSecrets({ run_env: [live(1), live(1, { name: "OTHER" })] }), /duplicate/);
@@ -203,7 +246,7 @@ describe("decodeRunEnvRedactResponse", () => {
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: [red(1, { value: "short" })] }), RunEnvClaimError);
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: [red(1), red(1)] }), /duplicate/);
   });
-  it("versions count: 200 accepted, 201 rejected", () => {
+  it("versions count: retired + live per scope accepted, one more rejected", () => {
     const mk = (n: number) => Array.from({ length: n }, (_, i) => red(i + 1));
     decodeRunEnvRedactResponse({ protected: true, versions: mk(RUN_ENV_MAX_REDACT) });
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: mk(RUN_ENV_MAX_REDACT + 1) }), RunEnvClaimError);
