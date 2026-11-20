@@ -604,9 +604,21 @@ residual that earlier text left open is closed by the owed-path marker above.
   positive generation at or below the releasing one, and its producing context
   must parse; any failure means no tracking anchor and no admission is
   required. Because the reconciliation deletes through the authority hook, the
-  runner takes the authority transaction (A) around the gate at its three
-  terminal and settle sites, with the wait of the owed-stop release path. If A
-  cannot be acquired the gate counts as ineligible and custody is kept. Failure
+  runner takes the authority transaction (A) around the gate. The waits differ
+  by site. `settleGuardedInventory` waits for the shutdown plus maintenance
+  budget plus the boundary deadline (the terms of `cleanupAuthorityWait`). The
+  transfer sites wait with `heldCapture`'s wait when held, with
+  `owedStopReleaseWait(flight)` after an owed-limit stop, and otherwise with
+  `owedStopReleaseWait(flight)` as a fallback; that fallback still refuses on a
+  recorded cancel or claim fence. If A cannot be acquired the gate counts as
+  ineligible and custody is kept. An A-acquisition failure is an ineligible
+  gate, and an ineligible gate closes the refusal fence for that generation in
+  this process. This is an accepted, fail-closed residual. The sealed cleanup
+  (`refusalCleanupPlan`, unchanged) still excludes and deletes a refused-ref and
+  ledger anchored import stage whatever its nonce. That is reachable only when a
+  FINAL predates the stage; the commit stays covered by the sealed covering head,
+  and the gate and seal hold such a stage as unproven. This is an accepted
+  boundary. Failure
   model: process crash only. The ref guarantees make no storage or power-loss
   claim. A crash between registration and settlement leaves a `running` bare
   record that fences later same-bare writers (the ADR-1783 residual above).

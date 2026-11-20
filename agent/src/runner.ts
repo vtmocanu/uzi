@@ -23365,8 +23365,9 @@ export class RunRunner {
     // generation (the hook runs again when the terminal is journaled and sent) re-proves the head the
     // first pass released instead of re-importing. Every other pass imports exactly as before.
     // issue #4481: stopForOwedLimit aborts the flight's cancel, lifecycle and terminal lifecycle signals,
-    // so the default authority wait would reject the refused head's release fetch at once. The same choice
-    // bounds the wait for A of the refusal gate, which reconciles through the shared-bare authority hook.
+    // so the default authority wait would reject the refused head's release fetch at once. The fetch falls
+    // back to this.authorityWait(flight) when neither choice applies, but the refusal gate's wait for A
+    // (gateWait below) falls back to this.owedStopReleaseWait(flight) instead.
     const sourceWait: AuthorityWait | (() => AuthorityWait) | undefined = heldCapture
       ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) }
       : flight.owedLimitStop !== undefined ? () => this.owedStopReleaseWait(flight) : undefined;

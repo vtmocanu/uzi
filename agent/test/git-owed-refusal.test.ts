@@ -1599,6 +1599,15 @@ describe("issue4481 reconciling proven-finished, independently anchored import s
       assert.equal(stageLeft(stage), true);
     });
 
+    it("importProducerProven is false for a finished stage that is also live", async () => {
+      const { stage } = await interruptedThenRetried();
+      const proven = (c: GitCache, ref: string): boolean => (c as unknown as { importProducerProven(r: string): boolean }).importProducerProven(ref);
+      assert.equal(finishedSet().has(stage), true);
+      assert.equal(proven(cache, stage), true, "control: finished and not live is proven");
+      (cache as unknown as { liveImportStages: Set<string> }).liveImportStages.add(stage);
+      assert.equal(proven(cache, stage), false);
+    });
+
     it("a sole anchor: tracking moved away, no pins", async () => {
       const { stage } = await interruptedThenRetried();
       assert.equal(await cache.admitRefusalProvenance(ctx), "written");

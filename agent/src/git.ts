@@ -29769,6 +29769,7 @@ try {
   /** An import stage's producer is proven finished only when it was created by this process, its import returned,
    *  and it is not live now. A foreign nonce, an evicted record or an injected stage is unproven (fail closed). */
   private importProducerProven(ref: string): boolean {
+    // The !liveImportStages clause is defence in depth: the gate's hasLiveImport check runs first.
     return isRefusalImportRef(ref) && importLeafNonce(ref) === this.processNonce &&
       this.finishedImportStages.has(ref) && !this.liveImportStages.has(ref);
   }
@@ -29811,10 +29812,19 @@ try {
         if (!recoveryPins) {
           recoveryPins = new Map();
           const prefix = recoveryPinRef(runId, 1).slice(0, -1);
-          const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", prefix]);
-          for (const line of out.split("\n").filter(Boolean)) {
-            const [ref, oid] = line.split(" ");
-            if (ref !== undefined && oid !== undefined) recoveryPins.set(ref, oid);
+          const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", prefix]);
+          for (const ref of out.split("\n").filter(Boolean)) {
+            const g = Number(ref.slice(ref.lastIndexOf("/") + 1));
+            if (!refusalGeneration(g, 1) || g > G || ref !== recoveryPinRef(runId, g)) continue;
+            // Same verification as the owed pin: exact ref, commit required, ambiguity refused. A failure
+            // means this pin does not anchor; only a boundary abort propagates.
+            try {
+              const oid = await this.checkedRefSha(barePath, ref);
+              if (oid !== undefined) recoveryPins.set(ref, oid);
+            } catch (cause) {
+              const abort = this.boundaryAbortError(cause);
+              if (abort) throw abort;
+            }
           }
         }
         for (const [ref, oid] of recoveryPins) {

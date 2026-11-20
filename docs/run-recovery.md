@@ -1332,11 +1332,14 @@ are kept by cleanup.
   process's nonce, import returned, not live), an independent anchor sits at its
   exact tip (the owed pin, a recovery pin at a generation at or below the
   releasing one, or the branch's tracking ref when the caller names the branch
-  and this run owns it at a positive generation at or below it) and the tip is
+  and this run owns it at a positive generation at or below it; that branch
+  must also equal the ledger's branch when a ledger exists) and the tip is
   covered (pinned, or an ancestor of the gate head). The removal runs under the
   authority transaction and the registered `refusal-cleanup-delete-ref`
-  deletion; if the authority is unavailable or refuses, the stage stays and
-  custody is kept. This assumes process crash only: it makes no storage or
+  deletion; if the authority is unavailable or refuses, the stage stays. The
+  gate then holds unless the stage is otherwise anchored by a refused ref plus
+  a ledger row and proven, in which case the ordinary evidence rules apply.
+  This assumes process crash only: it makes no storage or
   power-loss claim, and a crash between registration and settlement leaves a
   `running` bare record that fences later writers on that bare (accepted);
 - a bare left with an unresolved bare-mutation record by a worker killed while
