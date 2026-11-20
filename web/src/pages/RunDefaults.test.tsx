@@ -2994,6 +2994,7 @@ describe("Run defaults — Claude planning model and effort (PRD #3252)", () => 
     expect(screen.getByText(
       `Not a Claude model: ${codexId} is a Codex model, so Claude planning skips it. Choose Same as the run to clear it.`,
     )).toBeTruthy();
+    expect(model.getAttribute("aria-describedby")).toContain("planning-model-warning");
     expect(saveBtn().disabled).toBe(true);
   });
 

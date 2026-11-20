@@ -10531,6 +10531,17 @@ describe("SdkExecutor Claude planning phase model/effort (PRD #3252 M3)", () => 
     assert.equal(turns.length, 0);
   });
 
+  it("the unsupported configuration is refused at a resumed gate with no session (a revise would plan on the planning model)", async () => {
+    const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
+    const config: ClaimConfig = { plan_phase: { model: "opus" } };
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [noModelLead, coder], config, planApproved: false, resumePhase: "awaiting_approval", sessionId: null, approvedPlan: "# Submitted",
+    });
+    await assert.rejects(() => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /clear the Claude planning model/);
+    assert.equal(turns.length, 0);
+  });
+
   it("a fresh seeded start with no session runs no plan turn and proceeds on the implement request without a model key", async () => {
     const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
     const config: ClaimConfig = { plan_phase: { model: "opus" } };

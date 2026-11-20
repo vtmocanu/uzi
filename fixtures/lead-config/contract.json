@@ -1229,7 +1229,7 @@
     },
     {
       "id": "claude-planning-model-no-template-model-unsupported-implement-phase",
-      "note": "Unsupported phase configuration (PRD #3252 section 5): a planning model with no implementation model (no default_model, no templateModel). The resolver does not fail; it pins the implement request (no model key, source builtin). The Claude executor refuses the run where a plan turn runs or a session is resumed, since the planning model would otherwise leak into the implement turn.",
+      "note": "Unsupported phase configuration (PRD #3252 section 5): a planning model with no implementation model (no default_model, no templateModel). The resolver does not fail; it pins the implement request (no model key, source builtin). The Claude executor refuses the run on every start except a fresh pre-approved one with no session, since the planning model would otherwise leak into the implement turn.",
       "harness": "claude",
       "phase": "implement",
       "config": {

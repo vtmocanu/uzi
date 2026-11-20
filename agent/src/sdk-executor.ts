@@ -1838,8 +1838,8 @@ export class SdkExecutor implements Executor {
     const planLeadModel = planRequest.model;
     // PRD #3252: a planning model with no implementation model to fall back to is an unsupported
     // phase configuration. It is refused (before any turn) only where the planning model could
-    // reach the implement turn: when a plan turn will run, or when the implement turn resumes an
-    // existing session. That check sits below, once `preApproved` is known. On a provider run the
+    // reach the implement turn: on every start except a fresh pre-approved one with no session (a
+    // resumed gate is refused too: a revise there would plan on the planning model). That check sits below, once `preApproved` is known. On a provider run the
     // provider map's default (the sonnet alias) counts as the implementation model only if the map
     // yields a name; resolveProviderModel below throws otherwise.
     // PRD #4320 module 7: a provider run resolves the lead through the bound map BEFORE any content is
@@ -2403,14 +2403,16 @@ export class SdkExecutor implements Executor {
         ctx.resumePhase === "awaiting_approval" &&
         !!ctx.approvedPlan?.trim();
 
-      // PRD #3252: the unsupported-phase-configuration refusal (see leadModel above). A fresh
-      // seeded/pre-approved start with no session runs no plan turn and has no session to
-      // inherit the planning model from, so it proceeds on the implement request.
+      // PRD #3252: the unsupported-phase-configuration refusal (see leadModel above). Only a
+      // fresh pre-approved start with no session is exempt: it runs no plan turn and has no
+      // session to inherit the planning model from, so it proceeds on the implement request. A
+      // resume at the gate is NOT exempt: a revise there opens a planning session that the
+      // implement turn would resume with no model key, keeping the planning model.
       if (
         ctx.config?.plan_phase?.model &&
         state.implementRequest.model === undefined &&
         !ctx.provider &&
-        (!(preApproved || resumeAtGate) || !!ctx.sessionId)
+        (!preApproved || !!ctx.sessionId)
       ) {
         throw new Error(REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL);
       }
