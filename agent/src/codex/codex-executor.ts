@@ -2956,7 +2956,9 @@ export class CodexExecutor implements Executor {
       this.assertCaptureAdmission();
       const revision = this.captureRevision;
       // Capture once at call admission: an A closure must never acquire B's authority.
-      const authority = this.currentCodexAuthority;
+      // A public summary can precede run(); both entry points share the initial authority.
+      const authority = this.currentCodexAuthority ?? createCodexEpochAuthority(this.opts.binding);
+      this.currentCodexAuthority = authority;
       const assertAuthority = () => {
         if (!authority || this.currentCodexAuthority !== authority)
           throw new TrustedExecutionRefusal("summary credential authority changed");
