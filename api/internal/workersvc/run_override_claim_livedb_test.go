@@ -329,7 +329,7 @@ func TestClaimRunOverrideCodexLiveDB(t *testing.T) {
 
 		// A sibling run without a frozen effort follows the owner's changed setting.
 		env.exec(`UPDATE runs SET status = 'cancelled', status_since = now(), finished_at = now() WHERE id = $1`, fx.runID)
-		sibling := env.seedCodexRun(t, fx.userID, fx.workerB, fx.repoID)
+		sibling := env.seedCodexRun(t, fx.userID, fx.workerA, fx.repoID)
 		if err := fx.svc.FreezeCodexBinding(env.ctx, fx.userID, sibling, fx.aliasID, codexAuthModeSubscription); err != nil {
 			t.Fatalf("FreezeCodexBinding: %v", err)
 		}
@@ -362,7 +362,7 @@ func TestClaimRunOverrideCodexLiveDB(t *testing.T) {
 			if err != nil || p != nil {
 				t.Fatalf("Claim = (%v, %v), want an idle claim", p != nil, err)
 			}
-			requireOverrideHeld(t, env, fx.runID, fx.workerB, 1, tc.setting, tc.value)
+			requireOverrideHeld(t, env, fx.runID, fx.workerA, 1, tc.setting, tc.value)
 			if _, err := env.q.ResumePausedRun(env.ctx, store.ResumePausedRunParams{
 				ID: fx.runID, UserID: fx.userID, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
 			}); err != nil {
@@ -376,7 +376,7 @@ func TestClaimRunOverrideCodexLiveDB(t *testing.T) {
 			if p, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil); err != nil || p != nil {
 				t.Fatalf("reclaim = (%v, %v), want an idle claim", p != nil, err)
 			}
-			requireOverrideHeld(t, env, fx.runID, fx.workerB, 2, tc.setting, tc.value)
+			requireOverrideHeld(t, env, fx.runID, fx.workerA, 2, tc.setting, tc.value)
 		})
 	}
 }

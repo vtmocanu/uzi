@@ -61,4 +61,4 @@ pass "self_improve run $RUN_S completed through the stub and opened MR !$MR_S"
 
 # --- delete the schedule; leave vault state as found (unlocked) --------------
 uzi_cli schedule delete "$SID" >/dev/null || fail "schedule delete failed (exit $?)"
-pass "deleted self-improve schedule $SID; run terminal (quarantine-clean)"
+pass "deleted self-improve schedule $SID; run terminal (boundary-clean)"

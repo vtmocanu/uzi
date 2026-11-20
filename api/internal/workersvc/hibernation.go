@@ -37,10 +37,6 @@ const (
 	hibernationTextMax           = 500
 	// hibernationResourceVersionMax bounds the opaque Kubernetes resourceVersion.
 	hibernationResourceVersionMax = 64
-	// hibernationPollClampMin/Max bound the controller-reported poll interval used to
-	// size the advertisement freshness window.
-	hibernationPollClampMin = 1
-	hibernationPollClampMax = 300
 )
 
 // Refusal codes: the stable strings returned in the 409 body of a hibernate refusal.
@@ -438,23 +434,15 @@ func (s *Service) hibernateRefusal(ctx context.Context, q *store.Queries, w stor
 }
 
 func hibernationAdvertisementFresh(adv store.GetControllerHibernationAdvertisementRow, now time.Time) bool {
-	if !adv.HibernationVersion.Valid || adv.HibernationVersion.Int32 < hibernationAdvertisedVersion ||
-		!adv.HibernationAdvertisedAt.Valid {
-		return false
-	}
-	return now.Sub(adv.HibernationAdvertisedAt.Time) < 2*hibernationPollInterval(adv)
+	return AdvertisementFresh(adv.HibernationVersion, adv.HibernationAdvertisedAt, adv.PollIntervalSeconds,
+		hibernationAdvertisedVersion, now)
 }
 
-// hibernationPollInterval is the controller's advertised poll interval clamped to
-// [hibernationPollClampMin, hibernationPollClampMax] seconds, the clamp the advertisement
-// freshness window and the inventory observation-gap bound share. An absent interval reads as
-// the maximum.
+// hibernationPollInterval is the controller's advertised poll interval clamped (see
+// AdvertisementPollInterval), the clamp the advertisement freshness window and the
+// inventory observation-gap bound share.
 func hibernationPollInterval(adv store.GetControllerHibernationAdvertisementRow) time.Duration {
-	poll := int64(hibernationPollClampMax)
-	if adv.PollIntervalSeconds.Valid {
-		poll = min(max(int64(adv.PollIntervalSeconds.Int32), hibernationPollClampMin), hibernationPollClampMax)
-	}
-	return time.Duration(poll) * time.Second
+	return AdvertisementPollInterval(adv.PollIntervalSeconds)
 }
 
 // WakeWorker moves any non-none worker to waking. actor is nil for a system wake (no

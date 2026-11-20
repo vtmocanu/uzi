@@ -225,7 +225,9 @@ runs. The worker keeps its clone and HOME; verified local captures can
 contain unpublished work. These are not a guarantee of recovery after
 losing that worker's storage: another worker can recover published work or
 an available verified recovery copy, not an unverified capture or every
-latest edit. Pending pause requests are satisfied and cleared by this hold.
+latest edit. A Codex run that has been claimed once is never taken by another
+worker; it stays held for its last worker until the owner cancels it
+([Codex runs held](./run-recovery.md#codex-runs-held-for-their-last-worker)). Pending pause requests are satisfied and cleared by this hold.
 
 Typed reporting requires the negotiated `recovery_cause_provider_outage`
 feature. Old workers, or new workers against an API without it, send untyped
@@ -320,7 +322,8 @@ owner extension first.
    held parks keep source custody; an available earlier archive may omit latest
    local work. Losing the original storage can still lose that work. Another
    worker may resume from a published checkpoint after worker loss or affinity
-   expiry without the original local recovery journal.
+   expiry without the original local recovery journal (not a Codex run that has
+   been claimed once, which only its last worker may resume).
 
 Finite retry timestamps, including due ones, mean timed recovery. A NULL retry
 means an owner hold with no countdown; omitted timing means unknown. Default
@@ -424,7 +427,8 @@ log follow and the watcher stop for the owner decision; explicit `--until` keeps
 its status set. Retained sources can block image rolls and occupy storage; each
 fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
-loss or affinity expiry may use a published checkpoint behind the retained work.
+loss or affinity expiry may use a published checkpoint behind the retained work
+(except a Codex run that has been claimed once, which no peer takes).
 
 A temporary API connection problem during the worker's read-only ownership
 check, after the successor was verified and journaled, is retried in place
@@ -586,8 +590,9 @@ page shows "unwitnessed continuation hold" with Resume and Cancel.
 Resume requeues the run on the same worker (its local sources stay there) and
 starts a new requeue episode. The worker registration that was released cannot
 claim it again: the run continues only after that worker re-registers (for
-example after its own restart) or on a different worker once the original
-worker's claim affinity lapses (or it goes stale). A re-registration is
+example after its own restart) or, for a Claude run, on a different worker once the original
+worker's claim affinity lapses (or it goes stale). A Codex run that has been
+claimed once is held for the original worker and is never offered to another. A re-registration is
 not proof that the earlier source use ended. The worker still refuses a source
 that is in use, and a repeated refusal is bounded again in the new episode.
 Nothing restarts the worker for you.
@@ -650,7 +655,8 @@ reservation while leaving reachability unverified. Legacy workers without
 direct success reporting serialize the origin during the active flight;
 a stopped flight does not keep a perpetual reservation.
 
-A sibling can bypass ordinary affinity immediately only with complete
+A sibling can bypass ordinary affinity immediately (never for a Codex run that
+has been claimed once, which only its last worker claims) only with complete
 immutable guarded positive FINAL/source dispositions for generations 1..G
 and no open hold in any generation. Missing or nonguarded history,
 multiple/conflicting sources and local-only work remain protected.

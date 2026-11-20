@@ -30,6 +30,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { processGroupAlive } from "./tick-spawner.js";
 import { syncDirectory } from "./authority-lock.js";
+import { isIssuedManagedBareGroupTrust, type ManagedBareGroupTrust } from "./runner-group-trust.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
@@ -1075,6 +1076,17 @@ export interface GitCacheOptions {
   recoveryDecodedLimitBytes?: number;
   /** Physical terminal custody, rooted at the configured outbox by the caller. */
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
+  /** Result of the once-per-process runner-group probe (runner-group-trust.ts). Absent means the
+   *  group-writable managed bare allowance is off. */
+  managedBareGroupTrust?: ManagedBareGroupTrust;
+  /** Test-only seam (issue #4486): replaces the getfacl launch of the group-writable managed bare proof. It receives
+   *  the exact path list of each chunk (the ancestor paths first); a throw is an observed ACL. Production never passes it. */
+  managedBareAclObserve?: (paths: string[]) => Promise<void>;
+  /** Test-only seam (issue #4486): the getfacl executable, so a real launch of an absent binary is testable. The
+   *  audited launch shape admits this path only when it was configured. Production never passes it. */
+  managedBareGetfaclBin?: string;
+  /** Test-only seam (issue #4486): replaces `fs.statfs` of the group-writable managed bare proof. Production never passes it. */
+  managedBareStatfs?: (target: string) => Promise<{ type: number | bigint }>;
   /** The gitleaks executable. Default `"gitleaks"` (PATH outside a boundary scope, the image's
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
@@ -3807,6 +3819,19 @@ const RETENTION_WARNING_INTERVAL_MS = 3600_000;
  *  never resolves from a runner-writable PATH), and its deadline. */
 const RETENTION_RM_BIN = "/bin/rm";
 const RETENTION_RM_TIMEOUT_MS = 120_000;
+/** The audited ACL observer of a group-writable managed bare (issue #4486): the image's absolute getfacl, its fixed
+ *  argv prefix and environment, and the bounds of one launch. A launch lists extended ACL entries only
+ *  (`--skip-base`), so a clean tree prints nothing at all. */
+const GETFACL_BIN = "/usr/bin/getfacl";
+const GETFACL_ARGS_PREFIX: readonly string[] = ["--absolute-names", "--physical", "--skip-base", "--numeric", "--"];
+const GETFACL_ENV: Readonly<Record<string, string>> = { PATH: "/usr/bin:/bin", LC_ALL: "C" };
+const GETFACL_CHUNK_PATHS = 512;
+const GETFACL_TIMEOUT_MS = 60_000;
+const GETFACL_MAX_BUFFER = 4096;
+/** Filesystem magic numbers (statfs f_type) on which the permission bits and ACL observation of a group-writable
+ *  managed bare are meaningful: ext4, xfs, btrfs, tmpfs, overlayfs. Anything else (a network or FUSE
+ *  filesystem, which can enforce access outside the mode bits) is UNKNOWN. */
+const MANAGED_BARE_FS_TYPES: ReadonlySet<number> = new Set([0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630]);
 /** After the timeout's group kill, how long the delete waits for the rm's 'close' (its stderr
  *  pipe shut: every holder of it gone) before declaring the rm possibly still alive. */
 const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
@@ -4524,6 +4549,23 @@ export class GitCache {
     if (rm?.length === 3 && rm[0] === "-rf" && rm[1] === "--" &&
         this.epochNativePaths().includes(rm[2]!) && identity === "command" &&
         Object.entries(env).every(([k, v]) => v === undefined || k === "PATH" && v === "/usr/bin:/bin")) return env;
+    // The ACL observer of a group-writable managed bare (issue #4486): exactly the getfacl binary (the configured
+    // override only when one was configured), worker identity and never runner-wrapped, the fixed argv prefix, the
+    // exact two-variable environment, and only canonical absolute paths under the repos root or its ancestor chain.
+    if (command === this.managedBareGetfaclBin) {
+      const repos = path.resolve(this.reposRoot);
+      const ancestors = this.managedBareAncestors() ?? [];
+      const names = Object.entries(env).filter(([, v]) => v !== undefined);
+      const paths = args.slice(GETFACL_ARGS_PREFIX.length);
+      if (identity === "worker_pat" && ancestors.length > 0 &&
+          names.length === Object.keys(GETFACL_ENV).length &&
+          names.every(([k, v]) => GETFACL_ENV[k] === v) &&
+          args.length > GETFACL_ARGS_PREFIX.length && GETFACL_ARGS_PREFIX.every((arg, i) => args[i] === arg) &&
+          paths.length <= ancestors.length + GETFACL_CHUNK_PATHS &&
+          paths.every(p => !p.includes("\0") && path.isAbsolute(p) && path.resolve(p) === p &&
+            (ancestors.includes(p) || p === repos || p.startsWith(repos + path.sep)))) return env;
+      return refuse();
+    }
     if (!git) return refuse();
     // Accept only values the existing credential-free builders actually emit.
     // No credential pair, config override, loader variable or caller-selected path
@@ -4606,6 +4648,41 @@ export class GitCache {
       // No system gitattributes; with --attr-source and core.attributesFile pinned, no attribute
       // source remains that could name a clean filter.
       GIT_ATTR_NOSYSTEM: "1", GIT_CONFIG_NOSYSTEM: "1" };
+  }
+
+  /** The directories from the repos root up to and including the data directory, which a group-writable managed bare
+   *  depends on (issue #4486). Undefined when the repos root is not the data directory's own `repos`. */
+  private managedBareAncestors(): string[] | undefined {
+    const repos = path.resolve(this.reposRoot), data = path.resolve(this.dataDirRoot);
+    if (repos !== path.join(data, "repos")) return undefined;
+    const chain = [repos];
+    while (chain[chain.length - 1] !== data) chain.push(path.dirname(chain[chain.length - 1]!));
+    return chain;
+  }
+
+  /** One chunk of the ACL observation of a group-writable managed bare. Any ACL entry, any output, a failed or
+   *  absent executable, a timeout or an overrun is UNKNOWN, and never another error class (a lost reclaim
+   *  exclusion or an expired proof deadline excepted: the caller observes those). */
+  private async observeManagedBareAcl(paths: string[], automatic: AutomaticPreservation): Promise<void> {
+    const unknown = (message: string, cause?: unknown): never => {
+      throw new AutomaticCompletenessUnknown(`unowned alternate store: ${message}`, cause === undefined ? undefined : { cause });
+    };
+    if (this.managedBareAclObserveSeam) {
+      try { await this.managedBareAclObserveSeam([...paths]); }
+      catch (error) { return unknown("acl observed", error); }
+      return;
+    }
+    let result: { stdout: string; stderr: string };
+    try {
+      result = await this.automaticPreservationRead(automatic, () => this.execScoped(
+        this.managedBareGetfaclBin, [...GETFACL_ARGS_PREFIX, ...paths],
+        { env: { ...GETFACL_ENV }, timeout: GETFACL_TIMEOUT_MS, maxBuffer: GETFACL_MAX_BUFFER }, "worker_pat"));
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown) throw error;
+      automatic.checkLive();
+      return unknown("acl observation failed", error);
+    }
+    if (result.stdout !== "" || result.stderr !== "") unknown("acl observed");
   }
 
   /** The `-c` pins every Git launch of the epoch native scope carries; `core.worktree` only for a clone-side read. */
@@ -5997,6 +6074,11 @@ export class GitCache {
   private readonly compactForeignNow: () => number;
   private readonly archivedPinClock: NonNullable<GitCacheOptions["archivedPinClockForTest"]>;
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
+  private readonly managedBareGroupTrustValue: GitCacheOptions["managedBareGroupTrust"];
+  private readonly dataDirRoot: string;
+  private readonly managedBareAclObserveSeam: GitCacheOptions["managedBareAclObserve"];
+  private readonly managedBareGetfaclBin: string;
+  private readonly managedBareStatfsSeam: GitCacheOptions["managedBareStatfs"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
   /** See {@link GitCacheOptions.wipCapture}; undefined in production. */
@@ -6059,6 +6141,11 @@ export class GitCache {
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.terminalRecordProtection = opts.terminalRecordProtection;
+    this.managedBareGroupTrustValue = opts.managedBareGroupTrust;
+    this.dataDirRoot = dataDir;
+    this.managedBareAclObserveSeam = opts.managedBareAclObserve;
+    this.managedBareGetfaclBin = opts.managedBareGetfaclBin ?? GETFACL_BIN;
+    this.managedBareStatfsSeam = opts.managedBareStatfs;
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
     this.recoveryMaintenanceRoot = path.join(dataDir, "recovery-maintenance");
@@ -13850,6 +13937,33 @@ export class GitCache {
       };
       const managed = (root: string) => path.dirname(path.dirname(root)) === path.resolve(this.reposRoot) && path.basename(root) === "objects";
 
+      // ---- Group-writable managed stores (issue #4486). The allowance needs a value the runner-group probe issued
+      // (a cast literal is refused), whose group is this process's own and the entry's own. Every use re-reads the
+      // process group, so a changed identity ends the allowance at the next call.
+      const groupWriteStores = new Set<string>();
+      const groupTrusted = (gid: bigint): boolean => {
+        const trust = this.managedBareGroupTrustValue;
+        return isIssuedManagedBareGroupTrust(trust) && trust.state === "trusted" &&
+          process.getgid?.() === trust.gid && gid === BigInt(trust.gid);
+      };
+      const workerUid = BigInt(process.getuid!());
+      // S3 (lstat only): every directory from the repos root up to the data directory must be a real directory that
+      // only this worker (or root) owns, that nobody else can write, and that a group can write only if it is the
+      // trusted group. A sticky bit is no mitigation for world write.
+      let ancestorPaths: string[] | undefined;
+      const groupWriteAncestors = async (): Promise<string[]> => {
+        if (ancestorPaths) return ancestorPaths;
+        const chain = this.managedBareAncestors();
+        if (!chain) return unknown("unowned alternate store: data directory layout");
+        for (const dir of chain) {
+          const st = await stat(dir);
+          if (!st!.isDirectory() || st!.isSymbolicLink() || st!.uid !== workerUid && st!.uid !== 0n ||
+              (st!.mode & 0o002n) !== 0n || (st!.mode & 0o020n) !== 0n && !groupTrusted(st!.gid))
+            unknown("unowned alternate store: unsafe ancestor");
+        }
+        return ancestorPaths = chain;
+      };
+
       // ---- Stage one: topology. Nothing here charges object content. ----
       const topologyInfo = async (root: string, store: Store) => {
         const p = path.join(root, "info");
@@ -13915,7 +14029,7 @@ export class GitCache {
         }
       };
       /** One store's config as Git lists it (`git config --file -`, the bytes on stdin, no file of the store opened). */
-      const configListing = async (configBytes: Buffer) => {
+      const configListing = async (configBytes: Buffer, groupWrite: boolean) => {
         let listing: string;
         try {
           const parsed = await read(() => this.execScoped("git",
@@ -13936,6 +14050,9 @@ export class GitCache {
               key === "extensions.refstorage" || key === "extensions.worktreeconfig" || key === "extensions.partialclone" ||
               key === "core.worktree" || key !== undefined && PROMISOR_KEY_RE.test(key) || key?.startsWith("include.") || key?.startsWith("includeif."))
             unknown("object format or config indirection unsupported");
+          // S4 (issue #4486): Git lowercases the section and variable names it lists. A group-writable store with
+          // core.sharedRepository set has its file modes rewritten by Git itself: not provable.
+          if (groupWrite && key?.toLowerCase() === "core.sharedrepository") unknown("unowned alternate store: shared repository config");
         }
       };
       /** The loose fan-out directories of one store: every leaf name is classified, and its TYPE read (a symlink or any
@@ -13961,9 +14078,19 @@ export class GitCache {
         for (const parent of [path.dirname(path.dirname(root)), path.dirname(root)]) {
           if (!(await stat(parent))?.isDirectory()) unknown("object ancestor type");
         }
+        // S1 (issue #4486), per managed store. A store not owned by this worker, or writable by anyone, is not ours. A
+        // group-writable store is ours only under an issued, trusted runner-group probe whose group is this process's
+        // own group AND the store's group (re-read at every call), and only once its ancestors (S3) pass.
+        let groupWrite = false;
         if (managedBare) {
           const owner = await stat(path.dirname(root));
-          if (owner!.uid !== BigInt(process.getuid!()) || (owner!.mode & 0o022n) !== 0n) unknown("unowned alternate store");
+          if (owner!.uid !== BigInt(process.getuid!()) || (owner!.mode & 0o002n) !== 0n) unknown("unowned alternate store");
+          if ((owner!.mode & 0o020n) !== 0n) {
+            if (!groupTrusted(owner!.gid)) unknown("unowned alternate store");
+            groupWrite = true;
+            groupWriteStores.add(root);
+            await groupWriteAncestors();
+          }
         }
         const config = path.join(path.dirname(root), "config");
         const configBytes = await small(config);
@@ -13974,7 +14101,9 @@ export class GitCache {
           // afterwards; an include in any other store's config is judged here.
           if (cloneConfigIndirection(configBytes) !== undefined || /\[\s*include/i.test(configBytes.toString("latin1")))
             unknown("object format or config indirection unsupported");
-        } else await configListing(configBytes);
+          // S4: any spelling of the variable, however the file cases or splits it.
+          if (groupWrite && /sharedrepository/i.test(configBytes.toString("latin1"))) unknown("unowned alternate store: shared repository config");
+        } else await configListing(configBytes, groupWrite);
         for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
           if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
         }
@@ -14235,10 +14364,46 @@ export class GitCache {
           }
         }
       };
+      // S2 (issue #4486), full passes only, never cached: a group-writable managed store is proven private to this
+      // worker's group by looking at EVERY path of its bare (the config, HEAD, refs, hooks, logs and every object
+      // alike), not at its object directories alone. Each entry is charged and fingerprinted like any other topology
+      // read (a loose fan-out leaf as a leaf, everything else as a directory entry), so an overflow is UNKNOWN.
+      const groupWriteTree = async (root: string) => {
+        const top = path.dirname(root), objects = path.join(top, "objects");
+        const ancestors = await groupWriteAncestors();
+        const walked: string[] = [];
+        const visit = (p: string, st: import("node:fs").BigIntStats) => {
+          if (!st.isFile() && !st.isDirectory()) unknown("unowned alternate store: unsupported entry type");
+          if (st.uid !== workerUid || (st.mode & 0o002n) !== 0n ||
+              (st.mode & 0o020n) !== 0n && !groupTrusted(st.gid)) unknown("unowned alternate store");
+          walked.push(p);
+        };
+        visit(top, (await stat(top))!);
+        for (const dir = [top]; dir.length;) {
+          const current = dir.pop()!;
+          const leaves = path.dirname(current) === objects && /^[0-9a-f]{2}$/.test(path.basename(current));
+          for (const name of (await directory(current, undefined, leaves)).names) {
+            const child = path.join(current, name);
+            const st = (await stat(child))!;
+            visit(child, st);
+            if (st.isDirectory()) dir.push(child);
+          }
+        }
+        for (const target of [top, ...ancestors]) {
+          const type = await read(() => (this.managedBareStatfsSeam ?? ((p: string) => fs.statfs(p)))(target)).then(r => r.type);
+          // f_type is a signed long on some architectures: compare the low 32 bits.
+          if (!MANAGED_BARE_FS_TYPES.has(Number(BigInt.asUintN(32, BigInt(type))))) unknown("unowned alternate store: filesystem type");
+        }
+        for (let at = 0; at < walked.length; at += GETFACL_CHUNK_PATHS) {
+          tick();
+          await this.observeManagedBareAcl([...ancestors, ...walked.slice(at, at + GETFACL_CHUNK_PATHS)], automatic);
+        }
+      };
       await topology(source); await topology(bare);
       for (const root of stores.keys()) await topologyLoose(root);
       // The classification pass has no result of its own: its only product is the UNKNOWN it raises.
       if (topologyOnly) return undefined as never;
+      for (const root of groupWriteStores) await groupWriteTree(root);
       await afterTopology?.();
       topologyStage = false;
       for (const root of stores.keys()) await content(root);

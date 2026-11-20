@@ -244,6 +244,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Seed/refresh the shipped hosted-worker sizes (PRD #4213) before anything serves the
+	// hosted poll or a provision: an existing pristine row tracks the shipped values, an
+	// admin-edited row is kept. A failure aborts boot like the template reconcile above.
+	if err := store.ReconcileBuiltinWorkerSizes(ctx, pool); err != nil {
+		return err
+	}
 	// Same for the builtin agent skills (PRD #16): missing builtin skills are
 	// inserted, admin edits survive restarts. Newly-inserted builtins also get
 	// their default shared allocations (PRD #72 M2).
@@ -1847,6 +1853,9 @@ func translateGateSubmitErr(err error) error {
 		return slacksvc.ErrReviseCapReached
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		return slacksvc.ErrSelectionRejected
+	case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+		// Issue #4479: the interactive run is finishing; the replier tells the user.
+		return slacksvc.ErrFollowUpFinalizing
 	}
 	return err
 }
@@ -2080,7 +2089,8 @@ func (g gateSubmitter) SteerRunFromCard(ctx context.Context, userID, runID uuid.
 		return nil
 	case errors.Is(err, workersvc.ErrChatInputNotAllowed),
 		errors.Is(err, workersvc.ErrRunNotFound),
-		errors.Is(err, workersvc.ErrRunTerminal):
+		errors.Is(err, workersvc.ErrRunTerminal),
+		errors.Is(err, workersvc.ErrFollowUpFinalizing):
 		return errors.New(steerRunCardMessage(err))
 	default:
 		slog.Error("slack steer-run card", "run_id", runID, "error", err)
@@ -2100,6 +2110,9 @@ func steerRunCardMessage(err error) string {
 		return "That run isn't yours, or it no longer exists."
 	case errors.Is(err, workersvc.ErrRunTerminal):
 		return "That run has already finished."
+	case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+		// Issue #4479: the worker is finalizing the run; retrying cannot succeed.
+		return "That run is finishing; your follow-up was not delivered."
 	default:
 		return "Couldn't steer that run right now — try again, or steer it in uzi."
 	}

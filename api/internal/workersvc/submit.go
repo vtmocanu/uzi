@@ -673,7 +673,7 @@ func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, bo
 		RunID: runID, Kind: kind, Body: pgconv.TextOrNull(cleanBody),
 	})
 	if err != nil {
-		return SubmitInputResult{}, err
+		return SubmitInputResult{}, mapFollowupFinalizingErr(err)
 	}
 	return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
 }

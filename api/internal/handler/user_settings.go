@@ -84,6 +84,11 @@ type userSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
+	// SidebarMotion is the user's RAW opt-in for animated sidebar icons (issue #4510):
+	// null = not chosen. EffectiveSidebarMotion is the resolved boolean the web reads
+	// (the explicit choice, else the instance fallback).
+	SidebarMotion          *bool `json:"sidebar_motion"`
+	EffectiveSidebarMotion bool  `json:"effective_sidebar_motion"`
 	// DefaultHarness is the user's per-user default harness (PRD #1429 M1 / D3), nullable:
 	// null = "no preference", so implicit run creation falls through D11 rather than pinning.
 	// A non-null value is one of the closed claude|codex set (validateHarness gates the write).
@@ -127,17 +132,27 @@ type userSettingsDTO struct {
 // directly (PRD #1209 M1). A nil override uses the value read from GetUserSettings — the PUT
 // path, and the GET path's best-effort fallback when the prune UPDATE failed.
 func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, userID uuid.UUID, sidebarCodexOverride *[]uuid.UUID) {
+	dto, err := h.buildUserSettingsDTO(r, userID, sidebarCodexOverride)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"settings": dto})
+}
+
+// buildUserSettingsDTO is the read half of userSettingsResponse, split out so PUT
+// /api/me/model-settings can tell a failed post-commit readback apart from the write. Every
+// failure is logged here and returned as an error the caller maps to its own 500.
+func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sidebarCodexOverride *[]uuid.UUID) (userSettingsDTO, error) {
 	s, err := h.q.GetUserSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get user settings", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		return userSettingsDTO{}, err
 	}
 	pins, leadCodexPin, err := h.crossCheckPinSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get cross-check pins", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		return userSettingsDTO{}, err
 	}
 	sidebarCodexIDs := s.SidebarCodexAccountIds
 	if sidebarCodexOverride != nil {
@@ -151,20 +166,17 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	effHarness, err := h.resolveSettingsHarness(r.Context(), userID)
 	if err != nil {
 		slog.Error("resolve settings harness", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		return userSettingsDTO{}, err
 	}
 	codexMode, err := h.q.GetUserCodexAccountMode(r.Context(), userID)
 	if err != nil {
 		slog.Error("get codex account mode", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		return userSettingsDTO{}, err
 	}
 	policy, err := h.q.GetHarnessCreationPolicy(r.Context(), userID)
 	if err != nil {
 		slog.Error("get harness overflow preference", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		return userSettingsDTO{}, err
 	}
 	legacyModel := s.DefaultClaudeModel
 	if effHarness == workersvc.HarnessCodex {
@@ -196,43 +208,43 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// The codex cell's catalog default (issue #3251): the lane default_codex_model wins, then
 	// the lead template's Codex pin read with the pin rows above, then the provider default.
 	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"settings": userSettingsDTO{
-			VaultAutoReunlock:      settingsAutoReunlock(r),
-			CrossCheckPins:         pins,
-			DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
-			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
-			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
-			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-			DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-			JudgeModel:             judgeLane,
-			CodexJudgeModel:        codexJudgeLane,
-			SummaryModel:           summaryLane,
-			CodexSummaryModel:      codexSummaryLane,
-			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
-			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
-			NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
-			SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
-			SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
-			AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
-			LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
-			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
-			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
-			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
-			JudgeRunsOn:            textPtrValue(s.JudgeRunsOn.Valid, s.JudgeRunsOn.String),
-			ClaudeProviderID:       uuidPtrValue(s.ClaudeProviderID),
-			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
-			SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
-			EffortSettings: effortSettingCells(
-				textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-				catalogDefault),
-			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
-			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
-			CodexAccountMode:          codexMode,
-			HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
-		},
-	})
+	return userSettingsDTO{
+		VaultAutoReunlock:      settingsAutoReunlock(r),
+		CrossCheckPins:         pins,
+		DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
+		DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+		DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+		DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+		DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+		JudgeModel:             judgeLane,
+		CodexJudgeModel:        codexJudgeLane,
+		SummaryModel:           summaryLane,
+		CodexSummaryModel:      codexSummaryLane,
+		Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
+		MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
+		NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
+		SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
+		SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
+		AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
+		LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
+		DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
+		Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
+		SidebarMotion:          boolPtrValue(s.SidebarMotion),
+		EffectiveSidebarMotion: theme.ResolveSidebarMotion(boolPtrValue(s.SidebarMotion), sidebarMotionDefault),
+		DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
+		JudgeRunsOn:            textPtrValue(s.JudgeRunsOn.Valid, s.JudgeRunsOn.String),
+		ClaudeProviderID:       uuidPtrValue(s.ClaudeProviderID),
+		JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
+		SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
+		EffortSettings: effortSettingCells(
+			textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+			textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+			catalogDefault),
+		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
+		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
+		CodexAccountMode:          codexMode,
+		HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
+	}, nil
 }
 
 // GetMySettings returns the current user's own settings. Session-authenticated
@@ -321,6 +333,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		LightTheme     json.RawMessage `json:"light_theme"`
 		DarkTheme      json.RawMessage `json:"dark_theme"`
 		Typeface       json.RawMessage `json:"typeface"`
+		// sidebar_motion (issue #4510): absent keeps the stored value, true/false sets
+		// it, null clears to NULL (not chosen); any other JSON type is a 400.
+		SidebarMotion json.RawMessage `json:"sidebar_motion"`
 		// default_harness (PRD #1429 M1 / D3), same absent/null/value tri-state as the model
 		// fields: absent ⇒ column unchanged, null ⇒ clear to NULL ("no preference"), a
 		// claude|codex value ⇒ validated then set.
@@ -341,14 +356,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var modelVal pgtype.Text
 	modelPresent := req.DefaultModel != nil
 	if modelPresent {
-		var raw *string
-		if err := json.Unmarshal(req.DefaultModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid default_model")
-			return
-		}
-		v, err := validateModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeLegacyDefaultModelField(req.DefaultModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		modelVal = v
@@ -357,20 +367,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var claudeVal pgtype.Text
 	claudePresent := req.DefaultClaudeModel != nil
 	if claudePresent {
-		var raw *string
-		if err := json.Unmarshal(req.DefaultClaudeModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid default_claude_model")
-			return
-		}
-		v, err := validateModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		// Closed-list cross-vocabulary guard: a known Codex role id must not sit in
-		// the Claude lane. Custom ids outside that shared set remain provider-validated.
-		if err := rejectCodexIDInClaudeLane("default_claude_model", v); err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeDefaultClaudeModelField(req.DefaultClaudeModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		claudeVal = v
@@ -379,20 +378,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var codexVal pgtype.Text
 	codexPresent := req.DefaultCodexModel != nil
 	if codexPresent {
-		var raw *string
-		if err := json.Unmarshal(req.DefaultCodexModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid default_codex_model")
-			return
-		}
-		v, err := validateModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		// Closed-list cross-vocabulary guard (D3): a known Claude alias must not sit in the
-		// Codex lane. Only the closed alias set is rejected; a validated custom id passes.
-		if err := rejectClaudeAliasInCodexLane("default_codex_model", v); err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeDefaultCodexModelField(req.DefaultCodexModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		codexVal = v
@@ -401,14 +389,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var effortVal pgtype.Text
 	effortPresent := req.DefaultEffort != nil
 	if effortPresent {
-		var raw *string
-		if err := json.Unmarshal(req.DefaultEffort, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid default_effort")
-			return
-		}
-		v, err := validateDefaultEffort(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeDefaultEffortField(req.DefaultEffort, "default_effort")
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		effortVal = v
@@ -417,14 +400,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var codexEffortVal pgtype.Text
 	codexEffortPresent := req.DefaultCodexEffort != nil
 	if codexEffortPresent {
-		var raw *string
-		if err := json.Unmarshal(req.DefaultCodexEffort, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid default_codex_effort")
-			return
-		}
-		v, err := validateDefaultEffort(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeDefaultEffortField(req.DefaultCodexEffort, "default_codex_effort")
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		codexEffortVal = v
@@ -433,17 +411,12 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var judgeVal pgtype.Text
 	judgePresent := req.JudgeModel != nil
 	if judgePresent {
-		var raw *string
-		if err := json.Unmarshal(req.JudgeModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid judge_model")
-			return
-		}
 		// Same rules as default_model (PRD #69 M2, Decision 4) plus the Claude-lane
 		// guard (PRD #3245): nil/blank trims to NULL = inherit the instance judge_model;
 		// a bad model or a Codex role id is a 400.
-		v, err := validateClaudeJudgeModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, "judge_model: "+err.Error())
+		v, ferr := decodeJudgeModelField(req.JudgeModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		judgeVal = v
@@ -452,14 +425,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var codexJudgeVal pgtype.Text
 	codexJudgePresent := req.CodexJudgeModel != nil
 	if codexJudgePresent {
-		var raw *string
-		if err := json.Unmarshal(req.CodexJudgeModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid codex_judge_model")
-			return
-		}
-		v, err := validateCodexJudgeModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, "codex_judge_model: "+err.Error())
+		v, ferr := decodeCodexJudgeModelField(req.CodexJudgeModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		codexJudgeVal = v
@@ -468,17 +436,12 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var summaryVal pgtype.Text
 	summaryPresent := req.SummaryModel != nil
 	if summaryPresent {
-		var raw *string
-		if err := json.Unmarshal(req.SummaryModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid summary_model")
-			return
-		}
 		// Same Claude-lane validator as judge_model (PRD #362 M2, PRD #3248): nil/blank
 		// trims to NULL = inherit the instance summary_model; a bad model or a Codex
 		// role id is a 400.
-		v, err := validateClaudeJudgeModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, "summary_model: "+err.Error())
+		v, ferr := decodeSummaryModelField(req.SummaryModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		summaryVal = v
@@ -487,14 +450,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var codexSummaryVal pgtype.Text
 	codexSummaryPresent := req.CodexSummaryModel != nil
 	if codexSummaryPresent {
-		var raw *string
-		if err := json.Unmarshal(req.CodexSummaryModel, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid codex_summary_model")
-			return
-		}
-		v, err := validateCodexSummaryModel(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, "codex_summary_model: "+err.Error())
+		v, ferr := decodeCodexSummaryModelField(req.CodexSummaryModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		codexSummaryVal = v
@@ -546,17 +504,12 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var harnessVal pgtype.Text
 	harnessPresent := req.DefaultHarness != nil
 	if harnessPresent {
-		var raw *string
-		if err := json.Unmarshal(req.DefaultHarness, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid default_harness")
-			return
-		}
 		// PRD #1429 M1 / D3: present-null clears to NULL ("no preference"); a claude|codex
 		// value sets the pin; anything else is a 400 (validateHarness). Validated in phase 1
 		// with the other fields so a bad harness leaves nothing half-written.
-		v, err := validateHarness(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeDefaultHarnessField(req.DefaultHarness)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		harnessVal = v
@@ -565,16 +518,11 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	var judgeRunsOnVal pgtype.Text
 	judgeRunsOnPresent := req.JudgeRunsOn != nil
 	if judgeRunsOnPresent {
-		var raw *string
-		if err := json.Unmarshal(req.JudgeRunsOn, &raw); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "invalid judge_runs_on")
-			return
-		}
 		// Validated in phase 1 with the other fields so a bad value leaves nothing
 		// half-written.
-		v, err := validateJudgeRunsOn(raw)
-		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+		v, ferr := decodeJudgeRunsOnField(req.JudgeRunsOn)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
 			return
 		}
 		judgeRunsOnVal = v
@@ -609,6 +557,21 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if raw != nil {
 			nowVal = pgtype.Bool{Bool: *raw, Valid: true}
+		}
+	}
+
+	var motionVal pgtype.Bool
+	motionPresent := req.SidebarMotion != nil
+	if motionPresent {
+		// Same tri-state as now_summary_enabled: present-bool sets, present-null clears
+		// back to NULL (not chosen), a non-bool is a 400 before any write.
+		var raw *bool
+		if err := json.Unmarshal(req.SidebarMotion, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid sidebar_motion")
+			return
+		}
+		if raw != nil {
+			motionVal = pgtype.Bool{Bool: *raw, Valid: true}
 		}
 	}
 
@@ -666,7 +629,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// compute the effective target-lane value the legacy column must mirror — all in phase 1,
 	// so a conflict is a clean 400 that writes nothing. groupParams is nil when no grouped
 	// field is present.
-	groupParams, ok, err := h.buildHarnessModels(r.Context(), user.ID, harnessModelInputs{
+	groupParams, ok, err := h.buildHarnessModels(r.Context(), h.q, user.ID, harnessModelInputs{
 		modelPresent:   modelPresent,
 		modelVal:       modelVal,
 		claudePresent:  claudePresent,
@@ -857,7 +820,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if setMode || setLight || setDark || setTypeface {
+	if setMode || setLight || setDark || setTypeface || motionPresent {
 		if _, err := h.q.SetUserAppearance(r.Context(), store.SetUserAppearanceParams{
 			ID:             user.ID,
 			SetMode:        setMode,
@@ -868,6 +831,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			DarkTheme:      dark,
 			SetTypeface:    setTypeface,
 			Typeface:       typeface,
+
+			SetSidebarMotion: motionPresent,
+			SidebarMotion:    motionVal,
 		}); err != nil {
 			slog.Error("set user appearance", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1281,7 +1247,9 @@ type harnessModelInputs struct {
 //
 // All reads/decisions happen before the single write, so a conflict/cross-vocab 400 writes
 // nothing. A store error (resolver or the stored-lane read) is returned raw for a 500.
-func (h *Handler) buildHarnessModels(ctx context.Context, userID uuid.UUID, in harnessModelInputs) (store.SetUserHarnessModelsParams, bool, error) {
+// q is the querier for the stored-lane read (PutMySettings passes h.q). PUT /api/me/model-settings
+// does not call this function; it calls harnessModelParams directly with its transaction's queries.
+func (h *Handler) buildHarnessModels(ctx context.Context, q *store.Queries, userID uuid.UUID, in harnessModelInputs) (store.SetUserHarnessModelsParams, bool, error) {
 	if !in.modelPresent && !in.claudePresent && !in.codexPresent && !in.harnessPresent {
 		return store.SetUserHarnessModelsParams{}, false, nil
 	}
@@ -1347,13 +1315,19 @@ func (h *Handler) buildHarnessModels(ctx context.Context, userID uuid.UUID, in h
 		}
 	}
 
-	// A lane absent from the request may supply either the legacy bridge target or the
-	// effective compatibility mirror. Read once when any lane is absent; the grouped web
-	// save supplies both and needs no extra read.
+	return harnessModelParams(ctx, q, userID, in, claudePresent, claudeVal, codexPresent, codexVal, mirror)
+}
+
+// harnessModelParams builds the SetUserHarnessModels statement once the target lanes and the
+// compatibility-mirror harness are known. A lane absent from the request may supply either the
+// legacy bridge target or the effective compatibility mirror, so it reads the stored lanes once
+// through q when any lane is absent; the grouped web save supplies both and needs no extra read.
+func harnessModelParams(ctx context.Context, q *store.Queries, userID uuid.UUID, in harnessModelInputs,
+	claudePresent bool, claudeVal pgtype.Text, codexPresent bool, codexVal pgtype.Text, mirror workersvc.Harness) (store.SetUserHarnessModelsParams, bool, error) {
 	effClaude, effCodex := claudeVal, codexVal
 	needStored := !claudePresent || !codexPresent
 	if needStored {
-		cur, err := h.q.GetUserSettings(ctx, userID)
+		cur, err := q.GetUserSettings(ctx, userID)
 		if err != nil {
 			return store.SetUserHarnessModelsParams{}, false, err
 		}

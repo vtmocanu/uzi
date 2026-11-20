@@ -96,29 +96,63 @@ nobody's screen changes until an admin or a user opts into `system` mode or
 a light theme. See [Theming](./theming.md) for how themes and polarity work
 and how to add a theme.
 
+## Instance model defaults
+
+**Admin → Instance → Instance model defaults** (after **Credential protection**,
+before **Forge labels**; also reachable as **Model defaults** from the command
+menu) sets the instance default model for the [run judge](./judge.md) and for
+[run summaries](./run-summaries.md), one per harness, in one grid: rows **Judge
+model** and **Summary model**, columns **Claude** and **Codex**. A run reads only
+the lane of its own harness. The four keys are `judge_model`,
+`codex_judge_model`, `summary_model` and `codex_summary_model`.
+
+- Each column offers only that harness's models, with the same validation as
+  the per-user pickers. The Claude lanes (`judge_model`, `summary_model`) take
+  an alias or a custom model ID and refuse a Codex id; the Claude summary
+  picker lists `opus`, `sonnet`, `haiku` and `fable` plus **Other (custom model
+  ID)**, and an invalid ID (interior spaces, control or format characters, or
+  too long) or an empty custom ID is blocked before save, with a message
+  beneath the picker. An unchanged stored value does not block saving the other
+  lanes. A Claude lane (judge or summary) holding a Codex id shows a **Not a
+  Claude model** warning; choose **Default** to clear it. Model keys store values trimmed, and
+  a whitespace-only value stores empty and reads as source `default`. The Codex judge lane
+  (`codex_judge_model`) takes curated Codex ids only. The Codex summary lane
+  (`codex_summary_model`) takes the Codex role models, including `gpt-6-luna`,
+  with no custom ID.
+- **Default · <built-in> (built-in)** resets a lane to the built-in (`opus`,
+  `gpt-6.1-sol`, `haiku`, `gpt-6-luna` for the four lanes in order), which the
+  lane then follows, including future changes to it. Picking a model pins it.
+- A key set from the environment shows read-only as **Set from the
+  environment** and is never sent on save.
+- One **Save model defaults** button sends only the model keys you changed, in
+  one request; the server writes them in one transaction.
+- A rejected value (a 400 reading `<key>: <message>`) shows under that field.
+  Other validation errors show on the card. A server error or network failure
+  warns that the save may or may not have been applied and tells you to reload.
+- A user's own choice under **Settings → Run defaults** still wins over these
+  defaults; the admin value applies while they haven't chosen.
+
+The judge kill-switch, enforcement, cooldown and daily budget stay on the
+[Run judge](#run-judge) card, and the Now-line kill switch stays on the
+[Run summaries](#run-summaries) card; each has its own **Save** and neither
+sends a model key.
+
 ## Run judge
 
-A global kill-switch for the [run judge](./judge.md), plus the model it runs
-on (**Claude judge model**, `opus` by default — the judge's recommendations feed
-self-improvement; pin a cheaper alias
-like `haiku` or `sonnet` to spend less, and **Codex judge model**, `gpt-6.1-sol`
-by default, for judges of Codex runs). Each field is a model picker. The
-**Default · opus (built-in)** option of the Claude field and the
-**Default · gpt-6.1-sol (built-in)** option of the Codex field reset the
-instance value to the built-in, so it follows future changes to uzi's built-in
-default; saving an empty or whitespace-only `judge_model` through the admin API
-does the same (a blank instance value falls through to the built-in; a user's
-blank personal value instead inherits the instance value). The judge model keys
-store values trimmed, and a whitespace-only value stores empty and is reported
-as source `default`. This switch
-only arms the feature instance-wide; each user still opts in under their own
-Settings, and the judge always spends that user's own credential for the harness it runs on
-(each user's [Judge runs on](./judge.md#judge-runs-on) choice, default the reviewed run's
-harness), never the admin's and never charged to the other provider. A **Not a Claude model** warning appears under the Claude field
-when its stored value is a Codex id, which Claude judges skip. Changing a
-field to an invalid model ID (interior spaces, control or format characters,
-or too long) is blocked before save, with a message beneath the picker; an
-unchanged stored value does not block saving other settings.
+The **Run judge** card holds the global kill-switch for the [run judge](./judge.md),
+the enforcement checkbox, and the per-user spend guards below, with its own
+**Save**. That Save never sends a model key: the judge models (**Claude judge
+model**, `opus` by default, and **Codex judge model**, `gpt-6.1-sol` by default)
+are set in the **Instance model defaults** card, see
+[Instance model defaults](#instance-model-defaults). The card shows the current
+choice as a read-only **Instance default: Claude … · Codex … · users may
+override.** line with a link to **Model defaults**. The judge's recommendations
+feed self-improvement; pin a cheaper alias like `haiku` or `sonnet` in
+**Instance model defaults** to spend less. This switch only arms the feature instance-wide; each user still opts in
+under their own Settings, and the judge always spends that user's own credential
+for the harness it runs on (each user's [Judge runs on](./judge.md#judge-runs-on)
+choice, default the reviewed run's harness), never the admin's and never charged
+to the other provider.
 
 As an admin, you can also review every user's judge recommendations at once,
 in an attribution-hidden **All users** view on the Judge page, and mark them
@@ -128,15 +162,15 @@ done or file an issue from there — see
 **Upgrade note:** an instance that already had the judge enabled, with no
 `judge_model` pinned, starts spending `opus` the moment it upgrades to a
 version carrying this default — there's no migration that preserves the old
-(cheaper) value. Pin **Claude judge model** to `haiku` or `sonnet` before upgrading
-if you want to keep spending where it was.
+(cheaper) value. Pin **Claude judge model** (in **Instance model defaults**) to
+`haiku` or `sonnet` before upgrading if you want to keep spending where it was.
 
 **Upgrade note (per-harness judge model):** if the instance `judge_model`
 held a Codex id, Claude judges now skip it with a note and run on the built-in
 `opus` instead of the SDK default; a curated Codex id is also copied into
-`codex_judge_model`. **Admin → Instance → Run judge** shows the **Not a Claude
-model** warning on the Claude field while such a value is stored; choose
-**Default** there to clear it.
+`codex_judge_model`. **Admin → Instance → Instance model defaults** shows the
+**Not a Claude model** warning on the Claude judge field while such a value is
+stored; choose **Default** there to clear it.
 
 The judge has one model setting per harness; a judge run uses the lane of its
 own run's harness (user lane, then instance lane, then built-in):
@@ -150,8 +184,8 @@ A value not valid for the run's harness is skipped with a
 `harness_model_fallback` note and resolution falls through. A Codex id
 previously stored in `judge_model` is copied into `codex_judge_model` on
 upgrade; the Claude key is left unchanged. The instance Codex judge
-model is set in **Admin → Instance → Run judge → Codex judge model** or through
-the admin settings API (`codex_judge_model`).
+model is set in **Admin → Instance → Instance model defaults** (Judge model
+row, Codex column) or through the admin settings API (`codex_judge_model`).
 
 ### Judge mode: off, optional, enforced
 
@@ -181,7 +215,7 @@ If your users hold Anthropic **subscription** plans rather than metered
 console keys, remember that an enforced `opus` judge spends their
 plan/rate-limit **quota**, not dollars — a busy judge can eat into the quota
 their real runs need. Pin **Claude judge model** to `haiku`/`sonnet` before
-enforcing, or leave enforcement off and let users opt in with their own
+enforcing (in **Instance model defaults**), or leave enforcement off and let users opt in with their own
 per-user model choice (**Settings → Run defaults → Run judge → Claude judge model** and **Codex judge model**).
 
 ### Spend guards
@@ -203,24 +237,12 @@ and no queued run.
 
 ## Run summaries
 
-The **Run summaries** card sets the instance default model for
-[run summaries](./run-summaries.md), one per harness, side by side:
-**Claude summary model** (`summary_model`) and **Codex summary model**
-(`codex_summary_model`). A run reads only the lane of its own harness.
-
-- **Claude summary model** is a picker of the curated Claude models (`opus`,
-  `sonnet`, `haiku`, `fable`) plus **Other (custom model ID)**. A Codex model
-  is refused here: choose it in the Codex picker.
-- **Codex summary model** is a picker of the Codex role models (including
-  `gpt-6-luna`), with no custom ID. A Claude alias is refused here.
-- Each picker has a reset option, `Default · <model> (built-in)`, naming what
-  it follows (`haiku` for Claude, `gpt-6-luna` for Codex). It is selected
-  while the instance has not pinned a model, and choosing it and saving clears
-  the pin so the lane follows the built-in again, including future changes to
-  it. Saving sends only the lanes you changed.
-- In the Claude picker, an invalid ID (interior spaces, control or format
-  characters, or too long) or an empty custom ID is blocked before save, with a message beneath the
-  picker; an unchanged stored value does not block saving the other controls.
+The **Run summaries** card holds only the **Model-written Now line** kill
+switch, with its own **Save** that sends only `now_summary_enabled`. The
+instance default summary models (**Claude summary model**, `summary_model`, and
+**Codex summary model**, `codex_summary_model`) are set in
+[Instance model defaults](#instance-model-defaults). A run reads only the lane
+of its own harness.
 
 Each user can override either lane for their own runs from **Settings → Run
 defaults → Run summaries**, with a **Claude summary model** and a **Codex
@@ -235,8 +257,9 @@ refused or slow summaries are skipped without changing the run's outcome.
 **Model-written Now line** (`now_summary_enabled`, on by default) is the
 instance kill switch for the [Now summary](./run-activity.md#now-summary): the
 one-sentence "what the run is doing right now" line on the run progress card,
-the TUI detail and `uzi run get`. It is a checkbox in the same **Run
-summaries** card as the summary models. Off stops the summary for every user,
+the TUI detail and `uzi run get`. It is a checkbox in the **Run summaries**
+card; when the key is set from the environment the checkbox is disabled and
+shows **Set from the environment**. Off stops the summary for every user,
 whatever their own **Settings → Run defaults → Run summaries** choice; on lets
 each user's own setting decide (also on by default). The effective setting
 for a run is the admin switch AND the run owner's setting, and reaches a
@@ -304,11 +327,20 @@ single setting bounds self-service provisioning:
 | Setting | Default | Controls |
 |---|---|---|
 | `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a [separate cap](#ephemeral-workers). |
-| `hosted_default_size` | `l` | Size the persistent provision form preselects: `s`, `m`, `l` or `l-highmem`. Only the preselection changes: the provision API still requires an explicit size, and existing workers keep theirs. |
+| `hosted_default_size` | `l` | Size the persistent provision form preselects: any existing size, shipped (`s`, `m`, `l`, `l-highmem`) or admin-added; an unknown name is refused. Only the preselection changes: the provision API still requires an explicit size, and existing workers keep theirs. |
 
 Edit them in the **Hosted worker quota** card on **Admin → Workers**. The quota
 must be an integer from `0` to `20`; each setting saves independently of the other cards.
 Saving an empty default size (**Reset to default**) restores `l`; the quota itself has no reset and needs a number.
+
+The same tab has a **Worker sizes** card that edits what each shipped size provides
+(CPU, memory, data and DinD disk), resets it to the shipped values, and adds or
+removes sizes; see [Editing sizes](./hosted-workers.md#editing-sizes-admins). The
+default-size settings here and under [Ephemeral workers](#ephemeral-workers) may name
+any existing size, shipped or admin-added, and a size either one names cannot be
+removed. The environment override `UZI_EPHEMERAL_DEFAULT_SIZE` (chart
+`workers.ephemeralDefaultSize`) still accepts shipped names only, because it is
+validated at boot before the size table exists.
 
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
@@ -326,7 +358,7 @@ The **Ephemeral workers** card on **Admin → Workers** holds the instance switc
 | Setting | Default | Controls | Env that overrides it |
 |---|---|---|---|
 | `ephemeral_max_per_user` | 2 | Maximum concurrent ephemeral workers each user may hold, from 0 to 20. `0` stops ephemeral provisioning for everyone. | `UZI_EPHEMERAL_MAX_PER_USER` |
-| `ephemeral_default_size` | `m` | Size every new ephemeral worker is provisioned at: `s`, `m`, `l` or `l-highmem`. | `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`) |
+| `ephemeral_default_size` | `m` | Size every new ephemeral worker is provisioned at: any existing size, shipped or admin-added (the environment override accepts shipped names only). | `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`) |
 | `ephemeral_lease` | `2h` | How long an idle ephemeral worker stays available to its owner's next run on the same repository and branch after a run completes. A Go duration from `0s` to `2h`; `0` means no lease. | `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`) |
 
 A write that is out of range (a negative or non-integer cap, an unknown size, a lease
@@ -442,8 +474,8 @@ and anything above 1000.
   - new run-lane claims are refused (the dedicated cross-check lane is unaffected,
     but legacy checker children claimed through the ordinary run lane wait that cycle);
   - queued runs show "new runs are paused: the custody hold limit setting could not
-    be read; an admin should check Admin → Instance settings" (the reason text predates
-    the move: the limit is now on Admin → Workers);
+    be read; an admin should check Admin → Workers settings" (an older server may still
+    show the previous wording, which named Admin → Instance);
   - the held-work listing (`GET /api/recovery/holds`, `uzi run recovery`) returns a
     generic error;
   - the `custody.holds` health check reports `unknown` and names `custody_hold_limit`.

@@ -1619,6 +1619,8 @@ describe("Codex admission read-time projection", () => {
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
     "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
+    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings",
+    // Issue #4423: an older API still emits the legacy Admin → Instance wording during a rolling upgrade.
     "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
     "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
   ])("preserves the higher-priority queued blocker %s", (reason) => {
@@ -1627,6 +1629,12 @@ describe("Codex admission read-time projection", () => {
     for (const badge of [healthBadge(r, NOW), runBadge(r, NOW)]) {
       expect(badge).toMatchObject({ label: "⚠ waiting for worker", title: `${reason} · ${text}`, tone: "warning" });
     }
+  });
+  it.each([
+    ["current", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings"],
+    ["legacy (older API)", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"],
+  ])("treats the %s custody-limit-unavailable reason as a preceding blocker (#4423)", (_label, reason) => {
+    expect(queuedBlockerPrecedesCodexAdmission({ status: "queued", health_reason: reason })).toBe(true);
   });
   it("renders a redacted shared summary without inventing account detail", () => {
     expect(healthBadge(run({ status: "queued", health: "waiting_worker", health_reason: null }), NOW))

@@ -20,6 +20,7 @@ import { chatApi } from "./chat";
 import { secretsApi } from "./secrets";
 import { providersApi } from "./providers";
 import { workersApi } from "./workers";
+import { workerSizesApi } from "./workerSizes";
 import { settingsApi } from "./settings";
 import { healthApi } from "./health";
 import { maintenanceApi } from "./maintenance";
@@ -65,6 +66,8 @@ export const mockApi = {
 
   // ── Workers ─────────────────────────────────────────────────────────────────
   ...workersApi,
+  // ── Admin worker sizes (PRD #4213) ───────────────────────────────────────────
+  ...workerSizesApi,
 
   ...runsApi,
   ...crossChecksApi,

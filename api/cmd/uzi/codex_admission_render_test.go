@@ -72,7 +72,7 @@ func TestCodexAdmissionQueuedBlockerPriority(t *testing.T) {
 			{"queued handoff", "queued", "codex_" + class, "handoff setup has not finished", "queued (handoff setup has not finished)"},
 			{"queued vault", "queued", "codex_" + class, "your vault is locked, so this run can't start", "queued (your vault is locked, so this run can't start)"},
 			{"queued custody", "queued", "codex_" + class, "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity", "queued (recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity)"},
-			{"queued custody unavailable", "queued", "codex_" + class, "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "queued (new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings)"},
+			{"queued custody unavailable", "queued", "codex_" + class, "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings", "queued (new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings)"},
 			{"maintenance coexistence", "queued", "maintenance", unavailable, "queued (maintenance (uzi is in maintenance mode))"},
 			{"recovery wait", "recovery_wait", "codex_" + class, unavailable, "recovery_wait (Codex reconciling)"},
 			{"untyped provider text", "queued", "codex_" + class, "provider reported overload", "queued"},

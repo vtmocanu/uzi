@@ -247,7 +247,7 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
 			RunID: run.ID, Kind: "follow_up", Body: pgconv.TextOrNull(followupGuidance),
 		}); err != nil {
-			return err
+			return mapFollowupFinalizingErr(err)
 		}
 	}
 	if !live {

@@ -1257,3 +1257,42 @@ func TestMergePendingKeysTiesOrderNumerically(t *testing.T) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }
+
+// TestMRReworkTerminalConsumerGateBusyRetriesNextTick pins issue #4488: a busy terminal
+// consumer gate refuses the create with nothing written, so the review comments are not
+// consumed (ledger not advanced, no comment or notification) and the next tick starts the rework.
+func TestMRReworkTerminalConsumerGateBusyRetriesNextTick(t *testing.T) {
+	st := &mrwStore{
+		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 1, 100)},
+	}
+	runs := &mrwRuns{err: errors.Join(workersvc.ErrTerminalConsumerGateBusy, errors.New("lock timeout"))}
+	notifier := &mrwNotifier{}
+	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
+	w := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
+
+	w.detect(context.Background(), mrwRepoRow(), f, f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
+	}
+	if len(st.upserts) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 {
+		t.Fatalf("a busy gate must not advance the ledger or comment/notify: upserts=%d notes=%d notifs=%d",
+			len(st.upserts), len(f.notes), len(notifier.calls))
+	}
+
+	runs.err = nil // the hold ended
+	w.detect(context.Background(), mrwRepoRow(), f, f)
+
+	if len(runs.calls) != 2 {
+		t.Fatalf("expected the next tick to retry the create, calls=%d", len(runs.calls))
+	}
+	if len(st.upserts) != 1 {
+		t.Fatalf("the retried create must advance the ledger once, upserts=%d", len(st.upserts))
+	}
+	got := st.ledgers[mrwRef]
+	if got.RepoID != mrwRepoID || got.Ref != mrwRef || got.AttemptCount != 2 ||
+		mrwMarks(t, got)[forge.CommentNSReviewComment] != 140 {
+		t.Fatalf("retry recorded the wrong review identity or attempt: %+v", got)
+	}
+}

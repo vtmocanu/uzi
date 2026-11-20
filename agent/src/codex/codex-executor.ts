@@ -6571,6 +6571,7 @@ export class CodexExecutor implements Executor {
       try {
         const turnParams: Record<string, unknown> = {
           threadId: childThreadId,
+          environments: [],
           input: [{ type: "text", text: spec.taskInput }],
         };
         if (spec.model !== undefined) turnParams.model = spec.model;

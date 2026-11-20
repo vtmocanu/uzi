@@ -266,6 +266,51 @@ When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the ru
 row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
 genuine wait again.
 
+A queued Codex run that has already been claimed is held for the worker that last
+ran it (issue #4476, [ADR-4476](../adr/4476-codex-claim-provenance.md)); no stale-requeue
+grace, affinity ceiling, deleted owner row or cross-check exemption releases it to
+another worker. It shows `waiting_worker` with a recorded-worker or unavailable reason: "held for worker
+<name>: wait for it or cancel the run; only the worker that last ran this Codex run
+may resume it" (the name comes from the recorded claim provenance, or the worker id
+when that worker row was deleted). If that worker is still fenced by its released
+registration nonce, the reason instead says "restart it or cancel the run; its
+previous process was released"; waiting alone cannot clear that fence. A new
+registration nonce restores ordinary waiting advice. "held: predecessor provenance unavailable;
+cancel the run; no worker may resume this Codex run" is shown for a run with no usable
+provenance (any Codex run at generation 1 or later when the rule deployed,
+including a paused or parked one, or a run claimed by an older api). The reason is
+shown from the first evaluation, after the isolated egress lane blocker and before
+the manual cordon, owner hold and stale-requeue pin reasons; the account
+prerequisites above, the intake pause, the weekly reserve and the Codex admission
+wait still take precedence. The named reason is quiet while a stale-requeue pin
+or a draining or maintenance hold is in force by its clock, and nudges once when
+that window ends. If the condition behind the window ends early (the drain is
+cleared, or the worker row is deleted or replaced), the single nudge comes at the
+affinity ceiling after the run's last update. When the health detector observes a
+draining or maintenance owner hold in force during the episode, it records that on
+the run (a per-episode marker, valid only for the current episode), and the single
+nudge then waits for the affinity ceiling (the run's last update plus
+`WORKER_AFFINITY_CEILING`) even if the stale-requeue grace expired earlier and the
+drain then cleared. An episode held only by the stale-requeue pin still nudges once
+at grace expiry. Only owner holds the detector observed and committed are
+remembered: a hold that starts and clears between two health ticks, or whose marker
+write fails, falls back to the earlier timing, the end of the stale grace when the
+stale pin covered the episode and otherwise the affinity ceiling. This affects
+notification timing only. A hold that began in another quiet
+state (leaving a maintenance intake pause, a Codex admission wait or a reserve)
+nudges once at that point too, and not at all when that ceiling had already
+passed when the episode began. A held run outside any window (for example after a
+normal Resume onto a live worker) nudges on the first health tick, ignoring the
+young-run grace, and counts in `queue.waiting`. The unavailable reason never resolves
+itself, so it nudges on entering it from any state (the nudge cooldown still
+applies). Admission, custody, credentials and run state are unaffected by the
+nudge timing. None of these reasons starts with "waiting until", so `queue.waiting` and
+`fleet.capacity` count these runs as genuine waits: a routine drain of the last
+worker of a Codex run can raise `queue.waiting` while no nudge is sent. The Slack
+nudge text for `waiting_worker` ("still waiting for a worker to pick it up") does
+not match the unavailable reason; this is a known inconsistency. Owner action: wait
+for the named worker, restart it when the reason requests that, or `uzi run cancel <id>`.
+
 A queued run whose previous worker is draining or in active maintenance instead shows
 "waiting until <time, RFC3339 UTC> for its previous worker <name> to finish draining or
 maintenance; another worker may take it after that" (the name is omitted when empty).

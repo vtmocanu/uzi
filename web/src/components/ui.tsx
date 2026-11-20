@@ -145,6 +145,8 @@ export function Button({
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: ButtonVariant;
   size?: ButtonSize;
+  /** React 19 passes a ref as a prop; it reaches the <button> through the spread. */
+  ref?: Ref<HTMLButtonElement>;
 }) {
   return (
     <button
@@ -206,7 +208,7 @@ const INPUT_CLASS =
 export function Input({
   className = "",
   ...props
-}: InputHTMLAttributes<HTMLInputElement>) {
+}: InputHTMLAttributes<HTMLInputElement> & { ref?: Ref<HTMLInputElement> }) {
   return <input className={cx(INPUT_CLASS, className)} {...props} />;
 }
 

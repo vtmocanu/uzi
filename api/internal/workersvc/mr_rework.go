@@ -203,7 +203,12 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 	// PRD #4320: the rework is a successor of its source run, so it copies the source run's provider
 	// binding (or, for a vendor source, resolves vendor credentials without the owner's provider
 	// source), never the owner's current source.
+	gate := gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &sourceHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// Issue #4488: after the consumer gate, the source run must still exist in the gate's repo.
+		if err := requireGateTargetRepo(ctx, q, sourceRunID, gate); err != nil {
+			return store.Run{}, err
+		}
 		// Issue #1626: serialize against an issue-run create on the same agent branch. The
 		// run-branch lock is the closure's first statement (same (repo, ref) key the issue run
 		// for N takes on agent/issue-N, store.RunBranchLockClass); the check below is a new
@@ -321,7 +326,7 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
 			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	}, harnessCreationOrigin{InheritFrom: &sourceRun})
+	}, harnessCreationOrigin{InheritFrom: &sourceRun, ConsumerGateRepo: gate})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// WHERE NOT EXISTS matched an active cross-kind ci_fix sibling on this pipeline_ref:

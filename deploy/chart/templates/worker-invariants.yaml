@@ -264,13 +264,14 @@
 {{- /*
   THE UNSET PATH IS CHECKED TOO, and skipping it was a real hole (audit A18.2).
   An empty or absent dindDataSize does NOT mean "no claim" — it means the controller
-  falls back to its OWN compiled-in per-preset default (s/m 20Gi, l/l-highmem
-  50Gi) and creates that PVC anyway. Guarding
+  falls back to its OWN compiled-in per-preset default (the DEFAULTS of the built-in
+  sizes, s/m 20Gi and l/l-highmem 50Gi; admins can edit sizes, PRD #4213, and the api
+  checks those against the ceilings this chart hands it) and creates that PVC anyway. Guarding
   only the set value left that claim unchecked, so an empty string plus a lowered max
   rendered perfectly clean and produced exactly the failure this guard exists to stop.
   Measured: dindDataSize "" + maxPVCStorage 10Gi rendered with no env var at all.
 
-  The literal below MIRRORS the MAXIMUM over the presets' DinDDataSize in
+  The literal below MIRRORS the MAXIMUM over the built-in defaults' DinDDataSize in
   controller/internal/preset (the worst case an empty value can claim), and the two
   must move together. It is a genuine cross-toolchain duplicate — Helm cannot read the
   Go preset table — so it is tied by TestDinDDataChartLiteralIsTheMaxPresetDefault
@@ -295,6 +296,14 @@
 {{- end }}
 {{- end }}
 {{- end }}
+{{- /*
+  THE SIZE CEILINGS (PRD #4213). Every enabled tier's LimitRange max.cpu, max.memory and
+  maxPVCStorage is converted to an integer here (uzi.workerSizeEnv, the same include that
+  feeds the api Deployment), so a malformed, non-positive, zero-flooring or overflowing
+  ceiling fails the render naming its values path even when the api is not rendered.
+  Quota values are converted softly there and can never fail.
+*/ -}}
+{{- $_ := include "uzi.workerSizeEnv" . -}}
 {{- /*
   THE RUN-BOUND /data CLAIMANT (issue #1815 → UZI_WORKER_EPHEMERAL_DATA_SIZE). A
   run-bound ("ephemeral" = run-bound, NOT ephemeral-storage) worker's /data is sized by

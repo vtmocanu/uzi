@@ -159,16 +159,16 @@ record_margin "mr_rework second fire (mr !$MR_IID)" "$((SECONDS - start))" 60
 wait_status "$RUN_MRR2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "gate control (b): a note above the high-water fired a second run $RUN_MRR2 (watcher still live), completed"
 
-# --- 8/9) cleanup: every mr_rework run on MR_IID is terminal (quarantine-clean) ---
+# --- 8/9) cleanup: every mr_rework run on MR_IID is terminal (boundary-clean) ---
 [ "$(uzi_cli run list --json | active_mrr)" = 0 ] \
   || fail "an mr_rework run on MR !$MR_IID is still non-terminal at phase end"
-pass "all mr_rework runs on MR !$MR_IID are terminal (quarantine-clean)"
+pass "all mr_rework runs on MR !$MR_IID are terminal (boundary-clean)"
 
 # --- 10) stop the watcher from reworking MR !$MR_IID after this phase -----------------
 # Leaving the watcher live on this still-open MR is NOT harmless: any later loss of the
 # run's rework eligibility (phase 74 deletes the owner's last Anthropic token) evicts the MR's
 # review ledger, and when eligibility returns the already-handled note reads as new, so a
-# third mr_rework starts during a later phase and the quarantine logs a LEAK (seen in CI).
+# third mr_rework starts during a later phase and the end-of-phase boundary FAILs that phase (seen in CI as a leak).
 # Turn rework off for the source issue run (a per-run override, so later phases keep the
 # admin default) and let anything in flight settle.
 SRC_RUN="$(uzi_cli run list --json | jq -r --argjson mr "$MR_IID" \

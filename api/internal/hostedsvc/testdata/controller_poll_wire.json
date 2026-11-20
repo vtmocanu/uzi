@@ -132,6 +132,29 @@
           "reconcile_seq": 2
         }
       }
+    },
+    {
+      "id": "77777777-7777-7777-7777-777777777777",
+      "template": "base",
+      "size": "l",
+      "resources": {
+        "cpu_request_millicores": 1000,
+        "cpu_limit_millicores": 4000,
+        "memory_request_mib": 14336,
+        "memory_limit_mib": 20480,
+        "data_gib": 50,
+        "dind_data_gib": 50
+      },
+      "docker": false,
+      "isolated": false,
+      "busy": false,
+      "draining_since": null,
+      "disk_pressure": false,
+      "disk_pressure_volumes": [],
+      "ephemeral": false,
+      "custody_held": false,
+      "generation": 1,
+      "join_token": null
     }
   ]
 }

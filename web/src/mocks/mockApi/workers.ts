@@ -12,7 +12,8 @@ import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 import { secrets } from "./secrets";
 // workers ↔ settings is a third cycle: hibernate reads the instance switch inside its body only.
 import { appSettings } from "./settings";
-import { WORKER_SIZES } from "../../lib/workerSizes";
+import { DEFAULT_WORKER_SIZE } from "../../lib/workerSizes";
+import { mockHostedConfigSizes, mockSizeSpec } from "./workerSizes";
 import type { HostedConfig } from "../../lib/apiTypes";
 // runs ↔ workers is a second import cycle (runs → secrets → workers); deleteWorker reads
 // runsApi only inside its body, so no module-level initializer crosses the modules.
@@ -363,11 +364,20 @@ export const workersApi = {
   // show at all — so a browser pass could only ever validate the healthy path.
   hostedConfig: async (): Promise<HostedConfig> => {
     // PRD #4212: the form preselects the admin's hosted default size ("l" when unset/unknown).
+    // PRD #4213: the sizes, with their current integers, come from the one mock size list
+    // the admin sizes editor edits (./workerSizes).
+    const sizes = mockHostedConfigSizes();
     const configured = appSettings.hosted_default_size;
-    const default_size = (WORKER_SIZES as readonly string[]).includes(configured ?? "") ? (configured as string) : "l";
-    return delay({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true, default_size });
+    const default_size = sizes.some((s) => s.name === configured) ? (configured as string) : DEFAULT_WORKER_SIZE;
+    return delay({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true, default_size, sizes });
   },
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
+    // The api validates the size against its size table (PRD #4213), so the mock checks the
+    // same list the config ships.
+    const sizeSpec = mockSizeSpec(size);
+    if (!sizeSpec) {
+      throw new ApiError(400, "unknown worker size");
+    }
     const w = {
       id: `w-hosted-${++workerCounter}`,
       // Empty name → the server derives one from template + size (handler's
@@ -389,6 +399,7 @@ export const workersApi = {
       max_cross_check_slots: null,
       kind: "hosted" as const,
       hosted_size: size,
+      hosted_size_spec: sizeSpec,
       docker,
       template_declared: template,
       template_reported: null,

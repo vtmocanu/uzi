@@ -81,6 +81,7 @@ func TestTickProjectsRollHealthOntoStatusWire(t *testing.T) {
 		"poll_interval_seconds": 37,
 		"worker_image_tag": "controller-target",
 		"hibernation": 2,
+		"admin_sizes": 1,
 		"workers": [
 			{
 				"id": "worker-stuck",
@@ -151,6 +152,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
 		"hibernation": 2,
+		"admin_sizes": 1,
 		"workers": [{
 			"id": "worker-transition",
 			"phase": "stuck",
@@ -183,6 +185,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
 		"hibernation": 2,
+		"admin_sizes": 1,
 		"workers": [{
 			"id": "worker-transition",
 			"phase": "settled",
@@ -207,6 +210,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
 		"hibernation": 2,
+		"admin_sizes": 1,
 		"workers": []
 	}`)
 }
@@ -300,6 +304,7 @@ func TestTickOmitsRollHealthRowsForPreparingAndHibernatedWorkers(t *testing.T) {
 		"poll_interval_seconds": 10,
 		"worker_image_tag": "tag",
 		"hibernation": 2,
+		"admin_sizes": 1,
 		"workers": [{
 			"id": "w-wake", "phase": "rolling", "phase_since": null, "target_image": "img-wake",
 			"pod_phase": "", "blocking_container": null, "blocking_reason": null,

@@ -74,6 +74,129 @@ else
   printf '%s\n' "$raw"
 fi
 
+# db_psql_rows SQL [SECS] and boundary_cancel (#2892). The REAL definitions are extracted from
+# lib.sh (see above). db_psql_rows is driven through fake COMPOSE executables (the optional
+# limiter is `timeout`, which can only run an executable, not a shell function) and the caller
+# runs with pipefail OFF: the function's own `set -o pipefail` must turn a failing compose or a
+# limiter kill into the function's status, and must not leak into the caller.
+eval "$(awk '/^db_psql_rows\(\) \(/,/^\)/' "$LIB")"
+eval "$(awk '/^boundary_cancel\(\) \{/,/^\}/' "$LIB")"
+# The extraction must have produced both functions: an expect-failure case below would
+# otherwise pass vacuously on a missing function (rc 127).
+cases=$((cases + 1))
+if declare -F db_psql_rows >/dev/null && declare -F boundary_cancel >/dev/null; then
+  passed=$((passed + 1)); echo "PASS: db_psql_rows and boundary_cancel were extracted from lib.sh"
+else
+  echo "FAIL: db_psql_rows / boundary_cancel not defined after extraction from lib.sh"
+fi
+DBR_DIR="$(mktemp -d)"
+printf 'POSTGRES_PASSWORD=pw\n' > "$DBR_DIR/dbr.cfg"
+printf '#!/bin/sh\nexit 3\n' > "$DBR_DIR/compose-fail"
+printf '#!/bin/sh\nexec sleep 30\n' > "$DBR_DIR/compose-sleep"
+printf '#!/bin/sh\nprintf "row1\\r\\nINSERT 0 1\\nrow2\\n"\n' > "$DBR_DIR/compose-ok"
+chmod +x "$DBR_DIR"/compose-*
+mkdir -p "$DBR_DIR/bin"
+for t in grep cut tr awk; do ln -sf "$(command -v "$t")" "$DBR_DIR/bin/$t"; done
+# dbr_case NAME COMPOSE SECS-or-"" EXPECT(ok|fail) [OUT] [MAXSECS]
+dbr_case() {
+  local name="$1" comp="$2" secs="$3" expect="$4" want="${5:-}" max="${6:-}" rc=0 out start elapsed ok=1
+  cases=$((cases + 1))
+  start=$SECONDS
+  out="$(
+    set +o pipefail
+    # Functional checks need no host coreutils. Keep the real kill control separate.
+    if [ "$comp" != compose-sleep ]; then
+      PATH="$DBR_DIR/bin"
+      timeout() {
+        [ "$1" = --signal=KILL ] && [ "$2" = "$secs" ] || return 98
+        shift 2
+        "$@"
+      }
+    fi
+    ENVFILE="$DBR_DIR/dbr.cfg"; PGPW=""; COMPOSE=("$DBR_DIR/$comp")
+    if [ -n "$secs" ]; then db_psql_rows "SELECT 1" "$secs"; else db_psql_rows "SELECT 1"; fi
+  )" || rc=$?
+  elapsed=$((SECONDS - start))
+  if [ "$expect" = ok ]; then [ "$rc" -eq 0 ] || ok=0; else { [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; } || ok=0; fi   # 127 = function missing, not a refusal
+  [ -z "$want" ] || [ "$out" = "$want" ] || ok=0
+  [ -z "$max" ] || [ "$elapsed" -lt "$max" ] || ok=0
+  if [ "$ok" -eq 1 ]; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else
+    echo "FAIL: $name (rc=$rc out=[$out] elapsed=${elapsed}s)"
+  fi
+}
+dbr_case "db_psql_rows: a failing compose is a non-zero status (caller pipefail off)" compose-fail "" fail
+dbr_case "db_psql_rows: a failing compose is non-zero with a SECS bound too" compose-fail 5 fail
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  dbr_case "db_psql_rows: a hung exec is killed at SECS and fails within a bound" compose-sleep 1 fail "" 5
+else
+  echo 'SKIP: real timeout process-kill control (requires host timeout or gtimeout)'
+fi
+dbr_case "db_psql_rows: SECS leaves rows intact and strips the command tag" compose-ok 5 ok $'row1\nrow2'
+dbr_case "db_psql_rows: no SECS behaves as before" compose-ok "" ok $'row1\nrow2'
+dbr_case "db_psql_rows: SECS=0 is refused" compose-ok 0 fail
+dbr_case "db_psql_rows: a non-integer SECS is refused" compose-ok abc fail
+cases=$((cases + 1))
+rc=0
+# shellcheck disable=SC2034  # ENVFILE/PGPW are read by the real db_psql_rows extracted from lib.sh
+err="$( ( set +o pipefail; PATH="$DBR_DIR/bin"; ENVFILE="$DBR_DIR/dbr.cfg"; PGPW=""; COMPOSE=("$DBR_DIR/compose-ok"); db_psql_rows "SELECT 1" 5 ) 2>&1 >/dev/null )" || rc=$?
+if [ "$rc" -ne 0 ] && [ "$err" = "db_psql_rows: no timeout limiter" ]; then
+  passed=$((passed + 1)); echo "PASS: db_psql_rows: no timeout limiter is refused, not run unbounded"
+else
+  echo "FAIL: db_psql_rows: no-limiter case (rc=$rc err=[$err])"
+fi
+
+cases=$((cases + 1))
+printf '#!/bin/sh\necho docker-was-called\n' > "$DBR_DIR/bin/docker"
+chmod +x "$DBR_DIR/bin/docker"
+rc=0
+err="$(PATH="$DBR_DIR/bin" /bin/bash "$ROOT/e2e/run-e2e.sh" --e2e-sanitized 2>&1)" || rc=$?
+if [ "$rc" -eq 2 ] && [ "$err" = 'error: E2E requires GNU timeout or gtimeout on PATH (coreutils)' ]; then
+  passed=$((passed + 1)); echo 'PASS: run-e2e refuses a missing timeout limiter before stack startup'
+else
+  echo "FAIL: run-e2e limiter preflight (rc=$rc err=[$err])"
+fi
+
+# boundary_cancel PATH SECS PREFIX: a fake `curl` records its arguments and answers
+# FAKE_CURL_CODE / FAKE_CURL_RC; the evidence files and the return status are asserted.
+# shellcheck disable=SC2034  # JAR/BASE are read by the real boundary_cancel extracted from lib.sh
+JAR="$DBR_DIR/jar"; BASE="http://api.invalid"
+csrf() { printf 'tok'; }
+curl() {
+  local out=""
+  printf '%s\n' "$*" > "$DBR_DIR/curl-args"
+  while [ $# -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift ;; esac
+    shift
+  done
+  printf '{"fake":true}' > "$out"
+  if [ "${FAKE_CURL_RC:-0}" -ne 0 ]; then echo "curl: (${FAKE_CURL_RC}) fake failure" >&2; return "$FAKE_CURL_RC"; fi
+  printf '%s' "${FAKE_CURL_CODE:-204}"
+}
+bc_args_have() { case "$(cat "$DBR_DIR/curl-args")" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+# bc_case NAME CODE CURL_RC EXPECT(ok|fail)
+bc_case() {
+  local name="$1" code="$2" crc="$3" expect="$4" pre="$DBR_DIR/ev-$RANDOM" rc=0 good=1
+  cases=$((cases + 1))
+  FAKE_CURL_CODE="$code" FAKE_CURL_RC="$crc" boundary_cancel "/api/runs/r1/inputs" 7 "$pre" || rc=$?
+  if [ "$expect" = ok ]; then [ "$rc" -eq 0 ] || good=0; else { [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; } || good=0; fi
+  bc_args_have "--max-time 7" || good=0
+  bc_args_have "$BASE/api/runs/r1/inputs" || good=0
+  bc_args_have "X-CSRF-Token: tok" || good=0
+  bc_args_have '{"kind":"cancel","body":""}' || good=0
+  [ "$(cat "$pre.exit" 2>/dev/null)" = "$crc" ] || good=0
+  [ -f "$pre.body" ] && [ -f "$pre.stderr" ] || good=0
+  [ "$crc" -ne 0 ] || [ "$(cat "$pre.http" 2>/dev/null)" = "$code" ] || good=0
+  if [ "$good" -eq 1 ]; then passed=$((passed + 1)); echo "PASS: $name"; else echo "FAIL: $name (rc=$rc)"; fi
+}
+bc_case "boundary_cancel: 2xx and curl exit 0 -> success, evidence written, --max-time passed" 204 0 ok
+bc_case "boundary_cancel: a 409 -> non-zero, status kept in .http" 409 0 fail
+bc_case "boundary_cancel: curl exit 28 (timeout) -> non-zero, exit status kept in .exit" 000 28 fail
+unset -f curl csrf db_psql_rows boundary_cancel
+unset JAR BASE
+rm -rf "$DBR_DIR"
+
 # wait_regated (#1739): after a restart the pre-disruption row still reads awaiting_approval, so
 # only a NEW claimed_at on an awaiting_approval row proves a new claim re-showed the gate. The real
 # multi-line definition is extracted from lib.sh and driven by a scripted apiget: each call returns

@@ -6,6 +6,7 @@ import (
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -111,6 +112,13 @@ type schedulerCapacityObservation struct {
 	blocked             map[string]bool
 	deploymentNamespace map[string]string
 	podListFailed       bool
+
+	// Evidence for the paused-restore bind-timeout deferral (see timeoutDeferredClaims).
+	// Recorded per Observe pass, across every namespace fold.
+	deployments map[string]*appsv1.Deployment            // worker id -> its Deployment (last fold wins; count proved separately)
+	dataClaims  map[string]*corev1.PersistentVolumeClaim // "ns/name" of each worker's data claim, any state
+	claimMounts map[string]bool                          // "ns/claim" referenced by ANY pod volume, labelled or not
+	incomplete  map[string]bool                          // namespace whose deployment/pvc/pod list had a continuation token
 }
 
 // recordSchedulerCapacity adds evidence without changing ordinary pod selection or

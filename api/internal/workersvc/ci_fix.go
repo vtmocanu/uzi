@@ -291,7 +291,7 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
 			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	})
+	}, harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)})
 	if err != nil {
 		if isUniqueViolation(err) {
 			return store.Run{}, ErrActiveFixExists

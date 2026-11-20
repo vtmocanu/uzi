@@ -1045,6 +1045,11 @@ type Store interface {
 	// awaiting_approval move and its read-only lost-ACK replay (clarification_settlement.go).
 	SettleRunClarificationToGate(ctx context.Context, arg store.SettleRunClarificationToGateParams) (int64, error)
 	GetClarificationGateSettlementReplay(ctx context.Context, arg store.GetClarificationGateSettlementReplayParams) (bool, error)
+	// AdmitRunFollowupFinalize / GetFollowupFinalizeReplay / GetFollowupFinalizeBlockers are the issue
+	// #4479 followup_finalize admission, its lost-ACK replay and its refusal classification.
+	AdmitRunFollowupFinalize(ctx context.Context, arg store.AdmitRunFollowupFinalizeParams) (int64, error)
+	GetFollowupFinalizeReplay(ctx context.Context, arg store.GetFollowupFinalizeReplayParams) (bool, error)
+	GetFollowupFinalizeBlockers(ctx context.Context, id uuid.UUID) (store.GetFollowupFinalizeBlockersRow, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -1180,6 +1185,9 @@ type Store interface {
 	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
 	ListRunLeadToolWindow(ctx context.Context, arg store.ListRunLeadToolWindowParams) ([]store.ListRunLeadToolWindowRow, error)
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
+	// MarkRunHealthOwnerHold stamps the issue #4507 owner-hold marker on an existing health episode
+	// (guarded by the episode the detector read); it writes no other health column.
+	MarkRunHealthOwnerHold(ctx context.Context, arg store.MarkRunHealthOwnerHoldParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCaps backs PRD #84 M3: a queued run whose
@@ -2246,6 +2254,16 @@ type Service struct {
 	codexSelectHook            func(ctx context.Context)
 	codexSelectLockedHook      func(ctx context.Context)
 	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
+	// createBeforeCommitHook is a test-only seam in createRunAtomic: it runs with the created run
+	// inserted in the open transaction, right before that transaction's COMMIT, on every
+	// transactional create path. Nil in production.
+	createBeforeCommitHook func(run store.Run)
+	// reconcileBeforeCommitHook is a test seam in reconcileRunMRGated (issue #4488): it runs after
+	// the gated ReconcileRunMR UPDATE, before that transaction's COMMIT. Nil in production.
+	reconcileBeforeCommitHook func(runID uuid.UUID)
+	// consumerGateWait is a test-only override of terminalConsumerGateWait for the shared
+	// consumer gate an admission takes (consumerGateWaitFor). Zero in production.
+	consumerGateWait time.Duration
 	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
 	// (issue #3257): the first runs in the creating transaction after the isolation check and
 	// before the target lock, the second after the judge INSERT and before the commit. Nil in
@@ -3541,7 +3559,14 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// protection off needs no cached DEK. ClaimRun is scoped to wkr.UserID. A queued run
 	// sits indefinitely by design (no sweep touches status='queued'); the next
 	// unlock lets it claim within one poll cycle.
+	//
+	// Issue #4492: the gate returns before the claim transaction, where the memory-authority
+	// report is normally persisted, so a locked owner's workers would never earn a held receipt
+	// (and the warm-reserve policy would never count them ready). persistMemoryAuthorityVaultLocked
+	// records just that report (best effort, worker row only; no claim, snapshot apply or secrets)
+	// before the poll reports idle.
 	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, wkr.UserID) {
+		s.persistMemoryAuthorityVaultLocked(ctx, wkr, snapshot, lane, report)
 		return nil, nil // idle: owner locked
 	}
 
@@ -4522,6 +4547,10 @@ type StateRequest struct {
 	// exist because httpx.DecodeJSON sets DisallowUnknownFields — a new worker that sends
 	// it would 400 otherwise. Ignored on every state other than awaiting_followup.
 	OpenFollowupID *int64 `json:"open_followup_id"`
+	// FollowupParkSeq (issue #4479, feature followup_finalize_admission_v1) is the park sequence
+	// the worker read from the awaiting_followup ACK, echoed ONLY on a followup_finalize report so
+	// the admission applies to the park the worker actually observed. Valid on no other status.
+	FollowupParkSeq *int64 `json:"followup_park_seq"`
 	// LimitResetsAt is the epoch at which the exhausted Anthropic usage window
 	// reopens, as the worker read it off the SDK frame (PRD #35). The worker
 	// normalizes the SDK's unit-less number to MILLISECONDS before sending; the
@@ -4756,6 +4785,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateClarificationSettlementShape(req); err != nil {
 		return store.Run{}, false, err
 	}
+	if err := validateFollowupFinalizeShape(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if req.RequireRunning && (req.State != "awaiting_input" || req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
 		return store.Run{}, false, fmt.Errorf("%w: require_running requires awaiting_input and positive claim_generation", ErrInvalidState)
 	}
@@ -4829,6 +4861,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		return owned, false, nil
 	}
+	// Issue #4479: a superseded or released followup_finalize flight is told stale_claim, never a
+	// refusal, even onto a policy episode or an iteration-budget pause (the no-op exits below).
+	if req.State == stateFollowupFinalize && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
+		return owned, false, ErrStaleClaim
+	}
 	// Compact policy episodes have no generic continuation authority. Cancel remains
 	// the ordinary terminal action; the dedicated report reconciles its own replay.
 	if unresolvedPolicyEpisode(owned) && req.State != "cancelled" {
@@ -4846,7 +4883,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 
 	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
 		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
-			req.State == stateClarificationSettled ||
+			req.State == stateClarificationSettled || req.State == stateFollowupFinalize ||
 			((req.State == "credential_switch" || req.State == "credential_switch_failed") && req.ClaimGeneration != nil)) {
 		return owned, false, ErrSemanticCompletionAuthority
 	}
@@ -4854,13 +4891,14 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// not nest beneath the generic state fence on another connection.
 	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
 		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled ||
-		req.State == stateCredentialSwitchUncertain || req.State == stateClarificationSettled) {
+		req.State == stateCredentialSwitchUncertain || req.State == stateClarificationSettled ||
+		req.State == stateFollowupFinalize) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		if req.State == stateClarificationSettled {
+		if req.State == stateClarificationSettled || req.State == stateFollowupFinalize {
 			// beginClaimMutation holds the worker and run locks; set the publication-resume and
 			// checkpoint opt-ins now, as the generic fenced path does, so the run write is admitted
 			// identically for an enrolled run.
@@ -4889,7 +4927,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// statuses, so it is a no-op for awaiting_approval anyway. The web and Slack learn of the
 		// settlement through PublishState above; Slack dedups on the preserved gate generation
 		// (issue #3985, ADR-2149 D16: no new presentation).
-		if applied && current.Status != owned.Status && req.State != stateClarificationSettled {
+		// followup_finalize skips s.notify as well: the run only re-enters running for the worker's
+		// own finalize, which reports its terminal state itself (issue #4479).
+		if applied && current.Status != owned.Status && req.State != stateClarificationSettled && req.State != stateFollowupFinalize {
 			s.notify(runID, current.Status)
 		}
 		return current, applied, nil
@@ -4964,6 +5004,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.State == stateClarificationSettled {
 		return s.settleClarificationToGate(ctx, owned, wkr, req)
+	}
+	if req.State == stateFollowupFinalize {
+		return s.admitFollowupFinalize(ctx, owned, wkr, req)
 	}
 	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
 	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol
@@ -6081,8 +6124,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// no-op; if the status transition no-oped (e.g. the run was cancelled or already
 	// terminal), this still captures the MR so the run never reports "MR: none".
 	// Best-effort: a failure here must not fail the worker's terminal report.
+	// Issue #4488 (ADR-4007 T3): the state transaction has committed, so everything below that
+	// must not be lost to a dropped request runs detached from its cancellation: the gated MR
+	// reconcile, the authoritative re-read (an error there skips every hook) and the three gated
+	// fire-once hooks (judge, task review, then-fix), whose only new wait is the bounded consumer
+	// gate. Deliberately NO deadline is added: the hooks warn-and-swallow and never retry, and their
+	// downstream waits (judge target lock, run-branch lock, row locks) have no timeout of their own,
+	// so any deadline could drop an otherwise-successful admission. Detached, those waits are no
+	// longer cut short by the request ending (ADR-4007 T3 residual limits). Other steps keep ctx.
+	postCtx := context.WithoutCancel(ctx)
 	if req.MrIID != nil {
-		if _, mrErr := s.q.ReconcileRunMR(ctx, store.ReconcileRunMRParams{
+		if mrErr := s.reconcileRunMRGated(postCtx, owned.RepoID, store.ReconcileRunMRParams{
 			MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), Branch: stripNULParam(req.Branch),
 			ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		}); mrErr != nil {
@@ -6106,7 +6158,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// held above, so 0 rows means the transition was not applied under either branch
 	// of SetRunCompleted's now-two-branch guard (terminal, unless a superseded
 	// run_timeout) → not applied.
-	run, err = s.runOwnedByWorker(ctx, runID, wkr)
+	run, err = s.runOwnedByWorker(postCtx, runID, wkr)
 	if err == nil && rows > 0 {
 		if s.bcast != nil {
 			s.bcast.PublishState(runID, run.Status)
@@ -6149,7 +6201,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
 		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
-		s.maybeEnqueueJudge(ctx, run)
+		s.maybeEnqueueJudge(postCtx, run)
 		// PRD #929 M2: file a scheduled issues-mode prompt run's proposal as a forge
 		// issue on this same committed completion. The worker's proposal is untrusted, so
 		// it is clamped (kind-gated + control-char-stripped + secret-scrubbed + bounded)
@@ -6159,12 +6211,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		s.maybeFileProposal(ctx, run, clampWireProposal(run, req.Proposal))
 		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
 		// on the SAME committed transition. Best-effort — never fails the report.
-		s.maybeEnqueueTaskReview(ctx, run)
+		s.maybeEnqueueTaskReview(postCtx, run)
 		// PRD #400 M5: auto-create a chained fix run when a --then-fix handoff's review
 		// completes with findings. Its gates fire ONLY for a completed review run, and
 		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
 		// exclusive. Best-effort — never fails the report.
-		s.maybeEnqueueThenFix(ctx, run)
+		s.maybeEnqueueThenFix(postCtx, run)
 		// PRD #1349 M4 (D1/D2/D3): on a terminal SUCCESS (status='completed'), release the
 		// COMPLETING GENERATION'S custody hold idempotently — a completed code-publishing run
 		// published its head, so its unpublished-work custody is moot. GENERATION-EXACT via
@@ -8646,6 +8698,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	}, harnessCreationOrigin{
 		Kind: "issue", TriggerSource: triggerSource, Explicit: explicit, Model: model,
 		AnthropicOverride: credOverride != nil || (rawOverride != nil && rawOverride.Mode != CredentialOverrideModeInherit),
+		ConsumerGateRepo:  gateRepoOf(repoID),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

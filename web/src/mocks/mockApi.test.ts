@@ -239,6 +239,44 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     expect(restored.typeface).toBe("plex");
   });
 
+  it("sidebar_motion: defaults off, round-trips true/false, clears with null, rejects non-booleans", async () => {
+    installStorage();
+    let api = await reload();
+
+    const initial = (await api.getMySettings()).settings;
+    expect(initial.sidebar_motion).toBeNull();
+    expect(initial.effective_sidebar_motion).toBe(false);
+
+    await api.putMySettings({ sidebar_motion: true });
+    let s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBe(true);
+    expect(s.effective_sidebar_motion).toBe(true);
+
+    // Survives a hard reload.
+    api = await reload();
+    s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBe(true);
+
+    // An explicit false is stored as false (not collapsed to null).
+    await api.putMySettings({ sidebar_motion: false });
+    s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBe(false);
+    expect(s.effective_sidebar_motion).toBe(false);
+
+    await api.putMySettings({ sidebar_motion: true });
+    await api.putMySettings({ typeface: "plex" }); // absent keeps
+    expect((await api.getMySettings()).settings.sidebar_motion).toBe(true);
+
+    await api.putMySettings({ sidebar_motion: null });
+    s = (await api.getMySettings()).settings;
+    expect(s.sidebar_motion).toBeNull();
+    expect(s.effective_sidebar_motion).toBe(false);
+
+    await expect(
+      api.putMySettings({ sidebar_motion: "yes" as unknown as boolean }),
+    ).rejects.toMatchObject({ status: 400, message: expect.stringContaining("sidebar_motion") });
+  });
+
   it("clears a single appearance field back to inherit with present-null, leaving the rest", async () => {
     installStorage();
     const api = await reload();
@@ -341,8 +379,15 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
       light_theme: "hall",
       dark_theme: "ember",
       typeface: "system",
-      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
-      defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+      sidebar_motion: false,
+      overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: null },
+      defaults: {
+        mode: "dark",
+        light_theme: "hall",
+        dark_theme: "ember",
+        typeface: "system",
+        sidebar_motion: false,
+      },
     });
 
     // Set some overrides; the resolved values AND the raw overrides both move, while an
@@ -355,6 +400,13 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     expect(session.appearance.dark_theme).toBe("ember");
     expect(session.appearance.overrides.light_theme).toBe("dawn");
     expect(session.appearance.overrides.dark_theme).toBeNull();
+
+    // Sidebar motion resolves against the compiled off default and tracks the override.
+    await api.putMySettings({ sidebar_motion: true });
+    session = await api.me();
+    expect(session.appearance.sidebar_motion).toBe(true);
+    expect(session.appearance.overrides.sidebar_motion).toBe(true);
+    expect(session.appearance.defaults.sidebar_motion).toBe(false);
     // The deprecated trio stays coherent: resolved mode light → the resolved light slot.
     expect(session.theme).toBe("dawn");
   });
@@ -1194,5 +1246,68 @@ describe("mock harness overflow persistence", () => {
     const settings = (await api.getMySettings()).settings;
     expect(settings.harness_overflow_enabled).toBe(false);
     expect(settings.default_harness).toBe("codex");
+  });
+});
+
+describe("mockApi instance model defaults grid (#3259)", () => {
+  it("refuses a mixed two-key save with a field-prefixed 400 and leaves the valid key unchanged", async () => {
+    installStorage();
+    const api = await reload();
+    const before = await api.getSettings();
+    expect(before.settings.summary_model).toBe("haiku");
+    expect(before.sources.summary_model).toBe("default");
+
+    await expect(
+      api.updateSettings({ summary_model: "sonnet", codex_judge_model: "not-a-model" }),
+    ).rejects.toMatchObject({ status: 400, message: "codex_judge_model: is not a Codex judge model" });
+
+    const after = await api.getSettings();
+    expect(after.settings.summary_model).toBe("haiku");
+    expect(after.sources.summary_model).toBe("default");
+    expect(after.sources.codex_judge_model).toBe("default");
+  });
+
+  it("keeps a user's own summary choice over the instance value on both lanes, then follows the instance once cleared", async () => {
+    installStorage();
+    const api = await reload();
+    const cells = async () => {
+      const list = (await api.getMySettings()).settings.summary_models ?? [];
+      return {
+        claude: list.find((c) => c.harness === "claude"),
+        codex: list.find((c) => c.harness === "codex"),
+      };
+    };
+
+    await api.putMySettings({ summary_model: "opus", codex_summary_model: "gpt-6-sol" });
+
+    // Admin pins, then resets, both lanes: the user's value wins after each step.
+    for (const instance of [
+      { summary_model: "sonnet", codex_summary_model: "gpt-6-astra" },
+      { summary_model: "", codex_summary_model: "" },
+    ]) {
+      await api.updateSettings(instance);
+      const c = await cells();
+      expect(c.claude?.resolved_model).toBe("opus");
+      expect(c.claude?.source).toBe("user_default");
+      expect(c.codex?.resolved_model).toBe("gpt-6-sol");
+      expect(c.codex?.source).toBe("user_default");
+    }
+
+    // Clear the user's overrides while the instance is pinned: cells follow the instance.
+    await api.updateSettings({ summary_model: "sonnet", codex_summary_model: "gpt-6-astra" });
+    await api.putMySettings({ summary_model: null, codex_summary_model: null });
+    let c = await cells();
+    expect(c.claude?.resolved_model).toBe("sonnet");
+    expect(c.claude?.source).toBe("instance_default");
+    expect(c.codex?.resolved_model).toBe("gpt-6-astra");
+    expect(c.codex?.source).toBe("instance_default");
+
+    // Reset the instance: cells fall back to the built-ins.
+    await api.updateSettings({ summary_model: "", codex_summary_model: "" });
+    c = await cells();
+    expect(c.claude?.resolved_model).toBe("haiku");
+    expect(c.claude?.source).toBe("builtin");
+    expect(c.codex?.resolved_model).toBe("gpt-6-luna");
+    expect(c.codex?.source).toBe("builtin");
   });
 });

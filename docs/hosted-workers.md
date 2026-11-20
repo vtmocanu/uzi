@@ -45,7 +45,8 @@ particular token afterwards from **Settings → Workers** if you want one.
 **L** (the default), or **L-HIGHMEM**, with larger presets providing more capacity. The provision
 form shows the exact numbers next to each option when you pick — they live
 there, not here, so they can't say something different from what you'll
-actually get. Every size also gets the same 20Gi tools cache (`/nix`),
+actually get. The numbers quoted on this page are the shipped defaults: an
+admin can [edit them](#editing-sizes-admins) per instance. Every size also gets the same 20Gi tools cache (`/nix`),
 regardless of size or type — the one number that doesn't change with your
 choice.
 
@@ -67,7 +68,8 @@ than **L**, so pick it only when a workload needs it. A pod only fits on a node 
 at least 24Gi allocatable plus its sidecars, and a fleet of them can hit the
 worker namespace's shared quota, which shows as a failed replica on the worker's
 Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
-**L-HIGHMEM** workers allocate 50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
+**L-HIGHMEM** workers allocate 50Gi. These are the shipped defaults; an admin can
+[edit them](#editing-sizes-admins). Ephemeral data uses its independent 40Gi default. Existing data volumes
 are converged **upward** to these sizes by the controller when the claim's StorageClass allows volume
 expansion; it never shrinks, deletes or recreates a volume. An accepted
 expansion grows the claim's request first. The filesystem can stay pending until the
@@ -92,6 +94,58 @@ not to save quota: **L** for large projects (a big JVM test suite, a large
 `go build`), **S** for light repos. A hosted worker's CPU, memory and disk
 are real capacity on a shared cluster, so an oversized pick you don't need
 is capacity someone else's worker doesn't get.
+
+### Editing sizes (admins)
+
+The **Worker sizes** card on **Admin → Workers** edits the CPU request and limit,
+memory request and limit, data disk and DinD disk of each shipped size (`s`, `m`,
+`l`, `l-highmem`). **Reset** on a customized size returns it to its shipped values.
+**Add size** adds a size of your own and **Remove** deletes one you added; shipped sizes
+can be edited and reset but never removed.
+
+- **Adding.** The table holds up to 16 sizes. A name is lowercase letters, digits and
+  hyphens, starts with a letter and is at most 16 characters. A new size is validated
+  against the same chart ceilings as an edit. Admin-added sizes appear in the
+  provision form, in the `SIZE` column of `uzi worker list` and `uzi worker get`, and
+  in the TUI. They can also be chosen as the
+  [ephemeral default size and the default size for new workers](./admin-settings.md#hosted-worker-quota).
+- **Removing.** A size is refused while any worker uses it or either default-size
+  setting (`hosted_default_size`, `ephemeral_default_size`) names it; the refusal
+  says what holds it. Change those first, then remove.
+- **Same gate as edits.** Adding follows the ceilings and the read-only rule below;
+  removing follows the read-only rule.
+
+- **What an edit reaches.** The selectors on Admin → Workers update right after a
+  save; a provision form that is already open keeps its numbers until you reopen or
+  reload it. Existing idle workers pick up CPU and memory changes through the
+  controller's paced roll; a busy worker rolls once it is idle. A disk-only edit
+  rolls nothing: claims grow in place where the StorageClass allows expansion.
+  Lowering a disk only affects new workers, because claims never shrink (the editor
+  warns before saving an edit or reset that lowers a disk).
+- **Chart ceilings.** A value above the namespace LimitRange ceilings is refused
+  with a message naming the chart value to raise. The binding ceiling is the minimum
+  over the enabled tiers: `workers.limitRange.max.cpu`, `.max.memory` and
+  `.maxPVCStorage`; `workers.docker.limitRange.*`;
+  `workers.isolatedLane.limitRange.max.*`. The DinD disk is checked against
+  `workers.docker.limitRange.maxPVCStorage` only when the docker tier is enabled
+  (`workers.docker.enabled`), and not when `workers.docker.dindDataSize`
+  overrides it. ResourceQuota is advisory only: an edit that does not fit shows a
+  warning but saves, a quota of zero is accepted, and quota values the api cannot
+  read show as "quota check unavailable", never as unlimited or as fitting.
+  The docker tier's check counts only the worker container's requests, not the
+  DinD sidecars', so it always also shows "quota check unavailable"
+  (incomplete): no exceeded warning there does not mean the pod fits.
+- **Read-only until supported.** The editor stays read-only, and saves are refused
+  with `409`, until the controller advertises support on a fresh status report. On
+  a rolling upgrade the api rolls first, so the card unlocks once the new controller
+  reports in. Downgrading the api or the controller after a customization is
+  unsupported.
+- **Refusals.** A size the controller refuses (above its own ceilings) or a PVC the
+  cluster rejects at create shows on the worker as provisioning or upgrade
+  failed, and in [Admin health](./admin-health.md) on the **Worker image roll** check (`fleet.roll`).
+
+`uzi worker list` and `uzi worker get` show a `SIZE` column; see
+[CLI reference](./cli.md#worker-size).
 
 ## Your quota
 
@@ -738,16 +792,26 @@ Caveats:
 - Clearing `newPlacement` before updating the global placement sends stamped workers back
   to the old nodes, where their new volumes may not attach. Rolling back to a controller
   version without this feature has the same effect, because it ignores the stamp.
-- Known issues that can stall a restore in step 2.7:
-  - a roll pool whose participant reservations have lost their canary holds every
-    participant, and the controller does not recover it yet (#4466);
-  - while a restore waits on admission, its `WaitForFirstConsumer` claims stay Pending
-    before any consumer has tried to bind them, and can be reported stranded after the
-    bind timeout (#4468); Pending alone proves neither a storage fault nor healthy
-    storage;
-  - the roll status can drop a worker's health row when its blocker is synthetic, and
-    the worker list shares that status (#4467); when it looks stale, inspect the live
-    Deployment, reservation, claims and pod, and the controller logs.
+- A paced restore that waits on admission holds its worker at zero replicas, so its
+  `WaitForFirstConsumer` claims stay Pending: such a claim binds only once a pod is
+  scheduled to consume it. The controller does not report this narrowly evidenced pause as
+  stranded (no synthesized `stuck`, no `pvc-bind-timeout` log line) when, among other checks
+  (see [ADR-0837](../adr/0837-worker-disk-lifecycle.md) D6), the worker has one Deployment
+  held at explicit zero replicas under an open roll reservation for the API's desired
+  worker, no pod labelled for the worker exists, no pod mounts the claim, and the claim's
+  StorageClass reads as `WaitForFirstConsumer`. Without an open reservation there is no
+  exemption: a worker scaled to zero by hand in step 2.4 gets one only once its restore is
+  admitted, and a pin change can cancel one while the worker stays at zero. Until the worker
+  is admitted again its claims can still be reported stranded after the bind timeout, and
+  the report alone does not distinguish that wait from a storage fault. The class read
+  needs `workers.storageClassRead.create` (default `true`); without it, a waiting restore's
+  claims can be reported stranded after the bind timeout, and that report keeps the restore
+  unadmitted at zero replicas, so its claims cannot bind and its roll pool stays held until
+  the class read is restored or an operator intervenes. Claim
+  ages are never reset: after replicas are restored the original age applies, so a brief
+  `stuck` until the volume binds is expected. Waiting alone is not grounds to delete or
+  recreate claims repeatedly, bypass pacing, force-roll or remove reservations. Pending
+  alone proves neither a storage fault nor healthy storage (#4468).
 
 ## Pod shutdown grace
 
@@ -778,6 +842,76 @@ except for eligible custody-held migration drains; legacy recycle cannot evade
 that policy. Separately fenced DinD maintenance remains
 independent. A pool with one worker can have an outage during its roll. Waiting
 indefinitely can delay capacity turnover and security fixes indefinitely.
+
+A roll pool whose participants still carry incomplete reservations but no canary
+(for example after its reservation annotation was reset) recovers on its own when
+one participant already has full current-incarnation proof: a fresh registration,
+exact version, heartbeat and coverage on its reserved template with one replica,
+and it is not cordoned or drained.
+The first tick only marks that participant canary and does nothing else in the
+pool. Later ticks restore the other participants through normal admission, for
+example recreating a paused worker's claims and scaling it back. Removing only one
+participant's marker, uncordoning, or deleting a previously registered worker's
+Deployment need not repair the pool: the other markers remain, uncordoning alone
+supplies no registration proof, and deletion loses the evidence. A deleted
+worker usually trips the missing-deployment guard (`missing deployment lacks
+first-provision evidence; explicit recovery required`), which blocks adoption for
+the whole pool. If it kept a retained claim reservation, the guard is avoided but
+the pool still holds with `participant reservation without canary; explicit
+recovery required`. Either way that Deployment stays missing until a canary
+exists again or explicit recovery.
+
+While no canary exists the pool can stay held:
+
+- no participant has the proof, or the observation is not clean enough to adopt
+  (for example a hibernating, unavailable or unplanned worker, a stray annotated
+  Deployment, or an uncertain or migration fence): held with `participant
+  reservation without canary; explicit recovery required`. This applies even when
+  every participant is already proven, so no new canary is admitted beside them,
+  and also when a canary of the same owner exists in another capability pool of
+  the namespace: that canary touches no Deployment in this pool, so it cannot
+  fence an adoption request still outstanding here;
+- a smaller-ID participant is neither proven nor fenced (stale evidence, a desired
+  generation change, a claim mirror, or a Deployment recreated still carrying its
+  marker): held with `earlier participant may hold an unresolved adoption
+  request`. It clears when that
+  participant regains proof or its Deployment is rescaled, retemplated or loses its
+  marker. Deleting that Deployment replaces this hold, usually with the
+  missing-deployment guard above.
+
+A pool with exactly two incomplete canary reservations is normally held with
+`duplicate canary reservations unresolved; explicit recovery required`. The
+controller cancels one of them on its own only when it is provably stale: its
+Deployment is at zero replicas with no pod, PVC or claim attributable to that
+worker, every attributable ReplicaSet (including terminating ones) has a known
+zero replica count, its reservation no longer matches its deployed template and it has
+drifted from the target, and it is not custody-held, under maintenance, busy or
+hibernating. The other canary must be current: one replica, not stuck, with the
+reservation, deployed template and rendered target all matching, and no claim
+mirror or malformed reservation, and it must not be custody-held. The rest of the pool and namespace must also be clean (no hibernating,
+waking, unavailable or blocked worker, no uncertainty, migration or layout fence,
+no unplanned worker, no stray or ambiguous reservation, no same-owner canary
+outside the pool). The controller then makes one metadata-only cancellation of the
+stale reservation, holds the pool with `duplicate canary cancelled for absent
+worker; re-observation required` for that tick, and resumes normal roll planning
+on the next. This grants the surviving canary no promotion proof. A conflicting
+or unconfirmed write keeps the hold and is reported as an error.
+
+The pool stays held with the unresolved-duplicate reason when any of those
+conditions fails: the absent worker is already on the target template, a worker is
+waking from hibernation, the surviving canary is absent, terminating, stuck or
+otherwise not current, or there are three or more canaries. Two live canaries
+cannot use this absent-worker recovery; the existing old-incarnation proof may
+still cancel their reservations when both satisfy that proof.
+When the absent worker has drifted, an operator can pause controller
+reconciliation, remove the stale `uzi.dev/image-roll` annotation from its data
+claim first (if present), and then remove it from the Deployment. Re-observe both
+objects and verify the annotations are absent before resuming reconciliation;
+otherwise the retained mirror can restore the stale reservation. The worker then
+re-enters the roll as a fresh drifted participant. Other held shapes need
+case-specific recovery.
+
+Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
 `workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains its `24h` default and
 positive-only parsing, now only for independent **nondrifted** pressure/nix-size
@@ -996,7 +1130,15 @@ newer worker image.
 A resumed run can stay tied to its previous worker until the configured
 affinity ceiling (two hours by default), even if another capable worker
 comes online. This preserves unpublished work on the previous worker's
-volume before a cold move is allowed.
+volume before a cold move is allowed. A Codex run that has been claimed is
+stricter: no other worker, including a new ephemeral one, takes it at the
+ceiling. With valid claimant provenance, wait for the recorded worker or follow
+the health reason's restart advice. Runs claimed before this deployment have no
+recorded claimant (no backfill): waiting cannot enable a fresh claim, even by
+their last worker. An existing flight may continue through readoption under the
+existing fences; otherwise cancel with `uzi run cancel <id>`. Cancellation does
+not itself release custody (see
+[Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker)).
 
 ## Disk self-heal
 

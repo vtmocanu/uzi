@@ -15,6 +15,7 @@ import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
 import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
+  NATIVE_PATCH_INERT_TITLES,
   CODEX_P_NATIVE_ABSENT_TITLE,
   CODEX_P_ISOLATION_ENV_TITLE,
   CODEX_P_SHELL_POLICY_TITLE,
@@ -43,6 +44,14 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-native-patch-inert", adapter: "codex", layer: "P", family: "Native execution bypass",
+    seam: "harness-p production launcher/config/auth/transport/broker with offline loopback provider",
+    positiveControl: "nested uzi_apply_patch reaches broker fileop and nested uzi_bash reaches command seam; outputs return to provider",
+    negativeOracle: "each nested/direct patch refusal, unsupported goal dispatch and exact empty/unknown-server resource outcome precedes controls with zero callbacks, spawns, fileops and markers; exact inventories and model IDs",
+    intendedOutcome: "owner accepted 2026-11-20: native patch is inert without an execution environment and three MCP helpers are inert under no native MCP servers are configured; goals remain disabled; new server configuration requires fresh authority review",
+    tests: Object.values(NATIVE_PATCH_INERT_TITLES),
+  },
   {
     id: "codex-p-bounded-large-cold-resume",
     adapter: "codex",
@@ -181,18 +190,15 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     adapter: "codex",
     layer: "P",
     family: "Native execution bypass",
-    seam: "codex/launcher.ts:launchCodexRoot + config.ts native-disabled template (shell_tool/unified_exec/code_mode/apply_patch_freeform off) → app-server dispatch",
+    seam: "codex/launcher.ts:launchCodexRoot + config.ts supported suppression + environments:[] + replaced launcher CODEX_EXEC_SERVER_URL=none → app-server dispatch",
     positiveControl:
       "the intended-model custom exec (the dynamic uzi_bash callback) reaches its command-identity "
       + "effect through the REAL broker on the real protocol",
     negativeOracle:
-      "BOTH halves are checked (PRD 'Native execution bypass'): (schema) the real app-server "
-      + "does not advertise the representative effectful native deny identities; #1566 separately "
-      + "inspects namespace and nested inventories and characterizes native async/UTC exceptions; "
-      + "(dispatch) forced native shell/exec_command/unified_exec/write_stdin/"
-      + "local_shell function-calls and a native freeform apply_patch custom-tool-call produce NO "
-      + "worker callback, NO command spawn, NO fileop and NO marker file (absolute marker paths "
-      + "asserted absent after the turn)",
+      "the legacy schema oracle checks representative top-level identities only, not nested apply_patch "
+      + "absence; native-patch-inert.test.ts checks exact per-model inventories and nested/direct patch "
+      + "refusal. Forced representative native dispatch produces no callback, spawn, fileop or marker; "
+      + "#1566 async/read-only UTC exceptions remain reachable",
     intendedOutcome:
       "no alternate native execution authority or retained writable terminal exists on the "
       + "production path for the representative effectful deny probes; the authority-free code host "
@@ -386,13 +392,13 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     seam: "codex/config.ts:buildCodexProductionConfigToml/buildCodexLoopbackTestConfigToml + codex-harness.ts:threadConfig (start/resume)",
     positiveControl: "the real executor completes a fresh-start run and a resumed run",
     negativeOracle:
-      "the fixed config template pins project_doc_max_bytes=0 + trust_level untrusted and every native "
-      + "feature off EXCEPT the run-lane code_mode_host — the authority-free callback-routing host, off "
-      + "on the default/advice lane and enabled (codeModeHost:true → code_mode_host=true) on the run lane "
-      + "with other configurable effectful features and trust off; #1566 async/UTC remain reachable. It rejects any unknown (smuggled repo/hook) "
-      + "key, and references no AGENTS.md/.codex; thread/start (start) AND thread/resume (resume) "
-      + "RE-assert the untrusted config and turn/start reasserts environments:[]; no repo trust surface "
-      + "rides any construction request",
+      "the fixed config pins project_doc_max_bytes=0 + trust_level untrusted and supported suppression; "
+      + "exact false feature keys test construction, not runtime suppression: apply_patch_freeform is "
+      + "removed/ignored and model catalog metadata overrides code_mode/code_mode_only at pin 0.167.0. "
+      + "Native patch remains advertised under the run host; registration is not authority. Unknown "
+      + "keys are rejected, no AGENTS.md/.codex input is taken, and start/resume reassert untrusted "
+      + "config. Root thread/start and turn/start select environments:[]; thread/resume has no such "
+      + "field and the next turn reasserts []; launcher env pins CODEX_EXEC_SERVER_URL=none. #1566 remains",
     intendedOutcome: "untrusted repo content cannot install instructions, callbacks or execution authority at start, resume or a subsequent turn",
     tests: [CODEX_U_TRUST_CONSTRUCTION_TITLE],
   },
@@ -586,23 +592,15 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       + "provider (no override block) and the loopback builder wires an authenticated fake provider "
       + "(requires_openai_auth=true) — so the disabled hooks are a real deny inside a working config",
     negativeOracle:
-      "every builder in the DEFAULT/advice posture (prod api_key, prod subscription, loopback) pins "
-      + "hooks=false with NO hooks=true, NO bypass_hook_trust / dangerously-bypass-hook-trust, every "
-      + "native EXECUTION feature (shell_tool/unified_exec/code_mode/code_mode_only/code_mode_prewarm/"
-      + "apply_patch_freeform/shell_snapshot*/multi_agent*/plugins/apps) off, "
-      + "project_doc_max_bytes=0 and trust_level=untrusted; a non-loopback provider URL is rejected. "
-      + "code_mode_host is the ONE posture-dependent exception: it is the authority-free callback-routing "
-      + "execution HOST (environments:[], untrusted project, broker-mediated callbacks only), pinned OFF "
-      + "on the default/advice/stock lane and enabled ONLY on the run lane (codeModeHost:true → "
-      + "code_mode_host=true) with every OTHER native feature and hooks still off — NOT a native "
-      + "execution grant. The upstream hook serialization/spawn/timeout/malformed-output "
-      + "CHARACTERIZATION is the M0 test-only process (e2e/codex-m0/hooks-stdin.test.mjs, "
-      + "harness-errors.test.mjs) — referenced (its files exist), NOT re-run in this gate; production "
-      + "hooks being off is the production-side proof",
+      "production and loopback builders pin hooks=false without hook-trust bypass, untrusted project "
+      + "and project_doc_max_bytes=0; non-loopback provider URLs reject. Exact false feature keys test "
+      + "construction, not runtime suppression: apply_patch_freeform is ignored and catalog metadata "
+      + "overrides code_mode/code_mode_only. The run host remains enabled; native patch execution is "
+      + "denied by environments:[] plus launcher CODEX_EXEC_SERVER_URL=none. M0 hook-failure "
+      + "characterization is referenced, not rerun here",
     intendedOutcome:
-      "an upstream hook serialization/spawn/timeout/malformed-output failure can NEVER become production "
-      + "permission, because production Codex hooks (and every native EXECUTION feature) are disabled; the "
-      + "run-lane code_mode_host is the authority-free callback-routing host, not such a permission",
+      "production hooks are disabled without hook-trust bypass, so upstream hook failure supplies no "
+      + "production permission; native execution denial relies on protocol and launcher controls",
     tests: [CODEX_U_FAILURE_HOOKS_DISABLED_TITLE],
   },
   {

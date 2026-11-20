@@ -5,7 +5,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { formatAttemptId } from "../src/attempt-path.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, type GitCacheOptions } from "../src/git.js";
+import { managedBareGroupTrustForTest } from "../src/runner-group-trust.js";
 import { createHibernationCensus } from "../src/hibernation-census.js";
 import type { CensusResult, InventoryEntry } from "../src/hibernation-inventory.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -205,4 +206,70 @@ it("a .uzi-skills-<clone> sibling with a payload is listed unknown; an empty one
   assert.equal(entry?.classification, "unknown");
   assert.equal(entry?.detail, "skills_not_empty");
   assert.equal(result.entries.filter(e => e.path === skillsRel).length, 1);
+});
+
+// Issue #4486: under the uid split with umask 002 the managed bares are 2775. The census classifies such a clone as
+// proven only under an issued runner-group trust and a clean ACL observation; without them it stays unknown.
+function groupWritableCache(over: GitCacheOptions): GitCache {
+  const status = (uid: number) => ["Name:\tcat", `Uid:\t${uid}\t${uid}\t${uid}\t${uid}`, `Gid:\t${uid}\t${uid}\t${uid}\t${uid}`,
+    "Groups:\t10002", "CapInh:\t0000000000000000", "CapPrm:\t0000000000000000", "CapEff:\t0000000000000000",
+    "CapBnd:\t00000000000000c0", "CapAmb:\t0000000000000000", "NoNewPrivs:\t1"].join("\n") + "\n";
+  const trust = managedBareGroupTrustForTest({ runnerStatus: status(10002), commandStatus: status(10003),
+    anyIdentity: true, gid: process.getgid!() });
+  return new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+    managedBareGroupTrust: trust, managedBareStatfs: async () => ({ type: 0xef53 }), ...over }));
+}
+function widenBare(): void {
+  const repos = path.join(fx.dataDir, "repos");
+  fs.chmodSync(repos, 0o775);
+  for (const name of fs.readdirSync(repos)) fs.chmodSync(path.join(repos, name), 0o2775);
+}
+
+it("#4486: a 2775 managed-bare clone with trust and a clean ACL observation is content_proven and complete", async () => {
+  const observed: string[][] = [];
+  git = groupWritableCache({ managedBareAclObserve: async paths => { observed.push(paths); } });
+  widenBare();
+  const result = await census();
+  const [entry] = attemptEntries(result);
+  assert.equal(entry?.content_state, "content_proven", JSON.stringify(result.entries));
+  assert.equal(entry?.classification, "needs_receipt");
+  assert.equal(entry?.tip, command(clonePath, "rev-parse", "HEAD"));
+  assert.equal(result.complete, true, JSON.stringify(result.uncovered));
+  assert.ok(observed.length >= 2, "the bare tree was observed by every full snapshot");
+});
+
+it("#4486: an absent getfacl binary reaches the census as an unknown entry with detail completeness_unknown", async () => {
+  const rejections: unknown[] = [];
+  const onRej = (e: unknown) => { rejections.push(e); };
+  process.on("unhandledRejection", onRej);
+  try {
+    // No ACL observer seam: the real launch path runs and the nonexistent absolute binary fails with ENOENT.
+    git = groupWritableCache({ managedBareGetfaclBin: path.join(fx.dataDir, "no-such-getfacl") });
+    widenBare();
+    const result = await census();
+    const [entry] = attemptEntries(result);
+    assert.notEqual(entry?.content_state, "content_proven", JSON.stringify(result.entries));
+    assert.equal(entry?.classification, "unknown", JSON.stringify(entry));
+    assert.equal(entry?.detail, "completeness_unknown", JSON.stringify(entry));
+    assert.equal(entry?.content_state, "unproven_worktree_bytes");
+    assert.equal(entry?.tip, undefined);
+    // The census lists the unproven clone as an unknown entry (it blocks reclaim by classification); `complete`
+    // stays true because the clone is accounted for, as in the observed-ACL case above.
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onRej);
+  }
+});
+
+it("#4486: the same 2775 clone stays unproven without a trusted group, or with an observed ACL", async () => {
+  for (const over of [{ managedBareGroupTrust: undefined, managedBareAclObserve: async () => {} },
+    { managedBareAclObserve: async () => { throw new Error("named ACL entry"); } }] as GitCacheOptions[]) {
+    git = groupWritableCache(over);
+    widenBare();
+    const [entry] = attemptEntries(await census());
+    assert.notEqual(entry?.content_state, "content_proven");
+    assert.equal(entry?.classification, "unknown");
+    assert.equal(entry?.tip, undefined);
+  }
 });

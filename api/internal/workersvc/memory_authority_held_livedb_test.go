@@ -215,7 +215,8 @@ func TestHibernationSurplusMemoryAuthorityReceiptRefreshLiveDB(t *testing.T) {
 	p.wantStates(map[uuid.UUID]string{cand.id: "preparing", keeper.id: "none"})
 }
 
-// A lost report clears the receipt; a later held claim stamps it again.
+// A lost report clears the receipt; a later held claim does not stamp it again (issue #4492: a
+// loss is sticky until Register).
 func TestMemoryAuthorityLostClearsHeldReceiptLiveDB(t *testing.T) {
 	p := newPoolFx(t)
 	keeper := p.capableMember(5 * time.Hour)
@@ -231,8 +232,11 @@ func TestMemoryAuthorityLostClearsHeldReceiptLiveDB(t *testing.T) {
 	p.advance(time.Second)
 	p.beatOnly(keeper.id)
 	keeper.claim("held")
-	if _, ok := p.heldAt(keeper.id); !ok {
-		t.Fatal("a held claim after a loss did not stamp the receipt")
+	if _, ok := p.heldAt(keeper.id); ok {
+		t.Fatal("a held claim after a loss stamped the receipt; the loss is sticky until Register")
+	}
+	if p.ready(keeper.id) {
+		t.Fatal("a keeper with a recorded loss must not be ready")
 	}
 }
 

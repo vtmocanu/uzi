@@ -45,6 +45,10 @@ func TestPlanCrossCheckChildAdmissionLiveDB(t *testing.T) {
 				case "ReleaseCredentialSwitch", "RequeueAttestedFinalizeRuns":
 					status = "running"
 				}
+				if path == "ClaimRun" {
+					// The Codex checker is admitted at generation 1 only for the worker its provenance names.
+					seedClaimProvenance(ctx, t, f.pool, fx.checkerID, f.workerID, 1)
+				}
 				mustExec(ctx, t, f.pool, `UPDATE runs SET status=$2,worker_id=$3,claim_generation=1,
      hold_reason=NULLIF($4,''),recovery_wait_cause=NULLIF($5,''),started_at=NULL,status_since=now(),
      retry_not_before=now()-interval '1 minute',recovery_retry_not_before=now()-interval '1 minute'

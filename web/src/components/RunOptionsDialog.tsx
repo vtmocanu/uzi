@@ -27,6 +27,9 @@ import {
   type RunStartOptions,
 } from "../lib/startRun";
 import { stripUnsafeChars } from "../lib/safeText";
+import { DEFAULT_START_PREVIEW_REQUEST, defaultChoiceLabels, startPreviewRequest } from "../lib/startPreview";
+import { useStartPreview } from "../lib/startPreviewStore";
+import { StartPreview } from "./StartPreview";
 import { EffortSelect } from "./EffortSelect";
 import { HarnessPicker } from "./HarnessPicker";
 import { ModelSelect } from "./ModelSelect";
@@ -35,10 +38,10 @@ import { TokenPicker } from "./TokenPicker";
 import { XIcon } from "./icons";
 import { Button, Field } from "./ui";
 
-// Both selects name where a Default value really comes from: the caller's own Settings,
-// read when a worker claims the run. U+00B7 is the agreed separator.
-const DEFAULT_LABEL = "Default · your settings";
+// The Default options name where each value really comes from (defaultChoiceLabels, from the
+// server's own source tokens); U+00B7 is the agreed separator.
 const MODEL_MAX_BYTES = 100;
+const MODEL_PREVIEW_DEBOUNCE_MS = 400;
 
 // modelProblem is the inline check that disables Start run. The server is authoritative
 // (it answers 400 or 422 and the dialog shows that text), but these are the refusals a
@@ -122,6 +125,30 @@ export function RunOptionsDialog({
   const modelError = modelProblem(options.model, modelCustom, rows.effectiveHarness, rows.showHarness);
   const canStart = startGate.enabled && modelError === "" && !submitting;
 
+  // Issue #3261: the read-only preview. A custom ("Other") model entry reaches the request
+  // only after a ~400 ms pause in typing (one-shot input debounce, no polling); a curated
+  // pick applies at once. The request is withheld while the model is invalid, and it is
+  // built from the same runStartBody normalization Start sends.
+  const [typedModel, setTypedModel] = useState(options.model);
+  useEffect(() => {
+    if (!modelCustom) {
+      setTypedModel(options.model);
+      return;
+    }
+    const t = setTimeout(() => setTypedModel(options.model), MODEL_PREVIEW_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [options.model, modelCustom]);
+  const previewModel = modelCustom ? typedModel : options.model;
+  const previewModelProblem = modelProblem(previewModel, modelCustom, rows.effectiveHarness, rows.showHarness);
+  const previewRequest = modelError || previewModelProblem ? null : startPreviewRequest({ ...options, model: previewModel }, facts);
+  const selected = useStartPreview(previewRequest);
+  const defaultChoice = useStartPreview(DEFAULT_START_PREVIEW_REQUEST);
+  const labels = defaultChoiceLabels(
+    selected?.effective ?? defaultChoice?.effective ?? null,
+    defaultChoice?.preview ?? null,
+    selected?.preview ?? null,
+  );
+
   const patch = (next: Partial<RunStartOptions>) => setOptions((prev) => ({ ...prev, ...next }));
 
   const onHarnessChange = (harness: HarnessSelection) => {
@@ -183,6 +210,7 @@ export function RunOptionsDialog({
                 label="Harness"
                 value={options.harness}
                 onChange={onHarnessChange}
+                inheritLabel={labels.harness}
                 disabled={submitting}
               />
             </Field>
@@ -206,7 +234,7 @@ export function RunOptionsDialog({
               value={options.model}
               onChange={(model) => patch({ model })}
               harness={rows.effectiveHarness}
-              defaultLabel={DEFAULT_LABEL}
+              defaultLabel={labels.model}
               customAriaLabel="Custom model ID"
               ariaDescribedBy={[modelError ? modelErrorId : "", defaultsHintId].filter(Boolean).join(" ")}
               onCustomModeChange={setModelCustom}
@@ -222,11 +250,12 @@ export function RunOptionsDialog({
               id={`${ids}-effort`}
               value={options.effort}
               onChange={(effort) => patch({ effort })}
-              defaultLabel={DEFAULT_LABEL}
+              defaultLabel={labels.effort}
             />
           </Field>
+          <StartPreview variant="open" request={previewRequest} showNote={false} />
           <p id={defaultsHintId} className="text-xs text-faint">
-            A setting left on Default follows your Settings when a worker picks the run up. A choice made here stays
+            Model and effort left on Default are resolved when a worker picks the run up. A choice made here stays
             with this run, including after a resume.
           </p>
 

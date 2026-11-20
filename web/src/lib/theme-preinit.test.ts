@@ -46,7 +46,7 @@ function run({ storage, osDark }: { storage: Record<string, string>; osDark: boo
   return attrs;
 }
 
-const appearance = (over: Record<string, string> = {}) =>
+const appearance = (over: Record<string, unknown> = {}) =>
   JSON.stringify({ mode: "system", light: "hall", dark: "ember", typeface: "system", ...over });
 
 describe("theme-preinit.js pre-paint stamp (PRD #1167 m5)", () => {
@@ -113,6 +113,24 @@ describe("theme-preinit.js pre-paint stamp (PRD #1167 m5)", () => {
       });
       expect(attrs["data-theme"]).toBe("ember"); // compiled dark fallback, not `evil`
     }
+  });
+
+  it("stamps data-motion=on only for a cached strict boolean true", () => {
+    const attrs = run({ storage: { "uzi.appearance": appearance({ sidebarMotion: true }) }, osDark: false });
+    expect(attrs["data-motion"]).toBe("on");
+    const off = run({ storage: { "uzi.appearance": appearance({ sidebarMotion: false }) }, osDark: false });
+    expect(off["data-motion"]).toBe("off");
+  });
+
+  it("stamps data-motion=off for a string, absent field, no cache, or a parse error", () => {
+    expect(
+      run({ storage: { "uzi.appearance": appearance({ sidebarMotion: "true" }) }, osDark: false })["data-motion"],
+    ).toBe("off");
+    expect(run({ storage: { "uzi.appearance": appearance() }, osDark: false })["data-motion"]).toBe("off");
+    expect(run({ storage: {}, osDark: false })["data-motion"]).toBe("off");
+    const broken = run({ storage: { "uzi.appearance": "{not json" }, osDark: false });
+    expect(broken["data-theme"]).toBe("hall");
+    expect(broken["data-motion"]).toBe("off");
   });
 
   // The legacy uzi.theme migration lookup is guarded the same way: a prototype

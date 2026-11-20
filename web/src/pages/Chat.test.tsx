@@ -6,13 +6,23 @@ import { useRunStream } from "../lib/useRunStream";
 import { mockRuns } from "../mocks/data/runs";
 import { ChatConversation, ChatList } from "./Chat";
 import { api, type Chat, type Worker } from "../lib/api";
+import { RECORDED_EFFECTIVE_SCENARIOS } from "../mocks/data/effectiveSettings";
 
 // Mock only the two network calls the list makes; keep the real helpers.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { listChats: vi.fn(), listWorkers: vi.fn(), createChat: vi.fn(), continueChat: vi.fn() },
+    api: {
+      listChats: vi.fn(),
+      listWorkers: vi.fn(),
+      createChat: vi.fn(),
+      continueChat: vi.fn(),
+      // Issue #3261: the conversation's start cards read these through the shared preview
+      // store (a no-op unless a test sets authUser).
+      getEffectiveSettings: vi.fn(),
+      previewStartSettings: vi.fn(),
+    },
   };
 });
 
@@ -27,6 +37,10 @@ vi.mock("../lib/useRunStream", () => ({
     refreshRun: vi.fn(),
   })),
 }));
+
+// The preview store reads the signed-in user; null by default (no preview traffic).
+let authUser: { id: string } | null = null;
+vi.mock("../auth/AuthContext", () => ({ useOptionalAuth: () => ({ user: authUser }) }));
 
 const mockApi = vi.mocked(api);
 
@@ -103,6 +117,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  authUser = null;
 });
 
 // Issue #124 / item 7. The audit enumerated judge-DTO consumers and so missed this page:
@@ -286,6 +301,32 @@ it.each([
   expect(screen.getByText("live")).toBeTruthy();
   expect(screen.getByRole("button", { name: "End chat" }).hasAttribute("disabled")).toBe(false);
 });
+// Issue #3261: every pending start card in one conversation shares one effective-settings read
+// and one default preview through the provider in ChatConversation.
+it("chat detail start cards share one effective-settings read and one default preview", async () => {
+  authUser = { id: "u1" };
+  const scenario = RECORDED_EFFECTIVE_SCENARIOS[0];
+  mockApi.getEffectiveSettings.mockResolvedValue(structuredClone(scenario.get));
+  mockApi.previewStartSettings.mockResolvedValue(
+    structuredClone(scenario.start_previews.find((p) => p.name === "claude")!.response),
+  );
+  mockApi.listChats.mockResolvedValue(chatList([]));
+  const messages = [
+    { seq: 1, kind: "run_request", payload: { repo_path: "grp/proj", issue_iid: 1, title: "First" } },
+    { seq: 2, kind: "run_request", payload: { repo_path: "grp/proj", issue_iid: 2, title: "Second" } },
+  ];
+  vi.mocked(useRunStream).mockReturnValue({
+    run: { ...mockRuns[0], id: "c1", kind: "chat" as const, status: "running" as const },
+    messages, connected: true, error: "", refreshRun: vi.fn(),
+  } as unknown as ReturnType<typeof useRunStream>);
+  render(<MemoryRouter initialEntries={["/chat/c1"]}><Routes>
+    <Route path="/chat/:id" element={<ChatConversation />} />
+  </Routes></MemoryRouter>);
+  expect(await screen.findAllByText(/If started now:/)).toHaveLength(2);
+  expect(mockApi.getEffectiveSettings).toHaveBeenCalledTimes(1);
+  expect(mockApi.previewStartSettings).toHaveBeenCalledTimes(1);
+});
+
 it.each([
   ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
   ["2020-01-01T00:00:00Z", "Codex idle stall retrying"],

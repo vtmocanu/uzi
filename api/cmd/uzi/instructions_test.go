@@ -459,7 +459,59 @@ var knownInstructions = []knownInstruction{
 		// RESOLVES, and `uzi findings release` is a real subcommand exercised by TestFindingsRelease.
 		note: "HELP: the `uzi findings release` usage line (findings.go).",
 	},
+	{
+		command:  "uzi settings set",
+		evidence: evidenceHelpOnly,
+		note: "HELP: the usage lines of `uzi settings set`'s Long help (settings_model_write.go). " +
+			"The path resolving is the complete bar for a help reference.",
+	},
+	{
+		command:  "uzi settings reset",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi settings set`'s and `uzi settings reset`'s help name the undo verb " +
+			"(settings_model_write.go). The path resolving is the complete bar.",
+	},
+	{
+		command:  "uzi agent-template set",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi agent-template reset`'s Long help cross-links `set` (agent_template.go). " +
+			"The path resolving is the complete bar for a help reference.",
+	},
+	{
+		command:  "uzi agent-template reset",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi agent-template set`'s Long help names the undo verb (agent_template.go). " +
+			"The path resolving is the complete bar.",
+	},
+	{
+		command:  "uzi agent-template set reviewer --harness claude <model-id>",
+		evidence: evidenceHelpOnly,
+		note:     "HELP: a usage line of `uzi agent-template set`'s Long help (agent_template.go).",
+	},
+	{
+		command:  "uzi agent-template set reviewer --harness codex <model-id>",
+		evidence: evidenceHelpOnly,
+		note:     "HELP: a usage line of `uzi agent-template set`'s Long help (agent_template.go).",
+	},
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi agent-template show",
+		evidence: evidenceGoTest,
+		where:    "TestAgentTemplateServerMessagesEndToEnd",
+		note: "RUNTIME: the template_commit_unknown message (statusError in uzicli/client.go) tells " +
+			"the user to check with `uzi agent-template show`. TestAgentTemplateServerMessagesEndToEnd " +
+			"runs the real cobra command against an HTTP fixture answering the typed 500, asserts " +
+			"the message and exit 6, then executes the named show command against the same fixture.",
+	},
+	{
+		command:  "uzi settings get",
+		evidence: evidenceGoTest,
+		where:    "TestSettingsSetServerMessagesEndToEnd",
+		note: "RUNTIME: the settings_commit_unknown message (statusError in uzicli/client.go) tells " +
+			"the user to check with `uzi settings get`. TestSettingsSetServerMessagesEndToEnd " +
+			"runs the real cobra command against an HTTP fixture answering the typed 500 and " +
+			"asserts the message and exit 6.",
+	},
 	{
 		command:  "uzi findings release %s --confirm-no-issue",
 		evidence: evidenceGoTest,

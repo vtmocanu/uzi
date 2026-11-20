@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -113,6 +114,148 @@ func (f *FakeClient) GetEffectiveSettings(context.Context) (apitypes.EffectiveSe
 		return apitypes.EffectiveSettingsDTO{}, Exitf(ExitNotFound, "not found")
 	}
 	return *f.Effective, nil
+}
+
+// PutModelSettings records the patch, then answers the canned ModelSettingsResult or, without
+// one, applies the patch to Settings (a nil value clears the field) and returns that.
+func (f *FakeClient) PutModelSettings(_ context.Context, patch map[string]*string) (ModelSettingsResult, error) {
+	f.ModelSettingsCalls++
+	f.LastModelSettingsPatch = make(map[string]*string, len(patch))
+	for k, v := range patch {
+		f.LastModelSettingsPatch[k] = v
+	}
+	if f.PutModelSettingsErr != nil {
+		return ModelSettingsResult{}, f.PutModelSettingsErr
+	}
+	if f.Err != nil {
+		return ModelSettingsResult{}, f.Err
+	}
+	if f.ModelSettingsResult != nil {
+		return *f.ModelSettingsResult, nil
+	}
+	fields := map[string]**string{
+		"default_claude_model": &f.Settings.DefaultClaudeModel, "default_codex_model": &f.Settings.DefaultCodexModel,
+		"default_effort": &f.Settings.DefaultEffort, "default_codex_effort": &f.Settings.DefaultCodexEffort,
+		"judge_model": &f.Settings.JudgeModel, "codex_judge_model": &f.Settings.CodexJudgeModel,
+		"judge_runs_on": &f.Settings.JudgeRunsOn,
+		"summary_model": &f.Settings.SummaryModel, "codex_summary_model": &f.Settings.CodexSummaryModel,
+	}
+	for k, v := range patch {
+		if dst, ok := fields[k]; ok {
+			*dst = v
+		}
+	}
+	raw, err := json.Marshal(map[string]apitypes.UserSettingsDTO{"settings": f.Settings})
+	if err != nil {
+		return ModelSettingsResult{}, err
+	}
+	return ModelSettingsResult{Settings: f.Settings, Raw: raw}, nil
+}
+
+// PutCrossCheckPins records the cells, then answers like PutModelSettings; without a canned reply
+// each cell's present members are applied to the matching Settings.CrossCheckPins cell (appended
+// when absent) and the display fields are left as they were.
+func (f *FakeClient) PutCrossCheckPins(_ context.Context, cells []CrossCheckPinWire) (ModelSettingsResult, error) {
+	f.ModelSettingsCalls++
+	f.LastCrossCheckPins = make([]CrossCheckPinWire, len(cells))
+	for i, c := range cells {
+		members := make(map[string]*string, len(c.Members))
+		for k, v := range c.Members {
+			members[k] = v
+		}
+		f.LastCrossCheckPins[i] = CrossCheckPinWire{Stage: c.Stage, Harness: c.Harness, Members: members}
+	}
+	if f.PutModelSettingsErr != nil {
+		return ModelSettingsResult{}, f.PutModelSettingsErr
+	}
+	if f.Err != nil {
+		return ModelSettingsResult{}, f.Err
+	}
+	if f.ModelSettingsResult != nil {
+		return *f.ModelSettingsResult, nil
+	}
+	for _, c := range cells {
+		idx := -1
+		for i, p := range f.Settings.CrossCheckPins {
+			if p.Stage == c.Stage && p.Harness == c.Harness {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			f.Settings.CrossCheckPins = append(f.Settings.CrossCheckPins, apitypes.CrossCheckPinDTO{Stage: c.Stage, Harness: c.Harness, Active: true})
+			idx = len(f.Settings.CrossCheckPins) - 1
+		}
+		p := &f.Settings.CrossCheckPins[idx]
+		if v, ok := c.Members["model"]; ok {
+			p.Model = v
+		}
+		if v, ok := c.Members["effort"]; ok {
+			p.Effort = v
+		}
+	}
+	raw, err := json.Marshal(map[string]apitypes.UserSettingsDTO{"settings": f.Settings})
+	if err != nil {
+		return ModelSettingsResult{}, err
+	}
+	return ModelSettingsResult{Settings: f.Settings, Raw: raw}, nil
+}
+
+// ListMyAgentTemplates answers AgentTemplateListResult when set, else AgentTemplates.
+func (f *FakeClient) ListMyAgentTemplates(context.Context) (AgentTemplateListResult, error) {
+	f.AgentTemplateListCalls++
+	if f.AgentTemplateListErr != nil {
+		return AgentTemplateListResult{}, f.AgentTemplateListErr
+	}
+	if f.Err != nil {
+		return AgentTemplateListResult{}, f.Err
+	}
+	if f.AgentTemplateListResult != nil {
+		return *f.AgentTemplateListResult, nil
+	}
+	ts := append([]AgentTemplatePins{}, f.AgentTemplates...)
+	raw, err := json.Marshal(map[string][]AgentTemplatePins{"templates": ts})
+	if err != nil {
+		return AgentTemplateListResult{}, err
+	}
+	return AgentTemplateListResult{Templates: ts, Raw: raw}, nil
+}
+
+// PutAgentTemplateModelPins records the write, then answers AgentTemplatePutResult or, without
+// one, applies the patch to the matching AgentTemplates entry (a nil value clears the pin).
+func (f *FakeClient) PutAgentTemplateModelPins(_ context.Context, id string, patch map[string]*string) (AgentTemplatePinsResult, error) {
+	f.AgentTemplatePutCalls++
+	f.LastAgentTemplateID = id
+	f.LastAgentTemplatePatch = make(map[string]*string, len(patch))
+	for k, v := range patch {
+		f.LastAgentTemplatePatch[k] = v
+	}
+	if f.AgentTemplatePutErr != nil {
+		return AgentTemplatePinsResult{}, f.AgentTemplatePutErr
+	}
+	if f.Err != nil {
+		return AgentTemplatePinsResult{}, f.Err
+	}
+	if f.AgentTemplatePutResult != nil {
+		return *f.AgentTemplatePutResult, nil
+	}
+	for i := range f.AgentTemplates {
+		if f.AgentTemplates[i].ID != id {
+			continue
+		}
+		t := &f.AgentTemplates[i]
+		if v, ok := patch["model"]; ok {
+			t.Model = v
+		}
+		if v, ok := patch["codex_model"]; ok {
+			t.CodexModel = v
+		}
+		raw, err := json.Marshal(map[string]AgentTemplatePins{"template": *t})
+		if err != nil {
+			return AgentTemplatePinsResult{}, err
+		}
+		return AgentTemplatePinsResult{Template: *t, Raw: raw}, nil
+	}
+	return AgentTemplatePinsResult{}, Exitf(ExitNotFound, "template not found")
 }
 
 // PreviewScheduleSettings serves SchedulePreview and records the id; unset it answers 404.

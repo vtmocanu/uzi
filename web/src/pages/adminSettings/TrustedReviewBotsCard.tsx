@@ -1,5 +1,11 @@
 import { useRef, useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Input, SectionTitle } from "../../components/ui";
 import { PlusIcon, TrashIcon } from "../../components/icons";
@@ -91,7 +97,7 @@ export function TrustedReviewBotsCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const stored = settings.mr_review_trusted_bots ?? "";
   const [rows, setRows] = useState<Row[]>(() => rowsFrom(stored));
@@ -153,8 +159,9 @@ export function TrustedReviewBotsCard({
     const value = [...new Set(entries)].join(",");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ mr_review_trusted_bots: value });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { mr_review_trusted_bots: value };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setRows(rowsFrom(resp.settings.mr_review_trusted_bots ?? ""));
       setSubmitted(false);
       setNotice(

@@ -278,6 +278,14 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
    | 10 | active ci_fix, even with green CI, or recent terminal ci_fix while CI is red | follow *CI-fix branch ownership*; plain red without either remains exit 1 |
    | 12 | `RESULT=gh_rate_limited`: GitHub core or GraphQL allowance exhausted | re-arm after `GH_RETRY_AT`; never treat this as ready, findings, or CodeRabbit quota |
+   | 13 | `--since` observed an author-attention signal | inspect the push, human activity or CI approval request; never merge on this exit |
+
+   When waiting for a contributor, run `S/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA 60 60`.
+   It watches head changes, the PR author's comments/reviews/thread replies after startup,
+   and head CI requiring approval. Pass `--after ISO8601` to use an explicit discussion cutoff,
+   such as your review time. Ignore other humans, bots and edits to older comments; the mode
+   neither requests reviews nor approves CI. Read [review-signals.md](references/review-signals.md)
+   for the watermark and exit contract. Re-arm readiness separately after reviewing the response.
 
    Let an auto-review that is already running finish; never re-trigger it. Greptile skips a
    conflicting PR and a head pushed after its trigger: trigger on the final head. `--reviewer` also

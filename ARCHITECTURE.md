@@ -1068,7 +1068,11 @@ and it is not re-checked.
 
 With findings, the lead gets one repair turn and reports a disposition per
 finding through `report_cross_check_dispositions` (worker-authenticated,
-write-once). The worker renders the outcome into the MR description's "Code
+write-once). When every finding is a minor `Coverage uncertainty:` verification
+caveat, or no implementation iteration is left, no repair turn runs and
+the worker finalizes with an empty batch, so each finding is recorded as
+not reported (`CodeCrossCheckGate.done` in
+`agent/src/code-cross-check-gate.ts`). The worker renders the outcome into the MR description's "Code
 cross-check" section (`renderCodeCrossCheck` in `agent/src/pr-description.ts`);
 the run page and `uzi run get` read the same stored summary.
 
@@ -1294,7 +1298,9 @@ chain in the diagram above, with no intervening `running`.
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
   carries off the worker and adoption peels back to uncommitted (exact recovery
-  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`;
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`,
+  except that a claimed Codex run is never given to another worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md);
   the marker never commits core dumps or files over 8 MiB, and one under a
   verified coverage wrapper is peeled at successor adopt). A
   resumed run whose plan is provably reviewed and whose work recovered continues
@@ -1375,7 +1381,8 @@ chain in the diagram above, with no intervening `running`.
   rather than failing. An owner/worker/actual-Git-origin cooldown filters new
   claims until due, then serializes one ordinary recovery trial. Expiry is
   unverified; safe early affinity escape requires complete guarded source
-  disposition evidence. These placement hints grant no execution or custody
+  disposition evidence (never for a claimed Codex run, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)). These placement hints grant no execution or custody
   authority. A forge outage met later, while publishing finished work (#1324),
   parks the run in the same status with `recovery_wait_phase=publication`
   instead: the agent saves an HMAC-sealed write-ahead intent and enrolls it
@@ -1397,6 +1404,55 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
+- **awaiting_followup → running (finalize admission)** (issue #4479, feature
+  `followup_finalize_admission_v1`). When the follow-up wait ends idle or
+  stopped, the worker finalizes the run, and its publication intent can enroll
+  only against a `running` run. So before finalizing, the worker reports
+  `followup_finalize` with the `followup_park_seq` it read from this park's
+  ACK. `AdmitRunFollowupFinalize` is one fenced UPDATE under the claim-mutation
+  locks that moves exactly that park back to `running` and stamps
+  `followup_finalize_generation = claim_generation`.
+  - **Refusals.** A deliverable cancel always refuses, with `cancel_pending`
+    when the park is still at that seq or already admitted at it. A
+    pending follow-up refuses an idle finalize (`followup_pending`), but a
+    server-stamped stop does not. Anything else refuses with
+    `followup_finalize_refused`, and a superseded claim with `stale_claim`. A
+    lost ACK replays read-only to applied, unless a cancel became deliverable in
+    the meantime.
+  - **Authority.** The worker finalizes only on an applied
+    `followup_finalize_admitted` ACK. An unconfirmed reply keeps the flight and
+    custody and publishes nothing. It retries until a cancel, a shutdown, a
+    lifecycle abort or the claim fence ends it, and sends nothing while the
+    feature is withdrawn.
+  - **Stale-worker recovery.** If admission committed but its ACK was lost,
+    the worker can still report `awaiting_followup` in its snapshot. Both
+    snapshot readopt paths restore `running` for that same admitted generation
+    instead of recreating a park. The park sequence and admission stamp stay
+    unchanged; the worker still needs the explicit admission replay ACK before
+    finalizing. An unadmitted park still restores `awaiting_followup`.
+  - **Triggers (migration 00495).** They bind every writer, old api pods
+    included:
+    - `runs_followup_park_identity_trg` numbers each logical park. A retried
+      report, or a same-generation snapshot re-adopt of a numbered park, keeps
+      its seq. It also skips (`RETURN NULL`) any re-park after admission on the
+      same unreleased claim.
+    - `run_user_inputs_followup_finalize_trg` refuses every follow-up insert
+      on the interactive task once admission is live (SQLSTATE `UZ415`), until a
+      re-claim bumps the generation or the claim is released. Web, chat and
+      policy resume answer 409 `follow_up_finalizing`; Slack answers with a
+      "run is finishing" message.
+  - **Residuals.**
+    - An old worker on a new api still hangs at enrollment until it is upgraded.
+    - A park ACKed by an old api or pod carries no seq, so no admission is sent.
+    - A follow-up that arrives before a stop is admitted loses to the stop, as
+      before.
+    - A stop finalize followed by a forge outage still ends through
+      `CancelRunByWorker`, while an idle finalize parks in `recovery_wait`.
+    - The pre-existing #552-class delayed park onto a running run is unchanged.
+    - During a rolling deploy an old pod answers a refused follow-up with 500
+      rather than 409.
+    - The migration's Down loses the seq and generation values of any run that
+      is mid-finalize.
 - **running → paused (owner request)** ([PRD #1190](prds/done/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
@@ -1504,8 +1560,24 @@ chain in the diagram above, with no intervening `running`.
   `refs/uzi-recovery/<run-id>` ref rather than deleting or overwriting it. See
   [ADR-1810](adr/1810-checkpoint-retention-follows-custody.md).
   This same affinity leg is what lets a **paused** run's `resume` fall open
-  to a different worker once the pinned one is stale or gone; see
+  to a different worker once the pinned one is stale or gone (not for a Codex run at
+  generation >= 1, which stays held for its recorded worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)); see
   [ADR-1190](adr/1190-run-pause-invariants.md).
+
+- **Codex claim provenance** ([ADR-4476](adr/4476-codex-claim-provenance.md), issue #4476).
+  `runs` records the worker and generation of the last admitted Codex claim
+  (`claim_provenance_worker_id`, `claim_provenance_generation`). `ClaimRun` and its
+  provisioning/wake mirrors admit a Codex-indicating run at `claim_generation >= 1`
+  only for that worker at the current generation, through
+  `fn_codex_claim_provenance_admits`; a trigger (`trg_runs_claim_provenance_guard`)
+  lets the pair change only in an admitted `+1` claim. The affinity ceiling, the
+  stale-requeue grace, a deleted owner row, forge-origin owner pins and the
+  cross-check exemption do not override it, so the run waits for its worker
+  or is cancelled by the owner. Run health reports `waiting_worker` with "held for
+  worker NAME" or "predecessor provenance unavailable" (`workersvc/health.go`).
+  Claude runs are unchanged. There is no backfill and no rollback fence, and
+  predecessor quiescence is not proven (see the ADR's residuals).
 
 - **The checkpoint net survives a branch behind `main` on `.github/workflows`**
   ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing
@@ -1523,7 +1595,7 @@ chain in the diagram above, with no intervening `running`.
   run stays pinned to its prior worker while that worker's row exists and it is
   either draining or heartbeating, bounded by `WORKER_AFFINITY_CEILING` (default
   2h of queue dwell after promotion). A deleted worker, a stale non-draining
-  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it.
+  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it, except a Codex run already claimed once, which only the worker recorded for its current generation may claim ([ADR-4476](adr/4476-codex-claim-provenance.md)).
   `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
   A run the stale-worker sweeper requeued is additionally held for its previous
   worker, while that worker's row exists, for `WORKER_STALE_REQUEUE_GRACE` (default
@@ -2698,6 +2770,19 @@ chart `workers.ephemeralDefaultSize` or `UZI_EPHEMERAL_DEFAULT_SIZE` value pins 
 locks. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
+
+Sizes themselves live in the api's `worker_sizes` table as integers (CPU and
+memory request and limit, data and DinD disk). The api seeds and refreshes the
+shipped sizes at boot, and admins edit, add and remove sizes on **Admin →
+Workers**; the default-size settings may name any existing size, while the env
+and chart overrides stay limited to shipped names because they are validated
+before the table exists. The integers ride inline on each `DesiredWorker`, and the
+controller resolves a worker's resources from them, falling back to its
+compiled-in presets only when they are absent. It refuses values above its chart
+ceilings and reports `size_refused` or `pvc_rejected`, which surface in Admin
+health. A size a worker or a default-size setting references cannot be deleted.
+See [ADR-4213](adr/4213-admin-worker-sizes.md) and
+[PRD #4213](prds/4213-admin-worker-sizes.md).
 
 **Codex on a hosted worker needs a third identity, and that is opt-in.** The
 restricted-tier namespace above starts every worker single-uid, which is one

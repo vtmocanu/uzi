@@ -30,17 +30,20 @@
     "light_theme": "x",
     "dark_theme": "x",
     "typeface": "x",
+    "sidebar_motion": true,
     "overrides": {
       "mode": "x",
       "light_theme": "x",
       "dark_theme": "x",
-      "typeface": "x"
+      "typeface": "x",
+      "sidebar_motion": true
     },
     "defaults": {
       "mode": "x",
       "light_theme": "x",
       "dark_theme": "x",
-      "typeface": "x"
+      "typeface": "x",
+      "sidebar_motion": true
     }
   },
   "theme": "x",

@@ -113,32 +113,39 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		var unresolved *workersvc.CIFixPRUnresolvedError
-		switch {
-		case errors.As(err, &unresolved):
-			// Reason is a fixed uzi-authored string, never forge text.
-			httpx.Error(w, http.StatusConflict, "could not determine which pull request this branch belongs to: "+unresolved.Reason)
-		case errors.Is(err, workersvc.ErrCIFixBindingChanged):
-			httpx.Error(w, http.StatusConflict, "the branch's pull-request association changed while creating the CI fix; retry")
-		case errors.Is(err, workersvc.ErrCIFixPRUnavailable):
-			// err already starts with the ErrCIFixPRUnavailable text. Its cause is a fixed
-			// uzi-authored message, a deadline/cancel, or a forge driver error from
-			// GetMergeRequestSummary (PAT-redacted by the driver); database and forge
-			// construction errors are logged in workersvc and never reach this body.
-			httpx.Error(w, http.StatusBadGateway, err.Error())
-		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
-			writeNeverEnabled(w, err)
-		case errors.Is(err, workersvc.ErrRepoNotFound):
-			httpx.Error(w, http.StatusNotFound, "repo not found")
-		case errors.Is(err, workersvc.ErrActiveFixExists):
-			httpx.Error(w, http.StatusConflict, "an active CI-fix run already exists for this ref")
-		case errors.Is(err, workersvc.ErrBranchInUse):
-			httpx.Error(w, http.StatusConflict, "an active run already occupies this branch")
-		default:
-			slog.Error("create ci-fix run", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-		}
+		writeCIFixCreateError(w, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+}
+
+// writeCIFixCreateError maps CreateCIFixRun's non-guardrail refusals to an HTTP status (extracted so each arm is testable).
+func writeCIFixCreateError(w http.ResponseWriter, err error) {
+	var unresolved *workersvc.CIFixPRUnresolvedError
+	switch {
+	case writeTerminalConsumerGateRefusal(w, err):
+		// issue #4488: 503 + Retry-After (busy, retryable) or 409 (target run identity).
+	case errors.As(err, &unresolved):
+		// Reason is a fixed uzi-authored string, never forge text.
+		httpx.Error(w, http.StatusConflict, "could not determine which pull request this branch belongs to: "+unresolved.Reason)
+	case errors.Is(err, workersvc.ErrCIFixBindingChanged):
+		httpx.Error(w, http.StatusConflict, "the branch's pull-request association changed while creating the CI fix; retry")
+	case errors.Is(err, workersvc.ErrCIFixPRUnavailable):
+		// err already starts with the ErrCIFixPRUnavailable text. Its cause is a fixed
+		// uzi-authored message, a deadline/cancel, or a forge driver error from
+		// GetMergeRequestSummary (PAT-redacted by the driver); database and forge
+		// construction errors are logged in workersvc and never reach this body.
+		httpx.Error(w, http.StatusBadGateway, err.Error())
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		writeNeverEnabled(w, err)
+	case errors.Is(err, workersvc.ErrRepoNotFound):
+		httpx.Error(w, http.StatusNotFound, "repo not found")
+	case errors.Is(err, workersvc.ErrActiveFixExists):
+		httpx.Error(w, http.StatusConflict, "an active CI-fix run already exists for this ref")
+	case errors.Is(err, workersvc.ErrBranchInUse):
+		httpx.Error(w, http.StatusConflict, "an active run already occupies this branch")
+	default:
+		slog.Error("create ci-fix run", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }

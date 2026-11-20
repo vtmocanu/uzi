@@ -46,6 +46,18 @@ type PollResponse struct {
 	Workers []DesiredWorker `json:"workers"`
 }
 
+// SizeResources is one size's resolved quantities as plain integers (PRD #4213): CPU in
+// millicores, memory in MiB, disks in GiB. The controller builds its resource quantities
+// from these with fixed formats.
+type SizeResources struct {
+	CPURequestMillicores int64 `json:"cpu_request_millicores"`
+	CPULimitMillicores   int64 `json:"cpu_limit_millicores"`
+	MemoryRequestMiB     int64 `json:"memory_request_mib"`
+	MemoryLimitMiB       int64 `json:"memory_limit_mib"`
+	DataGiB              int64 `json:"data_gib"`
+	DinDDataGiB          int64 `json:"dind_data_gib"`
+}
+
 // DesiredWorker is one hosted worker's desired state.
 type DesiredWorker struct {
 	RollEvidence   *RollEvidence `json:"roll_evidence,omitempty"`
@@ -55,12 +67,15 @@ type DesiredWorker struct {
 	// (Decision 7). Always set — a hosted row cannot exist without one
 	// (ck_workers_hosted_metadata).
 	Template string `json:"template"`
-	// Size is the preset name (s/m/l/l-highmem), resolved to cpu/memory/PVC size by the
-	// controller against its own copy of the preset constants. The api sends the
-	// NAME, not the resolved quantities: presets are code constants on both
-	// sides, and shipping resolved values would make the api the authority on a
-	// pod spec it is not allowed to know anything about.
+	// Size is the size NAME (s/m/l/l-highmem for the shipped sizes). The name still
+	// rides; the resolved integers ride alongside it in Resources (PRD #4213 reverses
+	// PRD #58 Decision 7 for sizes only; templates stay name-only). A DesiredWorker
+	// with no Resources comes from an older api, and the controller then uses its
+	// compiled-in builtin values for the name.
 	Size string `json:"size"`
+	// Resources is the size's resolved quantities as plain integers (PRD #4213), so the
+	// api never handles a quantity string. omitempty: absent means an older api.
+	Resources *SizeResources `json:"resources,omitempty"`
 	// Docker is the rootless-DinD sidecar opt-in (PRD #83 M3): true → the controller
 	// renders the worker with a privileged DinD native sidecar in the dedicated
 	// privileged-tier namespace, false → #58's plain single-container worker in the
@@ -282,6 +297,9 @@ type StatusReport struct {
 	// Hibernation is the highest hibernation protocol version this controller speaks
 	// (PRD #4205); omitted by a controller that predates the feature.
 	Hibernation int `json:"hibernation,omitempty"`
+	// AdminSizes is the controller's admin-size support version (PRD #4213); 0 or
+	// absent means an older controller that ignores DesiredWorker.Resources.
+	AdminSizes int `json:"admin_sizes,omitempty"`
 }
 
 // WorkerStatus is one hosted worker's roll health as it arrives on the wire.

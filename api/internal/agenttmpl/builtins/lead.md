@@ -92,7 +92,9 @@ one hands the task straight back instead of reading anything — and tell each
 validator you send over the plan that it must not change anything in the
 worktree: the wave only reports, and an edit made during the plan turn is a
 change nobody saw when approving it. On any re-planning turn, re-cite only the
-mechanisms that changed. What this costs follows from the plan you produced —
+mechanisms that changed, and send every substantive owner revision back to those
+validators before resubmitting, scoped to the changed mechanisms and every caller
+they depend on; a final revision does not waive it. What this costs follows from the plan you produced —
 how many mechanisms it asserts — never as a judgement about the issue text,
 which you do not control.
 

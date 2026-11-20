@@ -869,3 +869,41 @@ func TestCIAutofixUnavailableBindingRetriesNextTick(t *testing.T) {
 		t.Fatalf("upserts after tick 2 = %d, want 1", len(st.upserts))
 	}
 }
+
+// TestCIAutofixTerminalConsumerGateBusyRetriesNextTick pins issue #4488: contention on the
+// repo's terminal consumer gate (nothing created) must NOT record the pipeline, unlike the
+// ErrActiveFixExists/ErrBranchInUse swallow, so the same failing pipeline is retried next tick.
+func TestCIAutofixTerminalConsumerGateBusyRetriesNextTick(t *testing.T) {
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}}
+	runs := &cfRuns{err: errors.Join(workersvc.ErrTerminalConsumerGateBusy, errors.New("lock timeout"))}
+	notifier := &cfNotifier{}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+	cf := newCF(st, runs, notifier)
+
+	cf.detect(context.Background(), cfRepoRow(), f, f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
+	}
+	if len(st.records) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("a busy gate must not consume the pipeline: records=%+v upserts=%+v", st.records, st.upserts)
+	}
+	if len(f.notes) != 0 || len(notifier.calls) != 0 {
+		t.Fatalf("a busy gate must not comment/notify: notes=%d notifs=%d", len(f.notes), len(notifier.calls))
+	}
+
+	runs.err = nil // the hold ended
+	cf.detect(context.Background(), cfRepoRow(), f, f)
+
+	if len(runs.calls) != 2 {
+		t.Fatalf("expected the next tick to retry the create, calls=%d", len(runs.calls))
+	}
+	if len(st.upserts) != 1 {
+		t.Fatalf("the retried create must advance the counter once, upserts=%d", len(st.upserts))
+	}
+	got := st.upserts[0]
+	if got.RepoID != cfRepoID || got.Ref != cfRef || !got.LastPipelineID.Valid || got.LastPipelineID.Int64 != 9001 ||
+		!got.LastSignature.Valid || got.LastSignature.String != workersvc.FailureSignature(runs.calls[1].snapshot) {
+		t.Fatalf("retry recorded the wrong pipeline identity or signature: %+v", got)
+	}
+}

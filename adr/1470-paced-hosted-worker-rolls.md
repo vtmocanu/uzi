@@ -86,6 +86,154 @@ confirm an identical non-nil marker without an artificial no-op revision advance
 changed markers and cancellation require confirmed revision advance. This
 handoff is not an additional journal and preserves legacy /data self-heal.
 
+#### Lost-canary adoption (#4466)
+
+When a pool has incomplete participant reservations but no canary (annotation
+reset, or a canary Deployment recreated without its marker outside the
+controller), the controller may adopt one existing participant as canary
+instead of holding the pool for explicit recovery. The
+chosen participant must pass the unchanged promotion proof (D4: fresh
+registration with a new nonce, exact version, current pod UID/ancestry,
+heartbeat, coverage, serving eligibility (not cordoned or drained), and no
+pressure, maintenance or custody-drain fence), be on
+its reserved template with exactly one replica, not drift, and carry no claim
+mirror. The smallest worker ID wins. Of the marker, only its `canary` bit
+changes, by one metadata patch (the usual operator labels and annotations are merged as on
+every reservation write) conditioned on the Deployment UID/resourceVersion; nonce,
+previous version, target, coverage and `completed=false` are preserved. No
+registration evidence is fabricated, nothing is completed, no peer is cleaned
+up and no cordon changes.
+
+Adoption needs a clean observation: no blocked or pin-changed pool; no write to
+any pool worker earlier in the same tick (reservation, claim mirror, drain
+release); no duplicate Deployments for a worker ID and no stray annotated
+Deployment in the namespace; no unplanned worker in scope; no uncertain,
+migration or layout fence; no hibernating, unavailable or unattributed
+reservation evidence; and no out-of-pool canary of the same owner and lane.
+
+The branch also runs when every remaining participant is already proven (none
+is in flight): while incomplete participant reservations exist without a canary,
+ordinary planning admits no new canary, because an earlier adoption patch could
+still commit beside it. If adoption is refused there, the pool holds with the
+no-canary reason. A same owner/lane canary in a sibling capability pool does not
+lift this hold: it touches no Deployment in this pool, so it cannot fence an
+adoption patch still outstanding here. Adoption refuses beside it, so the pool
+holds with the no-canary reason until a canary exists in the pool again or
+explicit recovery.
+
+The tick is adoption-only: the pool's planning ends after the write and its
+coverage is fenced, so no replacement, PVC or replica change happens that tick.
+Normal promotion, coverage and concurrency rules resume after re-observation. A
+conflicting or unconfirmed write keeps the pool closed until a fresh
+observation.
+
+Selection is restart-safe through two predicates. A participant is a
+*candidate* when it could be adopted now. It is *patch-fenced* when a delayed
+adoption patch for it can no longer commit, judged only from the currently
+observed Deployment: absent, terminating, replicas non-nil and not 1, template
+hash or image different from the marker, or marker absent or completed. Each of
+these implies a write to or removal of that Deployment, so an outstanding
+patch's UID/resourceVersion precondition fails. That precondition is carried by
+the request, not stored, and is unrecoverable after a restart; the marker
+records no Deployment UID and none is added. Not fencing: desired-state drift
+(for example generation rotation), target-version changes, claim mirrors,
+pod, heartbeat or cordon evidence, nil replicas, and a same-name Deployment
+recreated candidate-shaped (this errs toward holding). If any smaller-ID
+incomplete participant is neither candidate nor patch-fenced, the pool holds
+with "earlier participant may hold an unresolved adoption request".
+
+The invariant is that while orphaned, the controller writes blocked
+participants' Deployments only through metadata reservation writes that never
+undo a fence. Hibernation wake follows this invariant too: a waking worker with
+an open reservation (including unresolved Deployment metadata or a claim mirror)
+rejoins ordinary roll planning, occupies its existing roll slots and can never
+be an adoption candidate. Replica and template changes require ordinary
+admission on a tick free of uncertainty and migration fences. A waking worker
+supplies no serving coverage until its wake settles. Once its cohort's canary
+is observed and normal admission permits it, the worker may wake; readiness
+reporting then needs no further mutation admission, so the API can settle the
+wake. A retained canary reservation on the data claim can admit recreation of
+its missing Deployment through the same recovery path, carrying the marker
+forward, but only with matching API owner and placement evidence. A mirror
+alone does not authorize wake. Preparing and hibernated workers remain outside
+roll planning, and wakes
+with no open reservation or only a completed reservation retain their existing
+behaviour. An out-of-contract actor (an external edit, `forceRoll`) can still
+produce two canaries; the unchanged duplicate-canary hold keeps that pool
+closed.
+
+This deviates from "adopt the smallest eligible participant": adoption holds
+while an earlier participant is unresolved, and clears automatically once that
+participant regains proof or its Deployment is rescaled, retemplated or loses its
+marker. Deleting a previously registered participant's Deployment fences that
+participant but does not recover the pool. Without a retained claim
+reservation or independent-rebuild evidence it usually trips the
+missing-deployment guard ("missing deployment lacks first-provision evidence;
+explicit recovery required"), which blocks adoption for the whole pool. With a
+retained claim reservation the guard is avoided, but adoption is refused and the
+pool stays held with "participant reservation without canary; explicit
+recovery required"; the Deployment stays missing until a canary exists again or
+explicit recovery. The layout-migration hold has a matching fence: a held
+canary keeps its incomplete reservation and fences the pool while incomplete same-cohort participants
+remain, instead of cancelling it, because cancelling would leave those
+participants without a canary. A desired worker that cannot be rendered in the
+same or an unknown namespace also keeps this history: its cohort membership
+cannot be ruled out from the incomplete observation.
+
+#### Absent duplicate-canary cancellation (#4475)
+
+When a pool holds exactly two incomplete canary reservations and the
+old-incarnation duplicate proof fails, the controller cancels one (D) instead of
+holding the pool, only if every condition below holds. D's Deployment is live, at
+replicas 0, and no pod, PVC or claim is attributable to it by any identity
+signal: worker-id label, Deployment-name prefix, direct or ReplicaSet ownership
+(terminating ReplicaSets included), canonical claim names or mounts. Every
+attributable ReplicaSet must have a known zero desired replica count; a pending
+pod producer denies absence even when no pod has been observed. D's
+reservation hash differs from its deployed template and D has drifted from the
+target, and D is not custody-held, under maintenance, busy or hibernating. The
+other canary (S) is current: a live one-replica Deployment that is not physically
+absent and not stuck, its reservation equals the rendered target hash, image and
+exact version, its deployed template equals the reservation, it has the same
+owner and lane, is not custody-held, and carries no claim mirror or malformed
+reservation. The whole pool and namespace
+observation is clean: no hibernating or waking member, no unavailable, mutated,
+blocked, snapshot-incomplete or undecodable-reservation member, no uncertainty,
+migration or layout fence, no unplanned worker in the namespace or an unknown
+one, no ambiguous identity or stray reservation, and no out-of-pool canary of the
+same owner and lane or unattributed reservation.
+
+The only write is one metadata-only reservation cancellation conditioned on D's
+UID and resourceVersion. The pool is then held ("duplicate canary cancelled for
+absent worker; re-observation required") and the next tick re-observes and
+resumes through normal promotion, coverage and concurrency rules. The
+cancellation grants S no promotion proof. A conflict or unconfirmed write keeps
+the existing hold and is reported as an error; an uncertain write that committed
+is not repeated, because the next tick sees one canary.
+
+The pool stays in the existing hold (`duplicate canary reservations unresolved;
+explicit recovery required`) when any absence proof is not met; when the absent
+duplicate is already on the target template (not drifted), because cancelling it
+can leave a markerless worker held as "target template has no reservation
+proof"; when the pool has a waking hibernation member; when the survivor is
+physically absent, terminating, stuck or otherwise not current; and with three or
+more canaries. Two live canaries cannot use this fallback, but the existing
+old-incarnation duplicate proof may still cancel their reservations. When the
+absent worker has drifted, manual recovery is to pause controller reconciliation,
+clear the stale `uzi.dev/image-roll` annotation from its data claim first (if
+present), and then clear it from the Deployment. Re-observe both annotations as
+absent before resuming reconciliation, so rollSnapshot cannot restore the stale
+mirror. The worker then re-enters as a fresh drifted participant. Other held
+shapes need case-specific recovery.
+
+How the second canary arises is not established. Characterization tests found
+that the mapping-correction retarget rewrites only an entry's own marker (keeping
+its canary bit, resetting `completed`) and observed no second canary holder,
+including when completed canary history kept on a claim mirror is reopened as an
+incomplete canary at the new version. The producing path of the incident is
+therefore unknown; this rule settles the one provably safe shape and does not
+prevent the duplicate.
+
 ### D4 — Promotion proves the current incarnation
 
 The promotion boundary in `controller/internal/kube/roll_pacing.go` requires:
@@ -296,6 +444,8 @@ API-server ordering/conflict rejection and hosted retained-fleet availability
 remain **open**. Local health/report persistence and retained-N-1 claim replay
 checks do not establish real API-server behavior or production availability.
 The existing KinD smoke disables the controller and covers the envelope only.
+Lost-canary adoption (#4466) is proven only against the simulated API server;
+real-API-server and hosted coverage of it stays with #3346.
 The
 [maintainer runbook](../docs/hosted-worker-roll-verification.md) defines the open
 bad-tag/good-tag, restart, delayed-write, nonce and recovery checks.

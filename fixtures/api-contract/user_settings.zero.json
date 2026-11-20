@@ -17,6 +17,8 @@
   "light_theme": null,
   "dark_theme": null,
   "typeface": null,
+  "sidebar_motion": null,
+  "effective_sidebar_motion": false,
   "default_harness": null,
   "judge_runs_on": null,
   "claude_provider_id": null,

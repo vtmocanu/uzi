@@ -990,3 +990,27 @@ func TestReplierReviseMismatchRetiresCard(t *testing.T) {
 		t.Fatalf("user-facing copy must not carry an em dash: %q", u.sectionText)
 	}
 }
+
+// Issue #4479: a reply the finalizing run refuses (the worker's followup_finalize admission is
+// live) is told so with an ephemeral, on both the awaiting_followup park and a live run, instead
+// of only a log line.
+func TestReplierFollowUpFinalizingRefusalIsEphemeral(t *testing.T) {
+	for _, status := range []string{"awaiting_followup", "running"} {
+		t.Run(status, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+			sub := &fakeSubmitter{run: liveRun(runID, user.ID, status), submitErr: errors.Join(errors.New("submit"), ErrFollowUpFinalizing)}
+			fp := &fakePoster{}
+			r := NewReplier(fs, sub, fp, nil)
+
+			r.HandleMessage(context.Background(), reply("one more thing"))
+
+			if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "That run is finishing; your follow-up was not delivered.") {
+				t.Fatalf("a refused follow-up must be answered with the finishing ephemeral: %+v", fp.ephemerals)
+			}
+			if len(fp.reactions) != 0 {
+				t.Fatalf("a refused follow-up must not be acked: %+v", fp.reactions)
+			}
+		})
+	}
+}

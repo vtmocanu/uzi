@@ -135,6 +135,19 @@ func samplePollResponse() PollResponse {
 				OpID: "88888888-8888-8888-8888-888888888888", StopProofPodUID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", ReconcileSeq: 2,
 			}},
 		},
+		{
+			// A worker carrying resolved size integers (PRD #4213): the `l` builtin values. The
+			// other workers carry none, so both shapes (new api, and the pre-#4213 api) ride one
+			// wire and a drop or a pointer/value collapse of Resources reddens on either side.
+			ID:       "77777777-7777-7777-7777-777777777777",
+			Template: "base", Size: "l", Generation: 1,
+			Resources: &SizeResources{
+				CPURequestMillicores: 1000, CPULimitMillicores: 4000,
+				MemoryRequestMiB: 14336, MemoryLimitMiB: 20480,
+				DataGiB: 50, DinDDataGiB: 50,
+			},
+			DiskPressureVolumes: []string{},
+		},
 	}}
 }
 
@@ -231,3 +244,30 @@ func TestPollLivenessIndependentOfPromotionProof(t *testing.T) {
 // There is deliberately no request-side contract to pin: the poll is a GET with no
 // body. The ack that used to travel in one is gone — delivery is proved by the
 // worker's own registration, not asserted by the controller.
+
+// The api decodes both desired-worker shapes of the golden (PRD #4213): the pre-#4213
+// shape without resources (nil) and the new shape with the exact `l` integers.
+func TestPollWireGoldenDecodesBothResourceShapes(t *testing.T) {
+	raw, err := os.ReadFile(wireContractFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp PollResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatal(err)
+	}
+	var withResources int
+	for _, w := range resp.Workers {
+		if w.Resources == nil {
+			continue
+		}
+		withResources++
+		want := SizeResources{CPURequestMillicores: 1000, CPULimitMillicores: 4000, MemoryRequestMiB: 14336, MemoryLimitMiB: 20480, DataGiB: 50, DinDDataGiB: 50}
+		if *w.Resources != want {
+			t.Fatalf("resources = %+v, want %+v", *w.Resources, want)
+		}
+	}
+	if withResources != 1 || len(resp.Workers) < 2 {
+		t.Fatalf("%d workers carry resources of %d, want exactly 1 (the rest are the old shape)", withResources, len(resp.Workers))
+	}
+}

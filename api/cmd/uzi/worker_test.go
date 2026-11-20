@@ -854,12 +854,12 @@ func TestWorkerListShowsUptime(t *testing.T) {
 		t.Helper()
 		for _, line := range strings.Split(out, "\n") {
 			if strings.Contains(line, name) {
-				// UPTIME is the 4th column: ID NAME STATUS UPTIME VERSION UPGRADE TOKEN.
+				// UPTIME is the 5th column: ID NAME STATUS SIZE UPTIME VERSION UPGRADE TOKEN.
 				f := strings.Fields(line)
-				if len(f) < 4 {
+				if len(f) < 5 {
 					t.Fatalf("row for %s has too few fields: %q", name, line)
 				}
-				return f[3]
+				return f[4]
 			}
 		}
 		t.Fatalf("no row for %s in %q", name, out)
@@ -870,6 +870,50 @@ func TestWorkerListShowsUptime(t *testing.T) {
 	}
 	if got := uptimeOf("bravo"); got != "-" {
 		t.Errorf("offline worker's UPTIME = %q, want - (an offline worker is not up)", got)
+	}
+}
+
+// TestWorkerListAndGetShowSize asserts the SIZE column right after STATUS in both tables:
+// a builtin and an admin-added name render, a hostile name is sanitized, and an external
+// worker reads "-".
+func TestWorkerListAndGetShowSize(t *testing.T) {
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "alpha", Status: "online", Kind: "hosted", HostedSize: strPtrT("xs"), AnthropicBindMode: "default"},
+		{ID: "w2", Name: "bravo", Status: "online", Kind: "hosted", HostedSize: strPtrT("l-highmem"), AnthropicBindMode: "default"},
+		{ID: "w3", Name: "charlie", Status: "online", Kind: "external", AnthropicBindMode: "default"},
+		{ID: "w4", Name: "delta", Status: "online", Kind: "hosted", HostedSize: strPtrT("ev\x1b[31mil"), AnthropicBindMode: "default"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Fatalf("escape reached the table: %q", out)
+	}
+	cols := map[string]string{"alpha": "xs", "bravo": "l-highmem", "charlie": "-"}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if f[0] == "ID" {
+			if len(f) < 4 || f[2] != "STATUS" || f[3] != "SIZE" {
+				t.Fatalf("header = %q, want SIZE right after STATUS", line)
+			}
+			continue
+		}
+		if want, ok := cols[f[1]]; ok && f[3] != want {
+			t.Errorf("%s SIZE = %q, want %q (%q)", f[1], f[3], want, line)
+		}
+	}
+	got, _, code := runCLI(t, fakeEnv(fc), "worker", "get", "w1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("get exit = %d", code)
+	}
+	hdr := strings.Fields(strings.Split(got, "\n")[0])
+	row := strings.Fields(strings.Split(got, "\n")[1])
+	if len(hdr) < 4 || hdr[3] != "SIZE" || len(row) < 4 || row[3] != "xs" {
+		t.Errorf("worker get table = %q", got)
 	}
 }
 

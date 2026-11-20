@@ -6,7 +6,7 @@
 // Active-state logic keeps a parent lit on child routes.
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type HealthDoc, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
@@ -31,6 +31,7 @@ import { FindingsOpenContext, FindingsOpenValueContext } from "./FindingsOpenCon
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
 import { NAV_SECTIONS, type NavBadgeKey } from "./navItems";
+import { SIDEBAR_MOTION_ICONS, useNavIconMotion } from "./sidebarMotion";
 import { CommandMenu } from "./CommandMenu";
 import { CommandMenuContext } from "./CommandMenuContext";
 import { isApplePlatform } from "../lib/platform";
@@ -431,9 +432,10 @@ type NavItemBadge =
     }
   | { badge?: undefined; badgeLabel?: undefined };
 
-function NavItem({
+export function NavItem({
   to,
   icon,
+  motionKey,
   label,
   exactOnly = false,
   indent = false,
@@ -446,6 +448,9 @@ function NavItem({
 }: NavItemBadge & {
   to: string;
   icon?: ReactNode;
+  // Opt-in animated glyph (issue #4510): the NAV_SECTIONS key whose SIDEBAR_MOTION_ICONS entry
+  // replaces `icon`. Only the top-level destinations pass it; repo child rows do not.
+  motionKey?: string;
   label: string;
   exactOnly?: boolean;
   indent?: boolean;
@@ -482,6 +487,9 @@ function NavItem({
   healthPip?: HealthDoc["counts"] | null;
 }) {
   const { pathname } = useLocation();
+  const motion = useNavIconMotion();
+  const motionGlyph = motionKey ? SIDEBAR_MOTION_ICONS[motionKey] : undefined;
+  const iconNode = motionGlyph ? motionGlyph() : icon;
   const active = exactOnly ? pathname === to : isNavActive(pathname, to);
   const hasBadge = badge > 0;
   const alert = badgeTone === "alert";
@@ -495,7 +503,13 @@ function NavItem({
   return (
     <Link
       to={to}
-      onClick={onNavigate}
+      ref={motion.ref as RefObject<HTMLAnchorElement>}
+      onClick={() => {
+        onNavigate?.();
+        if (motionGlyph) motion.onClick();
+      }}
+      onPointerEnter={motionGlyph ? motion.onPointerEnter : undefined}
+      onFocus={motionGlyph ? motion.onFocus : undefined}
       aria-current={active ? "page" : undefined}
       title={collapsed ? label : undefined}
       className={cx(
@@ -515,9 +529,9 @@ function NavItem({
         active ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60 hover:text-fg",
       )}
     >
-      {icon && (
+      {iconNode && (
         <span className={cx("relative text-base", active ? "text-brand" : "text-faint group-hover:text-muted")}>
-          {icon}
+          {iconNode}
           {collapsed && hasBadge && (
             <span
               aria-hidden="true"
@@ -813,6 +827,7 @@ function SidebarContent({
                 <NavItem
                   to={def.to}
                   icon={def.icon}
+                  motionKey={def.key}
                   label={def.label}
                   exactOnly={def.exactOnly}
                   onNavigate={onNavigate}

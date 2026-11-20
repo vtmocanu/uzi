@@ -339,6 +339,10 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// notifier's statusGlyph — and so a future change to the default cannot silently break
 		// the resume of a parked interactive task.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text, nil); err != nil {
+			if errors.Is(err, ErrFollowUpFinalizing) {
+				r.ephemeral(ctx, m, followUpFinalizingText)
+				return
+			}
 			r.logf("submit follow_up (awaiting_followup)", err)
 			return
 		}
@@ -347,6 +351,10 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	default:
 		// Live run, no gate → follow_up for the next implement turn.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text, nil); err != nil {
+			if errors.Is(err, ErrFollowUpFinalizing) {
+				r.ephemeral(ctx, m, followUpFinalizingText)
+				return
+			}
 			r.logf("submit follow_up", err)
 			return
 		}

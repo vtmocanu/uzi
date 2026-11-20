@@ -1,3 +1,4 @@
+import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
 import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
@@ -5594,73 +5595,79 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
   ];
 
   it("(18) a root spawn_agent runs a CHILD turn demuxed onto a child thread; child effects run, child signals + nested delegation are denied, and the child settles before the parent callback resolves", async () => {
-    // The child's frames are pushed WHEN its turn/start is issued (i.e. AFTER the child
-    // sink is registered), modelling the app-server sending them after turn/start.
-    const responder: Responder = (c) => {
-      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
-      if (c.method === "turn/start") {
-        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
-        // The CHILD turn: emit its callbacks + terminal now that the sink is registered.
-        c.transport
-          .push(toolCall(11, "uzi_bash", { command: "echo hi" }, "th-child", "tn-child", "cc-bash"))
-          .push(toolCall(12, "submit_plan", { plan: "child cannot plan" }, "th-child", "tn-child", "cc-sig"))
-          .push(toolCall(13, "spawn_agent", { role: "coder" }, "th-child", "tn-child", "cc-nest"))
-          .push(turnCompleted("completed", "th-child", "tn-child"));
-        return { turn: { id: "tn-child" } };
-      }
-      if (c.method === "turn/interrupt") return {};
-      return {};
-    };
-    const rig = makeRig({ responder });
-    // The ROOT turn: a single spawn_agent callback, then (pushed once the parent replies)
-    // the root terminal.
-    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+    for (let invocation = 0; invocation < 2; invocation++) {
+      // The child's frames are pushed WHEN its turn/start is issued (i.e. AFTER the child
+      // sink is registered), modelling the app-server sending them after turn/start.
+      const responder: Responder = (c) => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          // The CHILD turn: emit its callbacks + terminal now that the sink is registered.
+          c.transport
+            .push(toolCall(11, "uzi_bash", { command: "echo hi" }, "th-child", "tn-child", "cc-bash"))
+            .push(toolCall(12, "submit_plan", { plan: "child cannot plan" }, "th-child", "tn-child", "cc-sig"))
+            .push(toolCall(13, "spawn_agent", { role: "coder" }, "th-child", "tn-child", "cc-nest"))
+            .push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        if (c.method === "turn/interrupt") return {};
+        return {};
+      };
+      const rig = makeRig({ responder });
+      // The ROOT turn: a single spawn_agent callback, then (pushed once the parent replies)
+      // the root terminal.
+      rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
 
-    const { ctx } = makeCtx({ agents, config: { default_effort: "medium" } });
-    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const { ctx } = makeCtx({ agents, config: { default_effort: "medium" } });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
 
-    // The parent spawn_agent callback resolves ONLY after the child settles; once the
-    // parent has replied, close the root turn.
-    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
-    // The ROOT then signals done so the m2 implement/review loop finishes (delegation is not a
-    // signal — only this root signal_done ends the run).
-    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
-    await withTimeout(runP, 3000, "delegation run");
+      // The parent spawn_agent callback resolves ONLY after the child settles; once the
+      // parent has replied, close the root turn.
+      await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
+      // The ROOT then signals done so the m2 implement/review loop finishes (delegation is not a
+      // signal — only this root signal_done ends the run).
+      rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+      await withTimeout(runP, 3000, "delegation run");
 
-    // A child thread + turn were started on the SAME transport (demuxed).
-    assert.equal(rig.transport.threadStartCount, 2, "a child thread/start was issued");
-    assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was issued");
-    const childTurn = rig.transport.requests.filter((request) => request.method === "turn/start")[1];
-    assert.ok(childTurn);
-    assert.equal(rec(childTurn.params).effort, "medium", "the delegated child inherits the configured effort through the real wire key");
-    assert.equal(rec(childTurn.params).modelReasoningEffort, undefined, "the ignored internal field name never reaches the child wire");
-    const childStart = rig.transport.requests.filter((request) => request.method === "thread/start")[1];
-    assert.ok(childStart);
-    const childParams = rec(childStart.params);
-    assert.deepEqual(childParams.environments, [], "the child receives no native execution environment");
-    const childTools = childParams.dynamicTools as Array<Record<string, unknown>>;
-    assert.ok(childTools.some((tool) => tool.name === "uzi_bash"), "the child's granted shell callback uses the collision-free wire alias");
-    assert.equal(childTools.some((tool) => tool.name === "signal_done"), false, "root signals are not advertised to a child");
-    assert.equal(childTools.some((tool) => tool.name === "spawn_agent"), false, "nested delegation is not advertised to a child");
-    assert.match(String(childParams.developerInstructions), /^coder body\n\n/, "the rendered child prompt uses the real protocol field");
-    assert.match(String(childParams.developerInstructions), /Read AGENTS\.md first/, "repository guidance reaches the actual child wire");
-    assert.match(String(childParams.developerInstructions), /git ls-files -s -- CLAUDE\.md/);
-    assert.match(String(childParams.developerInstructions), /git cat-file -p/);
-    assert.equal(childParams.instructions, undefined);
+      // A child thread + turn were started on the SAME transport (demuxed).
+      assert.equal(rig.transport.threadStartCount, 2, "a child thread/start was issued");
+      assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was issued");
+      const childTurn = rig.transport.requests.filter((request) => request.method === "turn/start")[1];
+      assert.ok(childTurn);
+      assert.deepEqual(rec(childTurn.params).environments, [], "the child turn disables native execution environments");
+      assert.equal(rec(childTurn.params).effort, "medium", "the delegated child inherits the configured effort through the real wire key");
+      assert.equal(rec(childTurn.params).modelReasoningEffort, undefined, "the ignored internal field name never reaches the child wire");
+      const childStart = rig.transport.requests.filter((request) => request.method === "thread/start")[1];
+      assert.ok(childStart);
+      const childParams = rec(childStart.params);
+      assertNoNativeServers(childParams.config);
+      assert.equal(childParams.ephemeral, true);
+      assert.equal(rig.transport.requests.some(r => r.method === "thread/resume"), false);
+      assert.deepEqual(childParams.environments, [], "the child receives no native execution environment");
+      const childTools = childParams.dynamicTools as Array<Record<string, unknown>>;
+      assert.ok(childTools.some((tool) => tool.name === "uzi_bash"), "the child's granted shell callback uses the collision-free wire alias");
+      assert.equal(childTools.some((tool) => tool.name === "signal_done"), false, "root signals are not advertised to a child");
+      assert.equal(childTools.some((tool) => tool.name === "spawn_agent"), false, "nested delegation is not advertised to a child");
+      assert.match(String(childParams.developerInstructions), /^coder body\n\n/, "the rendered child prompt uses the real protocol field");
+      assert.match(String(childParams.developerInstructions), /Read AGENTS\.md first/, "repository guidance reaches the actual child wire");
+      assert.match(String(childParams.developerInstructions), /git ls-files -s -- CLAUDE\.md/);
+      assert.match(String(childParams.developerInstructions), /git cat-file -p/);
+      assert.equal(childParams.instructions, undefined);
 
-    // The child's Bash effect ran as the command identity (through the demux + child broker).
-    const bash = rig.spawnCommandCalls.find((s) => JSON.stringify(s.argv).includes("echo hi"));
-    assert.ok(bash, "the child Bash effect reached the command-identity spawn seam");
+      // The child's Bash effect ran as the command identity (through the demux + child broker).
+      const bash = rig.spawnCommandCalls.find((s) => JSON.stringify(s.argv).includes("echo hi"));
+      assert.ok(bash, "the child Bash effect reached the command-identity spawn seam");
 
-    const replyOf = (id: number): { success?: boolean } => {
-      const entry = rig.transport.responses.find((r) => r.requestId === id);
-      const response = rec(entry?.response);
-      return rec(response.result) as { success?: boolean };
-    };
-    assert.equal(replyOf(11).success, true, "the child Bash callback succeeded");
-    assert.equal(replyOf(12).success, false, "a child submit_plan (non-root signal) is denied");
-    assert.equal(replyOf(13).success, false, "a child nested spawn_agent is denied");
-    assert.equal(replyOf(1).success, true, "the parent spawn_agent callback succeeded after the child settled");
+      const replyOf = (id: number): { success?: boolean } => {
+        const entry = rig.transport.responses.find((r) => r.requestId === id);
+        const response = rec(entry?.response);
+        return rec(response.result) as { success?: boolean };
+      };
+      assert.equal(replyOf(11).success, true, "the child Bash callback succeeded");
+      assert.equal(replyOf(12).success, false, "a child submit_plan (non-root signal) is denied");
+      assert.equal(replyOf(13).success, false, "a child nested spawn_agent is denied");
+      assert.equal(replyOf(1).success, true, "the parent spawn_agent callback succeeded after the child settled");
+    }
   });
 
   it("(19) the non-delegation root path is byte-identical after the demux edit (no child thread/start)", async () => {

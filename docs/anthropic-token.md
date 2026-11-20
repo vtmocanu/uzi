@@ -317,7 +317,7 @@ Four modes:
 
 | Mode | Meaning |
 |---|---|
-| **Inherit** (default) | No override — the run follows whatever the worker is bound to, exactly as today. |
+| **Inherit** (default) | No override — the run follows whatever the worker is bound to, exactly as today. The picker's option reads **Default · worker's token (worker binding)** wherever it renders (the start dialog, the plan gate, a run's token switch and the schedule modal). |
 | **Pin** to a named token | Spend that token, whatever the worker is bound to. |
 | **Auto** | Auto-select from your pool for this run, even on a worker that is itself pinned or set to default. |
 | **Default** | Spend your default token, even on a worker that is pinned or set to auto. |

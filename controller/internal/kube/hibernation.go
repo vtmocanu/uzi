@@ -330,6 +330,12 @@ func (m *Materializer) reportHibernation(ctx context.Context, w protocol.Desired
 	return nil
 }
 
+// hibernationRollReservation includes unresolved metadata and retained claim mirrors,
+// which are not permission to start or stop a worker outside roll planning.
+func hibernationRollReservation(e *rollEntry) bool {
+	return e.rawReservation || hasOpenReservation(e) || (e.claim != nil && e.claim.Annotations[annotationRoll] != "")
+}
+
 // hibernationRefusal returns why a worker preparing to hibernate must be refused, ""
 // when it may proceed. It fails closed: anything the roll machinery is doing, or could
 // not be shown not to be doing, refuses.
@@ -338,7 +344,7 @@ func (m *Materializer) hibernationRefusal(ctx context.Context, w protocol.Desire
 	switch {
 	case e == nil:
 		return refuseNoRollEvidence
-	case e.rawReservation || hasOpenReservation(e) || (e.claim != nil && e.claim.Annotations[annotationRoll] != ""):
+	case hibernationRollReservation(e):
 		return refuseRollReservation
 	case e.marker != nil && e.blocked != "":
 		return refuseRollReservation
@@ -407,11 +413,7 @@ func (m *Materializer) retireHibernationHistory(ctx context.Context, t *rollTick
 			if p == e || p.ns != e.ns {
 				continue
 			}
-			c, ok := coverageOf(p.w, p.ns)
-			outOfScope := ok && c.Owner != e.marker.Coverage.Owner && p.blocked == "" && !p.rawReservation &&
-				(p.claim == nil || p.claim.Annotations[annotationRoll] == "") &&
-				(p.marker == nil || p.marker.Coverage.Owner == c.Owner)
-			if outOfScope {
+			if rollPeerOutOfScope(p, e.marker.Coverage.Owner) {
 				continue
 			}
 			if p.marker != nil || p.rawReservation || (p.claim != nil && p.claim.Annotations[annotationRoll] != "") ||
@@ -677,8 +679,22 @@ func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.O
 	return false
 }
 
+// wakeRollAdmitted keeps unreserved wakes on their existing hibernation-owned
+// path. A wake with open roll evidence must pass ordinary admission, including
+// the tick's uncertainty and migration fences. Readiness reporting needs no new
+// mutation admission, so a restored participant can still settle its wake.
+func wakeRollAdmitted(ctx context.Context, id string) bool {
+	e := rollFrom(ctx, id)
+	if e == nil || (e.hibernation && !hibernationRollReservation(e) && !e.snapshotIncomplete) {
+		return true
+	}
+	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
+	return tick != nil && !e.hibernation && e.admitted &&
+		!tick.uncertain[coverageKey(e.coverage)] && !migrationLaneFenced(tick, e.coverage)
+}
+
 // hibernateWake brings a hibernated worker back at its current template. It
-// deliberately bypasses the busy/migration-held deferral that guards a drift roll: the
+// bypasses the busy/migration-held deferral only without an open roll reservation: the
 // worker has no pod and no run, and an old-layout custody hold protects a pod's
 // in-pod workdir that a woken-from-zero worker does not have.
 //
@@ -694,6 +710,9 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 	op := w.Hibernation.OpID
 	if !obs.HasDeployment {
 		if m.wakeHeldForPods(w, obs) {
+			return nil
+		}
+		if !wakeRollAdmitted(ctx, w.ID) {
 			return nil
 		}
 		return m.createHibernationDeployment(ctx, w, obs, ns, spec, 1)
@@ -718,6 +737,9 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 	asleep := obs.DeploymentReplicas == nil || *obs.DeploymentReplicas == 0
 	drifted := obs.SpecHash != wantHash || obs.Generation != w.Generation
 	if asleep || obs.HibernationOp != op || drifted {
+		if !wakeRollAdmitted(ctx, w.ID) {
+			return nil
+		}
 		// ONE conditioned patch: replicas 1, the current template and the op
 		// annotation together, so no intermediate state is observable.
 		dep.UID, dep.ResourceVersion = types.UID(obs.DeploymentUID), obs.DeploymentResourceVersion

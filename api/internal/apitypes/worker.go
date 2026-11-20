@@ -66,6 +66,10 @@ type WorkerDTO struct {
 	// RunDTO.
 	Kind       string  `json:"kind"`
 	HostedSize *string `json:"hosted_size"`
+	// HostedSizeSpec is HostedSize's resolved integers (PRD #4213), so the CLI and TUI show an
+	// admin-edited size's real quantities. Absent for an external worker and when no size row
+	// of that name exists (a deleted or unknown name).
+	HostedSizeSpec *WorkerSizeSpec `json:"hosted_size_spec,omitempty"`
 	// Docker is the worker's DinD capability, mirroring HostedSize's semantics: null
 	// for an external worker (docker not applicable), false for a hosted worker without
 	// the rootless-DinD sidecar, true for a docker-capable hosted worker (PRD #83 M3).

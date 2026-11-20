@@ -32,6 +32,10 @@ import (
 // an admin surface.
 const maxEvidenceBytes = 96
 
+// maxRefusedNamesShown caps the worker names in the "Refused workers" evidence row; the
+// rest are counted as "and K more" (each name is already bounded by maxEvidenceBytes).
+const maxRefusedNamesShown = 5
+
 // checkMeta is the fixed per-id metadata: the scope, group, human title, and docs slug
 // (empty ⇒ no doc link in M1). The registry order in Evaluate is the stable order; this
 // map only supplies the constant fields so each check builder sets just severity + text.
@@ -150,6 +154,39 @@ func (s *Service) hostedConfigured(workers []store.ListAllWorkersRow) bool {
 	return false
 }
 
+// rollSignalOfRow rebuilds the persisted roll signal of a fleet row.
+func rollSignalOfRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
+	sig := &workersvc.RollSignal{
+		BlockingKind: w.RollBlockingKind.String, Phase: w.RollPhase.String,
+		PodPhase: w.RollPodPhase.String, BlockingReason: w.RollBlockingReason.String,
+		BlockingContainer: w.RollBlockingContainer.String,
+	}
+	if w.RollRestartCount.Valid {
+		sig.RestartCount = w.RollRestartCount.Int32
+	}
+	if w.RollLastExitCode.Valid {
+		code := w.RollLastExitCode.Int32
+		sig.LastExitCode = &code
+	}
+	return sig
+}
+
+// freshRefusalKind is size_refused or pvc_rejected when the worker's roll signal is fresh,
+// stuck and stored as one of those controller refusals (PRD #4213), else "". It is how a
+// pod-less worker, which has no pod to be stuck, is still reported: the controller refused to
+// create one.
+func freshRefusalKind(now time.Time, w store.ListAllWorkersRow) string {
+	if !w.RollPhase.Valid || w.RollPhase.String != workersvc.PhaseStuck ||
+		!w.RollObservedAt.Valid || now.Sub(w.RollObservedAt.Time) > rollSignalTTL {
+		return ""
+	}
+	switch kind := workersvc.StoredBlockingKind(rollSignalOfRow(w)); kind {
+	case workersvc.BlockingKindSizeRefused, workersvc.BlockingKindPVCRejected:
+		return kind
+	}
+	return ""
+}
+
 // checkFleetRoll counts every fresh hosted stuck signal, including capacity blocks
 // and first-provision failures, independent of history or the upgrading ceiling.
 // warn when some hosted workers are stuck, danger when every one is.
@@ -173,7 +210,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		}
 		// A preparing, hibernated or waking worker is outside the roll: it is neither rolling
 		// nor stuck (PRD #4205). A wake that fails is reported by fleet.hibernation_wake.
-		if workersvc.IsPodless(w.Worker.HibernationState) {
+		// A controller refusal (size above its ceiling, PVC rejected) is the exception: the
+		// pod-less state is what the refusal produced or left in place, so it is reported.
+		if workersvc.IsPodless(w.Worker.HibernationState) && freshRefusalKind(now, w) == "" {
 			excluded++
 			continue
 		}
@@ -204,6 +243,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		failed          int
 		capacityBlocked int
 		provisionFailed int
+		sizeRefused     int
+		pvcRejected     int
+		refusedNames    []string
 		anyFreshSignal  bool
 		stuckSince      time.Time
 		haveStuckSince  bool
@@ -221,21 +263,19 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		}
 		if signalFresh && w.RollPhase.String == workersvc.PhaseStuck {
 			failed++
-			sig := &workersvc.RollSignal{
-				BlockingKind: w.RollBlockingKind.String, Phase: w.RollPhase.String,
-				PodPhase: w.RollPodPhase.String, BlockingReason: w.RollBlockingReason.String,
-				BlockingContainer: w.RollBlockingContainer.String,
-			}
-			if w.RollRestartCount.Valid {
-				sig.RestartCount = w.RollRestartCount.Int32
-			}
-			if w.RollLastExitCode.Valid {
-				code := w.RollLastExitCode.Int32
-				sig.LastExitCode = &code
+			sig := rollSignalOfRow(w)
+			refusal := freshRefusalKind(now, w)
+			switch refusal {
+			case workersvc.BlockingKindSizeRefused:
+				sizeRefused++
+				refusedNames = append(refusedNames, safe(w.Worker.Name))
+			case workersvc.BlockingKindPVCRejected:
+				pvcRejected++
+				refusedNames = append(refusedNames, safe(w.Worker.Name))
 			}
 			if workersvc.EffectiveBlockingKind(sig) == workersvc.BlockingKindSchedulerCapacity {
 				capacityBlocked++
-			} else if workersvc.NeverRegistered(w.Worker.Status, w.Worker.LastHeartbeatAt.Valid,
+			} else if refusal == "" && workersvc.NeverRegistered(w.Worker.Status, w.Worker.LastHeartbeatAt.Valid,
 				w.Worker.Version.Valid, w.Worker.SnapshotRegisterNonce.Valid,
 				w.Worker.RegisteredPodUid.Valid, w.Worker.RollHeartbeatAt.Valid) {
 				provisionFailed++
@@ -277,24 +317,47 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	if provisionFailed > 0 {
 		failureCounts += fmt.Sprintf("; %d first-provision failures", provisionFailed)
 	}
+	if sizeRefused > 0 {
+		failureCounts += fmt.Sprintf("; %d %s refused: size above ceiling", sizeRefused, workerNoun(sizeRefused))
+	}
+	if pvcRejected > 0 {
+		failureCounts += fmt.Sprintf("; %d %s refused: PVC rejected", pvcRejected, workerNoun(pvcRejected))
+	}
 	addFailures := func(paced bool) {
 		if failed == 0 {
 			return
 		}
 		if paced {
 			c.Summary += " " + failureCounts + ": " + strings.Join(causeCounts, "; ") + "."
-		} else if capacityBlocked > 0 || provisionFailed > 0 {
+		} else if capacityBlocked > 0 || provisionFailed > 0 || sizeRefused > 0 || pvcRejected > 0 {
 			c.Summary += ". " + failureCounts + "."
 		}
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Failure causes", Value: safe(strings.Join(causeCounts, "; "))})
 		if paced {
 			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))})
 		}
+		if len(refusedNames) > 0 {
+			shown, more := refusedNames, 0
+			if len(shown) > maxRefusedNamesShown {
+				shown, more = shown[:maxRefusedNamesShown], len(shown)-maxRefusedNamesShown
+			}
+			value := strings.Join(shown, ", ")
+			if more > 0 {
+				value += fmt.Sprintf(" and %d more", more)
+			}
+			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Refused workers", Value: value})
+		}
 		actions := []string{}
+		if sizeRefused > 0 {
+			actions = append(actions, "Lower the worker size on Admin > Workers or raise the chart ceiling it names.")
+		}
+		if pvcRejected > 0 {
+			actions = append(actions, "The cluster rejected a worker volume claim: check the namespace LimitRange maxPVCStorage, ResourceQuota and StorageClass.")
+		}
 		if capacityBlocked > 0 {
 			actions = append(actions, "Wait for available capacity, choose a smaller worker, or ask an operator to add capacity.")
 		}
-		if failed > capacityBlocked {
+		if failed > capacityBlocked+sizeRefused+pvcRejected {
 			actions = append(actions, "Inspect the blocking diagnostics for failed workers; resolve storage or runtime faults, or publish the image or a chart naming a published tag for image failures.")
 		}
 		c.Action = strPtr(strings.Join(actions, " "))
@@ -1797,4 +1860,11 @@ func orDash(v string) string {
 		return "—"
 	}
 	return v
+}
+
+func workerNoun(n int) string {
+	if n == 1 {
+		return "worker"
+	}
+	return "workers"
 }

@@ -1,12 +1,13 @@
-// Admin → Workers: the worker-fleet controls that used to sit on Admin → Instance
-// (hosted worker quota, custody hold limit, ephemeral workers, worker hibernation,
+// Admin → Workers: the worker sizes editor (PRD #4213) and the worker-fleet controls that
+// used to sit on Admin → Instance (hosted worker quota, custody hold limit, ephemeral workers, worker hibernation,
 // Docker worker repo allowlist, capability-aware scheduling). They are the same
 // DB-backed app_settings cards; only their home moved. Old /admin/settings#<id> links
 // are redirected here by AdminSettings. Admin-only (AdminRoute + the admin-only API).
 
 import { useLocation } from "react-router-dom";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../lib/api";
+import { api, type AdminWorkerSizes, type AppSettings, type SettingSource, type SettingsResponse } from "../lib/api";
+import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Skeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
@@ -20,6 +21,7 @@ import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
 import { WorkerHibernationCard } from "./adminSettings/WorkerHibernationCard";
 import { CapabilitySchedulingCard } from "./adminSettings/CapabilitySchedulingCard";
+import { WorkerSizesCard } from "./adminSettings/WorkerSizesCard";
 
 export function AdminWorkers() {
   const { hash, key } = useLocation();
@@ -33,6 +35,32 @@ export function AdminWorkers() {
     setSources(resp.sources ?? {});
     setDefaults(resp.defaults);
   }, []);
+
+  // The worker sizes (PRD #4213) are read once here and re-read whenever the sizes editor
+  // asks (after each successful write, on Retry and after some refused writes), then
+  // handed to the sizes editor AND the two default-size selectors, so an edited quantity
+  // shows in those selectors at once. A failed read leaves the last good list.
+  const [sizes, setSizes] = useState<AdminWorkerSizes | null>(null);
+  const [sizesError, setSizesError] = useState("");
+  const mounted = useRef(true);
+  const loadSizes = useCallback(async () => {
+    try {
+      const next = await api.getAdminWorkerSizes();
+      if (!mounted.current) return;
+      setSizes(next);
+      setSizesError("");
+    } catch (err) {
+      if (mounted.current) setSizesError(errorMessage(err, "Failed to load worker sizes"));
+    }
+  }, []);
+  useEffect(() => {
+    mounted.current = true;
+    void loadSizes();
+    return () => {
+      mounted.current = false;
+    };
+  }, [loadSizes]);
+  const sizeOptions = sizes?.sizes;
 
   const { loading, error: loadError } = useAsyncData(
     async ({ isCurrent }) => {
@@ -87,6 +115,7 @@ export function AdminWorkers() {
   const sections: { id: string; label: string }[] = loaded
     ? [
         { id: "docker-allowlist", label: "Docker workers" },
+        { id: "worker-sizes", label: "Worker sizes" },
         { id: "hosted-worker-quota", label: "Hosted worker quota" },
         { id: "custody-hold-limit", label: "Custody hold limit" },
         { id: "ephemeral-workers", label: "Ephemeral workers" },
@@ -131,14 +160,17 @@ export function AdminWorkers() {
           <section id="docker-allowlist" className="scroll-mt-6">
             <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
           </section>
+          <section id="worker-sizes" className="scroll-mt-6">
+            <WorkerSizesCard data={sizes} loadError={sizesError} onChanged={loadSizes} />
+          </section>
           <section id="hosted-worker-quota" className="scroll-mt-6">
-            <HostedWorkerQuotaCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
+            <HostedWorkerQuotaCard settings={saved} sources={sources} defaults={defaults} sizeOptions={sizeOptions} onSaved={applyResponse} />
           </section>
           <section id="custody-hold-limit" className="scroll-mt-6">
             <CustodyHoldLimitCard settings={saved} onSaved={applyResponse} />
           </section>
           <section id="ephemeral-workers" className="scroll-mt-6">
-            <EphemeralWorkersCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
+            <EphemeralWorkersCard settings={saved} sources={sources} defaults={defaults} sizeOptions={sizeOptions} onSaved={applyResponse} />
           </section>
           <section id="worker-hibernation" className="scroll-mt-6">
             <WorkerHibernationCard settings={saved} onSaved={applyResponse} />

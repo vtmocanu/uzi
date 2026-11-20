@@ -61,15 +61,21 @@ SELECT hibernation_version, hibernation_advertised_at, poll_interval_seconds
 FROM controller_report_status WHERE id = 1;
 
 -- name: UpsertControllerHibernationAdvertisement :exec
--- Record the controller's hibernation protocol version and poll interval from a status
--- report, stamped with the api's own receipt clock. Admission reads it back to refuse a
--- hibernate when no controller that understands the feature has reported recently.
-INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
-VALUES (1, @advertised_at, @hibernation_version, @advertised_at, @poll_interval_seconds)
+-- Record the controller's hibernation protocol version, admin-size support version and poll
+-- interval from a FLEET status report, stamped with the api's own receipt clock. Admission
+-- reads the hibernation version back to refuse a hibernate when no controller that understands
+-- the feature has reported recently; the admin-size version (PRD #4213, 0 is an honest "this
+-- controller ignores DesiredWorker.Resources") is written in the same statement so the two
+-- advertisements can never disagree about which report they came from.
+INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds,
+                                      admin_sizes_version, admin_sizes_advertised_at)
+VALUES (1, @advertised_at, @hibernation_version, @advertised_at, @poll_interval_seconds, @admin_sizes_version, @advertised_at)
 ON CONFLICT (id) DO UPDATE SET
     hibernation_version = EXCLUDED.hibernation_version,
     hibernation_advertised_at = EXCLUDED.hibernation_advertised_at,
-    poll_interval_seconds = EXCLUDED.poll_interval_seconds;
+    poll_interval_seconds = EXCLUDED.poll_interval_seconds,
+    admin_sizes_version = EXCLUDED.admin_sizes_version,
+    admin_sizes_advertised_at = EXCLUDED.admin_sizes_advertised_at;
 
 -- name: ListStalePreparingWorkerIDs :many
 -- Candidates only: the pass re-checks the predicate on the locked row. The deadline is measured
@@ -128,17 +134,25 @@ SELECT EXISTS (
 -- uses). The caller reads the status AFTER the lock, so a claim that won the race is seen.
 SELECT status FROM runs WHERE id = @id FOR SHARE;
 
+-- name: HibernationWakeProvenanceAdmits :one
+-- Read after LockRunForShare on the same READ COMMITTED transaction. The separate
+-- statement observes any claim/requeue committed while the run lock was awaited.
+SELECT COALESCE(fn_codex_claim_provenance_admits(r, @worker_id::uuid), false)::boolean AS admitted
+FROM runs r WHERE r.id = @run_id;
+
 -- name: ListStaleHibernationWakes :many
 -- Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
--- longer queued. A run that left 'queued' (claimed, cancelled, finished) qualifies, and so does a row
--- whose worker is hibernated or preparing again (the wake can no longer serve the run). A row whose
--- worker settled to none is kept while the run is queued, so the run never wakes a worker twice.
+-- longer queued or no longer admits its recorded worker under claim provenance. A run that left
+-- 'queued' (claimed, cancelled, finished) qualifies, and so does a row whose worker is hibernated
+-- or preparing again (the wake can no longer serve the run). An awake worker's row is kept while
+-- the queued run still admits it, so one pending run never wakes a valid worker twice.
 -- A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 SELECT hw.run_id, hw.worker_id
 FROM hibernation_wakes hw
 JOIN runs r ON r.id = hw.run_id
 JOIN workers w ON w.id = hw.worker_id
 WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
+   OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
 ORDER BY hw.worker_id, hw.run_id
 LIMIT @max_rows;
 
@@ -273,6 +287,8 @@ CROSS JOIN LATERAL (
            AND (r.kind <> 'job'
                 OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                     AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+           -- Issue #4476: ClaimRun's Codex claim-provenance clause.
+           AND fn_codex_claim_provenance_admits(r, w.id)
            -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
            AND (r.kind = 'cross_check' OR r.worker_id IS NULL OR r.worker_id = w.id
                 OR r.updated_at < @affinity_cutoff::timestamptz

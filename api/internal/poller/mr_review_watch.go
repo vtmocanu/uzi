@@ -448,6 +448,11 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		// A race with a ci_fix on the branch, a concurrent rework on this MR, or a concurrent
 		// cycle that consumed these comments or spent the cap: swallow, nothing was written,
 		// retry next tick.
+	case errors.Is(err, workersvc.ErrTerminalConsumerGateBusy):
+		// Issue #4488: a terminal-ref retirement briefly holds the repo's consumer gate; nothing
+		// was written, so the ledger is not advanced and the comments are not consumed. Retry next tick.
+		slog.Debug("poller: mr-rework deferred, terminal consumer gate busy",
+			"repo", r.PathWithNamespace, "ref", ref, "source_run", cand.SourceRunID.String())
 	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
 		// Issue #3719: the source run's Codex harness is inherited, and the owner's auto-mode pool
 		// has no bindable account. Same skip as below with the reason named; the ledger is not advanced.

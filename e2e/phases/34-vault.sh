@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  admin token sealing + mode; vault policy; legacy master row for user2; two API recreates
-# restores: required policy; admin + user2 protected/unlocked; tokens DEK-sealed; test runs completed on success (failure cancellation best effort; driver quarantines leaks)
+# restores: required policy; admin + user2 protected/unlocked; tokens DEK-sealed; test runs completed on success (failure cancellation best effort; the driver boundary cancels or fails on leaks)
 # =============================================================================
 # Bootstrap explicitly enrolled the initially-Off seed admin before this phase.
 # Preserve protected claim gating, boot unlock and lazy legacy rewrap, then prove
@@ -54,7 +54,7 @@ vault_fail_safe() (
     case "$state" in
       completed|failed|cancelled) ;;
       *) apipost "/api/runs/$run/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 \
-           || echo "vault fail-safe: run cancellation failed; driver must quarantine" >&2 ;;
+           || echo "vault fail-safe: run cancellation failed; driver boundary must catch it" >&2 ;;
     esac
   done
   state="$(apiget /api/vault/status)" || state='{}'

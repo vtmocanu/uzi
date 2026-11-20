@@ -133,7 +133,7 @@ func (m *Materializer) surfaceEphemeralLayoutHold(ctx context.Context, t *rollTi
 	if !w.Ephemeral || !obs.HasDeployment || !migrationHeld(w, obs.RunnerLayout) {
 		return
 	}
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
 		return
 	}

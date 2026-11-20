@@ -27,7 +27,16 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     // so the mock is the only place M5 can be seen at all.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true, default_size: "l" });
+    const { BUILTIN_WORKER_SIZES } = await import("../lib/workerSizes");
+    expect(await api.hostedConfig()).toEqual({
+      enabled: true,
+      quota: 5,
+      ephemeral_enabled: true,
+      docker_enabled: true,
+      default_size: "l",
+      // PRD #4213: the size list with its integers, seeded from the builtins.
+      sizes: BUILTIN_WORKER_SIZES.map((s) => ({ ...s })),
+    });
   });
 
   it("puts the at-quota journey three clicks away: four seeded hosted workers of five", async () => {

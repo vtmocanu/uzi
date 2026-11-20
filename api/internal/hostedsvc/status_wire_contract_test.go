@@ -56,6 +56,9 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	if got.Hibernation != 2 {
 		t.Errorf("Hibernation = %d, want 2 (PRD #4208 protocol version)", got.Hibernation)
 	}
+	if got.AdminSizes != 1 {
+		t.Errorf("AdminSizes = %d, want 1 (PRD #4213 admin-size support version)", got.AdminSizes)
+	}
 	if got.ReportedAt.IsZero() {
 		t.Error("ReportedAt did not decode; it is display-only but it must still arrive")
 	}
@@ -145,6 +148,21 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	}
 	if capacity.BlockingReason == nil || *capacity.BlockingReason != "scheduler capacity: insufficient cpu" {
 		t.Errorf("workers[2].BlockingReason = %v, want fixed CPU reason", capacity.BlockingReason)
+	}
+}
+
+// An old controller (pre-#4213) sends no admin_sizes: the api must read 0, and the field
+// must not be required for the rest of the report to decode.
+func TestStatusReportWithoutAdminSizesDecodesAsZero(t *testing.T) {
+	var got StatusReport
+	if err := json.Unmarshal([]byte(`{"kind":"fleet","poll_interval_seconds":10,"worker_image_tag":"0.11.6","hibernation":1,"workers":[]}`), &got); err != nil {
+		t.Fatalf("decode old-controller report: %v", err)
+	}
+	if got.AdminSizes != 0 {
+		t.Fatalf("AdminSizes = %d, want 0 for an old controller", got.AdminSizes)
+	}
+	if got.Hibernation != 1 || got.Kind != "fleet" {
+		t.Fatalf("old-controller report lost other fields: %+v", got)
 	}
 }
 

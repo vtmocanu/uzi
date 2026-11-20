@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -1111,6 +1112,21 @@ func TestCodexOutageFreshClaimFenceLiveDB(t *testing.T) {
 					x.env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '3 hours' WHERE id=$1", x.f.workerID)
 				}
 				before := mustRun(t, x.env, x.f.runID)
+				if !sameWorker {
+					// Issue #4476: a Codex run is admitted only to the worker its claim provenance
+					// records, so a different worker no longer takes it over after the stale
+					// requeue. The run, its generation and its single custody hold stay as they were.
+					if _, err := x.env.q.ClaimRun(x.env.ctx, claimRunParamsFor(w)); !errors.Is(err, pgx.ErrNoRows) {
+						t.Fatalf("different worker ClaimRun = %v, want pgx.ErrNoRows (held for the recorded worker)", err)
+					}
+					if !reflect.DeepEqual(before, mustRun(t, x.env, x.f.runID)) {
+						t.Fatal("a held claim mutated the run")
+					}
+					if holds := x.custody(t); len(holds) != 1 || holds[0].Worker != x.f.workerID || holds[0].Generation != 1 || holds[0].State != "open" {
+						t.Fatalf("held claim changed custody: %+v", holds)
+					}
+					return
+				}
 				claimed, err := x.env.q.ClaimRun(x.env.ctx, claimRunParamsFor(w))
 				if err != nil || claimed.ID != x.f.runID {
 					t.Fatalf("real next ClaimRun: %v", err)

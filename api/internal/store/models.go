@@ -336,6 +336,8 @@ type ControllerReportStatus struct {
 	HibernationVersion      pgtype.Int4        `json:"hibernation_version"`
 	HibernationAdvertisedAt pgtype.Timestamptz `json:"hibernation_advertised_at"`
 	PollIntervalSeconds     pgtype.Int4        `json:"poll_interval_seconds"`
+	AdminSizesVersion       pgtype.Int4        `json:"admin_sizes_version"`
+	AdminSizesAdvertisedAt  pgtype.Timestamptz `json:"admin_sizes_advertised_at"`
 }
 
 type CrossCheck struct {
@@ -1420,6 +1422,11 @@ type Run struct {
 	ModelProviderKeySecretID          pgtype.UUID        `json:"model_provider_key_secret_id"`
 	ModelProviderKeyRev               pgtype.Int8        `json:"model_provider_key_rev"`
 	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
+	ClaimProvenanceWorkerID           pgtype.UUID        `json:"claim_provenance_worker_id"`
+	ClaimProvenanceGeneration         pgtype.Int8        `json:"claim_provenance_generation"`
+	HealthOwnerHoldSince              pgtype.Timestamptz `json:"health_owner_hold_since"`
+	FollowupParkSeq                   int64              `json:"followup_park_seq"`
+	FollowupFinalizeGeneration        pgtype.Int8        `json:"followup_finalize_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -2021,6 +2028,7 @@ type User struct {
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
+	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
 }
 
 type UserCrossCheckPin struct {
@@ -2272,6 +2280,21 @@ type WorkerRunDisk struct {
 	CacheBytes int64              `json:"cache_bytes"`
 	Truncated  bool               `json:"truncated"`
 	SampledAt  pgtype.Timestamptz `json:"sampled_at"`
+}
+
+type WorkerSize struct {
+	Name                 string             `json:"name"`
+	CpuRequestMillicores int64              `json:"cpu_request_millicores"`
+	CpuLimitMillicores   int64              `json:"cpu_limit_millicores"`
+	MemoryRequestMib     int64              `json:"memory_request_mib"`
+	MemoryLimitMib       int64              `json:"memory_limit_mib"`
+	DataGib              int64              `json:"data_gib"`
+	DindDataGib          int64              `json:"dind_data_gib"`
+	DisplayOrder         int32              `json:"display_order"`
+	Builtin              bool               `json:"builtin"`
+	Customized           bool               `json:"customized"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	UpdatedBy            pgtype.UUID        `json:"updated_by"`
 }
 
 type WorkerUpgradeMute struct {

@@ -389,6 +389,32 @@ and uzi never falls back to your default login:
 Accounts that are merely at capacity are not "unusable": a run is still created
 on the one releasing soonest (`pool_exhausted`) and waits as any run does.
 
+### A Codex run held for its last worker
+
+Once a Codex run has been claimed, only the worker that last ran it may claim it
+again. Another worker, including a new ephemeral one, is never offered the run,
+even after the stale-requeue grace or the affinity ceiling would have released a
+Claude run. A run that was never claimed is unaffected.
+
+When a run is held, its health reason says so:
+
+- "held for worker NAME: wait for it or cancel the run; only the worker that last
+  ran this Codex run may resume it". Wait for that worker to come back (for
+  example after a restart or a drain), or cancel the run with `uzi run cancel <id>`.
+- "held for worker <name>: restart it or cancel the run; its previous process was
+  released; only the worker that last ran this Codex run may resume it". Restart
+  the recorded worker process so it registers with a new nonce, or cancel the
+  run. Waiting for the same released process does not make it claimable.
+- "held: predecessor provenance unavailable; cancel the run; no worker may resume
+  this Codex run". No worker can resume it. This is the state of any Codex run at
+  generation 1 or later when this rule was deployed (including a paused or parked
+  one), or that was claimed while an older api was serving claims. Cancel it with `uzi run cancel <id>`.
+
+A run that its own worker is still running in its current flight keeps going; the
+hold applies at the next fresh claim. See [admin health](admin-health.md) for the
+reasons and their alarm effect and [run recovery](run-recovery.md) for the upgrade
+and rollback behaviour.
+
 ### What does not change
 
 - **A run never switches account after creation.** A resume, a usage-limit park

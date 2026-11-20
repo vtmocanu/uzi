@@ -1,21 +1,17 @@
 // PRD #1287 C3 (D7 layer P) — native-execution-bypass + isolation on the REAL app-server.
 //
-// Under the SHIPPED production native-disabled template (config.ts, `shell_tool=false`,
-// `unified_exec=false`, `code_mode*=false`, `apply_patch_freeform=false`, `hooks=false`, …) and
-// NO `/etc/codex`, the model must hold NO native execution authority. The oracle is BEHAVIORAL and
-// discriminating (D4): a fake provider that FORCES a native `shell`/`shell_command`/`exec_command`/`unified_exec`/
-// `write_stdin`/`local_shell` function-call and a native freeform `apply_patch` custom-tool-call
-// must produce NO worker callback and NO native side effect (no marker file, no command spawn, no
-// fileop), while the intended-model exec — the dynamic `uzi_bash` callback — DOES reach its
-// command-identity effect. A reachable native authority here is a BLOCKING defect (D6).
+// Representative top-level native dispatch probes on the real protocol. Supported config
+// suppression, explicit environments: [] and the replaced launcher environment deny effects;
+// false feature keys alone do not establish runtime suppression on pin 0.167.0.
+// Forced shell/exec/write_stdin/local_shell and direct native patch calls produce no marker,
+// worker callback, command spawn or fileop; the dynamic uzi_bash control reaches the broker.
 //
-// This separates the DYNAMIC WORKER tool name (`uzi_bash`) from every NATIVE name so an allowed
-// callback is never mistaken for native execution. Per the PRD "Native execution bypass" clause,
-// BOTH halves are checked: (1) the ADVERTISED-SCHEMA absence — the real app-server offers the
-// model no native tool schema on any observed provider request (empty is a PASS; see the oracle
-// below), and (2) the forced-dispatch RESULT with no forbidden effect. The U layer
-// (broker-policy.test.ts) additionally proves the real broker denies a native name `unknown_tool`
-// if one ever reached it.
+// The legacy inventory oracle below checks representative TOP-LEVEL identities only. It does
+// not inspect nested inventories or prove nested apply_patch absent: native apply_patch remains
+// advertised under the code-mode host. See native-patch-inert.test.ts for the exact per-model
+// inventory matrix and nested/direct patch refusal across fresh and truly cold roots. #1566
+// native async questions and read-only UTC remain; registration grants no worker effects.
+// P-layer injected OS seams do not prove packaged OS isolation or exhaustive native OS denial.
 //
 // The isolation leg asserts the real app-server was spawned under the sparse REPLACED env
 // (buildReplacedEnv) with no provider credential or worker-token shape (command/provider
@@ -64,8 +60,8 @@ function leadEffectGrants(): RunGrants {
 
 /** One contract model per catalog `shell_type` spelling. The 0.160.0 catalog gives gpt-6-astra (and
  *  gpt-5.6-sol) `shell_type: "unified_exec"` but gpt-6-sol and gpt-6.1-sol `shell_type: "shell_command"` (a serde
- *  alias of the same internal type, gated by `shell_tool = false`), so the native-disabled template
- *  is proven for both catalog shapes, not only the default model. */
+ *  alias of the same internal type, gated by `shell_tool = false`), so these representative probes
+ *  cover both catalog shapes, not only the default model. */
 const NATIVE_BYPASS_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] as const;
 
 test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
@@ -104,7 +100,7 @@ async function nativeBypassFor(t: { diagnostic: (message: string) => void }, mod
       credential,
       model,
       effort: "medium",
-      // Force every native surface, then the intended-model worker exec (positive control), then done.
+      // Force the representative native surfaces, then the intended-model worker exec (positive control), then done.
       respond: scriptedStepsResponder([
         { kind: "call", callId: "n-shell", name: "shell", args: { command: ["/bin/sh", "-c", `touch ${marker("shell")}`] } },
         { kind: "call", callId: "n-shell-command", name: "shell_command", args: { command: `touch ${marker("shellcmd")}` } },
@@ -150,22 +146,9 @@ async function nativeBypassFor(t: { diagnostic: (message: string) => void }, mod
     const brokerTools = obs.callbacks.map((c) => c.tool);
     assert.deepEqual(brokerTools, ["uzi_bash"], "only the dynamic worker exec produced a worker callback; native names produced none");
 
-    // ── ADVERTISED-SCHEMA ABSENCE ORACLE ──────────────────────────────────────────
-    // The PRD "Native execution bypass" clause requires checking BOTH the advertised schemas
-    // (including nested/additional tool lists) AND the failed/unsupported dispatch result. The
-    // asserts above are the DISPATCH half (no native call is dispatchable / has any effect); this
-    // is the ADVERTISEMENT half — the real app-server must offer the model NO native execution
-    // schema. Collect the model-visible `tools` schema the app-server advertised on EVERY observed
-    // provider request (the harness's dedicated `advertisedTools` observation is the first
-    // request's; scanning all requests catches any nested/additional list on a later turn) and
-    // assert none of CODEX_NATIVE_TOOL_NAMES appears.
-    //
-    // On this production native-disabled path the app-server forwards no `tools` array to the
-    // provider (C3 finding: the native-disabled template advertises no native tool to the model,
-    // and the dynamic worker tools ride the app-server↔worker channel, not the provider Responses
-    // `tools` field). An absent/empty native-tool advertisement SATISFIES the absence property —
-    // the model is never offered a native execution schema — and the assertion is scoped over the
-    // real observed requests, so it is a truthful absence check, not a vacuous one.
+    // Representative TOP-LEVEL inventory oracle across observed provider requests.
+    // nativeToolsAdvertised does not traverse nested code-mode tools; this assertion does not
+    // prove nested apply_patch absence. The exact inventory matrix is native-patch-inert.test.ts.
     const advertised = [
       ...obs.advertisedTools,
       ...obs.providerRequests.flatMap((body) => {
@@ -179,10 +162,7 @@ async function nativeBypassFor(t: { diagnostic: (message: string) => void }, mod
       `advertised tool identities across ${obs.providerRequests.length} provider request(s): `
       + JSON.stringify(advertisedToolIdentities(advertised)),
     );
-    // Anchor the absence to REAL traffic: the app-server issued provider requests, so an empty
-    // native-tool advertisement is "the model was never offered a native schema", not "nothing
-    // was observed" — this keeps the absence check from silently going vacuous if the harness ever
-    // stopped capturing requests.
+    // Require observed traffic so the representative top-level check cannot pass on no requests.
     assert.ok(
       obs.providerRequests.length > 0,
       "the fake provider observed real requests (the advertised-schema absence reflects real traffic)",
@@ -250,7 +230,7 @@ test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   // for an app-server-auth root — HOME/CODEX_HOME/the four XDG_*/TMPDIR plus a fixed
   // PATH/SHELL/LANG/TERM, and NO provider credential var (the credential rides the login RPC).
   const REPLACED_ENV_ALLOWLIST = [
-    "HOME", "CODEX_HOME",
+    "HOME", "CODEX_HOME", "CODEX_EXEC_SERVER_URL",
     "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
     "TMPDIR", "PATH", "SHELL", "LANG", "TERM",
   ].sort();

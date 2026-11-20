@@ -1,4 +1,5 @@
 import type { AdminWorker, HealthCheck, HealthDoc } from "../../lib/api";
+import { builtinSizeSpec } from "./workerSizes";
 import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
@@ -355,6 +356,7 @@ function stuckHosted(over: Partial<AdminWorker>): AdminWorker {
     status: "offline",
     kind: "hosted",
     hosted_size: "l",
+    hosted_size_spec: builtinSizeSpec("l"),
     docker: false,
     busy: false,
     active_runs: 0,
@@ -424,6 +426,7 @@ function healthyHosted(over: Partial<AdminWorker>): AdminWorker {
     status: "online",
     kind: "hosted",
     hosted_size: "l",
+    hosted_size_spec: builtinSizeSpec("l"),
     docker: false,
     busy: false,
     active_runs: 0,

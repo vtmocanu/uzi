@@ -12,7 +12,7 @@ side; this exercises the real wire).
 ./e2e/run-e2e.sh
 ```
 
-Requirements: Docker + Compose v2, and `openssl`, `jq`, `git`, `curl` on the
+Requirements: Docker + Compose v2, GNU `timeout` or `gtimeout` (coreutils), and `openssl`, `jq`, `git`, `curl` on the
 host — plus **`go`** (the PRD #97 M2 CLI leg builds `api/cmd/uzi` on the host and
 drives the running api with it). **Docker Engine >= 25** is recommended: the overlay's healthchecks set
 `start_interval: 1s` (probe every second during `start_period`), which trims the
@@ -21,6 +21,11 @@ the field, so the suite still runs correctly — just a few seconds slower per b
 First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake` image
 (a few minutes); later runs reuse the layer cache. On success it prints
 `All E2E checks passed.` and tears everything down.
+
+The entrypoint checks for the timeout limiter before building or starting the stack.
+Without it, bounded database reads refuse to run. The hermetic helper tests supply a
+fake limiter for argument and status checks; their real process-kill control runs only
+when a host limiter is available (otherwise it prints an explicit SKIP).
 
 Fresh startup first verifies the default optional policy: the seed admin is Off
 (`mode=unprotected`, `unlocked=false`, `exists=false`) and its token uses
@@ -38,7 +43,7 @@ mkdir -p "$root/.uzi/scratch/tmp"
 TMPDIR="$root/.uzi/scratch/tmp" \
 UZI_E2E_COMPOSE_PROJECT="vlt3507-$(date +%s)-$$" \
 E2E_RUN_DIR="$root/.uzi/scratch/vlt3507-$(date +%s)-$$" \
-UZI_E2E_NO_RECLAIM=1 KEEP_RUNDIR=1 E2E_STRICT_LEAKS=1 \
+UZI_E2E_NO_RECLAIM=1 KEEP_RUNDIR=1 \
 E2E_ONLY='steer-queue-delivery,mr-close-watcher,autopilot-lifecycle,autopilot-carry-item,vault' \
 ./e2e/run-e2e.sh
 ```
@@ -58,7 +63,7 @@ runnable without login/unlock. The Anthropic admin meter row must report Off,
 not locked. This phase has no linked Codex account, so its accountless owner is
 absent from the Codex meter list. Its Off run reaches the plan gate and completes. Success restores
 required policy and both users protected/unlocked; failure attempts independent
-bounded restoration and cancellation without hiding failures or strict-lane leaks.
+bounded restoration and cancellation without hiding failures or boundary residue.
 
 Knobs (env vars):
 
@@ -91,9 +96,6 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
   acceptance with `E2E_ONLY=cli-smoke,api-outage-outbox ./e2e/run-e2e.sh`.
 - `E2E_SKIP=<glob[,glob]>` — the inverse: skip the phases whose slug matches. As
   with `E2E_ONLY`, critical phases are never skipped.
-- `E2E_STRICT_LEAKS=1` — make an end-of-phase quarantine **LEAK** (a non-terminal
-  run left behind and not declared via a `handoff:` header) a **FAIL** instead of a
-  non-fatal note, so a leaked run reddens the suite.
 - `E2E_FAULT_PHASE=<slug>` — inject a `fail` as the first statement of that phase,
   the live positive control for fail-soft: a non-critical target lets the suite
   continue (exactly one FAIL, exit 1), a critical one stops it (rest SKIP, exit 1).
@@ -105,11 +107,12 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
 Results and artifacts (written under the rundir, `$RUNROOT`):
 
 - `results.tsv` — one tab-separated row per phase: `slug`, status
-  (`PASS`|`FAIL`|`SKIP`|`LEAK`), seconds, message.
+  (`PASS`|`FAIL`|`SKIP`), seconds, message.
 - `junit.xml` — one `testsuite`, one `testcase` per phase (a `<failure>` carries the
   `fail` message; `<skipped>` for a SKIP).
-- `summary.md` — the phase table, the tightest `wait_*` margins, and any leaks.
-- `artifacts/<NN-slug>/` — captured **only** for a FAIL or LEAK phase (nothing on a
+- `summary.md` — the phase table, the tightest `wait_*` margins, and the
+  `## Boundary waits` table.
+- `artifacts/<NN-slug>/` — captured **only** for a FAIL phase (nothing on a
   PASS/SKIP): `phase.log` (the phase's own stdout), one `<service>.log` per service
   (`api`, `agent`, `forge-fake`, `db`, via `docker compose logs --since`), `runs.txt`
   (the run enumeration) and `run-counts.txt` (runs by status × kind). Capture is fully
@@ -121,8 +124,8 @@ Results and artifacts (written under the rundir, `$RUNROOT`):
   run output for teardown); `.absent` means the agent was absent where that is expected
   (initial start, the restart after phase 15's `down`, teardown). A snapshot is
   point-in-time: logs emitted between it and the operation are not guaranteed captured, and
-  this is not a continuous collector. Kept only when the rundir is kept (a red run, a LEAK
-  sentinel, `KEEP_RUNDIR` or `KEEP_STACK`; under `KEEP_STACK` no teardown snapshot is taken).
+  this is not a continuous collector. Kept only when the rundir is kept (a red run,
+  `KEEP_RUNDIR` or `KEEP_STACK`; under `KEEP_STACK` no teardown snapshot is taken).
 - `artifacts/docker-wiring/startup-*/`: written when a phase's in-phase DinD sidecar start
   (`docker_wire_prepare`, phases 45 and 52) fails, before the exit trap removes the
   containers (#4165): `up.log`, `ps.txt`, `dind-init.log` / `dind.log` (`--tail 80`),
@@ -147,13 +150,76 @@ weakening the census. A kept stack is not a fresh fixture allocation.
 
 Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
 just the first) to stdout **before** teardown, and the suite exits `1` iff any
-phase FAILed (a LEAK alone exits 0 unless `E2E_STRICT_LEAKS=1`).
+phase FAILed. A phase that leaves undeclared residue behind FAILs at its own boundary
+(below); there is no non-fatal leak status.
 
-Evidence on red (PRD #966 M3): a **red** run — any FAIL, or any LEAK (which writes a
-`$RUNROOT/.keep-rundir` sentinel even though a non-strict LEAK exits 0) — **keeps its
-rundir** instead of `rm -rf`-ing it, and `cleanup` prints the retained path and the
-`artifacts/` path so the per-phase evidence above survives for post-mortem (and #967's
-upload). A green run with no `KEEP_RUNDIR` is removed as before.
+Evidence on red (PRD #966 M3): a **red** run (any FAIL) **keeps its rundir** instead of
+`rm -rf`-ing it, and `cleanup` prints the retained path and the `artifacts/` path so the
+per-phase evidence above survives for post-mortem (and #967's upload). A green run with
+no `KEEP_RUNDIR` is removed as before.
+
+## End-of-phase boundary
+
+After every phase body the driver runs a boundary (#2892) that FAILs the phase when it
+leaves state behind that no later phase should have to tolerate. Before the body it
+records the owner (the user `ADMIN_EMAIL` names) and that owner's open custody holds
+(the baseline). After the body it samples, until nothing new is left, a read fails, or
+the deadline passes:
+
+- **Non-terminal runs** not held by a `# handoff:` variable. The driver cancels each
+  undeclared one once, **through the API** (`boundary_cancel`); a refused or timed-out
+  cancel is a FAIL. The driver never writes a run status.
+- **`worker_active_runs` rows** whose run is not declared by `# handoff:`, even for a
+  run that is already terminal in the DB. These must disappear.
+- **Owner open custody holds** that were not open at phase start and are not declared by
+  `# handoff-holds:`. These must settle (be released).
+
+The end-of-phase wait shares one **120 s deadline** (`E2E_BOUNDARY_TIMEOUT`, sampled every
+`E2E_BOUNDARY_INTERVAL`, default 1 s); every read and cancel gets only the remaining seconds.
+The phase-start snapshot adds two reads bounded to 10 s each, and a failed boundary one
+5 s history read, so one boundary is bounded by about 145 s (20 + 120 + 5) plus on-red artifact capture. There is **no SQL fallback**: an unverifiable read,
+a rejected cancel or an unusable phase-start snapshot is itself a FAIL, never a silent
+DB write. Residue still present in the last sample, or any such error, FAILs the phase
+(the body's own row when the body failed too, with `(declarations unavailable: body
+failed)` noted, since a failed body's declarations are not trusted). An undeclared run the
+boundary cancelled that then settled does not fail the phase; the PASS row's message
+records it.
+
+A run reported after its cancellation budget was exhausted remains attributed to its
+original phase. A later boundary may send its first cancellation request; an actual
+attempt is never repeated. Reads that exhaust the budget retain the last successful
+rows for that relation and fail the boundary as incomplete.
+
+Declarations are phase-header lines naming variables the body set, not values:
+
+- `# handoff: VAR [VAR...]` — variables holding **run IDs** that intentionally outlive the
+  phase (`-` for none).
+- `# handoff-holds: VAR [VAR...]` — variables holding **custody hold UUIDs** that
+  intentionally stay open. Unset or empty declares nothing. In both headers one variable may
+  hold several whitespace-separated UUIDs; each must be a UUID. The driver round-trips the
+  declared names itself; they need not appear in `provides:`. Phase 52 declares
+  `OUTBOX_CASE3_HOLD_ID` (case 3's completed run keeps its hold; the other cases' holds
+  must settle) and phase 72 declares `FRESH_ID` (the wedge run's fresh hold stays open
+  after its cancel). A phase that declares nothing must leave nothing.
+
+**Known residue.** Residue a failed boundary reports becomes *known*: later boundaries
+still sample it and FAIL while it is present, but never wait for it (a boundary with only
+known residue takes a single sample). Neither a later baseline nor a later
+`handoff:` / `handoff-holds:` declaration exempts a known item that is still present. Such an
+item is reported as `still present from <slug>` (the phase whose boundary first reported
+it). Every later row of a phase that ran after a failed boundary is annotated
+` [ran after contaminated boundary: <slug>[ <slug>...]]` (a SKIP, and a requires-miss FAIL that never
+ran its body, are not), because a clean-looking result after a dirty boundary is not
+trustworthy evidence.
+
+Evidence: summary.md has a `## Boundary waits` table (phase, start_secs for the
+phase-start reads, end_secs for the end-of-phase wait, total_secs) and a
+`Total boundary seconds` sum. Per-boundary samples and reads are staged under
+`$RUNROOT/boundary/<NN-slug>/` and copied to `artifacts/<NN-slug>/boundary/` for a phase
+whose boundary FAILed. `E2E_BOUNDARY_TIMEOUT` and `E2E_BOUNDARY_INTERVAL` are knobs for the hermetic
+driver test only; `run-e2e.sh` does not pass them through its `env -i` allowlist, so a normal
+run uses the defaults (only invoking the internal `--e2e-sanitized` re-exec flag by hand
+skips that allowlist).
 
 ## Live-DB candidate-selection test (`run-store-it.sh`)
 
@@ -187,7 +253,8 @@ prints `ok`, so a new live-DB test in an eleventh package must add that package 
 
 The script runs each package in a separate Go invocation against the same DSN,
 appending to one log for the aggregate and per-package guards. Each invocation has
-a 10-minute timeout except `store` and `handler` (20 minutes each) and `workersvc` (45 minutes).
+a 10-minute timeout except `store` (30 minutes, raised for headroom in #4502), `handler`
+(20 minutes) and `workersvc` (45 minutes).
 With artifact admission coverage, the worker-service suite took nearly 18 minutes
 in isolation and integrated sweeps exhausted 20 minutes. The local helper's larger
 bounded deadline provides headroom; it changes no test selection, race checking,
@@ -250,8 +317,11 @@ It applies mutants only to the live task's own throwaway database.
 The suite is now a **phase registry**: each assertion group lives in its own file
 `e2e/phases/NN-<slug>.sh`, sourced in `NN` order by a fail-soft driver
 (`e2e/driver.sh`). The driver runs each phase in an errexit-safe subshell, records
-a PASS/FAIL/SKIP/LEAK verdict, and keeps going after a non-critical failure so one
-red phase no longer discards every downstream verdict. `./e2e/run-e2e.sh --list`
+a PASS/FAIL/SKIP verdict, and keeps going after a non-critical failure so one
+red phase no longer discards every downstream verdict. Phase headers (`# phase:`,
+`# requires:`, `# provides:`, `# handoff:`, `# handoff-holds:`, ...) are parsed by the
+driver; see [End-of-phase boundary](#end-of-phase-boundary) for the last two.
+`./e2e/run-e2e.sh --list`
 prints the table below (it reads only the phase-file headers, so it needs no
 docker). The table is generated — `task check:e2e-registry-doc` fails if it drifts
 from the phase files, and `task e2e:registry-doc` regenerates it. Edit the phase

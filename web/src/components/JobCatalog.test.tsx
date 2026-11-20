@@ -13,7 +13,7 @@ import { api, type CatalogEntry, type Repo, type Schedule, type ScheduleCatalog 
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { checkRepoLabels: vi.fn(), ensureRepoLabels: vi.fn() } };
+  return { ...actual, api: { checkRepoLabels: vi.fn(), ensureRepoLabels: vi.fn(), previewScheduleSettings: vi.fn() } };
 });
 const mockApi = vi.mocked(api);
 
@@ -114,6 +114,15 @@ describe("JobCatalog — cards", () => {
     expect(within(bug).getByLabelText("Baked prompt, read-only")).toBeTruthy();
     expect(within(bug).getByText("sweep")).toBeTruthy();
     expect(within(card("docs-hygiene")).getByText("prompt")).toBeTruthy();
+  });
+
+  it("never asks for a schedule-settings preview (issue #3260: catalog cards show no prediction)", async () => {
+    vi.useFakeTimers();
+    renderCatalog();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(mockApi.previewScheduleSettings).not.toHaveBeenCalled();
   });
 
   it("marks a pinned catalog model", () => {

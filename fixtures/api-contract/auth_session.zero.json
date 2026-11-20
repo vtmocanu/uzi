@@ -30,17 +30,20 @@
     "light_theme": "",
     "dark_theme": "",
     "typeface": "",
+    "sidebar_motion": false,
     "overrides": {
       "mode": null,
       "light_theme": null,
       "dark_theme": null,
-      "typeface": null
+      "typeface": null,
+      "sidebar_motion": null
     },
     "defaults": {
       "mode": "",
       "light_theme": "",
       "dark_theme": "",
-      "typeface": ""
+      "typeface": "",
+      "sidebar_motion": false
     }
   },
   "theme": "",

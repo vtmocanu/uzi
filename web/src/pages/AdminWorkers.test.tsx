@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { AdminWorkers } from "./AdminWorkers";
 import { healthySilentDoc } from "../mocks/data/health";
 import { api } from "../lib/api";
+import { BUILTIN_WORKER_SIZES } from "../lib/workerSizes";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -16,6 +17,11 @@ vi.mock("../lib/api", async (importActual) => {
       updateSettings: vi.fn(),
       adminListDockerAllowlistRepos: vi.fn(),
       adminListWorkers: vi.fn(),
+      getAdminWorkerSizes: vi.fn(),
+      updateAdminWorkerSize: vi.fn(),
+      resetAdminWorkerSize: vi.fn(),
+      createAdminWorkerSize: vi.fn(),
+      deleteAdminWorkerSize: vi.fn(),
     },
   };
 });
@@ -82,6 +88,25 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
 
 type Src = "env" | "db" | "default";
 
+// GET /admin/worker-sizes over the builtin seed (PRD #4213); `over` patches rows by name.
+const adminSizes = (over: Record<string, Partial<import("../lib/api").AdminWorkerSize>> = {}): import("../lib/api").AdminWorkerSizes => ({
+  sizes: BUILTIN_WORKER_SIZES.map((s, i) => ({
+    ...s,
+    display_order: i,
+    builtin: true,
+    customized: false,
+    shipped: { ...s },
+    updated_at: "2026-11-01T09:00:00Z",
+    ...over[s.name],
+  })),
+  ceilings: { cpu_limit_millicores: null, memory_limit_mib: null, data_gib: null, dind_data_gib: null, dind_overridden: false, enabled_tiers: null },
+  editable: true,
+  read_only_reason: null,
+  read_only_code: null,
+  advisories: [],
+  max_sizes: 16,
+});
+
 const response = (
   over: Partial<import("../lib/api").AppSettings> = {},
   sources: Record<string, Src> = {},
@@ -95,6 +120,7 @@ const response = (
 
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(response());
+  mockApi.getAdminWorkerSizes.mockResolvedValue(adminSizes());
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
   mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
   mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
@@ -120,6 +146,7 @@ function renderPage() {
 
 const IDS = [
   "docker-allowlist",
+  "worker-sizes",
   "hosted-worker-quota",
   "custody-hold-limit",
   "ephemeral-workers",
@@ -128,7 +155,7 @@ const IDS = [
 ];
 
 describe("AdminWorkers", () => {
-  it("renders the six worker cards and an on-page index listing all of them", async () => {
+  it("renders the seven worker cards and an on-page index listing all of them", async () => {
     renderPage();
     const nav = await screen.findByRole("navigation", { name: "Sections on this page" });
     await waitFor(() => {
@@ -256,5 +283,82 @@ describe("AdminWorkers recreated cases", () => {
     expect(saveBtn.disabled).toBe(true);
     fireEvent.click(toggle);
     expect(saveBtn.disabled).toBe(false);
+  });
+});
+
+describe("AdminWorkers worker sizes (PRD #4213)", () => {
+  const optionTexts = (label: string) =>
+    [...(screen.getByLabelText(label) as HTMLSelectElement).options].filter((o) => !o.disabled).map((o) => o.textContent);
+
+  it("feeds the default-size selectors from the sizes list and refreshes them after a save", async () => {
+    mockApi.getAdminWorkerSizes
+      .mockResolvedValueOnce(adminSizes())
+      .mockResolvedValueOnce(adminSizes({ l: { memory_limit_mib: 24576, customized: true } }));
+    mockApi.updateAdminWorkerSize.mockResolvedValue({
+      size: adminSizes({ l: { memory_limit_mib: 24576, customized: true } }).sizes[2],
+      warnings: [],
+      advisories: [],
+    });
+    renderPage();
+    await waitFor(() => expect(optionTexts("Default size for new workers")).toContain("L — up to 4 CPU / 20Gi RAM / 50Gi disk"));
+    expect(optionTexts("Ephemeral default size")).toContain("L — up to 4 CPU / 20Gi RAM / 50Gi disk");
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit size L" }));
+    fireEvent.change(screen.getByLabelText("L Memory limit (GiB)"), { target: { value: "24" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save size L" }));
+
+    await waitFor(() => expect(mockApi.updateAdminWorkerSize).toHaveBeenCalledWith("l", expect.objectContaining({ memory_limit_mib: 24576 })));
+    // The page re-read the list and lifted it: both selectors on this page show 24Gi at once.
+    await waitFor(() => expect(optionTexts("Default size for new workers")).toContain("L — up to 4 CPU / 24Gi RAM / 50Gi disk"));
+    expect(optionTexts("Ephemeral default size")).toContain("L — up to 4 CPU / 24Gi RAM / 50Gi disk");
+    expect(optionTexts("Default size for new workers")).not.toContain("L — up to 4 CPU / 20Gi RAM / 50Gi disk");
+    expect(mockApi.getAdminWorkerSizes).toHaveBeenCalledTimes(2);
+  });
+
+  it("lists an added size in both default-size selectors at once, in display order, and saves it as a default", async () => {
+    const xs = {
+      name: "xs", cpu_request_millicores: 250, cpu_limit_millicores: 1000, memory_request_mib: 1024, memory_limit_mib: 2048,
+      data_gib: 5, dind_data_gib: 10, display_order: 4, builtin: false, customized: false, shipped: null, updated_at: "2026-11-19T09:00:00Z",
+    };
+    const withXs = { ...adminSizes(), sizes: [...adminSizes().sizes, xs] };
+    mockApi.getAdminWorkerSizes.mockResolvedValueOnce(adminSizes()).mockResolvedValueOnce(withXs);
+    mockApi.createAdminWorkerSize.mockResolvedValue({ size: xs, warnings: [], advisories: [] });
+    mockApi.updateSettings.mockResolvedValue(response({ hosted_default_size: "xs" }, { hosted_default_size: "db" }) as never);
+    renderPage();
+    await waitFor(() => expect(optionTexts("Default size for new workers")).toHaveLength(4));
+    expect(optionTexts("Default size for new workers")).not.toContain("XS — up to 1 CPU / 2Gi RAM / 5Gi disk");
+
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.change(screen.getByLabelText("New size name"), { target: { value: "xs" } });
+    for (const [label, value] of [["CPU request (cores)", "0.25"], ["CPU limit (cores)", "1"], ["Memory request (GiB)", "1"], ["Memory limit (GiB)", "2"], ["Data disk (GiB)", "5"], ["DinD data disk (GiB)", "10"]]) {
+      fireEvent.change(screen.getByLabelText(`New size ${label}`), { target: { value } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    await waitFor(() => expect(mockApi.createAdminWorkerSize).toHaveBeenCalledWith("xs", {
+      cpu_request_millicores: 250, cpu_limit_millicores: 1000, memory_request_mib: 1024, memory_limit_mib: 2048, data_gib: 5, dind_data_gib: 10,
+    }));
+    // The page re-read the list: both selectors offer XS last, after the builtins.
+    await waitFor(() =>
+      expect(optionTexts("Default size for new workers")).toEqual([
+        "S — up to 1 CPU / 4Gi RAM / 5Gi disk",
+        "M — up to 4 CPU / 12Gi RAM / 25Gi disk",
+        "L — up to 4 CPU / 20Gi RAM / 50Gi disk",
+        "L-HIGHMEM — up to 4 CPU / 32Gi RAM / 50Gi disk",
+        "XS — up to 1 CPU / 2Gi RAM / 5Gi disk",
+      ]),
+    );
+    expect(optionTexts("Ephemeral default size")).toContain("XS — up to 1 CPU / 2Gi RAM / 5Gi disk");
+
+    fireEvent.change(screen.getByLabelText("Default size for new workers"), { target: { value: "xs" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Default size for new workers" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ hosted_default_size: "xs" }));
+  });
+
+  it("keeps the other cards usable when the sizes read fails", async () => {
+    mockApi.getAdminWorkerSizes.mockRejectedValue(new (await import("../lib/apiError")).ApiError(500, "internal error"));
+    renderPage();
+    expect(await screen.findByRole("button", { name: "Retry loading worker sizes" })).toBeTruthy();
+    // The selectors fall back to the builtin names, bare: no quantity they cannot vouch for.
+    expect(optionTexts("Default size for new workers")).toEqual(["S", "M", "L", "L-HIGHMEM"]);
   });
 });

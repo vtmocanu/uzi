@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, type SettingSource, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Field, Input, Select } from "../../components/ui";
-import { WORKER_SIZES, sizeOptionLabel } from "../../lib/workerSizes";
+import { BUILTIN_WORKER_SIZE_NAMES, sizeLabel, sizeOptionLabel, type NamedWorkerSize } from "../../lib/workerSizes";
 
 // SettingControl edits ONE app setting on its own: it PUTs only its key, "Reset to
 // default" PUTs the empty string (the server's reset contract), and an env-sourced key
@@ -28,6 +28,7 @@ export function SettingControl({
   helper,
   min,
   max,
+  sizeOptions,
   onSaved,
 }: {
   settingKey: string;
@@ -42,6 +43,10 @@ export function SettingControl({
   helper?: string;
   min?: number;
   max?: number;
+  /** kind "size": the sizes to offer, with their quantities, from GET /admin/worker-sizes
+   *  (PRD #4213). Absent while that list is loading or after it failed: the builtin names
+   *  are offered bare then, because a quantity this control cannot vouch for would mislead. */
+  sizeOptions?: readonly NamedWorkerSize[];
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const id = `setting-${settingKey}`;
@@ -53,6 +58,7 @@ export function SettingControl({
   // Follow the saved value after a save, a reset, or a sibling card's save.
   useEffect(() => setDraft(value), [value]);
 
+  const sizeNames: readonly string[] = sizeOptions ? sizeOptions.map((s) => s.name) : BUILTIN_WORKER_SIZE_NAMES;
   const effectiveSource: SettingSource = source ?? "default";
   const isEnv = effectiveSource === "env";
   const dirty = draft.trim() !== value;
@@ -105,16 +111,22 @@ export function SettingControl({
       <Field label={label} htmlFor={id}>
         {kind === "size" ? (
           <Select {...common}>
-            {!(WORKER_SIZES as readonly string[]).includes(draft) && (
+            {!sizeNames.includes(draft) && (
               <option value={draft} disabled>
                 {draft === "" ? "Select a size" : draft}
               </option>
             )}
-            {WORKER_SIZES.map((s) => (
-              <option key={s} value={s}>
-                {sizeOptionLabel(s)}
-              </option>
-            ))}
+            {sizeOptions
+              ? sizeOptions.map((s) => (
+                  <option key={s.name} value={s.name}>
+                    {sizeOptionLabel(s)}
+                  </option>
+                ))
+              : BUILTIN_WORKER_SIZE_NAMES.map((name) => (
+                  <option key={name} value={name}>
+                    {sizeLabel(name)}
+                  </option>
+                ))}
           </Select>
         ) : (
           <Input

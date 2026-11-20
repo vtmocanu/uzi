@@ -1,3 +1,4 @@
+import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
 import { AdmissionClock, flushUntil } from "./operation-admission-clock.js";
 import type { CodexOperationRequest } from "../src/protocol.js";
@@ -593,6 +594,7 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     const start = bits.transport.requests.find((r) => r.method === "turn/start");
     assert.ok(start);
     const params = start.params as Record<string, unknown>;
+    assert.deepEqual(params.environments, [], "the advice turn disables native execution environments");
     assert.deepEqual(params.input, [{ type: "text", text: "please review" }]);
     assert.equal(params.model, "gpt-6-astra");
     assert.equal(params.effort, "high");
@@ -709,58 +711,64 @@ describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () =
   });
 
   it("thread/start pins untrusted project + doc_max 0, disables effectful native tools/agents/MCP, and never a hook-trust bypass", async () => {
-    const bits = makeHarness({ cwd: "/isolated/advice/proj" });
-    bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
-    await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+    for (let invocation = 0; invocation < 2; invocation++) {
+      const bits = makeHarness({ cwd: "/isolated/advice/proj" });
+      bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+      await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
 
-    const start = bits.transport.requests.find((r) => r.method === "thread/start");
-    assert.ok(start);
-    const params = start.params as Record<string, unknown>;
-    const config = params.config as Record<string, unknown>;
-    assert.equal(config.project_doc_max_bytes, 0);
-    assert.equal(config.web_search, "disabled");
-    assert.deepEqual((config.projects as Record<string, unknown>)["/isolated/advice/proj"], {
-      trust_level: "untrusted",
-    });
-    const features = config.features as Record<string, boolean>;
-    assert.equal(Object.hasOwn(features, "remote_models"), false, "the removed compatibility key is omitted");
-    assert.deepEqual(
-      Object.keys(features).sort(),
-      [
-        "apply_patch_freeform",
-        "apps",
-        "code_mode",
-        "code_mode_host",
-        "code_mode_only",
-        "code_mode_prewarm",
-        "enable_request_compression",
-        "hooks",
-        "multi_agent",
-        "multi_agent_v2",
-        "plugins",
-        "shell_snapshot",
-        "shell_snapshot_v2",
-        "shell_tool",
-        "sleep_tool",
-        "unified_exec",
-        "view_image",
-      ],
-      "the complete characterized feature ceiling stays explicit",
-    );
-    assert.deepEqual(
-      Object.entries(features).filter(([, enabled]) => enabled !== false),
-      [],
-      "every declared advice feature is disabled",
-    );
-    assert.equal((config.agents as Record<string, unknown>).enabled, false);
-    assert.equal(params.approvalPolicy, "never");
-    assert.deepEqual(params.environments, [], "no native execution environment is attached");
-    assert.deepEqual(params.dynamicTools, [], "advice receives no worker callback tools");
-    assert.equal(params.developerInstructions, "you are the reviewer");
-    assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
-    // No hook-trust bypass anywhere in the start params.
-    assert.ok(!JSON.stringify(params).includes("bypass_hook_trust"));
-    assert.ok(!JSON.stringify(params).includes("dangerously-bypass-hook-trust"));
+      const start = bits.transport.requests.find((r) => r.method === "thread/start");
+      assert.ok(start);
+      const params = start.params as Record<string, unknown>;
+      const config = params.config as Record<string, unknown>;
+      assertNoNativeServers(config);
+      assert.equal(params.ephemeral, true);
+      assert.equal(bits.transport.requests.some(r => r.method === "thread/resume"), false);
+      assert.equal(config.project_doc_max_bytes, 0);
+      assert.equal(config.web_search, "disabled");
+      assert.deepEqual((config.projects as Record<string, unknown>)["/isolated/advice/proj"], {
+        trust_level: "untrusted",
+      });
+      const features = config.features as Record<string, boolean>;
+      assert.equal(Object.hasOwn(features, "remote_models"), false, "the removed compatibility key is omitted");
+      assert.deepEqual(
+        Object.keys(features).sort(),
+        [
+          "apply_patch_freeform",
+          "apps",
+          "code_mode",
+          "code_mode_host",
+          "code_mode_only",
+          "code_mode_prewarm",
+          "enable_request_compression",
+          "goals",
+          "hooks",
+          "multi_agent",
+          "multi_agent_v2",
+          "plugins",
+          "shell_snapshot",
+          "shell_snapshot_v2",
+          "shell_tool",
+          "sleep_tool",
+          "unified_exec",
+          "view_image",
+        ],
+        "the complete characterized feature ceiling stays explicit",
+      );
+      assert.deepEqual(
+        Object.entries(features).filter(([, enabled]) => enabled !== false),
+        [],
+        "every declared advice feature is disabled",
+      );
+      assert.equal((config.agents as Record<string, unknown>).enabled, false);
+      assert.equal(params.approvalPolicy, "never");
+      assert.deepEqual(params.environments, [], "no native execution environment is attached");
+      assert.deepEqual(params.dynamicTools, [], "advice receives no worker callback tools");
+      assert.equal(params.developerInstructions, "you are the reviewer");
+      assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
+      // No hook-trust bypass anywhere in the start params.
+      assert.ok(!JSON.stringify(params).includes("bypass_hook_trust"));
+      assert.ok(!JSON.stringify(params).includes("dangerously-bypass-hook-trust"));
+    }
   });
 
   it("REJECTS a request carrying run-tool surface (agents) — the ceiling, enforced at runtime", async () => {

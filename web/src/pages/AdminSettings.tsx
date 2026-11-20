@@ -43,7 +43,8 @@ import {
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
 import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
-import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
+import { SummaryControlsCard } from "./adminSettings/SummaryControlsCard";
+import { InstanceModelDefaultsCard } from "./adminSettings/InstanceModelDefaultsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
 import { TrustedReviewBotsCard } from "./adminSettings/TrustedReviewBotsCard";
@@ -147,25 +148,17 @@ export function AdminSettings() {
   // (master-key) encryption. Fetched separately so a failure never blocks the
   // settings form; null = unknown/not-yet-loaded, rendered only when > 0.
   const [reunlockDays, setReunlockDays] = useState("7");
-  const confirmedReunlockDays = useRef<string | null>(null);
   const [reunlockError, setReunlockError] = useState("");
   const [vaultPolicy, setVaultPolicy] = useState("required");
   const [unprotectedUsers, setUnprotectedUsers] = useState<number | null>(null);
   const [masterSealed, setMasterSealed] = useState<number | null>(null);
 
-  // applyResponse fans a GET/PUT response out to the label-form fields and the
-  // shared secret/source state, so both the label form and the Slack card read a
-  // consistent snapshot.
-  const applyResponse = useCallback((resp: SettingsResponse) => {
+  // seedAll fans the initial GET out to every piece of page state. It is the only
+  // path that replaces state wholesale; card saves go through applySaved.
+  const seedAll = useCallback((resp: SettingsResponse) => {
     const { settings, secrets: sec, sources: src } = resp;
-    // Sibling cards save independently and may return an older full map.
-    // Only the initial load and this field's own save confirm its lifetime.
-    const lifetime = confirmedReunlockDays.current ?? settings.vault_reunlock_days ?? "7";
-    if (confirmedReunlockDays.current === null) {
-      confirmedReunlockDays.current = lifetime;
-      setReunlockDays(lifetime);
-    }
-    setSaved({ ...settings, vault_reunlock_days: lifetime });
+    setSaved(settings);
+    setReunlockDays(settings.vault_reunlock_days ?? "7");
     setVaultPolicy(settings.vault_policy ?? "required");
     setUnprotectedUsers(resp.unprotected_users ?? null);
     setSecrets(sec ?? {});
@@ -182,7 +175,41 @@ export function AdminSettings() {
     setDefaultTypeface(settings.default_typeface);
   }, []);
 
-  // The settings form fields are seeded by applyResponse as a fetcher side effect
+  // applySaved merges a card's PUT response, but only for the keys that request sent
+  // (`sent`): a save response confirms exactly those keys. Cards save independently, so
+  // a slower, older response must not revert keys another card has since confirmed, nor
+  // reset the label form, the GET-only oidc_* fields (which PUT responses leave empty),
+  // or the defaults and vault policy (owned by the initial load and their own controls). Ownership by key was chosen over a save sequence number
+  // because an older response is still the authority for its own keys. Values always
+  // come from the response, never from `sent`.
+  const applySaved = useCallback((resp: SettingsResponse, sent: UpdateSettingsPayload) => {
+    const keys = Object.keys(sent);
+    const respSettings = resp.settings as unknown as Record<string, string>;
+    setSaved(cur => {
+      if (cur === null) return cur;
+      const next = { ...cur } as unknown as Record<string, string>;
+      for (const k of keys) if (k in respSettings) next[k] = respSettings[k];
+      return next as unknown as AppSettings;
+    });
+    const mergeKeys = <T,>(prev: Record<string, T>, from: Record<string, T> | undefined) => {
+      if (!from) return prev;
+      const next = { ...prev };
+      for (const k of keys) if (k in from) next[k] = from[k];
+      return next;
+    };
+    setSecrets(prev => mergeKeys(prev, resp.secrets));
+    setSources(prev => mergeKeys(prev, resp.sources));
+    setSlackStatus(resp.slack_status ?? "disabled");
+    const s = resp.settings;
+    if ("uzi_label" in sent) setUziLabel(s.uzi_label);
+    if ("autopilot_label" in sent) setAutopilotLabel(s.autopilot_label);
+    if ("default_appearance_mode" in sent) setDefaultAppearanceMode(s.default_appearance_mode);
+    if ("default_light_theme" in sent) setDefaultLightTheme(s.default_light_theme);
+    if ("default_dark_theme" in sent) setDefaultDarkTheme(resolveDarkDisplay(s));
+    if ("default_typeface" in sent) setDefaultTypeface(s.default_typeface);
+  }, []);
+
+  // The settings form fields are seeded by seedAll as a fetcher side effect
   // (they are editable and also written by the save handler). The vaultMigration probe
   // runs in a `finally` so it fires regardless of the settings-load outcome, exactly as
   // the old load ran it after its own try/catch/finally (PRD #32). The hook owns
@@ -192,7 +219,7 @@ export function AdminSettings() {
     async ({ isCurrent }) => {
       try {
         const resp = await api.getSettings();
-        if (isCurrent()) applyResponse(resp);
+        if (isCurrent()) seedAll(resp);
       } finally {
         api
           .vaultMigration()
@@ -204,7 +231,7 @@ export function AdminSettings() {
           });
       }
     },
-    [applyResponse],
+    [seedAll],
     { fallback: "Failed to load settings" },
   );
 
@@ -258,7 +285,7 @@ export function AdminSettings() {
 
   // Poll only the live Slack connection state so the chip reflects connecting →
   // connected without a manual reload. Uses the dedicated status endpoint (not the
-  // whole settings blob) and deliberately does NOT call applyResponse (which would
+  // whole settings blob) and deliberately does NOT call seedAll (which would
   // reset the form fields and clobber an in-progress edit).
   useEffect(() => {
     const id = setInterval(async () => {
@@ -306,7 +333,7 @@ export function AdminSettings() {
         default_dark_theme: defaultDarkTheme,
         default_typeface: defaultTypeface,
       };
-      applyResponse(await api.updateSettings(payload));
+      applySaved(await api.updateSettings(payload), payload);
       setNotice(
         labelChanged
           ? "Settings saved. Boards reflect the label change after the next sync."
@@ -331,6 +358,7 @@ export function AdminSettings() {
       ? [{ id: "vault-migration", label: "Vault migration" }]
       : []),
     { id: "vault-policy", label: "Credential protection" },
+    ...(!loading && saved ? [{ id: "model-defaults", label: "Model defaults" }] : []),
     { id: "forge-labels", label: "Forge labels" },
     ...(!loading && saved ? [{ id: "run-judge", label: "Run judge" }] : []),
     ...(!loading ? [{ id: "maintenance", label: "Maintenance mode" }] : []),
@@ -408,7 +436,6 @@ export function AdminSettings() {
           try {
             const resp = await api.updateSettings({ vault_reunlock_days: reunlockDays });
             const days = resp.settings.vault_reunlock_days ?? "7";
-            confirmedReunlockDays.current = days;
             setSaved(current => current ? { ...current, vault_reunlock_days: days } : current);
             setReunlockDays(days);
           } catch (err) { setReunlockError(errorMessage(err, "Failed to save browser grant lifetime")); }
@@ -444,6 +471,12 @@ export function AdminSettings() {
           }}>Save vault policy</Button>
         </div>
       </Card>
+
+      {!loading && saved && (
+        <section id="model-defaults" className="scroll-mt-6">
+          <InstanceModelDefaultsCard settings={saved} sources={sources} defaults={defaults} onSaved={applySaved} />
+        </section>
+      )}
 
       <Card id="forge-labels" className="scroll-mt-6 space-y-5">
         <div>
@@ -560,13 +593,13 @@ export function AdminSettings() {
 
       {!loading && saved && (
         <section id="run-judge" className="scroll-mt-6">
-          <JudgeSettingsCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
+          <JudgeSettingsCard settings={saved} sources={sources} defaults={defaults} onSaved={applySaved} />
         </section>
       )}
 
       {!loading && saved && (
         <section id="run-summaries" className="scroll-mt-6">
-          <SummarySettingsCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
+          <SummaryControlsCard settings={saved} sources={sources} onSaved={applySaved} />
         </section>
       )}
 
@@ -612,38 +645,38 @@ export function AdminSettings() {
             secrets={secrets}
             sources={sources}
             status={slackStatus}
-            onSaved={applyResponse}
+            onSaved={applySaved}
           />
         </section>
       )}
 
       {!loading && saved && (
         <section id="run-health" className="scroll-mt-6">
-          <HealthSettingsCard settings={saved} sources={sources} onSaved={applyResponse} />
+          <HealthSettingsCard settings={saved} sources={sources} onSaved={applySaved} />
         </section>
       )}
 
       {!loading && saved && (
         <section id="review-bots" className="scroll-mt-6">
-          <TrustedReviewBotsCard settings={saved} sources={sources} onSaved={applyResponse} />
+          <TrustedReviewBotsCard settings={saved} sources={sources} onSaved={applySaved} />
         </section>
       )}
 
       {!loading && saved && (
         <section id="completion-interlock" className="scroll-mt-6">
-          <CompletionInterlockCard settings={saved} sources={sources} onSaved={applyResponse} />
+          <CompletionInterlockCard settings={saved} sources={sources} onSaved={applySaved} />
         </section>
       )}
 
       {!loading && saved && (
         <section id="github-project-sync" className="scroll-mt-6">
-          <GithubProjectSyncCard settings={saved} sources={sources} onSaved={applyResponse} />
+          <GithubProjectSyncCard settings={saved} sources={sources} onSaved={applySaved} />
         </section>
       )}
 
       {!loading && saved && (
         <section id="fetch-caps" className="scroll-mt-6">
-          <FetchCapsCard settings={saved} onSaved={applyResponse} />
+          <FetchCapsCard settings={saved} onSaved={applySaved} />
         </section>
       )}
 

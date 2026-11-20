@@ -23,6 +23,7 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "already_running",
   "description_too_large",
   "fetch_failed",
+  "consumer_gate_busy",
   "vault_locked",
   "self_improve_mr_cap_reached",
   "open_mr_exists",

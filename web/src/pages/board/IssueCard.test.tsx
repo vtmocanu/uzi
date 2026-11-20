@@ -1,11 +1,23 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { IssueCard } from "./IssueCard";
-import type { Card } from "../../lib/api";
+import { api, type Card } from "../../lib/api";
+import { RECORDED_EFFECTIVE_SCENARIOS } from "../../mocks/data/effectiveSettings";
+import { StartPreviewProvider } from "../../lib/startPreviewStore";
 
-afterEach(cleanup);
+vi.mock("../../lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/api")>();
+  return { ...actual, api: { getEffectiveSettings: vi.fn(), previewStartSettings: vi.fn() } };
+});
+// The preview store reads the signed-in user; only the preview describe renders a provider.
+vi.mock("../../auth/AuthContext", () => ({ useOptionalAuth: () => ({ user: { id: "u1" } }) }));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 const FAILED_PIPELINE: NonNullable<Card["pipeline"]> = {
   status: "failed",
@@ -221,4 +233,93 @@ it("shows the issue key instead of #iid when the card carries one", () => {
 it("shows #iid when the card has no issue key", () => {
   const { container } = renderCard();
   expect(container.textContent).toContain("#7");
+});
+
+// Issue #3261: the quiet "if started now" line under the start row, and the gate reason as text.
+describe("IssueCard — run-start preview", () => {
+  const SCENARIO = RECORDED_EFFECTIVE_SCENARIOS[0];
+  const mockApi = vi.mocked(api);
+
+  function renderWithPreview(
+    over: Partial<Card> = {},
+    props: { gate?: { enabled: boolean; reason: string }; isEligible?: boolean; canPromote?: boolean } = {},
+  ) {
+    return render(
+      <MemoryRouter>
+        <StartPreviewProvider generation={1}>
+          <IssueCard
+            card={aCard(over)}
+            repoId="repo-1"
+            chips={[]}
+            laneLabel="Review"
+            canMoveUp={false}
+            canMoveDown={false}
+            onMoveUp={vi.fn()}
+            onMoveDown={vi.fn()}
+            insertionEdge={null}
+            gate={props.gate ?? { enabled: true, reason: "" }}
+            starting={false}
+            onStart={vi.fn()}
+            onOptions={vi.fn()}
+            fixCiBusy={false}
+            onFixCi={vi.fn()}
+            uziLabel="uzi"
+            isEligible={props.isEligible ?? true}
+            canPromote={props.canPromote ?? false}
+            promoting={false}
+            onPromote={vi.fn()}
+            onDragStart={vi.fn()}
+            onDragEnd={vi.fn()}
+            dimmed={false}
+          />
+        </StartPreviewProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  beforeEach(() => {
+    mockApi.getEffectiveSettings.mockResolvedValue(structuredClone(SCENARIO.get));
+    mockApi.previewStartSettings.mockResolvedValue(
+      structuredClone(SCENARIO.start_previews.find((p) => p.name === "claude")!.response),
+    );
+  });
+
+  it("shows a closed disclosure with the server prediction on an eligible open card", async () => {
+    renderWithPreview();
+    const button = await screen.findByRole("button", { name: /If started now: Claude · opus · medium/ });
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("a gated card shows its reason as visible full-contrast text and still shows the preview", async () => {
+    renderWithPreview({}, { gate: { enabled: false, reason: "Add a worker first." } });
+    const reason = screen.getByText("Add a worker first.");
+    expect(reason.tagName).toBe("P");
+    expect(reason.className).toContain("text-xs");
+    expect(reason.className).not.toMatch(/text-(faint|muted)/);
+    expect(await screen.findByRole("button", { name: /If started now/ })).toBeTruthy();
+  });
+
+  it("an enabled card shows no gate line", async () => {
+    renderWithPreview();
+    await screen.findByRole("button", { name: /If started now/ });
+    expect(screen.queryByText("Add a worker first.")).toBeNull();
+  });
+
+  it("a promotable card, a closed card and an ineligible card show no preview", async () => {
+    renderWithPreview({}, { canPromote: true, isEligible: false });
+    renderWithPreview({ closed: true });
+    renderWithPreview({}, { isEligible: false });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText(/If started now|Resolving/)).toBeNull();
+    expect(mockApi.previewStartSettings).not.toHaveBeenCalled();
+  });
+
+  it("a failed preview shows the error text and leaves Start enabled", async () => {
+    mockApi.previewStartSettings.mockRejectedValue(new Error("boom"));
+    renderWithPreview();
+    expect(await screen.findByText("Preview unavailable; Start will validate your choices.")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Start run" }) as HTMLButtonElement).disabled).toBe(false);
+  });
 });

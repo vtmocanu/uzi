@@ -8185,6 +8185,8 @@ it.each([
   "handoff setup has not finished",
   "your vault is locked, so this run can't start",
   "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings",
+  // Issue #4423: legacy wording from an older API during a rolling upgrade.
   "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
   "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
   "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",

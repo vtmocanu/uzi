@@ -17,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 )
 
 // runTUIDemo runs the interactive program over the demo model. Called from `uzi tui --demo`.
@@ -274,8 +275,23 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	all[2].RetainingUnpublishedWork, all[2].CustodyDecisionsNeeded = true, num(0)
 	all[6].RetainingUnpublishedWork, all[6].CustodyDecisionsNeeded = true, num(1)
 	all[6].TemplateDeclared, all[6].TemplateReported = str("node"), str("node")
+	// Quantities for each hosted worker's size, from the builtin table, so the detail view
+	// shows what the real api would send.
+	specs := map[string]*apitypes.WorkerSizeSpec{}
+	for _, s := range builtin.Sizes() {
+		specs[s.Name] = &apitypes.WorkerSizeSpec{
+			CPURequestMillicores: s.CPURequestMillicores, CPULimitMillicores: s.CPULimitMillicores,
+			MemoryRequestMiB: s.MemoryRequestMiB, MemoryLimitMiB: s.MemoryLimitMiB,
+			DataGiB: s.DataGiB, DinDDataGiB: s.DinDDataGiB,
+		}
+	}
+	for i := range all {
+		if all[i].HostedSize != nil {
+			all[i].HostedSizeSpec = specs[*all[i].HostedSize]
+		}
+	}
 	for _, i := range []int{7, 8} {
-		all[i].Kind, all[i].HostedSize, all[i].Docker = "external", nil, nil
+		all[i].Kind, all[i].HostedSize, all[i].HostedSizeSpec, all[i].Docker = "external", nil, nil, nil
 		all[i].Busy = true
 	}
 	all[7].MaxConcurrentRuns, all[7].StatsMemLimitBytes, all[7].StatsSource = nil, nil, str("process")

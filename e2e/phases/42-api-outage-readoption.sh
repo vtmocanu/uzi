@@ -402,8 +402,8 @@ for r in "$E" "$G" "$EA" "$GA" "$X" "$ED"; do
   [ -n "${r:-}" ] && cancel_run "$r"
 done
 # The cancels are enqueued for the just-recreated agent (which may also requeue and reclaim a
-# run first); wait for them to land so the quarantine does not find a run still settling
-# after the restore and log a LEAK (seen in CI).
+# run first); wait for them to land so the end-of-phase boundary does not find a run still settling
+# after the restore and FAIL the phase (seen in CI as a leak).
 settle_runs_terminal 45 "${E:-}" "${G:-}" "${EA:-}" "${GA:-}" "${X:-}" "${ED:-}"
 
 # The loss/rollback fixtures proved retention above. End their explicit owner

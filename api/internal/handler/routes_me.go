@@ -270,6 +270,47 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// account mode, it is owner-scoped and Bearer-reachable; cookie writes require CSRF.
 	r.With(h.requireUser()).Put("/me/harness-overflow", h.SetHarnessOverflowEnabled)
 
+	// Current-user model and effort defaults (PRD #3264, `uzi settings set|reset`): a closed
+	// allowlist of the worker-model lanes, ordinary effort, judge and summary models and the
+	// judge harness, written in one transaction. RequireUser, so a uzc_ CLI Bearer works;
+	// PUT /me/settings (the whole settings surface) stays cookie-only above.
+	//
+	// Two different arguments cover the fields.
+	//
+	// The worker model and effort lanes are NON-ADDITIVE: per-run model/effort overrides
+	// already exist on requireUser POST /repos/{id}/runs and schedule create, so a Bearer
+	// that sets default_effort=max only raises the spend of runs the user already consented
+	// to. CAVEAT, as for /me/rate-limits (D23): this rests on those routes staying
+	// RequireUser; if that authority is ever narrowed, revisit this mount.
+	//
+	// The judge and summary lanes (judge_model, codex_judge_model, summary_model,
+	// codex_summary_model), judge_runs_on and cross_check_pins (the checker's per-stage,
+	// per-harness model and effort) are a DELIBERATE NEW Bearer authority: before this route
+	// they were writable only through cookie-only PutMySettings, and CreateRun takes no judge,
+	// summary or checker override. They redirect which model, effort or harness
+	// already-enabled judge, summary and cross-check work uses and never enable it (pins cannot
+	// turn cross-check on): the consent switches
+	// (/me/judge, /me/cross-check, autopilot, ...) stay cookie-only and the handler's
+	// allowlist rejects their keys. The authority is bounded by a token that can already
+	// create runs and spend.
+	//
+	// A uza_ admin token reaches handlers with IsAdmin=true; that is irrelevant here, the
+	// handler has no admin branch and the identity is the authenticated user, never the body.
+	r.With(h.requireUser()).Put("/me/model-settings", h.PutMyModelSettings)
+
+	// The caller's own agent templates for the CLI (PRD #3264 M3): a restricted list (identity,
+	// the two model pins, customized, editable; no prompt body, description or tools) and a
+	// pin-only write. Owner-scoped and Bearer-reachable, and only for the caller's OWN
+	// scope='user' templates: builtin and global templates stay web/admin-only through the
+	// cookie-only /api/agent-templates routes, and the pin route answers 403 for them even to
+	// an admin. A uza_ admin_ro token reaches handlers with IsAdmin=true, but neither handler
+	// has an admin branch (the list passes IsAdmin=false), so the list hides other users'
+	// templates even from an admin (D4, D5). Pins only choose a model for a template the
+	// caller already owns and can already edit in full in the web UI; the same Bearer cannot
+	// reach the prompt, tools or description.
+	r.With(h.requireUser()).Get("/me/agent-templates", h.ListMyAgentTemplates)
+	r.With(h.requireUser()).Put("/me/agent-templates/{id}/model-pins", h.PutMyAgentTemplateModelPins)
+
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
 	//

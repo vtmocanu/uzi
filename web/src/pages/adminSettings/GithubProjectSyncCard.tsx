@@ -1,5 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 import { DocLink } from "../../components/DocLink";
@@ -19,7 +25,7 @@ export function GithubProjectSyncCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.github_project_sync_enabled === "true");
   const [busy, setBusy] = useState(false);
@@ -37,10 +43,11 @@ export function GithubProjectSyncCard({
     if (isEnv || !dirty) return;
     setBusy(true);
     try {
-      const resp = await api.updateSettings({
+      const payload: UpdateSettingsPayload = {
         github_project_sync_enabled: enabled ? "true" : "false",
-      });
-      onSaved(resp);
+      };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setEnabled(resp.settings.github_project_sync_enabled === "true");
       setNotice("GitHub Projects sync setting saved.");
     } catch (err) {

@@ -3,13 +3,15 @@
 //
 // Two production surfaces decide trust, and NEITHER takes repo input:
 //   1. the config.toml builders (config.ts) — a FIXED native-disabled template pinning
-//      `project_doc_max_bytes = 0` + an explicit `trust_level = "untrusted"` and every native
-//      feature (agents/plugins/apps/shell_tool/code_mode*/unified_exec/hooks/multi_agent) off. They
+//      `project_doc_max_bytes = 0` + an explicit `trust_level = "untrusted"` and fixed feature
+//      settings. Removed apply_patch_freeform and catalog-overridden code_mode* keys do not
+//      prove runtime suppression; native patch stays advertised under the host. The builders
 //      accept only model/projectPath/authMode and REJECT any unknown key, so an AGENTS.md /
 //      .codex/agents / .codex/rules / hook / MCP / plugin / app value cannot be smuggled in.
 //   2. the CodexHarness thread construction — re-asserting the untrusted config on thread/start AND
 //      thread/resume, and an empty `environments: []` on every turn/start, so a resumed root cannot
-//      inherit a native execution environment.
+//      inherit a native execution environment. thread/resume has no environments field.
+//      Root thread/start also selects []; the launcher replaces env with CODEX_EXEC_SERVER_URL=none.
 //
 // The executor leg drives the REAL CodexExecutor over an in-memory transport and inspects the
 // thread/start (start), thread/resume (resume) and turn/start (subsequent turn) requests — proving
@@ -52,16 +54,16 @@ describe("codex U repository trust construction (real config builders + real exe
     const production = mods.config.buildCodexProductionConfigToml({ model: "gpt-6-astra", projectPath, authMode: "subscription" });
     const loopback = mods.config.buildCodexLoopbackTestConfigToml({ model: "gpt-6-astra", projectPath, authMode: "api_key" }, "http://127.0.0.1:44444/v1");
 
-    // Every native EXECUTION feature the fixed template pins off in BOTH postures. code_mode_host is
+    // Exact false config entries in BOTH postures, not proof of runtime suppression. code_mode_host is
     // NOT here: it is the authority-free run-lane callback-routing host — off on the default/advice
     // lane and enabled on the run lane — asserted posture-by-posture, not an always-off grant.
-    const otherNativeOff = ["hooks = false", "code_mode = false", "code_mode_only = false", "unified_exec = false", "shell_tool = false", "apply_patch_freeform = false", "apps = false", "plugins = false"];
+    const otherNativeOff = ["goals = false", "hooks = false", "code_mode = false", "code_mode_only = false", "unified_exec = false", "shell_tool = false", "apply_patch_freeform = false", "apps = false", "plugins = false"];
 
     for (const [label, toml] of [["production", production], ["loopback", loopback]] as const) {
       assert.match(toml, /project_doc_max_bytes = 0/, `${label} pins project_doc_max_bytes = 0`);
       assert.match(toml, /\[projects\."\/work\/repo"\]\ntrust_level = "untrusted"/, `${label} pins the project explicitly untrusted`);
       for (const off of otherNativeOff) {
-        assert.ok(toml.includes(off), `${label} disables native feature: ${off}`);
+        assert.ok(toml.split("[features]\n")[1]!.split("\n[")[0]!.split("\n").includes(off), `${label} disables native feature: ${off}`);
       }
       // DEFAULT/advice posture: the callback-routing host is OFF on the default (advice/stock) lane.
       assert.match(toml, /^code_mode_host = false$/m, `${label} keeps code_mode_host off on the default/advice lane`);
@@ -73,14 +75,14 @@ describe("codex U repository trust construction (real config builders + real exe
 
     // RUN-LANE posture: the SAME fixed template driven with the trusted launcher-fixed
     // codeModeHost:true enables ONLY the authority-free code-mode host (code_mode_host = true); every
-    // OTHER native feature stays off and the project stays untrusted — the host is not a trust or
+    // OTHER tested feature key stays false and the project stays untrusted — the host is not a trust or
     // native-execution grant, so no repo input decides it either.
     const productionRun = mods.config.buildCodexProductionConfigToml({ model: "gpt-6-astra", projectPath, authMode: "subscription", codeModeHost: true });
     const loopbackRun = mods.config.buildCodexLoopbackTestConfigToml({ model: "gpt-6-astra", projectPath, authMode: "api_key", codeModeHost: true }, "http://127.0.0.1:44444/v1");
     for (const [label, toml] of [["production (run lane)", productionRun], ["loopback (run lane)", loopbackRun]] as const) {
       assert.match(toml, /^code_mode_host = true$/m, `${label} enables the run-lane code_mode_host = true`);
       for (const off of otherNativeOff) {
-        assert.ok(toml.includes(off), `${label} keeps every OTHER native feature off: ${off}`);
+        assert.ok(toml.split("[features]\n")[1]!.split("\n[")[0]!.split("\n").includes(off), `${label} keeps every OTHER native feature off: ${off}`);
       }
       assert.match(toml, /\[projects\."\/work\/repo"\]\ntrust_level = "untrusted"/, `${label} keeps the project untrusted on the run lane`);
       assert.doesNotMatch(toml, /trust_level = "trusted"/, `${label} never promotes trust on the run lane`);

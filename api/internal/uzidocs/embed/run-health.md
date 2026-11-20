@@ -52,14 +52,14 @@ allowlist (**Admin → Workers → Docker worker repo allowlist**, at
 variant.
 
 - Owner is an admin: _"this repo isn't on the Docker worker repo allowlist, so
-  your Docker workers can't run it; add it under Admin → Instance → Docker
+  your Docker workers can't run it; add it under Admin → Workers → Docker
   worker repo allowlist"_
 - Owner is not an admin: _"this repo isn't on the Docker worker repo
   allowlist, so your Docker workers can't run it; ask an admin to add it under
-  Admin → Instance → Docker worker repo allowlist"_
+  Admin → Workers → Docker worker repo allowlist"_
 
-These reason texts still name Admin → Instance, where the allowlist used to
-live; the control is now on Admin → Workers.
+A run flagged by an older server may still show the previous wording, which
+named Admin → Instance, until the next health sweep rewrites it.
 
 The fix is to add the repo to the allowlist, not to start another worker. The
 owner's Slack nudge for this flag arrives sooner too, still subject to the

@@ -561,6 +561,13 @@ export interface UserSettings {
   light_theme: string | null;
   dark_theme: string | null;
   typeface: string | null;
+  /** Raw per-user opt-in for animated sidebar icons; null = inherit the instance
+   *  default (off). Optional for older servers: absent reads as off, never as a
+   *  stored false. */
+  sidebar_motion?: boolean | null;
+  /** Resolved sidebar-icon animation flag (override else the server default).
+   *  Read-only; never sent on a PUT. Optional for older servers. */
+  effective_sidebar_motion?: boolean;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
@@ -638,6 +645,9 @@ export interface UserSettingsPatch {
   light_theme?: string | null;
   dark_theme?: string | null;
   typeface?: string | null;
+  /** Sidebar icon animations: absent keeps, true/false sets, null clears back to
+   *  inherit. */
+  sidebar_motion?: boolean | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
   /** Replaces the whole sidebar Codex-account set (null clears it); absent leaves it.
@@ -1552,7 +1562,8 @@ export interface AppSettings {
   hosted_worker_quota: string;
   // Ephemeral worker admin settings (PRD #4212). Optional for older responses.
   // ephemeral_max_per_user: integer 0..20, default "2"; ephemeral_default_size and
-  // hosted_default_size: a worker size name (s, m, l, l-highmem), defaults "m" and "l";
+  // hosted_default_size: a worker size name, defaults "m" and "l" (writes accept any size
+  // that exists, builtin or admin-added; "<key>: unknown worker size" otherwise, PRD #4213);
   // ephemeral_lease: Go duration 0..2h, default "2h".
   ephemeral_max_per_user?: string;
   ephemeral_default_size?: string;
@@ -1854,17 +1865,22 @@ export interface AppearanceState {
   light_theme: string;
   dark_theme: string;
   typeface: string;
+  /** Resolved sidebar-icon animation flag. Optional for older servers: only a
+   *  strict `true` reads as on. */
+  sidebar_motion?: boolean;
   overrides: {
     mode: string | null;
     light_theme: string | null;
     dark_theme: string | null;
     typeface: string | null;
+    sidebar_motion?: boolean | null;
   };
   defaults: {
     mode: string;
     light_theme: string;
     dark_theme: string;
     typeface: string;
+    sidebar_motion?: boolean;
   };
 }
 
@@ -2590,6 +2606,7 @@ export type ScheduleSkipReason =
   | "already_running"
   | "description_too_large"
   | "fetch_failed"
+  | "consumer_gate_busy"
   | "vault_locked"
   | "self_improve_mr_cap_reached"
   | "open_mr_exists"
@@ -3071,11 +3088,15 @@ export interface Worker {
   status: string; // "offline" | "online"
   // Hosted workers (PRD #58). kind is never null — the column is NOT NULL DEFAULT
   // 'external' — so every worker carries one and a pre-#58 row reports "external".
-  // hosted_size is the preset name ("s"|"m"|"l"|"l-highmem", lowercase on the wire) and is null
-  // for an external worker. hosted_generation is deliberately not here: it is
-  // controller-internal and the DTO does not carry it.
+  // hosted_size is the size name (lowercase on the wire; the builtins are s, m, l and
+  // l-highmem, and admins edit what each buys, PRD #4213) and is null for an external worker.
+  // hosted_generation is deliberately not here: it is controller-internal and the DTO does
+  // not carry it.
   kind: "external" | "hosted";
   hosted_size: string | null;
+  // hosted_size's resolved integers (PRD #4213), so an admin-edited size shows its real
+  // quantities. Omitted for an external worker and when no size row of that name exists.
+  hosted_size_spec?: WorkerSizeSpec;
   // Whether this hosted worker carries the rootless-DinD sidecar (PRD #83 M3).
   // Absent/undefined or null for an external worker (docker is not applicable),
   // false for a hosted worker without the sidecar, true for a docker-capable one.
@@ -3339,6 +3360,119 @@ export interface HostedConfig {
   // Admin-chosen size the provision form preselects (PRD #4212). Optional: an older API
   // omits it, and an unknown name is ignored by the form.
   default_size?: string;
+  // Every size a worker can be provisioned at, in display order, with its resolved
+  // integers (PRD #4213). Optional: an older API omits it, and the form then falls back to
+  // the builtin sizes.
+  sizes?: HostedConfigSize[];
+}
+
+/**
+ * A hosted worker size's six resolved integers (PRD #4213): CPU in millicores, memory in
+ * MiB, disks in GiB. Every size display reads these; no client parses a quantity string.
+ */
+export interface WorkerSizeSpec {
+  cpu_request_millicores: number;
+  cpu_limit_millicores: number;
+  memory_request_mib: number;
+  memory_limit_mib: number;
+  data_gib: number;
+  dind_data_gib: number;
+}
+
+/** One entry of HostedConfig.sizes: a size name plus its integers. */
+export interface HostedConfigSize extends WorkerSizeSpec {
+  name: string;
+}
+
+/** One row of GET /admin/worker-sizes. shipped is the builtin default, null for an admin-added size. */
+export interface AdminWorkerSize extends WorkerSizeSpec {
+  name: string;
+  display_order: number;
+  builtin: boolean;
+  customized: boolean;
+  shipped: WorkerSizeSpec | null;
+  updated_at: string;
+}
+
+/** A binding ceiling: the smallest applicable integer and the chart value that moves it. */
+export interface WorkerSizeCeiling {
+  value: number;
+  chart_path: string;
+}
+
+/** The ceilings sizes are validated against. A null entry means no chart ceiling applies. */
+export interface WorkerSizeCeilings {
+  cpu_limit_millicores: WorkerSizeCeiling | null;
+  memory_limit_mib: WorkerSizeCeiling | null;
+  data_gib: WorkerSizeCeiling | null;
+  dind_data_gib: WorkerSizeCeiling | null;
+  // workers.docker.dindDataSize overrides the per-size DinD claim, so dind_data_gib has no ceiling.
+  dind_overridden: boolean;
+  // Tiers the ceilings were minimized over; null when the api does not know.
+  enabled_tiers: string[] | null;
+}
+
+/** A non-blocking note on a size write. */
+export interface WorkerSizeWarning {
+  kind: string; // "disk_lowered"
+  field: string;
+  message: string;
+}
+
+/**
+ * A quota advisory for one size and tier. quota_unavailable means the api cannot compare,
+ * never that the size fits. tier is "" when the enabled tiers are unknown.
+ */
+export interface WorkerSizeAdvisory {
+  size: string;
+  tier: string;
+  kind: "quota_unavailable" | "quota_zero" | "quota_exceeded";
+  field: string;
+  message: string;
+}
+
+/**
+ * A worker the cluster would not run at its size (PRD #4213): the controller refused the
+ * size (size_refused, e.g. above a controller ceiling) or the cluster rejected one of its
+ * volume claims (pvc_rejected). reason is the controller's own text.
+ */
+export interface WorkerSizeRefusal {
+  size: string;
+  worker_id: string;
+  worker_name: string;
+  kind: "size_refused" | "pvc_rejected";
+  reason: string;
+  reported_at: string;
+}
+
+/** GET /admin/worker-sizes. */
+export interface AdminWorkerSizes {
+  sizes: AdminWorkerSize[];
+  ceilings: WorkerSizeCeilings;
+  editable: boolean;
+  read_only_reason: string | null;
+  read_only_code: string | null;
+  advisories: WorkerSizeAdvisory[];
+  max_sizes: number;
+  /** Always an array on a current api; absent from an older one, which reads as none. */
+  refusals?: WorkerSizeRefusal[];
+}
+
+/** PUT /admin/worker-sizes/{name} and POST /admin/worker-sizes/{name}/reset. */
+export interface AdminWorkerSizeWrite {
+  size: AdminWorkerSize;
+  warnings: WorkerSizeWarning[];
+  advisories: WorkerSizeAdvisory[];
+}
+
+/**
+ * The 409 body of DELETE /admin/worker-sizes/{name}: a builtin size (reset it instead), or a
+ * size still in use by hosted workers and/or named by a stored default-size setting key.
+ */
+export interface WorkerSizeDeleteRefusal {
+  error: string;
+  reason: "builtin" | "in_use";
+  used_by?: { workers: number; settings: string[] };
 }
 
 export type RunStatus =

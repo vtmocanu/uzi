@@ -32,6 +32,9 @@ import type {
   AdminMaintenance,
   MaintenanceState,
   AdminDockerAllowlistRepos,
+  AdminWorkerSizes,
+  AdminWorkerSizeWrite,
+  WorkerSizeSpec,
   AdminCodexRateLimits,
   AdminRateLimits,
   AdminUsage,
@@ -1306,6 +1309,21 @@ const realApi = {
   // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
   // kind-blind on purpose, so there is no hosted delete to add here.
   hostedConfig: () => request<HostedConfig>("GET", "/workers/hosted/config"),
+  // Admin worker sizes (PRD #4213). The read is open to every admin; the edit and reset are
+  // cookie-only writes the api refuses with 409 (read_only_reason) until a fresh controller
+  // report advertises admin-size support, and with 400 { fields } on a value it cannot save.
+  getAdminWorkerSizes: () => request<AdminWorkerSizes>("GET", "/admin/worker-sizes"),
+  updateAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+  resetAdminWorkerSize: (name: string) =>
+    request<AdminWorkerSizeWrite>("POST", `/admin/worker-sizes/${encodeURIComponent(name)}/reset`),
+  // PRD #4213 M3: PUT on an absent name creates the size (201); the editor checks locally
+  // that the name is new, since the same PUT on an existing name edits it.
+  createAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+  // 409 {reason: "builtin" | "in_use", used_by: {workers, settings}} when the size cannot go.
+  deleteAdminWorkerSize: (name: string) =>
+    request<{ deleted: string }>("DELETE", `/admin/worker-sizes/${encodeURIComponent(name)}`),
   /**
    * Provision a hosted worker: one the CONTROLLER runs in the cluster.
    *

@@ -298,6 +298,66 @@ async function retireProductionSteps(req: { dataDir: string }, at: (step: string
     rootMode: fs.lstatSync(runnerRoot).mode & 0o7777, cloneExists: fs.existsSync(path.join(parentPath, "clone")),
     canonicalGone: !fs.existsSync(clone.path), bindings };
 }
+// ---- Issue #4486: the group-writable managed bare proof under the real worker uid, runner uids and getfacl ------------
+// Setup runs the production writers as the worker (umask 002 under a setgid repos root): the real runner-group probe,
+// a bare made by ensureClone and a runner `clone --shared` attempt. The proof runs the production
+// proveEpochWorktreeContent with the trust the real probe issued and the real /usr/bin/getfacl: no ACL, statfs or
+// getfacl seam is injected anywhere. The test (root) mutates the fixture between the two ops.
+type ManagedBareFixture = { git: any; bare: string; clonePath: string; selector: { runId: string; generation: number; attempt: string };
+  trust: { state: string; reason?: string; gid?: number } };
+const managedBareFixtures = new Map<string, ManagedBareFixture>();
+async function managedBareSetup(req: { dataDir: string }) {
+  process.env.UZI_UID_SPLIT = "1";
+  process.umask(0o002);
+  const { GitCache } = await import("../../agent/src/git.js");
+  const { formatAttemptId } = await import("../../agent/src/attempt-path.js");
+  const { probeRunnerGroupTrust } = await import("../../agent/src/runner-group-trust.js");
+  const { commandRootCommand } = await import("../../agent/src/runner-uid.js");
+  const logger: any = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
+    redactDiagnostic: (text: string) => text, child() { return logger; } };
+  const env = { PATH: "/usr/bin:/bin", HOME: os.tmpdir(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  const plain = (cwd: string, ...args: string[]) => execFileSync("git",
+    ["-C", cwd, "-c", "user.email=fixture@example.com", "-c", "user.name=fixture", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8", env });
+  // The real probe, once, as the production worker; the two wrapped children's status text is captured for the report.
+  const trust = await probeRunnerGroupTrust();
+  const status = (w: { command: string; args: string[] }) =>
+    spawnSync(w.command, w.args, { env: { PATH: "/usr/bin:/bin" }, encoding: "utf8", timeout: 10000 }).stdout;
+  const statuses = { runner: status(runnerCommand("/bin/cat", ["/proc/self/status"], true)),
+    command: status(commandRootCommand("/bin/cat", ["/proc/self/status"])) };
+  const origin = path.join(req.dataDir, "origin");
+  fs.mkdirSync(origin);
+  execFileSync("git", ["init", "-q", "-b", "main", origin], { env });
+  fs.writeFileSync(path.join(origin, "README.md"), "one\n");
+  plain(origin, "add", "README.md");
+  plain(origin, "commit", "-q", "-m", "commit 1");
+  const attemptId = formatAttemptId(new Date("2026-11-05T10:10:10Z"), 1, "0123456789abcdef");
+  const runId = "run-managed-bare";
+  const git: any = new GitCache(req.dataDir, logger, undefined, { managedBareGroupTrust: trust });
+  const bare = await git.ensureClone(origin);
+  const branch = "agent/issue-4486";
+  const clone = await git.createOrAttachRunnerClone(bare, 4486, { beforeFree: async () => {}, isLive: () => false }, runId, false, undefined,
+    { attemptId, isLive: () => false, beforeSeed: async () => {} });
+  await git.markRecoveryCapture(bare, clone.path, branch, runId, attemptId);
+  const st = fs.lstatSync(bare);
+  managedBareFixtures.set(req.dataDir, { git, bare, clonePath: clone.path,
+    selector: { runId, generation: 1, attempt: attemptId }, trust: trust as any });
+  return { bare, clonePath: clone.path, trust: { ...(trust as object) }, statuses, bareMode: st.mode & 0o7777, bareGid: st.gid, bareUid: st.uid,
+    isIssued: (await import("../../agent/src/runner-group-trust.js")).isIssuedManagedBareGroupTrust(trust) };
+}
+async function managedBareProve(req: { dataDir: string }) {
+  const fx = managedBareFixtures.get(req.dataDir);
+  if (!fx) throw new Error("no managed bare fixture for " + req.dataDir);
+  const scope = ownership.beginReclaim();
+  const started = Date.now();
+  try {
+    const verdict = await fx.git.proveEpochWorktreeContent({ scope, barePath: fx.bare, selector: fx.selector, clonePath: fx.clonePath,
+      signal: new AbortController().signal, deadline: Date.now() + 120_000 });
+    return { proven: verdict.proven, reason: verdict.reason ?? null, elapsedMs: Date.now() - started,
+      cloneExists: fs.existsSync(fx.clonePath), pending: scope.pendingMutations, stopped: scope.stopped() };
+  } finally {
+    try { if (!scope.stopped() && scope.pendingMutations === 0) scope.finish(); } catch { /* reported by the next op */ }
+  }
+}
 console.log(JSON.stringify({ ready: true, pid: process.pid, uid: process.getuid!(),
   actualFilesystem: Number(fs.statfsSync(root).type), classificationOnly: "ext4" }));
 for await (const line of createInterface({ input: process.stdin })) {
@@ -404,6 +464,8 @@ for await (const line of createInterface({ input: process.stdin })) {
       case "retire-bind": result = await retireBind(request); break;
       case "retire-eval": result = await retireEval(request); break;
       case "retire-production": result = await retireProduction(request); break;
+      case "managed-bare-setup": result = await managedBareSetup(request); break;
+      case "managed-bare-prove": result = await managedBareProve(request); break;
       default: throw new Error("unknown request");
     }
     console.log(JSON.stringify({ result }));

@@ -463,8 +463,11 @@ func TestCrossCheckLaneRequeueMarkerLiveDB(t *testing.T) {
 		t.Fatal("legacy reclaim retained lane marker")
 	}
 	inserted := uuid.New()
+	// The clone is a fresh row, so it does not inherit the source's claim provenance (an INSERT that
+	// carries it is refused by the provenance trigger).
 	f.env.exec(`INSERT INTO runs SELECT (jsonb_populate_record(NULL::runs,
-        to_jsonb(r) || jsonb_build_object('id',$2::uuid,'status','queued','cross_check_lane',true))).*
+        to_jsonb(r) || jsonb_build_object('id',$2::uuid,'status','queued','cross_check_lane',true,
+            'claim_provenance_worker_id',NULL,'claim_provenance_generation',NULL))).*
         FROM runs r WHERE id=$1`, f.runID, inserted)
 	if mustRun(t, f.env, inserted).CrossCheckLane {
 		t.Fatal("queued insert retained lane marker")

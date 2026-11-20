@@ -1,82 +1,139 @@
-# PRD #4322: Custom model providers on the judge, jobs, cross-check and isolated research lanes (Claude engine)
+# PRD #4322: Claude custom providers on judge, jobs, plan/code cross-check and isolated research lanes
 
 **Issue**: [#4322](https://github.com/vtmocanu/uzi/issues/4322)
-**Umbrella**: [#4319](https://github.com/vtmocanu/uzi/issues/4319)
-**Priority**: High
-**Status**: Draft
-**Entry prerequisite**: PRD #4320 complete (whole PRD). No milestone here starts before it.
+**Umbrella**: #4319
+**Priority / area**: High / runtime (isolated network-policy trust is part of the reviewed scope)
+**Status**: Draft refresh after Opus/xhigh and Astra/high review
+**Entry prerequisite**: #4320 is merged (PR #4464). #4505 must merge before any milestone with its final activation, exact-key redaction and all-upload scan contract. Re-read the merged code and ADR-4320 at dispatch: neither activation alone nor the current issue body proves every later scan requirement landed. Pending hosted acceptance is separate from unfinished implementation. No relay, #4509, #4323 or #50 dependency. Preparation is authorized, but dispatch requires the user's explicit go and final high-priority architecture approval.
 
-## Problem
+## Problem and outcome
 
-After PRD #4320 a provider-sourced user's issue runs and chat go through their gateway, but the server-assembled lanes refuse them with `provider_lane_unsupported`: the judge (`api/internal/workersvc/judge.go`), jobs (`job_claim.go`) and cross-check (`cross_check_claim.go`). The isolated research lane (ADR-1906, `docs/isolated-research-lane.md`) refuses them too: its network admits exactly one model host by exact name (`workers.isolatedLane.modelHost`, default `api.anthropic.com`, rendered by `deploy/chart/templates/worker-isolated-model-egress.yaml`), so a repo-less research job bound to a site list cannot reach a gateway. Each lane has its own credential authority today:
+#4320 and #4505 enable ordinary Claude issue/task-review/chat provider execution. Judge, job, both plan/code cross-check and research-lane consumers still reject or strip provider bindings. This is actual server and worker wiring work: the existing ordinary SDK adapter alone does not make these lanes provider-capable.
 
-- The judge credential is a property of the user, not the run (migration 00079; judge bind mode, default `auto`, 00197).
-- A cross-check checker runs on the opposite engine from the lead it checks (ADR-2149).
-- Jobs never park; a refusal is terminal (`job_claim.go`, `ARCHITECTURE.md` "Jobs").
+Deliver provider execution on all four lanes while preserving their separate credential authority and lifecycle. The judge resolves its own policy, checkers resolve the opposite engine, jobs fail rather than park, and isolated jobs keep their fixed tool/fetcher boundary with an explicit operator-trusted model-channel exception.
 
-## Outcome
+Examples:
 
-Each of these lanes can use a provider while keeping its own authority rules:
+1. A provider-only user with Claude judge mode default/auto gets a provider-frozen judge at creation (today skipped as provider_lane_unsupported). A valid explicitly pinned vendor judge still uses that token on the provider run's trace. A Codex judge uses only its Codex vendor authority until #4323; the Claude source is not consulted for that choice.
+2. A Codex lead's Claude plan or code checker freezes the user's Claude source and uses only it. A Claude provider lead's Codex checker uses its independent Codex vendor authority. Provider mappings cannot silently move a checker to another credential or engine.
+3. A provider-sourced owner's Claude job freezes the source and runs without a vendor credential. A revoked binding at assembly or the final delivery recheck fails terminally with the typed reason, never parked. Gateway overload is provider_gateway_limit, not a vendor reset or pool fallback.
+4. An operator lists a public gateway host for the isolated lane; a site-list job can execute through it with no general network client and with agent-initiated URL fetching still confined to the fetcher. The operator accepts the separate model/content-channel residual below. Real CNI/gateway behavior is hosted acceptance, not an in-run claim.
 
-- **Judge**: keeps the existing judge credential policy. Where that policy resolves to the user's Claude source and the source is a provider, the judge claim carries that provider's frozen binding. A judge pinned to a specific vendor credential keeps using it, even on a provider run's trace (the user chose it).
-- **Cross-check**: a checker resolves its own engine's source at creation and freezes it. A Claude checker of a Codex lead uses the user's Claude source (provider or vendor). A Codex checker of a Claude provider lead uses the Codex source (vendor until PRD #4323).
-- **Jobs**: a job resolves the owner's Claude source at creation and freezes it like a run. Any provider refusal fails the job terminally with the typed reason.
-- **Isolated research lane**: the operator may list extra exact gateway hosts the lane can reach; a provider run or job bound to the lane is admitted only when its provider's host is on that list.
+## Accepted activation and isolated content residual
 
-Acceptance examples:
+The owner accepted runtime redirect forwarding on 2026-11-19 and explicitly extended it on **2026-11-20 to judge, job, cross-check and isolated lanes** (D5). Newly gateway-bound data includes judged traces, including vendor traces judged by default/auto provider policy; job inputs/files; plan/code checker snapshots; and fetched pages in research jobs. Both supported Claude auth styles remain available; Bearer is recommended, not required. Bodies can reach redirect destinations; keys can reach same-host sibling paths, and cross-host with x_api_key. A pinned vendor judge or opposite-engine vendor checker can likewise receive provider-run content as part of its independent authorized policy. Document these destinations instead of implying the lead's source controls every evaluator.
 
-1. User A's Claude source is "corp-gw"; judge bind mode `auto`. A finished provider run's judge claim carries the provider binding, no OAuth token. User B's judge is pinned to Anthropic token T; B's provider run is judged with T, as today.
-2. User A has a Codex lead with plan cross-check on. The Claude checker child freezes "corp-gw" and runs through it. Reverse direction: a Claude provider lead's Codex checker uses the Codex vendor source; no Claude key reaches the Codex checker.
-3. A job created by a provider-sourced user runs through the provider; removing the URL from the operator list before claim fails the job with `provider_destination_not_allowed`.
-4. The operator sets `workers.isolatedLane.providerHosts: [gw.example.com]`. A site-list-bound research job from a user whose Claude source is a provider at `https://gw.example.com/anthropic` runs on the lane through the gateway, and its web content still arrives only through the fetcher. A provider at a host not on the list is refused with `provider_host_not_admitted_isolated`; vendor isolated runs keep reaching `api.anthropic.com` unchanged.
+#4496 would remove the redirect residual but remains parked. Starting URLs still need the exact operator allowlist; probes still refuse redirects. On the isolated lane, configured model egress is only `modelHost` plus operator `providerHosts`, TCP 443, subject to ADR-0285's existing IP/FQDN/shared-IP limitations. This is not an exact per-request hostname proof.
 
-## Out of scope
+Amend ADR-1906 with a **new model-destination invariant**, keeping invariant 1 intact rather than rewriting it. The added model destinations are operator-listed exact names, TCP 443. Explain the residual: a listed gateway is an operator-trusted content channel; the official/site-list source guarantee holds only for gateways that neither search nor proxy arbitrary web content, and the operator docs rule is advice, not enforcement. Agent-initiated URL retrieval remains through the fetcher and source log. Redirects can only use network reach granted by the unchanged policy and its known ADR-0285 limitations; do not claim cryptographic confinement to host labels.
 
-- The Codex engine (PRD #4323). Changing judge policy itself. Wildcard or per-run lane egress.
+API/CNI rollout and host removal are asynchronous, not instantaneous revocation of a held claim. Preserve next-actual-claim credential authority and no broad extra egress. Internal/in-cluster gateways remain unreachable behind the existing non-public/cluster Drop belts; docs must not promise private gateway reach. Existing private-CA delivery remains, including its UID-split limitation in docs/providers.md; isolated workers currently are not UID-split. No TLS-verification bypass.
 
-## Modules and seams
+## Shared implementation contract
 
-- **Judge** (`judge.go`), mapping of the existing judge bind mode (00197):
+### Frozen credentials, models and new worker capability
 
-  | judge bind mode | Claude source null | Claude source = provider |
-  |---|---|---|
-  | pinned | that vendor token | that vendor token (user's explicit choice) |
-  | default | vendor default token | the provider |
-  | auto | vendor pool | the provider (no pool over unknown usage) |
+Use the shared #4320 freeze/claim helpers and the actual five run columns `model_provider_id`, `model_provider_revision`, `model_provider_key_mode`, `model_provider_key_secret_id`, `model_provider_key_rev`. Retain exact claim exclusivity, owner/key-kind/revision/enablement fences, claim-time allowlist checks and no vendor fallback. Model validation is lane-aware: judge's actual resolved judge model, job's actual model, checker model at its existing claim-time resolution, and template models only for lanes carrying those templates. Do not run ordinary issue-template checks on a repo-less lane.
 
-  When the mapping yields the provider, freeze `(provider_id, revision, key id, enablement_rev)` on the judge row and send the A1 `provider` claim. Pinned vendor judge credentials unchanged. The judge's model resolves through the bound map (`provider_model_unmapped` otherwise).
-- **Cross-check** (`cross_check_claim.go`, `agent/src/cross-check-runner.ts`, `claude-cross-check.ts`): the checker child resolves its own engine's source in its own create transaction; the exclusivity check (`cross_check_claim.go`: a Claude checker carries Anthropic auth and no Codex auth, and the reverse) widens to "exactly one of: OAuth token, provider binding" for Claude checkers. **Same-model guard (additive):** opposite-engine selection, the existing credential resolution and checker confinement stay exactly as they are. Once both engines can bind providers, opposite engines no longer guarantee different models (an owner may point the Claude and Codex sources at the same self-hosted model, one through Messages and one through Responses). After resolving the checker, the server compares the frozen bindings' resolved model IDs (after the provider model map) together with the provider base URL host; a known match (same host and same resolved model ID) means no checker child is created, and the lead takes the existing human plan gate through its normal path with the typed reason `cross_check_same_model`, with no checker result fabricated. This detects known matches only; it cannot prove independence (different hosts or names can serve the same model), and the docs say so. A pairing is never treated as independent just because one side is a vendor credential and the other a provider.
-- **Jobs** (`job_claim.go`, `agent/src/job-runner.ts`): the job freezes the owner's Claude source at creation; claim carries the provider binding; refusals are terminal.
-- **Isolated research lane** (`deploy/chart`, `api/internal/workersvc`, ADR-1906): new value `workers.isolatedLane.providerHosts` (list of exact host names; new render validation in `_helpers.tpl` rejects `*`, a scheme, a port or a path, with render tests; today's `modelHost` check covers only presence and `*`), rendered into the same model-egress objects beside `modelHost` (Antrea: extra `fqdn` Allow rules after every Drop; OVN: extra `type: Allow, dnsName` entries before the final Deny), and into the api env (`api-deployment.yaml`, inside the same `uzi.isolatedLaneEnabled` guard as the fetcher-token env) so the api knows the admitted set; the api does not know `modelHost` today. The chart render guard `scripts/assert-chart-render.sh` (today: exactly one Antrea FQDN rule equal to `api.anthropic.com`, drop-before-allow checked for that one index) is extended: any number of FQDN Allows, each exactly one value from `modelHost` plus `providerHosts` on TCP 443, each after the last Drop; OVN equivalent; fixtures with and without `providerHosts`. `modelHost` stays and vendor isolated runs are unchanged. The lane's TCP 443-only invariant holds (both egress arms pin 443, `worker-isolated-model-egress.yaml`): no port is widened. Admission happens at job creation (where `api/internal/handler/v1_jobs.go` already refuses a missing lane with `isolated_lane_unavailable`) and again at claim (a chart upgrade can change the list): a lane-bound provider binding is admitted only when its base URL's effective port is 443 and its lowercase ASCII (punycode) host equals a normalized `providerHosts` entry (and still on `UZI_PROVIDER_ALLOWED_BASE_URLS`); otherwise `provider_host_not_admitted_isolated`, terminal for jobs, park for runs. Lane workers never take `uidSplit`, so `workers.extraCA` reaches their CLI for private-CA gateways. Lane gateways must resolve to public addresses: the lane drops every non-public and cluster range before the FQDN Allows (the anti-rebinding belt, kept), so an internal or in-cluster gateway times out; the api cannot detect this, so docs say it. On compose there is no lane (`IsolatedLaneEnabled()` false refuses site-list jobs at creation), so no lane-bound provider run exists. The new refusal reason is additive to `/api/v1`: add it to `api/openapi/v1.yaml` if reasons are enumerated and run `check:api-v1-compat`. ADR-1906 is amended, not only documented: its header decision (the lane reaches `api.anthropic.com` only and runs Claude only) and invariant 1 become "model destinations are exactly `modelHost` plus `providerHosts`, operator-listed, exact names, TCP 443"; a listed gateway is a model destination only; FQDN rules are per resolved address (ADR-0285), and a gateway that offers server-side web tools or proxies arbitrary URLs would bypass the fetcher, so docs tell operators to list only gateways without such features enabled. The ADR records this as a new residual: a gateway is an operator-trusted content channel, and the docs rule is advice, not enforcement (today's vendor residual, server-side web search, is narrower because the lane's fixed tool set never requests it). Changing `providerHosts` changes the lane policy objects and the api env (the api pod restarts), not worker pods (no fleet roll); during the rollout window a mismatch fails closed (timeout) or is refused.
-- All four reuse A1's capability gate `claude_provider_v1`, claim builder, `buildSdkEnv` provider mode, revocation semantics and probe-free model resolution. Worker-side wiring already exists from A1; this PRD admits the claims.
+Wire judge-runner, job-runner, claude-cross-check/cross-check-runner, isolated-runner/preflightReason, isolated-executor and stripForIsolation; several currently require OAuth, refuse provider bindings or clear Secrets.Provider. Constructors use sdkCredentialFromBinding, resolveProviderModel, stripProviderCost and the inherited gateway-limit classifier, not a key relabeled as OAuth. Route future shared-provider key modes through these same helpers once #4324 and its child add them.
 
-## Testing decisions
+Add one protocol capability per newly wired consumer, alongside #4505's claude_provider_v1: claude_provider_judge_v1 (M1a), claude_provider_job_v1 (M1b), claude_provider_checker_v1 (M2, both stages) and claude_provider_isolated_v1 (M3, lane jobs, together with the job capability). Each milestone advertises only its own, once that consumer is complete. A provider-bound lane claim requires claude_provider_v1, that lane's capability and its existing lane/job/checker capabilities, in ClaimRun, the claim_assembly.go backstop and fn_placement_admitting_workers. API-first rollout: old workers lack the lane capability and receive no claim. Worker-first rollout: an unused capability is harmless.
 
-- LiveDB: judge `auto` with a provider source, judge pinned to a vendor credential on a provider run, cross-check both directions (Claude provider checker of a Codex lead; Codex vendor checker of a Claude provider lead), the same-model guard (same host and same model: the lead parks at the human gate with `cross_check_same_model`; same host with different models and mapped aliases resolving to different IDs: checker created; mixed provider and vendor bindings: checker created only when the resolved models differ), and the new reason literal in the E2E sweep (all with synthetic provider bindings, so this PRD takes no implementation dependency on PRD #4323), job freeze and terminal refusal, capability gating per lane.
-- Agent: the runners spawn with provider env and no OAuth token.
-- Chart: render tests for `providerHosts` (both FQDN providers, render failure on wildcard, scheme or path, absent list renders today's objects byte-identical). Api: lane admission with listed and unlisted hosts, vendor lane runs unchanged.
-- Validation contract as PRD #4320, including `task scan:secrets`, watched red/green regressions, and **full agent suite: exact-head PR CI** as a landing obligation.
+Update applicable placement, demand, wake and reap predicates, including isolated job paths. Preserve #4505 provider-only demand and capable-worker suppression, saturation checks, paired old-image reap predicates and busy/custody guards, and provider-chat wake filtering. `LockUnservableEphemeralJobWorkers` must account for both provider and new lane capabilities on provider-bound jobs: an incapable bound ephemeral job worker leads to terminal no_job_capable_worker through that job path, rather than endless generic provider reprovisioning. Vendor jobs and ordinary issue/chat rules remain unchanged. No image-proof service, version floor or provisioning subsystem.
 
-## Milestones
+fn_placement_admitting_workers is replaced by a migration (draft number; its Down restores the 00486 body). ClaimRun's provider clause (runtime.sql, claude_provider_v1) gains the lane capability. The provider queued-reason rung in health.go (CountOnlineWorkersSatisfyingClaudeProvider) counts lane-capable workers for provider-bound lane runs, so a run waiting on a #4505-only fleet names the missing capability. Sweep e2e/ for any changed string.
 
-### M1: Judge and jobs use the provider under their own authority rules
-**Blocked by**: none (entry prerequisite above)
-Judge branch and freeze; job freeze and claim; refusals; docs.
-Acceptance: examples 1 and 3; `provider_lane_unsupported` no longer reachable for judge and jobs.
+### Exact-key redaction and output publication
 
-### M2: Cross-check checkers resolve and freeze their own engine's source
-**Blocked by**: none within this PRD (sequenced after M1 for review size, not a code dependency)
-Checker creation-time resolution and freeze; widened exclusivity check; both directions tested.
-Acceptance: example 2; the same-model guard holds.
+Register providerKeyForms with each lane runner's logger/redactor for the **whole claim**, not only refusal branches. Reuse #4505 redaction before parsing, truncation, persistence or output, including internal catch-and-log paths, model IDs/metadata and errors. Judge onResult and limit/usage facts receive only scope-redacted values, never the raw SDK frame; pass provider usage through stripProviderCost so cost_status stays unreported and no vendor prices/headroom/reset is fabricated.
 
-### M3: The isolated research lane admits listed gateway hosts
-**Blocked by**: M1 (lane work is jobs, whose provider claim M1 adds)
-`providerHosts` value, validation and render (both arms); extended render guard in `scripts/assert-chart-render.sh`; api env; creation-time and claim-time admission; v1 reason and compat check; ADR-1906 amendment (invariant 1 and the new residual); `docs/isolated-research-lane.md` (public-address requirement, web-feature warning) and docs sync.
-Acceptance: example 4; `provider_lane_unsupported` no longer reachable for any Claude lane.
+Before uploadJobOutputs, scan the exact immutable bytes to be uploaded for every providerKeyForms value. A hit or inability to validate prevents that file upload and records existing `worker_unreadable`, as unsafe names already do; the job can still complete with its other result/files. Do not rewrite binary content, scan one path then reopen different bytes, or turn optional-file refusal into a parked job. Test opaque key in filename/content, scanner failure, replacement between capture/upload and a clean-file control. Structured job results/findings/errors are separately redacted before their existing parse/size/persistence boundaries.
+
+Preserve #4505 exact-bound-key scanning before every GitHub/GitLab/Forgejo finalize/checkpoint/park/pause/shutdown upload reachable from a lane; a hit/scanner error blocks network writes and preserves existing custody/typed refusal. This is accidental-publication protection, not prevention of deliberate exfiltration by code already trusted with a key.
+
+### Lane-specific settlement, including final locked races
+
+Apply this matrix to assembly errors **and** the final locked authority recheck in claim_recovery.go; generic provider holds must not accidentally park repo-less evaluators:
+
+- Ordinary custody-holding runs keep existing provider hold behavior.
+- Judge/job/checker provider binding revocation fails the child terminally with its typed failure_reason and fail_origin credential_unavailable; no new fail-origin enum. Judge's existing vendor disabled-token behavior stays unchanged; provider refusals do not inherit generic provider parking.
+- A failed plan checker leads to the existing human gate without a synthetic verdict. A code checker records the existing unavailable/failure result through RecordCodeCrossCheckFailure; there is no plan gate at code completion and no fabricated approval.
+- Gateway 429/529 fails judge/job with provider_gateway_limit, with no vendor reset/pool fallback. A checker uses existing model_error settlement and its stage-specific lead outcome. Jobs never park.
+
+Test rotation/revocation between assembly and final delivery for judge, job, plan checker and code checker, including exact claim/lead generation fencing. New judge creation skip reasons and display strings require additive judge_skips CHECK changes in the existing NOT VALID/validate/guarded-Down pattern and CLI rendering; historical lane_unsupported rows remain honest history. Do not confuse an enqueue skip with a later created judge's terminal failure.
+
+## Lane modules
+
+### Judge
+
+At both judge creation sites (`judge_enqueue.go` and manual `judge_read.go`), choose the judge harness and provider-versus-vendor authority independently of the target and ordinary run resolver. A real pinned vendor token remains vendor even if the Claude source is set/unusable. Pinned with a NULL pointer is effective default (00197; effectiveBindMode), so it follows the default row: the provider when the Claude source is set, the vendor default otherwise. Behaviour matches what clients already display. Test it explicitly. For Claude default/auto mode with a source, freeze that provider/key/revision at judge creation and bypass the vendor-token-presence prerequisite; a bad selected provider skips/refuses explicitly instead of spending vendor tokens. Null source leaves the entire existing vendor judge ladder, auto fallback and disabled-token behavior intact. A Codex judge ignores Claude source and stays Codex-vendor until #4323.
+
+Later source/policy edits affect new provider-judge rows only; claims of a provider-frozen judge never call judgeChoice or reread the owner's current source. Vendor-frozen rows retain their existing claim-time vendor policy and never cross into provider resolution. Preserve independent model/effort settings and validate the actual judge model against the frozen map.
+
+### Jobs and `/api/v1`
+
+Freeze the owner's Claude source inside CreateJobRun's transaction. The provider model is lane-aware; source/model/host failures become documented typed v1 reasons, not a logged 500. A separate small error-mapping issue may land before this PRD while lane support stays disabled; reuse it. Extend api/openapi/v1.yaml additively for the new error reasons and their HTTP status codes; the public job status enum is unchanged (TestV1OpenAPIEnumsMatchGo). Run check:api-v1-compat. Existing product scopes, origin visibility, input ownership, rate/cap and terminal-job rules remain unchanged.
+
+### Plan and code checkers
+
+Both CreatePlanCrossCheckChild and SubmitCodeCrossCheck/CreateCodeCrossCheckChild resolve the opposite engine's own source and freeze it, not the lead's binding. Remove provider refusals at both creation closures and the settings-usability path only when the actual consumer/capability is ready. Widen singleFamilyCheckerCustody to exactly one Claude credential (vendor token or provider) with no Codex credential; preserve the reverse family rule, read-only confinement and no forge credential in the checker's model process; the worker-held clone PAT used by ensureClone is unchanged. Shared helpers maintain provider key modes for future #4324, not a duplicate per-lane resolver. Sequence overlapping #2169 work before editing these closures if it is still in flight.
+
+### Known same-model guard, additive M2b
+
+There is no guard implementation on main: the prior 18edc84c9 reference was PRD text only. Keep existing worker/template claim-time checker model selection. For a provider-involved pair, compare the actual resolved lead/checker model identities for that claim, after frozen provider maps, **before any model execution or credential delivery**; do not compare an assumed creation-time default or require that a child not yet exist. Preserve existing observed model metadata and repeat the check on a later actual claim if its worker-dependent resolution differs. Unresolved identity in a provider-involved pair is explicitly unavailable, not proof of independent review. Vendor/vendor pairs remain outside this new guard.
+
+Comparison rule: The guard evaluates only pairs where at least one side is provider-bound. A vendor/vendor pair is never evaluated and keeps today's behaviour exactly, including an unpinned model on either side. In a provider-involved pair, a side whose model the server cannot resolve (no pin, lane or template model) is checker_unavailable. The docs tell owners to pin the vendor side's model if such a pair should auto-approve.
+
+If both sides are providers, same normalized base-URL host and same resolved model ID is a known match; in a provider-involved pair with one vendor side, matching resolved model ID is the conservative known-match rule. Different names/hosts do not prove independence. Use existing checker_unavailable with server-side same_model detail; do not add cross_check_same_model as a public gate reason/protocol/migration. For plan, settle the already-created child through the existing unavailable human gate. For code, call RecordCodeCrossCheckFailure with checker_unavailable and no verdict. Synthetic dual-provider fixtures test the comparison contract without enabling Codex provider claims before #4323. Test mapped aliases, different IDs/hosts and provider/vendor pairs against this exact rule.
+
+### Isolated research lane
+
+The currently supported site-list path is CreateJobRun writing egress_profile_id. Do admission **inside that transaction** and again at actual claim, using the frozen provider binding. There is no invented ordinary-run park branch for a research binding that cannot currently be created. Reuse the fixed tool set, init verification, fetcher custody and route allowlist.
+
+Add chart `workers.isolatedLane.providerHosts`, exact normalized ASCII/punycode DNS names only: refuse wildcard, scheme, port, path and malformed names. Render api env under the existing isolatedLaneEnabled guard, with the same grammar; unset is empty, malformed env fails closed. Provider host must be in providerHosts, effective port 443, and initial base URL still in UZI_PROVIDER_ALLOWED_BASE_URLS; otherwise provider_host_not_admitted_isolated. Keep modelHost/vendor reach unchanged. Keep the non-public/cluster Drop belts and no broad CIDR/extra in-cluster peers.
+
+Both policies are required: Antrea exact FQDN Allows after the last Drop on TCP 443, OVN exact dnsName Allows before final Deny. Extend scripts/assert-chart-render.sh and scripts/assert-openshift-render.sh section (h); absent providerHosts must preserve today's objects. Host-list edits change API env/policy, not worker pods. Document asynchronous CNI/API skew and held-claim limits, not a claim of atomic network revocation. Correct ADR-1906/ARCHITECTURE's stale inert-until-#1908 status because site-list jobs already exist. Add the new invariant and D5 residual without rewriting invariant 1.
+
+## Verification and milestones
+
+Each unit has watched regressions and focused review. Each milestone is one PR. M1a and M1b are independent. M2 and M2b ship in one PR, so provider checkers never run without the guard. M3 depends on M1b. These are independently shippable slices within this PRD, not external unfinished-PRD dependencies. Before each gated run, freeze the permitted slice in its dispatch scope (M1a, M1b, M2+M2b or M3); do not ask one run to ship all remaining milestones as one PR. Partial deliveries remain non-closing until the remaining PRD work and recorded acceptance are complete. No milestone advertises another consumer's capability. The user reviews this decomposition before go; this is not an on-deck task.
+
+### M1a: Independent provider judge authority
+
+Creation/freeze at enqueue/manual sites, policy table including pinned-null and Codex controls, lane-aware models, real runner/SDK wiring, redacted onResult/usage, typed skips/claim settlement and docs. Test provider-only owner, pinned vendor, source/policy change while queued, revoked final delivery and provider gateway limits.
+
+### M1b: Terminal provider jobs and safe output publication
+
+Creation/claim freeze, worker/preflight/SDK wiring, typed v1 errors and unservable bound-worker capability handling, structured redaction and exact uploaded-file-byte refusal. Jobs remain terminal and optional unsafe files are omitted as worker_unreadable. Test no vendor call, before/after final-claim revocation, old workers, normal clean outputs and v1 compatibility.
+
+### M2: Opposite-engine plan and code provider checkers
+
+Both child-creation families, source/freeze, custody exclusivity, actual SDK consumer and stage-specific failures; preserve settings and pin resolution, no hidden Codex implementation. Test both engine directions and both plan/code stages, plus final locked races and no synthetic approval.
+
+### M2b: Actual resolved-model independence guard
+
+Existing claim-time models, the exact comparison rule and checker_unavailable outcomes above, pure comparison fixtures plus actual claim/lead-stage tests. A vendor/vendor plan and code cross-check with both models unset is created and runs unchanged. No new gate-reason vocabulary or assumed default. The final plan must identify where actual lead model identity is available for provider-involved pairs; if it cannot establish it, refuse explicitly rather than label unknown as independent or silently freeze a new vendor model policy. M2 and M2b are one PR, and the checker capability is advertised only with this guard complete.
+
+### M3: Explicit operator-listed isolated model channels
+
+Research claim stripping/preflight/runner/executor/job SDK wiring, the isolated-provider capability in addition to the job-provider capability, both chart/CNI arms and env parser, transactional admission and recheck, ADR/new invariant/residual and docs. Test listed/unlisted/443/malformed hosts, legacy/ordinary-only workers, no broad network tool and unchanged vendor/Compose refusal. Live real-gateway/site-list behavior is in the linked hosted acceptance issue, not an in-run milestone proof.
+
+### In-run boundary
+
+`UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` plus touched/directly affected tests; `task check:api` plus affected Go packages `-race -count=1`; applicable SQL generation/drift, additive migration/numbering and DTO checks. LiveDB only via `./e2e/run-store-it.sh` on an owned Docker-capable DB with named PASS and zero SKIP, serial package binaries on a shared DB (`-p 1`); otherwise pending exact-head test-api-store-it. Use prefixless runtime-assembled secrets, scan:secrets with detected canaries and token-literal checks.
+
+Chart: helm template with deploy/values/ci-render.yaml through the existing assert-chart-render.sh pattern, assert-openshift-render.sh, lint:shell, lint:yaml, check:api-v1-compat, docs:sync/check-docs:web and UUID changelog. Update ADR-4320 D9/ARCHITECTURE lane status, ADR-2149 checker custody, ADR-1906's new invariant/residual, and AI-synced specs/human.md. Sweep changed reasons/claim/output/forge contracts across E2E helpers, phases and forge fake; run test:e2e-lib and test:forge-fake and name affected phases left unrun. No new CI job or `.github/workflows/**` edits.
+
+Landing obligations outside milestones: **full agent suite: exact-head PR CI**, applicable API/repo/LiveDB/worker-UID checks. The linked maintainer acceptance issue covers real hosted gateway lanes, actual CNI reach/refusal, private-CA behavior and vendor controls, without a sweep/deadline. No offline fake is called live certification.
 
 ## Decision Log
 
-- **D1: Judges keep independent authority.** Reason: the judge credential is the user's choice (00079), not the run's. Rejected: inheriting the judged run's binding (an earlier draft).
-- **D2: Checkers resolve their own engine's source.** Reason: a checker runs on the opposite engine; inheriting the lead's binding is impossible across engines. Rejected: inheriting.
-- **D3: Jobs freeze like runs and fail terminally.** Reason: jobs never park. Rejected: parking jobs.
-- **D4: Isolated lane gets an operator list of extra exact gateway hosts.** Reason: keeps `modelHost` and vendor runs unchanged and keeps every lane destination an explicit operator choice. Rejected: swapping `modelHost` to the gateway (breaks vendor lane runs); deriving lane egress from the provider allowlist (would widen the lane whenever a provider URL is approved for ordinary runs).
+- **D1. Judge authority is independent.** Provider-versus-vendor branch is chosen at creation; provider bindings stay frozen, vendor claim policy remains compatible. Explicit pinned vendor semantics remain even on provider traces; pinned-with-NULL is default. Default/auto provider mode never silently falls back.
+- **D2. Checkers resolve their own engine.** Both plan and code are included by owner decision 2026-11-20. Existing opposite-family rule, model pins and confinement remain; no inheritance of the lead credential.
+- **D3. Jobs never park.** Provider refusal is terminal at assembly and final recheck. Unsafe optional output files are omitted with worker_unreadable, without upload or binary rewriting; a clean job result may still complete.
+- **D4. Research destinations are an explicit operator list.** modelHost plus providerHosts, exact names/443 in configured policy, with existing ADR-0285 enforcement limitations. No wildcard, general network tool, per-run policy or new proxy; the model channel has D5's accepted content residual.
+- **D5. Redirect risk extends to all four lanes (owner, 2026-11-20).** Judge traces, job inputs/files, plan/code snapshots and fetched pages may be forwarded through gateway redirects under both existing auth styles. Isolated model-channel reach remains its explicit policy. Add a new ADR-1906 model-destination invariant and conditional gateway content residual; do not rewrite invariant 1. The docs prohibition on gateway web proxy/search is advice, not enforced origin proof.
+- **D6. #4505 is the required merged base.** Its output/log redaction and all-upload exact-key scan are reused and extended at newly reachable result/file seams. Accepted redirects do not authorize accidental publication. #4496 stays parked; #4509/#4323 are independent Codex work.
+- **D7. Per-lane capability means actual consumers, not ordinary activation.** Alongside claude_provider_v1, judge/job/checker/isolated consumers advertise only their own claude_provider_judge_v1, claude_provider_job_v1, claude_provider_checker_v1 or claude_provider_isolated_v1 once complete. Isolated jobs also require the job capability. ClaimRun, assembly backstop, placement, health, unservable-job and reap predicates stay consistent; #4505-only workers never receive these claims. No version-floor or fleet-proof subsystem.
+- **D8. Independently shippable slices (lead Option A, 2026-11-20).** M1a judge and M1b jobs are independent PRs; M2 plan/code checker and M2b same-model guard ship together in one PR; M3 isolated channels depends on M1b and is another PR. No extra PRD is introduced. Freeze one permitted slice per gated run and keep partial delivery non-closing. The user must say go after final architecture/scope review; preparation is not dispatch.
+- **D9. Provider-involved same-model match uses existing unavailability.** Compare actual resolved IDs at claim only when a provider is involved, not a pre-child default or vendor/vendor pair. Use checker_unavailable with a server detail and the stage's existing outcome; unknown provider-pair identity is not independent-review proof. No new public reason/migration is justified solely for this guard.

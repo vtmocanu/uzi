@@ -141,6 +141,7 @@ var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-
 	"already_running":        "already running",
 	"description_too_large":  "description too large",
 	"fetch_failed":           "fetch failed",
+	"consumer_gate_busy":     "repository busy",
 	"schedules_paused":       "all schedules paused",
 	"credential_disabled":    "pinned credential is disabled",
 	"codex_pool_unavailable": "no pooled Codex account is available",
@@ -188,6 +189,7 @@ func skipReasonLabel(reason string) string {
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
 	"not_eligible":           "add the configured uzi label or assign the issue to uzi",
+	"consumer_gate_busy":     "start the skipped issue manually; a partial one-time sweep does not retry it",
 	"harness_label_conflict": "match the issue harness label to the schedule pin, or change the pin",
 	"harness_label_invalid":  "keep exactly one of harness::codex or harness::claude and remove other harness::* labels",
 	// PRD #1732 D2/D12: the schedule's pin is kept, never substituted; enabling is web-only.

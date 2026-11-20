@@ -52,12 +52,20 @@ function fallbackAppearance(
     light_theme: DEFAULT_LIGHT_THEME,
     dark_theme: dark,
     typeface: "system",
-    overrides: { mode: null, light_theme: null, dark_theme: overrideDark, typeface: null },
+    sidebar_motion: false,
+    overrides: {
+      mode: null,
+      light_theme: null,
+      dark_theme: overrideDark,
+      typeface: null,
+      sidebar_motion: null,
+    },
     defaults: {
       mode: "dark",
       light_theme: DEFAULT_LIGHT_THEME,
       dark_theme: defaultDark,
       typeface: "system",
+      sidebar_motion: false,
     },
   };
 }
@@ -160,7 +168,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // (PRD #1167): the server sends the resolved appearance, but a server that
   // predates the field is handled defensively by synthesising a minimal one from
   // the deprecated single-theme trio so the app still paints. applyAppearance
-  // stamps data-theme/data-font and arms the live system-mode listener.
+  // stamps data-theme/data-font/data-motion and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
     currentUserID.current = session.user?.id ?? null;
     setUser(session.user);
@@ -180,6 +188,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       light: nextAppearance.light_theme,
       dark: nextAppearance.dark_theme,
       typeface: nextAppearance.typeface,
+      sidebarMotion: nextAppearance.sidebar_motion === true,
     });
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultMetadataPending(false);

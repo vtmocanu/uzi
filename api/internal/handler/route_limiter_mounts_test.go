@@ -411,6 +411,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
 	{"GET", "/api/admin/maintenance", noLimiter},
+	// PRD #4213 M2: the sizes editor. Local reads and writes (no token spend, no forge call).
+	{"GET", "/api/admin/worker-sizes", noLimiter},
+	{"PUT", "/api/admin/worker-sizes/{name}", noLimiter},
+	{"POST", "/api/admin/worker-sizes/{name}/reset", noLimiter},
+	{"DELETE", "/api/admin/worker-sizes/{name}", noLimiter},
 	{"GET", "/api/admin/docker-allowlist-repos", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},
@@ -522,6 +527,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #3254: the effective-settings view. Owner-scoped reads of the caller's own state, no
 	// forge or provider call, no token spend → noLimiter, like /me/settings.
 	{"GET", "/api/me/effective-settings", noLimiter},
+	// PRD #3264 M3: the caller's own restricted template list (ListMyAgentTemplates), an
+	// owner-scoped store read, no spend, no forge call.
+	{"GET", "/api/me/agent-templates", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
 	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
@@ -1094,6 +1102,12 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/me/usage-reserve", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
 	{"PUT", "/api/me/harness-overflow", noLimiter},
+	// PRD #3264: the model and effort defaults (PutMyModelSettings). One bounded body, one transaction
+	// on the caller's own users row, no spend, no forge write, no fan-out: like /me/usage-reserve.
+	{"PUT", "/api/me/model-settings", noLimiter},
+	// PRD #3264 M3: pin-only write to the caller's own user template (PutMyAgentTemplateModelPins):
+	// one bounded body, one transaction on one row, no spend, no forge write.
+	{"PUT", "/api/me/agent-templates/{id}/model-pins", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

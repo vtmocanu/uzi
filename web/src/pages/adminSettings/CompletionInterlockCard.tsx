@@ -1,5 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 
@@ -16,7 +22,7 @@ export function CompletionInterlockCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.completion_interlock_rollout === "true");
   const [busy, setBusy] = useState(false);
@@ -34,10 +40,11 @@ export function CompletionInterlockCard({
     if (isEnv || !dirty) return;
     setBusy(true);
     try {
-      const resp = await api.updateSettings({
+      const payload: UpdateSettingsPayload = {
         completion_interlock_rollout: enabled ? "true" : "false",
-      });
-      onSaved(resp);
+      };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setEnabled(resp.settings.completion_interlock_rollout === "true");
       setNotice("Completion check setting saved.");
     } catch (err) {

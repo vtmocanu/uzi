@@ -71,6 +71,7 @@ import { maskRepoPath } from "../lib/demoMask";
 import { COLUMN_ACCENTS } from "./board/shared";
 import { IssueCard } from "./board/IssueCard";
 import { RunOptionsDialog } from "../components/RunOptionsDialog";
+import { StartPreviewProvider } from "../lib/startPreviewStore";
 import { CreateIssueForm } from "./board/CreateIssueForm";
 import { IssuesFilter } from "./board/IssuesFilter";
 import { ColumnSettings } from "./board/ColumnSettings";
@@ -431,6 +432,14 @@ export function Board() {
   useEffect(() => {
     setOptionsIid(null);
   }, [repoId]);
+  // Issue #3261: the run-start preview generation. null until the first successful
+  // loadPreconditions apply (nothing is fetched before then); every later successful apply
+  // bumps it, so the shared preview refreshes with the prerequisites it describes. A repo
+  // change returns it to null.
+  const [previewGeneration, setPreviewGeneration] = useState<number | null>(null);
+  useEffect(() => {
+    setPreviewGeneration(null);
+  }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
   const [awaitingRuns, setAwaitingRuns] = useState<RunSummaryItem[]>([]);
@@ -568,6 +577,7 @@ export function Board() {
         api.getMySettings(),
       ]);
       if (sourceEpochRef.current !== sourceEpoch || repoIdRef.current !== repoId) return;
+      setPreviewGeneration((g) => (g ?? 0) + 1);
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
       // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
@@ -1167,6 +1177,7 @@ export function Board() {
     `use "Issues" to show all other open issues alongside them.`;
 
   return (
+    <StartPreviewProvider generation={previewGeneration}>
     <div className="space-y-5">
       {/* M3: the toolbar pins so search stays reachable while a long lane scrolls. The
           app shell scrolls the WINDOW and neither <main> owns an overflow ancestor
@@ -1734,5 +1745,6 @@ export function Board() {
         </div>
       )}
     </div>
+    </StartPreviewProvider>
   );
 }

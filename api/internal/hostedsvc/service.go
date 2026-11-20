@@ -239,8 +239,11 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 		}
 		dw := DesiredWorker{
 			RollEvidence: evidence, ID: row.ID.String(),
-			Template:   row.TemplateDeclared.String,
-			Size:       row.HostedSize.String,
+			Template: row.TemplateDeclared.String,
+			Size:     row.HostedSize.String,
+			// The size's resolved integers (PRD #4213), keyed on the LEFT JOIN's name column so
+			// a size with no row (deleted out from under a worker) sends nil, never zeroes.
+			Resources:  sizeResources(row),
 			Generation: row.HostedGeneration,
 			// pgtype.Bool zero-value is {Bool:false, Valid:false}, so a NULL column
 			// reads as false here — exactly the "no sidecar" the controller wants. No
@@ -430,4 +433,21 @@ func inventoryGate(state string, status pgtype.Text, scalingDownAt pgtype.Timest
 		return InventoryGateAwait
 	}
 	return InventoryGatePermit
+}
+
+// sizeResources maps the poll row's joined worker_sizes columns to the wire shape. The
+// presence marker is the nullable name, not any one integer: every integer column is NOT
+// NULL on a real row, so a missing row is the only way they are all absent.
+func sizeResources(row store.ListHostedWorkersForControllerRow) *SizeResources {
+	if !row.SizeRowName.Valid {
+		return nil
+	}
+	return &SizeResources{
+		CPURequestMillicores: row.SizeCpuRequestMillicores.Int64,
+		CPULimitMillicores:   row.SizeCpuLimitMillicores.Int64,
+		MemoryRequestMiB:     row.SizeMemoryRequestMib.Int64,
+		MemoryLimitMiB:       row.SizeMemoryLimitMib.Int64,
+		DataGiB:              row.SizeDataGib.Int64,
+		DinDDataGiB:          row.SizeDindDataGib.Int64,
+	}
 }

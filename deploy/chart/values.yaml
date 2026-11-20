@@ -559,6 +559,11 @@ workers:
   # owner-authorized exception to the otherwise namespace-only RBAC. Set create to false
   # (for example where a cluster admin owns RBAC) and expansion fails closed: the
   # controller logs class-lookup-forbidden and leaves every existing claim untouched.
+  # The same read lets the controller confirm WaitForFirstConsumer for the paused-restore
+  # bind-timeout exemption (#4468); with it disabled the exemption does not apply, a
+  # waiting paced restore's claims can be reported stranded after the bind timeout, and
+  # that report keeps the restore unadmitted at zero replicas, so its claims cannot bind
+  # and its roll pool stays held until the read is restored or an operator intervenes.
   storageClassRead:
     create: true
 
@@ -752,7 +757,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.18"
+    tag: "0.87.0-rc.19"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -987,8 +992,9 @@ workers:
   # the same key in api.config or api.secretEnv fails the render.
   ephemeralLease: ~
   # Issue #2412: a run-bound worker needs one run's memory headroom, not a
-  # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
-  # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l, l-highmem; invalid values fail
+  # persistent L worker's two-run budget. The shipped defaults for M reserve 8Gi
+  # instead of 14Gi while both presets request 1 CPU and can burst to 4 CPU
+  # (admins can edit these size quantities under Admin -> Workers, PRD #4213). Valid values: s, m, l, l-highmem; invalid values fail
   # chart rendering. Existing workers keep their stored size; persistent workers
   # still preselect L.
   #
@@ -1020,6 +1026,12 @@ workers:
   secretMountPathAllowUnversionedImage: false
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
+  #
+  # The size quantities named in these comments (`l` = 1 CPU / 14Gi and so on) are the
+  # SHIPPED DEFAULTS of the built-in sizes: admins can edit them and define their own
+  # (PRD #4213), and the api validates each against the LimitRange ceilings below, which
+  # the chart hands it as integers (uzi.workerSizeEnv). The budgets below are sized on
+  # the defaults, so re-check them after raising a size.
   #
   # CPU and memory are budgeted on `l` (the persistent default, ADR-2240;
   # ephemeral workers default to the smaller `m`, #2412): 20 workers x 1 CPU
@@ -1088,7 +1100,8 @@ workers:
   # The backstop, never the source: every hosted worker pod arrives from the
   # controller with explicit requests + limits from its size preset.
   #
-  # `max` MUST stay >= the LARGEST preset's limits (l-highmem = 4 CPU / 32Gi) or that preset
+  # `max` MUST stay >= the LARGEST size's limits (the default l-highmem = 4 CPU / 32Gi; an
+  # admin-defined size above `max` is refused by the api) or that size
   # stops being admissible — which would surface as a worker that provisions and never
   # appears. maxPVCStorage likewise >= l's /data (50Gi) and >= ephemeralWorkerDataSize
   # (a run-bound worker's /data, 40Gi).
@@ -1248,7 +1261,7 @@ workers:
     # ephemeral storage.
     #
     # Sized for the 10 workers deployments advertises. CPU and memory are budgeted on
-    # `l` (persistent default, ADR-2240; ephemeral default `m`, #2412),
+    # the shipped default `l` size (admins can edit sizes, PRD #4213; persistent default, ADR-2240; ephemeral default `m`, #2412),
     # plus all sidecars from render.go/render_dind.go. `l-highmem` (24Gi request, 32Gi
     # limit) is deliberately not fleet-budgeted: it consumes more of this shared budget,
     # a quota hit shows as the Deployment's ReplicaFailure, and operators must check node
@@ -1310,7 +1323,7 @@ workers:
       max:
         cpu: "4"
         memory: 32Gi
-      # FOUR claimants sit at or under this ceiling: `l`'s DataSize (50Gi) exactly,
+      # FOUR claimants sit at or under this ceiling: the default `l` size's DataSize (50Gi) exactly,
       # the DinD data root (per-preset up to 50Gi, exactly at the ceiling for
       # `l`/`l-highmem`, or workers.docker.dindDataSize when set), nixSize and a
       # run-bound worker's /data (20Gi nix; workers.ephemeralWorkerDataSize is 40Gi). Raising any of them
@@ -1445,7 +1458,7 @@ workers:
       node: []
     # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
     # workers are run-bound (one run, then removed). CPU and memory ceilings cover
-    # ten `l` workers from render.go (the ephemeral default is the smaller
+    # ten `l` workers from render.go (the shipped default `l` size; the ephemeral default is the smaller
     # `m`, #2412, but a run may ask for `l`): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
     # `l-highmem` (24Gi request, 32Gi limit) is deliberately not fleet-budgeted: it
     # consumes more of this shared budget, a quota hit shows as the Deployment's
@@ -1459,7 +1472,8 @@ workers:
       requestsStorage: 600Gi
       persistentVolumeClaims: "20"
       deployments: "10"
-    # `max` must stay >= the largest worker preset's limits (l-highmem = 4 CPU / 32Gi).
+    # `max` must stay >= the largest worker size's limits (the default l-highmem = 4 CPU / 32Gi;
+    # admin-defined sizes are validated against it).
     # This lane is run-bound, so maxPVCStorage must admit ephemeralWorkerDataSize and
     # the 20Gi nix claim.
     limitRange:

@@ -109,7 +109,7 @@ export function FetchCapsCard({
   onSaved,
 }: {
   settings: AppSettings;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [values, setValues] = useState<Record<CapKey, string>>(
     () => Object.fromEntries(FIELDS.map((f) => [f.key, toDisplay(f, settings[f.key])])) as Record<CapKey, string>,
@@ -139,7 +139,7 @@ export function FetchCapsCard({
     setBusy(true);
     try {
       const resp = await api.updateSettings(payload);
-      onSaved(resp);
+      onSaved(resp, payload);
       setValues(
         Object.fromEntries(FIELDS.map((f) => [f.key, toDisplay(f, resp.settings[f.key])])) as Record<CapKey, string>,
       );

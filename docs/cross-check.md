@@ -187,7 +187,10 @@ generation and round, deadline, protocol, vault, credential, checker-slot and
 worker eligibility requirements still apply.
 
 The lead's worker is preferred. Another eligible worker of the same user may
-claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
+claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes), except a Codex
+child that has already been claimed (generation 1 or later): it stays held for the
+worker that last claimed it and fails at its deadline as usual if that worker does
+not return ([ADR-4476](../adr/4476-codex-claim-provenance.md)). A cordoned
 worker may still claim its own pinned child; maintenance fences and worker
 quarantine remain authoritative. An ephemeral worker may check its bound lead
 or the child it was provisioned for, but cannot take another lead's child.
@@ -863,7 +866,10 @@ model and effort pins for each checker family, beside the Plan row (see
    "not reported". One `report_cross_check_dispositions` call may list several
    finding IDs, still one entry per ID with its own disposition and reason;
    entries may share the same explanation. The repair is not checked again;
-   there is no second check.
+   there is no second check. When every finding is a minor verification caveat
+   (its title starts exactly with `Coverage uncertainty:`), there is nothing
+   for the lead to fix, so no repair turn runs: the check is finalized at
+   once and each caveat shows as "not reported".
 
 `CODE_CROSS_CHECK_TIMEOUT` (default `30m`, at most `2h`; see
 [Configuration](./configuration.md#cross-check-settings)) is the checker's

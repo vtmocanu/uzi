@@ -67,6 +67,11 @@ type UserSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
+	// SidebarMotion and EffectiveSidebarMotion mirror the animated-sidebar-icons opt-in
+	// (issue #4510): the raw choice (null = not chosen) and the resolved flag. Fidelity
+	// only; there is no CLI setter.
+	SidebarMotion          *bool `json:"sidebar_motion"`
+	EffectiveSidebarMotion bool  `json:"effective_sidebar_motion"`
 	// DefaultHarness is the CLI decode mirror of the per-user default harness (PRD #1429
 	// M1 / D3); null = "Default · automatic" (#3845: chosen per run by weekly limits when both
 	// harnesses are usable). `uzi settings get` displays it; there is deliberately no CLI

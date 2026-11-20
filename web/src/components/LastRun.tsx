@@ -35,6 +35,7 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   already_running: "neutral",
   description_too_large: "neutral",
   fetch_failed: "warning",
+  consumer_gate_busy: "warning",
   // A locked owner vault (self_improve, PRD #590) is benign and self-resolving: the
   // cycle re-fires on schedule once the vault is unlocked, so it reads neutral like the
   // other self-resolving skips.

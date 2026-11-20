@@ -400,6 +400,9 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	if writeProviderCreateRefusal(w, err) {
 		return // PRD #4320: provider_source_unusable, provider_model_unmapped, provider_lane_unsupported, ...
 	}
+	if writeTerminalConsumerGateRefusal(w, err) {
+		return // issue #4488: 503 + Retry-After (busy, retryable) or 409 (target run identity)
+	}
 	switch {
 	case errors.Is(err, workersvc.ErrContinuedIssueNotFound):
 		httpx.Error(w, http.StatusNotFound, err.Error())
@@ -1162,6 +1165,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// The confirmed discard lost the pending-lease race while the run stayed active.
 			// Nothing was cancelled; surface a retryable state conflict rather than false success.
 			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "outcome_pending_changed")
+		case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+			// Issue #4479: the interactive task's worker is finalizing the run (its followup_finalize
+			// admission is live), so the follow-up would never be delivered. 409 with a typed reason.
+			httpx.ErrorReason(w, http.StatusConflict, "run is finishing; your follow-up was not delivered", "follow_up_finalizing")
 		case errors.Is(err, workersvc.ErrStopNotInteractive):
 			// 409: a run-state conflict. Only an interactive task run's park honors a
 			// graceful stop; on any other run nothing would wind it down.

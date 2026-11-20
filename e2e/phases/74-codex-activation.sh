@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  admin secrets (adds then deletes a codex openai_api_key default; temporarily deletes+recreates the default anthropic_token for the codex-only sub-scenario, which cascades its anthropic_rate_limits gauge row); creates a fire-once prompt schedule pinned harness=codex (deleted before this phase ends); creates several issues+runs on REPO_ID
-# restores: admin secrets end exactly as found (one default anthropic_token = $DUMMY_ANTHROPIC, zero codex-kind secrets); the anthropic_rate_limits gauge is reseeded 55/12 (phase 47's values) under the recreated token id; an EXIT-trap fail-safe recreates the default anthropic_token if a mid-scenario assertion fails, mirroring 34-vault.sh, so a fail-soft driver never strands the admin Codex-only; every run this phase creates ends completed or cancelled (no handoff, nothing for the quarantine sweep)
+# restores: admin secrets end exactly as found (one default anthropic_token = $DUMMY_ANTHROPIC, zero codex-kind secrets); the anthropic_rate_limits gauge is reseeded 55/12 (phase 47's values) under the recreated token id; an EXIT-trap fail-safe recreates the default anthropic_token if a mid-scenario assertion fails, mirroring 34-vault.sh, so a fail-soft driver never strands the admin Codex-only; every run this phase creates ends completed or cancelled (no handoff, nothing for the end-of-phase boundary)
 # =============================================================================
 # PRD #1429 M6 — the last milestone of the atomic Codex public-activation PRD: prove
 # the WHOLE joined change (M1-M5) end to end, offline, through the fake forge + the
@@ -254,8 +254,8 @@ pass "Codex-only user's plain run $CX_ONLY_RUN implicitly resolved to codex (D11
 # same idiom 22-steer-queue-delivery.sh uses for its own live-worker cancel-at-gate:
 # fire the cancel, then wait_status ... cancelled). Waiting here (rather than firing and
 # moving straight to teardown) settles the run to a terminal state before the phase
-# ends, so it can never still be mid-cancel when driver.sh's end-of-phase leak-sweep
-# quarantine scan runs (a hard fail under E2E_STRICT_LEAKS=1).
+# ends, so it can never still be mid-cancel when driver.sh's end-of-phase boundary
+# samples it (an unsettled run FAILs the phase).
 apipost "/api/runs/$CX_ONLY_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 wait_status "$CX_ONLY_RUN" cancelled
 

@@ -241,6 +241,12 @@ uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
+uzi settings set <setting> [--harness claude|codex] <value>
+uzi settings reset <setting> [--harness claude|codex]
+uzi agent-template list
+uzi agent-template show <name|id>
+uzi agent-template set <name|id> --harness claude|codex <model>
+uzi agent-template reset <name|id> --harness claude|codex
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -3054,6 +3060,14 @@ it** — `console-key — auto, 62% headroom`, `console-key — pinned`,
 [Anthropic tokens](./anthropic-token.md) for the full set and what each
 reason means.
 
+### Worker size
+
+`uzi worker list` and `uzi worker get` carry a `SIZE` column right after `STATUS`:
+a hosted worker's size name (`s`, `m`, `l`, `l-highmem`), or `-` for an external
+worker or one without a size. `--json` carries `hosted_size` (the name) and
+`hosted_size_spec` (its CPU, memory and disk quantities; absent when no size of
+that name exists or the size table cannot be read). An admin can [edit the quantities](./hosted-workers.md#editing-sizes-admins).
+
 ### Upgrade status
 
 `uzi worker list` carries an `UPGRADE` column beside `VERSION`:
@@ -3374,7 +3388,9 @@ resolved model and effort, and each resolved field's source. Stored null
 fields show `Default`; explicit choices show `Pin · value`. All
 cells are active and editable in **Settings → Run defaults → Cross-check**:
 in each stage the Codex cell configures the checker of a Claude lead, the Claude cell the
-checker of a Codex lead. CLI set/reset is deferred to #1703.
+checker of a Codex lead. Pin or clear a cell from the CLI with `uzi settings
+set|reset cross-check` ([Changing model and effort
+settings](#changing-model-and-effort-settings)).
 
 JSON returns the decoded account settings DTO, including
 `cross_check_pins`. Each cell has nullable stored
@@ -3431,8 +3447,9 @@ claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
 `catalog_default`: `state` (`known`, `unknown` or `varies`), `effort`, `model`,
 `runtime_version`, `observed_at`, the last four `null` when `state` is
 `unknown`). `resolved_effort` is `null` exactly when
-`mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
-cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
+`mode` is `runtime_default`. Change effort with `uzi settings set effort`
+([Changing model and effort settings](#changing-model-and-effort-settings)) or in
+**Settings → Run defaults → Reasoning effort**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
 
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
@@ -3441,6 +3458,149 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 [kill switch](./admin-settings.md#run-summaries) can still turn it off for the
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
+
+### Changing model and effort settings
+
+```sh
+uzi settings set worker-model --harness codex gpt-5.5
+uzi settings set effort --harness claude runtime
+uzi settings set judge-model --harness codex <model-id>
+uzi settings set summary-model --harness claude <model-id>
+uzi settings set judge-runs-on codex
+uzi settings set cross-check --stage plan --harness codex --model <model-id> --effort high
+uzi settings reset worker-model --harness codex
+uzi settings reset judge-runs-on
+uzi settings reset cross-check --stage plan --harness codex
+```
+
+`uzi settings set <setting> <value>` and `uzi settings reset <setting>` write
+your own model and effort defaults for new runs (`PUT /api/me/model-settings`,
+which accepts a `uzc_` or `uza_` Bearer token). They write the same stored
+values as the matching **Settings → Run defaults** controls; the other users and
+the instance defaults are untouched.
+
+| Setting | `--harness` | Value | Web control |
+| --- | --- | --- | --- |
+| `worker-model` | `claude` or `codex`, required | A model id, passed through; the server validates it | [Worker model](./worker-model.md) |
+| `effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` | [Reasoning effort](./worker-effort.md) |
+| `judge-model` | `claude` or `codex`, required | A model id, validated by the server (the Codex judge lane accepts only curated models) | [Run judge](./judge.md#which-model-it-runs-on) |
+| `summary-model` | `claude` or `codex`, required | A model id, validated by the server | [Run summaries](./run-summaries.md#which-model-it-runs-on) |
+| `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
+| `cross-check` | `claude` or `codex`, required, plus `--stage plan` or `--stage code`, required | No positional value; `--model <id>` and `--effort low`, `medium`, `high`, `xhigh` or `max`, at least one of them (`runtime` is not a checker effort) | [Cross-check pins](./configuration.md#plan-cross-check-model-and-effort-pins) |
+
+`reset` takes the same setting and `--harness` and no value. It clears the stored
+pin, so the setting follows the upstream default again (nothing is stored, so a
+later change to the default applies). For `judge-runs-on`, `reset judge-runs-on` and
+`set judge-runs-on same-as-run` are the same write: they clear the stored value, so
+the judge runs on the harness of the run it reviews.
+
+`set cross-check` pins the checker of one stage and harness cell (the harness
+names the checker's family, as in the settings table). An omitted `--model` or
+`--effort` keeps its stored value, and the model is validated like the web
+control (a model of the wrong family is rejected). `reset cross-check --stage
+<stage> --harness <harness>` clears both the model and the effort of that cell
+only: its model then follows the worker default and its effort the cross-check
+default (`high`); the other cells are untouched.
+A missing or invalid `--stage`, `--harness` or effort, a `--model` or `--effort`
+with no member, and `--stage`, `--model` or `--effort` given to another setting
+exit 2 without a request.
+
+`effort ... runtime` is the explicit **Runtime default** mode: uzi sends no
+effort and the runtime picks its own level (see [Runtime
+default](./worker-effort.md#runtime-default)). It is not a reset. A reset
+removes your choice so the default applies (built-in medium); `runtime` is a
+stored choice that `uzi settings get` shows as `runtime default`.
+
+Human output prints the changed row of the **Model settings** table from a fresh
+[effective-settings](#effective-settings) read, so `STORED` and `SOURCE` show what
+the write did (`your choice` after a set; the default's own source after a
+reset). `judge-runs-on` prints the `Judge runs on:` line instead, and
+`cross-check` prints that cell's row of the cross-check table (stored pin,
+resolved value and source). `--json` prints
+the server's `{"settings": {...}}` envelope unchanged, without the effective
+read.
+
+A saved setting applies to runs that resolve it after the save. It never changes
+a run that froze its own choice, such as a run-level `--model` or `--effort`.
+Effort is resolved when a worker claims the run, so an already queued run picks
+up a new effort setting; see [Reasoning effort](./worker-effort.md). The judge's
+harness is frozen when the judge run is created.
+
+Exit codes:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | The write succeeded. If the follow-up effective-settings read fails, the command still exits 0 and prints `Saved; the effective view is unavailable, so only stored values are shown.` (the read error goes to stderr). |
+| 1 | The server predates the route: `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 2 | Usage error: an unknown setting, a missing, invalid or unwanted `--harness`, or an invalid value is refused before any request is sent. A value the server rejects (for example a model the harness cannot run) also exits 2, with the server's message; nothing is written. |
+| 3 | Authentication failed. |
+| 6 | Server error or rate limit. Two 500s are worded for the write's state: "the save may or may not have been applied; check with `uzi settings get`" (the commit outcome is unknown) and `settings saved; reading them back failed` (the save is durable). Run `uzi settings get` before retrying. |
+
+Exit 6 and the exit 0 `Saved; ...` line are different cases: exit 6 means the
+server could not confirm or read back the write, while the exit 0 line means
+the server confirmed the write and only the CLI's own effective-settings read
+failed.
+
+The route is an allowlist of ten fields (the two worker-model lanes, the two
+effort lanes, the two judge-model lanes, the two summary-model lanes,
+`judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
+are written in one transaction. Consent switches (enabling the judge, cross-check
+or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
+`judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
+already-enabled judge and summary work uses, and cannot turn that work on.
+
+### Agent-template model pins
+
+```sh
+uzi agent-template list
+uzi agent-template show my-reviewer
+uzi agent-template set my-reviewer --harness claude sonnet
+uzi agent-template set my-reviewer --harness codex <model-id>
+uzi agent-template reset my-reviewer --harness claude
+```
+
+`uzi agent-template` reads and edits the Claude pin (`model`) and the Codex pin
+(`codex_model`) of **your own** agent templates over `GET /api/me/agent-templates`
+and `PUT /api/me/agent-templates/{id}/model-pins`, both of which accept a `uzc_`
+or `uza_` Bearer token. A pin is stored per family; `--harness claude` or
+`--harness codex` is required for `set` and `reset`, and the other family is left
+unchanged. `set` passes the model id through and the server validates it like the
+web editor (see [Model pins](./agent-templates.md#model-pins)). `reset` clears
+that pin so the family inherits again. Only the two pins change; description,
+tools and prompt are untouched, and the template's `customized` flag stays as it
+was.
+
+`list` prints your builtin, global and own templates with `NAME`, `SCOPE`,
+`CLAUDE PIN`, `CODEX PIN`, `EDITABLE` and `ID`. `show`, `set` and `reset` print
+the template's stored pins, each as the value or `inherit`. The output states
+stored pins only and never a resolved model, because the model a template
+actually uses depends on the run role it fills (see [Model
+pins](./agent-templates.md#model-pins)). `--json` prints the server's envelope;
+`list` prints `{"templates": [...]}`, and `set`, `reset` and `show` print
+`{"template": {...}}` (`show` has no route of its own, so it prints that entry of
+the list unchanged).
+
+Only a template you own (scope `user`) is editable. A builtin or global template
+exits 3 with "builtin and global templates are edited in the web UI by an admin",
+even with an admin token. Another user's template or an unknown name or id exits
+4.
+
+Every verb first lists to resolve `<name|id>`: an exact id (case-insensitive)
+wins over a name; otherwise the name must match exactly one template. A name that
+matches several (a template of yours that shares a builtin's name) exits 2 and
+lists the ids; pass the id of one.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | The template was read or the pin written. |
+| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
+| 3 | Authentication failed, or the template is builtin or global. |
+| 4 | The template does not exist or belongs to another user, including a `404` on the write. |
+| 6 | Server error or rate limit, including a typed 500 for an unknown commit outcome or a failed readback. |
+
+Only the list's error-less 404 or 405, or an error-less 405 on the write, means an older server; a 404 on the write
+is always exit 4. A malformed template id is a 400, as on `/api/agent-templates`.
 
 ### Effective settings
 
@@ -3652,8 +3812,9 @@ JSON includes `harness_overflow_enabled`.
 run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
 `Judge runs on: Codex (your setting)`. `--json` carries the stored
 `judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
-`judge_harness` cell. The setting is changed in **Settings → Run defaults →
-Run judge**; there is no CLI write verb for it.
+`judge_harness` cell. Change it with `uzi settings set judge-runs-on`
+([Changing model and effort settings](#changing-model-and-effort-settings)) or in
+**Settings → Run defaults → Run judge**.
 
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your
@@ -4312,7 +4473,15 @@ finalization can open a new streak.
 The hold retains the claim, worker affinity and the issue lock for issue
 runs. Clone and HOME stay on the worker. Recovery depends on surviving
 worker storage or an available verified recovery copy; it does not promise
-that unpublished latest edits are available on another worker.
+that unpublished latest edits are available on another worker. A Codex run that
+has been claimed once is held for its last worker and is never offered to another;
+when its claimant provenance is valid, wait for that worker or follow the health
+reason's restart advice. Runs claimed before this deployment have no recorded
+claimant (no backfill): waiting cannot enable a fresh claim, even by their last
+worker. An existing flight may continue through readoption under the existing
+fences; otherwise cancel with `uzi run cancel <id>`. Cancellation does not itself
+release custody
+([details](./run-recovery.md#codex-runs-held-for-their-last-worker)).
 `run wait` prints the provider retry/hold notice and continues waiting
 through `paused` unless `--until paused` is selected.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)

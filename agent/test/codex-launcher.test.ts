@@ -302,16 +302,17 @@ describe("launchCodexRoot: fail-closed supported-profile gate", () => {
 describe("launchCodexRoot: env allowlist, trees, argv", () => {
   it("(b) builds a REPLACED env of EXACTLY the allowed keys; a canary is excluded", async () => {
     const fake = newFake();
-    await launchCodexRoot(baseSpec(), baseDeps(fake));
+    await launchCodexRoot(baseSpec(), baseDeps(fake, { env: { UZI_UID_SPLIT: "1", CODEX_EXEC_SERVER_URL: "http://untrusted.invalid" } }));
     const env = spawnCalls[0]?.options.env ?? {};
     assert.deepEqual(
       Object.keys(env).sort(),
       [
-        "CODEX_HOME", "CODEX_PROVIDER_KEY", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
+        "CODEX_EXEC_SERVER_URL", "CODEX_HOME", "CODEX_PROVIDER_KEY", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
         "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
         // issue #1783 (R4): NO worker spawn mark — the app-server runs model-directed work.
       ].sort(),
     );
+    assert.equal(env.CODEX_EXEC_SERVER_URL, "none");
     assert.equal(env.CODEX_PROVIDER_KEY, "dummy-key");
     assert.equal(env.HOME, `${DATA_ROOT}/home`);
     assert.equal(env.CODEX_HOME, `${DATA_ROOT}/codex`);
@@ -332,6 +333,7 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
     const fake = newFake({ uid: COMMAND_UID });
     await launchCodexRoot(baseSpec({ kind: "command", childArgv: ["exec", "--", "echo"] }), baseDeps(fake));
     const env = spawnCalls[0]?.options.env ?? {};
+    assert.equal(env.CODEX_EXEC_SERVER_URL, undefined, "command roots do not receive the app-server override");
     assert.equal(env.CODEX_PROVIDER_KEY, undefined, "no provider credential for a command root");
     assert.equal(Object.keys(env).includes("CODEX_PROVIDER_KEY"), false);
   });
@@ -417,11 +419,12 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     const env = spawnCalls[0]?.options.env ?? {};
     assert.equal(env.CODEX_PROVIDER_KEY, undefined, "no provider credential var under app-server auth");
     assert.equal(Object.keys(env).includes("CODEX_PROVIDER_KEY"), false);
+    assert.equal(env.CODEX_EXEC_SERVER_URL, "none");
     // Exactly the base allowlist, MINUS the provider credential var.
     assert.deepEqual(
       Object.keys(env).sort(),
       [
-        "CODEX_HOME", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
+        "CODEX_EXEC_SERVER_URL", "CODEX_HOME", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
         "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
       ].sort(),
     );
@@ -747,7 +750,7 @@ describe("launchCodexRoot: trusted construction contract", () => {
   });
 
   it("trusted refusal: rejects allowlist-reserved and malformed provider env keys", async () => {
-    for (const envKey of ["PATH", "BAD-KEY"]) {
+    for (const envKey of ["PATH", "CODEX_EXEC_SERVER_URL", "BAD-KEY"]) {
       await assert.rejects(
         launchCodexRoot(baseSpec({ provider: { ...baseSpec().provider, envKey } }), baseDeps(newFake())),
         (error: unknown) => error instanceof TrustedExecutionRefusal

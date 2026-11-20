@@ -15,6 +15,9 @@ func TestLoadEphemeralDefaultSize(t *testing.T) {
 		{name: "unset", unset: true, want: "m"},
 		{name: "empty", want: "m"},
 		{name: "invalid", value: "unknown", want: "m"},
+		// The env is builtins-only: a well-formed name that is not shipped (an admin size)
+		// cannot be validated before the database exists, so it falls back (PRD #4213).
+		{name: "well-formed but not builtin falls back", value: "xs", want: "m"},
 		{name: "whitespace-only value uses the default", value: "  ", want: "m"},
 		{name: "explicit small", value: "s", want: "s"},
 		{name: "explicit medium", value: "m", want: "m"},

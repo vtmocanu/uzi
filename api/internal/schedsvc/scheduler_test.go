@@ -1537,8 +1537,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	// PRD #2865 added the eleven ci_watch reasons (ci_green .. ci_config_changed).
 	// Issue #3719 added codex_pool_unavailable.
 	// PRD #4320 M4 added the six provider-source reasons.
-	if len(AllSkipReasons) != 32 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 32", len(AllSkipReasons))
+	// Issue #4488's narrowed partial-fire outcome adds consumer_gate_busy.
+	if len(AllSkipReasons) != 33 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 33", len(AllSkipReasons))
 	}
 }
 

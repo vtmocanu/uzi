@@ -29,6 +29,7 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -336,6 +337,20 @@ func (m *Materializer) storageClassVerdict(ctx context.Context, tick *rollTick, 
 	return verdict
 }
 
+// bindingModeWFFC reports whether the named StorageClass exists with volumeBindingMode
+// WaitForFirstConsumer. Any read error (Forbidden, NotFound, other), nil object, nil or
+// Immediate mode yields false. cache memoises every verdict (negatives included) so one
+// Observe pass issues at most one Get per class.
+func (m *Materializer) bindingModeWFFC(ctx context.Context, cache map[string]bool, name string) bool {
+	if v, ok := cache[name]; ok {
+		return v
+	}
+	sc, err := m.client.StorageV1().StorageClasses().Get(ctx, name, metav1.GetOptions{})
+	v := err == nil && sc != nil && sc.VolumeBindingMode != nil && *sc.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer
+	cache[name] = v
+	return v
+}
+
 // classReclaimPolicy returns the StorageClass's reclaim policy (Retain, Delete or Recycle)
 // for the hibernation volume inventory, memoised for the tick. A nil or empty class name,
 // a Forbidden, NotFound or any other read error, or an unrecognised value yields
@@ -420,7 +435,7 @@ func (m *Materializer) reportClaimStates(desired []protocol.DesiredWorker, obser
 		if err != nil {
 			continue
 		}
-		spec, err := m.resolver.Resolve(w.Template, w.Size)
+		spec, err := m.resolveWorker(w)
 		if err != nil {
 			continue
 		}
