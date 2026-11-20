@@ -189,6 +189,14 @@ uzi settings get
 uzi settings reserve
 uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
+uzi settings set <setting> [--harness claude|codex] <value>
+uzi settings reset <setting> [--harness claude|codex]
+uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>] [--effort <level>]
+uzi settings reset cross-check --stage plan|code --harness claude|codex
+uzi agent-template list
+uzi agent-template show <name|id>
+uzi agent-template set <name|id> --harness claude|codex <model>
+uzi agent-template reset <name|id> --harness claude|codex
 uzi context list
 uzi context current
 uzi context use <name>
@@ -395,6 +403,41 @@ uzi version
   Prints the resulting reserve; `--json` returns `weekly_reserve_pct` and
   `weekly_reserve_pause_running`. Usage exit 2 on an out-of-range threshold. A uzc_ token
   can run it.
+- `uzi settings set <setting> [--harness claude|codex] <value>` and
+  `uzi settings reset <setting> [--harness claude|codex]` — write or clear one model or
+  effort default for new runs (`PUT /api/me/model-settings`). Settings: `worker-model`,
+  `effort` (`low|medium|high|xhigh|max|runtime`), `judge-model` and `summary-model` all
+  need `--harness`; `judge-runs-on` (`same-as-run|claude|codex`) takes none. A model id
+  is passed through and the server validates it; `reset` clears to the inherited value.
+  Prints the changed row with its source, from a fresh effective-settings read; when
+  that read fails the stored value is shown, the write still exits 0 and the read error
+  goes to stderr. `--json` prints the server's `{"settings": ...}` envelope unchanged.
+  Usage exit 2 (no request) on an unknown setting, a missing, invalid or unwanted
+  `--harness`, or an invalid value. Exit 6 with "the save may or may not have been
+  applied; check with `uzi settings get`" when the commit outcome is unknown, and with
+  "settings saved; reading them back failed" when the save is durable. A server without
+  the route exits 1 ("upgrade the server").
+- `uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>]
+  [--effort low|medium|high|xhigh|max]` and `uzi settings reset cross-check --stage
+  plan|code --harness claude|codex` — pin or clear the checker model and effort of one
+  cross-check cell (`PUT /api/me/model-settings`, key `cross_check_pins`). `set` needs
+  `--stage`, `--harness` and at least one of `--model` and `--effort`, and leaves an
+  omitted member unchanged; `runtime` is not a checker effort. `reset` clears both
+  members: the model follows the worker default and the effort the cross-check default (high). Prints that cell with its pin,
+  resolved value and source; `--json` prints the server envelope. Usage exit 2 (no
+  request) on a missing or invalid `--stage`, `--harness`, member or effort, or when
+  those flags are given to another setting.
+- `uzi agent-template list|show <name|id>|set <name|id> --harness claude|codex <model>|reset
+  <name|id> --harness claude|codex` — read and edit the Claude (`model`) and Codex
+  (`codex_model`) pins of your own agent templates (`GET /api/me/agent-templates`,
+  `PUT /api/me/agent-templates/{id}/model-pins`). Every verb first lists to resolve the
+  argument: an exact id wins, else an exact name; a name matching several templates exits 2
+  and lists the ids, no match exits 4. Pins are stored per family; `reset` clears one so it
+  inherits. Output shows stored pins only (value or `inherit`), never a resolved model.
+  `--json` prints the server envelope (`show` prints `{"template": ...}`). Usage exit 2
+  (no request) on a missing or invalid `--harness`, or a missing or empty model. Builtin and
+  global templates exit 3 ("edited in the web UI by an admin"). Exit 6 on an unknown commit
+  outcome or a failed readback; a server without the routes exits 1 ("upgrade the server").
 
 ### Named contexts
 

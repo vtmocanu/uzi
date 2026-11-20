@@ -1504,6 +1504,10 @@ WITH checker_template_pins AS MATERIALIZED (
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR ('codex_harness_v1' = ANY(@worker_protocol_caps::text[]) AND 'codex_runtime_v2' = ANY(@worker_protocol_caps::text[])))
+      -- Issue #4476: Codex claim provenance. A Codex-indicating run that has been claimed before (generation >= 1)
+      -- is claimable only by its last successful Codex claimant for the CURRENT generation. Standalone,
+      -- like the clauses above; never bypassed by capability or affinity overrides.
+      AND fn_codex_claim_provenance_admits(r, @worker_id::uuid)
       -- Interlocked Codex turns require the newer completion loop, independently of overrides.
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -1786,6 +1790,9 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- claimant's @worker_protocol_caps).
                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR ('codex_harness_v1' = ANY(p.protocol_capabilities) AND 'codex_runtime_v2' = ANY(p.protocol_capabilities)))
+                -- Issue #4476: MIRROR the Codex claim-provenance clause for the peer, so a recorded worker never
+                -- defers to a peer that provenance would stop from claiming the run.
+                AND fn_codex_claim_provenance_admits(r, p.id)
                 AND (r.completion_contract_version IS NULL
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
@@ -2114,6 +2121,10 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
+    -- Issue #4476: Codex claim provenance, the (worker, generation) pair of this claim. Written only here,
+    -- for Codex-indicating rows; trg_runs_claim_provenance_guard rejects any write that is not an admitted +1 claim.
+    claim_provenance_worker_id = CASE WHEN (runs.harness = 'codex' OR runs.codex_material_revision IS NOT NULL OR runs.codex_secret_id IS NOT NULL) THEN @worker_id::uuid ELSE runs.claim_provenance_worker_id END,
+    claim_provenance_generation = CASE WHEN (runs.harness = 'codex' OR runs.codex_material_revision IS NOT NULL OR runs.codex_secret_id IS NOT NULL) THEN runs.claim_generation + 1 ELSE runs.claim_provenance_generation END,
     -- Compatible-lane one-claim Fresh (#3607 Mf): a pending authorization is consumed by exactly this
     -- claim, which records the generation it spent it on; RETURNING projects it for this claim only.
     -- Every right-hand side reads the PRE-update row.
@@ -11471,6 +11482,9 @@ SELECT id, runs.user_id, status, auto_approve,
        cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
+       -- Issue #4507: true only while the owner-hold marker names the CURRENT episode (marker = health_since).
+       COALESCE(runs.health_owner_hold_since IS NOT NULL AND runs.health_since IS NOT NULL
+                AND runs.health_owner_hold_since = runs.health_since, false)::boolean AS health_owner_hold_active,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
@@ -11488,6 +11502,21 @@ SELECT id, runs.user_id, status, auto_approve,
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())
                             AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())), '')::text AS stale_requeue_worker_name,
+       -- issue #4476: a Codex-indicating run with a generation whose provenance does not admit any
+       -- claimant is held. The worker name comes ONLY from the recorded provenance (never runs.worker_id),
+       -- and only while the provenance generation is the current one.
+       (NOT fn_codex_claim_provenance_admits(runs, NULL::uuid))::boolean AS codex_provenance_held,
+       (CASE WHEN runs.claim_provenance_worker_id IS NOT NULL
+                  AND runs.claim_provenance_generation = runs.claim_generation
+             THEN COALESCE((SELECT pw.name FROM workers pw WHERE pw.id = runs.claim_provenance_worker_id), runs.claim_provenance_worker_id::text)
+             ELSE '' END)::text AS codex_provenance_worker_name,
+       -- Mirror ClaimRun's released-incarnation fence for the recorded claimant, not
+       -- the mutable worker_id affinity hint. NULL nonces match via IS NOT DISTINCT FROM.
+       EXISTS (SELECT 1 FROM workers pw
+               WHERE pw.id = runs.claim_provenance_worker_id
+                 AND runs.claim_provenance_generation = runs.claim_generation
+                 AND runs.released_worker_id = pw.id
+                 AND runs.released_worker_nonce IS NOT DISTINCT FROM pw.snapshot_register_nonce)::boolean AS codex_provenance_restart_required,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
            SELECT a.terminal_pending_since AS since FROM worker_active_runs a
@@ -11618,12 +11647,27 @@ LIMIT @lim;
 -- COALESCE advances it then and preserves it otherwise. It is never cleared here
 -- (nor by the exit contract), so it damps DM flapping across episodes and API
 -- restarts. The detector remains the single writer of every health column.
+--
+-- Issue #4507: health_owner_hold_since is the episode-keyed owner-hold marker. When
+-- @mark_owner_hold is true it is set to the health_since being written (this episode);
+-- otherwise it is left as is. It is never cleared: it is valid only while it equals the
+-- row's current health_since, so a new episode invalidates it.
 UPDATE runs SET
     health             = @health,
     health_reason      = sqlc.narg('health_reason'),
     health_since       = sqlc.narg('health_since'),
-    health_notified_at = COALESCE(sqlc.narg('health_notified_at'), health_notified_at)
+    health_notified_at = COALESCE(sqlc.narg('health_notified_at'), health_notified_at),
+    health_owner_hold_since = CASE WHEN @mark_owner_hold::boolean THEN sqlc.narg('health_since') ELSE health_owner_hold_since END
 WHERE id = @id AND status = @status;
+
+-- name: MarkRunHealthOwnerHold :execrows
+-- Issue #4507: stamp the owner-hold marker on an EXISTING health episode without rewriting
+-- any other health column (the detector's unchanged-skip branch uses it when the owner hold
+-- begins mid-episode). Guarded by the exact episode the detector read (status, health,
+-- reason, health_since), so it matches zero rows if the episode changed since the read.
+UPDATE runs SET health_owner_hold_since = health_since
+WHERE id = @id AND status = @status AND health = @health AND health_reason = @health_reason
+  AND health_since IS NOT NULL AND health_since = @health_since;
 
 -- name: CountOnlineWorkersForUser :one
 -- How many of a user's workers are online — the queued-run reason resolver uses it
@@ -11835,6 +11879,8 @@ WHERE run.id = @run_id
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- Issue #4476: Codex claim provenance, mirrored (see ClaimRun).
+  AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
@@ -12354,6 +12400,10 @@ WHERE r.status = 'queued'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
                 AND fn_forge_origin_owner_pins(ow, r, now())), false)
+  -- Issue #4476: a run held by Codex claim provenance (its last Codex claimant is the only worker
+  -- that may claim it) is never ephemeral demand: a new ephemeral worker is always a fresh id, so
+  -- the gate can never admit it. NULL claimant models that fresh worker.
+  AND fn_codex_claim_provenance_admits(r, NULL::uuid)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -12555,6 +12605,10 @@ WHERE r.status = 'queued'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
                 AND fn_forge_origin_owner_pins(ow, r, now())), false)
+  -- Issue #4476: a run held by Codex claim provenance (its last Codex claimant is the only worker
+  -- that may claim it) is never ephemeral demand: a new ephemeral worker is always a fresh id, so
+  -- the gate can never admit it. NULL claimant models that fresh worker.
+  AND fn_codex_claim_provenance_admits(r, NULL::uuid)
   AND now() - r.status_since > @saturation_delay::interval
   AND EXISTS (
       SELECT 1 FROM workers w

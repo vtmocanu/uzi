@@ -257,6 +257,12 @@ function renderDetail(f: LastFire) {
   );
 }
 
+it("shows a partial-fire gate refusal as a visible warning", () => {
+  renderDetail(fire([{ issue_iid: 97, title: "Deferred issue", reason: "consumer_gate_busy", web_url: null }]));
+  expect(screen.getByText("repository busy").className).toMatch(/warn/);
+  expect(screen.queryByText("fetch failed")).toBeNull();
+});
+
 it.each([
   ["harness_label_conflict", "issue harness label conflicts with schedule pin"],
   ["harness_label_invalid", "invalid issue harness labels"],

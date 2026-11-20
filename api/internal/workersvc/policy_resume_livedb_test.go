@@ -59,6 +59,8 @@ func (p policyLive) running(t *testing.T, gen int64) uuid.UUID {
 	t.Helper()
 	id := p.e.fpSeedRunning(t, p.wid, gen)
 	p.e.exec(t, "UPDATE runs SET harness='codex',session_id='original-session',started_at=now() WHERE id=$1", id)
+	// A Codex run at generation >= 1 is claimable only by the worker its claim provenance records.
+	seedClaimProvenance(t, p.e.ctx, p.e.pool, func(q string, a ...any) { p.e.exec(t, q, a...) }, id, p.wid, gen)
 	return id
 }
 

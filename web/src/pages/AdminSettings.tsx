@@ -43,7 +43,8 @@ import {
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
 import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
-import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
+import { SummaryControlsCard } from "./adminSettings/SummaryControlsCard";
+import { InstanceModelDefaultsCard } from "./adminSettings/InstanceModelDefaultsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
 import { TrustedReviewBotsCard } from "./adminSettings/TrustedReviewBotsCard";
@@ -331,6 +332,7 @@ export function AdminSettings() {
       ? [{ id: "vault-migration", label: "Vault migration" }]
       : []),
     { id: "vault-policy", label: "Credential protection" },
+    ...(!loading && saved ? [{ id: "model-defaults", label: "Model defaults" }] : []),
     { id: "forge-labels", label: "Forge labels" },
     ...(!loading && saved ? [{ id: "run-judge", label: "Run judge" }] : []),
     ...(!loading ? [{ id: "maintenance", label: "Maintenance mode" }] : []),
@@ -444,6 +446,12 @@ export function AdminSettings() {
           }}>Save vault policy</Button>
         </div>
       </Card>
+
+      {!loading && saved && (
+        <section id="model-defaults" className="scroll-mt-6">
+          <InstanceModelDefaultsCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
+        </section>
+      )}
 
       <Card id="forge-labels" className="scroll-mt-6 space-y-5">
         <div>
@@ -566,7 +574,7 @@ export function AdminSettings() {
 
       {!loading && saved && (
         <section id="run-summaries" className="scroll-mt-6">
-          <SummarySettingsCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
+          <SummaryControlsCard settings={saved} sources={sources} onSaved={applyResponse} />
         </section>
       )}
 

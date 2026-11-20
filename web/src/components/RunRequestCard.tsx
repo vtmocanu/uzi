@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 import { api, type RunRequest } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Button } from "./ui";
+import { StartPreview } from "./StartPreview";
+import { DEFAULT_START_PREVIEW_REQUEST } from "../lib/startPreview";
 import { PlayIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
@@ -57,6 +59,10 @@ export function RunRequestCard({ request }: { request: RunRequest }) {
             {request.title ? <span className="text-muted">{" · "}{stripUnsafeChars(request.title)}</span> : null}
           </p>
         </div>
+
+        {/* Issue #3261: the read-only prediction of what Start would run with, only while the
+            request is still actionable. It never changes what Start posts below. */}
+        {state === "pending" && <StartPreview variant="static" request={DEFAULT_START_PREVIEW_REQUEST} />}
 
         {err && <p className="text-xs text-danger">{err}</p>}
 

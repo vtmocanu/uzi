@@ -42,9 +42,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(settingsGetJSON{UserSettingsDTO: settings, Effective: effective, SchedulePreview: schedule})
 			}
-			if err := p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
-				"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"},
-				settingsCrossCheckRows(settings)); err != nil {
+			if err := p.Table(crossCheckColumns, settingsCrossCheckRows(settings)); err != nil {
 				return err
 			}
 			// PRD #3245: one table for every model setting, after the cross-check table.
@@ -91,6 +89,8 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd.AddCommand(newSettingsReserveCmd(env, gf))
 	cmd.AddCommand(newSettingsCodexModeCmd(env, gf))
 	cmd.AddCommand(newSettingsHarnessOverflowCmd(env, gf))
+	cmd.AddCommand(newSettingsSetCmd(env, gf))
+	cmd.AddCommand(newSettingsResetCmd(env, gf))
 	return cmd
 }
 

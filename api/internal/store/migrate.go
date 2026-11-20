@@ -298,6 +298,24 @@ const JudgeDispositionCoordLockClass int32 = 0x757A6A64 // "uzjd"
 // pool's default READ COMMITTED isolation (OpenPool sets none), like its siblings.
 const RunBranchLockClass int32 = 0x757A7262 // "uzrb"
 
+// TerminalConsumerGateLockClass is the class half of the per-repository two-int advisory
+// "consumer gate" that serializes terminal-ref retirement against run admissions (ADR-4007,
+// T3). Every admission that may consume a repository's terminal ref takes
+// pg_advisory_xact_lock_shared(TerminalConsumerGateLockClass, TerminalConsumerGateObjID(repo_id))
+// (LockTerminalConsumerGateShared) so admissions never block each other; retirement takes the
+// same key with pg_try_advisory_xact_lock (TryLockTerminalConsumerGate), exclusive and never
+// waiting, so it backs off while any admission is in flight.
+//
+// It must be the FIRST lock its transaction takes, so no lock-order cycle can form with the
+// other classes here (the admission path takes RunBranchLockClass afterwards). XACT-scoped:
+// released on commit or rollback. The shared acquire is its own statement and the next
+// statement takes a fresh READ COMMITTED snapshot, the mechanism SettingsMutationLockKey
+// documents above, so the lock helpers refuse any other isolation level. Two-int space,
+// disjoint from the other classes here (the lockClassesFromSource collision check in
+// product_token_lock_test.go covers it); an objid collision only serializes two unrelated
+// repositories for a moment.
+const TerminalConsumerGateLockClass int32 = 0x757A7463 // "uztc"
+
 // CheckpointRetentionLockClass is the class half of the two-int advisory lock that serializes
 // every forge write against one run's retained checkpoint ref (PRD #1810): the terminal-time
 // settle delete (M1), supersession (M3) and the settlement/reconciliation sweeper (M4). Taken

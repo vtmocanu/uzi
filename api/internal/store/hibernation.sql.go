@@ -268,6 +268,25 @@ func (q *Queries) GetHibernationWake(ctx context.Context, runID uuid.UUID) (Hibe
 	return i, err
 }
 
+const hibernationWakeProvenanceAdmits = `-- name: HibernationWakeProvenanceAdmits :one
+SELECT COALESCE(fn_codex_claim_provenance_admits(r, $1::uuid), false)::boolean AS admitted
+FROM runs r WHERE r.id = $2
+`
+
+type HibernationWakeProvenanceAdmitsParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	RunID    uuid.UUID `json:"run_id"`
+}
+
+// Read after LockRunForShare on the same READ COMMITTED transaction. The separate
+// statement observes any claim/requeue committed while the run lock was awaited.
+func (q *Queries) HibernationWakeProvenanceAdmits(ctx context.Context, arg HibernationWakeProvenanceAdmitsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hibernationWakeProvenanceAdmits, arg.WorkerID, arg.RunID)
+	var admitted bool
+	err := row.Scan(&admitted)
+	return admitted, err
+}
+
 const hibernationWakeSuppresses = `-- name: HibernationWakeSuppresses :one
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
@@ -590,6 +609,8 @@ CROSS JOIN LATERAL (
            AND (r.kind <> 'job'
                 OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                     AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+           -- Issue #4476: ClaimRun's Codex claim-provenance clause.
+           AND fn_codex_claim_provenance_admits(r, w.id)
            -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
            AND (r.kind = 'cross_check' OR r.worker_id IS NULL OR r.worker_id = w.id
                 OR r.updated_at < $5::timestamptz
@@ -710,6 +731,7 @@ FROM hibernation_wakes hw
 JOIN runs r ON r.id = hw.run_id
 JOIN workers w ON w.id = hw.worker_id
 WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
+   OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
 ORDER BY hw.worker_id, hw.run_id
 LIMIT $1
 `
@@ -720,9 +742,10 @@ type ListStaleHibernationWakesRow struct {
 }
 
 // Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
-// longer queued. A run that left 'queued' (claimed, cancelled, finished) qualifies, and so does a row
-// whose worker is hibernated or preparing again (the wake can no longer serve the run). A row whose
-// worker settled to none is kept while the run is queued, so the run never wakes a worker twice.
+// longer queued or no longer admits its recorded worker under claim provenance. A run that left
+// 'queued' (claimed, cancelled, finished) qualifies, and so does a row whose worker is hibernated
+// or preparing again (the wake can no longer serve the run). An awake worker's row is kept while
+// the queued run still admits it, so one pending run never wakes a valid worker twice.
 // A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 func (q *Queries) ListStaleHibernationWakes(ctx context.Context, maxRows int32) ([]ListStaleHibernationWakesRow, error) {
 	rows, err := q.db.Query(ctx, listStaleHibernationWakes, maxRows)

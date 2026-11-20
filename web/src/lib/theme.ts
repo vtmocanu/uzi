@@ -165,9 +165,10 @@ export function resolveAppearance(
 // appearance, refresh the pre-paint cache, and keep the live system-mode
 // listener in one place. Supersedes the legacy applyTheme: it stamps BOTH
 // data-theme (the painted polarity's theme) and data-font (the typeface), caches
-// the whole appearance under APPEARANCE_STORAGE_KEY for the pre-paint script, and
-// arms/tears down a single matchMedia listener so "system" mode re-themes live
-// when the OS colour scheme flips.
+// the whole appearance (including sidebarMotion, which drives data-motion) under
+// APPEARANCE_STORAGE_KEY for the pre-paint script, and arms/tears down a single
+// matchMedia listener so "system" mode re-themes live when the OS colour scheme
+// flips.
 // ---------------------------------------------------------------------------
 
 // APPEARANCE_STORAGE_KEY is the pre-paint cache slot the external
@@ -198,6 +199,7 @@ export function applyAppearance(a: {
   light: string;
   dark: string;
   typeface: string;
+  sidebarMotion: boolean;
 }): void {
   // Narrow defensively: cached / wire data may be stale or tampered, so every
   // field falls back to its compiled default rather than stamping a bogus value.
@@ -210,11 +212,15 @@ export function applyAppearance(a: {
     mode === "system" ? (prefersDark() ? "dark" : "light") : mode;
   document.documentElement.dataset.theme = polarity === "dark" ? dark : light;
   document.documentElement.dataset.font = typeface;
+  // Sidebar icon animations are opt-in: only a strict true stamps "on". There is
+  // deliberately no web-side default; the server resolves the value.
+  const sidebarMotion = a.sidebarMotion === true;
+  document.documentElement.dataset.motion = sidebarMotion ? "on" : "off";
 
   try {
     localStorage.setItem(
       APPEARANCE_STORAGE_KEY,
-      JSON.stringify({ mode, light, dark, typeface }),
+      JSON.stringify({ mode, light, dark, typeface, sidebarMotion }),
     );
   } catch {
     // Storage unavailable (private mode / disabled): theming still works; only

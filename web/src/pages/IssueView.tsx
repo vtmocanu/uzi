@@ -9,6 +9,9 @@ import { firstStartIso } from "../lib/runDuration";
 import { DEFAULT_RUN_START_OPTIONS, startRunWithOptions, type RunStartOptions } from "../lib/startRun";
 import type { HarnessSelection } from "../lib/harnessSelection";
 import { RunOptionsDialog, type RunOptionsStartCallbacks } from "../components/RunOptionsDialog";
+import { StartPreview } from "../components/StartPreview";
+import { StartPreviewProvider } from "../lib/startPreviewStore";
+import { DEFAULT_START_PREVIEW_REQUEST } from "../lib/startPreview";
 import { activeRunInHistory, effectiveRunStatus, historyShowsParkLabel, parkLabel, sourceEndDeclinedCopy, isStoppedRun, isRejectedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
@@ -139,6 +142,18 @@ export function IssueView() {
     // just cleared the previous issue and the page would otherwise sit blank.
     { fallback: "Failed to load the issue", skeleton: "deps" },
   );
+  // Issue #3261: the run-start preview generation. useAsyncData sets a fresh `data` object
+  // on every successful load (first load, a route change, reload() after a start or
+  // promote) and keeps the old one on failure, so a bump per data identity is a bump per
+  // successful refresh of the start prerequisites. null before the first data and after a
+  // route change.
+  const [previewGeneration, setPreviewGeneration] = useState<number | null>(null);
+  useEffect(() => {
+    setPreviewGeneration(null);
+  }, [repoId, iidNum]);
+  useEffect(() => {
+    if (data) setPreviewGeneration((g) => (g ?? 0) + 1);
+  }, [data]);
   const runs = data?.runs ?? [];
   const hasWorker = data?.hasWorker ?? false;
   const hasToken = data?.hasToken ?? false;
@@ -239,6 +254,7 @@ export function IssueView() {
   const gate = gateFor("inherit");
 
   return (
+    <StartPreviewProvider generation={previewGeneration}>
     <div className="space-y-5">
       <nav className="flex items-center gap-1.5 text-xs text-faint">
         <Link to={`/repos/${repoId}/board`} className="hover:text-fg">
@@ -437,6 +453,7 @@ export function IssueView() {
                 </Button>
               </div>
               {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
+              <StartPreview variant="open" request={DEFAULT_START_PREVIEW_REQUEST} className="mt-2" />
             </div>
           )}
           {/* Mounted on the open flag alone (Board's rule), not on closed/eligible: the
@@ -486,6 +503,7 @@ export function IssueView() {
         />
       )}
     </div>
+    </StartPreviewProvider>
   );
 }
 

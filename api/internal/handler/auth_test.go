@@ -502,3 +502,67 @@ func TestSessionPayloadTypedWireMetadata(t *testing.T) {
 		t.Fatal("passwordless session claims password")
 	}
 }
+
+// sessionMotion is the sidebar_motion slice of a session payload's appearance
+// (issue #4510): resolved bool, raw nullable override, instance default.
+type sessionMotion struct {
+	Appearance struct {
+		SidebarMotion bool `json:"sidebar_motion"`
+		Overrides     struct {
+			SidebarMotion *bool `json:"sidebar_motion"`
+		} `json:"overrides"`
+		Defaults struct {
+			SidebarMotion bool `json:"sidebar_motion"`
+		} `json:"defaults"`
+	} `json:"appearance"`
+}
+
+func decodeSessionMotion(t *testing.T, payload sessionResponse) sessionMotion {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var got sessionMotion
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode payload %s: %v", raw, err)
+	}
+	return got
+}
+
+func TestSessionPayloadSidebarMotion(t *testing.T) {
+	t.Parallel()
+	h := newSettingsHandler()
+	ctx := context.Background()
+
+	unset := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{}))
+	if unset.Appearance.SidebarMotion || unset.Appearance.Defaults.SidebarMotion || unset.Appearance.Overrides.SidebarMotion != nil {
+		t.Errorf("NULL user: %+v, want resolved false, default false, override null", unset.Appearance)
+	}
+
+	on := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{SidebarMotion: pgtype.Bool{Bool: true, Valid: true}}))
+	if !on.Appearance.SidebarMotion || on.Appearance.Overrides.SidebarMotion == nil || !*on.Appearance.Overrides.SidebarMotion {
+		t.Errorf("explicit true: %+v, want resolved true, override true", on.Appearance)
+	}
+}
+
+// Not parallel: it flips the package-level sidebarMotionDefault seam.
+func TestSessionPayloadSidebarMotionInstanceDefaultOn(t *testing.T) {
+	prev := sidebarMotionDefault
+	sidebarMotionDefault = true
+	t.Cleanup(func() { sidebarMotionDefault = prev })
+	h := newSettingsHandler()
+	ctx := context.Background()
+
+	unset := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{}))
+	if !unset.Appearance.SidebarMotion || !unset.Appearance.Defaults.SidebarMotion || unset.Appearance.Overrides.SidebarMotion != nil {
+		t.Errorf("NULL user with default on: %+v, want resolved true, default true, override null", unset.Appearance)
+	}
+	off := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{SidebarMotion: pgtype.Bool{Bool: false, Valid: true}}))
+	if off.Appearance.SidebarMotion || off.Appearance.Overrides.SidebarMotion == nil || *off.Appearance.Overrides.SidebarMotion {
+		t.Errorf("explicit false with default on: %+v, want resolved false, override false", off.Appearance)
+	}
+	if !off.Appearance.Defaults.SidebarMotion {
+		t.Errorf("defaults.sidebar_motion = false, want true")
+	}
+}

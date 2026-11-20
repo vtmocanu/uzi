@@ -138,7 +138,7 @@ func assertOwnerHold(t *testing.T, p *pinAgreementEnv, at time.Time, wantReason 
 		AffinityCutoff:  ownerHoldStamp(at.Add(-p.ceiling)), StaleRequeueCutoff: StaleRequeueCutoff(at, p.grace),
 		SpreadCutoff: ownerHoldStamp(at.Add(-9 * time.Second)), BackgroundGraceCutoff: ownerHoldStamp(at.Add(-15 * time.Minute)),
 		CrossCheckEvaluatedAt: ownerHoldStamp(at), CrossCheckAffinityCutoff: ownerHoldStamp(at.Add(-2 * time.Minute)),
-		WorkerCaps: []string{}, WorkerProtocolCaps: []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1},
+		WorkerCaps: []string{}, WorkerProtocolCaps: []string{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1},
 		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
 	run, err := p.e.q.ClaimRun(p.e.ctx, cp)
@@ -223,7 +223,11 @@ func TestOwnerHoldReleaseAndControlsLiveDB(t *testing.T) {
 			case "deleted owner":
 				p.e.exec(t, `DELETE FROM workers WHERE id=$1`, p.owner)
 			case "PLAN cross_check":
-				protocols := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
+				// The checkers run on Claude under a Codex lead (the opposite family): this control is
+				// about the owner pin skipping a cross_check kind, and a previously claimed Codex
+				// checker is now admitted only to its recorded worker (issue #4476), so a Codex
+				// checker could not model the peer taking over.
+				protocols := []string{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
 				p.e.exec(t, `UPDATE workers SET protocol_capabilities=$2 WHERE user_id=$1`, p.e.userID, protocols)
 				for i, id := range []uuid.UUID{p.gapRun, p.satRun} {
 					lead := uuid.New()
@@ -231,11 +235,12 @@ func TestOwnerHoldReleaseAndControlsLiveDB(t *testing.T) {
 						status,claim_generation,status_since,updated_at,created_at)
 						VALUES ($1,$2,$3,$4,'lead','d','running',1,$5,$5,$5)`,
 						lead, p.e.userID, p.e.repoID, 10+i, at.Add(-time.Hour))
+					p.e.exec(t, `UPDATE runs SET harness='codex' WHERE id=$1`, lead)
 					p.e.exec(t, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,
-						harness='codex',report_only=true,budget_wall_seconds=1800,required_tools='{}' WHERE id=$1`, id, lead)
+						harness='claude',report_only=true,budget_wall_seconds=1800,required_tools='{}' WHERE id=$1`, id, lead)
 					p.e.exec(t, `INSERT INTO cross_checks (id,lead_run_id,checker_run_id,stage,round,
 						lead_claim_generation,plan_md,milestones,size_class,base_commit,candidate_digest,checker_harness,deadline_at)
-						VALUES ($1,$2,$3,'plan',1,1,'plan','[]','s',repeat('a',40),$4,'codex',$5)`,
+						VALUES ($1,$2,$3,'plan',1,1,'plan','[]','s',repeat('a',40),$4,'claude',$5)`,
 						uuid.New(), lead, id, []byte("test-digest"), at.Add(5*time.Minute))
 				}
 			}

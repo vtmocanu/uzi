@@ -379,6 +379,36 @@ type FakeClient struct {
 	Effective    *apitypes.EffectiveSettingsDTO
 	EffectiveErr error
 
+	// PutModelSettings capture (PRD #3264): ModelSettingsCalls counts the writes (zero proves a
+	// command refused before any request), LastModelSettingsPatch is a copy of the last patch
+	// (a nil value is a clear). ModelSettingsResult, when set, is the canned reply; otherwise the
+	// patch is applied to Settings and that is returned. PutModelSettingsErr wins over the blanket
+	// Err while the capture still proves the write was reached.
+	ModelSettingsCalls     int
+	LastModelSettingsPatch map[string]*string
+	ModelSettingsResult    *ModelSettingsResult
+	PutModelSettingsErr    error
+	// PutCrossCheckPins capture: the same counters and canned reply as above, shared with
+	// ModelSettingsCalls/ModelSettingsResult/PutModelSettingsErr; LastCrossCheckPins is a copy of
+	// the last cells sent. Without a canned reply the cells are applied to Settings.CrossCheckPins.
+	LastCrossCheckPins []CrossCheckPinWire
+
+	// Agent-template pin capture (PRD #3264 M3). AgentTemplates is what the list answers (also
+	// updated by a write); AgentTemplateListErr fails the list; AgentTemplateListCalls and
+	// AgentTemplatePutCalls count requests (zero proves a refusal before any request);
+	// LastAgentTemplateID and LastAgentTemplatePatch record the last write (a nil value is a
+	// clear); AgentTemplatePutResult is a canned reply and AgentTemplatePutErr fails the write
+	// (it wins over the blanket Err while the capture still proves the write was reached).
+	AgentTemplates          []AgentTemplatePins
+	AgentTemplateListErr    error
+	AgentTemplateListCalls  int
+	AgentTemplatePutCalls   int
+	LastAgentTemplateID     string
+	LastAgentTemplatePatch  map[string]*string
+	AgentTemplatePutResult  *AgentTemplatePinsResult
+	AgentTemplatePutErr     error
+	AgentTemplateListResult *AgentTemplateListResult
+
 	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
 	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.
 	SchedulePreview    *apitypes.ScheduleSettingsPreviewDTO

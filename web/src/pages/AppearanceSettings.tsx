@@ -202,6 +202,23 @@ export function AppearanceSettings() {
   // sitting beside the "follows you across browsers" control. Live via useDemoMode().
   const demoMode = useDemoMode();
 
+  // Optimistic local state for the sidebar-animations toggle: it flips at once and
+  // clears when the save settles (success re-reads the session, failure rolls back).
+  const [pendingMotion, setPendingMotion] = useState<boolean | null>(null);
+  // The server-resolved sidebar_motion a successful PUT confirmed. It covers the gap
+  // when the follow-up session re-read fails (refresh swallows that and leaves the
+  // context stale), so the toggle, the root stamp and later saves agree with the
+  // stored value. It is tied to the appearance it was confirmed against, so any new
+  // session appearance supersedes it.
+  const [confirmedMotion, setConfirmedMotion] = useState<{
+    value: boolean;
+    against: typeof appearance;
+  } | null>(null);
+  const confirmed = confirmedMotion?.against === appearance ? confirmedMotion.value : null;
+  // Strict: an absent field (older server) reads as off, never as a stored value.
+  const resolvedMotion = confirmed ?? appearance.sidebar_motion === true;
+  const motionChecked = pendingMotion ?? resolvedMotion;
+
   // The current resolved appearance as applyAppearance's argument shape; each
   // handler replaces exactly one field before stamping.
   const current = {
@@ -209,10 +226,17 @@ export function AppearanceSettings() {
     light: appearance.light_theme,
     dark: appearance.dark_theme,
     typeface: appearance.typeface,
+    sidebarMotion: resolvedMotion,
   };
 
   const saveAppearance = async (
-    optimistic: { mode: string; light: string; dark: string; typeface: string },
+    optimistic: {
+      mode: string;
+      light: string;
+      dark: string;
+      typeface: string;
+      sidebarMotion: boolean;
+    },
     patch: UserSettingsPatch,
   ) => {
     setAppearanceError("");
@@ -220,13 +244,24 @@ export function AppearanceSettings() {
     applyAppearance(optimistic);
     setAppearanceBusy(true);
     try {
-      await api.putMySettings(patch);
+      const res = await api.putMySettings(patch);
+      const saved = res?.settings?.effective_sidebar_motion;
+      if (typeof saved === "boolean") setConfirmedMotion({ value: saved, against: appearance });
       await refresh(); // sync overrides + re-apply the authoritative appearance
     } catch (err) {
       setAppearanceError(errorMessage(err, "Failed to save appearance"));
-      await refresh(); // revert the optimistic stamp to the server's truth
+      // Roll the optimistic stamp (and the pre-paint cache) back locally first, so an
+      // outage that also fails the session re-read cannot leave a failed choice applied
+      // and cached for the next load; then reconcile with the server if it answers.
+      applyAppearance(current);
+      try {
+        await refresh();
+      } catch {
+        // Session re-read failed too: the local rollback above stands.
+      }
     } finally {
       setAppearanceBusy(false);
+      setPendingMotion(null);
     }
   };
 
@@ -238,6 +273,10 @@ export function AppearanceSettings() {
     saveAppearance({ ...current, dark }, { dark_theme: dark });
   const pickTypeface = (typeface: string) =>
     saveAppearance({ ...current, typeface }, { typeface });
+  const pickMotion = (sidebarMotion: boolean) => {
+    setPendingMotion(sidebarMotion);
+    return saveAppearance({ ...current, sidebarMotion }, { sidebar_motion: sidebarMotion });
+  };
   const useInstanceDefaults = () =>
     saveAppearance(
       {
@@ -245,8 +284,16 @@ export function AppearanceSettings() {
         light: appearance.defaults.light_theme,
         dark: appearance.defaults.dark_theme,
         typeface: appearance.defaults.typeface,
+        // The server's compiled default, not a hardcoded off.
+        sidebarMotion: appearance.defaults.sidebar_motion === true,
       },
-      { appearance_mode: null, light_theme: null, dark_theme: null, typeface: null },
+      {
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        sidebar_motion: null,
+      },
     );
 
   // Which polarity currently paints (so the other picker is dimmed). An explicit
@@ -388,6 +435,25 @@ export function AppearanceSettings() {
               );
             })}
           </div>
+        </div>
+
+        {/* SIDEBAR ICON ANIMATIONS: opt-in, off by default; saved like the rest. */}
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-edge bg-raised/60 px-4 py-3">
+          <div>
+            <p className="text-sm font-medium text-fg">Sidebar icon animations</p>
+            <p id="sidebar-motion-desc" className="mt-1 text-xs text-faint">
+              Plays a small one-shot animation on sidebar icons on hover, focus and
+              click. Respects your system&apos;s reduced-motion setting.
+            </p>
+          </div>
+          <Toggle
+            checked={motionChecked}
+            onChange={pickMotion}
+            label="Sidebar icon animations"
+            disabled={appearanceBusy}
+            focusableWhenDisabled
+            aria-describedby="sidebar-motion-desc"
+          />
         </div>
 
         <div className="border-t border-edge pt-4">

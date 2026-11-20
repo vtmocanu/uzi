@@ -1206,6 +1206,36 @@ Recovery archives and [job files](./jobs.md#job-files) live in the same database
 
 The owner and instance recovery quotas in the table above still apply on top of the shared budget. If you raise the budget or either store's quota, size the database volume for the budget plus your ordinary data ([Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909)). The design is recorded in [ADR-1909](../adr/1909-stored-file-budget.md).
 
+## Codex runs held for their last worker
+
+A Codex run that has been claimed at least once is claimed again only by the
+worker recorded as having claimed it in its current generation (issue #4476,
+[ADR-4476](../adr/4476-codex-claim-provenance.md)). The stale-requeue grace,
+the affinity ceiling, a deleted owner row, immediate affinity escape on a
+complete guarded history and the cross-check exemption do not release it to
+another worker, including a new ephemeral one. Claude runs and Codex runs that
+were never claimed are unchanged. The run shows `waiting_worker` with a reason
+naming the worker, or saying the predecessor provenance is unavailable; see
+[Run health](./admin-health.md) and
+[Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker).
+Owner action: wait for the named worker, restart that worker if the health reason
+requests it (the previous process is still fenced), or `uzi run cancel <id>`.
+
+Upgrade and rollback:
+
+- **Upgrade.** There is no backfill. Every Codex run at generation 1 or later
+  when the change deploys has no recorded claimant, so it is held at its next
+  fresh claim, even on its own worker. A run that its worker is still running in
+  its current flight keeps going through readoption; otherwise cancel it.
+- **Rollback.** There is no in-database rollback fence. While an api from
+  before this change serves claims, nothing gates Codex claims, so any worker
+  can take such a run and that interval is unprotected. After you upgrade again,
+  a Codex run claimed by the older api has a stale record, is held, and cannot be
+  re-recorded; cancel it. Rolling the migration back drops the records.
+- **Not covered.** A held run does not prove that its previous flight has
+  ended; Claude runs and the forge token have the same gap, and a restarted
+  worker is admitted for its own earlier run ([ADR-4476](../adr/4476-codex-claim-provenance.md)).
+
 ## Custody: why a worker won't disappear
 
 While a run's committed work is unpublished and not yet durably captured
@@ -1593,6 +1623,9 @@ reachability. Immediate escape from ordinary worker affinity requires
 complete immutable guarded positive FINAL/source dispositions for
 generations 1..G and no open hold in any generation; missing, nonguarded,
 multiple/conflicting-source or local-only evidence remains protected.
+That escape does not apply to a Codex run that has been claimed at least once:
+it stays with the worker that last ran it (see
+[Codex runs held for their last worker](#codex-runs-held-for-their-last-worker)).
 An available archive alone does not establish that complete history.
 Resume preserves custody and cooldown and does not promise execution.
 Export an archive when one is available; a forge park does not promise one.
@@ -3598,6 +3631,46 @@ record:
 With no such record, completion behaves as before, and your own discard is
 never blocked. Since nothing creates a record yet, you should not see either
 reason today.
+
+### Retirement waits for run starts in the same repo
+
+Starting a run that could depend on a finished run's terminal ref (an issue,
+self-improve, continued task, review, fix, MR rework, CI fix or judge run) now
+coordinates with terminal-ref retirement in the same repo, so the two can never
+both act on stale facts. Retirement is still switched off, so in this release
+none of this is visible.
+
+Once retirement is on, you may see:
+
+- **A short 503.** If a retirement is deciding for the repo at that moment, a
+  start may wait up to about 6 seconds and, in the rare case it still cannot
+  proceed, answers `503` with `Retry-After: 1`. Nothing was created; retry. The
+  pollers and issue schedules treat it the same way: the trigger is not used up
+  and is tried again on the next pass. A sweep schedule that has started no run
+  in that fire is retried the same way; one that already started runs stops,
+  records the busy issue with the visible `consumer_gate_busy` reason
+  ("repository busy") and advances. A one-time sweep is then done; start the
+  skipped issue manually or explicitly re-fire the sweep as a new fire. A
+  recurring sweep considers it at its next fire. Later candidates were not
+  attempted. Resuming partial progress without replay or exceeding the original
+  cap needs the durable per-fire progress design deferred to
+  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
+  The final outcome gets a bounded write after a canceled wait, but advancement
+  is separate from run creation: a crash or failed advance can still leave the
+  schedule due and replay work.
+- **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
+  run start was in progress, so retirement kept the ref and tries again later.
+- **A potentially longer worker report.** Each shared-gate acquisition has a
+  six-second lock-wait timeout (at most two acquisitions per report). This does
+  not bound the report: after acquiring the gate, MR row-lock and follow-up
+  advisory-lock waits have no added deadline. They continue after the worker
+  disconnects so the reported MR and follow-ups are not dropped, but can retain
+  the handler and a database connection until the lock holder ends. A held
+  shared gate makes retirement keep the ref; other shared admissions remain
+  compatible with it.
+  If a step's gate wait ends busy, that step is skipped: MR metadata may remain
+  unwritten, or a follow-up hook may create no child. The run's status is already
+  committed and later steps can still run. Failed steps have no durable retry.
 
 ### The worker side is built but switched off
 

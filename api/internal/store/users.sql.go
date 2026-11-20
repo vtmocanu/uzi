@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type CreateUserParams struct {
@@ -116,6 +116,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -123,7 +124,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 const createUserOIDC = `-- name: CreateUserOIDC :one
 INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject)
 VALUES ($1, NULL, $2, $3, $4, $5)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type CreateUserOIDCParams struct {
@@ -206,6 +207,7 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -213,7 +215,7 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 const enrollUser = `-- name: EnrollUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin, vault_mode)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type EnrollUserParams struct {
@@ -295,6 +297,7 @@ func (q *Queries) EnrollUser(ctx context.Context, arg EnrollUserParams) (User, e
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -302,7 +305,7 @@ func (q *Queries) EnrollUser(ctx context.Context, arg EnrollUserParams) (User, e
 const enrollUserOIDC = `-- name: EnrollUserOIDC :one
 INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject, vault_mode)
 VALUES ($1, NULL, $2, $3, $4, $5, $6)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type EnrollUserOIDCParams struct {
@@ -385,6 +388,7 @@ func (q *Queries) EnrollUserOIDC(ctx context.Context, arg EnrollUserOIDCParams) 
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -404,7 +408,7 @@ func (q *Queries) GetUserAttributionEnabled(ctx context.Context, id uuid.UUID) (
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -470,12 +474,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -541,12 +546,13 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const getUserByOIDCSubject = `-- name: GetUserByOIDCSubject :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
 `
 
 type GetUserByOIDCSubjectParams struct {
@@ -618,6 +624,7 @@ func (q *Queries) GetUserByOIDCSubject(ctx context.Context, arg GetUserByOIDCSub
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -767,7 +774,7 @@ func (q *Queries) GetUserSchedulePause(ctx context.Context, id uuid.UUID) (GetUs
 }
 
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id FROM users WHERE id = $1
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
@@ -794,6 +801,7 @@ type GetUserSettingsRow struct {
 	WeeklyReservePauseRunning bool        `json:"weekly_reserve_pause_running"`
 	JudgeRunsOn               pgtype.Text `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID `json:"claude_provider_id"`
+	SidebarMotion             pgtype.Bool `json:"sidebar_motion"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
@@ -848,6 +856,7 @@ func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSet
 		&i.WeeklyReservePauseRunning,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -896,7 +905,7 @@ func (q *Queries) GetUserUsageReserve(ctx context.Context, id uuid.UUID) (GetUse
 const linkUserOIDC = `-- name: LinkUserOIDC :one
 UPDATE users SET oidc_issuer = $2, oidc_subject = $3
 WHERE id = $1 AND oidc_subject IS NULL
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type LinkUserOIDCParams struct {
@@ -973,12 +982,13 @@ func (q *Queries) LinkUserOIDC(ctx context.Context, arg LinkUserOIDCParams) (Use
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -1050,6 +1060,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.CredentialsResetAt,
 			&i.JudgeRunsOn,
 			&i.ClaudeProviderID,
+			&i.SidebarMotion,
 		); err != nil {
 			return nil, err
 		}
@@ -1059,6 +1070,22 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockUserSettingsRow = `-- name: LockUserSettingsRow :one
+SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE
+`
+
+// Takes the row lock a multi-column settings write holds for its whole transaction (PUT
+// /api/me/model-settings). FOR NO KEY UPDATE is the mode a plain UPDATE of a non-key column
+// takes itself, so concurrent settings writers to the same user serialize here instead of
+// interleaving, while foreign-key checks from other tables (FOR KEY SHARE) are not blocked.
+// Own-user only; the caller passes the session user's id.
+func (q *Queries) LockUserSettingsRow(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockUserSettingsRow, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const pruneUserSidebarCodexAccounts = `-- name: PruneUserSidebarCodexAccounts :one
@@ -1112,7 +1139,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserActiveParams struct {
@@ -1183,13 +1210,14 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserAdmin = `-- name: SetUserAdmin :one
 UPDATE users SET is_admin = $1 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserAdminParams struct {
@@ -1265,6 +1293,7 @@ func (q *Queries) SetUserAdmin(ctx context.Context, arg SetUserAdminParams) (Use
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -1274,21 +1303,24 @@ UPDATE users
 SET appearance_mode = CASE WHEN $1::bool THEN $2 ELSE appearance_mode END,
     light_theme = CASE WHEN $3::bool THEN $4 ELSE light_theme END,
     dark_theme = CASE WHEN $5::bool THEN $6 ELSE dark_theme END,
-    typeface = CASE WHEN $7::bool THEN $8 ELSE typeface END
-WHERE id = $9
-RETURNING appearance_mode, light_theme, dark_theme, typeface
+    typeface = CASE WHEN $7::bool THEN $8 ELSE typeface END,
+    sidebar_motion = CASE WHEN $9::bool THEN $10::boolean ELSE sidebar_motion END
+WHERE id = $11
+RETURNING appearance_mode, light_theme, dark_theme, typeface, sidebar_motion
 `
 
 type SetUserAppearanceParams struct {
-	SetMode        bool        `json:"set_mode"`
-	AppearanceMode pgtype.Text `json:"appearance_mode"`
-	SetLight       bool        `json:"set_light"`
-	LightTheme     pgtype.Text `json:"light_theme"`
-	SetDark        bool        `json:"set_dark"`
-	DarkTheme      pgtype.Text `json:"dark_theme"`
-	SetTypeface    bool        `json:"set_typeface"`
-	Typeface       pgtype.Text `json:"typeface"`
-	ID             uuid.UUID   `json:"id"`
+	SetMode          bool        `json:"set_mode"`
+	AppearanceMode   pgtype.Text `json:"appearance_mode"`
+	SetLight         bool        `json:"set_light"`
+	LightTheme       pgtype.Text `json:"light_theme"`
+	SetDark          bool        `json:"set_dark"`
+	DarkTheme        pgtype.Text `json:"dark_theme"`
+	SetTypeface      bool        `json:"set_typeface"`
+	Typeface         pgtype.Text `json:"typeface"`
+	SetSidebarMotion bool        `json:"set_sidebar_motion"`
+	SidebarMotion    pgtype.Bool `json:"sidebar_motion"`
+	ID               uuid.UUID   `json:"id"`
 }
 
 type SetUserAppearanceRow struct {
@@ -1296,10 +1328,11 @@ type SetUserAppearanceRow struct {
 	LightTheme     pgtype.Text `json:"light_theme"`
 	DarkTheme      pgtype.Text `json:"dark_theme"`
 	Typeface       pgtype.Text `json:"typeface"`
+	SidebarMotion  pgtype.Bool `json:"sidebar_motion"`
 }
 
 // PATCHes the current user's appearance (PRD #1167 M1) in ONE atomic statement:
-// each of the four fields is written only when its @set_* flag is true, otherwise
+// each of the five fields is written only when its @set_* flag is true, otherwise
 // the current column value is kept (the CASE keeps the row's own value). A true
 // flag with a NULL value CLEARS that field back to the instance default (the
 // resolver treats a NULL column as inherit). Because every unset field re-writes
@@ -1317,6 +1350,8 @@ func (q *Queries) SetUserAppearance(ctx context.Context, arg SetUserAppearancePa
 		arg.DarkTheme,
 		arg.SetTypeface,
 		arg.Typeface,
+		arg.SetSidebarMotion,
+		arg.SidebarMotion,
 		arg.ID,
 	)
 	var i SetUserAppearanceRow
@@ -1325,13 +1360,14 @@ func (q *Queries) SetUserAppearance(ctx context.Context, arg SetUserAppearancePa
 		&i.LightTheme,
 		&i.DarkTheme,
 		&i.Typeface,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserAttributionEnabled = `-- name: SetUserAttributionEnabled :one
 UPDATE users SET attribution_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserAttributionEnabledParams struct {
@@ -1405,13 +1441,14 @@ func (q *Queries) SetUserAttributionEnabled(ctx context.Context, arg SetUserAttr
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserAutopilotEnabledParams struct {
@@ -1484,13 +1521,14 @@ func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopi
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserCIAutofixEnabled = `-- name: SetUserCIAutofixEnabled :one
 UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserCIAutofixEnabledParams struct {
@@ -1565,6 +1603,7 @@ func (q *Queries) SetUserCIAutofixEnabled(ctx context.Context, arg SetUserCIAuto
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -1651,7 +1690,7 @@ const setUserEphemeralWorkerPreferences = `-- name: SetUserEphemeralWorkerPrefer
 UPDATE users SET ephemeral_workers_enabled = COALESCE($1::boolean, ephemeral_workers_enabled),
     ephemeral_docker_enabled = COALESCE($2::boolean, ephemeral_docker_enabled)
 WHERE id = $3
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserEphemeralWorkerPreferencesParams struct {
@@ -1724,13 +1763,14 @@ func (q *Queries) SetUserEphemeralWorkerPreferences(ctx context.Context, arg Set
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserEphemeralWorkersEnabled = `-- name: SetUserEphemeralWorkersEnabled :one
 UPDATE users SET ephemeral_workers_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserEphemeralWorkersEnabledParams struct {
@@ -1807,6 +1847,7 @@ func (q *Queries) SetUserEphemeralWorkersEnabled(ctx context.Context, arg SetUse
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -1877,7 +1918,7 @@ UPDATE users
 SET judge_anthropic_bind_mode = $1,
     judge_anthropic_secret_id = $2
 WHERE id = $3
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserJudgeAnthropicBindingParams struct {
@@ -1961,13 +2002,14 @@ func (q *Queries) SetUserJudgeAnthropicBinding(ctx context.Context, arg SetUserJ
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserJudgeEnabled = `-- name: SetUserJudgeEnabled :one
 UPDATE users SET judge_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserJudgeEnabledParams struct {
@@ -2042,6 +2084,7 @@ func (q *Queries) SetUserJudgeEnabled(ctx context.Context, arg SetUserJudgeEnabl
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -2110,7 +2153,7 @@ func (q *Queries) SetUserMrReworkEnabled(ctx context.Context, arg SetUserMrRewor
 
 const setUserNotifyEarlyReset = `-- name: SetUserNotifyEarlyReset :one
 UPDATE users SET notify_early_limit_reset = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserNotifyEarlyResetParams struct {
@@ -2185,6 +2228,7 @@ func (q *Queries) SetUserNotifyEarlyReset(ctx context.Context, arg SetUserNotify
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
@@ -2320,7 +2364,7 @@ func (q *Queries) SetUserTheme(ctx context.Context, arg SetUserThemeParams) (pgt
 
 const setUserUsageReserve = `-- name: SetUserUsageReserve :one
 UPDATE users SET weekly_reserve_pct = $2, weekly_reserve_pause_running = $3 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserUsageReserveParams struct {
@@ -2395,13 +2439,14 @@ func (q *Queries) SetUserUsageReserve(ctx context.Context, arg SetUserUsageReser
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }
 
 const setUserWaitOnLimit = `-- name: SetUserWaitOnLimit :one
 UPDATE users SET wait_on_limit = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode, harness_overflow_enabled, codex_summary_model, credentials_reset_at, judge_runs_on, claude_provider_id, sidebar_motion
 `
 
 type SetUserWaitOnLimitParams struct {
@@ -2481,6 +2526,7 @@ func (q *Queries) SetUserWaitOnLimit(ctx context.Context, arg SetUserWaitOnLimit
 		&i.CredentialsResetAt,
 		&i.JudgeRunsOn,
 		&i.ClaudeProviderID,
+		&i.SidebarMotion,
 	)
 	return i, err
 }

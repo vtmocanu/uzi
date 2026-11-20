@@ -1410,6 +1410,9 @@ type Run struct {
 	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
 	FollowupParkSeq                   int64              `json:"followup_park_seq"`
 	FollowupFinalizeGeneration        pgtype.Int8        `json:"followup_finalize_generation"`
+	ClaimProvenanceWorkerID           pgtype.UUID        `json:"claim_provenance_worker_id"`
+	ClaimProvenanceGeneration         pgtype.Int8        `json:"claim_provenance_generation"`
+	HealthOwnerHoldSince              pgtype.Timestamptz `json:"health_owner_hold_since"`
 }
 
 type RunCompletionAttempt struct {
@@ -2011,6 +2014,7 @@ type User struct {
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
+	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
 }
 
 type UserCrossCheckPin struct {

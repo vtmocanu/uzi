@@ -7,7 +7,8 @@ audience: user
 # Appearance
 
 **Settings → Appearance** controls how uzi looks for you: a light/dark
-mode, a theme for each polarity, and a typeface. Every choice is
+mode, a theme for each polarity, a typeface, and optional sidebar icon
+animations. Every choice is
 server-side: it persists to your account and follows you across browsers
 and devices, the same as your Anthropic tokens. A pick applies immediately;
 if the save fails, it reverts and shows why.
@@ -46,10 +47,18 @@ palette and differing only in where the dark "factory" still shows through:
 **IBM Plex** is bundled with uzi, so switching to it fetches no external
 font either; the files ship with the app.
 
+## Sidebar icon animations
+
+**Sidebar icon animations** is off by default. Turn it on and each sidebar
+icon plays a small one-shot animation when you hover it, focus it with the
+keyboard, or click it. Nothing moves on its own, and the animation never
+plays when your OS asks for reduced motion. Like theme and typeface, the
+choice follows you across browsers and devices.
+
 ## Use instance defaults
 
 **Use instance defaults** clears every personal choice above, so you go
 back to tracking whatever your admin has set instance-wide for mode, both
-theme slots, and typeface. See
+theme slots, and typeface. Sidebar icon animations go back to off. See
 [Admin settings](./admin-settings.md#default-appearance) for what an admin
 controls there.

@@ -25,6 +25,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipAlreadyRunning:          true,
 		SkipDescriptionTooLarge:     true,
 		SkipFetchFailed:             true,
+		SkipConsumerGateBusy:        true,
 		SkipVaultLocked:             true,
 		SkipSelfImproveMRCapReached: true,
 		SkipOpenMRExists:            true,

@@ -202,7 +202,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 			// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
 			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 		})
-	})
+	}, taskConsumerGateOrigin(continued.Valid, repoID))
 	if err != nil {
 		return store.Run{}, taskCreateError(err)
 	}
@@ -290,7 +290,12 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 	if err != nil {
 		return store.Run{}, err
 	}
+	origin.ConsumerGateRepo = gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &targetHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// After the gate: the target must still exist in the gate's repository.
+		if err := requireGateTargetRepo(ctx, q, targetRunID, origin.ConsumerGateRepo); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
 			RunID:       id,
 			UserID:      userID,
@@ -367,7 +372,12 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 	if err != nil {
 		return store.Run{}, err
 	}
+	origin.ConsumerGateRepo = gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &originalHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// After the gate: the original must still exist in the gate's repository.
+		if err := requireGateTargetRepo(ctx, q, originalRunID, origin.ConsumerGateRepo); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
 			RunID:            id,
 			UserID:           userID,
@@ -471,4 +481,14 @@ func taskCreateError(err error) error {
 		}
 	}
 	return err
+}
+
+// taskConsumerGateOrigin gates a task create only when it continues an issue: that run matches a
+// terminal source's same-issue check (continued_issue_iid), so it is a consumer (issue #4488,
+// ADR-4007 T3). A plain task matches no blocker predicate and takes no gate.
+func taskConsumerGateOrigin(continuesIssue bool, repoID uuid.UUID) harnessCreationOrigin {
+	if !continuesIssue {
+		return harnessCreationOrigin{}
+	}
+	return harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)}
 }

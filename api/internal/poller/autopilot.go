@@ -260,6 +260,12 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// through the Error default, so the retry is not an error-log storm. Each deferred tick
 		// repeats this issue's forge reads, as an active ci_fix already did before #1626.
 		slog.Debug("poller: autopilot deferred, branch busy", "repo", r.PathWithNamespace, "issue", iid)
+	case errors.Is(err, workersvc.ErrTerminalConsumerGateBusy):
+		// Issue #4488: a terminal-ref retirement briefly holds the repo's consumer gate and
+		// nothing was created. Contention is retryable and must never consume the label event:
+		// leave it UNRECORDED so the next tick retries (Debug, not the Error default, so a
+		// brief hold is not an error-log storm).
+		slog.Debug("poller: autopilot deferred, terminal consumer gate busy", "repo", r.PathWithNamespace, "issue", iid)
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
 		// The run gate says this issue is not uzi's: it carries neither the uzi_label
 		// nor a uzi-bot assignment (PRD #102 Decision 14; the gate is widened by PRD

@@ -37,6 +37,10 @@ type harnessCreationOrigin struct {
 	// RefuseProviderOwner refuses the creation (ErrProviderLaneUnsupported) when the owner selected
 	// a Claude provider source: judge, job and cross-check lanes (PRD #4322 enables them later).
 	RefuseProviderOwner bool
+	// ConsumerGateRepo, when valid, makes createRunAtomic take that repository's shared terminal
+	// consumer gate as the first lock of the create transaction (issue #4488, ADR-4007 T3). The zero
+	// value gates nothing.
+	ConsumerGateRepo pgtype.UUID
 }
 
 func (o harnessCreationOrigin) eligible(p store.GetHarnessCreationPolicyRow) bool {

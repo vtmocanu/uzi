@@ -233,6 +233,25 @@ type Client interface {
 	// caller (PRD #3254): GET /api/me/effective-settings. RequireUser, read-only, owner-scoped;
 	// no credential id, label or value is in the body. An older server answers 404.
 	GetEffectiveSettings(ctx context.Context) (apitypes.EffectiveSettingsDTO, error)
+	// PutModelSettings writes model and effort defaults (PRD #3264): PUT /api/me/model-settings
+	// with a patch object whose key is the API field and whose value is the string to set or nil
+	// to clear (JSON null). Absent keys are left alone. The result carries the decoded settings
+	// and the server's envelope bytes so --json can print them unchanged. A server without the
+	// route answers an error-less 404 or 405, mapped to an "upgrade the server" error.
+	PutModelSettings(ctx context.Context, patch map[string]*string) (ModelSettingsResult, error)
+	// PutCrossCheckPins writes checker pins through the same route (PRD #3264 M2): the body is
+	// {"cross_check_pins": cells}. A cell names its stage and harness and carries only the members
+	// being changed; a nil member value is JSON null (a clear). The reply and the older-server
+	// mapping are PutModelSettings'.
+	PutCrossCheckPins(ctx context.Context, cells []CrossCheckPinWire) (ModelSettingsResult, error)
+	// ListMyAgentTemplates lists the builtin, global and caller-owned agent templates in the
+	// restricted pin view (PRD #3264 M3): GET /api/me/agent-templates. The result carries the
+	// server envelope for --json. An error-less 404 or 405 is an older server.
+	ListMyAgentTemplates(ctx context.Context) (AgentTemplateListResult, error)
+	// PutAgentTemplateModelPins sets or clears (nil value, JSON null) the model and codex_model
+	// pins of one of the caller's own templates: PUT /api/me/agent-templates/{id}/model-pins.
+	// Absent keys are left alone. Builtin and global templates answer 403 template_not_editable.
+	PutAgentTemplateModelPins(ctx context.Context, id string, patch map[string]*string) (AgentTemplatePinsResult, error)
 	// PreviewScheduleSettings returns what firing a saved schedule now, and claiming the run,
 	// would use (PRD #3254): POST /api/me/effective-settings/schedule-preview with the schedule
 	// id. RequireUser, read-only, owner-scoped; the server loads the stored override, so a stored
@@ -1197,6 +1216,21 @@ const ReasonGateRevisionMismatch = "gate_revision_mismatch"
 // message so the cause is visible without --json.
 const ReasonCodexPoolUnavailable = "codex_pool_unavailable"
 
+// Reasons of the two 500s PUT /api/me/model-settings answers beyond a plain internal error
+// (PRD #3264): the write's outcome is unknown, or it is durable but could not be read back.
+const (
+	ReasonSettingsCommitUnknown       = "settings_commit_unknown"
+	ReasonSettingsSavedReadbackFailed = "settings_saved_readback_failed"
+)
+
+// Reasons of PUT /api/me/agent-templates/{id}/model-pins beyond a plain error (PRD #3264 M3): a
+// builtin or global template, and the same two post-write 500s as the model-settings write.
+const (
+	ReasonTemplateNotEditable         = "template_not_editable"
+	ReasonTemplateCommitUnknown       = "template_commit_unknown"
+	ReasonTemplateSavedReadbackFailed = "template_saved_readback_failed"
+)
+
 // Typed owner-reset refusals never authorize rebinding or retrying consent.
 const (
 	ReasonMilestoneReconciliationRequired = "milestone_reconciliation_required"
@@ -1221,6 +1255,23 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 		e = Exitf(ExitConflict, "reset consent is stale or conflicts with the current gate; review uzi run get again and make a new explicit decision with its bindings; consent was not retried")
 	case ReasonMilestoneReconciliationNotReady:
 		e = Exitf(ExitConflict, "milestone reset is not ready; request a plan revision to attempt a fresh published checkpoint; if revisions are exhausted, cancel and start a new run")
+	}
+	// The model-settings write's two 500s are worded here, not from the server text, so the
+	// message never implies a rollback the client cannot prove.
+	switch reason {
+	case ReasonSettingsCommitUnknown:
+		e = Exitf(ExitUnreachable, "the save may or may not have been applied; check with `uzi settings get`")
+	case ReasonSettingsSavedReadbackFailed:
+		e = Exitf(ExitUnreachable, "settings saved; reading them back failed")
+	case ReasonTemplateCommitUnknown:
+		e = Exitf(ExitUnreachable, "the save may or may not have been applied; check with `uzi agent-template show`")
+	case ReasonTemplateSavedReadbackFailed:
+		e = Exitf(ExitUnreachable, "template pins saved; reading them back failed")
+	}
+	// A builtin or global template is not an auth-scope problem, so the generic admin-scope hint
+	// of a 403 is replaced by the web-UI pointer.
+	if status == http.StatusForbidden && reason == ReasonTemplateNotEditable {
+		e = Exitf(ExitAuth, "builtin and global templates are edited in the web UI by an admin")
 	}
 	e.Reason = reason
 	if reason == ReasonGateRevisionMismatch {

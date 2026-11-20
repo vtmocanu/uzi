@@ -28,8 +28,9 @@ Your admin enables the feature globally under **Admin → Instance →
 Run judge**. Once that's on, open **Settings → Run defaults → Run judge** and check
 **Judge my finished runs**. Admins can also force-enable or force-disable the
 judge for any individual user from **Admin → Users**. See
-[Admin settings](./admin-settings.md#run-judge) for the full set of
-instance-wide judge controls.
+[Admin settings](./admin-settings.md#run-judge) for the instance-wide judge
+controls, and [Instance model defaults](./admin-settings.md#instance-model-defaults)
+for the instance judge models.
 
 Opting in also means your instance admin can see your recommendations: they
 get an attribution-hidden aggregate across every user's — your name, your
@@ -96,6 +97,12 @@ judge runs on. The card dims the other harness's model field with a "Not used:
 the judge runs on X" note, and the token picker is dimmed when the judge runs
 on Codex. The [effective settings](./configuration.md#effective-settings)
 view reports the choice as `judge_harness`.
+
+From the CLI, `uzi settings set judge-runs-on same-as-run|claude|codex` writes
+this choice and `uzi settings reset judge-runs-on` returns it to **Same as the
+run**. It only redirects where an already enabled judge runs; turning the judge
+on stays a web action. See [Changing model and effort
+settings](./cli.md#changing-model-and-effort-settings).
 
 ## Which token the judge spends
 
@@ -174,7 +181,7 @@ The Claude built-in is **opus** — the strongest model, since the judge's
 recommendations feed the [self-improvement job](./scheduling.md#default-jobs)
 and a shallow retrospective produces shallow self-improvement work. Your
 admin can pin a cheaper instance-wide Claude default (`haiku` or `sonnet`)
-from **Admin → Instance → Run judge**; your own value only changes your runs,
+from **Admin → Instance → Instance model defaults**; your own value only changes your runs,
 while the admin's is the fallback for everyone who hasn't set one.
 
 Where to set each lane:
@@ -186,14 +193,18 @@ Where to set each lane:
   judge model**, shown only if you can run Codex. **Save judge models** saves
   the lanes you changed. Under each field, **In effect: <model> · <source>** names what a
   judge run would resolve to and where that came from.
-- **Instance Claude and Codex judge models:** **Admin → Instance → Run judge**
-  (the same two fields; their Default option reads **Default · <model>
+- **Instance Claude and Codex judge models:** **Admin → Instance → Instance
+  model defaults** (the Judge model row, with the same two fields; their Default option reads **Default · <model>
   (built-in)**). The Claude field shows a **Not a Claude model** warning when
   its stored value is a Codex id.
 
 `uzi settings get` prints a **Model settings** table showing, per lane, what
 is stored, the default, what a judge run would resolve to, and where that came
-from; see [CLI](./cli.md#plan-cross-check-settings).
+from; see [CLI](./cli.md#plan-cross-check-settings). To change a lane from the
+CLI, use `uzi settings set judge-model --harness claude|codex <model-id>` and
+`uzi settings reset judge-model --harness claude|codex` (the value goes to the
+server's validation; a reset inherits the instance value again). See [Changing
+model and effort settings](./cli.md#changing-model-and-effort-settings).
 
 **Migration.** A curated Codex id previously stored in `judge_model` (yours or
 the instance's) is copied into the Codex lane; the Claude key is left unchanged

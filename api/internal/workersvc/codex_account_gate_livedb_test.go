@@ -267,7 +267,7 @@ func TestClaimQuarantinedAccountNeverClaimedLiveDB(t *testing.T) {
 	fx.setAccount(t, "coord_state = 'quarantined'")
 	before := mustRun(t, env, fx.runID)
 	holds := countRunHolds(t, env, fx.runID)
-	for _, snap := range []*ActiveSnapshot{nil, {SnapshotEpoch: 1, RegisterNonce: "nonce-B", Active: []ActiveRunEntry{}}} {
+	for _, snap := range []*ActiveSnapshot{nil, {SnapshotEpoch: 1, RegisterNonce: "nonce-A", Active: []ActiveRunEntry{}}} {
 		payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), snap)
 		if err != nil || payload != nil {
 			t.Fatalf("Claim = (%v, %v), want idle", payload != nil, err)

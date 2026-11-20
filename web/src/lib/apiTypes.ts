@@ -561,6 +561,13 @@ export interface UserSettings {
   light_theme: string | null;
   dark_theme: string | null;
   typeface: string | null;
+  /** Raw per-user opt-in for animated sidebar icons; null = inherit the instance
+   *  default (off). Optional for older servers: absent reads as off, never as a
+   *  stored false. */
+  sidebar_motion?: boolean | null;
+  /** Resolved sidebar-icon animation flag (override else the server default).
+   *  Read-only; never sent on a PUT. Optional for older servers. */
+  effective_sidebar_motion?: boolean;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
@@ -638,6 +645,9 @@ export interface UserSettingsPatch {
   light_theme?: string | null;
   dark_theme?: string | null;
   typeface?: string | null;
+  /** Sidebar icon animations: absent keeps, true/false sets, null clears back to
+   *  inherit. */
+  sidebar_motion?: boolean | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
   /** Replaces the whole sidebar Codex-account set (null clears it); absent leaves it.
@@ -1855,17 +1865,22 @@ export interface AppearanceState {
   light_theme: string;
   dark_theme: string;
   typeface: string;
+  /** Resolved sidebar-icon animation flag. Optional for older servers: only a
+   *  strict `true` reads as on. */
+  sidebar_motion?: boolean;
   overrides: {
     mode: string | null;
     light_theme: string | null;
     dark_theme: string | null;
     typeface: string | null;
+    sidebar_motion?: boolean | null;
   };
   defaults: {
     mode: string;
     light_theme: string;
     dark_theme: string;
     typeface: string;
+    sidebar_motion?: boolean;
   };
 }
 
@@ -2591,6 +2606,7 @@ export type ScheduleSkipReason =
   | "already_running"
   | "description_too_large"
   | "fetch_failed"
+  | "consumer_gate_busy"
   | "vault_locked"
   | "self_improve_mr_cap_reached"
   | "open_mr_exists"

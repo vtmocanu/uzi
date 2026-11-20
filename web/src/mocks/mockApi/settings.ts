@@ -104,6 +104,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   light_theme: null,
   dark_theme: null,
   typeface: null,
+  // Opt-in animated sidebar icons; null = inherit the (off) instance default.
+  sidebar_motion: null,
   sidebar_token_ids: [],
   // PRD #1209 M3: LINKED Codex subscription accounts surfaced on the sidebar rail — the
   // Codex sibling of sidebar_token_ids. Default-only (empty).
@@ -313,6 +315,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.light_theme === null || typeof u.light_theme === "string") &&
     (u.dark_theme === null || typeof u.dark_theme === "string") &&
     (u.typeface === null || typeof u.typeface === "string") &&
+    // Optional so a pre-feature blob stays valid; absent reads as inherit (off).
+    (u.sidebar_motion === undefined || u.sidebar_motion === null || typeof u.sidebar_motion === "boolean") &&
     // Optional so a pre-#700 blob stays valid; absent/null reads as the default-ON state.
     (u.mr_rework_enabled === undefined ||
       u.mr_rework_enabled === null ||
@@ -601,6 +605,10 @@ export function setMockCodexCatalogSample(sample: MockCodexCatalogSample): void 
   mockCodexCatalogSample = sample;
 }
 
+// The mock's compiled default for animated sidebar icons (off), the value a null
+// override resolves against; mirrors the server's compiled default.
+const MOCK_SIDEBAR_MOTION_DEFAULT = false;
+
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -644,7 +652,8 @@ function mySettingsResponse(): { settings: UserSettings } {
   // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -788,17 +797,20 @@ export function sessionBody() {
       light_theme: resolved.light,
       dark_theme: resolved.dark,
       typeface: resolved.typeface,
+      sidebar_motion: userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT,
       overrides: {
         mode: userSettings.appearance_mode,
         light_theme: userSettings.light_theme,
         dark_theme: userSettings.dark_theme,
         typeface: userSettings.typeface,
+        sidebar_motion: userSettings.sidebar_motion ?? null,
       },
       defaults: {
         mode: appSettings.default_appearance_mode,
         light_theme: appSettings.default_light_theme,
         dark_theme: appSettings.default_dark_theme,
         typeface: appSettings.default_typeface,
+        sidebar_motion: MOCK_SIDEBAR_MOTION_DEFAULT,
       },
     },
     // Deprecated single-theme trio (PRD #21), derived from the resolved appearance so
@@ -1793,6 +1805,13 @@ export const settingsApi = {
         throw new ApiError(400, "typeface: must be one of system, plex");
       }
       next = { ...next, typeface: patch.typeface };
+    }
+    if (patch.sidebar_motion !== undefined) {
+      // Tri-state: true/false sets, null clears back to inherit; anything else is a 400.
+      if (patch.sidebar_motion !== null && typeof patch.sidebar_motion !== "boolean") {
+        throw new ApiError(400, "sidebar_motion: must be a boolean or null");
+      }
+      next = { ...next, sidebar_motion: patch.sidebar_motion };
     }
     if (patch.sidebar_token_ids !== undefined) {
       // Whole-set replace, mirroring how the real handler would treat a list

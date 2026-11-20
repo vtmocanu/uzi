@@ -219,4 +219,60 @@ func TestSetUserAppearanceLiveDB(t *testing.T) {
 	if afterClear.AppearanceMode.Valid || afterClear.LightTheme.Valid || afterClear.DarkTheme.Valid || afterClear.Typeface.Valid {
 		t.Errorf("GetUserSettings(after clear-all) = %+v, want all NULL", afterClear)
 	}
+
+	// --- sidebar_motion (issue #4510): the fifth conditional field. Baseline is NULL.
+	if afterClear.SidebarMotion.Valid {
+		t.Fatalf("baseline sidebar_motion must be NULL, got %+v", afterClear.SidebarMotion)
+	}
+	yes := pgtype.Bool{Bool: true, Valid: true}
+	no := pgtype.Bool{Bool: false, Valid: true}
+
+	// (e) set true.
+	m, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{SetSidebarMotion: true, SidebarMotion: yes, ID: user.ID})
+	if err != nil {
+		t.Fatalf("SetUserAppearance(motion true): %v", err)
+	}
+	if m.SidebarMotion != yes {
+		t.Errorf("motion true RETURNING = %+v, want true", m.SidebarMotion)
+	}
+
+	// (f) an appearance-only save (motion flag unset) keeps true.
+	a, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{
+		SetMode: true, AppearanceMode: pgtype.Text{String: "light", Valid: true},
+		SetTypeface: true, Typeface: pgtype.Text{String: "plex", Valid: true}, ID: user.ID,
+	})
+	if err != nil {
+		t.Fatalf("SetUserAppearance(appearance only): %v", err)
+	}
+	if a.SidebarMotion != yes {
+		t.Errorf("appearance-only save clobbered sidebar_motion: %+v, want true", a.SidebarMotion)
+	}
+
+	// (g) a motion-only save keeps the appearance fields; set false.
+	f, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{SetSidebarMotion: true, SidebarMotion: no, ID: user.ID})
+	if err != nil {
+		t.Fatalf("SetUserAppearance(motion false): %v", err)
+	}
+	if f.SidebarMotion != no {
+		t.Errorf("motion false RETURNING = %+v, want explicit false", f.SidebarMotion)
+	}
+	if f.AppearanceMode.String != "light" || f.Typeface.String != "plex" {
+		t.Errorf("motion-only save clobbered appearance fields: %+v", f)
+	}
+	got, err := q.GetUserSettings(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSettings(after motion false): %v", err)
+	}
+	if got.SidebarMotion != no {
+		t.Errorf("GetUserSettings sidebar_motion = %+v, want explicit false", got.SidebarMotion)
+	}
+
+	// (h) clear back to NULL, appearance untouched.
+	c, err := q.SetUserAppearance(ctx, store.SetUserAppearanceParams{SetSidebarMotion: true, ID: user.ID})
+	if err != nil {
+		t.Fatalf("SetUserAppearance(motion clear): %v", err)
+	}
+	if c.SidebarMotion.Valid || c.AppearanceMode.String != "light" {
+		t.Errorf("motion clear RETURNING = %+v, want NULL motion and mode=light kept", c)
+	}
 }

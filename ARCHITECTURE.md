@@ -1298,7 +1298,9 @@ chain in the diagram above, with no intervening `running`.
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
   carries off the worker and adoption peels back to uncommitted (exact recovery
-  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`;
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`,
+  except that a claimed Codex run is never given to another worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md);
   the marker never commits core dumps or files over 8 MiB, and one under a
   verified coverage wrapper is peeled at successor adopt). A
   resumed run whose plan is provably reviewed and whose work recovered continues
@@ -1379,7 +1381,8 @@ chain in the diagram above, with no intervening `running`.
   rather than failing. An owner/worker/actual-Git-origin cooldown filters new
   claims until due, then serializes one ordinary recovery trial. Expiry is
   unverified; safe early affinity escape requires complete guarded source
-  disposition evidence. These placement hints grant no execution or custody
+  disposition evidence (never for a claimed Codex run, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)). These placement hints grant no execution or custody
   authority. A forge outage met later, while publishing finished work (#1324),
   parks the run in the same status with `recovery_wait_phase=publication`
   instead: the agent saves an HMAC-sealed write-ahead intent and enrolls it
@@ -1557,8 +1560,24 @@ chain in the diagram above, with no intervening `running`.
   `refs/uzi-recovery/<run-id>` ref rather than deleting or overwriting it. See
   [ADR-1810](adr/1810-checkpoint-retention-follows-custody.md).
   This same affinity leg is what lets a **paused** run's `resume` fall open
-  to a different worker once the pinned one is stale or gone; see
+  to a different worker once the pinned one is stale or gone (not for a Codex run at
+  generation >= 1, which stays held for its recorded worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)); see
   [ADR-1190](adr/1190-run-pause-invariants.md).
+
+- **Codex claim provenance** ([ADR-4476](adr/4476-codex-claim-provenance.md), issue #4476).
+  `runs` records the worker and generation of the last admitted Codex claim
+  (`claim_provenance_worker_id`, `claim_provenance_generation`). `ClaimRun` and its
+  provisioning/wake mirrors admit a Codex-indicating run at `claim_generation >= 1`
+  only for that worker at the current generation, through
+  `fn_codex_claim_provenance_admits`; a trigger (`trg_runs_claim_provenance_guard`)
+  lets the pair change only in an admitted `+1` claim. The affinity ceiling, the
+  stale-requeue grace, a deleted owner row, forge-origin owner pins and the
+  cross-check exemption do not override it, so the run waits for its worker
+  or is cancelled by the owner. Run health reports `waiting_worker` with "held for
+  worker NAME" or "predecessor provenance unavailable" (`workersvc/health.go`).
+  Claude runs are unchanged. There is no backfill and no rollback fence, and
+  predecessor quiescence is not proven (see the ADR's residuals).
 
 - **The checkpoint net survives a branch behind `main` on `.github/workflows`**
   ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing
@@ -1576,7 +1595,7 @@ chain in the diagram above, with no intervening `running`.
   run stays pinned to its prior worker while that worker's row exists and it is
   either draining or heartbeating, bounded by `WORKER_AFFINITY_CEILING` (default
   2h of queue dwell after promotion). A deleted worker, a stale non-draining
-  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it.
+  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it, except a Codex run already claimed once, which only the worker recorded for its current generation may claim ([ADR-4476](adr/4476-codex-claim-provenance.md)).
   `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
   A run the stale-worker sweeper requeued is additionally held for its previous
   worker, while that worker's row exists, for `WORKER_STALE_REQUEUE_GRACE` (default

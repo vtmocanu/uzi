@@ -111,7 +111,20 @@ const (
 	FallbackLight    = "hall"         // a valid light theme
 	FallbackDark     = Default        // "ember", a valid dark theme
 	FallbackTypeface = TypefaceSystem // "system"
+
+	// FallbackSidebarMotion is the animated-sidebar-icons default for a user
+	// who has not chosen (users.sidebar_motion NULL): off.
+	FallbackSidebarMotion = false
 )
+
+// ResolveSidebarMotion returns the user's explicit choice when set, else the
+// fallback. An explicit false stays false even when the fallback is true.
+func ResolveSidebarMotion(override *bool, fallback bool) bool {
+	if override != nil {
+		return *override
+	}
+	return fallback
+}
 
 // modes and typefaces are the closed sets the mode/typeface fields accept.
 var (

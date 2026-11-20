@@ -148,6 +148,7 @@ and [the authenticated observation/success queries](../api/internal/store/querie
 The ordinary affinity pin can be bypassed immediately for an unverified
 worker/origin only when generations 1..G have complete immutable guarded
 positive FINAL/source dispositions and no open hold in any generation.
+
 The accepted dispositions and exact identity/source/coverage checks live in
 `fn_forge_source_history_safe` in
 [the placement migration](../api/internal/store/migrations/00382_forge_origin_placement.sql).
@@ -156,6 +157,12 @@ prerequisite-dependent captures or local-only work do not qualify.
 A bare available capture is not a FINAL disposition. Custody admission and
 source/deletion guards remain independent; safe placement does not settle a
 hold or prove a sibling is warm.
+
+*Amendment (2026-11-19, issue #4476):* this escape does not apply to a Codex-indicating run at
+generation >= 1. `ClaimRun` admits such a run only for the worker recorded as the claimant of
+its current generation (claim provenance), and `fn_forge_origin_owner_pins` does not override
+that gate, so a complete guarded history no longer offers the run to another worker. See
+[ADR-4476](4476-codex-claim-provenance.md).
 
 ### Finite automatic allowance, explicit owner retry
 

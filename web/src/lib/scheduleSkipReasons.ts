@@ -14,6 +14,7 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   already_running: "already running",
   description_too_large: "description too large",
   fetch_failed: "fetch failed",
+  consumer_gate_busy: "repository busy",
   vault_locked: "vault locked",
   self_improve_mr_cap_reached: "self-improve MR cap reached",
   open_mr_exists: "issue already has an open MR",

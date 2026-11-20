@@ -2061,10 +2061,12 @@ describe("vault lifecycle contract fixtures", () => {
     ].sort());
     expect(Object.keys(authSessionFull.user).sort()).toEqual(Object.keys(userFull).sort());
     expect(Object.keys(authSessionFull.appearance).sort()).toEqual([
-      "mode", "light_theme", "dark_theme", "typeface", "overrides", "defaults",
+      "mode", "light_theme", "dark_theme", "typeface", "sidebar_motion", "overrides", "defaults",
     ].sort());
     for (const values of [authSessionFull.appearance.overrides, authSessionFull.appearance.defaults]) {
-      expect(Object.keys(values).sort()).toEqual(["mode", "light_theme", "dark_theme", "typeface"].sort());
+      expect(Object.keys(values).sort()).toEqual(
+        ["mode", "light_theme", "dark_theme", "typeface", "sidebar_motion"].sort(),
+      );
     }
     expect(authSessionFull.vault).toEqual(vaultStatusFull);
     expect(authSessionZero.vault).toEqual(vaultStatusZero);
@@ -2076,8 +2078,10 @@ describe("vault lifecycle contract fixtures", () => {
     expect(authSessionZero.user).toEqual(userZero);
     expect(authSessionZero.theme_override).toBeNull();
     expect(authSessionZero.appearance.overrides).toEqual({
-      mode: null, light_theme: null, dark_theme: null, typeface: null,
+      mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: null,
     });
+    expect(authSessionZero.appearance.sidebar_motion).toBe(false);
+    expect(authSessionZero.appearance.defaults.sidebar_motion).toBe(false);
     expect(authSessionFull.has_password).toBe(true);
     expect(authSessionFull.judge_enforced_by_admin).toBe(true);
     expect(authSessionFull.effective_judge_model).toBe("x");
