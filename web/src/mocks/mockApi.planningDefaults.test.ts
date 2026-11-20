@@ -48,6 +48,35 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
     expect([...got].sort(), "exercised case ids").toEqual([...ids].sort());
   });
 
+  // Mirrors agenttmpl.ValidateEffort / ValidateModel wording and rules (the server prefixes
+  // each message with the field name).
+  it("refuses values with the server's wording", async () => {
+    const api = await reload();
+    const refused = async (body: Record<string, string>) => {
+      try {
+        await api.putMySettings(body);
+      } catch (err) {
+        expect((err as { status: number }).status).toBe(400);
+        return (err as Error).message;
+      }
+      return "accepted";
+    };
+    expect(await refused({ planning_claude_effort: "runtime" }))
+      .toBe("planning_claude_effort: effort must be one of low, medium, high, xhigh, max");
+    // 100 bytes pass, 101 fail: 34 three-byte characters are 102 bytes yet only 34 runes.
+    expect(await refused({ planning_claude_model: "x".repeat(100) })).toBe("accepted");
+    expect(await refused({ planning_claude_model: "x".repeat(101) }))
+      .toBe("planning_claude_model: model must be at most 100 characters");
+    expect(await refused({ planning_claude_model: "€".repeat(34) }))
+      .toBe("planning_claude_model: model must be at most 100 characters");
+    for (const bad of ["a\u0007b", "a‮b", "a​b", "a�b"]) {
+      expect(await refused({ planning_claude_model: bad }), JSON.stringify(bad))
+        .toBe("planning_claude_model: model must not contain newlines or control characters");
+    }
+    expect(await refused({ planning_claude_model: "two words" }))
+      .toBe("planning_claude_model: model must be a single token with no spaces");
+  });
+
   it("serves one Claude planning cell each, resolving like the server", async () => {
     const api = await reload();
     let { settings } = await api.getMySettings();

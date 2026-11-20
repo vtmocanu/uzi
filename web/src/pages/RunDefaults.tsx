@@ -652,7 +652,13 @@ export function RunDefaults() {
     setEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_effort: defaultEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_effort: settings.default_effort, effort_settings: settings.effort_settings }));
+      // The planning cells resolve against the worker effort, so adopt them with it.
+      setCommittedSettings(current => current && ({
+        ...current,
+        default_effort: settings.default_effort,
+        effort_settings: settings.effort_settings,
+        planning_efforts: settings.planning_efforts,
+      }));
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
@@ -721,6 +727,15 @@ export function RunDefaults() {
   const planningEffortDirty = planningEffort !== savedPlanningEffort;
   const planningCustomEmpty = planningModelCustom && planningModelTrimmed === "";
   const planningBlocked = planningModelWarning !== "" || planningCustomEmpty;
+  // The messages shown under the model select, so assistive tech reads them with it.
+  const planningModelDescribedBy =
+    [
+      planningModelWarning && "planning-model-warning",
+      planningCustomEmpty && "planning-model-empty",
+      planningModelError && "planning-model-error",
+    ]
+      .filter(Boolean)
+      .join(" ") || undefined;
 
   // One PUT carrying only the dirty fields (null = Same as the run). A 400 names its field
   // as a "planning_claude_model:" / "planning_claude_effort:" prefix; an unattributable
@@ -754,8 +769,8 @@ export function RunDefaults() {
       const message = errorMessage(err, "Failed to save planning defaults");
       const forModel = message.startsWith("planning_claude_model:");
       const forEffort = message.startsWith("planning_claude_effort:");
-      if (!forModel || forEffort) setPlanningEffortError(message);
-      if (!forEffort || forModel) setPlanningModelError(message);
+      if (!forModel) setPlanningEffortError(message);
+      if (!forEffort) setPlanningModelError(message);
     } finally {
       setPlanningBusy(false);
     }
@@ -874,6 +889,9 @@ export function RunDefaults() {
         default_claude_model: settings.default_claude_model,
         default_codex_model: settings.default_codex_model,
         effort_settings: settings.effort_settings,
+        // The planning defaults resolve against the worker model lane.
+        planning_models: settings.planning_models,
+        planning_efforts: settings.planning_efforts,
         cross_check_pins: current.cross_check_pins?.map(cell => {
           const delivered = settings.cross_check_pins?.find(p => p.stage === cell.stage && p.harness === cell.harness);
           return delivered ? { ...cell, worker_default_model: delivered.worker_default_model } : cell;
@@ -1725,20 +1743,42 @@ export function RunDefaults() {
               <ModelSelect
                 id="planning-claude-model"
                 value={planningModel}
-                onChange={setPlanningModel}
+                onChange={(v) => { setPlanningModel(v); setPlanningModelError(""); }}
                 harness="claude"
                 defaultLabel={planningModelDefaultLabel}
                 customAriaLabel="Custom Claude planning model ID"
                 onCustomModeChange={setPlanningModelCustom}
+                ariaDescribedBy={planningModelDescribedBy}
               />
             </Field>
-            {planningModelWarning && <Alert message={planningModelWarning} tone="warning" />}
-            {planningCustomEmpty && <Alert message="Enter a custom model ID, or choose Same as the run." tone="warning" />}
-            {planningModelError && <Alert message={planningModelError} />}
+            {planningModelWarning && (
+              <div id="planning-model-warning">
+                <Alert message={planningModelWarning} tone="warning" />
+              </div>
+            )}
+            {planningCustomEmpty && (
+              <p id="planning-model-empty" className="text-xs text-danger" role="alert">
+                Enter a custom model ID, or choose Same as the run.
+              </p>
+            )}
+            {planningModelError && (
+              <p id="planning-model-error" className="text-xs text-danger" role="alert">
+                {planningModelError}
+              </p>
+            )}
             <Field label="Claude planning effort" htmlFor="planning-claude-effort">
-              <EffortSelect id="planning-claude-effort" value={planningEffort} onChange={setPlanningEffort} defaultLabel={planningEffortDefaultLabel} />
+              <EffortSelect
+                id="planning-claude-effort"
+                value={planningEffort}
+                onChange={(v) => { setPlanningEffort(v); setPlanningEffortError(""); }}
+                defaultLabel={planningEffortDefaultLabel}
+              />
             </Field>
-            {planningEffortError && <Alert message={planningEffortError} />}
+            {planningEffortError && (
+              <p id="planning-effort-error" className="text-xs text-danger" role="alert">
+                {planningEffortError}
+              </p>
+            )}
             <Button
               type="button"
               disabled={planningBusy || planningBlocked || !(planningModelDirty || planningEffortDirty)}

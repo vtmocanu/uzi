@@ -604,18 +604,25 @@ function mockPlanningEffort(raw: string | null | undefined): string | null {
   const trimmed = raw?.trim() ?? "";
   if (trimmed === "") return null;
   if (!["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
-    throw new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh or max");
+    throw new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh, max");
   }
   return trimmed;
 }
 
-// PRD #3252: the planning model validator (Claude-lane rules): blank clears, a single
-// token of at most 100 characters (agenttmpl.MaxModelLen), no Codex role id.
+// PRD #3252: the planning model validator (Claude-lane rules), mirroring
+// agenttmpl.ValidateModel: blank clears; at most 100 UTF-8 BYTES (agenttmpl.MaxModelLen,
+// measured with len(), not runes); no control (Cc) or format (Cf) character and no U+FFFD;
+// a single token; and no Codex role id.
 function mockPlanningModel(raw: string | null | undefined): string | null {
   const trimmed = raw?.trim() ?? "";
   if (trimmed === "") return null;
-  if ([...trimmed].length > 100) throw new ApiError(400, "planning_claude_model: model must be at most 100 characters");
-  if (/\s/.test(trimmed)) throw new ApiError(400, "planning_claude_model: model must be a single token with no spaces");
+  if (new TextEncoder().encode(trimmed).length > 100) throw new ApiError(400, "planning_claude_model: model must be at most 100 characters");
+  for (const ch of trimmed) {
+    if (ch === "�" || /[\p{Cc}\p{Cf}]/u.test(ch)) {
+      throw new ApiError(400, "planning_claude_model: model must not contain newlines or control characters");
+    }
+    if (/\s/.test(ch)) throw new ApiError(400, "planning_claude_model: model must be a single token with no spaces");
+  }
   if (CODEX_ROLE_MODELS.includes(trimmed)) throw new ApiError(400, "planning_claude_model: model is a Codex model id");
   return trimmed;
 }
