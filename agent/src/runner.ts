@@ -4416,12 +4416,15 @@ export class RunRunner {
    *  lifecycle abort; later steps (settleGuardedInventory guards, freezeInventory cancel observation, the
    *  reportState claim fence, the server's generation fences) still catch it. */
   private owedStopReleaseWait(flight: RunFlight): AuthorityWait {
-    const base = this.cleanupAuthorityWait();
+    // Same shutdown, budget and boundary-deadline terms as cleanupAuthorityWait, spelled out here so that
+    // wait keeps exactly its pinned callers (runner-cleanup-authority-wait.test.ts).
+    const budget = MaintenanceBudget.current();
     const terminal = flight.steering.terminalLifecycleSignal();
     const refused = flight.steering.isCancelled() || flight.steering.claimFence() !== undefined;
     return {
-      ...base,
-      signal: AbortSignal.any([base.signal,...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
+      signal: AbortSignal.any([this.shutdownSignal.signal, ...(budget ? [budget.signal] : []),
+        ...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
+      timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, budget?.remainingMs() ?? Infinity)),
     };
   }
 
@@ -4430,7 +4433,7 @@ export class RunRunner {
    *  usually already aborted when a cancellation, park or early-terminal cleanup runs, and a flight that is
    *  not cancelled (an early failed/terminal caller) gains nothing from them either. Without a current
    *  maintenance budget the wait is shutdown plus the boundary deadline only. */
-  private cleanupAuthorityWait(boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait & { signal: AbortSignal; timeoutMs: number } {
+  private cleanupAuthorityWait(boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
     const budget = MaintenanceBudget.current();
     return {
       signal: AbortSignal.any([this.shutdownSignal.signal, ...(budget ? [budget.signal] : [])]),
