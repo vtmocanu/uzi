@@ -1875,7 +1875,12 @@ describe("sibling-card save responses (#4530)", () => {
       // PUT responses leave the GET-only oidc fields empty and may carry older values.
       if ("health_stall_seconds" in patch) {
         return Promise.resolve({
-          ...response({ health_stall_seconds: "901", uzi_label: "older", judge_enabled: "false" }),
+          // Unsent secret and source entries differ too: they must not leak into page state.
+          ...response(
+            { health_stall_seconds: "901", uzi_label: "older", judge_enabled: "false" },
+            { slack_bot_token: true },
+            { health_queued_seconds: "env" },
+          ),
           oidc_status: "",
           oidc_provider_name: "",
         });
@@ -1901,5 +1906,8 @@ describe("sibling-card save responses (#4530)", () => {
     expect(input("uzi label").value).toBe("edited");
     expect(judgeToggle().checked).toBe(true);
     expect(judgeSaveButton().disabled).toBe(true);
+    // secrets and sources merge only the sent keys, too.
+    expect((screen.getByLabelText(/Stuck queued after/i) as HTMLInputElement).disabled).toBe(false);
+    expect(screen.queryByPlaceholderText(/configured ✓/)).toBeNull();
   });
 });

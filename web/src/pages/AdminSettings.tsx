@@ -178,8 +178,8 @@ export function AdminSettings() {
   // applySaved merges a card's PUT response, but only for the keys that request sent
   // (`sent`): a save response confirms exactly those keys. Cards save independently, so
   // a slower, older response must not revert keys another card has since confirmed, nor
-  // reset the label form or the GET-only fields (oidc_*, defaults, vault policy), which
-  // PUT responses leave empty. Ownership by key was chosen over a save sequence number
+  // reset the label form, the GET-only oidc_* fields (which PUT responses leave empty),
+  // or the defaults and vault policy (owned by the initial load and their own controls). Ownership by key was chosen over a save sequence number
   // because an older response is still the authority for its own keys. Values always
   // come from the response, never from `sent`.
   const applySaved = useCallback((resp: SettingsResponse, sent: UpdateSettingsPayload) => {
