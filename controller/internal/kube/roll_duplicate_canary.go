@@ -65,13 +65,13 @@ func (r replicaSetOwners) record(rs *appsv1.ReplicaSet) {
 // ReplicaSet that merely reuses the name under another UID is a different object, so the
 // reference is reported unlisted and the caller's name-prefix safeguard applies. Only a
 // UID-less reference falls back to the name.
-func (r replicaSetOwners) lookup(ref metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
+func (r replicaSetOwners) lookup(ref metav1.OwnerReference) (replicaSetAbsenceFact, bool) {
 	if ref.UID != "" {
 		o, ok := r["uid:"+string(ref.UID)]
-		return o.owners, ok
+		return o, ok
 	}
 	o, ok := r["name:"+ref.Name]
-	return o.owners, ok
+	return o, ok
 }
 
 // pendingForWorker counts possible pod producers, including terminating sets and
@@ -142,8 +142,11 @@ func podObservedForWorker(e *rollEntry, pod corev1.Pod) bool {
 				return true
 			}
 		case "ReplicaSet":
-			owners, _ := e.absenceOwners.lookup(ref)
-			for _, o := range owners {
+			fact, listed := e.absenceOwners.lookup(ref)
+			if listed && fact.workerID == id {
+				return true
+			}
+			for _, o := range fact.owners {
 				if deploymentRefMatches(e, o) {
 					return true
 				}
@@ -287,7 +290,20 @@ func (m *Materializer) cancelAbsentDuplicateCanary(ctx context.Context, t *rollT
 		return false
 	}
 
-	err := m.reserveRoll(ctx, d, nil)
+	// rollSnapshot reads pods before ReplicaSets. Recheck after the sets have
+	// settled to zero so a pod created between those observations cannot be missed.
+	// A failed or incomplete list proves no absence and leaves the duplicate hold.
+	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+	if err != nil || pods.Continue != "" {
+		return false
+	}
+	for _, pod := range pods.Items {
+		if podObservedForWorker(d, pod) {
+			return false
+		}
+	}
+
+	err = m.reserveRoll(ctx, d, nil)
 	t.uncertain[key] = true
 	if err != nil {
 		t.errors = append(t.errors, fmt.Errorf("worker %s: duplicate canary cancellation unconfirmed: %w; re-observe and re-poll required", d.w.ID, err))

@@ -472,6 +472,10 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "orphan-set"}, Spec: appsv1.ReplicaSetSpec{Replicas: &zero}})
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-orphan", OwnerReferences: ownedBy("ReplicaSet", name, "orphan-set")}})
 		}},
+		{name: "pod linked only by a labelled zero-replica noncanonical ReplicaSet", mutate: func(t *testing.T, o *orphanCohort) {
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "labelled-orphan", UID: "labelled-set", Labels: map[string]string{LabelWorkerID: "w2"}}, Spec: appsv1.ReplicaSetSpec{Replicas: &zero}})
+			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "unlabelled-child", OwnerReferences: ownedBy("ReplicaSet", "labelled-orphan", "labelled-set")}})
+		}},
 		{name: "pod under a listed foreign-owned ReplicaSet with D prefix", mutate: func(t *testing.T, o *orphanCohort) {
 			name := deploymentName("w2") + "-foreign"
 			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "foreign-set",
@@ -745,6 +749,72 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 	}
 }
 
+func TestDuplicateCanaryLabelledSettledReplicaSetWithoutMatchingPod(t *testing.T) {
+	for _, staleUID := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stale pod owner UID=%v", staleUID), func(t *testing.T) {
+			o := newOrphanCohort(t, 2, 2)
+			staleDuplicate(t, o, false)
+			zero := int32(0)
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "labelled-orphan", UID: "current-set", Labels: map[string]string{LabelWorkerID: "w2"}}, Spec: appsv1.ReplicaSetSpec{Replicas: &zero}})
+			if staleUID {
+				o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "unrelated-child", OwnerReferences: ownedBy("ReplicaSet", "labelled-orphan", "previous-set")}})
+			}
+			o.c.ClearActions()
+			o.mustTick(t)
+			if w2Cancellations(o.c) != 1 {
+				t.Fatalf("settled set without a UID-matched pod prevented cancellation: %v", actionTrace(o.c))
+			}
+		})
+	}
+}
+
+func TestDuplicateCanaryRechecksPodsAfterReplicaSets(t *testing.T) {
+	for _, mode := range []string{"late pod", "list error", "continued list"} {
+		t.Run(mode, func(t *testing.T) {
+			o := newOrphanCohort(t, 2, 2)
+			staleDuplicate(t, o, false)
+			before := o.dep(t, "w2").Annotations[annotationRoll]
+			ctx := context.Background()
+			obs, err := o.m.Observe(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			setsListed, podLists := false, 0
+			o.c.PrependReactor("list", "replicasets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				setsListed = true
+				return false, nil, nil
+			})
+			o.c.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+				podLists++
+				if podLists == 1 {
+					return false, nil, nil // The roll snapshot predates the late observation.
+				}
+				if !setsListed {
+					t.Fatal("pod recheck preceded the ReplicaSet snapshot")
+				}
+				switch mode {
+				case "list error":
+					return true, nil, fmt.Errorf("fresh pod list denied")
+				case "continued list":
+					return true, &corev1.PodList{ListMeta: metav1.ListMeta{Continue: "unobserved-page"}}, nil
+				default:
+					return true, &corev1.PodList{Items: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "late-child", UID: "late-child", OwnerReferences: ownedBy("ReplicaSet", "old-rs-"+deploymentName("w2"), types.UID("rs-"+deploymentName("w2")))}}}}, nil
+				}
+			})
+			o.c.ClearActions()
+			if err := o.m.Reconcile(ctx, o.workers, obs); err != nil {
+				t.Fatal(err)
+			}
+			if w2Cancellations(o.c) != 0 || o.dep(t, "w2").Annotations[annotationRoll] != before {
+				t.Fatalf("cancelled without a fresh complete absence proof: %v", actionTrace(o.c))
+			}
+			if podLists < 2 {
+				t.Fatal("no pod recheck after the ReplicaSet snapshot")
+			}
+		})
+	}
+}
+
 func TestDuplicateCanaryCancellationConflictHolds(t *testing.T) {
 	o := newOrphanCohort(t, 2, 2)
 	staleDuplicate(t, o, false)
@@ -833,8 +903,8 @@ func TestDuplicateCanarySnapshotKeepsTerminatingSetsOutOfAncestry(t *testing.T) 
 	if _, ok := e.sets["zzz-terminating"]; ok {
 		t.Fatal("a terminating replicaset entered serving-proof ancestry")
 	}
-	owners, listed := e.absenceOwners.lookup(metav1.OwnerReference{Kind: "ReplicaSet", Name: "zzz-terminating", UID: "uid-zzz-terminating"})
-	if !listed || len(owners) != 1 || owners[0].Name != deploymentName("w2") || owners[0].UID != w2uid {
-		t.Fatalf("absence owners = %v (listed %v)", owners, listed)
+	fact, listed := e.absenceOwners.lookup(metav1.OwnerReference{Kind: "ReplicaSet", Name: "zzz-terminating", UID: "uid-zzz-terminating"})
+	if !listed || len(fact.owners) != 1 || fact.owners[0].Name != deploymentName("w2") || fact.owners[0].UID != w2uid {
+		t.Fatalf("absence fact = %v (listed %v)", fact, listed)
 	}
 }
