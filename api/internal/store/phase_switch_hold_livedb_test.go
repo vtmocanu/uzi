@@ -1,0 +1,179 @@
+package store_test
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// PRD #3252 m4: the phase-switch hold. SetRunPhaseSwitchHold parks a Claude run's own live claim
+// (running | awaiting_approval -> paused, hold_reason 'phase_switch_unavailable'); the owner's
+// resume re-queues it keeping worker, generation and marker, and every worker-report writer must
+// refuse the marker in both the paused and the queued interval. Skipped unless
+// UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
+
+const phaseSwitchReason = "phase_switch_unavailable"
+
+// TestSetRunPhaseSwitchHoldStatementLiveDB executes the setter's fence directly: the six eligible
+// kinds, interactive or not, in running or awaiting_approval, hold; every other shape matches 0 rows.
+func TestSetRunPhaseSwitchHoldStatementLiveDB(t *testing.T) {
+	fx := newWPFixture(t)
+	worker := fx.worker("w-3252s", wpWorker{})
+	wid := pgtype.UUID{Bytes: worker, Valid: true}
+	// The fixture inserts an issue-shaped row; runs_kind_shape needs each other kind's own columns.
+	kindShape := map[string]string{
+		"ci_fix":       "kind = 'ci_fix', pipeline_id = PIPE, pipeline_ref = 'ref-PIPE'",
+		"prompt":       "kind = 'prompt', issue_iid = NULL",
+		"task":         "kind = 'task', issue_iid = NULL, branch = 'uzi/task/x'",
+		"self_improve": "kind = 'self_improve'",
+		"mr_rework":    "kind = 'mr_rework', pipeline_ref = 'r-PIPE', mr_iid = PIPE, target_run_id = 'TARGET'",
+	}
+	seed := func(o wpRun, mut string) uuid.UUID {
+		w := worker
+		o.worker = &w
+		o.claimGen = 3
+		kind := o.kind
+		o.kind = ""
+		id := fx.run(o)
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET health = 'stalled', health_reason = 'x', health_since = now() WHERE id = $1`, id)
+		if shape := kindShape[kind]; shape != "" {
+			shape = strings.ReplaceAll(shape, "PIPE", fmt.Sprint(fx.iid))
+			if kind == "mr_rework" {
+				target := fx.run(wpRun{})
+				shape = strings.ReplaceAll(shape, "TARGET", target.String())
+			}
+			mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET `+shape+` WHERE id = $1`, id)
+		}
+		if mut != "" {
+			mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET `+mut+` WHERE id = $1`, id)
+		}
+		return id
+	}
+	hold := func(id uuid.UUID, w pgtype.UUID, gen int64) (store.Run, error) {
+		return fx.q.SetRunPhaseSwitchHold(fx.ctx, store.SetRunPhaseSwitchHoldParams{
+			HoldCapturedHead: pgtype.Text{String: "h", Valid: true}, ID: id, WorkerID: w, ClaimGeneration: gen})
+	}
+
+	for _, kind := range []string{"issue", "ci_fix", "self_improve", "prompt", "mr_rework", "task"} {
+		for _, interactive := range []bool{false, true} {
+			for _, status := range []string{"running", "awaiting_approval"} {
+				t.Run(fmt.Sprintf("%s/interactive=%v/%s", kind, interactive, status), func(t *testing.T) {
+					id := seed(wpRun{kind: kind, interactive: interactive, status: status}, "")
+					// self_improve and ci_fix allow one active run each: free the slot for the next case.
+					t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM runs WHERE id = $1`, id) })
+					run, err := hold(id, wid, 3)
+					if err != nil {
+						t.Fatalf("hold: %v", err)
+					}
+					if run.Status != "paused" || run.HoldReason.String != phaseSwitchReason || run.HoldCapturedHead.String != "h" {
+						t.Fatalf("held = (%q, %q, %q)", run.Status, run.HoldReason.String, run.HoldCapturedHead.String)
+					}
+					if run.OpenQuestionID.Valid || run.Health != "ok" || run.HealthReason.Valid || run.HealthSince.Valid {
+						t.Fatalf("question/health not reset: %v %q", run.OpenQuestionID, run.Health)
+					}
+					if run.WorkerID.Bytes != worker || run.ClaimGeneration != 3 || run.ClaimReleasedAt.Valid {
+						t.Fatal("the hold keeps the worker and the live claim")
+					}
+				})
+			}
+		}
+	}
+
+	refused := map[string]func() uuid.UUID{
+		"wrong generation": func() uuid.UUID { return seed(wpRun{}, "claim_generation = 4") },
+		"released claim":   func() uuid.UUID { return seed(wpRun{}, "claim_released_at = now()") },
+		"awaiting_input":   func() uuid.UUID { return seed(wpRun{status: "awaiting_input"}, "") },
+		"queued":           func() uuid.UUID { return seed(wpRun{status: "queued"}, "") },
+		"codex harness":    func() uuid.UUID { return seed(wpRun{harness: "codex"}, "") },
+		"review target": func() uuid.UUID {
+			target := seed(wpRun{}, "")
+			return seed(wpRun{}, "review_target_run_id = '"+target.String()+"'")
+		},
+	}
+	for name, mk := range refused {
+		if _, err := hold(mk(), wid, 3); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("%s: err = %v, want ErrNoRows", name, err)
+		}
+	}
+	if _, err := hold(seed(wpRun{}, ""), pgtype.UUID{Bytes: uuid.New(), Valid: true}, 3); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("other worker: err = %v, want ErrNoRows", err)
+	}
+	id := seed(wpRun{}, "")
+	if _, err := hold(id, wid, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hold(id, wid, 3); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("the statement itself must be a 0-row no-op on an already-held row; err = %v", err)
+	}
+}
+
+// TestPhaseSwitchHoldResumeAndCancelLiveDB: the owner's resume admits the hold and re-queues the run
+// KEEPING worker, generation and marker; the owner's cancel still applies.
+func TestPhaseSwitchHoldResumeAndCancelLiveDB(t *testing.T) {
+	fx := newWPFixture(t)
+	worker := fx.worker("w-3252r", wpWorker{})
+	w := worker
+	id := fx.run(wpRun{status: "paused", worker: &w, claimGen: 3, holdReason: phaseSwitchReason, holdCapturedHead: "h"})
+	if _, err := fx.q.ResumePausedRun(fx.ctx, store.ResumePausedRunParams{ID: id, UserID: fx.userID, GlobalTimeoutSeconds: 3600}); err != nil {
+		t.Fatalf("ResumePausedRun on the phase-switch hold: %v", err)
+	}
+	resumed := fx.mustRun(id)
+	if resumed.Status != "queued" || resumed.WorkerID.Bytes != worker || resumed.ClaimGeneration != 3 ||
+		resumed.ClaimReleasedAt.Valid || resumed.HoldReason.String != phaseSwitchReason {
+		t.Fatalf("resumed = (%q, worker %v, gen %d, released %v, hold %q), want queued keeping worker, generation and marker",
+			resumed.Status, resumed.WorkerID.Bytes, resumed.ClaimGeneration, resumed.ClaimReleasedAt.Valid, resumed.HoldReason.String)
+	}
+}
+
+// TestPhaseSwitchHoldRefusesLateWorkerReportsLiveDB: a late report from the parking flight must not
+// move the held row in either interval (paused, and queued after the owner's resume). Each report
+// also runs against the same row WITHOUT the marker, the control showing the marker refuses it.
+func TestPhaseSwitchHoldRefusesLateWorkerReportsLiveDB(t *testing.T) {
+	fx := newWPFixture(t)
+	worker := fx.worker("w-3252l", wpWorker{})
+	wid := pgtype.UUID{Bytes: worker, Valid: true}
+	reports := map[string]func(id uuid.UUID) (int64, error){
+		"SetRunAwaitingInput": func(id uuid.UUID) (int64, error) {
+			return fx.q.SetRunAwaitingInput(fx.ctx, store.SetRunAwaitingInputParams{
+				OpenQuestionID: pgtype.Text{String: "q1", Valid: true}, ID: id, WorkerID: wid})
+		},
+		"SetRunAwaitingFollowup": func(id uuid.UUID) (int64, error) {
+			return fx.q.SetRunAwaitingFollowup(fx.ctx, store.SetRunAwaitingFollowupParams{ID: id, WorkerID: wid})
+		},
+		"SupersedeRunByWorker": func(id uuid.UUID) (int64, error) {
+			return fx.q.SupersedeRunByWorker(fx.ctx, store.SupersedeRunByWorkerParams{StopReason: "branch moved", ID: id, WorkerID: wid})
+		},
+		"SetRunFailed": func(id uuid.UUID) (int64, error) {
+			return fx.q.SetRunFailed(fx.ctx, store.SetRunFailedParams{ID: id, WorkerID: wid, FailureReason: pgtype.Text{String: "boom", Valid: true}})
+		},
+	}
+	for name, report := range reports {
+		for _, status := range []string{"paused", "queued"} {
+			t.Run(name+"/"+status, func(t *testing.T) {
+				held := fx.run(wpRun{status: status, worker: &worker, claimGen: 3, holdReason: phaseSwitchReason, holdCapturedHead: "h"})
+				n, err := report(held)
+				if err != nil || n != 0 {
+					t.Fatalf("%s on a %s phase-switch hold = (%d, %v), want (0, nil)", name, status, n, err)
+				}
+				run := fx.mustRun(held)
+				if run.Status != status || run.HoldReason.String != phaseSwitchReason || run.HoldCapturedHead.String != "h" || run.WorkerID.Bytes != worker {
+					t.Fatalf("late report changed the held row: %q %q %q", run.Status, run.HoldReason.String, run.HoldCapturedHead.String)
+				}
+				if status == "queued" {
+					// Control: the same queued row without the marker is moved by the report.
+					plain := fx.run(wpRun{status: status, worker: &worker, claimGen: 3})
+					if n, err := report(plain); err != nil || n != 1 {
+						t.Fatalf("control: %s on an unmarked queued run = (%d, %v), want (1, nil)", name, n, err)
+					}
+				}
+			})
+		}
+	}
+}

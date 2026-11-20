@@ -5403,6 +5403,8 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- A provider-unavailable hold retains its claim; the specialized holds below do too.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+  -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
@@ -5736,6 +5738,8 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- A provider-unavailable hold retains its claim; the specialized holds below do too.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+  -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
@@ -5955,6 +5959,8 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- All paused runs are protected above. Retain provider protection through
   -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+  -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -6015,6 +6021,8 @@ WITH failed AS (
       -- All paused runs are protected above. Retain provider protection through
       -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
       AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+      -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+      AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -6388,6 +6396,7 @@ WITH candidates AS MATERIALIZED (
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
+  AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'phase_switch_unavailable', FALSE))
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -6438,6 +6447,7 @@ WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
+  AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'phase_switch_unavailable', FALSE))
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
 -- name: FailRunAutoStop :execrows
@@ -8852,6 +8862,9 @@ WITH candidates AS MATERIALIZED (
     SELECT r.id, r.kind FROM runs r, worker_active_runs a
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
@@ -8924,6 +8937,9 @@ UPDATE runs r SET
 FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = @worker_id
   AND r.status = 'queued'

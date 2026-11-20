@@ -138,6 +138,7 @@ var jobRefusedRoutes = []struct {
 	{"decisions memo save", "POST", "/decisions-memo", false},
 	{"decisions memo read", "GET", "/decisions-memo", false},
 	{"lead config record", "POST", "/lead-config", false},
+	{"phase switch hold", "POST", "/phase-switch-hold", false},
 	{"codex catalog default record", "POST", "/codex-catalog-default", false},
 	{"interrupted calls read", "GET", "/interrupted-calls", false},
 	{"forge issue", "GET", "/forge/issues/1", false},

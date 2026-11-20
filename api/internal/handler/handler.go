@@ -1367,6 +1367,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// retained work no checkpoint attests; the service parks its own live claim (running ->
 		// paused, hold_reason='base_attestation_missing') before the agent ever runs.
 		r.Post("/runs/{id}/base-attestation-hold", h.WorkerRunBaseAttestationHold)
+		// PRD #3252 m4: the Claude phase-switch HOLD. The worker could not bind the next plan/implement
+		// phase to a supported model configuration; the service parks its own live claim (running |
+		// awaiting_approval -> paused, hold_reason='phase_switch_unavailable'). A job run never holds.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/phase-switch-hold", h.WorkerRunPhaseSwitchHold)
 		r.Post("/runs/{id}/repo-agent-source-hold", h.WorkerRunRepoAgentSourceHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,

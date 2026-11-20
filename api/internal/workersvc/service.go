@@ -989,6 +989,7 @@ type Store interface {
 	// carries no attestation: running -> paused with hold_reason='base_attestation_missing',
 	// fenced to this worker's live claim generation. An owner-only exit; nothing automatic leaves it.
 	SetRunBaseAttestationHold(ctx context.Context, arg store.SetRunBaseAttestationHoldParams) (store.Run, error)
+	SetRunPhaseSwitchHold(ctx context.Context, arg store.SetRunPhaseSwitchHoldParams) (store.Run, error)
 	SetRunRepoAgentSourceHold(ctx context.Context, arg store.SetRunRepoAgentSourceHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
