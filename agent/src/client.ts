@@ -328,7 +328,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
   }
   const caps = list(c.required_capabilities), tools = list(c.required_tools);
   if (!caps || !tools) return invalid();
-  // The normalizer preserves extra milestone prose, bounded to depth 32 and total bytes.
+  // The server admits only {id,title} milestone objects, so an unexpected nested field is
+  // refused there; this client check stays a tolerant text/depth/size bound (depth 32, total bytes).
   const prose = (v: unknown, depth: number): boolean => depth <= 32 &&
     (typeof v === "string" ? crossCheckText(v, 256 * 1024) :
       Array.isArray(v) ? v.every((x) => prose(x, depth + 1)) :

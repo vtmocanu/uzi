@@ -30,6 +30,7 @@ func TestPlanCrossCheckCandidateDigestCanonicalStoredFields(t *testing.T) {
 		t.Fatalf("equivalent stored candidate digest = %x", same)
 	}
 	// Normalize first: only the reviewer disposition changes in the stored plan.
+	c.Milestones = json.RawMessage(`[{"id":"m1","title":"T"}]`)
 	normalized, err := NormalizePlanCrossCheckCandidate(c)
 	if err != nil {
 		t.Fatal(err)
