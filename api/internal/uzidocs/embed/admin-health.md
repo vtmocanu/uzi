@@ -44,9 +44,8 @@ It surfaces six ways:
 - **Overview**, for an admin: a health chip in the page header opens a popover.
   When every check passes it lists them by area; otherwise it shows every
   attention item with its evidence and docs link, plus a disclosure for passing
-  checks. The popover has an Open health link. During the short classic-Overview
-  soak, `/overview/classic` still has the older self-hiding health card beside
-  its custody alert. Neither page makes an admin-health request for a non-admin.
+  checks. The popover has an Open health link. The Overview makes no admin-health
+  request for a non-admin.
 - **An app-wide Danger banner**, admins only, shown while `blocking` is
   `true`. It carries the instance-blocker verdict, the first instance danger
   check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger

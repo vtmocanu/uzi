@@ -1872,7 +1872,7 @@ chain in the diagram above, with no intervening `running`.
   release, committed → generation-bound capture, unverifiable → retain), and
   owners can list retained holds and discard one exact held source
   (`GET /api/recovery/holds` + aggregate; `uzi run recovery` /
-  `uzi run discard`; a Dashboard board alert and Workers resolution surface),
+  `uzi run discard`; an Overview held-work card and Workers resolution surface),
   with the per-run custody Slack nudge coalesced into one owner-level
   blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
   [PRD #1296](prds/done/1296-durable-run-recovery.md),
