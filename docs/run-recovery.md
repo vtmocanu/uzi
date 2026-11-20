@@ -1327,6 +1327,13 @@ are kept by cleanup.
   holds (`refusal import stage producer unproven`) on any import stage whose
   producer this process cannot prove finished: a stage left by another or a
   crashed process, or one whose process-local finished record was evicted;
+- a bare whose refusal-cleanup deletion was cut short by a SIGKILL. The dead
+  owner's `running` bare record blocks later same-bare writes (seeds, pins,
+  coverage ref writes) until operator intervention, because no in-product path
+  resolves it ([ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md);
+  #4066, recovery-design follow-up #4550). Only that bare is affected, and the
+  remaining refusal refs, ledger and seal are kept, so no head loses coverage.
+  This is a known residual: the record is not force-cleared;
 - a leftover import stage from an interrupted import followed by a successful
   retry. The gate removes it only when its producer is proven finished (this
   process's nonce, import returned, not live), an independent anchor sits at its

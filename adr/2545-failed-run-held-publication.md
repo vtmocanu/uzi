@@ -654,6 +654,16 @@ residual that earlier text left open is closed by the owed-path marker above.
   checks and the server's generation fences still stop any later report or release.
 - **Failure model.** Every ordering above is for a process crash. No storage or
   power-loss durability claim is made.
+- **Known residual: a dead owner's refusal-cleanup record.** A worker SIGKILLed
+  between the `refusal-cleanup-delete-ref` registration (or its `update-ref -d`)
+  and its settlement leaves a `running` bare record. Under
+  [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md)'s accepted contract
+  (no in-product path resolves a dead owner's running bare record), that record
+  blocks later same-bare writes (`assertBareClear`, `bare_unresolved`): seeds,
+  pins and coverage ref writes. This lasts until operator intervention and
+  affects only that bare. The remaining refusal refs, the ledger and the seal are
+  kept, and no head loses coverage. See #4066 and the recovery-design follow-up
+  #4550. This change does not force-clear the record or weaken bare registration.
 
 ## Consequences
 

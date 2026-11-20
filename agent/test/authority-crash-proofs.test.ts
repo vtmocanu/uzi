@@ -1258,7 +1258,8 @@ for (const nth of [1, 2, 3, 4]) {
     assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`));
     assertNoLoss(w, `after delete ${nth}`, true);
 
-    // The refusal-stage delete is a registered bare mutation (git-authority-hooks.ts "refusal-cleanup-delete-ref"). Its
+    // KNOWN RESIDUAL of ADR-2545 (#4481 amendment), under ADR-1783's accepted contract (#4066; recovery-design
+    // follow-up #4550): the refusal-stage delete is a registered bare mutation (git-authority-hooks.ts "refusal-cleanup-delete-ref"). Its
     // owner died before settling it, and no production path resolves a dead owner's running bare record by read-back
     // (the same contract as proofs 2 and the recovery-cleanup-delete-ref records above): it stays running and fences every
     // later writer on the bare (no in-product path resolves it; operator intervention is needed). So the resumed cleanup
