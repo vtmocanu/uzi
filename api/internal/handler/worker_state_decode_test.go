@@ -88,6 +88,7 @@ type stateRequestMinusGateRevision struct {
 	OpenQuestionID              *string                                `json:"open_question_id"`
 	CompletionQuestion          bool                                   `json:"completion_question"`
 	OpenFollowupID              *int64                                 `json:"open_followup_id"`
+	FollowupParkSeq             *int64                                 `json:"followup_park_seq"`
 	LimitResetsAt               *int64                                 `json:"limit_resets_at"`
 	RateLimitType               *string                                `json:"rate_limit_type"`
 	FailOrigin                  *string                                `json:"fail_origin"`

@@ -405,6 +405,10 @@ func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userI
 		httpx.Error(w, http.StatusConflict, "already resumed with different guidance; the new guidance was not recorded")
 	case errors.Is(err, workersvc.ErrPolicyResumeConflict):
 		httpx.Error(w, http.StatusConflict, "policy hold changed or does not match this mode; refresh the run and choose again")
+	case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+		// Issue #4479: the run's worker is finalizing it (its followup_finalize admission is live), so
+		// the guidance follow-up is refused and the whole resume rolled back. Resume without guidance.
+		httpx.ErrorReason(w, http.StatusConflict, "run is finishing; your guidance was not delivered", "follow_up_finalizing")
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
 	default:

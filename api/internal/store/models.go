@@ -1411,6 +1411,8 @@ type Run struct {
 	ClaimProvenanceWorkerID           pgtype.UUID        `json:"claim_provenance_worker_id"`
 	ClaimProvenanceGeneration         pgtype.Int8        `json:"claim_provenance_generation"`
 	HealthOwnerHoldSince              pgtype.Timestamptz `json:"health_owner_hold_since"`
+	FollowupParkSeq                   int64              `json:"followup_park_seq"`
+	FollowupFinalizeGeneration        pgtype.Int8        `json:"followup_finalize_generation"`
 }
 
 type RunCompletionAttempt struct {

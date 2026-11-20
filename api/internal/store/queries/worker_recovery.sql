@@ -113,6 +113,8 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
 -- still requires the latest eligible pending plan round and active lead.
 
 -- name: FrozenReadoptRunsFromSnapshot :many
+-- Issue #4479: like ordinary readopt, restore running when this generation already has finalize
+-- admission, even if the snapshot still says awaiting_followup because its admission ACK was lost.
 -- PRD #1390 M2b (D5, D2): restore a `queued` run-lane run the worker still lists as a LIVE entry
 -- (terminal_pending = false) at the SAME generation to its listed phase. This is a DIRECT status
 -- write (not SetRunRunning), correct because the held-state content columns (open_question_id,
@@ -239,7 +241,11 @@ WITH candidates AS MATERIALIZED (
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
 UPDATE runs r SET
-    status = a.phase,
+    -- Same-generation readopt after a lost finalize ACK must restore admission,
+    -- rather than ask the no-re-park trigger to recreate awaiting_followup.
+    status = CASE WHEN a.phase = 'awaiting_followup'
+                       AND r.followup_finalize_generation = r.claim_generation
+                  THEN 'running' ELSE a.phase END,
     status_since = now(),
     health = 'ok', health_reason = NULL, health_since = NULL,
     budget_paused_seconds = r.budget_paused_seconds

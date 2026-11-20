@@ -1045,6 +1045,11 @@ type Store interface {
 	// awaiting_approval move and its read-only lost-ACK replay (clarification_settlement.go).
 	SettleRunClarificationToGate(ctx context.Context, arg store.SettleRunClarificationToGateParams) (int64, error)
 	GetClarificationGateSettlementReplay(ctx context.Context, arg store.GetClarificationGateSettlementReplayParams) (bool, error)
+	// AdmitRunFollowupFinalize / GetFollowupFinalizeReplay / GetFollowupFinalizeBlockers are the issue
+	// #4479 followup_finalize admission, its lost-ACK replay and its refusal classification.
+	AdmitRunFollowupFinalize(ctx context.Context, arg store.AdmitRunFollowupFinalizeParams) (int64, error)
+	GetFollowupFinalizeReplay(ctx context.Context, arg store.GetFollowupFinalizeReplayParams) (bool, error)
+	GetFollowupFinalizeBlockers(ctx context.Context, id uuid.UUID) (store.GetFollowupFinalizeBlockersRow, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -4542,6 +4547,10 @@ type StateRequest struct {
 	// exist because httpx.DecodeJSON sets DisallowUnknownFields — a new worker that sends
 	// it would 400 otherwise. Ignored on every state other than awaiting_followup.
 	OpenFollowupID *int64 `json:"open_followup_id"`
+	// FollowupParkSeq (issue #4479, feature followup_finalize_admission_v1) is the park sequence
+	// the worker read from the awaiting_followup ACK, echoed ONLY on a followup_finalize report so
+	// the admission applies to the park the worker actually observed. Valid on no other status.
+	FollowupParkSeq *int64 `json:"followup_park_seq"`
 	// LimitResetsAt is the epoch at which the exhausted Anthropic usage window
 	// reopens, as the worker read it off the SDK frame (PRD #35). The worker
 	// normalizes the SDK's unit-less number to MILLISECONDS before sending; the
@@ -4776,6 +4785,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateClarificationSettlementShape(req); err != nil {
 		return store.Run{}, false, err
 	}
+	if err := validateFollowupFinalizeShape(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if req.RequireRunning && (req.State != "awaiting_input" || req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
 		return store.Run{}, false, fmt.Errorf("%w: require_running requires awaiting_input and positive claim_generation", ErrInvalidState)
 	}
@@ -4849,6 +4861,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		return owned, false, nil
 	}
+	// Issue #4479: a superseded or released followup_finalize flight is told stale_claim, never a
+	// refusal, even onto a policy episode or an iteration-budget pause (the no-op exits below).
+	if req.State == stateFollowupFinalize && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
+		return owned, false, ErrStaleClaim
+	}
 	// Compact policy episodes have no generic continuation authority. Cancel remains
 	// the ordinary terminal action; the dedicated report reconciles its own replay.
 	if unresolvedPolicyEpisode(owned) && req.State != "cancelled" {
@@ -4866,7 +4883,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 
 	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
 		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
-			req.State == stateClarificationSettled ||
+			req.State == stateClarificationSettled || req.State == stateFollowupFinalize ||
 			((req.State == "credential_switch" || req.State == "credential_switch_failed") && req.ClaimGeneration != nil)) {
 		return owned, false, ErrSemanticCompletionAuthority
 	}
@@ -4874,13 +4891,14 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// not nest beneath the generic state fence on another connection.
 	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
 		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled ||
-		req.State == stateCredentialSwitchUncertain || req.State == stateClarificationSettled) {
+		req.State == stateCredentialSwitchUncertain || req.State == stateClarificationSettled ||
+		req.State == stateFollowupFinalize) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		if req.State == stateClarificationSettled {
+		if req.State == stateClarificationSettled || req.State == stateFollowupFinalize {
 			// beginClaimMutation holds the worker and run locks; set the publication-resume and
 			// checkpoint opt-ins now, as the generic fenced path does, so the run write is admitted
 			// identically for an enrolled run.
@@ -4909,7 +4927,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// statuses, so it is a no-op for awaiting_approval anyway. The web and Slack learn of the
 		// settlement through PublishState above; Slack dedups on the preserved gate generation
 		// (issue #3985, ADR-2149 D16: no new presentation).
-		if applied && current.Status != owned.Status && req.State != stateClarificationSettled {
+		// followup_finalize skips s.notify as well: the run only re-enters running for the worker's
+		// own finalize, which reports its terminal state itself (issue #4479).
+		if applied && current.Status != owned.Status && req.State != stateClarificationSettled && req.State != stateFollowupFinalize {
 			s.notify(runID, current.Status)
 		}
 		return current, applied, nil
@@ -4984,6 +5004,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.State == stateClarificationSettled {
 		return s.settleClarificationToGate(ctx, owned, wkr, req)
+	}
+	if req.State == stateFollowupFinalize {
+		return s.admitFollowupFinalize(ctx, owned, wkr, req)
 	}
 	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
 	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol

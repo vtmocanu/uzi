@@ -1404,6 +1404,55 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
+- **awaiting_followup → running (finalize admission)** (issue #4479, feature
+  `followup_finalize_admission_v1`). When the follow-up wait ends idle or
+  stopped, the worker finalizes the run, and its publication intent can enroll
+  only against a `running` run. So before finalizing, the worker reports
+  `followup_finalize` with the `followup_park_seq` it read from this park's
+  ACK. `AdmitRunFollowupFinalize` is one fenced UPDATE under the claim-mutation
+  locks that moves exactly that park back to `running` and stamps
+  `followup_finalize_generation = claim_generation`.
+  - **Refusals.** A deliverable cancel always refuses, with `cancel_pending`
+    when the park is still at that seq or already admitted at it. A
+    pending follow-up refuses an idle finalize (`followup_pending`), but a
+    server-stamped stop does not. Anything else refuses with
+    `followup_finalize_refused`, and a superseded claim with `stale_claim`. A
+    lost ACK replays read-only to applied, unless a cancel became deliverable in
+    the meantime.
+  - **Authority.** The worker finalizes only on an applied
+    `followup_finalize_admitted` ACK. An unconfirmed reply keeps the flight and
+    custody and publishes nothing. It retries until a cancel, a shutdown, a
+    lifecycle abort or the claim fence ends it, and sends nothing while the
+    feature is withdrawn.
+  - **Stale-worker recovery.** If admission committed but its ACK was lost,
+    the worker can still report `awaiting_followup` in its snapshot. Both
+    snapshot readopt paths restore `running` for that same admitted generation
+    instead of recreating a park. The park sequence and admission stamp stay
+    unchanged; the worker still needs the explicit admission replay ACK before
+    finalizing. An unadmitted park still restores `awaiting_followup`.
+  - **Triggers (migration 00495).** They bind every writer, old api pods
+    included:
+    - `runs_followup_park_identity_trg` numbers each logical park. A retried
+      report, or a same-generation snapshot re-adopt of a numbered park, keeps
+      its seq. It also skips (`RETURN NULL`) any re-park after admission on the
+      same unreleased claim.
+    - `run_user_inputs_followup_finalize_trg` refuses every follow-up insert
+      on the interactive task once admission is live (SQLSTATE `UZ415`), until a
+      re-claim bumps the generation or the claim is released. Web, chat and
+      policy resume answer 409 `follow_up_finalizing`; Slack answers with a
+      "run is finishing" message.
+  - **Residuals.**
+    - An old worker on a new api still hangs at enrollment until it is upgraded.
+    - A park ACKed by an old api or pod carries no seq, so no admission is sent.
+    - A follow-up that arrives before a stop is admitted loses to the stop, as
+      before.
+    - A stop finalize followed by a forge outage still ends through
+      `CancelRunByWorker`, while an idle finalize parks in `recovery_wait`.
+    - The pre-existing #552-class delayed park onto a running run is unchanged.
+    - During a rolling deploy an old pod answers a refused follow-up with 500
+      rather than 409.
+    - The migration's Down loses the seq and generation values of any run that
+      is mid-finalize.
 - **running → paused (owner request)** ([PRD #1190](prds/done/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,

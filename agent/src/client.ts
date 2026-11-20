@@ -154,6 +154,7 @@ import {
   type RecoverySettleRequest,
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
+  type FollowupFinalizeResult,
   BASE_ATTESTATION_HOLD_REASON,
   REPO_AGENT_SOURCE_HOLD_REASON,
 } from "./protocol.js";
@@ -529,12 +530,34 @@ interface StateAttemptEvidence {
 }
 
 // The api's generic invalid-state 400 body (worker_protocol.go state handler).
-// Both spellings are generic: the list an api without credential_switch_uncertain prints, and the
-// one a current api prints.
+// All three spellings are generic: the list an api without credential_switch_uncertain prints, the one
+// an api without followup_finalize prints, and the one a current api prints.
 const GENERIC_INVALID_STATE_ERRORS: ReadonlySet<string> = new Set([
   "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed",
   "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed",
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, followup_finalize, completed, failed",
 ]);
+
+/** Issue #4479: true when a `followup_finalize` send got the answer of an api that does not know the
+ *  state or its field (a rollback past the negotiated feature): the strict-decode 400 or exactly the
+ *  generic invalid-state 400. Any other failure says nothing about support. */
+export function isFollowupFinalizeUnsupported(error: unknown): boolean {
+  return isStrictDecodeError(error) || isUnsupportedSpendLimitRefusal(error);
+}
+
+/** Issue #4479: fold one `followup_finalize` reply into its typed result. Anything this does not
+ *  positively recognise is unconfirmed, never a guess in either direction. */
+function foldFollowupFinalize(status: number, fields: {
+  runId?: unknown; applied?: boolean; status?: string; reason?: string; staleClaim?: boolean; followupFinalizeAdmitted?: boolean;
+}, runId: string): FollowupFinalizeResult {
+  if (fields.staleClaim === true) return { kind: "stale_claim" };
+  if (status === 200 && fields.runId === runId && fields.applied === true && fields.followupFinalizeAdmitted === true && fields.status === "running")
+    return { kind: "admitted" };
+  if (status === 409 && fields.applied === false &&
+      (fields.reason === "followup_pending" || fields.reason === "cancel_pending" || fields.reason === "followup_finalize_refused"))
+    return { kind: "refused", reason: fields.reason };
+  return { kind: "unconfirmed" };
+}
 
 /** True when a spend-limit park refusal means the server does not understand the cause: the strict
  *  decode refusal, or a 400 whose body is exactly the generic invalid-state error. */
@@ -1433,6 +1456,8 @@ const APPLY_RESPONSE_MAX_BYTES = 16 * 1024;
 const APPLY_REASON_MAX = 128;
 /** Issue #3985: the server accepts `clarification_settled` after a human revise's clarification. */
 export const CLARIFICATION_REVISION_SETTLEMENT_FEATURE = "clarification_revision_settlement_v1";
+/** Issue #4479: the server accepts `followup_finalize` and echoes `followup_park_seq` on the park ACK. */
+export const FOLLOWUP_FINALIZE_ADMISSION_FEATURE = "followup_finalize_admission_v1";
 
 /** Issue #1324: the api accepts NEW publication intents and the typed publication-phase park. */
 const PUBLICATION_RESUME_FEATURE = "publication_resume_v1";
@@ -3184,6 +3209,27 @@ export class WorkerClient {
         throw new Error("clarification settlement requires the clarification_revision_settlement_v1 feature, a positive claim_generation and clarification_settlement");
       return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
+    if (body.status === "followup_finalize") {
+      // Issue #4479: sent whole or not at all, like a settlement. Never stripped, downgraded or
+      // re-sent as another status: an api that does not know it answers the generic 400, which
+      // propagates to the caller (the runner reads that as unconfirmed after an ambiguous send).
+      if (!this.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          !Number.isSafeInteger(body.followup_park_seq) || (body.followup_park_seq ?? 0) <= 0)
+        throw new ReportPreconditionError("follow-up finalize requires the followup_finalize_admission_v1 feature, a positive claim_generation and a positive followup_park_seq");
+      // An earlier transport attempt inside this call may have reached the server and admitted the
+      // finalize before its ACK was lost. A later attempt's rollback 400 (an old pod) then proves
+      // nothing about that earlier attempt, so it must not read as "unsupported, nothing applied":
+      // it is rethrown as an uncertain outcome, which the runner keeps as unconfirmed.
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if ((evidence.refusedAfterAmbiguity || evidence.definiteAfterAmbiguity) && isFollowupFinalizeUnsupported(error))
+          throw new Error("follow-up finalize outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
     if (hasRevisionSourceFields(body))
@@ -3634,6 +3680,10 @@ export class WorkerClient {
             ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
           // Issue #3985: only a 200 can confirm a clarification settlement; a 409 is a refusal.
           if (res.status === 200 && fields.clarificationSettled === true) ack.clarificationSettled = true;
+          // Issue #4479: the park sequence rides an applied awaiting_followup ACK only.
+          if (body.status === "awaiting_followup" && res.status === 200 && fields.status === "awaiting_followup" &&
+              fields.followupParkSeq !== undefined) ack.followupParkSeq = fields.followupParkSeq;
+          if (body.status === "followup_finalize") ack.followupFinalize = foldFollowupFinalize(res.status, fields, runId);
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
@@ -6307,6 +6357,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitchHoldSettled?: boolean;
   credentialSwitchUncertain?: boolean;
   clarificationSettled?: boolean;
+  followupParkSeq?: number;
+  followupFinalizeAdmitted?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
@@ -6409,6 +6461,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitchHoldSettled?: boolean;
       credentialSwitchUncertain?: boolean;
       clarificationSettled?: boolean;
+      followupParkSeq?: number;
+      followupFinalizeAdmitted?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
       supersededRevisionInputIds?: number[];
@@ -6551,6 +6605,11 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (parsed?.disposition === "uncertain") out.credentialSwitchUncertain = true;
     // Issue #3985: the clarification settlement applied; read only off the 200 ack.
     if (parsed?.disposition === "clarification_settled") out.clarificationSettled = true;
+    // Issue #4479: the follow-up finalize admission disposition, and the park sequence echoed on an
+    // awaiting_followup ACK. A positive safe integer only; anything else leaves it absent.
+    if (parsed?.disposition === "followup_finalize_admitted") out.followupFinalizeAdmitted = true;
+    const parkSeq = (parsed as { followup_park_seq?: unknown } | null)?.followup_park_seq;
+    if (typeof parkSeq === "number" && Number.isSafeInteger(parkSeq) && parkSeq > 0) out.followupParkSeq = parkSeq;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).

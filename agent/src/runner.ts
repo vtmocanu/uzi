@@ -30,7 +30,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, CHECKPOINT_PUBLICATION_WITHHELD_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, ReportPreconditionError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import { RequestError, ReportPreconditionError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE, FOLLOWUP_FINALIZE_ADMISSION_FEATURE, isFollowupFinalizeUnsupported } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -72,6 +72,7 @@ import type {
   CredentialFreeSettleOutcome,
   Executor,
   ExecutorResult,
+  FollowUpOutcome,
   RunContext,
   SecretRemediationDecision,
   WallParkOutcome,
@@ -144,6 +145,7 @@ import type {
   RunOwnershipResponse,
   StateAck,
   StateRequest,
+  FollowupFinalizeResult,
   PublicationHoldReason,
 } from "./protocol.js";
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
@@ -3301,6 +3303,8 @@ interface RunFlight {
     midRunTrigger?: { observation: number; tip: string };
     midRunSeq?: number;
   };
+  /** Issue #4479: how many times a followup_pending refusal re-armed this flight's follow-up wait. */
+  followUpPendingRearms?: number;
 }
 
 /** PRD #1390 M2a: the four run states a worker's ActiveSnapshot may report as a `phase`
@@ -6928,7 +6932,10 @@ export class RunRunner {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         await batcher.close().catch(() => undefined);
-      } else if (flight.active?.shuttingDown && !(err instanceof RetainedRecoveryStop)) {
+      } else if (flight.active?.shuttingDown && !(err instanceof RetainedRecoveryStop) &&
+          !(err instanceof ServerWallParkedError)) {
+        // A confirmed server wall park keeps its clone, HOME and retirement path below,
+        // even if shutdown started after the ACK was parsed.
         // Issue #3767: a spend-limit terminal that arrives while the worker is already shutting down
         // takes this arm and sends no park request.
         if (err instanceof SpendLimitHoldError) {
@@ -14064,7 +14071,12 @@ export class RunRunner {
         // the context it captured), no hold, and on a running ACK no change to `running`. Any other
         // ACK takes the ordinary path below.
         const continuing = body.status === "pause_failed";
-        if (memory && body.status !== undefined && body.status !== "running" && !continuing && !settling) {
+        // Issue #4479: the follow-up finalize admission leaves the follow-up hold as it is until the
+        // server admits it: no retire and no new hold before the send. It is released below only on
+        // an admitted ACK, and never moves the snapshot phase before that.
+        const finalizing = body.status === "followup_finalize";
+        const finalizeToken = finalizing ? memory?.phaseToken : undefined;
+        if (memory && body.status !== undefined && body.status !== "running" && !continuing && !settling && !finalizing) {
           memory.running = false;
           memory.resumeReady = false;
           memory.epochReady = false;
@@ -14246,6 +14258,14 @@ export class RunRunner {
           }
         }
         if (settling && settled && flight.stateReportOrdinal === reportOrdinal) this.snapshotRegistry?.setPhase(runId, "awaiting_approval");
+        // Issue #4479: only an admitted ACK releases the follow-up hold and moves the snapshot phase to
+        // running (a snapshot still saying awaiting_followup would make the server's re-adopt drop an
+        // admitted run). Guarded by the report ordinal like the settlement above.
+        if (finalizing && ack.followupFinalize?.kind === "admitted") {
+          if (memory && finalizeToken && this.memoryRuntime!.commands.releasePhase(finalizeToken) &&
+              memory.phaseToken === finalizeToken && memory.context === finalizeToken.context) memory.phaseToken = undefined;
+          if (flight.stateReportOrdinal === reportOrdinal) this.snapshotRegistry?.setPhase(runId, "running");
+        }
         // Issue #3985: a new presentation at a later gate revision supersedes the pending revise.
         if (body.status === "awaiting_approval" && ack.applied === true && ack.status === "awaiting_approval" &&
             flight.pendingHumanRevision && (ack.gateRevision ?? 0) > flight.pendingHumanRevision.gateRevision)
@@ -17919,6 +17939,9 @@ export class RunRunner {
         // into a server-derived MAX(consumed) and strand the run: the last-DELIVERED id does
         // NOT advance during the round-trip (the follow-up waiter is armed only AFTER this
         // report returns, below), so the racing follow-up is excluded and its later wake wins.
+        // Issue #4479: the park sequence THIS park's ACK carried; local to this invocation, so a
+        // later park never reuses it. Unset on the skip path and on an api that does not send it.
+        let parkSeq: number | undefined;
         if (!steering.hasPendingFollowUpOutcome()) {
           // Read the ACK the same way askUser and the limit park do: the park TOOK only if
           // the server reports `awaiting_followup`. SetRunAwaitingFollowup (M2) matches
@@ -17935,6 +17958,7 @@ export class RunRunner {
               `${REASON_FOLLOWUP_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
             );
           }
+          parkSeq = ack.followupParkSeq;
           runLog.info("interactive task: awaiting follow-up", { run_id: runId });
         } else {
           // issue #559 M3: the SKIP path. A follow-up (or stop/cancel) is already buffered,
@@ -17974,7 +17998,14 @@ export class RunRunner {
             );
           }
         }
-        const outcome = await steering.awaitFollowUp(idleMs);
+        let outcome = await steering.awaitFollowUp(idleMs);
+        // Issue #4479: an idle or stopped end is about to finalize; move the server's awaiting_followup
+        // row back to running first, or the publication intent refuses it forever. Nothing changes
+        // without this park's sequence, the negotiated feature or a usable publication resume (the
+        // callee checks the last two before each send that follows no unknown send).
+        if (parkSeq !== undefined && outcome.kind === "ended" && (outcome.reason === "idle" || outcome.reason === "stopped")) {
+          outcome = await this.admitFollowUpFinalize(flight, outcome, idleMs, parkSeq, (body) => reportState(body));
+        }
         if (outcome.kind === "followup" && flight.workerMemory) flight.workerMemory.resumeReady = true;
         return outcome;
       },
@@ -18848,6 +18879,142 @@ export class RunRunner {
       finally {
         try { if (!flight.cancel.signal.aborted) flight.cancel.abort(reason); }
         finally { flight.steering.abortLifecycle(reason); }
+      }
+    }
+  }
+
+  /**
+   * Issue #4479: an interactive task park whose follow-up wait ended idle or stopped finalizes next, but
+   * the server still holds the run at awaiting_followup, where the publication intent refuses (it needs
+   * running). Ask the server to move the run back to running (`followup_finalize`, bound to the park
+   * sequence its park ACK carried) BEFORE the outcome reaches the executor. Only an `admitted` reply
+   * returns the finalize outcome; observing `running` through ownership never proves admission.
+   *
+   * `parkSeq` is local to one park. Before every send that follows no unknown send, the negotiated feature
+   * and a usable publication resume are re-checked; without them the outcome is returned untouched, as before, unless a cancel arrived.
+   * After a send whose reply is unknown the loop only ever resends (the server replay is idempotent)
+   * under the interrupts of the publication enrollment reconciliation: it never re-runs the park and
+   * never lets the finalize outcome through unconfirmed.
+   *
+   * An unconfirmed admission holds the flight indefinitely: it resends until a reply confirms it, or
+   * until a cancel, a shutdown, a lifecycle abort or a claim fence interrupts the loop. It publishes
+   * nothing meanwhile. An error thrown before any request is issued (the client's local guard) is never
+   * ambiguous: while no earlier send is unknown, the outcome returns untouched, as before. While the feature
+   * is absent after an unknown send nothing is resent (the loop only waits, and logs once per streak);
+   * sending resumes when a later heartbeat advert restores the feature.
+   */
+  private async admitFollowUpFinalize(
+    flight: RunFlight,
+    first: FollowUpOutcome,
+    idleMs: number,
+    parkSeq: number,
+    send: (body: StateRequest) => Promise<StateAck>,
+  ): Promise<FollowUpOutcome> {
+    const { runLog } = flight;
+    const cancelled: FollowUpOutcome = { kind: "ended", reason: "cancelled" };
+    let outcome: FollowUpOutcome = first;
+    let ambiguous = false;
+    let sentOnce = false;
+    let unsendableLogged = false;
+    // After an unknown send, a send the client refuses locally (feature gone) or an api that does not know
+    // the state leaves nothing to resend: say so once per streak.
+    const unsendable = (why: string): void => {
+      if (unsendableLogged) return;
+      unsendableLogged = true;
+      runLog.warn("interactive task: follow-up finalize is not being resent after an unconfirmed attempt; holding until it can be", { run_id: flight.runId, why });
+    };
+    const keep = (): void => {
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.stoppedSourceKept = true;
+    };
+    // The #3846 interrupt set. A cancel is not thrown: it becomes the cancelled outcome, which the
+    // executor raises as REASON_CANCELLED. A credential-switch abort after an unknown
+    // send is deliberately skipped (the park is never re-run, so it counts as unconfirmed).
+    const interrupted = (): boolean => {
+      try {
+        if (flight.steering.claimFence() !== undefined) throw new StaleClaimError();
+        if (flight.steering.isCancelled()) return true;
+        if (flight.active?.shuttingDown || this.shuttingDownGlobal) throw new Error("worker shutdown");
+        for (const lifecycle of this.retainedLifecycleSignals(flight)) {
+          if (ambiguous && lifecycle.aborted && lifecycle.reason instanceof CredentialSwitchSignal) continue;
+          lifecycle.throwIfAborted();
+        }
+      } catch (error) {
+        keep();
+        throw error;
+      }
+      return false;
+    };
+    for (;;) {
+      if (outcome.kind !== "ended" || (outcome.reason !== "idle" && outcome.reason !== "stopped")) return outcome;
+      const stopped = outcome.reason === "stopped";
+      // While no earlier send is unknown, a withdrawn feature or publication resume means today's behaviour.
+      // A cancel that arrived meanwhile still wins over that return.
+      if (!ambiguous && (!this.client.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) || !this.publicationResumeAvailable()))
+        return flight.steering.isCancelled() ? cancelled : outcome;
+      if (sentOnce) {
+        if (interrupted()) return cancelled;
+      } else if (flight.steering.isCancelled()) return cancelled;
+      sentOnce = true;
+      let result: FollowupFinalizeResult;
+      try {
+        const ack = await send({ status: "followup_finalize", followup_park_seq: parkSeq });
+        result = ack.followupFinalize ?? { kind: "unconfirmed" };
+        unsendableLogged = false;
+      } catch (error) {
+        if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop || error instanceof ServerWallParkedError) throw error;
+        if (error instanceof ReportPreconditionError) {
+          // Thrown by the client before any request: never ambiguous.
+          if (!ambiguous) return flight.steering.isCancelled() ? cancelled : outcome;
+          unsendable("client_precondition");
+          result = { kind: "unconfirmed" };
+        } else if (isFollowupFinalizeUnsupported(error)) {
+          // A rolled-back api that does not know the state: today's behaviour on the first send, and
+          // never a license to finalize once an earlier send might have applied.
+          if (!ambiguous) return flight.steering.isCancelled() ? cancelled : outcome;
+          unsendable("api_does_not_know_the_state");
+          result = { kind: "unconfirmed" };
+        } else if (this.isDefinitiveApiRefusal(error)) {
+          // The api will answer this the same way every time (ownership unknown): retain, report nothing.
+          keep();
+          throw new StaleClaimError();
+        } else if (error instanceof CredentialSwitchSignal && !ambiguous) {
+          throw error;
+        } else {
+          result = { kind: "unconfirmed" };
+          runLog.warn("interactive task: follow-up finalize send not confirmed; retrying", { run_id: flight.runId, error: errMessage(error) });
+        }
+      }
+      switch (result.kind) {
+        case "admitted":
+          runLog.info("interactive task: follow-up finalize admitted", { run_id: flight.runId, reason: outcome.reason });
+          return flight.steering.isCancelled() ? cancelled : outcome;
+        // A stale_claim reply never reaches here: the reportState closure throws StaleClaimError first.
+        case "refused": {
+          if (result.reason === "followup_finalize_refused")
+            throw new TrustedExecutionRefusal(`${REASON_FOLLOWUP_NOT_PARKED} (the server refused the follow-up finalize admission)`);
+          if (result.reason === "followup_pending" && stopped)
+            throw new TrustedExecutionRefusal(`${REASON_FOLLOWUP_NOT_PARKED} (the server reports a pending follow-up after a stop)`);
+          if (result.reason === "followup_pending") flight.followUpPendingRearms = (flight.followUpPendingRearms ?? 0) + 1;
+          runLog.info("interactive task: follow-up finalize refused; waiting again", {
+            run_id: flight.runId, reason: result.reason, followup_pending_rearms: flight.followUpPendingRearms ?? 0,
+          });
+          // A definite answer: the run is still parked. Wait again with a fresh idle window; a pending
+          // follow-up or cancel is delivered by the poll loop and resolves this wait.
+          ambiguous = false;
+          outcome = await flight.steering.awaitFollowUp(idleMs);
+          if (outcome.kind === "ended" && (outcome.reason === "idle" || outcome.reason === "stopped")) {
+            // The wait ended idle or stopped again: pay the backoff so the resend is bounded (a sticky
+            // stop returns at once).
+            await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs);
+          }
+          break;
+        }
+        case "unconfirmed":
+          ambiguous = true;
+          await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs);
+          break;
       }
     }
   }

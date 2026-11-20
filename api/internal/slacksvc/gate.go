@@ -116,6 +116,15 @@ var ErrReviseCapReached = errors.New("slack: plan revision limit reached")
 // free of a workersvc import.
 var ErrGateRevisionMismatch = errors.New("slack: plan gate revision changed")
 
+// ErrFollowUpFinalizing is the replier-facing translation of workersvc's ErrFollowUpFinalizing
+// (issue #4479): the interactive run's worker is finalizing it, so the follow-up was refused and
+// will not be delivered. Surfaced as an ephemeral rather than a silent drop. The adapter in main
+// translates it, keeping slacksvc free of a workersvc import.
+var ErrFollowUpFinalizing = errors.New("slack: run is finishing; follow-up not delivered")
+
+// followUpFinalizingText answers a threaded reply the finalizing run refused.
+const followUpFinalizingText = "That run is finishing; your follow-up was not delivered."
+
 // gateSupersededText answers a click or reply on a gate card that is no longer the live gate:
 // the anchor moved to a newer card, or the server refused the card's revision.
 const gateSupersededText = "This gate was superseded. Scroll down to the latest plan message."

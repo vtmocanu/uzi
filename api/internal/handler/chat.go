@@ -315,6 +315,9 @@ func (h *Handler) SteerChatRun(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "run has already finished")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):
 			httpx.Error(w, http.StatusConflict, "steering applies to issue runs, not chats")
+		case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+			// Issue #4479: the run's worker is finalizing it; the follow-up was not delivered.
+			httpx.ErrorReason(w, http.StatusConflict, "run is finishing; your follow-up was not delivered", "follow_up_finalizing")
 		default:
 			slog.Error("steer chat run", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

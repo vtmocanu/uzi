@@ -695,7 +695,7 @@ func (s *Service) SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID
 	if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: runID, Kind: "follow_up", Body: pgconv.TextOrNull(message),
 	}); err != nil {
-		return SubmitInputResult{}, err
+		return SubmitInputResult{}, mapFollowupFinalizingErr(err)
 	}
 	return SubmitInputResult{ServerSide: false}, nil
 }
