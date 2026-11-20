@@ -278,13 +278,16 @@ func TestCrossCheckLaneRoundsPinsStaleEarlierRoundLiveDB(t *testing.T) {
 	if err != nil || cc.Verdict != "pending" || cc.WaitCredited || cc.LeadClaimGeneration != mustRun(t, f.env, f.lead).ClaimGeneration {
 		t.Fatalf("stale attempt setup: %+v err=%v", cc, err)
 	}
-	f.placement(t, earlier, 0, true)
+	// Round 1's checker was claimed once, so its Codex claim provenance holds it for the recorded
+	// worker: it is not an ephemeral placement gap (a new worker is never admitted), and the
+	// recorded worker's zero claimable count isolates the stale-round refusal.
+	f.placement(t, earlier, 0, false)
 	f.refused(t, earlier, "cross_check")
 	// Give the run request a genuine legacy route and a free ordinary slot,
 	// so its refusal also isolates stale-round admission.
 	f.env.exec(`UPDATE workers SET max_cross_check_slots=NULL,max_concurrent_runs=2,
 		protocol_capabilities=array_remove(protocol_capabilities,'cross_check_lane_v1') WHERE id=$1`, f.worker.ID)
-	f.placement(t, earlier, 0, true)
+	f.placement(t, earlier, 0, false)
 	f.refused(t, earlier, "run")
 	after, err := f.env.q.GetExactPlanCrossCheck(f.env.ctx, store.GetExactPlanCrossCheckParams{LeadRunID: f.lead, Round: 1})
 	if err != nil || !reflect.DeepEqual(cc, after) {

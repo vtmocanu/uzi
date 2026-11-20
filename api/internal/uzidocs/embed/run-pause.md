@@ -135,7 +135,9 @@ DM because it is not a status transition; its reason is in the activity feed.
 
 - If that same worker is still alive, it picks the run back up and
   **continues the same session where it stopped — no re-planning.**
-- If the worker is gone, another worker claims the run, **recovers the
+- If the worker is gone, another worker claims the run (a Codex run that has
+  been claimed once is the exception: it stays held for its last worker until
+  that worker returns or you cancel it, and no worker may take a legacy run with no recorded provenance, see [Codex runs held for their last worker](./run-recovery.md#codex-runs-held-for-their-last-worker)), **recovers the
   branch from the pushed checkpoint, and re-plans only the milestones that
   weren't finished yet** — the ones already done stay done, from the plan
   you already approved.

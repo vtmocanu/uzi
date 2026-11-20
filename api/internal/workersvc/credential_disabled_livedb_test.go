@@ -205,11 +205,11 @@ func TestCodexClaimCredentialDisabledCustodyLiveDB(t *testing.T) {
 	}
 	fx.assertNoClaudeFallback(t, payload)
 	r := assertHeld(t, env, fx.runID, true)
-	if r.FailOrigin.Valid || r.RecoveryWaitCause.Valid || len(r.CodexCapHash) != 0 || r.WorkerID != pgconv.UUID(fx.workerB) {
+	if r.FailOrigin.Valid || r.RecoveryWaitCause.Valid || len(r.CodexCapHash) != 0 || r.WorkerID != pgconv.UUID(fx.workerA) {
 		t.Fatalf("park: origin=%v cause=%v cap=%x worker=%v", r.FailOrigin, r.RecoveryWaitCause, r.CodexCapHash, r.WorkerID)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 
 	env.exec(`UPDATE user_secrets SET disabled_at = NULL WHERE id = $1`, fx.aliasID)
 	fx.svc.SetBackground(func(fn func()) { fn() })
@@ -260,7 +260,7 @@ func TestFinishRunClaimCredentialDisabledStaleLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ClaimRun: %v", err)
 			}
-			id := claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true}
+			id := claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true}
 			tc.stale(env, fx, &run, &id)
 			before := mustRun(t, env, fx.runID)
 			payload, err := fx.svc.finishRunClaim(env.ctx, run, nil, errCredentialDisabled, id)
@@ -273,7 +273,7 @@ func TestFinishRunClaimCredentialDisabledStaleLiveDB(t *testing.T) {
 				t.Fatalf("stale claim mutated the run: status %s->%s hold=%v", before.Status, after.Status, after.HoldReason)
 			}
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 		})
 	}
 }
@@ -314,7 +314,7 @@ func TestFinishRunClaimCredentialDisabledRollbackLiveDB(t *testing.T) {
 	before := mustRun(t, env, fx.runID)
 	svc := New(parkFenceSkewStore{Store: env.q, pool: env.pool}, env.box, testParams())
 	payload, err := svc.finishRunClaim(env.ctx, run, nil, errCredentialDisabled,
-		claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+		claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 	if payload != nil || !errors.Is(err, errClaimRecoveryStale) {
 		t.Fatalf("finishRunClaim = (%v, %v), want (nil, errClaimRecoveryStale)", payload != nil, err)
 	}
@@ -322,7 +322,7 @@ func TestFinishRunClaimCredentialDisabledRollbackLiveDB(t *testing.T) {
 	if after.Status != "claimed" || after.HoldReason.Valid || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
 		t.Fatalf("partial park: status=%s hold=%v", after.Status, after.HoldReason)
 	}
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 }
 

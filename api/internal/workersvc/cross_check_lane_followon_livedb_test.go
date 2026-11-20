@@ -159,7 +159,8 @@ func TestCrossCheckLaneInheritedFencesLiveDB(t *testing.T) {
 					t.Fatal("released generation restored")
 				}
 			case "released-reclaim":
-				f.env.exec("UPDATE runs SET claim_generation=3,claim_released_at=now() WHERE id=$1", f.runID)
+				seedClaimProvenance(t, f.env.ctx, f.env.pool, f.env.exec, f.runID, f.workerID, 3)
+				f.env.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", f.runID)
 				p := laneClaim(t, f, "cross_check", nil)
 				if p == nil || p.ClaimGeneration != 4 {
 					t.Fatal("reclaim generation not incremented")

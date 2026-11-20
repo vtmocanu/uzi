@@ -46,7 +46,7 @@ func claimCodexForPark(t *testing.T, env codexTestEnv) (*codexClaimFix, store.Wo
 	fx.svc.p.RunLimitMaxWaits = 5
 	fx.svc.p.RunLimitMaxPark = 8 * 24 * time.Hour
 	env.exec("UPDATE runs SET wait_on_limit = true WHERE id = $1", fx.runID)
-	env.exec("UPDATE workers SET anthropic_bind_mode = 'auto' WHERE id = $1", fx.workerB)
+	env.exec("UPDATE workers SET anthropic_bind_mode = 'auto' WHERE id = $1", fx.workerA)
 	w := fx.claimant(t, true)
 	p, err := fx.svc.Claim(env.ctx, w, nil)
 	if err != nil || p == nil || p.Secrets.Codex == nil {

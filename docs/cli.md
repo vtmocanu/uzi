@@ -4473,7 +4473,15 @@ finalization can open a new streak.
 The hold retains the claim, worker affinity and the issue lock for issue
 runs. Clone and HOME stay on the worker. Recovery depends on surviving
 worker storage or an available verified recovery copy; it does not promise
-that unpublished latest edits are available on another worker.
+that unpublished latest edits are available on another worker. A Codex run that
+has been claimed once is held for its last worker and is never offered to another;
+when its claimant provenance is valid, wait for that worker or follow the health
+reason's restart advice. Runs claimed before this deployment have no recorded
+claimant (no backfill): waiting cannot enable a fresh claim, even by their last
+worker. An existing flight may continue through readoption under the existing
+fences; otherwise cancel with `uzi run cancel <id>`. Cancellation does not itself
+release custody
+([details](./run-recovery.md#codex-runs-held-for-their-last-worker)).
 `run wait` prints the provider retry/hold notice and continues waiting
 through `paused` unless `--until paused` is selected.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
