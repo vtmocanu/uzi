@@ -407,9 +407,9 @@ func (f *effFix) startRoute(body string) (done <-chan routeResult, exited <-chan
 	return d, e
 }
 
-// waitBlockedBy polls until the route's backend (the first pid on pids) is waiting on a lock held
+// waitRouteBlockedBy polls until the route's backend (the first pid on pids) is waiting on a lock held
 // by wpid, and returns that pid.
-func waitBlockedBy(ctx context.Context, t *testing.T, f *effFix, pids <-chan int32, done <-chan routeResult, wpid int32) int32 {
+func waitRouteBlockedBy(ctx context.Context, t *testing.T, f *effFix, pids <-chan int32, done <-chan routeResult, wpid int32) int32 {
 	t.Helper()
 	var npid int32
 	select {
@@ -478,7 +478,7 @@ func TestModelSettingsUserLockAllowsConcurrentPinInsertLiveDB(t *testing.T) {
 	done, exited := f.startRoute(`{"default_effort":"high","cross_check_pins":[{"stage":"code","harness":"claude","model":"opus"}]}`)
 	defer finishW(ctx, wtx, exited)
 
-	npid := waitBlockedBy(ctx, t, f, pids, done, wpid)
+	npid := waitRouteBlockedBy(ctx, t, f, pids, done, wpid)
 
 	// N is waiting on W while holding a FOR NO KEY UPDATE-strength lock on its users row (the explicit
 	// lock or its own earlier UPDATE). Lock ordering itself is pinned by the mirror-ordering test.
@@ -547,7 +547,7 @@ func TestModelSettingsUserLockOrdersMirrorReadAfterConcurrentWriterLiveDB(t *tes
 
 	done, exited := f.startRoute(`{"default_codex_model":"gpt-6-sol"}`)
 	defer finishW(ctx, wtx, exited)
-	waitBlockedBy(ctx, t, f, pids, done, wpid)
+	waitRouteBlockedBy(ctx, t, f, pids, done, wpid)
 	if err := wtx.Commit(ctx); err != nil {
 		t.Fatalf("W commit: %v", err)
 	}
