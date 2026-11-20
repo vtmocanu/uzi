@@ -1935,7 +1935,8 @@ chain in the diagram above, with no intervening `running`.
   See [ADR-1296](adr/1296-durable-run-recovery.md) and
   [ADR-2417](adr/2417-guarded-local-retention.md) for the dated amendments.
   The retained predecessor FINAL pass (#2969) stays disabled; its command-uid
-  writer-exclusion enablement contract, incomplete and pending owner decisions,
+  writer-exclusion enablement contract, incomplete and pending owner decisions or
+  missing mechanisms,
   is [ADR-4001](adr/4001-command-uid-writer-exclusion.md).
   Older/successor holds and unstamped older completions gain no completed-publication authority;
   failed/cancelled/parked runs and other kinds keep their existing policy.

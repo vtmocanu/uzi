@@ -63,7 +63,8 @@ pass may be enabled. One uzi run yields one PR, so the contract lands first.
 | (c) Worker-launched uid-10003 helpers | Every enumerated launch site | Confinement, or the runtime T-overlap veto, plus pinned resolution (H-A, defined in the mechanism section). |
 | (w) Worker-uid processes | Hold group `runner` and ambient setuid (`agent/templates/entrypoint.sh` `--ambient-caps -all,+setuid,+setgid`) | Part of the named TCB. Their writes to T are audited: only the pass's own effects and the ordinary paths. |
 | (d) Docker daemon and container writers | | Excluded by ineligibility (D4, D5). The ADR-1783/1786 residual is unchanged elsewhere. |
-| (e) Runner-uid writers outside T | A runner-uid process with cwd outside every target path: the 2026-11-06 escaped writer with no attempt marker or clone key, and also other runs' live Claude agents, which carry their own markers and are ignored by the quiescence scan when their cwd is outside T | The 2026-11-06 owner-accepted residual, unchanged. It never exempts a command-uid writer. Routes by which such a process enables a command-uid write (hardlink alias, rename in and out) are pending under P-1. |
+| (e) Runner-uid escaped writers | A runner-uid process with cwd outside every target path and no attempt marker or clone key | The 2026-11-06 owner-accepted residual, unchanged. It never exempts a command-uid writer. |
+| (e') Other runs' marked runner-uid agents | Other runs' live Claude agents: they carry their own markers and are ignored by the quiescence scan while their cwd is outside T | NOT covered by the accepted residual, which is limited to markerless processes. Pending under P-1, together with the routes (hardlink alias, rename in and out) by which any runner-uid process can enable a command-uid write. |
 
 No residual's disclosure, and no behaviour of the ordinary terminal FINAL,
 substitutes for the command-uid proof. The ordinary terminal FINAL keeps
@@ -90,7 +91,10 @@ posture is needed.
 
 ## Owner decisions (2026-11-20, owner decision via lead and buddy)
 
-D1 to D9 were each answered by the owner through this run's ask_user gates on 2026-11-20, with the answer recorded as "owner decision via lead and buddy". The later checker-raised questions (P-1 to P-5) reached no human and are not decided.
+D1 to D9 were each answered by the owner through this run's ask_user
+gates on 2026-11-20, with the answer recorded as "owner decision via lead
+and buddy". The later checker-raised questions (P-1 to P-5) reached no human
+and are not decided.
 
 **D1. Opt-in posture approved.**
 - The compound proof below is the enablement contract.
@@ -104,7 +108,9 @@ D1 to D9 were each answered by the owner through this run's ask_user gates on 20
 **D2. Descriptor transfer is closed by seccomp, not accepted as a residual.**
 - The mechanism is an unprivileged cmdsandbox seccomp filter that denies
   `socket(AF_UNIX)` and allows `socketpair`, for the restricted posture only.
-- Landlock ABI 6 alone is insufficient (a design assumption about Landlock ABIs, recorded with the owner's decision, that the implementation must confirm on the probed kernel). It scopes abstract sockets, but
+- Landlock ABI 6 alone is insufficient (a design assumption about Landlock
+  ABIs, recorded with the owner's decision, that the implementation must
+  confirm on the probed kernel). It scopes abstract sockets, but
   withholding socket-file creation does not stop a `connect` to an existing
   pathname socket. Pathname-connect control needs Landlock ABI 9.
 - Required, stated here:
@@ -174,16 +180,19 @@ predecessors only.**
   predecessor custody release.
 - Consequences:
   - A restarted container, any later pod, and a pod replaced after force
-    deletion are all ineligible to run their own pass. Ineligibility fences
-    only the replacement's own pass, not by any teardown claim. A's in-flight
+    deletion are all ineligible to run their own pass. That ineligibility
+    rests on attestation history, not on any teardown claim, and it fences
+    only the replacement's own pass. A's in-flight
     effects while a replacement runs are the D9 and P-2 problem, and stay
     gated there.
   - Posture stickiness: a PVC with a genesis record is permanently tied to the
     posture. The controller refuses any non-posture render on it, or such a
     render invalidates the genesis row so every later container is refused.
-    The history check reads every incarnation's boundary record, not only
-    attestations; under the posture both are mandatory, so an incarnation
-    without them makes the PVC ineligible.
+    Stickiness is enforced by the controller branch only: a worker-side
+    history check cannot detect an incarnation whose record write failed,
+    because boundary records are read by name and nothing lists all
+    incarnations. The P-5 per-incarnation server registration, once built,
+    is the listing source a history check would need.
   - Missing, unreadable or contradictory history refuses pre-entry.
 
 **D8. ReadWriteOncePod.**
@@ -386,8 +395,11 @@ only namespaced Roles plus one owner-authorized ClusterRole, `storageclasses`
 get (`deploy/chart/templates/worker-rbac.yaml`). A `persistentvolumes` get
 ClusterRole is therefore new read authority under requirement 4.
 
-**Recommendation:** approve a get-only ClusterRole on `persistentvolumes`,
-scoped by name where the API allows, for opted-in workers only. It is
+**Recommendation:** approve a get-only ClusterRole on `persistentvolumes`.
+In practice this is an unscoped, cluster-wide get: dynamically provisioned
+PV names exist only after the role does, so `resourceNames` cannot pre-scope
+it, and a ClusterRole binds to the controller's service account, not to
+opted-in workers. It is
 justified against the smaller options: the worker has no kube access, and no
 namespaced object carries the PV fields. **Alternative:** keep the gate. This
 is an owner decision under requirement 10.
@@ -402,13 +414,19 @@ established for this path, and it stays gated under D9's fallback.
 
 **Candidate mechanism (not yet sufficient).**
 - Every PROCESS_INCARNATION makes a durable, superseding server registration,
-  carried by its attestation, before its first uid-10003 launch.
-- A keeps T active in its registry until a replay settles an unknown release
-  outcome, so a client-side RPC timeout never drops T's protection.
-- This does not cover the root entrypoint's writes, which run before any node
-  code. Those are TCB writes (root, fixed code), but they are B activity under
-  D9.2. Closing them needs either a proof that they never touch T's content,
-  mode or namespace, or an owner decision classifying them.
+  carried by its attestation, before ANY of its activity that could write T,
+  not only before its first uid-10003 launch.
+- While A lives, it keeps T active in its registry until a replay settles an
+  unknown release outcome, so a client-side RPC timeout never drops T's
+  protection. This does nothing once A's process has died, because the
+  registry is in-process.
+- Activity that runs before that registration needs a disjointness proof or
+  an owner decision:
+  - the root entrypoint's writes, which run before any node code (TCB writes:
+    root, fixed code, but B activity under D9.2);
+  - worker-uid startup passes in `agent/src/main.ts` that run before
+    registration (today in `worker.run()`): pod-epoch consume and reclaim,
+    HOME reclaim and the job-workspace reap.
 
 ## Mechanism: the compound proof (requirement 1)
 
@@ -622,7 +640,9 @@ which is availability, never an integrity loss.
   - compose and Docker-capable lanes are ineligible;
   - a single-uid worker has no command uid, which the implementation must
     establish, else the worker is ineligible.
-- Postgres `fsync=on` and `synchronous_commit=on`, verified at API startup.
+- Postgres `fsync=on` and `synchronous_commit=on`, plus a single instance
+  or synchronous replication covering every promotable standby (see Server
+  durability).
 - CSI provisioning freshness (P-3, pending).
 
 ## Durability, serialization and recovery
@@ -722,15 +742,23 @@ lock.
   asynchronous unless synchronous replicas are configured. With asynchronous
   replication a failover can lose a committed supersession, release or
   genesis row after its ACK was sent. The posture therefore requires a single
-  instance or synchronous replication with at least one synchronous standby.
-  It also re-checks the effective settings with `SHOW` inside each fence
-  transaction, not only at startup, because `ALTER SYSTEM`, per-role or
-  per-database settings can change them later.
+  instance or synchronous replication whose quorum covers every standby that
+  failover may promote (or failover limited to synchronous standbys).
+  A settings `SHOW` cannot verify this: async replicas and a single instance
+  both show an empty `synchronous_standby_names`, and a reload between the
+  `SHOW` and the commit reopens a check-then-commit window. So:
+  - topology is checked from replication state (`pg_stat_replication`
+    `sync_state`) or controller-read cluster evidence, not from settings;
+  - each fence transaction forces `SET LOCAL synchronous_commit = on` rather
+    than checking it;
+  - whether a quorum can still lose an ACKed commit on failover is a hosted
+    owner-acceptance item.
 - **Storage or power loss.**
   - This relies on Postgres `fsync=on` and `synchronous_commit=on`.
   - These are defaults: no override was found in the chart values, the compose
     file or the store package, though that search was not exhaustive.
-  - The implementation verifies both at API startup, and otherwise refuses to
+  - The implementation verifies `fsync` at API startup and forces
+    `synchronous_commit` per fence transaction, and otherwise refuses to
     enable the posture.
 
 **Recovered state.**
@@ -807,7 +835,7 @@ Absence is never inferred.
 | Server generation | Superseded, not current |
 | Release fence | Refusal (STOP) |
 | Committed release replay | Returns the original ACK, never "custody kept" |
-| Postgres durability settings | Not verified |
+| Postgres durability settings and replication topology | Not verified, or topology not single-instance or covered synchronous |
 | Unorderable lane or startup path | Gated |
 
 ## Authority (requirement 4)
@@ -823,7 +851,7 @@ Absence is never inferred.
   named.
 - **Server mechanisms.** The server fence, lease and genesis only add
   refusals and waits.
-- **Owner-approved:** D1, D2, D5, D7, D8 and D9.
+- **Owner-approved:** D1 to D9 (those adding or bounding authority: D1, D2, D5, D7, D8, D9).
 - **Pending:** P-1 to P-5.
 
 ## Authority interface (requirement 9)
@@ -977,7 +1005,7 @@ may already hold on base.
   - a legacy PVC;
   - hostPID evidence;
   - missing Landlock or seccomp;
-  - a claim without controller genesis, or with an extra pre-existing entry.
+  - a claim without controller genesis.
 - A symlink-swap racer against each unconfined helper.
 - A record-write failure blocking every uid-10003 launch.
 - A replacement pod after force deletion is ineligible.
@@ -1038,8 +1066,10 @@ this ADR:
 - P-2 by a proof that every local predecessor effect is non-authoritative and
   harmless with B running, plus an owner decision accepting that deviation, or
   by a local-write fence (none exists today);
-- P-5 by the per-incarnation superseding registration, plus a proof or an
-  owner decision for the root entrypoint's writes.
+- P-5 by the per-incarnation superseding registration ordered before any
+  activity that could write T, the live-A registry rule, and a disjointness
+  proof or owner decision for every pre-registration startup write (root
+  entrypoint and worker-uid startup passes).
 Approval alone does not close P-2 or P-5.
 
 **Dependencies:**
@@ -1058,7 +1088,9 @@ Approval alone does not close P-2 or P-5.
   - spawn-wrapper gating keyed on the resolved uid;
   - the fence init container;
   - a durable, superseding server registration by every PROCESS_INCARNATION
-    before its first uid-10003 launch (P-5).
+    before any activity that could write T (P-5);
+  - keeping T active in a live A's registry until replay settles an unknown
+    release outcome (P-5).
 - **Controller side.**
   - the controller genesis record at claim creation, with provenance checks
     and `volumeHandle` uniqueness;
