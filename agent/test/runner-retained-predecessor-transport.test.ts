@@ -9,7 +9,7 @@
 // generation-2 source), exactly as runner-retained-predecessor-final.test.ts does; only the per-record operation is
 // real here instead of stubbed. Two exact-hold facts (the list and the exact-hold GET) are served by the fake api too, so a
 // failed grant-2 observation is produced by api data, not by a stub.
-import { afterEach, it } from "node:test";
+import { afterEach, it as nodeIt } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -27,6 +27,12 @@ import { fixtureFetchTracking, fixtureTrackingOptions } from "./runner-tracking-
 import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
+
+// issue #4528: RunRunner.settlePredecessorHolds returns "proceed" before any predecessor work off Linux (its
+// `process.platform !== "linux"` gate), so no case here can hold elsewhere; every case is skipped there, with this reason.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "the retained predecessor FINAL pass is Linux-only (RunRunner.settlePredecessorHolds platform gate)" : false;
+const it = (name: string, fn: () => Promise<void>): void => { nodeIt(name, { skip: LINUX_ONLY }, fn); };
 
 const JOURNAL_KEY = "fixture-journal-key";
 const REPO_ID = "00000000-0000-4000-8000-000000002969";
@@ -268,6 +274,8 @@ async function drive(o: Opts = {}) {
   const runner = runnerWith(make, fakeGitlab().gitlab, JOURNAL_KEY, logs.logger, {
     recoveryRetryMs: 1, quiesceRun: quiesceRunAttempt, codexBoundaryDeadlineMs: CODEX_BOUNDARY_MS,
     predecessorFinalForTests: true, // the pass is disabled in production (issue #2969 fallback)
+    // issue #4528: the blocker write in fail() keeps the production budget; every other boundary stays at CODEX_BOUNDARY_MS.
+    retainedBlockerPersistDeadlineMs: 30_000,
     ...(o.budget ? { predecessorFinalBudgetMs: o.budget } : {}),
   } as never);
   const recovery = Reflect.get(runner, "recovery") as RecoveryCoordinator;
@@ -315,6 +323,8 @@ const failedReports = (r: Result) => api.states.filter(s => s.runId === r.claim.
 
 /** The retained recovery stopped before any successor: custody and the predecessor stay exactly as they were. */
 function assertStopped(r: Result, reason?: RegExp): void {
+  const unpersisted = logged(r, "retained recovery blocker could not be persisted");
+  assert.deepEqual(unpersisted, [], "the blocker write landed (issue #4528: its bounded operation did not expire)");
   assert.equal(r.events.includes("prepare"), false, "no successor was prepared");
   assert.equal(r.models(), 0, "no model call");
   assert.ok(failedReports(r).length > 0, "the claim ended with the custody-retaining failed report");
@@ -611,6 +621,30 @@ for (const [name, reason, setup, arm] of integrity) {
     assert.equal(r.events.filter(e => e.startsWith("operate:")).length, 1);
   });
 }
+
+// issue #4528: a slow blocker write in fail() (a loaded CI shard) must still land. The write runs inside its own bounded
+// recovery operation; with the test's 1s Codex boundary as that bound, a write slower than 1s expired and the journal
+// stayed at `captured`. The delay is installed once the world exists and strikes only the stop's quiescence_failed write.
+it("integrity (auth loss) stop whose blocker write is slower than the Codex boundary still persists blocked", async () => {
+  let world!: Pre;
+  let delayed = 0;
+  const r = await drive({
+    arrange: (server, w) => {
+      world = w;
+      integrity.find(([name]) => name === "auth loss on the record after selection")![3]!(server, () => world);
+      const block = git.blockRecoveryEpisode;
+      git.blockRecoveryEpisode = async function (this: typeof git, ...args: Parameters<typeof block>) {
+        if (args[4] === "quiescence_failed") { delayed++; await sleep(CODEX_BOUNDARY_MS + 500); }
+        return block.apply(this, args);
+      };
+      cleanups.push(() => { git.blockRecoveryEpisode = block; });
+    },
+  });
+  assert.equal(delayed, 1, "the stop's blocker write was the delayed one");
+  assertStopped(r, /integrity:record_unauthenticated/);
+  assert.equal(postsOf(r, "release").length, 0, "no FINAL after the integrity failure");
+  assert.equal(r.server.released.has(2), false, "the api's hold is still open");
+});
 
 it("an integrity failure combined with a typed quota error on another candidate still stops", async () => {
   let world!: Pre;

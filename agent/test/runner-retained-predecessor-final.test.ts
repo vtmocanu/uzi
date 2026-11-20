@@ -3,7 +3,7 @@
 // real runFreeCapture -> registerPredecessorBoundary -> proveInventorySources chain; only the coordinator's per-record
 // operation (operateFrozenInventory with a predecessor scope) is replaced by a stub that enters the runner's boundary
 // exactly as the coordinator does, so each test chooses the outcome the coordinator would report.
-import { afterEach, it } from "node:test";
+import { afterEach, it as nodeIt } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -23,6 +23,12 @@ import { FakeCodexExecutor, codexRig } from "./runner-codex-sinks-fixture.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
+
+// issue #4528: RunRunner.settlePredecessorHolds returns "proceed" before any predecessor work off Linux (its
+// `process.platform !== "linux"` gate), so no case here can hold elsewhere; every case is skipped there, with this reason.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "the retained predecessor FINAL pass is Linux-only (RunRunner.settlePredecessorHolds platform gate)" : false;
+const it = (name: string, fn: () => Promise<void>): void => { nodeIt(name, { skip: LINUX_ONLY }, fn); };
 
 const JOURNAL_KEY = "fixture-journal-key";
 const REPO_ID = "00000000-0000-4000-8000-000000002969";
@@ -146,6 +152,8 @@ async function drive(o: Opts = {}) {
   const runner = runnerWith(make, fakeGitlab().gitlab, JOURNAL_KEY, logs.logger, {
     recoveryRetryMs: 1, quiesceRun, codexBoundaryDeadlineMs: CODEX_BOUNDARY_MS,
     predecessorFinalForTests: true, // the pass is disabled in production (issue #2969 fallback)
+    // issue #4528: the blocker write in fail() keeps the production budget; every other boundary stays at CODEX_BOUNDARY_MS.
+    retainedBlockerPersistDeadlineMs: 30_000,
     ...(o.budget ? { predecessorFinalBudgetMs: o.budget } : {}),
     ...o.runnerOpts,
   } as never);
@@ -203,6 +211,8 @@ function logged(r: Result, msg: string): Array<Record<string, any>> {
 }
 /** The retained recovery stopped before any successor: custody and the predecessor stay exactly as they were. */
 function assertStopped(r: Result): void {
+  const unpersisted = logged(r, "retained recovery blocker could not be persisted");
+  assert.deepEqual(unpersisted, [], "the blocker write landed (issue #4528: its bounded operation did not expire)");
   assert.equal(r.events.includes("prepare"), false, "no successor was prepared");
   assert.equal(r.models(), 0, "no model call");
   assert.ok(failedReports(r).length > 0, "the claim ended with the custody-retaining failed report");
