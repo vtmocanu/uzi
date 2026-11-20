@@ -5505,7 +5505,7 @@ SELECT EXISTS (
 -- awaiting_followup -> running for exactly the park the worker observed (followup_park_seq echoed
 -- from the park ACK) and stamps followup_finalize_generation = claim_generation, which the
 -- runs_followup_park_identity_trg and run_user_inputs_followup_finalize_trg triggers (migration
--- 00492) read to refuse a re-park and a later owner follow-up for this claim.
+-- 00495) read to refuse a re-park and a later owner follow-up for this claim.
 --
 -- Modelled on SettleRunClarificationToGate: one fenced statement, SetRunRunning is NOT relaxed (its
 -- Decision-7 wake guard keeps requiring a follow-up newer than the watermark). Deliberately
