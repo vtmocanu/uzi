@@ -141,7 +141,7 @@ function Rows({ view }: { view: SchedulePreviewView }) {
     <>
       {h && (
         <Row label="Harness" value={h.chosenAtCreate ? "chosen when it fires" : h.value}>
-          {h.chosenAtCreate ? notes : [h.source, h.timing, notes].filter(Boolean).join(" · ")}
+          {[h.source, h.timing, notes].filter(Boolean).join(" · ")}
         </Row>
       )}
       {h?.chosenAtCreate &&

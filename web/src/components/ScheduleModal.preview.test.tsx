@@ -159,7 +159,9 @@ describe("schedule modal preview", () => {
     mockApi.previewScheduleSettings.mockResolvedValue(p);
     renderModal();
     const r = await readyRegion();
-    expect(within(r).getByText("chosen when it fires")).toBeTruthy();
+    const harnessDetail = within(r).getByText("chosen when it fires").nextElementSibling!;
+    expect(harnessDetail.textContent).toContain("chosen when the run is created");
+    expect(harnessDetail.textContent).toContain("predicted · fixed when it fires");
     expect(within(r).getByText("Claude model")).toBeTruthy();
     expect(within(r).getByText("Codex model")).toBeTruthy();
     expect(within(r).getByText(p.alternatives![1].worker_model!.resolved_model)).toBeTruthy();
