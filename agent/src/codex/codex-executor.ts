@@ -1573,6 +1573,8 @@ export interface CodexToolHandlerDeps {
   readonly log: Logger;
   /** The run's live-stream emit (the findings tool emits a `finding` card through it). */
   readonly emit: (msg: EmittedMessage) => void;
+  /** The run's text redactor (ctx.redactText); absent means identity. */
+  readonly redactText?: (s: string) => string;
   /** The run's GRANTED skills (ctx.skills). The Skill handler returns the sanitized
    *  body/description of the requested granted skill; the broker has ALREADY gated the
    *  call on `allowedSkills` before the handler is reached. */
@@ -1600,7 +1602,7 @@ export interface CodexToolHandlerDeps {
  *     mismatch a latent inconsistency — it is deliberately NOT registered.
  */
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
-  const { client, runId, log, emit, skills } = deps;
+  const { client, runId, log, emit, skills, redactText } = deps;
   const map = new Map<string, ToolHandler>();
   if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, async args => {
     const reply = await readCIEvidence(deps.ciEvidence!, args);
@@ -1615,14 +1617,14 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
 
   // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
   // allowedTools gate stops a subagent reaching this handler regardless).
-  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration });
+  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration, redactText });
   map.set(
     memoryToolNames()[0]!,
     (args) => memHandlers.saveMemory(args as Parameters<MemoryToolHandlers["saveMemory"]>[0]),
   );
 
   // findings (granted to the lead AND every subagent — stays in the subagent base).
-  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log });
+  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log, redactText });
   map.set(
     reportIncidentalIssueToolName(),
     (args) => findingsHandlers.reportIncidentalIssue(args as Parameters<FindingsToolHandlers["reportIncidentalIssue"]>[0]),
@@ -1631,7 +1633,7 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
   // forge (8 tools; the 6 reads + 2 writes share the ONE per-run budget in makeForgeToolHandlers).
   // An explicit [suffix, handler] table so a rename cannot silently misalign the map; the
   // qualified keys equal forgeToolNames() by construction (same FORGE_SERVER_NAME + suffixes).
-  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log });
+  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log, redactText });
   const forgeEntries: ReadonlyArray<readonly [suffix: string, handler: ToolHandler]> = [
     ["get_issue", (a) => forgeHandlers.getIssue(a as Parameters<ForgeToolHandlers["getIssue"]>[0])],
     ["list_issues", (a) => forgeHandlers.listIssues(a as Parameters<ForgeToolHandlers["listIssues"]>[0])],
@@ -3804,6 +3806,7 @@ export class CodexExecutor implements Executor {
         claimGeneration: ctx.claimGeneration,
         log: this.log,
         emit: (msg) => ctx.emit(msg),
+        redactText: ctx.redactText,
         skills: ctx.skills ?? [],
         ciEvidence: ctx.ciEvidence,
         codeCrossCheck: codeCrossCheckAccess(ctx),

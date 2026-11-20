@@ -2016,6 +2016,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         claimGeneration: ctx.claimGeneration,
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
       // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
       // run-scoped, so the server needs only the client + runId — no RunContext
@@ -2029,6 +2030,7 @@ export class SdkExecutor implements Executor {
         client: this.client,
         runId: ctx.runId,
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
       // PRD #333 M2: the incidental-findings capture tool (mcp__findings__report_-
       // incidental_issue). A PLAIN working tool (POST → emit card → ack, turn
@@ -2043,6 +2045,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         emit: (m) => ctx.emit(m),
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
     }
 

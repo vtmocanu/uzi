@@ -20003,11 +20003,12 @@ export class GitCache {
       for (const hit of hits) {
         let commit = hit.type === "commit" ? hit.oid : range.tip;
         // Attribution is best effort and bounded by the scan deadline: once it is spent the finding names the tip.
-        if (hit.type !== "commit" && remaining() > 0) {
+        const attributionLeftMs = remaining();
+        if (hit.type !== "commit" && attributionLeftMs > 0) {
           try {
             const log = await this.execScoped("git", withDir(barePath, [
               "--no-replace-objects", "log", "-m", "--reverse", "--format=%H", `--find-object=${hit.oid}`, ...revs,
-            ]), { env: gitEnv(), timeout: remaining(), maxBuffer: 1024 * 1024 });
+            ]), { env: gitEnv(), timeout: attributionLeftMs, maxBuffer: 1024 * 1024 });
             const first = log.stdout.split("\n").find((l) => SHA40_RE.test(l.trim()));
             if (first) commit = first.trim();
           } catch (err) {
