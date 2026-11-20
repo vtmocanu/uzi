@@ -38,6 +38,19 @@ describe("classifyBareFootprint", () => {
     }
   });
 
+  it("accepts a refusal stage ref only for the refusal cleanup op, capturing its generation", () => {
+    const ref = "refs/uzi-incoming/run_1-a/3/refused-abc.1";
+    assert.deepEqual(classifyBareFootprint(`refusal-cleanup-delete-ref: ${ref}`),
+      { deletionClass: "refusal-cleanup-delete-ref", subjectRun: "run_1-a", generation: 3 });
+    for (const op of ["recovery-pin-delete-ref", "recovery-pin-archive-delete-ref", "recovery-cleanup-delete-ref", "owed-reconcile-delete-ref"]) {
+      assert.deepEqual(classifyBareFootprint(`${op}: ${ref}`), unparsed);
+    }
+    for (const bad of ["refs/uzi-incoming/run1/x/name", "refs/uzi-incoming/run1/3", "refs/uzi-incoming/run1/3/a/b",
+      "refs/uzi-incoming/run1/-1/name", `refs/uzi-owed/run1/${SHA}`]) {
+      assert.deepEqual(classifyBareFootprint(`refusal-cleanup-delete-ref: ${bad}`), unparsed, bad);
+    }
+  });
+
   it("rejects a pin ref for the reconcile op", () => {
     assert.deepEqual(classifyBareFootprint("owed-reconcile-delete-ref: refs/uzi-recovery-pin/run1/1"), unparsed);
   });

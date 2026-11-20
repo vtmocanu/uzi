@@ -4368,8 +4368,8 @@ function parseRefusalLedger(v: unknown): RefusalLedger | undefined {
   const seen = new Set<string>();
   for (const e of v.entries as unknown[]) {
     if (!refusalKeys(e, "generation,path,sha") || !refusalGeneration(e.generation, 0) || !refusalOid(e.sha) ||
-        !(REFUSAL_PATHS as readonly unknown[]).includes(e.path) || seen.has(e.sha)) return undefined;
-    seen.add(e.sha);
+        !(REFUSAL_PATHS as readonly unknown[]).includes(e.path) || seen.has(`${e.generation}:${e.sha}`)) return undefined;
+    seen.add(`${e.generation}:${e.sha}`);
   }
   return { runId: v.runId, branch: v.branch, barePath: v.barePath, entries: v.entries as RefusalEntry[] };
 }
@@ -4409,6 +4409,18 @@ function refusalFileGenerations(names: string[], prefix: string, runId: string):
   const out: number[] = [];
   for (const n of names) { const m = pattern.exec(n); if (m) out.push(Number(m[1])); }
   return out;
+}
+const REFUSAL_TEMP_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Whether a leftover `.tmp-*` entry of `info/uzi-refusals` blocks `runId`. A refusal-directory writer names its
+ *  temp `.tmp-<runId>-<uuid>`; run ids may contain `-`, so the uuid is peeled off the END of the name. Only a temp
+ *  that is positively another run's (a valid run id plus a uuid) is ignored: this run's own temp, and any temp
+ *  without a recognisable run tag (including the untagged `.tmp-<uuid>` form), fails closed. */
+function refusalTempBlocks(name: string, runId: string): boolean {
+  if (!name.startsWith(".tmp-")) return false;
+  const uuidAt = name.length - 36;
+  if (uuidAt < 6 || name[uuidAt - 1] !== "-" || !REFUSAL_TEMP_UUID.test(name.slice(uuidAt))) return true;
+  const tag = name.slice(5, uuidAt - 1);
+  return tag === runId || !OWED_RUN_ID.test(tag);
 }
 
 export type InventoryReadCause =
@@ -29418,9 +29430,13 @@ try {
   }
 
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
-  private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<void> {
+  private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed",
+    runId?: string): Promise<void> {
     const dir = await this.ensureOwedDirectory(barePath, directoryName);
-    const temp = path.join(dir, `.tmp-${randomUUID()}`);
+    // issue #4481: a refusal-directory temp carries its run, so a stranded temp of one run never blocks another;
+    // the uzi-owed validator accepts only `.tmp-<uuid>`, so that directory keeps the untagged name.
+    const temp = path.join(dir, directoryName === REFUSAL_DIRECTORY && runId !== undefined
+      ? `.tmp-${runId}-${randomUUID()}` : `.tmp-${randomUUID()}`);
     const file = await fs.open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT |
       fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
     try {
@@ -29505,6 +29521,17 @@ try {
       const outcome = await this.recordRefusalUnderLock(c, sha, refusalPath);
       throw new OwedCandidateLimitError(sha, outcome.sealed, outcome.alreadyLedgered);
     }
+    // issue #4481: the pin that fills the cap is preceded by the durable owed-path marker, so a restarted
+    // process can tell that this generation once stood at the cap even when every other record is lost. A
+    // failed write refuses the pin as a generic preservation failure, never as the cap.
+    if (!held.includes(ref) && held.length + 1 >= this.maxOwedCandidates) {
+      try { await this.ensureOwedPathMarker(c); }
+      catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        throw new Error("owed path marker write failed", { cause });
+      }
+    }
     await this.persistOwedContext(c); // Durable discovery precedes the first pin.
     const context = this.contextName(c);
     const name = `candidate-${c.runId}-${sha}-${context.slice(8, -5)}.json`;
@@ -29558,15 +29585,75 @@ try {
     return names.sort();
   }
 
-  /** Every ref under `refs/uzi-incoming/<run>/`; a ref of any other shape is unattributable and throws. */
+  /** Every ref under `refs/uzi-incoming/<run>/`; a ref of any other shape is unattributable and throws. The
+   *  listing is only trusted when git says nothing on stderr, the ref backend is the files backend, and every
+   *  loose ref file under the run's directory is a plain 40-hex ref that the listing shows with the same oid
+   *  (so a broken, symbolic, symlinked or unlisted loose ref that git declined to list cannot hide evidence).
+   *  Callers map a throw to fail-closed (gate: ineligible, cleanup plan: retain). */
   private async refusalStages(barePath: string, runId: string): Promise<RefusalStage[]> {
-    const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-incoming/${runId}/`]);
+    const { stdout, stderr } = await this.execScoped("git", withDir(barePath, ["for-each-ref",
+      "--format=%(refname) %(objectname)", `refs/uzi-incoming/${runId}/`]), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+    if (String(stderr ?? "") !== "") throw new Error("refusal stage listing wrote to stderr");
     const pattern = new RegExp(`^(refs/uzi-incoming/${runId}/(0|[1-9][0-9]*)/[A-Za-z0-9._-]+) ([0-9a-f]{40})$`);
-    return out.split("\n").filter(Boolean).map((line) => {
+    const stages = stdout.split("\n").filter(Boolean).map((line) => {
       const m = pattern.exec(line);
       if (!m) throw new Error("unattributed refusal stage ref");
       return { ref: m[1]!, generation: Number(m[2]), sha: m[3]! };
     });
+    await this.assertRefusalLooseRefs(barePath, runId, new Map(stages.map((s) => [s.ref, s.sha])));
+    return stages;
+  }
+
+  /** The files-backend check and a bounded, no-follow walk of `<bare>/refs/uzi-incoming/<run>/`. */
+  private async assertRefusalLooseRefs(barePath: string, runId: string, listed: Map<string, string>): Promise<void> {
+    const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      if ((nl < 0 ? item : item.slice(0, nl)).toLowerCase() === "extensions.refstorage") throw new Error("refusal stages: non-files ref backend");
+    }
+    try {
+      await fs.lstat(path.join(barePath, "reftable"));
+      throw new Error("refusal stages: non-files ref backend");
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+    }
+    const isDirectory = async (p: string): Promise<boolean> => {
+      try {
+        const st = await fs.lstat(p);
+        if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("refusal stages: unsafe ref directory");
+        return true;
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw cause;
+      }
+    };
+    const rootRef = `refs/uzi-incoming/${runId}`;
+    for (const ancestor of ["refs", "refs/uzi-incoming", rootRef]) {
+      if (!await isDirectory(path.join(barePath, ancestor))) return;
+    }
+    let entries = 0;
+    const walk = async (rel: string, depth: number): Promise<void> => {
+      if (depth > 3) throw new Error("refusal stages: loose ref tree too deep");
+      for (const name of await fs.readdir(path.join(barePath, rel))) {
+        if (++entries > 4096) throw new Error("refusal stages: loose ref entry budget");
+        const child = `${rel}/${name}`;
+        const full = path.join(barePath, child);
+        const st = await fs.lstat(full);
+        if (st.isSymbolicLink()) throw new Error("refusal stages: symlinked loose ref");
+        if (st.isDirectory()) { await walk(child, depth + 1); continue; }
+        if (!st.isFile() || st.size !== 41) throw new Error("refusal stages: unreadable loose ref");
+        const handle = await fs.open(full, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+        let text: string;
+        try {
+          const opened = await handle.stat();
+          if (!opened.isFile() || opened.size !== 41) throw new Error("refusal stages: unreadable loose ref");
+          text = (await handle.readFile()).toString("latin1");
+        } finally { await handle.close(); }
+        if (!/^[0-9a-f]{40}\n$/.test(text)) throw new Error("refusal stages: malformed loose ref");
+        if (listed.get(child) !== text.slice(0, 40)) throw new Error("refusal stages: loose ref differs from the listing");
+      }
+    };
+    await walk(rootRef, 0);
   }
 
   private async readRefusalRecord<T>(barePath: string, name: string, parse: (v: unknown) => T | undefined):
@@ -29608,15 +29695,29 @@ try {
       const ledger: RefusalLedger = read.state === "valid" ? read.value
         : { runId: c.runId, branch: c.branch, barePath: c.barePath, entries: [] };
       if (ledger.runId !== c.runId || ledger.branch !== c.branch || ledger.barePath !== c.barePath) return false;
-      if (ledger.entries.some((e) => e.sha === sha)) { outcome.alreadyLedgered = true; return true; }
+      // Keyed by (generation, sha): another generation's row of the same head never stands in for this one.
+      if (ledger.entries.some((e) => e.generation === generation && e.sha === sha)) { outcome.alreadyLedgered = true; return true; }
       if (ledger.entries.length >= MAX_OWED_CANDIDATES_PER_RUN) return false;
       await this.writeOwedFile(c.barePath, name, { version: 1, runId: ledger.runId, branch: ledger.branch,
-        barePath: ledger.barePath, entries: [...ledger.entries, { generation, sha, path: refusalPath }] }, REFUSAL_DIRECTORY);
+        barePath: ledger.barePath, entries: [...ledger.entries, { generation, sha, path: refusalPath }] }, REFUSAL_DIRECTORY, c.runId);
       return true;
     });
-    if (!refWritten || !ledgerWritten) { this.refusalRecordingFailed.add(c.runId); await this.markRefusalIncomplete(c); }
+    // The refusal branch also leaves the owed-path marker when the cap-filling pin did not (old-worker pins, direct pins).
+    const markerWritten = await attempt(async () => { await this.ensureOwedPathMarker(c); return true; });
+    if (!refWritten || !ledgerWritten || !markerWritten) { this.refusalRecordingFailed.add(c.runId); await this.markRefusalIncomplete(c); }
     if (abort) throw abort;
     return outcome;
+  }
+
+  /** Write-once `owedpath-<run>-<generation>.json`: this positive generation reached (or was about to fill) the owed
+   *  cap. An existing marker is left alone. A null or non-positive generation never writes one. Throws on failure. */
+  private async ensureOwedPathMarker(c: StoredOwedContext): Promise<void> {
+    const generation = c.generation;
+    if (generation === null || !refusalGeneration(generation, 1)) return;
+    const name = `owedpath-${c.runId}-${generation}.json`;
+    if (await this.readOwedFile(c.barePath, name, REFUSAL_DIRECTORY) !== undefined) return;
+    await this.writeOwedFile(c.barePath, name,
+      { version: 1, runId: c.runId, generation, branch: c.branch, barePath: c.barePath }, REFUSAL_DIRECTORY, c.runId);
   }
 
   /** Durable, irreversible companion of the in-process latch: it survives a restart, so a successor process
@@ -29624,7 +29725,7 @@ try {
   private async markRefusalIncomplete(c: StoredOwedContext): Promise<void> {
     try {
       await this.writeOwedFile(c.barePath, `incomplete-${c.runId}.json`,
-        { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath }, REFUSAL_DIRECTORY);
+        { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath }, REFUSAL_DIRECTORY, c.runId);
     } catch { /* the in-process latch still holds */ }
   }
 
@@ -29638,7 +29739,7 @@ try {
       return await this.withLock(barePath, async () => {
         if (await this.readOwedFile(barePath, name, REFUSAL_DIRECTORY) !== undefined) return "existing" as const;
         await this.writeOwedFile(barePath, name, { version: 1, runId, generation, branch, barePath, protocol: 1,
-          process: this.processNonce }, REFUSAL_DIRECTORY);
+          process: this.processNonce }, REFUSAL_DIRECTORY, runId);
         return "written" as const;
       });
     } catch { return "failed"; }
@@ -29662,7 +29763,7 @@ try {
     const names = await this.refusalNames(barePath);
     // Valid or not, an incomplete marker is final: the history cannot be proven complete, whatever else is found.
     if (names.includes(`incomplete-${runId}.json`)) return ineligible("refusal history incomplete");
-    if (names.some((n) => n.startsWith(".tmp-"))) return ineligible("temporary refusal metadata present");
+    if (names.some((n) => refusalTempBlocks(n, runId))) return ineligible("temporary refusal metadata present");
     const ledgerRead = await this.readRefusalRecord(barePath, `refusals-${runId}.json`, parseRefusalLedger);
     if (ledgerRead.state === "invalid") return ineligible("refusal ledger malformed");
     const ledger = ledgerRead.state === "valid" ? ledgerRead.value : undefined;
@@ -29672,7 +29773,10 @@ try {
     const stages = allStages.filter((s) => s.generation <= G);
     const pinned = new Set((await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${runId}/`]))
       .split("\n").filter(Boolean).map((r) => r.slice(r.lastIndexOf("/") + 1)));
-    if (!entries.length && !stages.length && pinned.size < this.maxOwedCandidates) return { kind: "none" };
+    // An owed-path marker at or below G says the generation once stood at the cap, so an empty-looking run is
+    // proven only by an admission of this process, never by the absence of evidence.
+    const atCapBefore = refusalFileGenerations(names, "owedpath", runId).some((g) => g <= G);
+    if (!entries.length && !stages.length && pinned.size < this.maxOwedCandidates && !atCapBefore) return { kind: "none" };
     if (allStages.length !== stages.length) return ineligible("refusal stage of a later generation");
     if (G > REFUSAL_MAX_GENERATIONS) return ineligible("too many generations to prove");
     let branch = ledger?.branch;
@@ -29717,7 +29821,7 @@ try {
         if (existing.state === "absent") {
           if (gate.kind === "none") return "none" as const;
           await this.writeOwedFile(barePath, name, { version: 1, runId, generation, sourceSha,
-            evidenceDigest: gate.evidenceDigest, process: this.processNonce }, REFUSAL_DIRECTORY);
+            evidenceDigest: gate.evidenceDigest, process: this.processNonce }, REFUSAL_DIRECTORY, runId);
           return "sealed" as const;
         }
         if (existing.state === "invalid") return "mismatch" as const;
@@ -29732,7 +29836,8 @@ try {
 
   /** Read-only decision for cleanupRecoveryGeneration: ordinary cleanup, retain, or the sealed protocol. */
   private async refusalCleanupPlan(barePath: string, context: PositiveOwedCandidateContext, coveringSha: string):
-    Promise<{ kind: "none" } | { kind: "retain" } | { kind: "run"; cleanup: RefusalCleanup; write: boolean }> {
+    Promise<{ kind: "none"; markers: string[] } | { kind: "retain"; markers?: undefined } |
+      { kind: "run"; cleanup: RefusalCleanup; write: boolean; markers: string[] }> {
     const retain = { kind: "retain" } as const;
     const R = context.runId, G = context.generation;
     let names: string[], ledgerRead, allStages: RefusalStage[];
@@ -29752,9 +29857,12 @@ try {
     const stages = allStages.filter((s) => s.generation <= G);
     const finals = refusalFileGenerations(names, "final", R).filter((g) => g <= G);
     const cleanups = refusalFileGenerations(names, "cleanup", R).filter((g) => g <= G);
-    if (!entries.length && !stages.length && !finals.length && !cleanups.length) return { kind: "none" };
+    // Owed-path markers are not evidence a seal must cover: they are removed with the generation, last.
+    const markers = refusalFileGenerations(names, "owedpath", R).filter((g) => g <= G).sort((a, b) => a - b)
+      .map((g) => `owedpath-${R}-${g}.json`);
+    if (!entries.length && !stages.length && !finals.length && !cleanups.length) return { kind: "none", markers };
     try {
-      if (names.some((n) => n.startsWith(".tmp-")) || cleanups.some((g) => g !== G) || stages.length > 256) return retain;
+      if (names.some((n) => refusalTempBlocks(n, R)) || cleanups.some((g) => g !== G) || stages.length > 256) return retain;
       const finalRead = finals.includes(G)
         ? await this.readRefusalRecord(barePath, `final-${R}-${G}.json`, parseRefusalFinal) : undefined;
       const final = finalRead?.state === "valid" ? finalRead.value : undefined;
@@ -29765,10 +29873,12 @@ try {
         const cleanup = read.value;
         if (cleanup.runId !== R || cleanup.generation !== G || cleanup.branch !== context.branch ||
             cleanup.barePath !== barePath || (final && final.evidenceDigest !== cleanup.finalDigest)) return retain;
-        // A listed head must keep exactly the generation the intent recorded, wherever it now sits (also G+1).
-        const listedShas = new Set([...cleanup.ledgerEntries.map((x) => x.sha), ...cleanup.stages.map((x) => x.tip)]);
-        for (const e of ledger?.entries ?? []) {
-          if (listedShas.has(e.sha) && !cleanup.ledgerEntries.some((x) => x.sha === e.sha && x.generation === e.generation)) return retain;
+        // A listed (generation, head) pair that is gone from the ledger while the same head sits at ANOTHER
+        // generation was rebound (also to G+1). A row of the same head at another generation that coexists with the
+        // listed pair is a different row and does not retain G.
+        for (const x of cleanup.ledgerEntries) {
+          const rows = (ledger?.entries ?? []).filter((e) => e.sha === x.sha);
+          if (rows.length && !rows.some((e) => e.generation === x.generation)) return retain;
         }
         // The intent must still prove itself: its own lists hash to the sealed digest, and every listed stage
         // is a ref of this run at a generation <= G whose tip the intent's ledger entries cover.
@@ -29782,7 +29892,7 @@ try {
         // Current evidence must be an exact-pair subset of the lists; anything else is a rebound generation.
         if (!stages.every((s) => cleanup.stages.some((x) => x.ref === s.ref && x.tip === s.sha && x.generation === s.generation)) ||
             !entries.every((e) => cleanup.ledgerEntries.some((x) => x.sha === e.sha && x.generation === e.generation))) return retain;
-        return { kind: "run", cleanup, write: false };
+        return { kind: "run", cleanup, write: false, markers };
       }
       if (!final) return retain;
       if (refusalEvidenceDigest(entries, stages) !== final.evidenceDigest) return retain;
@@ -29790,7 +29900,7 @@ try {
         if (await this.ancestry(barePath, sha, coveringSha) !== "ancestor") return retain;
       }
       for (const s of stages) if (!entries.some((e) => e.sha === s.sha && e.generation <= s.generation)) return retain;
-      return { kind: "run", write: true, cleanup: { version: 1, runId: R, generation: G, branch: context.branch, barePath,
+      return { kind: "run", write: true, markers, cleanup: { version: 1, runId: R, generation: G, branch: context.branch, barePath,
         finalDigest: final.evidenceDigest,
         stages: stages.map((s) => ({ ref: s.ref, generation: s.generation, tip: s.sha })).sort((a, b) => a.ref.localeCompare(b.ref)),
         ledgerEntries: entries.map((e) => ({ generation: e.generation, sha: e.sha })) } as RefusalCleanup };
@@ -29809,8 +29919,9 @@ try {
       if (current === undefined) continue;
       if (current !== s.tip) throw new Error("refusal stage changed during cleanup");
       open();
-      await this.runGit(barePath, ["update-ref", "-d", s.ref, s.tip]);
-      if (await this.checkedRefSha(barePath, s.ref) !== undefined) throw new Error("refusal stage deletion mismatch");
+      // The authority registers the shared-bare deletion before the child runs and settles it after a read-back.
+      const settlement = await this.beginBare(barePath, "refusal-cleanup-delete-ref", [s.ref]);
+      await this.deleteRefSettled(barePath, s.ref, s.tip, settlement, "refusal stage deletion mismatch");
     }
     const name = `refusals-${cleanup.runId}.json`;
     const read = await this.readRefusalRecord(barePath, name, parseRefusalLedger);
@@ -29821,7 +29932,7 @@ try {
     open();
     if (kept.length === 0) await this.removeOwedFile(barePath, name, true, REFUSAL_DIRECTORY);
     else await this.writeOwedFile(barePath, name, { version: 1, runId: read.value.runId, branch: read.value.branch,
-      barePath: read.value.barePath, entries: kept }, REFUSAL_DIRECTORY);
+      barePath: read.value.barePath, entries: kept }, REFUSAL_DIRECTORY, read.value.runId);
   }
 
   /** Checked enumeration distinguishes a genuinely absent exact ref from a failed read. */
@@ -30586,7 +30697,7 @@ try {
         open();
         boundary();
         if (refusal.write) {
-          await this.writeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, refusal.cleanup, REFUSAL_DIRECTORY);
+          await this.writeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, refusal.cleanup, REFUSAL_DIRECTORY, context.runId);
         }
         await this.applyRefusalCleanup(barePath, refusal.cleanup, open);
       }
@@ -30622,6 +30733,13 @@ try {
         open();
         await this.removeOwedFile(barePath, `final-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
         await this.removeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
+      }
+      // The owed-path markers of generations <= G go last: they are the weakest evidence, and every caller reaches
+      // here only for a released or completed generation (the completion-check preflight returned above).
+      for (const marker of refusal.markers ?? []) {
+        open();
+        boundary();
+        await this.removeOwedFile(barePath, marker, true, REFUSAL_DIRECTORY);
       }
       // issue #4481: admissions are kept (the seal's process-binding evidence); only an owner discard or the
       // bare's removal deletes them.

@@ -753,16 +753,16 @@ describe("issue4481 durable incomplete marker and seal comparison", { timeout: 3
     toBare(head);
     const internals = cache as unknown as {
       runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string>;
-      writeOwedFile: (b: string, name: string, value: unknown, dir?: string) => Promise<void>;
+      writeOwedFile: (b: string, name: string, value: unknown, dir?: string, runId?: string) => Promise<void>;
     };
     const runGit = internals.runGit.bind(cache), write = internals.writeOwedFile.bind(cache);
     internals.runGit = async (cwd, args, ...rest) => {
       if (args[0] === "update-ref" && String(args[1]).includes("/refused-")) throw new Error("injected ref failure");
       return runGit(cwd, args, ...rest);
     };
-    internals.writeOwedFile = async (b, name, value, dir) => {
+    internals.writeOwedFile = async (b, name, value, dir, runId) => {
       if (name.startsWith("refusals-")) throw new Error("injected ledger failure");
-      return write(b, name, value, dir);
+      return write(b, name, value, dir, runId);
     };
     try { await assert.rejects(cache["pinOwedUnderLock"](ctx, head, "P4"), /owed candidate limit/); }
     finally { internals.runGit = runGit; internals.writeOwedFile = write; }
@@ -794,7 +794,9 @@ describe("issue4481 durable incomplete marker and seal comparison", { timeout: 3
     fs.rmSync(path.join(refDir(), ledgerName));
     for (const line of incomingRefs()) gitIn(bare, ["update-ref", "-d", line.split(" ")[0]!]);
     for (const sha of kept) gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${sha}`]);
-    assert.deepEqual(await gate(cover), { kind: "none" });
+    // The cap-filling pin left an owed-path marker, so an empty-looking run is proven by this process's admission
+    // (eligible with the empty-evidence digest), not reported as none.
+    assert.deepEqual(await gate(cover), { kind: "eligible", evidenceDigest: createHash("sha256").update("").digest("hex") });
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "mismatch");
   });
 
@@ -812,5 +814,276 @@ describe("issue4481 durable incomplete marker and seal comparison", { timeout: 3
     const cover = coverOf([...kept, oldWorkerHead, refused]);
     assert.deepEqual(await gate(cover, 3), { kind: "ineligible", reason: "admission for generation 2 absent" });
     assert.equal(await cache.sealRefusalRelease(bare, RUN, 3, cover), "ineligible");
+  });
+});
+
+describe("issue4481 owed-path marker (restart residual)", { timeout: 300_000 }, () => {
+  const markerName = `owedpath-${RUN}-1.json`;
+  const restarted = (): GitCache => new GitCache(fx.dataDir, nullLogger(), undefined,
+    testGitCacheOptions({ maxOwedCandidates: CAP, processNonce: OTHER_NONCE }));
+  type Internals = {
+    runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string>;
+    writeOwedFile: (b: string, name: string, value: unknown, dir?: string, runId?: string) => Promise<void>;
+  };
+  /** A cap refusal of an unseen head in which the refused ref, ledger and incomplete-marker writes all fail. */
+  async function refuseWithEverythingFailing(): Promise<{ kept: string[]; head: string }> {
+    const kept = await atCap();
+    const head = commitTree("unseen head", false);
+    toBare(head);
+    const internals = cache as unknown as Internals;
+    const runGit = internals.runGit.bind(cache), write = internals.writeOwedFile.bind(cache);
+    internals.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "update-ref" && String(args[1]).includes("/refused-")) throw new Error("injected ref failure");
+      return runGit(cwd, args, ...rest);
+    };
+    internals.writeOwedFile = async (b, name, value, dir, runId) => {
+      if (name.startsWith("refusals-") || name.startsWith("incomplete-")) throw new Error("injected write failure");
+      return write(b, name, value, dir, runId);
+    };
+    try { await assert.rejects(cache["pinOwedUnderLock"](ctx, head, "P4"), /owed candidate limit/); }
+    finally { internals.runGit = runGit; internals.writeOwedFile = write; }
+    return { kept, head };
+  }
+
+  it("the cap-filling pin leaves a write-once marker; fewer pins leave none", async () => {
+    await rewriteTimes(CAP - 1);
+    assert.equal(refusalFiles().includes(markerName), false, "below the cap there is no marker");
+    assert.deepEqual(await gate(base), { kind: "none" });
+    await rewriteTimes(1);
+    assert.deepEqual(readJson(markerName), { version: 1, runId: RUN, generation: 1, branch: BRANCH, barePath: bare });
+    const before = fs.readFileSync(path.join(refDir(), markerName), "utf8");
+    await rewriteTimes(0);
+    await cache["pinOwedUnderLock"](ctx, base, "P4").catch(() => undefined);
+    assert.equal(fs.readFileSync(path.join(refDir(), markerName), "utf8"), before, "write-once");
+  });
+
+  it("R2(i): a restarted process cannot call a run none after every refusal write failed (admission is another process's)", async () => {
+    const { kept } = await refuseWithEverythingFailing();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    assert.equal(refusalFiles().some((n) => n.startsWith("refusals-") || n.startsWith("incomplete-")), false);
+    assert.equal(incomingRefs().some((r) => r.includes("/refused-")), false);
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${kept[0]}`]);
+    assert.ok(pinRefs().length < CAP);
+    const verdict = await gate(coverOf(kept), 1, restarted());
+    assert.equal(verdict.kind, "ineligible", JSON.stringify(verdict));
+    assert.match((verdict as { reason: string }).reason, /another process/);
+  });
+
+  it("R2(ii): the same with no admission ever written is ineligible", async () => {
+    const { kept } = await refuseWithEverythingFailing();
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${kept[0]}`]);
+    assert.deepEqual(await gate(coverOf(kept), 1, restarted()), { kind: "ineligible", reason: "admission for generation 1 absent" });
+  });
+
+  it("R2(iii): a run that never filled the cap stays none after a restart", async () => {
+    await rewriteTimes(CAP - 1);
+    assert.deepEqual(await gate(base, 1, restarted()), { kind: "none" });
+    assert.equal(refusalFiles().some((n) => n.startsWith("owedpath-")), false);
+  });
+
+  it("the refusal branch writes the marker when pins were made outside the pin path", async () => {
+    for (let i = 0; i < CAP; i++) gitIn(bare, ["update-ref", `refs/uzi-owed/${RUN}/${String(i).padStart(40, "e")}`, base]);
+    const head = commitTree("direct", false);
+    toBare(head);
+    await assert.rejects(cache["pinOwedUnderLock"](ctx, head, "P4"), /owed candidate limit/);
+    assert.ok(refusalFiles().includes(markerName));
+  });
+
+  it("R2(iv): a failing marker write refuses the cap-filling pin as preservation_failed, and no pin ref appears", async () => {
+    await rewriteTimes(CAP - 1);
+    const pinsBefore = pinRefs();
+    const internals = cache as unknown as Internals;
+    const write = internals.writeOwedFile.bind(cache);
+    internals.writeOwedFile = async (b, name, value, dir, runId) => {
+      if (name.startsWith("owedpath-")) throw new Error("injected marker failure");
+      return write(b, name, value, dir, runId);
+    };
+    try {
+      commitTree("filler", true);
+      assert.deepEqual(await fetchHead(), { kind: "not_updated", reason: "preservation_failed" });
+    } finally { internals.writeOwedFile = write; }
+    assert.deepEqual(pinRefs(), pinsBefore);
+    assert.equal(refusalFiles().includes(markerName), false);
+  });
+
+  it("cleanup of a marker-only generation removes the marker, nothing else", async () => {
+    const kept = await atCap();
+    assert.ok(refusalFiles().includes(markerName));
+    fs.writeFileSync(path.join(refDir(), `incomplete-${RUN}.json`), JSON.stringify({ version: 1, runId: RUN, branch: BRANCH, barePath: bare }) + "\n", { mode: 0o600 });
+    assert.equal(await cleanup(coverOf(kept)), "removed");
+    assert.deepEqual(refusalFiles(), [`incomplete-${RUN}.json`]);
+  });
+});
+
+describe("issue4481 ledger keyed by generation and head", { timeout: 300_000 }, () => {
+  it("generations 1 and 2 both refuse X: sealing and cleaning generation 1 keeps generation 2's row, which is then eligible", async () => {
+    const kept = await atCap();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    const X = await refuse("shared head");
+    const cover1 = coverOf([...kept, X]);
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover1), "sealed");
+    const ctx2 = { ...ctx, generation: 2 };
+    await assert.rejects(cache["pinOwedUnderLock"](ctx2, X, "P4"), /owed candidate limit/);
+    assert.deepEqual(readJson(ledgerName).entries.map((e: any) => [e.generation, e.sha]), [[1, X], [2, X]]);
+    assert.ok(incomingRefs().some((r) => r.startsWith(`refs/uzi-incoming/${RUN}/1/refused-${X} `)));
+    assert.ok(incomingRefs().some((r) => r.startsWith(`refs/uzi-incoming/${RUN}/2/refused-${X} `)));
+    assert.equal(await cleanup(cover1), "removed");
+    assert.deepEqual(readJson(ledgerName).entries, [{ generation: 2, sha: X, path: "P4" }]);
+    assert.deepEqual(incomingRefs(), [`refs/uzi-incoming/${RUN}/2/refused-${X} ${X}`]);
+    assert.equal(await cache.admitRefusalProvenance(ctx2), "written");
+    const verdict = await gate(coverOf([...kept, X]), 2);
+    assert.equal(verdict.kind, "eligible", JSON.stringify(verdict));
+  });
+
+  it("the same (generation, head) pair is still a single row; a malformed duplicate pair is rejected", async () => {
+    const kept = await atCap();
+    await cache.admitRefusalProvenance(ctx);
+    const X = await refuse("dup");
+    await assert.rejects(cache["pinOwedUnderLock"](ctx, X, "P4"), /owed candidate limit/);
+    assert.equal(readJson(ledgerName).entries.length, 1);
+    const good = readJson(ledgerName);
+    writeRaw(ledgerName, { ...good, entries: [...good.entries, ...good.entries] });
+    assert.equal((await gate(coverOf([...kept, X]))).kind, "ineligible");
+  });
+});
+
+describe("issue4481 run-tagged refusal temps", { timeout: 300_000 }, () => {
+  const OTHER_RUN = "44814481-aaaa-bbbb-cccc-555555555555";
+  const UUID = "00000000-0000-4000-8000-000000000000";
+  const drop = (name: string): void => { fs.writeFileSync(path.join(refDir(), name), "x", { mode: 0o600 }); };
+
+  it("another run's stranded tagged temp does not block this run; its own and unattributed temps do", async () => {
+    const { cover } = await eligibleState();
+    drop(`.tmp-${OTHER_RUN}-${UUID}`);
+    assert.equal((await gate(cover)).kind, "eligible", "run B's temp is ignored by run A");
+    drop(`.tmp-short-${UUID}`);
+    assert.equal((await gate(cover)).kind, "eligible", "a differently named run's temp is ignored too");
+    fs.rmSync(path.join(refDir(), `.tmp-short-${UUID}`));
+    drop(`.tmp-${RUN}-${UUID}`);
+    assert.deepEqual(await gate(cover), { kind: "ineligible", reason: "temporary refusal metadata present" });
+    fs.rmSync(path.join(refDir(), `.tmp-${RUN}-${UUID}`));
+    for (const bad of [`.tmp-${UUID}`, ".tmp-garbage", `.tmp-${OTHER_RUN}-not-a-uuid`, `.tmp--${UUID}`, `.tmp-bad/run-${UUID}`.replace("/", "!")]) {
+      drop(bad);
+      assert.equal((await gate(cover)).kind, "ineligible", bad);
+      fs.rmSync(path.join(refDir(), bad));
+    }
+    assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  it("the cleanup plan retains for this run's or an unattributed temp, and ignores another run's", async () => {
+    const { cover } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "sealed");
+    drop(`.tmp-${RUN}-${UUID}`);
+    assert.equal(await cleanup(cover), "retained");
+    fs.rmSync(path.join(refDir(), `.tmp-${RUN}-${UUID}`));
+    drop(`.tmp-${UUID}`);
+    assert.equal(await cleanup(cover), "retained");
+    fs.rmSync(path.join(refDir(), `.tmp-${UUID}`));
+    drop(`.tmp-${OTHER_RUN}-${UUID}`);
+    assert.equal(await cleanup(cover), "removed");
+    assert.deepEqual(refusalFiles(), [`.tmp-${OTHER_RUN}-${UUID}`, `admission-${RUN}-1.json`]);
+  });
+
+  it("refusal-directory writers tag their temp with the run; uzi-owed temps stay untagged", async () => {
+    const renames: string[] = [];
+    const fsp = (await import("node:fs/promises")).default;
+    const original = fsp.rename;
+    (fsp as { rename: typeof fsp.rename }).rename = (async (from: fs.PathLike, to: fs.PathLike) => {
+      renames.push(`${path.basename(path.dirname(String(from)))}/${path.basename(String(from))}`);
+      return original(from, to);
+    }) as typeof fsp.rename;
+    try { await rewriteTimes(CAP); await cache.admitRefusalProvenance(ctx); }
+    finally { (fsp as { rename: typeof fsp.rename }).rename = original; }
+    const refusal = renames.filter((r) => r.startsWith("uzi-refusals/"));
+    const owed = renames.filter((r) => r.startsWith("uzi-owed/"));
+    assert.ok(refusal.length >= 2, "the marker and the admission were written");
+    for (const r of refusal) assert.match(r, new RegExp(`^uzi-refusals/\\.tmp-${RUN}-[0-9a-f-]{36}$`));
+    assert.ok(owed.length > 0);
+    for (const r of owed) assert.match(r, /^uzi-owed\/\.tmp-[0-9a-f-]{36}$/);
+  });
+});
+
+describe("issue4481 refusal stage listing is cross-checked against loose refs", { timeout: 300_000 }, () => {
+  const looseDir = (g = 1): string => path.join(bare, "refs", "uzi-incoming", RUN, String(g));
+  const putLoose = (name: string, content: string, g = 1): string => {
+    fs.mkdirSync(looseDir(g), { recursive: true });
+    const p = path.join(looseDir(g), name);
+    fs.writeFileSync(p, content);
+    return p;
+  };
+
+  it("a broken loose stage file with an otherwise empty listing makes the gate ineligible", async () => {
+    await rewriteTimes(2);
+    assert.deepEqual(await gate(base), { kind: "none" });
+    putLoose("garbage", "garbage\n");
+    assert.equal((await gate(base)).kind, "ineligible");
+  });
+
+  it("a dangling symbolic or symlinked stage added to an eligible setup makes it ineligible; removing it restores eligibility", async () => {
+    const { cover } = await eligibleState();
+    assert.equal((await gate(cover)).kind, "eligible");
+    const sym = putLoose("sym", "ref: refs/does/not/exist\n");
+    assert.equal((await gate(cover)).kind, "ineligible");
+    fs.rmSync(sym);
+    fs.symlinkSync("/does/not/exist", path.join(looseDir(), "link"));
+    assert.equal((await gate(cover)).kind, "ineligible");
+    fs.rmSync(path.join(looseDir(), "link"));
+    putLoose("unlisted", `${base}\n`);
+    assert.equal((await gate(cover)).kind, "ineligible", "a well-formed loose ref the listing does not show");
+    fs.rmSync(path.join(looseDir(), "unlisted"));
+    assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  it("a broken loose stage makes the cleanup plan retain", async () => {
+    const { cover } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "sealed");
+    const garbage = putLoose("garbage", "garbage\n");
+    const before = evidence() + JSON.stringify(pinRefs());
+    assert.equal(await cleanup(cover), "retained");
+    assert.equal(evidence() + JSON.stringify(pinRefs()), before);
+    fs.rmSync(garbage);
+    assert.equal(await cleanup(cover), "removed");
+  });
+});
+
+describe("issue4481 sealed cleanup registers its stage deletions with the authority", { timeout: 300_000 }, () => {
+  const hooks = (events: string[], refuse = false) => ({
+    admitSourceUse: async () => undefined,
+    assertBareClear: async () => undefined,
+    beginDestructive: async () => ({ settle: async () => undefined }),
+    beginBareMutation: async (_b: string, op: string, footprint: readonly string[]) => {
+      if (refuse && op === "refusal-cleanup-delete-ref") throw new Error("authority refused");
+      events.push(`bare:${op}:${footprint.join(",")}`);
+      return { settle: async (outcome: unknown) => { events.push(`settle:${op}:${JSON.stringify(outcome)}`); } };
+    },
+  });
+
+  it("each stage deletion is registered with its ref footprint and settled ok", async () => {
+    const { cover } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "sealed");
+    const stages = incomingRefs().map((l) => l.split(" ")[0]!).sort();
+    assert.equal(stages.length, 2);
+    const events: string[] = [];
+    const hooked = new GitCache(fx.dataDir, nullLogger(), undefined,
+      testGitCacheOptions({ maxOwedCandidates: CAP, authority: hooks(events) as never }));
+    assert.equal(await hooked.cleanupRecoveryGeneration(bare, ctx, await roots(), [], [], cover, undefined, "archive"), "removed");
+    const mine = events.filter((e) => e.includes("refusal-cleanup-delete-ref"));
+    assert.deepEqual(mine.filter((e) => e.startsWith("bare:")).sort(), stages.map((s) => `bare:refusal-cleanup-delete-ref:${s}`).sort());
+    assert.equal(mine.filter((e) => e === 'settle:refusal-cleanup-delete-ref:{"ok":true}').length, 2);
+    for (let i = 0; i < mine.length; i += 2) {
+      assert.match(mine[i]!, /^bare:/);
+      assert.equal(mine[i + 1], 'settle:refusal-cleanup-delete-ref:{"ok":true}');
+    }
+    assert.deepEqual(incomingRefs(), []);
+  });
+
+  it("a refused registration deletes nothing", async () => {
+    const { cover } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "sealed");
+    const before = incomingRefs();
+    const hooked = new GitCache(fx.dataDir, nullLogger(), undefined,
+      testGitCacheOptions({ maxOwedCandidates: CAP, authority: hooks([], true) as never }));
+    await assert.rejects(hooked.cleanupRecoveryGeneration(bare, ctx, await roots(), [], [], cover, undefined, "archive"), /authority refused/);
+    assert.deepEqual(incomingRefs(), before);
   });
 });
