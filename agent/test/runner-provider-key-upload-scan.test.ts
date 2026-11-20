@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -8,7 +8,7 @@ import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimProviderBinding } from "../src/protocol.js";
 import { LimitReachedError } from "../src/limit.js";
 import { providerKeyForms } from "../src/redact.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
+import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, assertCustodyRetained, commit, failingWork, heldServer, skipCheckpoints,
   type Work,
@@ -245,6 +245,93 @@ describe("provider key scan: the final branch push (every forge)", () => {
   it("a provider-bound run with a clean commit pushes", async () => {
     const claim = await finalize(bound(), "ordinary notes");
     assert.equal(branchOnOrigin(claim.issue_iid!), true);
+  });
+});
+
+const headHasKey = (worktree: string, form: string): boolean =>
+  execFileSync("git", ["-C", worktree, "show", "HEAD:notes.txt"], { stdio: "pipe" }).toString().includes(form);
+
+describe("provider key scan: pause checkpoint upload", () => {
+  async function pause(secrets: object, body: string) {
+    const seen = spyPublish();
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: secrets as never });
+    const out: { parked?: boolean; localKeptKey?: boolean } = {};
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, "notes.txt", `leaked: ${body}\n`);
+        await ctx.checkpoint!({ reap: false });
+        const at = { completedCount: 1, total: 3 };
+        out.parked = await ctx.parkForPause!(at);
+        out.localKeptKey = headHasKey(ctx.worktreePath, body);
+        return out.parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab, JOIN_TOKEN, { checkpointIntervalMs: 0 }).execute(claim);
+    return { seen, claim, out };
+  }
+  const statuses = (runId: string) => api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
+
+  for (const [label, form] of [["raw", KEY], ["JSON-escaped slash", JSON_SLASH]] as const) {
+    it(`a provider-bound pause whose range carries the ${label} form uploads nothing, does not park, and keeps the work`, async () => {
+      const { seen, claim, out } = await pause(bound(), form);
+      assert.equal(seen.uploads, 0, "ZERO pause uploads");
+      assert.equal(out.parked, false, "no durable checkpoint, so no park (pause_failed: the run continues)");
+      assert.ok(!statuses(claim.run_id).includes("paused"), "never reported paused");
+      assert.equal(out.localKeptKey, true, "the committed work stays local, untouched");
+      assertNoKeyForm("run feed", api.messages(claim.run_id));
+    });
+  }
+
+  it("a vendor pause with the very same commit uploads and parks as before", async () => {
+    const { seen, claim, out } = await pause(vendor(), KEY);
+    assert.equal(seen.uploads, 1);
+    assert.equal(out.parked, true);
+    assert.ok(statuses(claim.run_id).includes("paused"));
+  });
+});
+
+describe("provider key scan: overlay (GitHub milestone) checkpoint upload", () => {
+  const githubRepo = () => ({ id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" as const });
+  async function overlayMilestone(t: TestContext, secrets: object, body: string) {
+    const seen = spyPublish();
+    const { github } = fakeGitHub();
+    const { gitlab } = fakeGitlab();
+    const overlays: unknown[] = [];
+    const realPack = git.checkpointPack.bind(git);
+    t.mock.method(git, "checkpointPack", ((...args: Parameters<typeof realPack>) => {
+      overlays.push(args[2]);
+      return realPack(...args);
+    }) as typeof realPack);
+    // The overlay's default-tip fetch is credentialed; stubbing it makes the overlay fail soft to the real tip.
+    t.mock.method(git, "fetchDefaultTip", async () => { throw new Error("stub: no network"); });
+    const claim = gitlabClaim(iid++, { secrets: secrets as never, repo: githubRepo() });
+    let continued = false;
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, "notes.txt", `leaked: ${body}\n`);
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        continued = true;
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab, JOIN_TOKEN, { github, checkpointIntervalMs: 1000 }).execute(claim);
+    return { seen, claim, overlays, continued: () => continued };
+  }
+
+  it("a provider-bound overlay publish carrying the key uploads nothing (the overlay path skips the pre-publish scan)", async (t) => {
+    const { seen, overlays, continued, claim } = await overlayMilestone(t, bound(), JSON_SLASH);
+    assert.ok(overlays.length > 0, "the publish went through checkpointPack");
+    assert.ok(overlays.every((o) => o !== undefined), "every pack was built with an overlay context");
+    assert.equal(seen.uploads, 0, "ZERO overlay uploads");
+    assert.equal(continued(), true, "the skip never stops the executor");
+    assertNoKeyForm("run feed", api.messages(claim.run_id));
+  });
+
+  it("a vendor overlay publish with the same commit uploads as before", async (t) => {
+    const { seen, overlays } = await overlayMilestone(t, vendor(), JSON_SLASH);
+    assert.ok(overlays.length > 0 && overlays.every((o) => o !== undefined));
+    assert.equal(seen.uploads, 1);
   });
 });
 
