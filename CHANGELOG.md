@@ -288,6 +288,30 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **uzi handoff checks the origin host, not just the path ([#4449](https://github.com/vtmocanu/uzi/pull/4449), [#4459](https://github.com/vtmocanu/uzi/pull/4459)).**
   An origin on another host no longer resolves to a same-path connected repo; SSH origins are checked through `ssh -G`.
 
+- **The warm reserve can hibernate surplus memory-capable workers of a vault-locked owner ([#4492](https://github.com/vtmocanu/uzi/pull/4492), [#4499](https://github.com/vtmocanu/uzi/pull/4499)).**
+  A locked owner's idle polls now record the worker's memory-authority report without claiming anything, and a recorded loss stays until the worker re-registers.
+
+- **The Docker worker repo allowlist no longer widens the page on narrow screens ([#4428](https://github.com/vtmocanu/uzi/pull/4428), [#4433](https://github.com/vtmocanu/uzi/pull/4433)).**
+  At 400px the Trusted repositories list now shrinks to the card, and long repository paths, owner emails and hosts are cut off with an ellipsis instead of making the admin page scroll sideways.
+
+- **Pod-epoch reclaim and the hibernation census prove clones on group-writable managed bares ([#4486](https://github.com/vtmocanu/uzi/pull/4486), [#4498](https://github.com/vtmocanu/uzi/pull/4498)).**
+  Admitted only under a startup runner-group trust probe and per-store ownership, ancestor, filesystem and ACL checks; worker images now ship acl (getfacl), which changes the runtime image key and rolls the fleet, and older images keep refusing as before.
+
+- **Run health reasons for the Docker worker repo allowlist and an unreadable custody hold limit now point to Admin → Workers ([#4423](https://github.com/vtmocanu/uzi/pull/4423), [#4434](https://github.com/vtmocanu/uzi/pull/4434)).**
+  Both controls moved off Admin → Instance; the web and API still recognize the previous wording from an older server during a rolling upgrade.
+
+- **`uzi handoff` validates the push destination ([#4470](https://github.com/vtmocanu/uzi/pull/4470), [#4471](https://github.com/vtmocanu/uzi/pull/4471)).**
+  Handoff now checks `git remote get-url --push --all origin` instead of the fetch URL, so a `pushurl` or `pushInsteadOf` rewrite to another host is refused, more than one push destination is refused, and SSH origins with `remote.origin.receivepack` set are refused.
+
+- **A malformed optional pacing diagnostic no longer drops a worker's roll health ([#4467](https://github.com/vtmocanu/uzi/pull/4467), [#4482](https://github.com/vtmocanu/uzi/pull/4482)).**
+  The controller no longer reports synthetic worker identifiers for pool-level roll holds, and the API keeps a row's phase, blocking detail and roll marker when its pacing diagnostic is malformed, discarding only the bad pacing or identifier.
+
+- **Hosted roll pools recover a lost canary from a proven participant ([#4466](https://github.com/vtmocanu/uzi/pull/4466), [#4485](https://github.com/vtmocanu/uzi/pull/4485)).**
+  When participants hold incomplete reservations but no canary, the controller marks the smallest-ID participant with full current-incarnation proof as canary in one metadata-only patch, then resumes normal admission; it holds while an earlier participant may still carry an unresolved adoption request.
+
+- **A paused paced restore's WaitForFirstConsumer claims are no longer reported stranded ([#4468](https://github.com/vtmocanu/uzi/pull/4468), [#4480](https://github.com/vtmocanu/uzi/pull/4480)).**
+  The bind timeout is skipped only for a worker held at zero replicas under its open roll reservation with no consumer pod and a confirmed WaitForFirstConsumer class (needs workers.storageClassRead.create); ages are not reset, so a brief stuck status until the volume binds after replicas return is expected.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -449,6 +473,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A repo created after this release can be linked to a YouTrack project and eligibility tag, and tagged issues start runs ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4431](https://github.com/vtmocanu/uzi/pull/4431)).**
   The link is made through the API before the repo's first enable, once the operator allows the YouTrack base URL (web and CLI screens come later); tagged issues sync onto the board with their YouTrack key (`ABC-12`), and comments and issue text by accounts other than the connection's own are withheld or need approval; issue writes on a linked repo come in a later release. Roll out the API before the workers: a worker needs `issue_key_v1` to claim a linked run. Forge health on a linked repo follows the code host, and issue tracker sync has its own `issue_tracker.sync` admin health check; enabling a repo does not race a link into forge label writes; a removed and re-listed repo keeps its issue source: it cannot be linked or flipped, and a re-listed repo that was linked reads no issues and starts no runs (issue detail, labels and board order are refused for a never-enabled repo too); autopilot runs on a linked repo are not auto-approved for an unmapped issue tracker author; over-long issue tracker ids are a 400; unusable tag names are not listed.
 
+- **Starting a run now shows what it would use ([#3261](https://github.com/vtmocanu/uzi/pull/3261), [#4513](https://github.com/vtmocanu/uzi/pull/4513)).**
+  A read-only "If started now" preview on board cards, the issue page, the Run options dialog and chat start cards shows the predicted harness, model, effort and token with sources; it is a prediction, since model and effort left on Default are resolved when a worker picks the run up, and it never disables Start.
+
+- **`uzi settings set` and `uzi settings reset` change your model and effort defaults, and `uzi agent-template` edits your template model pins, from the CLI ([#3264](https://github.com/vtmocanu/uzi/pull/3264), [#4533](https://github.com/vtmocanu/uzi/pull/4533)).**
+  Covers worker model, effort, judge model, summary model (each with `--harness claude|codex`), judge-runs-on and the Plan and Code cross-check model and effort pins (`set|reset cross-check --stage plan|code --harness ...`) over `PUT /api/me/model-settings`, which accepts a CLI token; `reset` follows the upstream default, `effort runtime` is the distinct Runtime default, and the generic settings write and consent switches stay cookie-only. `uzi agent-template list|show|set|reset` reads and edits the Claude and Codex pins of your own templates only; builtin and global templates stay admin edits in the web UI.
+
+- **Opt-in animated sidebar icons in Settings > Appearance ([#4510](https://github.com/vtmocanu/uzi/pull/4510), [#4532](https://github.com/vtmocanu/uzi/pull/4532)).**
+  A new Sidebar icon animations toggle, off by default, plays a small one-shot animation on sidebar icons on hover, focus and click, and respects reduced motion.
+
+- **Custom Anthropic-compatible model providers can be defined, tested and selected, but runs through them are blocked for now ([#4320](https://github.com/vtmocanu/uzi/pull/4320), [#4464](https://github.com/vtmocanu/uzi/pull/4464)).**
+  Users define a provider (a named endpoint with its own key and model map) at a base URL the operator allowed with `UZI_PROVIDER_ALLOWED_BASE_URLS`, manage it from a Custom providers card in Settings and `uzi provider list|create|edit|test|retire`, check it with a Test probe, and can select it as the Claude source from Settings (Use as Claude source), `uzi provider use <name|id>|--none` or `PUT /api/me/providers/claude-source`; a run bound to a provider keeps the destination frozen at creation and, once activation lands, parks rather than falling back to an Anthropic token when it is revoked, waits out a gateway rate limit on a 1, 5, 15 minute schedule, and reports usage and cost as unknown. Activation is blocked because the pinned Claude CLI follows a gateway 307 redirect (characterized offline), so workers do not advertise `claude_provider_v1` and a provider run stays queued as "no worker that supports model providers is online" until a loopback relay lands in a separate change; Settings notes that provider runs wait in the queue until workers support providers. A gateway behind a private CA is trusted by the Test probe through `workers.extraCA`, which the chart now also mounts into the api pod (an inline `workers.extraCA.pem` change rolls the pod, and the api refuses to boot on an unparseable bundle); roll back an api image only after pausing or cancelling queued provider runs. Provider Test probes refuse concurrent destination or key changes before sending credentials.
+
+- **Custom Codex provider compatibility can be characterized offline ([#4321](https://github.com/vtmocanu/uzi/pull/4321)).**
+  A standalone pinned-runtime fixture records authentication, transport, callback authority, cancellation and resume behavior to guide provider support.
+
+- **Admins define hosted worker sizes on Admin → Workers ([#4213](https://github.com/vtmocanu/uzi/pull/4213), [#4501](https://github.com/vtmocanu/uzi/pull/4501)).**
+  Admins can edit and reset the shipped sizes and add or remove their own (the table holds at most 16 sizes in total, the four shipped ones included); chart limit-range ceilings refuse oversize values, refusals show in Admin health, and `uzi worker list` and `uzi worker get` gain a SIZE column.
+
 ### Changed
 
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
@@ -606,6 +648,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Retirements on uid-split Docker workers now record a durable `.retire-*` binding and keep the parent in place ([#4263](https://github.com/vtmocanu/uzi/pull/4263), [#4429](https://github.com/vtmocanu/uzi/pull/4429)).**
   Retirements record a durable `uzi-retire-scratch.<uuid>.binding` in the bare config; on a uid-split pod no binding is ever written as `settled`, so every bound non-completion parent stays at `intent` (`bound_intent`) and the verified pod epoch deletes none of them (more retention, never less; reclaim needs operator action or the existing discard paths). Past 64 bindings per bare a retire is unbound and takes the in-process removal path, and single-uid and completion disposal are unchanged. Disable the epoch phase with `workers.epochReclaim.retireScratchReclaim: false` (worker `UZI_RETIRE_SCRATCH_RECLAIM=0`; applies at the next worker startup); hosted rollout observation stays on #4143. Kept split parents no longer take the epoch's per-pass work slots, so they cannot starve recovery of bindings whose parents are already gone.
+
+- **Terminal-ref retirement coordinates with run starts in the same repo ([#4488](https://github.com/vtmocanu/uzi/pull/4488), [#4506](https://github.com/vtmocanu/uzi/pull/4506)).**
+  Run admissions take a per-repo gate that a (still switched-off) retirement must win first; contention answers 503 with Retry-After and leaves poller and issue-schedule triggers for a retry. A sweep retries when nothing started; a partial fire instead records a visible repository-busy skip and finishes, with durable progress deferred to #4512.
+
+- **PRD and mockup pull requests skip component CI ([#4521](https://github.com/vtmocanu/uzi/pull/4521)).**
+  Added or modified files under prds/ can use the existing safe-path skip while repository checks, documentation links and Helm validation still run; PRDs read by component tests, deletions, renames and main pushes keep full component CI.
+
+- **Code cross-check: no repair turn for caveat-only findings ([#4472](https://github.com/vtmocanu/uzi/pull/4472)).**
+  When every code cross-check finding is a minor `Coverage uncertainty:` verification caveat, the lead no longer gets a repair turn it could not use; the check is finalized at once and the caveats show as "not reported" in the merge request's verification caveats.
+
+- **Human plan revision prompts now require scoped review of substantive changes ([#4483](https://github.com/vtmocanu/uzi/pull/4483), [#4484](https://github.com/vtmocanu/uzi/pull/4484)).**
+  The revise prompt and lead template tell the lead to map each owner instruction to the mechanism it changes and send substantive revisions, final ones included, back to its read-only validators.
+
+- **Admin judge and summary model defaults now live in one Instance model defaults grid ([#3259](https://github.com/vtmocanu/uzi/pull/3259), [#4524](https://github.com/vtmocanu/uzi/pull/4524)).**
+  The Run judge and Run summaries cards keep only their kill switches, judge policy and per-card saves, and the grid saves the changed model keys in one request.
+
+- **A Codex run that has been claimed is held for the worker that last ran it ([#4476](https://github.com/vtmocanu/uzi/pull/4476), [#4500](https://github.com/vtmocanu/uzi/pull/4500)).**
+  No fall-open path (stale-requeue grace, affinity ceiling, deleted worker, cross-check) offers it to another worker, and runs already at generation 1 or later at upgrade have no record, so they are held at their next fresh claim: cancel them with `uzi run cancel`. Run health shows "held for worker NAME" or "predecessor provenance unavailable", which now count as genuine waits for `queue.waiting` and `fleet.capacity`; a released worker still fenced by its registration nonce gets restart advice. Hibernation wakes recheck provenance before recording demand and release obsolete wake rows. Rolling the api back leaves claims ungated until re-upgrade.
 
 ### Security
 
