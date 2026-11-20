@@ -439,6 +439,17 @@ export function RunDefaults() {
   const [savedCodexEffort, setSavedCodexEffort] = useState("");
   const [codexEffortBusy, setCodexEffortBusy] = useState(false);
 
+  // Claude planning model and effort (PRD #3252): "" = "Same as the run". One shared
+  // saved/busy pair; the inline errors are keyed by the field the server names.
+  const [planningModel, setPlanningModel] = useState("");
+  const [savedPlanningModel, setSavedPlanningModel] = useState("");
+  const [planningModelCustom, setPlanningModelCustom] = useState(false);
+  const [planningEffort, setPlanningEffort] = useState("");
+  const [savedPlanningEffort, setSavedPlanningEffort] = useState("");
+  const [planningBusy, setPlanningBusy] = useState(false);
+  const [planningModelError, setPlanningModelError] = useState("");
+  const [planningEffortError, setPlanningEffortError] = useState("");
+
   // secrets feed the judge token picker; settings carry the saved worker model.
   // secrets is read-only display, set only here, so it rides in the hook's data
   // bundle. The settings fields seed editable form state the Save handlers also
@@ -477,6 +488,12 @@ export function RunDefaults() {
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
+      const pm = settings.planning_claude_model ?? "";
+      setPlanningModel(pm);
+      setSavedPlanningModel(pm);
+      const pe = settings.planning_claude_effort ?? "";
+      setPlanningEffort(pe);
+      setSavedPlanningEffort(pe);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
       setNowSummaryEnabled(settings.now_summary_enabled ?? null);
       setJudgeRunsOn(settings.judge_runs_on ?? "");
@@ -673,6 +690,74 @@ export function RunDefaults() {
       setError(errorMessage(err, "Failed to save Codex reasoning effort"));
     } finally {
       setCodexEffortBusy(false);
+    }
+  };
+
+  // Claude planning pair (PRD #3252). The default labels describe the SAVED state: the
+  // server-resolved cells name what "Same as the run" currently means.
+  const planningModelCell = committedSettings?.planning_models?.find((c) => c.harness === "claude");
+  const planningEffortCell = committedSettings?.planning_efforts?.find((c) => c.harness === "claude");
+  const planningModelDefaultLabel = planningModelCell
+    ? `Same as the run · ${
+        planningModelCell.default_model === ""
+          ? modelSettingSourceLabel("note", "sdk_default")
+          : `${planningModelCell.default_model} (${modelSettingSourceLabel("planning_model", planningModelCell.default_source)})`
+      }`
+    : "Same as the run";
+  const planningEffortDefaultLabel = planningEffortCell
+    ? `Same as the run · ${
+        planningEffortCell.default_effort === "runtime"
+          ? modelSettingSourceLabel("effort", "runtime_default")
+          : planningEffortCell.default_effort
+      } (${modelSettingSourceLabel("planning_effort", planningEffortCell.default_source)})`
+    : "Same as the run";
+  const planningModelTrimmed = planningModel.trim();
+  const planningModelWarning =
+    modelFieldWarning(planningModel) ||
+    (CODEX_ROLE_MODELS.includes(planningModelTrimmed)
+      ? `Not a Claude model: ${planningModelTrimmed} is a Codex model, so Claude planning skips it. Choose Same as the run to clear it.`
+      : "");
+  const planningModelDirty = planningModelTrimmed !== savedPlanningModel;
+  const planningEffortDirty = planningEffort !== savedPlanningEffort;
+  const planningCustomEmpty = planningModelCustom && planningModelTrimmed === "";
+  const planningBlocked = planningModelWarning !== "" || planningCustomEmpty;
+
+  // One PUT carrying only the dirty fields (null = Same as the run). A 400 names its field
+  // as a "planning_claude_model:" / "planning_claude_effort:" prefix; an unattributable
+  // message shows under both controls.
+  const savePlanning = async () => {
+    setError("");
+    setNotice("");
+    setPlanningModelError("");
+    setPlanningEffortError("");
+    setPlanningBusy(true);
+    try {
+      const patch: UserSettingsPatch = {};
+      if (planningModelDirty) patch.planning_claude_model = planningModelTrimmed || null;
+      if (planningEffortDirty) patch.planning_claude_effort = planningEffort || null;
+      const { settings } = await api.putMySettings(patch);
+      setCommittedSettings(current => current && ({
+        ...current,
+        planning_claude_model: settings.planning_claude_model,
+        planning_claude_effort: settings.planning_claude_effort,
+        planning_models: settings.planning_models,
+        planning_efforts: settings.planning_efforts,
+      }));
+      const pm = settings.planning_claude_model ?? "";
+      setPlanningModel(pm);
+      setSavedPlanningModel(pm);
+      const pe = settings.planning_claude_effort ?? "";
+      setPlanningEffort(pe);
+      setSavedPlanningEffort(pe);
+      setNotice("Planning defaults saved. They apply the next time a run plans.");
+    } catch (err) {
+      const message = errorMessage(err, "Failed to save planning defaults");
+      const forModel = message.startsWith("planning_claude_model:");
+      const forEffort = message.startsWith("planning_claude_effort:");
+      if (!forModel || forEffort) setPlanningEffortError(message);
+      if (!forEffort || forModel) setPlanningModelError(message);
+    } finally {
+      setPlanningBusy(false);
     }
   };
 
@@ -1618,6 +1703,49 @@ export function RunDefaults() {
                 </Button>
               </>
             )}
+          </div>
+        )}
+      </Card>
+
+      {/* Claude planning model and effort (PRD #3252): used while a run plans; the run
+          continues on the worker model and effort above once the plan is approved. */}
+      <Card className="space-y-5">
+        <div>
+          <SectionTitle>Planning</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            Use a different model and reasoning effort while a run plans. When the plan is approved the run continues on your worker model and effort above; if it plans again, it uses these. Planning stays on the run's harness. Handoff (task) runs also plan first. A model chosen by a schedule or when starting the run applies to both phases.
+          </p>
+        </div>
+
+        {loading ? (
+          <Skeleton className="h-9 w-full max-w-sm" />
+        ) : (
+          <div className="space-y-3">
+            <Field label="Claude planning model" htmlFor="planning-claude-model">
+              <ModelSelect
+                id="planning-claude-model"
+                value={planningModel}
+                onChange={setPlanningModel}
+                harness="claude"
+                defaultLabel={planningModelDefaultLabel}
+                customAriaLabel="Custom Claude planning model ID"
+                onCustomModeChange={setPlanningModelCustom}
+              />
+            </Field>
+            {planningModelWarning && <Alert message={planningModelWarning} tone="warning" />}
+            {planningCustomEmpty && <Alert message="Enter a custom model ID, or choose Same as the run." tone="warning" />}
+            {planningModelError && <Alert message={planningModelError} />}
+            <Field label="Claude planning effort" htmlFor="planning-claude-effort">
+              <EffortSelect id="planning-claude-effort" value={planningEffort} onChange={setPlanningEffort} defaultLabel={planningEffortDefaultLabel} />
+            </Field>
+            {planningEffortError && <Alert message={planningEffortError} />}
+            <Button
+              type="button"
+              disabled={planningBusy || planningBlocked || !(planningModelDirty || planningEffortDirty)}
+              onClick={savePlanning}
+            >
+              Save planning defaults
+            </Button>
           </div>
         )}
       </Card>

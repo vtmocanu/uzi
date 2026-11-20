@@ -635,6 +635,9 @@ export interface UserSettingsPatch {
   /** Per-user reasoning effort (PRD #617); present-null clears back to inherit. */
   default_effort?: string | null;
   default_codex_effort?: string | null;
+  /** Per-user Claude planning model and effort (PRD #3252); present-null clears to "Same as the run". */
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
   /** Per-user Codex judge model (PRD #3245); present-null clears back to inherit. */

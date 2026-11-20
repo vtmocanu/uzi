@@ -2850,3 +2850,113 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     );
   });
 });
+
+describe("Run defaults — Claude planning model and effort (PRD #3252)", () => {
+  const modelCell = (over: Partial<ModelSettingCell> = {}): ModelSettingCell => ({
+    harness: "claude", model: null, default_model: "sonnet", default_source: "user_default", resolved_model: "sonnet", source: "user_default", ...over,
+  });
+  const effortCell = (over: object = {}) => ({
+    harness: "claude", effort: null, default_effort: "high", default_source: "user_default", resolved_effort: "high", source: "user_default", mode: "explicit", ...over,
+  });
+  const settings = (over: object = {}): { settings: UserSettings } => ({
+    settings: {
+      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null,
+      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      planning_claude_model: null, planning_claude_effort: null,
+      planning_models: [modelCell()], planning_efforts: [effortCell()],
+      ...over,
+    } as UserSettings,
+  });
+  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  const saveBtn = () => screen.getByText("Save planning defaults") as HTMLButtonElement;
+
+  it("renders the Planning card with the verbatim intro and default labels from the cells", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
+    expect(screen.getByText("Planning")).toBeTruthy();
+    expect(screen.getByText("Use a different model and reasoning effort while a run plans. When the plan is approved the run continues on your worker model and effort above; if it plans again, it uses these. Planning stays on the run's harness. Handoff (task) runs also plan first. A model chosen by a schedule or when starting the run applies to both phases.")).toBeTruthy();
+    expect(model.options[0].text).toMatch(/^Same as the run · sonnet \(/);
+    expect(effort.options[0].text).toMatch(/^Same as the run · high \(/);
+    expect(Array.from(effort.options).map((o) => o.value)).not.toContain("runtime");
+    expect(saveBtn().disabled).toBe(true);
+  });
+
+  it("uses the runtime and SDK-default wording for those defaults", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings({
+      planning_models: [modelCell({ default_model: "", default_source: "builtin" })],
+      planning_efforts: [effortCell({ default_effort: "runtime", mode: "runtime_default" })],
+    }));
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
+    expect(model.options[0].text).not.toContain("()");
+    expect(model.options[0].text.startsWith("Same as the run · ")).toBe(true);
+    expect(effort.options[0].text).not.toContain("runtime (");
+    expect(effort.options[0].text.startsWith("Same as the run · ")).toBe(true);
+  });
+
+  it("sends only the dirty field in one PUT and adopts the response", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockResolvedValue(settings({
+      planning_claude_effort: "max",
+      planning_efforts: [effortCell({ effort: "max", resolved_effort: "max", source: "user_planning_default" })],
+    }));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "max" } });
+    expect(saveBtn().disabled).toBe(false);
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMySettings).toHaveBeenCalledWith({ planning_claude_effort: "max" });
+    await waitFor(() => expect(saveBtn().disabled).toBe(true));
+    expect((screen.getByLabelText("Claude planning effort") as HTMLSelectElement).value).toBe("max");
+  });
+
+  it("Same as the run sends null and is disabled while busy", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings({ planning_claude_effort: "max" }));
+    let release!: (v: { settings: UserSettings }) => void;
+    mockApi.putMySettings.mockReturnValue(new Promise((r) => { release = r; }));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "" } });
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ planning_claude_effort: null }));
+    expect(saveBtn().disabled).toBe(true);
+    release(settings());
+    await waitFor(() => expect(effort.value).toBe(""));
+  });
+
+  it("a model warning blocks the save", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    fireEvent.change(model, { target: { value: "custom" } });
+    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: "two words" } });
+    expect(screen.getByText("Model must be a single token with no spaces.")).toBeTruthy();
+    expect(saveBtn().disabled).toBe(true);
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+  });
+
+  it("shows a 400 under the field the server names", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh or max"));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "low" } });
+    fireEvent.click(saveBtn());
+    const msg = await screen.findAllByText(/planning_claude_effort: effort must be one of/);
+    expect(msg).toHaveLength(1);
+  });
+
+  it("shows an unattributable 400 under both fields", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "bad planning pair"));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "low" } });
+    fireEvent.click(saveBtn());
+    expect(await screen.findAllByText("bad planning pair")).toHaveLength(2);
+  });
+});
