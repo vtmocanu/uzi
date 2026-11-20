@@ -371,11 +371,13 @@ describe("Providers — delete", () => {
 describe("Providers — Claude source (PRD #4320 M7)", () => {
   const USE = { name: "Use as Claude source" };
 
-  it("shows Anthropic as the current source and the queue-wait note by default", async () => {
+  it("shows Anthropic as the current source and the redirect warning by default", async () => {
     await renderCard();
     const box = await screen.findByTestId("claude-source");
     expect(box.textContent).toMatch(/Current Claude source: Anthropic/);
-    expect(box.textContent).toMatch(/Runs that use a provider wait in the queue until workers support providers\./);
+    expect(box.textContent).toMatch(/Only allowlist gateways you trust not to redirect/);
+    expect(box.textContent).toMatch(/Bearer auth is safer/);
+    expect(box.textContent).not.toMatch(/wait in the queue until workers support providers/);
   });
 
   it("selects a provider, then reloads and shows it as the source with Stop using", async () => {

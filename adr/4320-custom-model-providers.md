@@ -1,6 +1,6 @@
 # ADR-4320: Custom model providers (Anthropic-compatible gateways)
 
-**Status**: Accepted (PRD #4320, issue #4320). Shipped with activation blocked: no worker advertises `claude_provider_v1`, so a run bound to a provider queues and does not start. See [Known, accepted limit](#known-accepted-limit-the-cli-follows-redirects-and-activation-is-blocked).
+**Status**: Accepted (PRD #4320, issue #4320). Activated 2026-11-19 without the loopback relay, accepting the redirect risk (owner decision, #4505); the 2026-11-18 decision to ship blocked is superseded. See [Known, accepted limit](#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay).
 **Date**: 2026-11-18
 **Deciders**: the maintainer + agent team; the owner decisions of 2026-11-18 are listed below.
 **Related**: [PRD #4320](../prds/4320-custom-providers-core-anthropic.md) (the Decision Log carries D1-D14 and the per-milestone findings), [ADR-1106](1106-codex-harness.md) (the Codex binding freeze this extends to a destination), [ADR-1732](1732-disable-credentials.md) (disable/enable), [ADR-4201](4201-in-place-credential-switch.md) (the switch machinery providers opt out of), [docs/vault-threat-model.md](../docs/vault-threat-model.md#residual-risks-accepted).
@@ -13,8 +13,8 @@ Shipped: the allowlist, provider and key storage, the Test probe, the Claude-sou
 
 Not shipped (see the PRD for the milestone notes):
 
-- **Activation.** `claude_provider_v1` is defined in `api/internal/capability/capability.go` but deliberately not advertised by `agent/src/worker.ts`, pinned by `agent/test/worker-provider-capability.test.ts`. No provider run has started on a real or fake worker through the full path.
-- A loopback relay that would let activation proceed. It is deferred to a separate issue with its own design review.
+- **Real-gateway and hosted-tier validation.** Activation shipped on 2026-11-19 (`agent/src/worker.ts` advertises `claude_provider_v1`, pinned by `agent/test/worker-provider-capability.test.ts`), but it is not validated against a real gateway or the hosted tier; that is owner acceptance, pending in #4473.
+- A loopback relay that would stop redirects. Parked as #4496, the future mitigation.
 - Server lanes (judge, jobs, cross-check) and the isolated research lane (PRD #4322), the Codex engine (PRD #4323), admin-shared providers (PRD #4324).
 - Any real-gateway or hosted-tier validation. That is owner acceptance.
 
@@ -129,23 +129,39 @@ An attacker with database write could repoint a binding or the unsealed `base_ur
 - **Image-only api rollback.** Pause or cancel queued provider runs and gateway waits first. An older api does not know the `provider_gateway_limit` type, the provider holds or the claim `provider` object.
 - **Migration Downs refuse live gateway waits.** 00488's Down raises while any run is `limit_wait` on `provider_gateway_limit`. Resume or cancel those runs, then downgrade.
 
-## Known, accepted limit: the CLI follows redirects, and activation is blocked
+## Known, accepted limit: the CLI follows redirects, activated without the relay
 
 The pinned Claude CLI (SDK 0.3.319, CLI 2.1.319) follows HTTP redirects from the gateway. `agent/test/provider-exclusive-routing.integration.test.ts` characterizes it against a loopback fake gateway:
 
 - A 307 to a same-origin sibling path is followed and the key travels in **both** auth styles.
 - A 307 to another origin is followed: `Authorization` is dropped, but `x-api-key` is forwarded and the request body is re-sent.
 
-So a gateway (or anyone who can make it answer with a redirect) could cause the key or the request body to be re-sent to a `Location` it names. The PRD made activation depend on this test, and the test shows the property does not hold.
+So a gateway (or anyone who can make it answer with a redirect) can cause the key to be re-sent to another path on the same host under either auth style, and the request body (prompts, plus code and tool output the agent read) to be re-sent to any `Location` host it names. With `x_api_key` auth the key goes cross-host too; Bearer drops `Authorization` cross-origin. The PRD made activation depend on a test asserting that a redirect is not followed with the key, and the test shows the property does not hold.
 
-**Decision (owner, 2026-11-18): ship with activation blocked.** Workers do not advertise `claude_provider_v1`, the worker itself refuses a provider claim it did not advertise for, and the api's claim assembly has a Go-side backstop. A run bound to a provider therefore stays queued with the health reason "no worker that supports model providers is online; waiting for a worker roll". Nothing here weakens a vendor run: a null source behaves as before.
+### History: ship blocked (owner, 2026-11-18), superseded
 
-**Deferred: a loopback relay.** A relay on the worker would hold the key and refuse redirects, so the CLI would only ever talk to loopback. It is deferred to a separate issue the owner files, with its own design review. The advertisement and the guard test flip together in the change that lands it. Until then, provider runs cannot be used and any statement that they run is wrong.
+On 2026-11-18 the owner decided to ship with activation blocked: workers did not advertise `claude_provider_v1`, so a provider-bound run stayed queued with the health reason "no worker that supports model providers is online; waiting for a worker roll". The PRD's Decision Log rejected "advertising the capability with the redirect leak documented" and deferred a loopback relay (a worker-side relay that holds the key and refuses redirects) to a separate issue. Ephemeral capability-gap provisioning also excluded provider-bound runs during that dormant phase. The decision below supersedes this.
 
-Ephemeral capability-gap provisioning also excludes provider-bound runs during this dormant phase. An ordinary ephemeral image cannot claim them and an online worker bound to a queued run is not reaped for lacking the provider capability. Activation must remove that temporary query exclusion along with enabling the worker capability.
+### Decision (owner, 2026-11-19): activate without the relay, accept the redirect risk
+
+Custom providers are activated for every install without the loopback relay; the relay (#4496) is parked as the future mitigation. The owner accepts the redirect risk stated above. Consequences of the decision:
+
+- **The allowlist is the only control on where provider traffic starts.** The operator allowlist (`UZI_PROVIDER_ALLOWED_BASE_URLS`) cannot stop a redirect once the CLI is talking to an allowed gateway. Operators should allowlist only gateways they trust not to redirect, and users should prefer Bearer auth, which limits cross-host key exposure. The routing integration test pins the redirect behaviour, so an SDK bump that changes it turns red and prompts a review of this section.
+- **Workers advertise `claude_provider_v1` by default**, with no switch. The worker still refuses a provider claim it did not advertise for, and the api's claim assembly keeps its Go-side backstop. Old workers never claim provider runs; the run queues with the reason above.
+- **Ephemeral provisioning treats a provider-bound run as demand** (the temporary query exclusion is removed). An online ephemeral worker on an old image (no capability) bound to a provider run is reaped and re-provisioned. Bounded-concurrency re-provision churn is accepted until the worker image pin catches up; total cycles are not bounded while an old image override remains. Waking a hibernated worker for a provider chat requires the capability.
+- **Rollout.** No new switch. The release helper autobumps the chart's worker image pin. Operator image overrides, Compose and separately run workers must be updated by their operator; old persistent workers leave provider runs queued.
+
+### Decision (owner-approved, 2026-11-20): redact the provider key and block pushes that carry it
+
+The redirect risk concerns where the key can go on the wire. Activation also makes a gateway key a secret the API's pattern-based scrubber cannot recognize, since an arbitrary gateway key has no known shape. Two worker-side controls cover the run's own outputs, both keyed on the exact key bound to the run:
+
+- **Redaction.** The key and its encoded forms (raw, JSON-escaped, `\/`, HTML-safe `\u00XX`, percent-encoded) are redacted before any clamp from model-pass output, usage and errors and logs (review, intent, plan and PR-description summaries), run and chat messages and failure reasons, the lead PR summary, the plan gate, completion reports, MR thread replies, findings, memory, chat issue proposals, progress labels and milestone ids.
+- **Exact-key push scan.** A worker-side scan blocks any forge upload whose objects carry the bound key in any encoded form: the finalize branch push on every forge, checkpoint packs (including park, pause, shutdown, capture and overlay) and held publication. A hit or a scanner failure blocks the upload (`push_secret_blocked` / `secret_remediation_pending`) and keeps the work local. Vendor runs are unaffected.
+
+Limits of the scan: recovery-bundle uploads to the uzi API custody archive are not scanned (a private archive, not the forge). Objects reachable only from a stale remote-tracking ref (the branch was deleted or force-pushed on the forge) are excluded, since they came from the forge. A provider run whose new objects exceed the scan caps (128 MiB, 100k objects, 60 s) has its checkpoints withheld and its final push refused.
 
 ## Consequences
 
 - Operators can allowlist gateway URLs and users can define, test, retire and select providers (Settings, `uzi provider use`, API).
-- No provider run starts. This is by design until the relay lands.
+- Provider runs start on workers that advertise `claude_provider_v1`, with the redirect risk above accepted (owner, 2026-11-19). Not validated against a real gateway or the hosted tier: owner acceptance is pending in #4473.
 - Docs: [docs/providers.md](../docs/providers.md), [docs/configuration.md](../docs/configuration.md#custom-model-providers-prd-4320), [docs/run-limit-wait.md](../docs/run-limit-wait.md#a-custom-providers-gateway-rate-limit), [docs/cli.md](../docs/cli.md#model-providers-uzi-provider), and [ARCHITECTURE.md](../ARCHITECTURE.md#custom-model-providers-prd-4320).

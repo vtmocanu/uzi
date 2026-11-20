@@ -256,11 +256,15 @@ so does every Test, right before it connects) and the claims of runs already bou
 run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
 run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
 
-**Activation is blocked.** Workers do not advertise the capability `claude_provider_v1` that provider
-runs need, because the pinned Claude CLI follows gateway redirects (see
-[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-and-activation-is-blocked)).
-Setting the allowlist lets users define, test and select providers, but a run bound to one stays
-queued ("no worker that supports model providers is online") until a later release removes the block.
+**Activated, with an accepted redirect risk.** Workers advertise the capability `claude_provider_v1`
+by default (no switch), so a run bound to a provider starts on a current worker. The pinned Claude
+CLI follows gateway redirects, so the allowlist is the only control on where provider traffic
+starts: allowlist only gateways you trust not to redirect (see
+[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay) and
+[Model providers](./providers.md)). Workers on an image that predates the capability never claim a
+provider run, which queues ("no worker that supports model providers is online"); update operator
+image overrides and Compose or separately run workers yourself, since only the chart's worker image
+pin is bumped by the release helper.
 
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
