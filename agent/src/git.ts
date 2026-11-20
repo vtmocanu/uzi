@@ -9081,8 +9081,9 @@ export class GitCache {
       ? `refs/uzi-incoming/${opts.context.runId}/${stageGeneration}/import-${this.processNonce}-${randomUUID()}`
       : `refs/uzi-incoming/${randomUUID()}`;
     const attributedStage = stage.startsWith(`refs/uzi-incoming/${opts.context.runId}/`);
-    // issue #4481: set once this import's own CAS delete of its stage succeeded, so a deleted stage is never
-    // recorded as a finished producer (only a surviving stage consumes the bounded completion record).
+    // issue #4481: set once this import's own CAS delete of its stage succeeded, so a stage this import deleted is
+    // not recorded as a finished producer. An import that never wrote its stage (closed while waiting, failed
+    // authentication or transport) is still recorded; that only spends a slot of the bounded record (fail closed).
     let stageDeleted = false;
     const deleteStage = async (oid: string): Promise<void> => {
       await this.runGit(barePath, ["update-ref", "-d", stage, oid]);
