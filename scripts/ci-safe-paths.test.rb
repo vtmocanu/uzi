@@ -364,6 +364,7 @@ audited_prd_refs = %w[
   api/internal/handler/semantic_drift_livedb_test.go
   api/internal/handler/sweep_uzi_gate_livedb_test.go
   api/internal/poller/autopilot_test.go
+  api/internal/poller/linked_comments_livedb_test.go
   api/internal/poller/linked_repo_livedb_test.go
   api/internal/poller/poller.go
   api/internal/poller/recorded_calls_livedb_test.go
