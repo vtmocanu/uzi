@@ -2526,6 +2526,8 @@ export interface CompletionPermitResponse {
 /** issue #3194: the `hold_reason` of the `--require-base` base-attestation hold (POST
  *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
 export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
+/** Issue #3252: the owner hold an active Claude run parks on when the runtime did not switch between the planning and implementation model or effort. */
+export const PHASE_SWITCH_HOLD_REASON = "phase_switch_unavailable";
 
 export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
 

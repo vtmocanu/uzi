@@ -2220,6 +2220,76 @@
       }
     },
     {
+      "id": "dc-q1-paused-phase-switch-unavailable",
+      "input": {
+        "status": "paused",
+        "holdReason": "phase_switch_unavailable",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "plan",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_planning_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "high",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_planning_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": "high",
+              "observed_effort_evidence": "claude_init",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            },
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "sonnet",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": null,
+              "observed_model_evidence": null,
+              "observed_effort": null,
+              "observed_effort_evidence": null,
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: plan opus · high → implement sonnet · medium",
+        "lines": [
+          "plan opus: your Claude planning default",
+          "plan high: your Claude planning effort",
+          "plan runtime: claude-opus-5 (Claude SDK init)",
+          "plan effort: high (Claude SDK init)",
+          "implement sonnet: your Claude default",
+          "implement medium: your Claude effort",
+          "implement runtime: not reported yet",
+          "implement effort: not reported yet",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
       "id": "dc6-both-phases-same-values",
       "input": {
         "status": "running",
