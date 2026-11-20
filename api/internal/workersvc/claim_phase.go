@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
@@ -19,10 +20,10 @@ type ClaimPhaseSettings struct {
 	Effort *string `json:"effort,omitempty"`
 	// ModelSource is leadcfg.ModelSourceUserPlanningDefault for a planning-lane value, else the
 	// implement model's source (empty when neither ships a model).
-	ModelSource string `json:"model_source"`
+	ModelSource string `json:"model_source,omitempty"`
 	// EffortSource is leadcfg.EffortSourceUserPlanningDefault for a planning-lane value, else the
 	// implement effort's source.
-	EffortSource string `json:"effort_source"`
+	EffortSource string `json:"effort_source,omitempty"`
 }
 
 // resolvePlanPhase is the pure plan-phase rule (PRD #3252 section 2), called from
@@ -30,7 +31,8 @@ type ClaimPhaseSettings struct {
 // a frozen run value (a run_override or schedule_pin model, a run_override effort) wins in both
 // phases, so the plan value is the implement value; otherwise a set planning value applies to the
 // plan phase; otherwise the plan value equals the implement value. A planning model that is a
-// Codex role id is treated as unset (the same guard the Claude lane has). The planning model is
+// Codex role id, or a planning effort outside agenttmpl.EffortLevels (the preference-only `runtime`
+// token, junk), is treated as unset (the same guards the Claude lane has). The planning model is
 // always shipped when selected, even when the implement side has no default_model.
 //
 // It returns nil when the harness is not Claude, the run override is unhonorable, or no plan
@@ -60,7 +62,7 @@ func resolvePlanPhase(in LeadSettingsInput, implement LeadSettings) *ClaimPhaseS
 	frozenEffort := implement.EffortSource == leadcfg.EffortSourceRunOverride
 	planEffort := strings.TrimSpace(in.PlanningEffort.String)
 	switch {
-	case !frozenEffort && in.PlanningEffort.Valid && planEffort != "":
+	case !frozenEffort && in.PlanningEffort.Valid && slices.Contains(agenttmpl.EffortLevels, planEffort):
 		plan.Effort = &planEffort
 		plan.EffortSource = string(leadcfg.EffortSourceUserPlanningDefault)
 		fromPlanning = true

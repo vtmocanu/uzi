@@ -12486,7 +12486,17 @@ WHERE r.status = 'queued'
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   -- PRD #4173: a run on a LINKED repo is demand too: with no worker reporting issue_key_v1 online,
   -- only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[])
+      -- PRD #3252: a Claude lead-lane run whose owner has a planning value set is demand too: with no
+      -- worker reporting 'claude_phase_models_v1' online, only a freshly provisioned worker can claim it
+      -- (required_capabilities stays '{}' for it). The same predicate text as every claim site.
+      OR (
+            r.harness = 'claude'
+            AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+            AND r.review_target_run_id IS NULL
+            AND r.egress_profile_id IS NULL
+            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+      ))
 
   -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
   -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand

@@ -28,6 +28,7 @@ type phaseMatrixCase struct {
 	model    any // users.planning_claude_model
 	effort   any // users.planning_claude_effort
 	required bool
+	noCaps   bool // required_capabilities '{}' and no docker preference: a phase-only run (PRD example 5)
 }
 
 func phaseMatrixCases() []phaseMatrixCase {
@@ -36,7 +37,10 @@ func phaseMatrixCases() []phaseMatrixCase {
 		out = append(out,
 			phaseMatrixCase{name: k + "/planning model", kind: k, harness: "claude", model: "opus", required: true},
 			phaseMatrixCase{name: k + "/planning effort", kind: k, harness: "claude", effort: "high", required: true},
-			phaseMatrixCase{name: k + "/nothing set", kind: k, harness: "claude"})
+			phaseMatrixCase{name: k + "/nothing set", kind: k, harness: "claude"},
+			phaseMatrixCase{name: k + "/planning model/no caps", kind: k, harness: "claude", model: "opus", required: true, noCaps: true},
+			phaseMatrixCase{name: k + "/planning effort/no caps", kind: k, harness: "claude", effort: "high", required: true, noCaps: true},
+			phaseMatrixCase{name: k + "/nothing set/no caps", kind: k, harness: "claude", noCaps: true})
 	}
 	out = append(out,
 		phaseMatrixCase{name: "task review is not a planning run", kind: "task", review: true, harness: "claude", model: "opus", effort: "high"})
@@ -44,12 +48,16 @@ func phaseMatrixCases() []phaseMatrixCase {
 }
 
 // phaseRun inserts a queued, unowned run of c.kind for the fixture user with required_capabilities
-// {docker} (so the capability-gap trigger's demand gate admits it) and an old status_since (so the
-// saturation debounce admits it).
+// {docker} (so the capability-gap trigger's demand gate admits it; '{}' for a noCaps case, where
+// only the phase predicate can admit it) and an old status_since (so the saturation debounce admits
+// it).
 func phaseRun(fx *fleetFixture, c phaseMatrixCase) uuid.UUID {
 	fx.t.Helper()
 	id := uuid.New()
 	docker := []string{"docker"}
+	if c.noCaps {
+		docker = []string{}
+	}
 	switch {
 	case c.review:
 		target := uuid.New()
@@ -107,6 +115,45 @@ func phaseClaim(fx *fleetFixture, worker uuid.UUID, protos []string) (uuid.UUID,
 	return run.ID, true
 }
 
+// phaseMaxRows is far above any leftover queued-run count on a shared database, so the trigger
+// queries' ORDER BY ... LIMIT cannot crowd the fixture's run out of the listed batch (the shared
+// listedUnplaceable / listedSaturation helpers cap at 50 rows).
+const phaseMaxRows = 100000
+
+func phaseListedUnplaceable(fx *fleetFixture, iv pgtype.Interval) map[uuid.UUID]bool {
+	fx.t.Helper()
+	rows, err := fx.q.ListUnplaceableQueuedRunsForEphemeral(fx.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+		BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
+		EphemeralLease:        iv, MaxPerUser: 1000, MaxRows: phaseMaxRows,
+		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute))})
+	if err != nil {
+		fx.t.Fatalf("ListUnplaceableQueuedRunsForEphemeral: %v", err)
+	}
+	out := map[uuid.UUID]bool{}
+	for _, r := range rows {
+		out[r.ID] = true
+	}
+	return out
+}
+
+func phaseListedSaturation(fx *fleetFixture, iv pgtype.Interval) map[uuid.UUID]bool {
+	fx.t.Helper()
+	rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+		BackgroundGraceCutoff: pgtype.Timestamptz{Time: time.Now().Add(-15 * time.Minute), Valid: true},
+		SaturationDelay:       leaseInterval(0), EphemeralLease: iv, MaxPerUser: 1000, MaxRows: phaseMaxRows,
+		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
+		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute))})
+	if err != nil {
+		fx.t.Fatalf("ListSaturationQueuedRunsForEphemeral: %v", err)
+	}
+	out := map[uuid.UUID]bool{}
+	for _, r := range rows {
+		out[r.ID] = true
+	}
+	return out
+}
+
 func phaseHealthRow(fx *fleetFixture, run uuid.UUID) store.ListActiveRunsForHealthRow {
 	fx.t.Helper()
 	rows, err := fx.q.ListActiveRunsForHealth(fx.ctx, []string{"gpt-6-sol"})
@@ -158,7 +205,7 @@ func TestPhaseModelsMirrorMatrixLiveDB(t *testing.T) {
 			if n := claimableCount(fx, run, iv); n != want(!c.required) {
 				t.Fatalf("claimable by the incapable worker = %d, want %d", n, want(!c.required))
 			}
-			if gap := listedUnplaceable(fx, 1000, iv); gap[run] != c.required {
+			if gap := phaseListedUnplaceable(fx, iv); gap[run] != c.required {
 				t.Fatalf("capability-gap trigger listed = %v, want %v", gap[run], c.required)
 			}
 			if id, ok := phaseClaim(fx, incapable, []string{}); ok != !c.required || (ok && id != run) {
@@ -173,7 +220,7 @@ func TestPhaseModelsMirrorMatrixLiveDB(t *testing.T) {
 			if n := claimableCount(fx, run, iv); n != 2-want(c.required) {
 				t.Fatalf("claimable = %d, want %d", n, 2-want(c.required))
 			}
-			if gap := listedUnplaceable(fx, 1000, iv); gap[run] {
+			if gap := phaseListedUnplaceable(fx, iv); gap[run] {
 				t.Fatal("capability-gap trigger listed a run a capable worker can take")
 			}
 			if id, ok := phaseClaim(fx, capable, []string{phaseCap}); !ok || id != run {
@@ -183,7 +230,7 @@ func TestPhaseModelsMirrorMatrixLiveDB(t *testing.T) {
 			// Fleet C: only a SATURATED incapable worker. A required run has no capable worker to wait
 			// for, so it is the gap trigger's, not the saturation trigger's; a free run is capable-but-full.
 			fx, run, _, _ = setup(false, true)
-			if sat := listedSaturation(fx, 1000, iv); sat[run] != !c.required {
+			if sat := phaseListedSaturation(fx, iv); sat[run] != !c.required {
 				t.Fatalf("saturation trigger listed = %v, want %v", sat[run], !c.required)
 			}
 
@@ -194,11 +241,26 @@ func TestPhaseModelsMirrorMatrixLiveDB(t *testing.T) {
 			busyCapable := phaseWorkerRow(fx, "busy-capable", capOf(1), []string{phaseCap})
 			fx.holdActive(busyCapable, 1)
 			run = phaseRun(fx, c)
-			if sat := listedSaturation(fx, 1000, iv); !sat[run] {
+			if sat := phaseListedSaturation(fx, iv); !sat[run] {
 				t.Fatal("saturation trigger did not list a run waiting on a saturated capable worker")
 			}
-			if gap := listedUnplaceable(fx, 1000, iv); gap[run] {
+			if gap := phaseListedUnplaceable(fx, iv); gap[run] {
 				t.Fatal("capability-gap trigger listed a run a (saturated) capable worker could take")
+			}
+
+			// Fleet F: a SATURATED capable worker plus an IDLE incapable one. For a required run the idle
+			// incapable worker has no free slot the run can use, so the run is still slot-blocked and the
+			// saturation trigger lists it (the "capable worker with a free slot" NOT EXISTS must apply the
+			// phase clause); for a free run the idle worker takes it, so it is not listed.
+			fx = newFleetFixture(t)
+			optInEphemeral(fx)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_claude_model = $2, planning_claude_effort = $3 WHERE id = $1`, fx.userID, c.model, c.effort)
+			busyCapable = phaseWorkerRow(fx, "busy-capable", capOf(1), []string{phaseCap})
+			fx.holdActive(busyCapable, 1)
+			phaseWorkerRow(fx, "idle-incapable", capOf(1), []string{})
+			run = phaseRun(fx, c)
+			if sat := phaseListedSaturation(fx, iv); sat[run] != c.required {
+				t.Fatalf("saturation trigger with a busy capable and an idle incapable worker listed = %v, want %v", sat[run], c.required)
 			}
 
 			// Fleet E: the fleet-spread peer clause. The capable claimant already holds a run and an idle

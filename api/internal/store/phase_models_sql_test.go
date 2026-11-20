@@ -60,13 +60,15 @@ func TestPhaseModelsPredicateKindListMatchesLeadLane(t *testing.T) {
 		"CountOnlineWorkersClaimableForRun":    1,
 		"ListSaturationQueuedRunsForEphemeral": 2,
 		"ListActiveRunsForHealth":              1,
+		// The demand gate of the capability-gap trigger (a phase-only run with no required caps).
+		"ListUnplaceableQueuedRunsForEphemeral": 1,
 	} {
 		body, ok := bodies[name]
 		if !ok {
 			t.Fatalf("%s not found", name)
 		}
 		phaseModelsSiteKinds(t, name, body, sites)
-		if !strings.Contains(body, "claude_phase_models_v1") && name != "ListActiveRunsForHealth" {
+		if !strings.Contains(body, "claude_phase_models_v1") && name != "ListActiveRunsForHealth" && name != "ListUnplaceableQueuedRunsForEphemeral" {
 			t.Errorf("%s does not test the claude_phase_models_v1 capability", name)
 		}
 	}

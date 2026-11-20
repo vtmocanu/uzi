@@ -303,6 +303,11 @@ func TestClaimPlanPhaseCodexClaimUnaffectedLiveDB(t *testing.T) {
 func TestCheckProviderModelsRequiresMappedPlanningModelLiveDB(t *testing.T) {
 	f := newIsoFix(t)
 	f.env.exec(`UPDATE users SET default_claude_model = 'sonnet' WHERE id = $1`, f.userID)
+	// Independent of a shared database: a global allocation row left by another suite can enable a
+	// builtin template (e.g. architect, opus) whose model would also need mapping. A user-scoped
+	// allocation overrides the global one, so disable every non-user template for this user.
+	f.env.exec(`INSERT INTO agent_template_allocations (template_id, user_id, enabled)
+	            SELECT id, $1, false FROM agent_templates WHERE scope <> 'user' ON CONFLICT DO NOTHING`, f.userID)
 	src := providerSource{ModelMap: providers.ModelMap{"sonnet": providers.ModelEntry{Model: "vendor-sonnet"}}}
 	run := f.insertPhaseRun(t, "issue", "queued", uuid.Nil)
 

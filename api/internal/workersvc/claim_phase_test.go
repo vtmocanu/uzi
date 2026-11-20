@@ -1,7 +1,9 @@
 package workersvc
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -53,6 +55,11 @@ func TestResolvePlanPhase(t *testing.T) {
 		{"a Codex role id planning model does not hide a planning effort",
 			LeadSettingsInput{Harness: HarnessClaude, LaneModel: txt("sonnet"), PlanningModel: txt("gpt-6-sol"), PlanningEffort: txt("high")},
 			&ClaimPhaseSettings{Model: strp("sonnet"), ModelSource: "user_default", Effort: strp("high"), EffortSource: planSrc}},
+		{"the preference-only runtime token as the planning effort is treated as unset",
+			LeadSettingsInput{Harness: HarnessClaude, LaneModel: txt("sonnet"), PlanningModel: txt("opus"), PlanningEffort: txt("runtime")},
+			&ClaimPhaseSettings{Model: strp("opus"), ModelSource: planSrc, Effort: strp("medium"), EffortSource: "builtin"}},
+		{"a junk planning effort alone ships no plan_phase",
+			LeadSettingsInput{Harness: HarnessClaude, LaneModel: txt("sonnet"), PlanningEffort: txt("bogus")}, nil},
 		{"Codex harness never plans",
 			LeadSettingsInput{Harness: HarnessCodex, LaneModel: txt("gpt-6-luna"), PlanningModel: txt("opus"), PlanningEffort: txt("high")}, nil},
 		{"unhonorable run override model ships nothing",
@@ -93,6 +100,13 @@ func TestResolvePlanPhaseEmptyImplementModelHasNoSource(t *testing.T) {
 	got := resolveLeadSettings(in).Plan
 	if got == nil || got.Model != nil || got.ModelSource != "" {
 		t.Fatalf("plan = %s, want a nil model with an empty source", planString(got))
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "model") {
+		t.Fatalf("inherited unset model serialized as %s, want no model or model_source key", raw)
 	}
 }
 
