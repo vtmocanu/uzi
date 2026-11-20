@@ -449,7 +449,10 @@ or make it ineligible. P7 is fenced by the seal of the generation it would pin:
 under the bare lock it returns `ownership_unknown`, before any candidate,
 context or pin write, when a `final-` file exists at or above the producing
 context's generation or the caller's generation (a failed read of the names
-also returns `ownership_unknown`). Once `final-`
+refuses too, as `preservation_failed`). The fence is checked before the
+already-pinned and remotely-covered short cuts, so after a seal a retain that
+would have written nothing new is also refused (`not_updated`, the clone is
+preserved): an accepted, fail-closed over-refusal. Once `final-`
 exists the seal blocks recording on every path, including `retainCurrentOwedCandidate`.
 On these paths a second terminal pass for the same generation re-proves the
 released head instead of re-importing (this only stops the hook from
@@ -616,12 +619,15 @@ residual that earlier text left open is closed by the owed-path marker above.
   `owedStopReleaseWait(flight)` after an owed-limit stop, and otherwise with
   `owedStopReleaseWait(flight)` as a fallback; that fallback still refuses on a
   recorded cancel or claim fence. If A cannot be acquired the gate counts as
-  ineligible and custody is kept. An A-acquisition failure is an ineligible
-  gate, and an ineligible gate closes the refusal fence for that generation in
-  this process. This is an accepted, fail-closed residual. The sealed cleanup
+  ineligible and custody is kept. At the transfer sites an ineligible gate,
+  including one caused by an A-acquisition failure, closes the refusal fence for
+  that generation in this process (the settle site only preserves the clone).
+  This is an accepted, fail-closed residual. The sealed cleanup
   (`refusalCleanupPlan`, unchanged) still excludes and deletes a refused-ref and
-  ledger anchored import stage whatever its nonce. That is reachable only when a
-  FINAL predates the stage; the commit stays covered by the sealed covering head,
+  ledger anchored import stage whatever its nonce. A stage that was proven when
+  sealed (for example one a successor cleans up after a restart) is harmless; one
+  that was not proven when sealed can exist only if it postdates the FINAL. In
+  either case the commit stays covered by the sealed covering head,
   and the gate and seal hold such a stage as unproven. This is an accepted
   boundary. Failure
   model: process crash only. The ref guarantees make no storage or power-loss
