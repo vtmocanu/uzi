@@ -13,10 +13,9 @@ Shipped: the allowlist, provider and key storage, the Test probe, the Claude-sou
 
 Not shipped (see the PRD for the milestone notes):
 
-- **Real-gateway and hosted-tier validation.** Activation shipped on 2026-11-19 (`agent/src/worker.ts` advertises `claude_provider_v1`, pinned by `agent/test/worker-provider-capability.test.ts`), but it is not validated against a real gateway or the hosted tier; that is owner acceptance, pending in #4473.
+- Real-gateway and hosted-tier validation. Activation itself shipped on 2026-11-19 (`agent/src/worker.ts` advertises `claude_provider_v1`, pinned by `agent/test/worker-provider-capability.test.ts`), but nothing is validated against a real gateway or the hosted tier; that is owner acceptance, pending in #4473.
 - A loopback relay that would stop redirects. Parked as #4496, the future mitigation.
 - Server lanes (judge, jobs, cross-check) and the isolated research lane (PRD #4322), the Codex engine (PRD #4323), admin-shared providers (PRD #4324).
-- Any real-gateway or hosted-tier validation. That is owner acceptance.
 
 ## Context
 
@@ -136,7 +135,7 @@ The pinned Claude CLI (SDK 0.3.319, CLI 2.1.319) follows HTTP redirects from the
 - A 307 to a same-origin sibling path is followed and the key travels in **both** auth styles.
 - A 307 to another origin is followed: `Authorization` is dropped, but `x-api-key` is forwarded and the request body is re-sent.
 
-So a gateway (or anyone who can make it answer with a redirect) can cause the key to be re-sent to another path on the same host under either auth style, and the request body (prompts, plus code and tool output the agent read) to be re-sent to any `Location` host it names. With `x_api_key` auth the key goes cross-host too; Bearer drops `Authorization` cross-origin. The PRD made activation depend on a test asserting that a redirect is not followed with the key, and the test shows the property does not hold.
+So a gateway (or anyone who can make it answer with a redirect) can cause the key to be re-sent to another path on the same host under either auth style, and the request body (prompts, plus code and tool output the agent read) to be re-sent to any `Location` host it names. With `x_api_key` auth the key goes cross-host too; Bearer drops `Authorization` cross-origin. The test characterizes the cross-origin case with a second loopback origin, so "cross-host" here is a cross-origin result, not a measurement against a different real host. The PRD made activation depend on a test asserting that a redirect is not followed with the key, and the test shows the property does not hold.
 
 ### History: ship blocked (owner, 2026-11-18), superseded
 
@@ -158,7 +157,7 @@ The redirect risk concerns where the key can go on the wire. Activation also mak
 - **Redaction.** The key and its encoded forms (raw, JSON-escaped, `\/`, HTML-safe `\u00XX`, percent-encoded) are redacted before any clamp from model-pass output, usage and errors and logs (review, intent, plan and PR-description summaries), run and chat messages and failure reasons, the lead PR summary, the plan gate, completion reports, MR thread replies, findings, memory, chat issue proposals, progress labels and milestone ids.
 - **Exact-key push scan.** A worker-side scan blocks any forge upload whose objects carry the bound key in any encoded form: the finalize branch push on every forge, checkpoint packs (including park, pause, shutdown, capture and overlay) and held publication. A hit or a scanner failure blocks the upload (`push_secret_blocked` / `secret_remediation_pending`) and keeps the work local. Vendor runs are unaffected.
 
-Limits of the scan: recovery-bundle uploads to the uzi API custody archive are not scanned (a private archive, not the forge). Objects reachable only from a stale remote-tracking ref (the branch was deleted or force-pushed on the forge) are excluded, since they came from the forge. A provider run whose new objects exceed the scan caps (128 MiB, 100k objects, 60 s) has its checkpoints withheld and its final push refused.
+Limits of the scan: recovery-bundle uploads to the uzi API custody archive are not scanned (a private archive, not the forge). For the finalize branch push only (not checkpoint packs), objects reachable only from a stale remote-tracking ref (the branch was deleted or force-pushed on the forge) are excluded, since they came from the forge. A provider run whose new objects exceed the scan caps (128 MiB, 100k objects, 60 s) has its checkpoints withheld and its final push refused.
 
 ## Consequences
 

@@ -148,10 +148,6 @@ frozen binding, not whatever your source is later. CI-fix and handoff runs have 
 use your current source. Editing a provider's model map creates a new revision for later runs
 and older ones keep theirs.
 
-The rest of this section and the next one (Gateway rate limits) describe how a provider run
-behaves once workers support providers. Until then a provider run waits in the queue (see the note at the top of this
-page), and a revoked binding simply leaves it queued.
-
 Revocation takes effect at the run's **next claim**, not mid-claim, and cancelling is the
 immediate stop. If the operator removes the URL from the allowlist, the run pauses as
 `provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the

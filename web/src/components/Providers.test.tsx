@@ -375,8 +375,11 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     await renderCard();
     const box = await screen.findByTestId("claude-source");
     expect(box.textContent).toMatch(/Current Claude source: Anthropic/);
-    expect(box.textContent).toMatch(/Only allowlist gateways you trust not to redirect/);
-    expect(box.textContent).toMatch(/Bearer auth is safer/);
+    expect(box.textContent).toMatch(/Use only a gateway you trust not to redirect/);
+    expect(box.textContent).toMatch(/your key to another path on the same host/);
+    expect(box.textContent).toMatch(/Bearer auth limits this/);
+    expect(box.textContent).not.toMatch(/Only allowlist gateways/);
+    expect(box.textContent).not.toMatch(/Bearer auth is safer/);
     expect(box.textContent).not.toMatch(/wait in the queue until workers support providers/);
   });
 

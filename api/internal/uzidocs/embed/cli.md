@@ -2971,7 +2971,7 @@ applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 
 has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
 (`use --none` only clears the selection, so it succeeds even with the feature off).
 `--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
-"unknown (custom provider)". Runs through a provider are currently blocked and stay queued; see [Model providers](./providers.md).
+"unknown (custom provider)". Runs start on workers that advertise `claude_provider_v1`; an older worker leaves them queued ("no worker that supports model providers is online"). See [Model providers](./providers.md).
 
 ## Anthropic tokens
 
