@@ -60,7 +60,7 @@ func TestPlanCrossCheckCandidateMilestoneAdmissibility(t *testing.T) {
 		{"50 entries", entries(50), accepted, "base"},
 		{"200-rune title", one("m1", strings.Repeat("a", 200)), accepted, "base"},
 		{"multibyte title", one("m1", "Überprüfung 検証"), accepted, "base"},
-		{"scrub-dependent title", one("m1", " "+token+" ‮ title "), accepted, "base"},
+		{"scrub-dependent title", one("m1", " "+token+" \u202e title "), accepted, "base"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := PlanCrossCheckCandidate{PlanMd: "Plan", Milestones: json.RawMessage(tc.milestones),

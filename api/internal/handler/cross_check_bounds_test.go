@@ -130,9 +130,10 @@ func TestCrossCheckNormalizedResponseFitsClientBound(t *testing.T) {
 }
 
 // The full 256 KiB milestone envelope is proven on a response built directly, with
-// no normalizer: the client bound must hold even for stored bytes at every cap.
+// no normalizer: the client bound must hold even when the stored milestones reach the
+// 256 KiB cap on the wire (each literal "<" marshals to a six-byte \u003c escape).
 func TestCrossCheckResponseEnvelopeFitsClientBound(t *testing.T) {
-	escaped := strings.Repeat(`<`, ((256<<10)-14)/6)
+	lt := strings.Repeat(`<`, ((256<<10)-14)/6)
 	var caps, tools []string
 	for i := 0; i < 64; i++ {
 		caps = append(caps, strings.Repeat("<", 256))
@@ -141,7 +142,7 @@ func TestCrossCheckResponseEnvelopeFitsClientBound(t *testing.T) {
 	cc := store.CrossCheck{Round: 1, LeadClaimGeneration: 1, Verdict: "failed",
 		PlanMd:       pgtype.Text{String: strings.Repeat("<", 256<<10), Valid: true},
 		PlanningDiff: pgtype.Text{String: strings.Repeat("<", 512<<10), Valid: true},
-		Milestones:   json.RawMessage(`[{"title":"` + escaped + `"}]`), RequiredCapabilities: caps,
+		Milestones:   json.RawMessage(`[{"title":"` + lt + `"}]`), RequiredCapabilities: caps,
 		RequiredTools: tools, SizeClass: pgtype.Text{String: "s", Valid: true},
 		BaseCommit: pgtype.Text{String: strings.Repeat("a", 40), Valid: true}, CandidateDigest: make([]byte, 32),
 		Findings: json.RawMessage(`{"summary":"` + strings.Repeat("a", (32<<10)-14) + `"}`)}
@@ -183,7 +184,7 @@ func TestCrossCheckSubmitRefusesBlankMilestoneIdentity(t *testing.T) {
 	if code, reason := call(h, body(`[{"id":"","title":""}]`)); code != http.StatusBadRequest || reason != "candidate_invalid" {
 		t.Fatalf("blank milestone: status=%d reason=%s", code, reason)
 	}
-	if code, reason := call(h, body(`[{"id":"m1","title":"T"}]`)); code == http.StatusBadRequest && reason == "candidate_invalid" {
-		t.Fatal("valid milestones refused as candidate_invalid")
+	if code, reason := call(h, body(`[{"id":"m1","title":"T"}]`)); code != -1 || reason != "past_normalizer" {
+		t.Fatalf("valid milestones did not pass the normalizer: status=%d reason=%s", code, reason)
 	}
 }

@@ -127,7 +127,7 @@ func checkedPlanMilestonesAdmissible(raw []byte) bool {
 	}
 	for _, entry := range entries {
 		var fields map[string]json.RawMessage
-		if json.Unmarshal(entry, &fields) != nil || fields == nil || len(fields) != 2 {
+		if json.Unmarshal(entry, &fields) != nil || len(fields) != 2 {
 			return false
 		}
 		if _, ok := fields["id"]; !ok {
