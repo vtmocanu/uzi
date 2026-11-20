@@ -1402,13 +1402,6 @@ type Run struct {
 	CheckpointWithheldGeneration      pgtype.Int8        `json:"checkpoint_withheld_generation"`
 	CheckpointWithheldNonce           pgtype.Text        `json:"checkpoint_withheld_nonce"`
 	CheckpointWithheldReportSeq       pgtype.Int8        `json:"checkpoint_withheld_report_seq"`
-	CodexSwitchTargetSecretID         pgtype.UUID        `json:"codex_switch_target_secret_id"`
-	CodexSwitchTargetGeneration       pgtype.Int8        `json:"codex_switch_target_generation"`
-	CodexSwitchTargetOpID             pgtype.UUID        `json:"codex_switch_target_op_id"`
-	CodexSwitchTargetAuthMode         pgtype.Text        `json:"codex_switch_target_auth_mode"`
-	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
-	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
-	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
 	ModelProviderID                   pgtype.UUID        `json:"model_provider_id"`
 	ModelProviderRevision             pgtype.Int4        `json:"model_provider_revision"`
 	ModelProviderKeyMode              pgtype.Text        `json:"model_provider_key_mode"`
@@ -1417,6 +1410,13 @@ type Run struct {
 	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
 	ClaimProvenanceWorkerID           pgtype.UUID        `json:"claim_provenance_worker_id"`
 	ClaimProvenanceGeneration         pgtype.Int8        `json:"claim_provenance_generation"`
+	CodexSwitchTargetSecretID         pgtype.UUID        `json:"codex_switch_target_secret_id"`
+	CodexSwitchTargetGeneration       pgtype.Int8        `json:"codex_switch_target_generation"`
+	CodexSwitchTargetOpID             pgtype.UUID        `json:"codex_switch_target_op_id"`
+	CodexSwitchTargetAuthMode         pgtype.Text        `json:"codex_switch_target_auth_mode"`
+	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
+	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
+	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
 }
 
 type RunCompletionAttempt struct {
