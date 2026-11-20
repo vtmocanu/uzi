@@ -229,7 +229,13 @@ export interface RunContext {
    *  receiving lead lane (see runner.ts `runEnvForClaim`). The Claude and Codex run executors pass it to
    *  buildSdkEnv / buildCommandEnv, which re-check every name and drop violations with a run event. Secret
    *  values: never log. Absent for every other lane and for a run without variables. */
-  runEnv?: readonly { readonly name: string; readonly value: string }[];
+  runEnv?: readonly {
+    readonly name: string;
+    readonly value: string;
+    readonly secret: boolean;
+    readonly scope: "repo" | "user";
+    readonly description: string;
+  }[];
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;

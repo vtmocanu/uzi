@@ -16,6 +16,7 @@
 // text can never drive an action, and the system prompt frames the inputs as data the
 // model must never take instructions from (Decision 10).
 
+import { redactStrings } from "./redact.js";
 import os from "node:os";
 import { diagramEvent, type DiagramParserReason, type DiagramReason } from "./diagram-diagnostic.js";
 
@@ -90,6 +91,14 @@ export interface Delta {
 export interface PlanSummaryResult {
   summary: string;
   deltas: Delta[];
+}
+
+/** The body of the plan-summary POST: the model's summary and deltas plus the plan guard value, every
+ *  string scrubbed with the run's redactor (`redactText`; absent means identity). `plan_md` is what the api
+ *  compares with its stored plan, which was redacted the same way, so the guard keeps matching. */
+export function planSummaryPostBody(result: PlanSummaryResult, planMd: string, redactText?: (s: string) => string): PlanSummaryResult & { plan_md: string } {
+  const body = { ...result, plan_md: planMd.replaceAll("\u0000", "") };
+  return redactText ? redactStrings(body, redactText) : body;
 }
 
 /** Common inputs to a summary turn. `prdText` is the resolved PRD body (M3b) or null

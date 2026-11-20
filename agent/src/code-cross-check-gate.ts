@@ -151,6 +151,8 @@ export async function checkCode(options: {
    *  Called only while the server reports repository instructions enabled. */
   readInstructions?(baseCommit: string, signal: AbortSignal): Promise<string>;
   pollMs?: number; requestMs?: number;
+  /** The run's text redactor, applied to the repository instruction text before it is submitted. */
+  redactText?: (s: string) => string;
 }): Promise<CodeCrossCheckStatus | undefined> {
   const { client, runId, generation, signal } = options;
   const request = <T>(fn: (signal: AbortSignal) => Promise<T>, remaining = 3000) =>
@@ -170,7 +172,7 @@ export async function checkCode(options: {
         if (!enabled) return { repo_instructions_enabled: false };
         let text = "";
         try { text = (await options.readInstructions?.(snapshot.repo_instructions_commit ?? snapshot.base_commit, signal)) ?? ""; } catch { signal.throwIfAborted(); }
-        return { repo_instructions_enabled: true, repo_instructions_text: text };
+        return { repo_instructions_enabled: true, repo_instructions_text: options.redactText ? options.redactText(text) : text };
       };
       const first = await instructionsFor(current.repo_instructions_enabled);
       try {

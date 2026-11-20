@@ -1,3 +1,4 @@
+import { redactStrings } from "./redact.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -44,6 +45,10 @@ interface CheckPlanOptions {
   /** "required" (default): an APPROVE releases the autopilot approval. "gated": an APPROVE yields
    * gated_pass and a human still approves. */
   mode?: "required" | "gated";
+  /** The run's text redactor. The candidate's model- and repository-derived text (plan, milestones,
+   *  planning diff) is scrubbed with it before submission; absent means identity. Idempotent over
+   *  text the caller already redacted, so the plan stays equal to the semantic candidate's. */
+  redactText?: (s: string) => string;
 }
 
 export function checkPlan(options: CheckPlanOptions & { mode: "gated"; allowAutomaticRevision?: false }):
@@ -56,7 +61,13 @@ export function checkPlan(options: CheckPlanOptions & { mode?: "required" }):
   Promise<Exclude<CheckedPlanDecision, { kind: "gated_pass" }>>;
 export function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision>;
 export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision> {
-  const { client, runId, generation, candidate, batcher, signal } = options;
+  const { client, runId, generation, batcher, signal } = options;
+  const redact = options.redactText;
+  const candidate: PlanCrossCheckCandidate = redact
+    ? { ...options.candidate, plan_md: redact(options.candidate.plan_md),
+        milestones: redactStrings(options.candidate.milestones, redact),
+        planning_diff: redact(options.candidate.planning_diff) }
+    : options.candidate;
   const timing = options.timing;
   const round = options.round ?? 1;
   if (!Number.isSafeInteger(round) || round < 1 || round > 5)

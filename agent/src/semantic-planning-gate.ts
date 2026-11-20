@@ -1,3 +1,4 @@
+import { redactStrings } from "./redact.js";
 import { validateCoverageReport } from "./plan-contract-report.js";
 import { randomUUID, createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -19,7 +20,9 @@ const sameBinding = (a: SemanticBinding, b: SemanticBinding) =>
 export class SemanticPlanningGate {
   constructor(private readonly client: WorkerClient, private readonly runId: string,
     private readonly generation: number, private readonly signalSource: AbortSignal | (() => AbortSignal),
-    private readonly testTransport?: BoundedCoverageTestTransport) {}
+    private readonly testTransport?: BoundedCoverageTestTransport,
+    /** The run's text redactor: the model-authored coverage report is scrubbed with it before it is published. */
+    private readonly redactText?: (s: string) => string) {}
 
   /** The signal for one public call, resolved once on entry. A provider lets a caller whose
    * lifecycle controller is replaced (a credential-switch give-up) hand each call the live one. */
@@ -135,7 +138,8 @@ export class SemanticPlanningGate {
     // Settlement is independent of publication. A failed settlement never publishes.
     if (result.report && last?.review_id && last.invocation_id && result.reason !== "coverage_settlement_failed") {
       await this.client.publishSemanticCoverage(this.runId, this.generation, {
-        review_id: last.review_id, invocation_id: last.invocation_id, report: result.report,
+        review_id: last.review_id, invocation_id: last.invocation_id,
+        report: this.redactText ? redactStrings(result.report, this.redactText) : result.report,
       }, signal);
     }
     return result;

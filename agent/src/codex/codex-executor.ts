@@ -140,7 +140,7 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
+import { SummaryRunner, planSummaryPostBody, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
 import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
@@ -197,6 +197,7 @@ import { resolveChildTurnDeadlineMs } from "./child-budget.js";
 import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
 import { foldRunEnv, type RunEnvDropHandler, type RunEnvVar } from "../run-env-merge.js";
 import { runEnvDropEmitter } from "../run-env-drop-event.js";
+import { buildRunEnvBlock } from "../run-env-prompt.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -1607,7 +1608,7 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
   const { client, runId, log, emit, skills, redactText } = deps;
   const map = new Map<string, ToolHandler>();
   if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, async args => {
-    const reply = await readCIEvidence(deps.ciEvidence!, args);
+    const reply = await readCIEvidence(deps.ciEvidence!, args, redactText);
     if (reply.isError) throw new Error("CI evidence read denied or unavailable");
     // The reply adapters stringify objects; preserve the already bounded text.
     return reply.content[0]!.text;
@@ -3385,9 +3386,8 @@ export class CodexExecutor implements Executor {
               return;
             }
             if (!allowed()) return;
-            await this.opts.client.postPlanSummary(ctx.runId, {
-              ...result, plan_md: planMd.replaceAll("\u0000", ""),
-            });
+            // See the same post in sdk-executor.ts: summary and the plan_md guard pass the run's redactor.
+            await this.opts.client.postPlanSummary(ctx.runId, planSummaryPostBody(result, planMd, ctx.redactText));
             if (allowed()) latestPlanSummary = result;
           } catch (error) {
             this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
@@ -7229,6 +7229,7 @@ export class CodexExecutor implements Executor {
       prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
       childTurnBudgetMs: this.childTurnDeadlineMs(),
+      runEnvBlock: buildRunEnvBlock(ctx.runEnv),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       redactText: ctx.redactText,
@@ -7281,7 +7282,8 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${head}\n\n${review}` : head;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}${runEnvBlock ? `\n\n${runEnvBlock}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -7373,7 +7375,9 @@ export class CodexExecutor implements Executor {
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
     const block = buildEnvironmentFactsBlock(facts);
-    const withFacts = block ? `${prompt}\n\n${block}` : prompt;
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const withEnv = runEnvBlock ? `${prompt}\n\n${runEnvBlock}` : prompt;
+    const withFacts = block ? `${withEnv}\n\n${block}` : withEnv;
     const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
     return dockerResume ? `${withFacts}\n\n${dockerResume}` : withFacts;
   }

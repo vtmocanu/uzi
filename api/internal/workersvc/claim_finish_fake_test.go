@@ -106,6 +106,36 @@ func (t *fakeClaimFinishTx) InsertRunOverrideUnavailableMessage(_ context.Contex
 	return 1, nil
 }
 
+func (t *fakeClaimFinishTx) LockUserVaultStateForShareNowait(context.Context, uuid.UUID) (store.LockUserVaultStateForShareNowaitRow, error) {
+	t.f.runEnvLockCalls++
+	if len(t.f.runEnvLockErrs) > 0 {
+		err := t.f.runEnvLockErrs[0]
+		t.f.runEnvLockErrs = t.f.runEnvLockErrs[1:]
+		if err != nil {
+			return store.LockUserVaultStateForShareNowaitRow{}, err
+		}
+	}
+	return store.LockUserVaultStateForShareNowaitRow{}, nil
+}
+
+func (t *fakeClaimFinishTx) ParkRunEnvHistoryUnavailableRun(_ context.Context, arg store.ParkRunEnvHistoryUnavailableRunParams) (int64, error) {
+	t.pending = append(t.pending, func() { t.f.claimRunEnvParked = &arg })
+	return 1, nil
+}
+
+func (t *fakeClaimFinishTx) ListRunEnvEffectiveKeysForRun(context.Context, uuid.UUID) ([]store.ListRunEnvEffectiveKeysForRunRow, error) {
+	return t.f.runEnvLiveKeys, nil
+}
+
+func (t *fakeClaimFinishTx) ListRunEnvRedactKeysForRun(context.Context, uuid.UUID) ([]store.ListRunEnvRedactKeysForRunRow, error) {
+	return t.f.runEnvRedactKeys, nil
+}
+
+func (t *fakeClaimFinishTx) UpsertRunEnvReceipt(_ context.Context, arg store.UpsertRunEnvReceiptParams) error {
+	t.pending = append(t.pending, func() { t.f.runEnvReceipts = append(t.f.runEnvReceipts, arg) })
+	return nil
+}
+
 // GetUserCredentialsResetAt: the fake users have never redeemed a reset link (NULL marker).
 func (t *fakeClaimFinishTx) GetUserCredentialsResetAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, nil

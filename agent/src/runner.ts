@@ -17044,7 +17044,7 @@ export class RunRunner {
     };
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
-      () => steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+      () => steering.lifecycleSignal(), this.semanticCoverageTestTransport, flight.redactText) : undefined;
     // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
     // is only populated inside run(), so it is excluded here by the signals known before launch
     // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
@@ -18007,7 +18007,8 @@ export class RunRunner {
               required_capabilities: toolchainDetection?.required_capabilities ?? [],
               required_tools: toolchainDetection?.required_tools ?? [],
               size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-              planning_diff: semanticDiff.diff,
+              // Redacted here, before the structural candidate exists, so the compile's plan check holds.
+              planning_diff: flight.redactText(semanticDiff.diff),
             }, semanticSubmission, semanticSources.sources);
             flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
               sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
@@ -18166,7 +18167,7 @@ export class RunRunner {
                     required_capabilities: toolchainDetection?.required_capabilities ?? [],
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-                    planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
+                    planning_diff: flight.redactText(captured.diff) }, batcher, redactText: flight.redactText, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
                   round: crossCheckRound, allowAutomaticRevision: true as const };
                 // Literal-mode calls select the typed overloads: the gated result excludes
                 // "approve" at compile time (the runtime throw below stays as a backstop).
@@ -18745,6 +18746,7 @@ export class RunRunner {
           if (completion.reportOnly || completion.notCode || completion.confirmedEmptyPrompt) return { action: "proceed" as const };
           const done = async () => {
             codeGate ??= new CodeCrossCheckGate({
+            redactText: flight.redactText,
             client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
             readInstructions: async (instructionsCommit: string, signal: AbortSignal) => {
               if (!barePath) return "";

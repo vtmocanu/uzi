@@ -46,6 +46,7 @@ import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-co
 import { toLeadObservation } from "./runtime-observation.js";
 import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
 import { runEnvDropEmitter } from "./run-env-drop-event.js";
+import { buildRunEnvBlock } from "./run-env-prompt.js";
 import { assertAgentModelsMapped, isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
@@ -144,7 +145,7 @@ import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 import { isSeededOwnerPlan } from "./seeded-plan.js";
-import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
+import { SummaryRunner, planSummaryPostBody, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
@@ -1503,9 +1504,9 @@ export class SdkExecutor implements Executor {
             },
           });
           if (!result || !allowed()) return;
-          await this.client!.postPlanSummary(ctx.runId, {
-            ...result, plan_md: planMd.replaceAll("\u0000", ""),
-          });
+          // The summary is model output over the plan and plan_md is the stale-write guard value the
+          // api compares with its stored (already redacted) plan, so both pass the run's redactor.
+          await this.client!.postPlanSummary(ctx.runId, planSummaryPostBody(result, planMd, ctx.redactText));
           if (allowed()) this.latestPlanSummary = result;
         } catch (error) {
           this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
@@ -1798,10 +1799,13 @@ export class SdkExecutor implements Executor {
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
     const survivorNames = new Set(runSkills.map((s) => s.name));
+    // PRD #4416: the same variables block the lead prompt carries, for every subagent's prompt.
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
     const assembled = assembleAgents(
       ctx.agents ?? [],
       survivorNames,
       prepared.repoSurvivorNames,
+      runEnvBlock,
     );
     // Model precedence (PRD #17 Decision 6): the run owner's per-user default
     // model wins over the lead template's model for the main thread. Set the key
@@ -1845,6 +1849,7 @@ export class SdkExecutor implements Executor {
         ctx.approvedSelection?.source === "repo" ? ctx.approvedSelection.exclusions : [],
         survivorNames,
         prepared.repoSurvivorNames,
+        runEnvBlock,
       )
       : assembled.subagents;
     const planTurn = planTurnSubagents(planPool);
@@ -1985,7 +1990,7 @@ export class SdkExecutor implements Executor {
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildRunSignalServer(),
     };
-    if (ctx.ciEvidence) mcpServers[CI_EVIDENCE_SERVER] = buildCIEvidenceServer(ctx.ciEvidence);
+    if (ctx.ciEvidence) mcpServers[CI_EVIDENCE_SERVER] = buildCIEvidenceServer(ctx.ciEvidence, ctx.redactText);
     const enableImplementationSignals = (): void => {
       signalParkRun = parkRunEnabled(ctx, "implement");
       mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer();
@@ -2549,6 +2554,7 @@ export class SdkExecutor implements Executor {
         let planPrompt: string;
         if (isCIFix) {
           planPrompt = buildCIFixPlanPrompt({
+            runEnv: ctx.runEnv,
             ref: ctx.pipeline!.ref,
             branch: ctx.branch,
             pipelineWebURL: ctx.pipeline!.web_url,
@@ -2581,6 +2587,7 @@ export class SdkExecutor implements Executor {
           // backlog; the trusted "pick one / guardrails / tests" directive lives in the
           // prompt builder, outside the untrusted fence (PRD #46 Decision 10, audit C1).
           planPrompt = buildSelfImprovePlanPrompt({
+            runEnv: ctx.runEnv,
             branch: ctx.branch,
             recommendations: ctx.issueDescription,
             subagentNames: planSubagentNames,
@@ -2610,6 +2617,7 @@ export class SdkExecutor implements Executor {
           });
         } else {
           planPrompt = buildPlanPrompt({
+            runEnv: ctx.runEnv,
             issueIid: ctx.issueIid ?? 0,
             issueKey: ctx.issueKey,
             issueTitle: ctx.issueTitle,
@@ -3073,6 +3081,7 @@ export class SdkExecutor implements Executor {
         selection.exclusions,
         survivorNames,
         prepared.repoSurvivorNames,
+        buildRunEnvBlock(ctx.runEnv),
       );
       // PRD #305: repo-source defs are freshly built from repo files here and were NOT
       // touched by the own-roster override above; apply it so the flag covers the repo
@@ -3662,6 +3671,7 @@ export class SdkExecutor implements Executor {
           "implement",
           resumeId,
           (reworkForTurn?.answered || drive.approvedContractSuperseded ? "" : checkedContext) + buildImplementPrompt({
+            runEnv: ctx.runEnv,
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
