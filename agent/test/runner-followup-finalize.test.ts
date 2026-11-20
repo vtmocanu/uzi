@@ -89,6 +89,8 @@ class FakeClock {
 }
 
 const RECOVERY_RETRY_MS = 5;
+/** The follow-up idle bound the parks arm; only the FakeClock crosses it. */
+const IDLE_MS = 40;
 const realAwaitFollowUp = SteeringChannel.prototype.awaitFollowUp;
 let clock = new FakeClock();
 let armPolicy: (armIndex: number) => boolean = () => true;
@@ -240,7 +242,7 @@ function commitWork(ctx: RunContext, note: string): void {
 
 /** Parks until the park ENDS (idle, stop or cancel), reporting a turn after each follow-up as the
  *  SDK executor does, then commits and returns. A cancelled park raises the cancel signal as it does. */
-function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = 40): Executor {
+function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = IDLE_MS): Executor {
   return {
     async run(ctx: RunContext): Promise<{ branch: string }> {
       await ctx.checkpoint?.({ reap: true });
@@ -361,22 +363,32 @@ async function observeThenCancel(r: RunRunner, claim: ClaimResponse, log: { outc
   const execution = r.execute(claim).then(() => { settled = true; return "done" as const; });
   // The window is FAKE time measured from the first backoff wait: every pending admission backoff is
   // advanced to its deadline until the window has elapsed, so the resend count never depends on the host.
-  assert.ok(await until(() => statuses(claim.run_id).includes("awaiting_followup"), 8_000), "the run parked");
-  let firstBackoffAt: number | undefined;
-  for (;;) {
-    await until(() => clock.pending > 0 || log.outcomes.length > 0 || settled, 8_000);
-    const deadline = clock.nextDeadline();
-    if (deadline === undefined) break;
-    firstBackoffAt ??= clock.now();
-    if (clock.now() - firstBackoffAt >= windowMs) break;
-    clock.advance(Math.max(0, deadline - clock.now()));
+  // A real-time cap that expires is a failure, never a completed window; on any failure the run is
+  // still cancelled and the clock released, so the file never hangs.
+  let cancelSent = false;
+  try {
+    assert.ok(await until(() => statuses(claim.run_id).includes("awaiting_followup"), 8_000), "the run parked");
+    let firstBackoffAt: number | undefined;
+    for (;;) {
+      assert.ok(await until(() => clock.pending > 0 || log.outcomes.length > 0 || settled, 8_000),
+        "the admission reached a backoff, an outcome or the end of the run");
+      const deadline = clock.nextDeadline();
+      if (deadline === undefined) break;
+      firstBackoffAt ??= clock.now();
+      if (clock.now() - firstBackoffAt >= windowMs) break;
+      clock.advance(Math.max(0, deadline - clock.now()));
+    }
+    // An outcome that reached the executor proceeds to publication (or completes); let that settle.
+    if (log.outcomes.length > 0)
+      assert.ok(await until(() => api.publicationIntentRequests.length >= 1 || settled, 8_000), "the outcome reached publication");
+    observed.push({ statuses: statuses(claim.run_id), intents: api.publicationIntentRequests.length, finished: settled });
+    api.setInputs(claim.run_id, [{ id: 9_001, kind: "cancel", body: null }]);
+    cancelSent = true;
+    assert.ok(await until(() => currentSteering?.isCancelled() === true || settled, 8_000), "the cancel was observed");
+  } finally {
+    if (!cancelSent) api.setInputs(claim.run_id, [{ id: 9_001, kind: "cancel", body: null }]);
+    clock.release();
   }
-  // An outcome that reached the executor proceeds to publication (or completes); let that settle.
-  if (log.outcomes.length > 0) await until(() => api.publicationIntentRequests.length >= 1 || settled, 8_000);
-  observed.push({ statuses: statuses(claim.run_id), intents: api.publicationIntentRequests.length, finished: settled });
-  api.setInputs(claim.run_id, [{ id: 9_001, kind: "cancel", body: null }]);
-  await until(() => currentSteering?.isCancelled() === true || settled, 8_000);
-  clock.release();
   const winner = await Promise.race([execution, sleep(ms).then(() => "deadline" as const)]);
   assert.equal(winner, "done", "the cancel ends the run");
 }
@@ -557,7 +569,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       onFinalize: index => { if (index === 0) api.setInputs(claim.run_id, [{ id: 8, kind: "cancel", body: null }]); },
     });
     neverIdle();
-    // The clock never advances: the cancel queued by the first refusal wakes the pending fake backoff.
+    // The clock never advances: the queued cancel ends the park (or wakes the fake backoff if one is pending).
     clock.engage();
     const r = build(parkingExecutor(log), outbox);
     const cap = captureFlight(r);

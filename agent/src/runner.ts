@@ -3551,7 +3551,7 @@ export interface RunnerOptions {
   codexFinalizeBoundaryDeadlineMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
-  /** TEST-ONLY (issue #4536): clock for the run's SteeringChannel (follow-up idle window); default Date.now. */
+  /** TEST-ONLY (issue #4536): clock for every time read of the run's SteeringChannel (follow-up idle window, receipt deadlines); default Date.now. */
   steeringNow?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
    *  paired with a clearTimeout canceller. Lets a test arm and OBSERVE the per-run
