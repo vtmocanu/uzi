@@ -294,6 +294,14 @@ RETURNING summary_model;
 UPDATE users SET codex_summary_model = @codex_summary_model WHERE id = @id
 RETURNING codex_summary_model;
 
+-- name: LockUserSettingsRow :one
+-- Takes the row lock a multi-column settings write holds for its whole transaction (PUT
+-- /api/me/model-settings). FOR NO KEY UPDATE is the mode a plain UPDATE of a non-key column
+-- takes itself, so concurrent settings writers to the same user serialize here instead of
+-- interleaving, while foreign-key checks from other tables (FOR KEY SHARE) are not blocked.
+-- Own-user only; the caller passes the session user's id.
+SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE;
+
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
 -- (PRD #17), per-user default reasoning effort (PRD #617), per-user judge model

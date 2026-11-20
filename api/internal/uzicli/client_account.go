@@ -169,6 +169,74 @@ func (c *HTTPClient) GetEffectiveSettings(ctx context.Context) (apitypes.Effecti
 	return out, nil
 }
 
+// ModelSettingsResult is the 200 reply of PUT /api/me/model-settings: the decoded settings and the
+// server's envelope exactly as sent, so `--json` prints what the server said.
+type ModelSettingsResult struct {
+	Settings apitypes.UserSettingsDTO
+	Raw      json.RawMessage
+}
+
+// errModelSettingsUnsupported is the refusal for a server that predates PUT /api/me/model-settings.
+const errModelSettingsUnsupported = "this server does not support CLI model-setting writes; upgrade the server"
+
+// unsupportedRouteError maps a 404 or 405 that carries no JSON {"error"} message to an
+// ExitGeneric "upgrade the server" error with the given text, and returns nil for every other
+// response. A route a server lacks answers the router's text/plain 404 or an empty 405, while a
+// handler that exists answers a JSON error body, so only the former means "older server". Callers
+// whose route can legitimately answer a JSON 404 (a missing resource) keep it as a not-found.
+func unsupportedRouteError(status int, body []byte, message string) *ExitError {
+	if (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) && serverErrMsg(body) == "" {
+		return Exitf(ExitGeneric, "%s", message)
+	}
+	return nil
+}
+
+func (c *HTTPClient) PutModelSettings(ctx context.Context, patch map[string]*string) (ModelSettingsResult, error) {
+	return c.putModelSettingsBody(ctx, patch)
+}
+
+// CrossCheckPinWire is the wire form of one cross_check_pins cell of PUT /api/me/model-settings: a
+// member present in Members is sent (nil is JSON null, a clear) and an absent member is left alone.
+type CrossCheckPinWire struct {
+	Stage   string
+	Harness string
+	Members map[string]*string
+}
+
+// MarshalJSON renders {"stage":..,"harness":..,<member>:<string|null>...}.
+func (p CrossCheckPinWire) MarshalJSON() ([]byte, error) {
+	cell := map[string]any{"stage": p.Stage, "harness": p.Harness}
+	for k, v := range p.Members {
+		cell[k] = v
+	}
+	return json.Marshal(cell)
+}
+
+func (c *HTTPClient) PutCrossCheckPins(ctx context.Context, cells []CrossCheckPinWire) (ModelSettingsResult, error) {
+	return c.putModelSettingsBody(ctx, map[string][]CrossCheckPinWire{"cross_check_pins": cells})
+}
+
+func (c *HTTPClient) putModelSettingsBody(ctx context.Context, patch any) (ModelSettingsResult, error) {
+	const path = "/api/me/model-settings"
+	resp, body, err := c.doJSONRead(ctx, http.MethodPut, path, patch)
+	if err != nil {
+		return ModelSettingsResult{}, err
+	}
+	if resp.StatusCode/100 != 2 {
+		if e := unsupportedRouteError(resp.StatusCode, body, errModelSettingsUnsupported); e != nil {
+			return ModelSettingsResult{}, e
+		}
+		return ModelSettingsResult{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
+	}
+	var env struct {
+		Settings *apitypes.UserSettingsDTO `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Settings == nil {
+		return ModelSettingsResult{}, Exitf(ExitGeneric, "malformed response from uzi (%s)", path)
+	}
+	return ModelSettingsResult{Settings: *env.Settings, Raw: json.RawMessage(body)}, nil
+}
+
 func (c *HTTPClient) PreviewScheduleSettings(ctx context.Context, scheduleID string) (apitypes.ScheduleSettingsPreviewDTO, error) {
 	body := struct {
 		ScheduleID string `json:"schedule_id"`

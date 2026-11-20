@@ -1072,6 +1072,22 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
+const lockUserSettingsRow = `-- name: LockUserSettingsRow :one
+SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE
+`
+
+// Takes the row lock a multi-column settings write holds for its whole transaction (PUT
+// /api/me/model-settings). FOR NO KEY UPDATE is the mode a plain UPDATE of a non-key column
+// takes itself, so concurrent settings writers to the same user serialize here instead of
+// interleaving, while foreign-key checks from other tables (FOR KEY SHARE) are not blocked.
+// Own-user only; the caller passes the session user's id.
+func (q *Queries) LockUserSettingsRow(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockUserSettingsRow, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const pruneUserSidebarCodexAccounts = `-- name: PruneUserSidebarCodexAccounts :one
 UPDATE users u
 SET sidebar_codex_account_ids = (

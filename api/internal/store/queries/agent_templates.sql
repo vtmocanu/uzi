@@ -77,6 +77,19 @@ SET description = @description,
 WHERE id = @id
 RETURNING *;
 
+-- name: UpdateAgentTemplateModelPins :one
+-- CLI pin-only edit (PRD #3264 M3): writes ONLY the two model pins plus the audit
+-- columns. description, tools, prompt_body, customized and origin are deliberately not
+-- touched. The caller holds the row lock (GetAgentTemplateForUpdate) and passes the locked
+-- current value for a lane the request omitted, so an omitted lane is preserved.
+UPDATE agent_templates
+SET model = @model,
+    codex_model = @codex_model,
+    updated_by = @updated_by,
+    updated_at = now()
+WHERE id = @id
+RETURNING *;
+
 -- name: ResetBuiltinAgentTemplate :one
 -- Reset-to-default path (PRD #275): re-apply a builtin's embedded definition AND
 -- return the row to pristine (customized=false) so it resumes tracking upstream
