@@ -1,3 +1,5 @@
+// Owner accepted 2026-11-20: native patch is inert without an execution environment; MCP helpers require
+// no native MCP servers are configured. New server configuration requires fresh authority review.
 // PRD #1287 C3 — the exact executed-test TITLE constants shared by the three places that must
 // never drift: the `it(...)` name, the `recordEvidence(...)` call, and the clause row's `tests`
 // list (clauses-codex.ts). A single source of truth keeps the completeness checker's
@@ -33,4 +35,11 @@ export const CODEX_U_SIGNAL_ORIGIN_TITLE =
 export const CODEX_U_SIGNAL_REPLAY_TITLE =
   "codex U workflow signals: a replayed callback identity returns the cached terminal and a changed-payload reuse poisons, with no second effect";
 export const CODEX_U_TRUST_CONSTRUCTION_TITLE =
-  "codex U trust: production start/resume/turn construction pins the project untrusted with project_doc_max_bytes=0 and every native feature disabled, taking no repo AGENTS.md/.codex input";
+  "codex U trust: production start/resume/turn construction pins the project untrusted with project_doc_max_bytes=0 and fixed suppression settings, taking no repo AGENTS.md/.codex input";
+
+/** One evidence title per serial model/scenario case, also consumed by strict completeness. */
+export const NATIVE_PATCH_INERT_TITLES: Readonly<Record<string, string>> = Object.fromEntries(
+  ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"].flatMap(model =>
+    ["fresh", "cold", "cold-no-explicit-selection", "fresh-no-launcher-guard"].map(scenario =>
+      [`${model}/${scenario}`, `codex P native patch inert: ${model}/${scenario}`])),
+);

@@ -374,6 +374,31 @@ callback must resolve only after its owned child turn finishes; root completion
 alone cannot establish that condition. Role TOML and healthy hook behavior are
 not substitutes for these checks.
 
+Owner accepted on 2026-11-20: `apply_patch` is inert with no execution
+environment; `list_mcp_resources`, `list_mcp_resource_templates` and
+`read_mcp_resource` are inert under the exact invariant **no native MCP servers are configured**.
+Any later native MCP server configuration requires fresh authority review.
+The controls apply per native surface:
+
+- Native `apply_patch`: empty thread/turn execution environments (`environments: []`)
+  and the launcher guard `CODEX_EXEC_SERVER_URL=none` deny execution; see the
+  [real-binary matrix](../e2e/codex-m4/native-patch-inert.test.ts).
+- Native MCP resource helpers: no servers in builder output or outgoing thread
+  config is the invariant. Semantic regressions cover
+  [config](../agent/test/codex-config.test.ts),
+  [harness](../agent/test/codex-harness.test.ts),
+  [executor](../agent/test/codex-executor.test.ts),
+  [advice](../agent/test/codex-advice-harness.test.ts) and
+  [cross-check](../agent/test/codex-cross-check.test.ts).
+  Isolated configuration and environment prevent inherited server settings.
+- Goals: `[features].goals = false` remains mandatory; the real-binary matrix
+  checks their absence and forced-call rejection.
+
+False obsolete feature keys are construction checks, not runtime evidence.
+The worker broker gates permitted worker effects; it does not establish native
+helper inertness. This acceptance makes no global inertness or packaged OS
+isolation claim.
+
 ### Accepted native exceptions (#1566)
 
 **Current characterization (0.159.3).** Option 1 explicitly accepts the two
@@ -1466,3 +1491,55 @@ record gains two weekly-reset fields and the reasons `auto_soonest_reset`,
 `auto_only_qualified` and `auto_fallback`. The decision runs under the same
 shared secret-mutation lock and creation fence described above. See
 [ADR-3845](3845-limit-aware-automatic-harness.md).
+
+## Adoption record: native patch execution denial (#4509, 2026-11-19)
+
+At pin 0.167.0, `apply_patch_freeform` is removed/ignored and model catalog
+metadata overrides `code_mode` / `code_mode_only`. Native `apply_patch` remains
+advertised under the run code-mode host. False config entries are useful
+construction checks, not proof that those native surfaces disappeared.
+Registration is not execution authority.
+
+Execution denial combines explicit `environments: []` at root `thread/start`
+and `turn/start` with launcher `CODEX_EXEC_SERVER_URL=none` in the replaced
+environment. Run, child, advice and cross-check turns select the empty list,
+including cold resumed turns. `thread/resume` has no `environments` field;
+the subsequent turn reasserts `[]`. Supported extension/hook suppression,
+project trust and document suppression, worker callback/broker authority and
+#1566 native async questions/read-only UTC exceptions remain unchanged. This
+adoption neither replaces the vendor model catalog nor changes worker callback
+admission. It does not assert that a native bypass was found.
+
+### Evidence and limits
+
+The real-binary [native-patch-inert matrix](../e2e/codex-m4/native-patch-inert.test.ts)
+covers the four curated models on fresh and truly cold roots (old root disposed,
+new PID/transport, retained thread). Nested and direct native patch attempts
+both return `No usable execution environment is available` at this pin. After
+each attempt, no marker exists and worker callbacks, spawns and fileops remain
+zero; subsequent nested worker patch and exec controls pass. Two independent
+omission fixtures remove every explicit thread/turn selection or the launcher guard separately.
+Per-site request-contract mutations check the construction boundary separately.
+
+The matrix checks a finite exact inventory per model, including nested tools.
+Supported `features.goals = false` in the shared production/loopback/custom builder
+and the advice thread request map disables create_goal/get_goal/update_goal.
+Root thread config overrides only project settings; child/cross-check roots inherit
+the shared launcher config. Real-binary inventories exclude all three goal names,
+and forced nested calls return call-linked `tools.<name> is not a function` errors;
+forced top-level goal calls return `unsupported call: <name>`.
+The three MCP resource helpers remain natively registered. With no configured native
+MCP server, list_mcp_resources and list_mcp_resource_templates return exact empty
+resources/resourceTemplates JSON; read_mcp_resource for offline-fixture returns an
+unknown MCP server error. Each observed outcome precedes controls with zero callbacks,
+spawns, fileops or markers. These finite no-server observations do not prove global
+inertness. Owner accepted these helpers on 2026-11-20 under **no native MCP servers are configured**;
+INV_EXTRA_NATIVES is closed under that invariant. Adding any native MCP server
+requires fresh authority review. Native patch is accepted only without an execution environment.
+`gpt-5.6-sol` omits the async and UTC helpers shown by the other curated
+models. The legacy [native-bypass probes](../e2e/codex-m4/native-bypass.test.ts)
+retain their representative top-level inventory assertion; they do not prove
+nested patch absence. P-layer protocol evidence uses injected OS seams: it is
+neither packaged OS isolation nor exhaustive proof about native OS effects.
+The [archived #4321 evidence](../prds/done/4321-codex-provider-spike.md)
+is background; this record states the current adoption boundary.

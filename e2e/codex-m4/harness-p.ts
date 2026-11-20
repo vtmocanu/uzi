@@ -18,7 +18,7 @@
 
 import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js";
 import type { CodexNotification } from "../../agent/src/codex/transport.js";
@@ -127,6 +127,11 @@ export interface ProtocolObservation {
   readonly binSource: string;
   readonly binaryEvidence: { path: string; version: string; archiveDigest: string; receipt: string; integrity: true };
   readonly notes: readonly CodexNotification[];
+  readonly turnParams: Record<string, unknown>;
+  readonly threadParams: Record<string, unknown>;
+  readonly coldRestart?: { oldPid: number; newPid: number; transportChanged: boolean; retainedThreadId: string; closureConfirmed: true };
+  readonly primingTurnParams?: Record<string, unknown>;
+  readonly primingRequests: readonly ResponsesBody[];
 }
 
 /** Inputs to one driven turn. Only the policy-relevant knobs; the launch plumbing is fixed. */
@@ -162,7 +167,11 @@ export interface ProtocolTurnOptions {
    *  disabled (the same exec cell fails with "code-mode host is disabled" and no callback fires). */
   readonly codeModeHost?: boolean;
   /** #1566: worker-created child, saved-root resume, or isolated advice protocol posture. */
-  readonly lifecycle?: "start" | "resume" | "child" | "advice";
+  readonly lifecycle?: "start" | "resume" | "child" | "advice" | "cold";
+  /** Offline fixture knobs, never production bypasses. */
+  readonly omitLauncherGuardForTest?: boolean;
+  readonly omitAllEnvironmentsForTest?: boolean;
+  readonly onProviderRequestForTest?: (body: ResponsesBody, callbacks: readonly ObservedCallback[]) => void;
   /** How long to wait for the single turn to complete (default 60s). */
   readonly turnDeadlineMs?: number;
 }
@@ -174,12 +183,14 @@ export interface ProtocolTurnOptions {
  * is O-layer). The spawned env is captured into `envSink` (the sparse replaced env isolation
  * oracle). Disposal really SIGKILLs the codex child.
  */
-function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { env?: NodeJS.ProcessEnv }): SpawnSupervisor {
+function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { env?: NodeJS.ProcessEnv }, omitGuard = false): SpawnSupervisor {
   return (_command, _args, options): SupervisorProcess => {
-    envSink.env = options.env;
+    const env = { ...options.env };
+    if (omitGuard) delete env.CODEX_EXEC_SERVER_URL;
+    envSink.env = env;
     const child: ChildProcess = nodeSpawn(codexBin, ["app-server"], {
       cwd: options.cwd,
-      env: options.env,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     const control = new PassThrough();
@@ -339,9 +350,16 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
   let transport: ReturnType<ProtocolModules["createCodexTransport"]> | undefined;
   let primaryFailure: { error: unknown } | undefined;
   try {
-    let priming = opts.lifecycle === "resume";
+    let priming = opts.lifecycle === "resume" || opts.lifecycle === "cold";
+    const callbacks: ObservedCallback[] = [];
+    let measuredRequestOffset = 0;
+    let coldRestart: ProtocolObservation["coldRestart"];
     provider = await FakeProvider.start({ credential: opts.credential,
-      respond: (body, p) => priming ? [message("saved root control") as ResponseItem] : opts.respond(body, p) });
+      respond: (body, p) => {
+        if (priming) return [message("saved root control") as ResponseItem];
+        opts.onProviderRequestForTest?.(body, [...callbacks]);
+        return opts.respond(body, p);
+      } });
     const scratch = path.resolve(__dirname, "../../.uzi/scratch");
     mkdirSync(scratch, { recursive: true });
     base = realpathSync(mkdtempSync(path.join(scratch, "codex-m4-p-")));
@@ -364,7 +382,6 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     const broker = new mods.CodexCallbackBroker(brokerOpts);
 
     const envSink: { env?: NodeJS.ProcessEnv } = {};
-    const callbacks: ObservedCallback[] = [];
     const rawNotes: CodexNotification[] = [];
     const launchPlan = buildProviderLaunchPlan(mods, {
       executableBin: resolved.codexBin,
@@ -379,7 +396,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       resolveRunnerUid: () => runnerUid,
       makeRunnerTrees: fakeMakeRunnerTrees,
       removeRunnerTree: fakeRemoveRunnerTree,
-      spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid, envSink),
+      spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid, envSink, opts.omitLauncherGuardForTest),
       appServerAuthOpenAIBaseUrlForTest: provider.baseUrl,
       deadlines: { started: 60_000 },
     };
@@ -396,8 +413,8 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     let turnStatus: string | undefined;
     let primeFinished!: () => void;
     const primeCompletion = new Promise<void>(resolve => { primeFinished = resolve; });
-    const notes = transport.notifications();
-    const consume = (async (): Promise<void> => {
+    const consumeNotes = async (): Promise<void> => {
+      const notes = transport!.notifications();
       for await (const note of notes) {
         rawNotes.push(note);
         if (note.kind === "turn_completed" && note.threadId === threadId && note.turnId === turnId) {
@@ -420,7 +437,8 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
           transport!.respond(note.requestId, { error: { code: -32601, message: opts.lifecycle === "advice" ? "codex advice is tool-less" : "unsupported request" } });
         }
       }
-    })();
+    };
+    let consume = consumeNotes();
     void consume.catch(() => undefined);
 
     const threadParams = {
@@ -431,7 +449,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       approvalsReviewer: "user",
       sandbox: "danger-full-access",
       ephemeral: false,
-      environments: [],
+      ...(opts.omitAllEnvironmentsForTest ? {} : { environments: [] }),
       dynamicTools: opts.lifecycle === "advice" ? [] : mods.buildCodexDynamicTools(opts.grants),
       config: { project_doc_max_bytes: 0, projects: { [cwd]: { trust_level: "untrusted" } } },
       developerInstructions: "M4 C3 P developer instructions",
@@ -444,12 +462,46 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     threadId = threadRes.thread?.id;
     if (threadId === undefined) throw new Error("thread/start returned no thread id");
 
-    if (opts.lifecycle === "resume") {
-      const prime = await transport.request<{ turn?: { id?: string } }>("turn/start", {
-        threadId, model, environments: [], input: [{ type: "text", text: "save root before resume" }],
-      });
+    let primingTurnParams: Record<string, unknown> | undefined;
+    if (opts.lifecycle === "resume" || opts.lifecycle === "cold") {
+      primingTurnParams = {
+        threadId, model, ...(opts.omitAllEnvironmentsForTest ? {} : { environments: [] }),
+        input: [{ type: "text", text: "save root before resume" }],
+      };
+      const prime = await transport.request<{ turn?: { id?: string } }>("turn/start", primingTurnParams);
       turnId = prime.turn?.id;
       await deadline(primeCompletion, "saved root completion", opts.turnDeadlineMs ?? 60_000);
+      measuredRequestOffset = provider.requests.length;
+      if (opts.lifecycle === "cold") {
+        const oldPid = handle.supervisorPid;
+        if (oldPid === undefined) throw new Error("missing old PID");
+        const oldTransport = transport;
+        const sessions = path.join(base, "saved-sessions");
+        cpSync(path.join(envSink.env!.CODEX_HOME!, "sessions"), sessions, { recursive: true });
+        await cleanupP({ transport, handle });
+        await consume;
+        handle = undefined;
+        transport = undefined;
+        const coldPlan = buildProviderLaunchPlan(mods, {
+          executableBin: resolved.codexBin,
+          provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
+          model, cwd, ownedDataRoot: path.join(base, "cold-root"), codeModeHost: opts.codeModeHost,
+        });
+        handle = await mods.launchCodexRoot(coldPlan.spec, { ...deps,
+          makeRunnerTrees: request => {
+            fakeMakeRunnerTrees(request);
+            cpSync(sessions, path.join(request.root, "codex", "sessions"), { recursive: true });
+          },
+        });
+        transport = mods.createCodexTransport({ inbound: handle.transport.stdout!, outbound: handle.transport.stdin! });
+        await mods.createCodexAppServerAuth({ mode: "api_key", apiKey: opts.credential }).authenticate(transport);
+        if (handle.supervisorPid === undefined || handle.supervisorPid === oldPid || transport === oldTransport) {
+          throw new Error("cold restart reused process or transport");
+        }
+        coldRestart = { oldPid, newPid: handle.supervisorPid, transportChanged: true, retainedThreadId: threadId, closureConfirmed: true };
+        consume = consumeNotes();
+        void consume.catch(() => undefined);
+      }
       priming = false;
       const resumed = await transport.request<{ thread?: { id?: string } }>("thread/resume", {
         threadId, model, modelProvider: mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME, cwd,
@@ -458,13 +510,14 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       if (resumed.thread?.id !== threadId) throw new Error("resume did not retain the saved root");
     }
 
-    const turnRes = await transport.request<{ turn?: { id?: string } }>("turn/start", {
+    const turnParams = {
       threadId,
       input: [{ type: "text", text: "M4 C3 P: run the scripted turn" }],
-      environments: [],
+      ...(opts.omitAllEnvironmentsForTest ? {} : { environments: [] }),
       model,
       ...(opts.effort === undefined ? {} : { effort: opts.effort }),
-    });
+    };
+    const turnRes = await transport.request<{ turn?: { id?: string } }>("turn/start", turnParams);
     turnId = turnRes.turn?.id;
     if (turnId === undefined) throw new Error("turn/start returned no turn id");
 
@@ -472,10 +525,12 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
 
     return {
       callbacks,
-      advertisedTools: advertisedToolsOf(provider.requests),
+      advertisedTools: advertisedToolsOf(provider.requests.slice(measuredRequestOffset)),
       spawnEnv: envSink.env ?? {},
       turnStatus,
-      providerRequests: [...provider.requests],
+      providerRequests: provider.requests.slice(measuredRequestOffset),
+      primingRequests: provider.requests.slice(0, measuredRequestOffset),
+      turnParams, threadParams, primingTurnParams, coldRestart,
       providerErrors: [...provider.errors],
       elapsedMs: Date.now() - startedAt,
       binSource: resolved.source,

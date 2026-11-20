@@ -582,6 +582,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       web_search: "disabled",
       agents: { enabled: false },
       features: {
+        goals: false,
         apps: false,
         plugins: false,
         shell_tool: false,
@@ -645,6 +646,7 @@ export class CodexAdviceHarness implements AdviceHarness {
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
+      environments: [],
       input: [{ type: "text", text: rendered.prompt }],
     };
     if (model !== undefined) params.model = model;

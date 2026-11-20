@@ -1,4 +1,4 @@
-// PRD #1156 (M3a) — the stock Codex config with native effectful surfaces disabled.
+// PRD #1156 (M3a) — fixed Codex config; execution denial also needs protocol/launcher controls.
 // #1566: async questions and read-only UTC remain reachable; the run code host routes callbacks.
 //
 // This reproduces the environment-replacement stock `config.toml` characterized by
@@ -11,9 +11,17 @@
 //     `bypass_hook_trust`, NO `--dangerously-bypass-hook-trust` anywhere.
 //   * the fixture accepts arbitrary caller-shaped knobs (code_mode / unified_exec /
 //     multi_agent variables, `write_stdin_approval`). The generic M3a launcher builder
-//     accepts only a trusted provider + model + canonical project path and pins every
-//     configurable native effectful surface disabled. The production authentication builder below is narrower:
+//     accepts only a trusted provider + model + canonical project path and pins the
+//     supported suppression settings. The production authentication builder below is narrower:
 //     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
+//
+// #4509, pin 0.167.0: apply_patch_freeform is removed/ignored; model catalog metadata
+// overrides code_mode/code_mode_only. Native apply_patch remains advertised under the
+// code-mode host. Registration is not execution authority: explicit environments: []
+// at root thread/start and turn/start (including child, advice, cross-check and cold
+// resumed turns), plus launcher CODEX_EXEC_SERVER_URL=none in the replaced environment,
+// deny native execution. thread/resume has no environments field; the following turn
+// reasserts []. Worker callbacks remain subject to the broker, not these feature flags.
 //
 // ADR-1106 requires the canonical project be
 // provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: characterized
@@ -88,6 +96,7 @@ function nativeDisabledConfigLines(
     `enabled = false`,
     ``,
     `[features]`,
+    `goals = false`,
     `apps = false`,
     `plugins = false`,
     `shell_tool = false`,
@@ -115,10 +124,10 @@ function nativeDisabledConfigLines(
 }
 
 /**
- * Build the `config.toml` TEXT with native effectful surfaces disabled (#1566 exceptions above).
+ * Build the fixed `config.toml` TEXT (#1566 exceptions above).
  *
- * The controls emitted by nativeDisabledConfigLines disable native effectful
- * surfaces, project docs, web search, analytics, feedback, agents and startup
+ * The supported controls suppress native extensions/hooks, project docs, web
+ * search, analytics, feedback, agents and startup
  * update checks. The canonical project is explicitly `untrusted`; the provider
  * block carries zero retries and no websockets.
  *
