@@ -19,10 +19,11 @@ const maxPhaseSwitchHoldBodyBytes = 4 << 10
 //
 // The ack mirrors WorkerRunBaseAttestationHold: 200 with the paused run when the hold applied (or
 // had already applied for this generation, a lost ACK retried); 409 with the run's REAL status and
-// hold_reason when the fence refused it (another generation, a released claim, an unapproved
-// implement phase, or an owner resume that already queued the run); 404 when the run is no longer
-// this worker's; 400 for a missing claim_generation or an unknown phase. The worker keeps its clone
-// and claim on every answer.
+// hold_reason when the fence refused it (another generation, a released claim, or an owner resume
+// that already queued the run); an implement hold refused because the plan is not approved is the
+// same 409 plus "reason":"plan_not_approved" beside "run"; 404 when the run is no longer this
+// worker's; 400 for a missing claim_generation or an unknown phase. The worker keeps its clone and
+// claim on every answer.
 func (h *Handler) WorkerRunPhaseSwitchHold(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -60,8 +61,17 @@ func (h *Handler) WorkerRunPhaseSwitchHold(w http.ResponseWriter, r *http.Reques
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
 			httpx.ErrorReason(w, http.StatusBadRequest, "positive claim_generation required", "claim_generation_required")
+		case errors.Is(err, workersvc.ErrInvalidPhaseSwitchPhase):
+			httpx.ErrorReason(w, http.StatusBadRequest, "phase must be plan or implement", "invalid_phase")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.ErrorReason(w, http.StatusBadRequest, "invalid phase switch hold request", "invalid_phase")
+			httpx.ErrorReason(w, http.StatusBadRequest, "invalid phase switch hold request", "invalid_phase_switch_hold")
+		case errors.Is(err, workersvc.ErrPhaseSwitchPlanNotApproved):
+			// The service returns the unchanged owned row with this error: 409 with the same {run, reason}
+			// shape as messages_pending, so the worker can tell "plan not approved yet" from a lost claim.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    h.workerRunDTO(r.Context(), run),
+				"reason": "plan_not_approved",
+			})
 		case errors.Is(err, workersvc.ErrStaleClaim):
 			httpx.ErrorReason(w, http.StatusConflict, "phase switch hold claim is stale", "stale_claim")
 		default:

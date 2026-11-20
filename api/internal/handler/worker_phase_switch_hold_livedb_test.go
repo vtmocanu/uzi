@@ -134,9 +134,17 @@ func TestWorkerPhaseSwitchHoldLiveDB(t *testing.T) {
 			t.Fatalf("approved implement hold status = %v, want paused", run["status"])
 		}
 		unapproved := seed(t, false)
-		run := dtoOf(post(t, unapproved, req(generation, "implement"), http.StatusConflict))
+		out := post(t, unapproved, req(generation, "implement"), http.StatusConflict)
+		run := dtoOf(out)
 		if run["status"] != "running" || run["hold_reason"] != nil {
 			t.Fatalf("refused DTO = (%v, %v), want the real running status and no hold", run["status"], run["hold_reason"])
+		}
+		if out["reason"] != "plan_not_approved" {
+			t.Fatalf("refused reason = %v, want plan_not_approved: %v", out["reason"], out)
+		}
+		// Every other 409 keeps its shape: no machine reason beside the run.
+		if stale := post(t, seed(t, false), req(generation-1, "plan"), http.StatusConflict); stale["reason"] != nil {
+			t.Fatalf("stale-generation 409 carries reason %v, want none", stale["reason"])
 		}
 	})
 

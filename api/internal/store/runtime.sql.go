@@ -26656,6 +26656,10 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- that has already exited. A pause is only ever requested on a running run, so no legitimate
   -- awaiting_approval report is expected from a paused row.
   AND status <> 'paused'
+  -- PRD #3252 m4: nor may a late report move a run held at phase_switch_unavailable to the gate. The hold
+  -- keeps its claim and ResumePausedRun leaves it queued on the same worker and generation, which the
+  -- paused-only exclusion above does not cover.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
 `
 
 type SetRunAwaitingApprovalParams struct {
@@ -27056,6 +27060,10 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- non-released row (the interlocked path is completeRunWithPermitLease, fenced on its own locked row),
   -- so this never blocks a legitimate completion.
   AND status <> 'paused' AND claim_released_at IS NULL
+  -- PRD #3252 m4: nor may a late report complete a run held at phase_switch_unavailable. The hold keeps its
+  -- claim (claim_released_at stays NULL) and ResumePausedRun leaves it queued with the same worker and
+  -- generation, so only this predicate stops the old flight's report reviving it.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- PRD #1908: a job is completed only from a live (claimed or running) status. In particular the
   -- issue #329 supersede arm below must never flip a job the wall backstop failed with
   -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so

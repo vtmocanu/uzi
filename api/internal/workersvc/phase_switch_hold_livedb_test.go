@@ -63,12 +63,14 @@ func TestSetRunPhaseSwitchHoldServiceLiveDB(t *testing.T) {
 	t.Run("an invalid phase or generation is a validation error", func(t *testing.T) {
 		id := seedPhaseSwitchRun(t, env, o, next(), "running")
 		for _, phase := range []string{"", "plans", "Implement"} {
-			if _, _, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 3, phase); !errors.Is(err, ErrInvalidState) {
-				t.Fatalf("phase %q err = %v, want ErrInvalidState", phase, err)
+			if _, _, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 3, phase); !errors.Is(err, ErrInvalidState) ||
+				!errors.Is(err, ErrInvalidPhaseSwitchPhase) || errors.Is(err, ErrMissingClaimGeneration) {
+				t.Fatalf("phase %q err = %v, want ErrInvalidPhaseSwitchPhase (and ErrInvalidState) only", phase, err)
 			}
 		}
-		if _, _, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 0, PhaseSwitchPlan); !errors.Is(err, ErrInvalidState) {
-			t.Fatalf("generation 0 err = %v, want ErrInvalidState", err)
+		if _, _, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 0, PhaseSwitchPlan); !errors.Is(err, ErrInvalidState) ||
+			!errors.Is(err, ErrMissingClaimGeneration) || errors.Is(err, ErrInvalidPhaseSwitchPhase) {
+			t.Fatalf("generation 0 err = %v, want ErrMissingClaimGeneration (and ErrInvalidState) only", err)
 		}
 		if s := statusOf(t, env, id); s != "running" {
 			t.Fatalf("status = %q, want running", s)
@@ -110,8 +112,8 @@ func TestSetRunPhaseSwitchHoldServiceLiveDB(t *testing.T) {
 					approvePlanVia(t, env, id, how)
 				}
 				run, applied, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 3, PhaseSwitchImplement)
-				if err != nil || applied || run.Status != status || run.HoldReason.Valid {
-					t.Fatalf("%s/unapproved(%q) implement hold = (%q, hold %v, applied=%v, %v), want refused and unchanged", status, how, run.Status, run.HoldReason, applied, err)
+				if !errors.Is(err, ErrPhaseSwitchPlanNotApproved) || applied || run.Status != status || run.HoldReason.Valid {
+					t.Fatalf("%s/unapproved(%q) implement hold = (%q, hold %v, applied=%v, %v), want ErrPhaseSwitchPlanNotApproved and unchanged", status, how, run.Status, run.HoldReason, applied, err)
 				}
 				if s := statusOf(t, env, id); s != status {
 					t.Fatalf("status = %q, want %q unchanged", s, status)

@@ -92,6 +92,33 @@ func TestSetRunPhaseSwitchHoldStatementLiveDB(t *testing.T) {
 		"awaiting_input":   func() uuid.UUID { return seed(wpRun{status: "awaiting_input"}, "") },
 		"queued":           func() uuid.UUID { return seed(wpRun{status: "queued"}, "") },
 		"codex harness":    func() uuid.UUID { return seed(wpRun{harness: "codex"}, "") },
+		// Kind is the setter's allowlist: a chat or cross_check run is never parked into this hold.
+		"chat kind": func() uuid.UUID {
+			return seed(wpRun{}, "kind = 'chat', repo_id = NULL, issue_iid = NULL, branch = NULL")
+		},
+		"cross_check kind": func() uuid.UUID {
+			target := fx.run(wpRun{})
+			return seed(wpRun{}, "kind = 'cross_check', issue_iid = NULL, target_run_id = '"+target.String()+
+				"', report_only = true, budget_wall_seconds = 3600")
+		},
+		// runs.egress_profile_id is immutable after insert, so the profiled run is inserted whole.
+		"egress profile": func() uuid.UUID {
+			profile := uuid.New()
+			mustExec(fx.ctx, t, fx.pool, `INSERT INTO egress_profiles (id, name, hosts) VALUES ($1, $2, '{docs.example.com}')`,
+				profile, "ps-"+profile.String()[:20])
+			id := uuid.New()
+			fx.iid++
+			mustExec(fx.ctx, t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description,
+				status, harness, worker_id, started_at, status_since, claim_generation, egress_profile_id)
+				VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running', 'claude', $5, now(), now(), 3, $6)`,
+				id, fx.userID, fx.repoID, fx.iid, worker, profile)
+			// Registered after the fixture's cleanup, so it runs first: the profile is RESTRICTed while a run uses it.
+			t.Cleanup(func() {
+				_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM runs WHERE egress_profile_id = $1`, profile)
+				_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM egress_profiles WHERE id = $1`, profile)
+			})
+			return id
+		},
 		"review target": func() uuid.UUID {
 			target := seed(wpRun{}, "")
 			return seed(wpRun{}, "review_target_run_id = '"+target.String()+"'")
@@ -133,8 +160,12 @@ func TestPhaseSwitchHoldResumeAndCancelLiveDB(t *testing.T) {
 }
 
 // TestPhaseSwitchHoldRefusesLateWorkerReportsLiveDB: a late report from the parking flight must not
-// move the held row in either interval (paused, and queued after the owner's resume). Each report
-// also runs against the same row WITHOUT the marker, the control showing the marker refuses it.
+// move the held row in either interval (paused, and queued after the owner's resume). It covers the
+// worker-report writers SetRunAwaitingInput, SetRunAwaitingFollowup, SetRunAwaitingApproval,
+// SetRunCompleted, SetRunFailed, SetRunFailedPlanRejected and SupersedeRunByWorker. SetRunRunning,
+// the limit/recovery/provider parks and the pause writers require status 'running', so they never
+// match a held row. Each report also runs against an unmarked queued row, the control showing the
+// marker is what refuses it.
 func TestPhaseSwitchHoldRefusesLateWorkerReportsLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
 	worker := fx.worker("w-3252l", wpWorker{})
@@ -152,6 +183,17 @@ func TestPhaseSwitchHoldRefusesLateWorkerReportsLiveDB(t *testing.T) {
 		},
 		"SetRunFailed": func(id uuid.UUID) (int64, error) {
 			return fx.q.SetRunFailed(fx.ctx, store.SetRunFailedParams{ID: id, WorkerID: wid, FailureReason: pgtype.Text{String: "boom", Valid: true}})
+		},
+		"SetRunFailedPlanRejected": func(id uuid.UUID) (int64, error) {
+			return fx.q.SetRunFailedPlanRejected(fx.ctx, store.SetRunFailedPlanRejectedParams{
+				ID: id, WorkerID: wid, FailureReason: pgtype.Text{String: "rejected", Valid: true}})
+		},
+		"SetRunAwaitingApproval": func(id uuid.UUID) (int64, error) {
+			return fx.q.SetRunAwaitingApproval(fx.ctx, store.SetRunAwaitingApprovalParams{
+				PlanMd: pgtype.Text{String: "plan", Valid: true}, ID: id, WorkerID: wid})
+		},
+		"SetRunCompleted": func(id uuid.UUID) (int64, error) {
+			return fx.q.SetRunCompleted(fx.ctx, store.SetRunCompletedParams{ID: id, WorkerID: wid})
 		},
 	}
 	for name, report := range reports {
