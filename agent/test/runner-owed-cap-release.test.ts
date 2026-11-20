@@ -9,6 +9,7 @@ import { execFileSync } from "node:child_process";
 import type { Executor, RunContext } from "../src/executor.js";
 import { randomUUID } from "node:crypto";
 import type { RefusalReleaseGate } from "../src/git.js";
+import type { RecoveryCoordinator } from "../src/recovery.js";
 import { recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, git, gitlabClaim, installHarness, restartGitCache, runnerWith, runner } from "./runner-harness.js";
 import {
@@ -670,8 +671,9 @@ interface Gens { runId: string; iid: number; servers: HeldServer[]; gates: GateS
 const newGens = (iid: number): Gens => ({ runId: randomUUID(), iid, servers: [], gates: [], work: {}, logs: [] });
 const lastServer = (g: Gens): HeldServer => g.servers[g.servers.length - 1]!;
 
-/** One real claim of the run; `restart` first replaces the GitCache with a fresh one under `process`. */
-async function claimGeneration(g: Gens, generation: number, how: { process?: string; lostReport?: boolean; old?: boolean; cap?: number; executor?: Executor } = {}): Promise<void> {
+/** One real claim of the run; passing `process` first replaces the GitCache with a fresh one under that nonce. */
+async function claimGeneration(g: Gens, generation: number, how: { process?: string; lostReport?: boolean; old?: boolean; cap?: number; executor?: Executor;
+  onRunner?: (r: ReturnType<typeof runner>) => void } = {}): Promise<void> {
   if (how.process) restartGitCache({ maxOwedCandidates: how.cap ?? CAP, processNonce: how.process });
   if (how.old) git.admitRefusalProvenance = async () => "failed";
   const gate = git.refusalReleaseGate.bind(git);
@@ -687,6 +689,7 @@ async function claimGeneration(g: Gens, generation: number, how: { process?: str
   const rec = recordingLogger();
   g.logs = rec.lines;
   const r = runnerWith(() => ({ executor: how.executor ?? failingWork(g.work) }), fakeGitlab().gitlab, JOIN_TOKEN, rec.logger, { checkpointIntervalMs: 1 });
+  how.onRunner?.(r);
   // A restarted worker recovers its boot-time state before it takes the next claim.
   if (how.process && g.last) await r.resumePendingRecoveries(undefined, await r.snapshotBootRecoveries());
   try { await r.execute(claim); } finally { stop?.(); }
@@ -816,5 +819,99 @@ for (const old of [true, false]) {
     assert.equal(g.servers[0]!.archiveUploads(), old ? 0 : 1, "only the updated worker's generation 1 uploaded an archive");
     assert.equal(g.servers[1]!.archiveUploads(), 0, "generation 2 uploaded nothing");
     assert.ok(command(bare(), ["for-each-ref", `refs/uzi-owed/${g.runId}/`]).length > 0, "the owed evidence is still pinned");
+  });
+}
+
+// The retained-capture gate precedes successor creation, so an ineligible history cannot reach that successor's
+// terminal hook. Give adoption enough pin capacity to distinguish that refusal from the full-cap retry budget.
+// The control keeps the complete history in one updated process and must adopt, execute and release instead.
+for (const old of [true, false]) {
+  it(`${old ? "an old worker's lost report is refused at retained capture before successor creation" : "control: an updated worker's lost report adopts and releases when retained capture is eligible"}`, opts, async t => {
+    const g = newGens(old ? 44855 : 44856);
+    await claimGeneration(g, 1, {
+      process: "retained-capture-p1", lostReport: true, old,
+      executor: { run: async ctx => {
+        g.work.clone = ctx.worktreePath;
+        // Linear roots are adoptable without independent remediation evidence. The shared failingWork fixture
+        // intentionally diverges, which correctly stops wrapper adoption even when this gate permits capture.
+        for (const name of ["retained-root-a.txt", "retained-root-b.txt"]) {
+          commit(ctx.worktreePath, name);
+          await ctx.checkpoint!({ reap: false });
+        }
+        commit(ctx.worktreePath, "retained-refused.txt");
+        throw new Error("executor failed");
+      } },
+    });
+    assert.equal(failedStates(g.runId).length, 0, "generation 1's terminal report was lost");
+    const predecessor = g.work.clone!;
+    assert.ok(fs.existsSync(predecessor), "the real retained source remains");
+    assert.equal(refusalFiles().includes(`admission-${g.runId}-1.json`), !old);
+    // This is a capacity control, not a bypass of provenance: the owed-path marker and the refused heads stay.
+    // Both cases get the same room, so neither can pass just because a full cap prevented the retained capture.
+    const cap = CAP + 16;
+    if (!old) Reflect.set(git, "maxOwedCandidates", cap);
+    let captures = 0, successors = 0, executions = 0, terminalTransfers = 0;
+    const captureGates: RefusalReleaseGate[] = [];
+    await claimGeneration(g, 2, {
+      ...(old ? { process: "retained-capture-p2", cap } : {}),
+      executor: { run: async ctx => {
+        executions++;
+        g.work.clone = ctx.worktreePath;
+        // A read-only successful turn completes retained adoption; a later turn then fails normally.
+        // Keep the already frozen retained inventory unchanged so its release remains a valid control.
+        await ctx.onModelTurnSettled?.(1);
+        throw new Error("executor failed");
+      } },
+      onRunner: r => {
+        const coordinator = Reflect.get(r, "recovery") as RecoveryCoordinator;
+        const capture = coordinator.captureAndUpload.bind(coordinator);
+        t.mock.method(coordinator, "captureAndUpload", async (...args: Parameters<typeof capture>) => {
+          captures++;
+          const before = g.gates.length;
+          try { return await capture(...args); }
+          finally { captureGates.push(...g.gates.slice(before).filter(x => x.generation === 2).map(x => x.result)); }
+        });
+        const prepare = git.prepareRecoverySuccessor.bind(git);
+        t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+          successors++;
+          return prepare(...args);
+        });
+        const target = r as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+        const transfer = target.transferRestorePointToTrustedBare!.bind(r);
+        t.mock.method(target, "transferRestorePointToTrustedBare", async (...args: unknown[]) => {
+          terminalTransfers++;
+          return transfer(...args);
+        });
+      },
+    });
+    await redrive(g.last!);
+    // The live flight deferred its source proof; the normal boot sweep can now observe it quiescent.
+    // Reuse the same GitCache, so this does not invent a new process admission or bypass the gate.
+    await restartReplay();
+    assert.ok(captures >= 1, "the real retained-capture producer ran");
+    assert.ok(captureGates.length >= 1, "captureAndUpload consulted generation 2's refusal gate");
+    const logs = g.logs as { msg: string; blocker?: string }[];
+    assert.ok(!logs.some(l => l.blocker === "budget_exhausted"), "pin capacity did not exhaust the recovery budget");
+    if (old) {
+      assert.deepEqual(captureGates[0], { kind: "ineligible", reason: "refusal import stage producer unproven" });
+      assert.equal(lastServer(g).archiveUploads(), 0, "the refused retained capture uploaded no bundle");
+      assert.ok(logs.some(l => l.blocker === "prerequisites_unavailable"), "the gate prevented the prerequisite bundle");
+      assert.equal(successors, 0, "refusal precedes successor creation");
+      assert.equal(executions, 0, "no successor executor ran");
+      assert.equal(terminalTransfers, 0, "refusal precedes the successor terminal hook");
+      for (const server of g.servers) noHold(server, "old-worker lost-report history");
+      assert.ok(fs.existsSync(predecessor), "the predecessor clone stays in custody");
+      assert.ok(refusalFiles().includes(`owedpath-${g.runId}-1.json`), "the cap history remains recorded");
+    } else {
+      assert.deepEqual(captureGates.filter(x => x.kind !== "eligible"), []);
+      assert.ok(successors >= 1, "eligible capture permits real successor creation");
+      assert.equal(executions, 1, "the successor executor ran");
+      assert.ok(terminalTransfers >= 1, "the successor reached the real terminal hook");
+      const server = lastServer(g);
+      assert.equal(server.finals.length, 1, "the control sent its FINAL");
+      assert.equal(server.finals[0]!.disposition?.kind, "archive", "the retained capture is delivered");
+      assert.equal(server.acked(), 1, "the control released custody");
+      assert.equal(server.holdOpen(), false);
+    }
   });
 }
