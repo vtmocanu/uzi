@@ -569,7 +569,11 @@ residual that earlier text left open is closed by the owed-path marker above.
   import stages, refused refs, ledger, pins, files, markers); a resumed cleanup
   rediscovers them from the intent. A failed acquisition CAS-deletes its own
   attributed stage at the fetched SHA, and keeps it if the ref moved, if it is
-  the sole anchor of a ledgered head, or on a boundary stop.
+  the sole anchor of a ledgered head, or on a boundary stop. A failure in a
+  producing-source import's second phase (changed source proof, refused or
+  timed-out source authority, failed second lock) keeps the stage: the head is
+  unproven and the stage may be its only bare copy, so the run stays held
+  (gate ineligible, cleanup retained) for the owner.
 - **Soft deadline.** The incoming head's refusal is recorded before the
   checkpoint soft-deadline return.
 - **Recovery.** When the refusal gate is ineligible, a saved FINAL the api
@@ -585,7 +589,8 @@ residual that earlier text left open is closed by the owed-path marker above.
   shutdown, the maintenance budget, a recorded cancel or claim fence (re-checked
   at each acquisition) and the terminal lifecycle signal if still live. A
   cancel or fence recorded while an acquisition is already queued does not abort
-  that acquisition (every steering signal is already aborted by the stop); the
+  that acquisition once the stop has aborted the terminal lifecycle signal (while
+  that signal is still live, a fence aborts it through the terminal signal); the
   import writes only this worker's bare, and the runner's local claim-fence
   checks and the server's generation fences still stop any later report or release.
 - **Failure model.** Every ordering above is for a process crash. No storage or
