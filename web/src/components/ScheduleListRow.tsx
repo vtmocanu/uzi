@@ -20,6 +20,8 @@ import { maskRepoPath } from "../lib/demoMask";
 import { humanizeCron } from "../lib/schedulePresets";
 import { nextFireOf } from "../lib/scheduleList";
 import { modelChipText } from "../lib/modelChip";
+import { defaultModelChipSuffix } from "../lib/schedulePreview";
+import { useSchedulePreview } from "../lib/useSchedulePreview";
 import { relativeFromNow } from "./ScheduleModal";
 import { LastRunOutcome, LastFireDetail, RecentFiresPanel, formatStamp } from "./LastRun";
 import { AddAnotherRepo } from "./AddAnotherRepo";
@@ -507,10 +509,22 @@ function UserOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) 
   );
 }
 
+// The unpinned chip adds the server's prediction (issue #3260) read from the schedule-preview
+// endpoint; a pinned model sends no request, and a loading or failed preview leaves the plain
+// chip. The refresh key covers every stored field that changes the answer.
 function ModelChips({ s }: { s: Schedule }) {
+  const unpinned = !s.model?.trim();
+  const preview = useSchedulePreview(unpinned ? { schedule_id: s.id, target: s.target } : null, {
+    debounceMs: 0,
+    refreshKey: JSON.stringify([s.harness ?? null, s.credential_override ?? null, s.override_subagent_model, s.model ?? null]),
+  });
+  const suffix = unpinned && preview.status === "ready" && preview.preview ? defaultModelChipSuffix(preview.preview) : null;
   return (
     <>
-      <OptionChip>{modelChipText(s.model)}</OptionChip>
+      <OptionChip>
+        {modelChipText(s.model)}
+        {suffix ? ` · ${suffix}` : ""}
+      </OptionChip>
       {s.override_subagent_model && <OptionChip>+ agents</OptionChip>}
     </>
   );
