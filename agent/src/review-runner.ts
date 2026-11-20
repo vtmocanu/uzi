@@ -18,7 +18,8 @@ import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
-import { providerKeyForms } from "./redact.js";
+import { makeTextRedactor, providerKeyForms } from "./redact.js";
+import { redactStrings } from "./publication-intent.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
@@ -326,7 +327,13 @@ export class ReviewRunner {
         }
       }
       try {
-        await this.client.postTaskReview(targetId, review, claim.claim_generation, reviewRunId);
+        // The review's summary and findings are model- or error-authored; scrub the claim's provider
+        // key (every encoded form) here, at the one sink, whichever path produced them.
+        const providerCredential = claim.secrets?.provider?.credential;
+        const scrubbed = providerCredential
+          ? redactStrings(review, makeTextRedactor(providerKeyForms(providerCredential)))
+          : review;
+        await this.client.postTaskReview(targetId, scrubbed, claim.claim_generation, reviewRunId);
       } catch (err) {
         // Issue #1423: the server fence refused the write because this flight's claim was
         // superseded (reclaimed at a newer generation), released, reassigned, or its review run

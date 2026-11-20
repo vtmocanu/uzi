@@ -7,6 +7,7 @@ import type { AdviceRequest, AdviceUsageSnapshot } from "../src/harness.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 
 import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt, hasProviderCostForEveryModel } from "../src/review-runner.js";
+import { providerKeyForms } from "../src/redact.js";
 import { CODEX_TASK_REVIEW_MODEL } from "../src/codex/task-review-model.js";
 import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -369,6 +370,26 @@ describe("ReviewRunner", () => {
     await runner.execute(reviewClaim({ review_target_run_id: null, secrets: { forge_pat: "pat", anthropic_oauth_token: "", provider } as never }));
     assert.deepEqual(added, [key]);
     assert.deepEqual(removed, [key]);
+  });
+
+  // The posted review is the sink that holds the invariant: a prep-phase error that echoes the
+  // provider key must not reach postTaskReview. Assembled at runtime from fragments.
+  it("redacts the provider key from a prep-failure review before posting it", async () => {
+    const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff\n");
+    git.ensureClone = (async () => { throw new Error(`clone refused for header ${key}`); }) as typeof git.ensureClone;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
+    const provider = {
+      provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+      auth_style: "bearer", credential: key, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+    };
+    await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", anthropic_oauth_token: "", provider } as never }));
+    assert.ok(calls.review, "a failed review was still posted");
+    assert.match(calls.review!.review.summary, /^Review could not be produced: clone refused for header /);
+    const posted = JSON.stringify(calls.review!.review);
+    for (const f of providerKeyForms(key)) assert.ok(!posted.includes(f), `form leaked: ${f}`);
+    assert.ok(!posted.includes("Hd6y") && !posted.includes("eT8m"), "no key fragment leaked");
   });
 
   // Lane-acceptance: a capability worker's review run is ACCEPTED by a generation-fencing api.

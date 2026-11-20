@@ -22,6 +22,7 @@
 import { randomUUID } from "node:crypto";
 import { RequestError } from "./client.js";
 import type { Logger } from "./log.js";
+import { redactStrings } from "./publication-intent.js";
 import { isSubagentFrame } from "./signals.js";
 import { errMessage } from "./util.js";
 
@@ -368,6 +369,8 @@ export interface UsageRecorderOptions {
   /** The claim generation stamped on every post (0 = legacy: never sent, the client decides). */
   claimGeneration: number;
   log: Logger;
+  /** The run's text redactor, applied to every string on the wire record. */
+  redactText?: (text: string) => string;
   /** Tests shrink these. */
   debounceMs?: number;
   requestTimeoutMs?: number;
@@ -471,7 +474,9 @@ export class UsageRecorder implements UsageSink {
         if (recs.length > 0) {
           const m = new Map<Rec, number>();
           for (const r of recs) {
-            body.messages.push({ ...r.wire });
+            // The model id and tier strings come from the provider's reply; scrub them like every
+            // other model-authored string the worker posts.
+            body.messages.push(this.opts.redactText ? redactStrings({ ...r.wire }, this.opts.redactText) : { ...r.wire });
             m.set(r, r.version);
           }
           sent.set(leg, m);

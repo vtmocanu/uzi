@@ -11237,7 +11237,10 @@ export class RunRunner {
               await this.client.recordCompletionAttempt(runId, {
                 milestonesCompleted: [], head: fallbackHead, worktreeFingerprint: null,
                 claimGeneration: flight.claimGeneration,
-                nonClosing: result.nonClosing ?? claim.config?.non_closing,
+                nonClosing: (() => {
+                  const declared = result.nonClosing ?? claim.config?.non_closing;
+                  return declared ? { ...declared, reason: flight.redactText(declared.reason) } : declared;
+                })(),
               }, fallbackSignal);
               recorded = true;
             } catch (error) {
@@ -11847,7 +11850,7 @@ export class RunRunner {
             await this.client.recordCompletionAttempt(runId, {
               milestonesCompleted: [], head, worktreeFingerprint: null,
               claimGeneration: flight.claimGeneration,
-              ...(effectiveDeclared && this.client.hasFeature("completion_non_closing_v1") ? { nonClosing: effectiveDeclared } : {}),
+              ...(effectiveDeclared && this.client.hasFeature("completion_non_closing_v1") ? { nonClosing: { ...effectiveDeclared, reason: flight.redactText(effectiveDeclared.reason) } } : {}),
             }, signal);
             break;
           } catch (error) {
@@ -13175,7 +13178,7 @@ export class RunRunner {
       await finishCommittedPublish({
         status: "completed",
         branch: result.branch,
-        prd_done_path: result.prdDonePath,
+        prd_done_path: result.prdDonePath === undefined ? undefined : flight.redactText(result.prdDonePath),
         milestones_completed: result.milestonesCompleted,
       }, "task run completed (no MR)", { branch: result.branch });
       return;
@@ -13789,7 +13792,7 @@ export class RunRunner {
       branch: result.branch,
       mr_iid: mr.iid,
       mr_web_url: mr.webUrl || undefined,
-      prd_done_path: result.prdDonePath,
+      prd_done_path: result.prdDonePath === undefined ? undefined : flight.redactText(result.prdDonePath),
       milestones_completed: result.milestonesCompleted,
       // PRD #634 M3: stamp the scope-capped disposition so the server records
       // stop_kind='scope_capped'. OMITTED (not false) on a normal completion, so the wire
@@ -17959,7 +17962,10 @@ export class RunRunner {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
         return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
-      gatePlan: async (rawPlanMd, rawMilestones, onPlanPersisted, settles, semanticSubmission) => {
+      gatePlan: async (rawPlanMd, rawMilestones, onPlanPersisted, settles, rawSemanticSubmission) => {
+        // The semantic proposal is model-authored too and reaches the compile (and the persisted
+        // candidate); `{ invalid: true }` keeps its shape since it carries no strings.
+        const semanticSubmission = rawSemanticSubmission === undefined ? undefined : redactStrings(rawSemanticSubmission, flight.redactText);
         // The plan and milestone titles are model-authored and reach the api through the semantic
         // compile, the cross-check candidate and the awaiting_approval/running reports. The api's
         // scrub is pattern-based and cannot catch a prefixless provider key, so redact every string
@@ -19008,7 +19014,7 @@ export class RunRunner {
       recordCompletionAttempt: async ({ declared, head, worktreeFingerprint, nonClosing }) => {
         const result = await this.client.recordCompletionAttempt(runId, {
           milestonesCompleted: declared,
-          nonClosing,
+          nonClosing: nonClosing === undefined ? undefined : { ...nonClosing, reason: flight.redactText(nonClosing.reason) },
           head,
           worktreeFingerprint,
           // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
