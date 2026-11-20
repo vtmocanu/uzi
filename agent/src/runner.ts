@@ -3523,6 +3523,14 @@ export interface RunnerOptions {
    *  bounding the unrelated launch remediation rounds that `codexBoundaryDeadlineMs` governs. A non-positive value
    *  falls back to the default. */
   memoryHoldDeadlineMs?: number;
+  /** TEST-ONLY (issue #4528): the deadline (ms) of the one bounded operation in which a retained re-claim's failure path
+   *  persists its blocker (the `blockRecoveryEpisode` write inside `fail()`). Defaults to `codexBoundaryDeadlineMs`
+   *  (30s in production, unchanged). Unlike its neighbours this knob exists so a test can LENGTHEN that one deadline back
+   *  to the production budget while keeping the rest of the Codex boundary shortened: a 1s boundary otherwise lets a
+   *  loaded host miss the write, leaving the journal at `captured`. Only a positive finite value is accepted (stricter
+   *  than `memoryHoldDeadlineMs`); anything else falls back to the default. Not applied to the `source_missing` save or
+   *  the adoption-rediscovery operation, which these tests do not reach (the latter swallows its own errors). */
+  retainedBlockerPersistDeadlineMs?: number;
   /** TEST-ONLY (issue #3980): shortens the 60s deadline `prepareGateCheckpoint` enforces on a Claude
    *  changed-plan gate checkpoint. A non-positive or non-finite value falls back to 60s. */
   gateCheckpointDeadlineMs?: number;
@@ -3764,6 +3772,8 @@ export class RunRunner {
   private readonly codexBoundaryDeadlineMs: number;
   /** issue #4069: see RunnerOptions.memoryHoldDeadlineMs. */
   private readonly memoryHoldDeadlineMs: number;
+  /** issue #4528: see RunnerOptions.retainedBlockerPersistDeadlineMs. */
+  private readonly retainedBlockerPersistDeadlineMs: number;
   private readonly gateCheckpointDeadlineMs: number;
   /** issue #2969: the predecessor FINAL pass budget (constants unless a test shortens them). */
   private readonly predecessorFinalBudget: { successorPrepAllowanceMs: number; actionCapMs: number; settlementMarginMs: number };
@@ -4084,6 +4094,9 @@ export class RunRunner {
       opts.memoryHoldDeadlineMs && opts.memoryHoldDeadlineMs > 0
         ? opts.memoryHoldDeadlineMs
         : this.codexBoundaryDeadlineMs;
+    this.retainedBlockerPersistDeadlineMs =
+      typeof opts.retainedBlockerPersistDeadlineMs === "number" && Number.isFinite(opts.retainedBlockerPersistDeadlineMs) &&
+      opts.retainedBlockerPersistDeadlineMs > 0 ? opts.retainedBlockerPersistDeadlineMs : this.codexBoundaryDeadlineMs;
     this.gateCheckpointDeadlineMs =
       typeof opts.gateCheckpointDeadlineMs === "number" && Number.isFinite(opts.gateCheckpointDeadlineMs) &&
       opts.gateCheckpointDeadlineMs > 0 ? opts.gateCheckpointDeadlineMs : 60_000;
@@ -30488,7 +30501,7 @@ export class RunRunner {
       let persisted: RecoveryJournalEntry | undefined;
       let persistedPaths: string[] = [];
       try {
-        await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+        await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.retainedBlockerPersistDeadlineMs,
           async () => {
             this.retainedLifecycleGuard(flight);
             // Owner accounting authorizes renewed work, never preservation. A
