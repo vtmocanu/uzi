@@ -455,8 +455,9 @@ failover. The API cannot verify replication topology or `fsync` by itself
   today) would be new controller read authority of the same class as P-4,
   and is not approved.
 - The vouched promotion set carries a version that the ACK path re-reads
-  after the flush check; a changed version withholds the ACK. Without that,
-  the window between the check and the ACK is an unavoidable race.
+  after the flush check; a changed version withholds the ACK. This detects a
+  change before the re-read only (see the open problem on promotion
+  admission below).
 - `fsync` cannot be forced per transaction and rests only on that trust.
 
 **Open problems.**
@@ -469,8 +470,23 @@ failover. The API cannot verify replication topology or `fsync` by itself
 - A withheld ACK leaves A with an unknown release outcome. A STOPs with the
   outcome unknown and retries replay later; it is never described as
   "custody kept" (D9.4). Named availability cost: if a promotion-set member
-  stays behind, every replay is withheld and A keeps T and the hold until an
-  owner discard or the standby catches up.
+  stays behind, every replay is withheld and A keeps T locally until an owner
+  discard or the standby catches up.
+- Server visibility of an unflushed release. Withholding the ACK does not
+  keep the server hold open. The release commit flips the hold to `released`
+  and clears `live_worker_id` / `live_run_id` in the same update (ADR-1296,
+  the two-lifetime foreign-key model), which lifts the `ON DELETE RESTRICT`
+  teardown block for every server consumer before the flush check runs. A's
+  local retention cannot restore that restriction. Closing P-6 therefore
+  needs every custody and teardown consumer to be unable to act on an
+  unflushed release (for example a release that stays non-terminal until the
+  flush is confirmed), not ACK gating alone.
+- Promotion admission after the final re-read. Nothing serializes a topology
+  change between the last version re-read and ACK publication, so a standby
+  lacking the commit could join the promotion set and later be promoted.
+  Closing P-6 needs promotion admission that preserves acknowledged history
+  (a standby is promotable only once it has every ACKed fence commit), or an
+  equivalent synchronization mechanism.
 - A synchronous wait cut short by the transaction's own timeout commits
   locally. The check above treats it like any unflushed commit.
 
@@ -982,9 +998,25 @@ under today's contracts. #4494 Direction 1 motivates it but supplies nothing.
   this ADR defines.
 - Stable attribution of post-cut bytes to a generation has no mechanism.
 
+**Capture versus release-authorizing evidence.**
+- An available capture is not release authority. Only the ADR-1296 release
+  evidence classes close a hold, and D5's thin archive FINAL refusal stays in
+  force: a thin capture cannot authorize an archive-backed FINAL.
+- A cutoff would therefore need release-authorizing evidence at the cut, not
+  merely a capture, plus complete original root and head attribution for
+  every claim generation through release. Today nothing binds post-cut bytes
+  to a generation, so that attribution cannot be preserved.
+
 **Closing a hold, retirement and remaining writers.**
 - **Closing a hold** permits custody accounting to drop the hold
-  ([ADR-2445](2445-custody-admission-accounting.md)).
+  ([ADR-2445](2445-custody-admission-accounting.md)). It also clears the
+  hold's live custody references, which lifts the server's teardown
+  restriction (ADR-1296, the two-lifetime foreign-key model). It is more than
+  accounting relief.
+- **Consumer protection.** ADR-2417 still retains sibling generations, shared
+  owed pins and metadata that has consumers. A cutoff release would have to
+  preserve those retention obligations through release, and no mechanism
+  today ties them to a cutoff.
 - **Retirement still forbidden.** Local retirement and source reuse remain
   forbidden while the run executes: the record is `source_protected`, and a
   pin authorizes no retirement (ADR-2417's #2969 amendment).
@@ -1131,7 +1163,9 @@ literal leaves, `run.sh` invocations, and `lint:shell`.
 this ADR:
 - P-1, P-3 and P-4 by owner decision;
 - P-6 by a promotion-set flush check on every ACK path including replay,
-  the owner's confirmation of that D9.4 reading, and an owner decision on the
+  the owner's confirmation of that D9.4 reading, server-side visibility rules
+  so no custody or teardown consumer acts on an unflushed release, promotion
+  admission that preserves acknowledged history, and an owner decision on the
   topology evidence source and `fsync` trust;
 - P-2 by a proof that every local predecessor effect is non-authoritative and
   harmless with B running, plus an owner decision accepting that deviation, or
