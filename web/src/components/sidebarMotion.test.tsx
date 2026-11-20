@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { NavItem, forgeIcon } from "./AppShell";
 import { NAV_SECTIONS } from "./navItems";
-import { SIDEBAR_MOTION_ICONS } from "./sidebarMotion";
+import { SIDEBAR_MOTION_ICONS, useNavIconMotion } from "./sidebarMotion";
 import { HomeIcon } from "./icons";
 
 // The jsdom half of issue #4510: the gesture hook's gating and class lifecycle, and the glyph
@@ -43,41 +43,42 @@ afterEach(() => {
 });
 
 describe("sidebar motion gestures", () => {
-  it("plays on pointerenter and click only when data-motion is on", () => {
+  it("plays on click only when data-motion is on", () => {
     const { link, svg } = renderItem();
     expect(svg().getAttribute("data-nav-motion")).toBe("overview");
 
-    fireEvent.pointerEnter(link);
+    // Motion unset: click plays nothing.
     fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(false);
 
     setMotion("off");
-    fireEvent.pointerEnter(link);
     fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(false);
 
+    // Motion on, same render: pointerenter and focus add nothing, click does.
     setMotion("on");
     fireEvent.pointerEnter(link);
-    expect(svg().classList.contains(PLAY)).toBe(true);
-    svg().classList.remove(PLAY);
+    fireEvent.focus(link);
+    expect(svg().classList.contains(PLAY)).toBe(false);
     fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(true);
   });
 
-  it("plays on focus only when the focus is keyboard-visible", () => {
+  it("focus does not play, even when keyboard-visible", () => {
     setMotion("on");
     const { link, svg } = renderItem();
-    // jsdom cannot evaluate :focus-visible; a thrown or false match must not play.
-    fireEvent.focus(link);
-    expect(svg().classList.contains(PLAY)).toBe(false);
-
-    vi.spyOn(link, "matches").mockReturnValue(false);
-    fireEvent.focus(link);
-    expect(svg().classList.contains(PLAY)).toBe(false);
-
     vi.spyOn(link, "matches").mockReturnValue(true);
     fireEvent.focus(link);
+    expect(svg().classList.contains(PLAY)).toBe(false);
+
+    // Paired positive on the same link.
+    fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(true);
+  });
+
+  it("returns exactly ref and onClick from the hook", () => {
+    const { result } = renderHook(() => useNavIconMotion());
+    expect(Object.keys(result.current).sort()).toEqual(["onClick", "ref"]);
   });
 
   it("does not play under prefers-reduced-motion", () => {
@@ -88,7 +89,6 @@ describe("sidebar motion gestures", () => {
       removeEventListener: vi.fn(),
     }) as unknown as typeof window.matchMedia;
     const { link, svg } = renderItem();
-    fireEvent.pointerEnter(link);
     fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(false);
   });
@@ -98,8 +98,8 @@ describe("sidebar motion gestures", () => {
     const { link, svg } = renderItem();
     const add = vi.spyOn(svg().classList, "add");
     const remove = vi.spyOn(svg().classList, "remove");
-    fireEvent.pointerEnter(link);
-    fireEvent.pointerEnter(link);
+    fireEvent.click(link);
+    fireEvent.click(link);
     expect(add.mock.calls.filter(([c]) => c === PLAY)).toHaveLength(2);
     // Each play drops the class before re-adding it.
     expect(remove.mock.calls.filter(([c]) => c === PLAY).length).toBeGreaterThanOrEqual(2);
@@ -109,12 +109,12 @@ describe("sidebar motion gestures", () => {
   it("clears the class on animationend and animationcancel", () => {
     setMotion("on");
     const { link, svg } = renderItem();
-    fireEvent.pointerEnter(link);
+    fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(true);
     svg().dispatchEvent(new Event("animationend", { bubbles: true }));
     expect(svg().classList.contains(PLAY)).toBe(false);
 
-    fireEvent.pointerEnter(link);
+    fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(true);
     svg().dispatchEvent(new Event("animationcancel", { bubbles: true }));
     expect(svg().classList.contains(PLAY)).toBe(false);
@@ -123,7 +123,7 @@ describe("sidebar motion gestures", () => {
   it("drops a playing class when the setting turns off", async () => {
     setMotion("on");
     const { link, svg } = renderItem();
-    fireEvent.pointerEnter(link);
+    fireEvent.click(link);
     expect(svg().classList.contains(PLAY)).toBe(true);
     setMotion("off");
     await waitFor(() => expect(svg().classList.contains(PLAY)).toBe(false));

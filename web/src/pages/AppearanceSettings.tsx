@@ -442,8 +442,8 @@ export function AppearanceSettings() {
           <div>
             <p className="text-sm font-medium text-fg">Sidebar icon animations</p>
             <p id="sidebar-motion-desc" className="mt-1 text-xs text-faint">
-              Plays a small one-shot animation on sidebar icons on hover, focus and
-              click. Respects your system&apos;s reduced-motion setting.
+              Plays a small one-shot animation when you click a sidebar icon (or press
+              Enter on it). Respects your system&apos;s reduced-motion setting.
             </p>
           </div>
           <Toggle

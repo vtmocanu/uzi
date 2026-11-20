@@ -50,10 +50,10 @@ font either; the files ship with the app.
 ## Sidebar icon animations
 
 **Sidebar icon animations** is off by default. Turn it on and each sidebar
-icon plays a small one-shot animation when you hover it, focus it with the
-keyboard, or click it. Nothing moves on its own, and the animation never
-plays when your OS asks for reduced motion. Like theme and typeface, the
-choice follows you across browsers and devices.
+icon plays a small one-shot animation when you click it (or press Enter on
+it); hovering or focusing it alone plays nothing. Nothing moves on its own,
+and the animation never plays when your OS asks for reduced motion. Like
+theme and typeface, the choice follows you across browsers and devices.
 
 ## Use instance defaults
 
