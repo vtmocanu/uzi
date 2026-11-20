@@ -176,8 +176,8 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// (migration 00226), so a persisted run always carries its authoritative harness — frozen
 	// by the D11 resolver inside the create transaction (createRunAtomic) — and needs no
 	// users.default_harness fallback here (the old pre-transaction createRunEffectiveHarness
-	// guesser is gone; see service.go and runs_lifecycle.go). An empty value is defended as
-	// claude, the safe direction (only a codex harness is refused, D9).
+	// guesser is gone; see service.go and runs_lifecycle.go). An empty value keeps the
+	// existing Claude default. Codex uses the active-only switch path below.
 	harness := run.Harness
 	if harness == "" {
 		harness = harnessClaude
