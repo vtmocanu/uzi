@@ -29,6 +29,14 @@ The cold Codex switch control omits the additional turn-level model override, so
 the runtime's resume response is checked without a second override masking it.
 This control is separate from production model omission, which is not applicable.
 
+For an effort-reporting rerun, append `--effort-check-only` to the Codex command.
+It runs only the omitted/null effort groups, eight live turns total. Resume
+effort presence and explicit null are preserved, and each turn reports the
+runtime's model/effort settings notifications. Those notifications are observations
+after dispatch, not a new pre-provider admission barrier. The older report format
+collapsed null and absent resume effort into `unreported`; do not infer the live
+omission rule from that older field or from output-token counts.
+
 The macOS Codex entry uses the pinned Linux runner image and the locally prepared
 `cdx3246-deps` and `cdx3246-codex` volumes. Preparation uses the unchanged
 `install-codex.sh` SHA256/manifest checks, never Homebrew. Container names start

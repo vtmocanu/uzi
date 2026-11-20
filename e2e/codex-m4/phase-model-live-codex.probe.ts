@@ -5,12 +5,15 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { liveArgs, offlineProof, probeError } from "../../agent/test/phase-model-live.js";
-import { PhaseCodex } from "./phase-model-driver.js";
+import { PhaseCodex, phaseSettings } from "./phase-model-driver.js";
 import { assertBinaryVersion, resolveCodexBin } from "./provision.js";
 import { MACOS_LINUX_RUNNER_REF } from "./macos-linux-runner.js";
 
 async function main(): Promise<void> {
-  const args = liveArgs(process.argv.slice(2), process.env);
+  const raw = process.argv.slice(2);
+  const effortOnly = raw.includes("--effort-check-only");
+  if (raw.filter(v => v === "--effort-check-only").length > 1) throw new Error("duplicate effort-check-only flag");
+  const args = liveArgs(raw.filter(v => v !== "--effort-check-only"), process.env);
   const startedAt = Date.now();
   if (args.variable !== "CODEX_HOME") throw new Error("Codex probe requires --credential-env CODEX_HOME");
   const home = path.resolve(args.credential);
@@ -69,7 +72,7 @@ async function main(): Promise<void> {
       offlineProof("../e2e/codex-m4/phase-model-switch.test.ts", "PHASE_CODEX_EVIDENCE ") }));
     const active = warm = await PhaseCodex.open(bin, home, root, undefined, undefined, args.modelA);
     check();
-    for (const name of ["switch-reclaim-replan", "omitted-effort", "null-effort"]) {
+    for (const name of effortOnly ? ["omitted-effort", "null-effort"] : ["switch-reclaim-replan", "omitted-effort", "null-effort"]) {
       const started = await active.thread(args.modelA);
       const group = { name, thread: started.thread.id, ...(name === "null-effort" ? { omission: null } : {}), turns: [] as unknown[], count: 0 };
       groups.push(group);
@@ -86,7 +89,8 @@ async function main(): Promise<void> {
       };
       await drive(args.modelA, args.effortA);
       const report = await active.thread(args.modelB, group.thread);
-      group.turns.push({ resumeModel: report.model, resumeEffort: report.reasoningEffort ?? "unreported", role: "warm" });
+      group.turns.push({ resumeModel: report.model, resumeEffortPresent: Object.hasOwn(report, "reasoningEffort"),
+        resumeEffort: Object.hasOwn(report, "reasoningEffort") ? report.reasoningEffort : "absent", role: "warm" });
       await drive(args.modelB, name === "switch-reclaim-replan" ? args.effortB : group.omission);
       await active.thread(args.modelA, group.thread);
       await drive(args.modelA, args.effortA);
@@ -98,7 +102,8 @@ async function main(): Promise<void> {
     for (const group of groups) {
       const report = await cold.thread(args.modelB, group.thread);
       accountant.registerThread(group.thread, args.modelB, true);
-      group.turns.push({ resumeModel: report.model, resumeEffort: report.reasoningEffort ?? "unreported", role: "cold" });
+      group.turns.push({ resumeModel: report.model, resumeEffortPresent: Object.hasOwn(report, "reasoningEffort"),
+        resumeEffort: Object.hasOwn(report, "reasoningEffort") ? report.reasoningEffort : "absent", role: "cold" });
       if (++group.count > 4) throw new Error("probe turn budget exceeded");
       const effort = group.name === "switch-reclaim-replan" ? args.effortB : group.omission;
       check();
@@ -112,7 +117,7 @@ async function main(): Promise<void> {
     await cold?.close(); await warm?.close();
     clearTimeout(soft); clearTimeout(hard); process.off("SIGINT", stop); process.off("SIGTERM", stop);
     fs.rmSync(root, { recursive: true, force: true });
-    const summary = JSON.stringify({ kind: "phase-model-live", harness: "codex", pin: "0.167.0", failure,
+    const summary = JSON.stringify({ kind: "phase-model-live", harness: "codex", pin: "0.167.0", scope: effortOnly ? "effort-only" : "full", failure,
       groups: groups.map(({ name, turns, count }) => ({ name, turns, count })),
       usage: accountant.aggregateByModel(), authJsonMtimeChanged: mtime() !== before,
       modelOmission: "not applicable: buildRunRequest uses leadRequestFor/resolveLeadRequest provider fallback",
@@ -131,7 +136,8 @@ async function main(): Promise<void> {
           pricingEvidenceComplete: note.usage.pricingEvidenceComplete ?? null, attributedModel: attributed?.model });
       }
     }
-    return { requestedModel: model ?? "omitted-resume-effectiveness-control", requestedEffort: effort === undefined ? "omitted" : effort, status: "completed", usage, nonceObserved: result.text.includes(nonce) };
+    return { requestedModel: model ?? "omitted-resume-effectiveness-control", requestedEffort: effort === undefined ? "omitted" : effort,
+      status: "completed", settings: phaseSettings(result.notes, thread, result.turnId), usage, nonceObserved: result.text.includes(nonce) };
   }
 }
 void main().catch(error => { console.error(probeError(error)); process.exitCode = 1; });

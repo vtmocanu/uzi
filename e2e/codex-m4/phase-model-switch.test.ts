@@ -8,7 +8,7 @@ import { FakeProvider, dummyCredential } from "./fake-provider.js";
 import { message } from "../codex-m0/harness.mjs";
 import { loadPackagedConfig } from "./packaged-modules.js";
 import { assertBinaryVersion, resolveCodexBin } from "./provision.js";
-import { PhaseCodex } from "./phase-model-driver.js";
+import { PhaseCodex, phaseSettings } from "./phase-model-driver.js";
 import { P_LAYER_SKIP } from "./p-platform.js";
 import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { recordEvidence } from "./evidence.js";
@@ -68,12 +68,14 @@ before(async () => {
   observed.warmControl = { report: controlReport.model, wire: fake.requests.at(-1)!.model };
   const groups: Array<{ id: string; omitted: undefined | null; nonce: string }> = [];
   const effortWire: unknown[] = [];
+  const effortReports: unknown[] = [];
   for (const omitted of [undefined, null]) {
     const groupNonce = `${nonce}-${omitted === null ? "null" : "omitted"}`;
     const thread = await warm.thread(A);
     await warm.turn(thread.thread.id, A, groupNonce, "high");
     await warm.thread(B, thread.thread.id);
-    await warm.turn(thread.thread.id, B, "Repeat it.", omitted);
+    const result = await warm.turn(thread.thread.id, B, "Repeat it.", omitted);
+    effortReports.push(phaseSettings(result.notes, thread.thread.id, result.turnId).at(-1));
     effortWire.push(fake.requests.at(-1)!.reasoning);
     await warm.turn(thread.thread.id, A, "Repeat it.", "high");
     groups.push({ id: thread.thread.id, omitted, nonce: groupNonce });
@@ -89,11 +91,13 @@ before(async () => {
   for (const group of groups) {
     const reply = await cold.thread(B, group.id);
     assert.equal(reply.thread.id, group.id);
-    await cold.turn(group.id, B, "Repeat it.", group.omitted);
+    const result = await cold.turn(group.id, B, "Repeat it.", group.omitted);
+    effortReports.push(phaseSettings(result.notes, group.id, result.turnId).at(-1));
     assert.match(JSON.stringify(fake.requests.at(-1)!.input), new RegExp(group.nonce), "cold effort reset retains its own group's history");
     effortWire.push(fake.requests.at(-1)!.reasoning);
   }
   observed.efforts = effortWire;
+  observed.effortReports = effortReports;
   observed.requests = fake.requests.length;
   assert.deepEqual(fake.errors, []);
 }, { timeout: 110_000 });
@@ -116,8 +120,11 @@ for (const [key, title] of Object.entries(PHASE_MODEL_TITLES)) test(title, { ski
   else if (key === "modelOmitted") {
     const { resolveLeadRequest } = await import("../../agent/src/lead-config-report.js");
     assert.equal(resolveLeadRequest({ harness: "codex", phase: "implement", config: undefined, providerDefaultModel: A }).model, A);
-  } else if (key === "effortOmitted") assert.deepEqual(
-    (observed.efforts as Array<{ effort: string }>).map(r => r.effort), ["high", "high", "low", "low"]);
+  } else if (key === "effortOmitted") {
+    assert.deepEqual((observed.efforts as Array<{ effort: string }>).map(r => r.effort), ["high", "high", "low", "low"]);
+    assert.deepEqual((observed.effortReports as Array<{ model: string; effortPresent: boolean; effort: string | null }>).map(r => ({ model: r.model, effortPresent: r.effortPresent, effort: r.effort })),
+      ["high", "high", null, null].map(effort => ({ model: B, effortPresent: true, effort })));
+  }
   else {
     assert.equal(switched.priorRequests, 1);
     assert.equal(coldResult.after, coldResult.before + 1);
@@ -130,7 +137,7 @@ test("Codex phase case 6: today's shared accountant attributes switched usage to
   assert.deepEqual(observed.accountedCold, [A]);
   const warmResult = observed.switch as { resumed: { model: string }; wire: { model?: unknown } };
   const coldResult = observed.cold as { reclaimed: { model: string }; wire: { model?: unknown } };
-  console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.167.0", efforts: observed.efforts, requests: observed.requests,
+  console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.167.0", efforts: observed.efforts, effortReports: observed.effortReports, requests: observed.requests,
     warmResumeModel: warmResult.resumed.model, warmRequestModel: warmResult.wire.model,
     coldResumeModel: coldResult.reclaimed.model, coldRequestModelWithoutTurnOverride: coldResult.wire.model, warmControl: observed.warmControl,
     switchedModelAccounting: observed.accounted })}`);

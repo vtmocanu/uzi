@@ -3,6 +3,24 @@ import { once } from "node:events";
 import type { CodexNotification, CodexTransport } from "../../agent/src/codex/transport.js";
 import { loadPackagedAppServerAuth, loadPackagedConfig, loadPackagedTransport } from "./packaged-modules.js";
 
+/** Preserve an explicit runtime-default null separately from an absent effort observation. */
+export function phaseSettings(notes: readonly CodexNotification[], threadId: string, turnId: string) {
+  let duringTurn = false;
+  const observations: Array<{ phase: string; model: string; effortPresent: boolean; effort: string | null }> = [];
+  for (const note of notes) {
+    if (note.kind === "turn_started" && note.threadId === threadId && note.turnId === turnId) duringTurn = true;
+    if (note.method !== "thread/settings/updated") continue;
+    const params = note.params as { threadId?: string; threadSettings?: Record<string, unknown> };
+    if (params.threadId !== threadId || !params.threadSettings) continue;
+    const settings = params.threadSettings;
+    const effortPresent = Object.hasOwn(settings, "effort");
+    observations.push({ phase: duringTurn ? "turn" : "before-turn",
+      model: typeof settings.model === "string" ? settings.model : "unreported", effortPresent,
+      effort: settings.effort === null ? null : typeof settings.effort === "string" ? settings.effort : "absent-or-invalid" });
+  }
+  return observations;
+}
+
 /** Only scalar assignments emitted by the production builder; unknown syntax refuses launch. */
 function configArguments(text: string, provider?: string): string[] {
   let section = "";
