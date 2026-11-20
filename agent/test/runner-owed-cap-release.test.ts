@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import type { RunContext } from "../src/executor.js";
+import type { Executor, RunContext } from "../src/executor.js";
 import { randomUUID } from "node:crypto";
 import type { RefusalReleaseGate } from "../src/git.js";
 import { recordingLogger } from "./helpers.js";
@@ -670,8 +670,9 @@ const newGens = (iid: number): Gens => ({ runId: randomUUID(), iid, servers: [],
 const lastServer = (g: Gens): HeldServer => g.servers[g.servers.length - 1]!;
 
 /** One real claim of the run; `restart` first replaces the GitCache with a fresh one under `process`. */
-async function claimGeneration(g: Gens, generation: number, how: { process?: string; lostReport?: boolean } = {}): Promise<void> {
-  if (how.process) restartGitCache({ maxOwedCandidates: CAP, processNonce: how.process });
+async function claimGeneration(g: Gens, generation: number, how: { process?: string; lostReport?: boolean; old?: boolean; cap?: number; executor?: Executor } = {}): Promise<void> {
+  if (how.process) restartGitCache({ maxOwedCandidates: how.cap ?? CAP, processNonce: how.process });
+  if (how.old) git.admitRefusalProvenance = async () => "failed";
   const gate = git.refusalReleaseGate.bind(git);
   git.refusalReleaseGate = async (...a: Parameters<typeof gate>) => {
     const result = await gate(...a);
@@ -684,7 +685,7 @@ async function claimGeneration(g: Gens, generation: number, how: { process?: str
   const stop = how.lostReport ? api.dropStatesWhen(g.runId, b => b.status === "failed") : undefined;
   const rec = recordingLogger();
   g.logs = rec.lines;
-  const r = runnerWith(() => ({ executor: failingWork(g.work) }), fakeGitlab().gitlab, JOIN_TOKEN, rec.logger, { checkpointIntervalMs: 1 });
+  const r = runnerWith(() => ({ executor: how.executor ?? failingWork(g.work) }), fakeGitlab().gitlab, JOIN_TOKEN, rec.logger, { checkpointIntervalMs: 1 });
   // A restarted worker recovers its boot-time state before it takes the next claim.
   if (how.process && g.last) await r.resumePendingRecoveries(undefined, await r.snapshotBootRecoveries());
   try { await r.execute(claim); } finally { stop?.(); }
@@ -706,7 +707,7 @@ async function releaseGeneration(g: Gens, generation: number, label: string, old
 const gateAt = (g: Gens, generation: number): RefusalReleaseGate[] => g.gates.filter(x => x.generation === generation).map(x => x.result);
 
 /** The custody-retention assertions for the generation that must not release. */
-function assertRetained(g: Gens, generation: number, reason: string): void {
+function assertRetained(g: Gens, generation: number, reason: string, owed = CAP): void {
   const gates = gateAt(g, generation);
   assert.ok(gates.length >= 1, `the real terminal hook consulted the gate at generation ${generation}`);
   assert.deepEqual(gates.filter(x => x.kind === "eligible"), [], "no gate call was eligible");
@@ -718,7 +719,7 @@ function assertRetained(g: Gens, generation: number, reason: string): void {
   assert.equal(server.archiveUploads(), 0, "no archive upload");
   assert.equal(server.archiveReserves(), 0, "no archive capture");
   assert.equal(server.acked(), 0, "nothing was released");
-  assert.equal(command(bare(), ["for-each-ref", `refs/uzi-owed/${g.runId}/`]).split("\n").filter(Boolean).length, CAP, "the owed evidence is still pinned");
+  assert.equal(command(bare(), ["for-each-ref", `refs/uzi-owed/${g.runId}/`]).split("\n").filter(Boolean).length, owed, "the owed evidence is still pinned");
   assert.ok(refusalFiles().includes(`owedpath-${g.runId}-${generation}.json`), "the at-cap marker is still present");
   assert.ok(fs.existsSync(g.work.clone!), "the runner clone is retained");
 }
@@ -743,20 +744,42 @@ it("an old worker's released generation, then a restarted updated worker's claim
   assertRetained(g, 2, "admission for generation 1 absent");
 });
 
-it("updated, then old, then a restarted updated worker (generation 1 head preserved) keeps custody", opts, async () => {
+/** Two owed roots on fresh lines of history, then a divergent head that only a successful terminal import can take. */
+function divergentWork(work: Partial<Work>): Executor {
+  return { run: async (ctx: RunContext) => {
+    const clone = ctx.worktreePath;
+    work.clone = clone;
+    for (const name of ["gen2-a.txt", "gen2-b.txt"]) {
+      command(clone, ["reset", "--hard", originMain()]);
+      commit(clone, name);
+      await ctx.checkpoint!({ reap: false });
+    }
+    commit(clone, "gen2-final.txt");
+    throw new Error("executor failed");
+  } };
+}
+
+it("updated, then old (real displacement), then a restarted updated worker keeps custody", opts, async () => {
   const g = newGens(44852);
   await claimGeneration(g, 1, { process: "worker-process-p1" });
   const trackingRef = `refs/uzi-runner/agent/issue-${g.iid}`;
   const gen1Head = command(bare(), ["rev-parse", "--verify", trackingRef]);
   await releaseGeneration(g, 1, "generation 1", false);
-  await claimGeneration(g, 2);
-  const heldElsewhere = command(bare(), ["for-each-ref", "--format=%(objectname) %(refname)", `refs/uzi-owed/${g.runId}/`, "refs/uzi-recovery-pin/"])
-    .split("\n").filter(l => l.startsWith(gen1Head + " "));
-  assert.ok(heldElsewhere.length >= 1, "generation 1's tracking head is preserved by an owed ref or a pin");
-  await releaseGeneration(g, 2, "generation 2", true);
+  // Generation 2 is an old worker's claim (no admission) in its own cache with room for its terminal import, which
+  // therefore succeeds and moves the tracking ref off generation 1's head.
+  await claimGeneration(g, 2, { process: "worker-process-p2", cap: CAP + 2, old: true, executor: divergentWork(g.work) });
+  const gen2Head = command(g.work.clone!, ["rev-parse", "HEAD"]);
+  assert.notEqual(gen2Head, gen1Head, "generation 2 built its own head");
+  assert.equal(command(bare(), ["rev-parse", "--verify", trackingRef]), gen2Head, "generation 2's import moved the tracking ref to its head");
+  assert.equal(command(bare(), ["rev-parse", "--verify", `refs/uzi-owed/${g.runId}/${gen1Head}`]), gen1Head,
+    "the displacement preserved generation 1's tracking head as an owed ref");
+  assert.ok(!refusalFiles().includes(`admission-${g.runId}-2.json`), "the old worker wrote no admission");
+  // The old worker's own custody handling is its code, not this build's: model what it leaves once finished.
+  fs.rmSync(g.work.clone!, { recursive: true, force: true });
+  command(bare(), ["config", "--unset-all", `uzi-recovery.agent/issue-${g.iid}.clone`]);
   await claimGeneration(g, 3, { process: "worker-process-p3" });
   await redrive(g.last!);
-  assertRetained(g, 3, "admission for generation 1 is from another process");
+  assertRetained(g, 3, "admission for generation 1 is from another process", CAP + 2);
 });
 
 for (const old of [true, false]) {
@@ -768,8 +791,16 @@ for (const old of [true, false]) {
     assert.equal(failedStates(g.runId).length, 0, "the terminal report was lost");
     assert.equal(refusalFiles().includes(`admission-${g.runId}-1.json`), !old,
       old ? "the old worker wrote no admission" : "the updated worker wrote its admission");
+    const before = g.gates.length;
     await claimGeneration(g, 2, { process: "worker-process-p2" });
     await redrive(g.last!);
+    const afterRestart = g.gates.slice(before).filter(x => x.generation === 1).map(x => x.result);
+    if (old) assert.deepEqual(afterRestart, [], "the old worker left nothing for boot recovery to prove");
+    else {
+      assert.ok(afterRestart.length >= 1, "boot recovery consulted the generation 1 gate under the restarted cache");
+      assert.deepEqual(afterRestart[0], { kind: "ineligible", reason: "admission for generation 1 is from another process" },
+        "the restarted cache refuses generation 1 for the admission");
+    }
     const logs = g.logs as { msg: string; blocker?: string }[];
     assert.ok(logs.some(l => l.msg === "Retained recovery blocked: budget exhausted; local work and custody retained" && l.blocker === "budget_exhausted"),
       "the retained-recovery adoption exhausted its budget");

@@ -91,12 +91,10 @@ export function installHarness(
   });
 }
 
-// PRD #51 M3 (b): the run's working tree is the RUNNER CLONE under runner/, not a
-// linked worktree under worktrees/.
 /**
- * A worker restart over the same data dir: a brand new GitCache (so no in-process refusal state
- * survives: closed generations, recording failures, import stages, mocks) with its own process
- * nonce. The fake api and the client stay, as a restarted worker meets the same server.
+ * A brand new GitCache over the same data dir with its own options (e.g. process nonce): no
+ * in-process refusal state of the GitCache survives. The WorkerClient (and anything installed on
+ * it), the fake api and module-level state persist, so this is not a full process restart.
  */
 export function restartGitCache(opts: GitCacheOptions = {}): GitCache {
   git = new GitCache(fx.dataDir, nullLogger(), undefined,
@@ -104,6 +102,8 @@ export function restartGitCache(opts: GitCacheOptions = {}): GitCache {
   return git;
 }
 
+// PRD #51 M3 (b): the run's working tree is the RUNNER CLONE under runner/, not a
+// linked worktree under worktrees/.
 export function worktreeDirFor(iid: number): string {
   const repoDir = path
     .basename(git.barePathFor(fx.originPath))
