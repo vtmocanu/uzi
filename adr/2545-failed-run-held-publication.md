@@ -451,8 +451,9 @@ context or pin write, when a `final-` file exists at or above the producing
 context's generation or the caller's generation (a failed read of the names
 refuses too, as `preservation_failed`). The fence is checked before the
 already-pinned and remotely-covered short cuts, so after a seal a retain that
-would have written nothing new is also refused (`not_updated`, the clone is
-preserved): an accepted, fail-closed over-refusal. Once `final-`
+would have written nothing new is also refused (`not_updated`; the settle path
+then preserves the clone, the retirement path preserves it when the claim is
+inventory-guarded): an accepted, fail-closed over-refusal. Once `final-`
 exists the seal blocks recording on every path, including `retainCurrentOwedCandidate`.
 On these paths a second terminal pass for the same generation re-proves the
 released head instead of re-importing (this only stops the hook from
@@ -660,8 +661,9 @@ residual that earlier text left open is closed by the owed-path marker above.
   [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md)'s accepted contract
   (no in-product path resolves a dead owner's running bare record), that record
   blocks later same-bare writes (`assertBareClear`, `bare_unresolved`): seeds,
-  pins and coverage ref writes. This lasts until operator intervention and
-  affects only that bare. The remaining refusal refs, the ledger and the seal are
+  pins and coverage ref writes. This lasts until a manual operator action
+  outside the product (ADR-1783's guarded operator discard also refuses a
+  `running` pending record) and affects only that bare. The remaining refusal refs, the ledger and the seal are
   kept, and no head loses coverage. See #4066 and the recovery-design follow-up
   #4550. This change does not force-clear the record or weaken bare registration.
 

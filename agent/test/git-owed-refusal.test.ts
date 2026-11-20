@@ -299,7 +299,7 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]), tip);
     // A later generation of the same run is not fenced.
     assert.notDeepEqual(await fetchHead(withContext(2)), { kind: "not_updated", reason: "ownership_unknown" });
-    // retainCurrentOwedCandidate is sealed by the chokepoint, not fenced.
+    // retainCurrentOwedCandidate is not stopped by the in-process fence; only a seal of the generation it would pin stops it.
     assert.equal((await cache.retainCurrentOwedCandidate(bare, opts)).kind, "updated");
   });
 
