@@ -17,16 +17,29 @@ const fixture = JSON.parse(
   fs.readFileSync(new URL("../../fixtures/run-env/name-rules.json", import.meta.url), "utf8"),
 ) as {
   harness_versions: { claude_agent_sdk: string; codex: string };
-  denied_names: string[];
-  denied_prefixes: string[];
-  denied_suffixes: string[];
+  invariants: string[];
+  review: { date: string; method: string };
+  denied_names: FixtureRule[];
+  denied_prefixes: FixtureRule[];
+  denied_suffixes: FixtureRule[];
 };
+type FixtureRule = { value: string; invariant: string; note: string };
+const toFixtureShape = (rules: readonly FixtureRule[]) => rules.map((r) => ({ value: r.value, invariant: r.invariant, note: r.note }));
 
 describe("run-env name rules match the shared fixture", () => {
   it("denied names, prefixes and suffixes are identical, in order", () => {
-    assert.deepEqual([...RUN_ENV_DENIED_NAMES], fixture.denied_names);
-    assert.deepEqual([...RUN_ENV_DENIED_PREFIXES], fixture.denied_prefixes);
-    assert.deepEqual([...RUN_ENV_DENIED_SUFFIXES], fixture.denied_suffixes);
+    assert.deepEqual(toFixtureShape(RUN_ENV_DENIED_NAMES), fixture.denied_names);
+    assert.deepEqual(toFixtureShape(RUN_ENV_DENIED_PREFIXES), fixture.denied_prefixes);
+    assert.deepEqual(toFixtureShape(RUN_ENV_DENIED_SUFFIXES), fixture.denied_suffixes);
+  });
+
+  it("every entry names a known invariant and carries a note; the review is dated", () => {
+    assert.match(fixture.review.date, /^\d{4}-\d{2}-\d{2}$/);
+    assert.ok(fixture.review.method.trim().length > 0);
+    for (const r of [...fixture.denied_names, ...fixture.denied_prefixes, ...fixture.denied_suffixes]) {
+      assert.ok(fixture.invariants.includes(r.invariant), `${r.value}: invariant ${r.invariant}`);
+      assert.ok(r.note.trim().length > 0, `${r.value}: empty note`);
+    }
   });
 
   it("recorded harness versions are identical", () => {
@@ -53,18 +66,18 @@ describe("recorded harness versions track the pinned harnesses", () => {
 });
 
 describe("runEnvNameViolation", () => {
-  for (const name of fixture.denied_names) {
+  for (const { value: name } of fixture.denied_names) {
     it(`denies name ${name}`, () => {
       assert.notEqual(runEnvNameViolation(name), null);
     });
   }
-  for (const prefix of fixture.denied_prefixes) {
+  for (const { value: prefix } of fixture.denied_prefixes) {
     it(`denies prefix ${prefix}`, () => {
       const v = runEnvNameViolation(`${prefix}SOMETHING`);
       assert.ok(v !== null && v.includes(`denied prefix ${prefix}`), String(v));
     });
   }
-  for (const suffix of fixture.denied_suffixes) {
+  for (const { value: suffix } of fixture.denied_suffixes) {
     it(`denies suffix ${suffix}`, () => {
       const v = runEnvNameViolation(`SOMETHING${suffix}`);
       assert.ok(v !== null && v.includes(`denied suffix ${suffix}`), String(v));
@@ -80,6 +93,9 @@ describe("runEnvNameViolation", () => {
     "GRADLE_OPTS",
     "DOCKER_AUTH_CONFIG",
     "TESTCONTAINERS_HOST_OVERRIDE",
+    "NODE_ENV",
+    "NPM_CONFIG_REGISTRY",
+    "PIP_INDEX_URL",
     "_LEADING_UNDERSCORE",
     "A",
     "A".repeat(128),

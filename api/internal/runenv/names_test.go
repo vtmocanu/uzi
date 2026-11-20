@@ -11,14 +11,25 @@ import (
 
 const nameRulesFixture = "../../../fixtures/run-env/name-rules.json"
 
+type fixtureRule struct {
+	Value     string `json:"value"`
+	Invariant string `json:"invariant"`
+	Note      string `json:"note"`
+}
+
 type nameRulesFile struct {
+	Review struct {
+		Date   string `json:"date"`
+		Method string `json:"method"`
+	} `json:"review"`
+	Invariants      []string `json:"invariants"`
 	HarnessVersions struct {
 		ClaudeAgentSDK string `json:"claude_agent_sdk"`
 		Codex          string `json:"codex"`
 	} `json:"harness_versions"`
-	DeniedNames    []string `json:"denied_names"`
-	DeniedPrefixes []string `json:"denied_prefixes"`
-	DeniedSuffixes []string `json:"denied_suffixes"`
+	DeniedNames    []fixtureRule `json:"denied_names"`
+	DeniedPrefixes []fixtureRule `json:"denied_prefixes"`
+	DeniedSuffixes []fixtureRule `json:"denied_suffixes"`
 	Overlaps       []struct {
 		Name     string `json:"name"`
 		Harness  string `json:"harness"`
@@ -47,15 +58,41 @@ func loadNameRules(t *testing.T) nameRulesFile {
 func TestGoNameRulesEqualSharedFixture(t *testing.T) {
 	fx := loadNameRules(t)
 	for _, c := range []struct {
-		what      string
-		got, want []string
+		what string
+		got  []deniedRule
+		want []fixtureRule
 	}{
 		{"denied names", deniedNames, fx.DeniedNames},
 		{"denied prefixes", deniedPrefixes, fx.DeniedPrefixes},
 		{"denied suffixes", deniedSuffixes, fx.DeniedSuffixes},
 	} {
-		if !slices.Equal(c.got, c.want) {
-			t.Errorf("%s differ from fixtures/run-env/name-rules.json:\n go:      %v\n fixture: %v", c.what, c.got, c.want)
+		if len(c.got) != len(c.want) {
+			t.Errorf("%s: %d entries in Go, %d in fixtures/run-env/name-rules.json", c.what, len(c.got), len(c.want))
+			continue
+		}
+		for i := range c.got {
+			g := fixtureRule{c.got[i].Value, c.got[i].Invariant, c.got[i].Note}
+			if g != c.want[i] {
+				t.Errorf("%s differ from fixtures/run-env/name-rules.json at index %d:\n go:      %+v\n fixture: %+v", c.what, i, g, c.want[i])
+				break
+			}
+		}
+	}
+}
+
+func TestFixtureEntriesCarryAnInvariantAndNote(t *testing.T) {
+	fx := loadNameRules(t)
+	if fx.Review.Date == "" || strings.TrimSpace(fx.Review.Method) == "" {
+		t.Error("the fixture records no review date or method")
+	}
+	for _, list := range [][]fixtureRule{fx.DeniedNames, fx.DeniedPrefixes, fx.DeniedSuffixes} {
+		for _, r := range list {
+			if !slices.Contains(fx.Invariants, r.Invariant) {
+				t.Errorf("%q has invariant %q, not in %v", r.Value, r.Invariant, fx.Invariants)
+			}
+			if strings.TrimSpace(r.Note) == "" {
+				t.Errorf("%q has no note", r.Value)
+			}
 		}
 	}
 }
@@ -93,7 +130,8 @@ func TestFixtureHarnessVersionsMatchPins(t *testing.T) {
 
 func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 	fx := loadNameRules(t)
-	for _, n := range fx.DeniedNames {
+	for _, r := range fx.DeniedNames {
+		n := r.Value
 		if deniedBy(n) == "" {
 			t.Errorf("denied name %q is not denied by the lists", n)
 		}
@@ -101,16 +139,16 @@ func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 			t.Errorf("ValidateName(%q) accepted a denied name", n)
 		}
 	}
-	for _, p := range fx.DeniedPrefixes {
-		n := p + "SOMETHING"
+	for _, r := range fx.DeniedPrefixes {
+		n := r.Value + "SOMETHING"
 		if err := ValidateName(n); err == nil {
-			t.Errorf("ValidateName(%q) accepted a name under denied prefix %q", n, p)
+			t.Errorf("ValidateName(%q) accepted a name under denied prefix %q", n, r.Value)
 		}
 	}
-	for _, s := range fx.DeniedSuffixes {
-		n := "SOMETHING" + s
+	for _, r := range fx.DeniedSuffixes {
+		n := "SOMETHING" + r.Value
 		if err := ValidateName(n); err == nil {
-			t.Errorf("ValidateName(%q) accepted a name with denied suffix %q", n, s)
+			t.Errorf("ValidateName(%q) accepted a name with denied suffix %q", n, r.Value)
 		}
 	}
 }
@@ -176,6 +214,13 @@ func TestValidateNameTable(t *testing.T) {
 		{"MAX_THINKING_TOKENS", "MAX_THINKING_TOKENS is set or reserved"},
 		{"MAX_MCP_OUTPUT_TOKENS", "MAX_MCP_OUTPUT_TOKENS is set or reserved"},
 		{"DOCKER_HOST", "DOCKER_HOST is set or reserved"},
+		{"BUN_CONFIG_REGISTRY", "denied prefix BUN_"},
+		{"NODE_DEBUG", "NODE_DEBUG is set or reserved"},
+		{"SSLKEYLOGFILE", "protects network_wiring"},
+		{"NODE_ENV", ""},
+		{"NPM_CONFIG_REGISTRY", ""},
+		{"PIP_INDEX_URL", ""},
+		{"MAVEN_OPTS", ""},
 		{"UZI_ANYTHING", "denied prefix UZI_"},
 	}
 	for _, tc := range tests {

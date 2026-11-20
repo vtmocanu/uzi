@@ -1,0 +1,19 @@
+{
+  "protected": true,
+  "versions": [
+    {
+      "var_id": "0a9b8c7d-6e5f-4a3b-9c2d-1e0f9a8b7c6d",
+      "scope": "repo",
+      "rev": 2,
+      "name": "PAYMENTS_SANDBOX_KEY",
+      "value": "dummy-sandbox-key-0000"
+    },
+    {
+      "var_id": "3c4d5e6f-7a8b-4c9d-8e0f-a1b2c3d4e5f6",
+      "scope": "user",
+      "rev": 1,
+      "name": "PRIVATE_INDEX_TOKEN",
+      "value": "dummy-index-token-0001"
+    }
+  ]
+}

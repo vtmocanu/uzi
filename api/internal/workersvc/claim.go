@@ -557,6 +557,16 @@ type ClaimSecrets struct {
 	// key, not null, not empty; snapshot-tested). Only a worker advertising claude_provider_v1 is
 	// offered such a claim. Never logged: it carries the usable gateway key.
 	Provider *ClaimProviderBinding `json:"provider,omitempty"`
+	// RunEnv is the effective set of live, enabled repo environment variables for this run
+	// (PRD #4416), present ONLY when the run is of a receiving kind and has any. omitempty is
+	// load-bearing: a run without variables leaves it nil so its emitted JSON is BYTE-IDENTICAL
+	// to today's wire (no `run_env` key). Only a worker advertising run_env_v1 is offered a
+	// claim carrying it. Never logged: it carries usable secret values.
+	RunEnv []ClaimRunEnvVar `json:"run_env,omitempty"`
+	// RunEnvRedact is every secret version this run holds a receipt for that is not in RunEnv,
+	// for redaction and scanning only (never set in an environment or a prompt). Same omitempty
+	// and never-logged rules as RunEnv.
+	RunEnvRedact []ClaimRunEnvRedact `json:"run_env_redact,omitempty"`
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run
