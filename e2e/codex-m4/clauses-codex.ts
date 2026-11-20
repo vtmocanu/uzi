@@ -11,6 +11,7 @@
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
 import type { ClauseRow } from "./clause.js";
+import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
 import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
@@ -44,6 +45,14 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-phase-model-switch", adapter: "codex", layer: "P", family: "Persisted context and usage replay",
+    seam: "pinned app-server with production config/auth/transport and two process roles",
+    positiveControl: "model A then B then A and cold B retain nonce-bearing context and exact provider model/effort",
+    negativeOracle: "resume alone sends zero provider requests; omitted and null effort are measured warm and cold",
+    intendedOutcome: "phase-switch characterization only; live provider acceptance and D1 remain separate maintainer evidence",
+    tests: Object.values(PHASE_MODEL_TITLES),
+  },
   {
     id: "codex-p-native-patch-inert", adapter: "codex", layer: "P", family: "Native execution bypass",
     seam: "harness-p production launcher/config/auth/transport/broker with offline loopback provider",
