@@ -337,11 +337,17 @@ neither a different credential nor revoking the old uzi capability stops a
 provider credential that predecessor already holds. This case is an
 owner-recorded limitation, unvalidated and uncredited. The owner's stated
 requirement is that the new credential is never used while the predecessor is
-unproven, but **uzi does not enforce that across workers.** If the lost host's
-run is claimed by another of your workers (once the old worker is stale and not draining past the grace period, past the affinity ceiling, or deleted), that worker has no local
-retained journal, so the quiescence proof does not run, and the run continues
-with its current credential: the new one after a switch, or the old one if you
-never switched. The unreachable host may still hold the old credential, and the new one too if the switch had already applied there.
+unproven. The [claim-provenance restriction](#a-codex-run-held-for-its-last-worker)
+now refuses a fresh Codex claim on another worker, even after affinity expiry
+or deletion of the previous worker. Missing or stale provenance also refuses a
+fresh claim. This is not proof that the old process stopped: a replacement under
+the same worker id can still claim while its predecessor incarnation runs, and
+the local quiescence proof cannot see the other pod. That same-worker
+new-incarnation gap remains unvalidated and uncredited. Claude cross-worker
+reclaim and the predecessor's forge PAT remain outside this restriction
+([ADR-4476](../adr/4476-codex-claim-provenance.md#residuals-claude-runs-and-the-forge-pat)).
+The unreachable host may still hold the old credential, and the new one too if
+the switch had already applied there.
 
 If a worker host is lost, revoke or rotate every credential delivered to that host at the provider (OpenAI): the old one, and the new one if the switch had already applied there. For an API key, rotate the key; for a ChatGPT subscription login, sign out of or revoke its sessions. Removing a credential in uzi, or switching away from it, does not stop a copy an unreachable host already holds.
 

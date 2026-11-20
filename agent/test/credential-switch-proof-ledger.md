@@ -9,6 +9,14 @@ Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
 Earlier Runner controls below used 6a7e7ae11b43c8fbf658d8b2fdcc557441c699c8
 and the replacement-first adoption assertion as specified per control.
 Results belong to their recorded revisions; this is not an exact-head full-suite claim.
+Landing integration (2026-11-20) merges #4500's cross-worker Codex claim
+restriction. Earlier cross-worker nonconformance traces below describe their
+recorded revisions, not the integrated code. The remaining decision 11 gap is
+same-worker new-incarnation recovery; see ADR-4201 and the validation record's
+updated deferred checklist. Claude and forge-PAT gaps remain in ADR-4476.
+This integration grants no additional proof credit. Current migration numbers
+are 00494 (Codex epoch snapshot) and 00495 (pending switch); dated numeric
+references below remain historical evidence.
 The earlier [validation record](credential-switch-validation.md) retains
 positive execution, review and migration evidence. Passing positive tests
 alone does not satisfy the proof-method requirement below.

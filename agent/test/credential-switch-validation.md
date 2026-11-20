@@ -1174,8 +1174,14 @@ The owner decided a partial delivery: m4, every reviewed commit and the
 qualifying clause-level evidence above are retained; milestone m3 is
 **deferred, not complete**. This authorizes a non-closing PR for review only,
 not merge or activation. No unvalidated criterion below is accepted or waived.
-Decision 11's fail-closed requirement stands: the current cross-worker
-recovery path is a **known nonconformance**, not an accepted residual.
+Decision 11's fail-closed requirement stands. Landing integration on 2026-11-20
+includes #4500's cross-worker Codex claim restriction; the remaining
+**known nonconformance** is the same-worker new-incarnation path described in
+ADR-4201. Historical cross-worker traces below predate that restriction and
+remain uncredited; integrating #4500 adds no proof credit to them. Claude
+reclaim and the forge PAT remain separate gaps in ADR-4476. Landing renumbering
+puts the Codex epoch snapshot at 00494 and the pending switch at 00495, above
+main's 00493; earlier migration numbers in dated evidence describe those runs.
 
 Each unchecked item is carried from the ledger's Clause-accounting table
 (`agent/test/credential-switch-proof-ledger.md`, "Clause accounting"), the
@@ -1272,10 +1278,11 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 - [ ] Two unledgered authorities, with no Clause-accounting row and no ledger
       evidence: the owner-scoped usage refresh (`handleCodexUsageUnauthorized`)
       and the fresh-claim pending expiry (`expireCodexSwitchOnFreshClaim`).
-- [ ] **Known nonconformance, decision 11 cross-worker path:** a successor claim
-      on another worker has no retained journal, so the `predecessor_capture`
-      / `quiescence_failed` gate does not run and the run proceeds with the
-      delivered binding. Required: fail closed and hold for the owner there.
+- [ ] **Known nonconformance, decision 11 same-worker new incarnation:**
+      #4500 refuses peer-worker Codex claims, but the recorded worker id can
+      return in a new pod while the old pod still runs. The local predecessor
+      proof cannot see that old pod. No positive takeover proof or credit is
+      supplied by the worker-id restriction.
 - [ ] **Decision 11 held outcome (same worker):** on `quiescence_failed` the
       run ends in a terminal `failed` report with clone and custody kept, not an
       owner hold as decision 11 requires.

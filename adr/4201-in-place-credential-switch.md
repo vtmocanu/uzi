@@ -85,18 +85,26 @@ predecessor already holds. The owner's stated requirement is that B is never
 used while predecessor quiescence is unproven, with the run held for the owner
 instead (on the same-worker path that means terminal `failed`,
 `worker_residue_blocked`, with clone and custody kept; not an owner pause).
-**The code does not enforce that requirement across workers.** A stale worker's
-run is requeued (`RequeueRunsOfStaleWorkers`); `ClaimRun`'s affinity pin lets
-another of the user's workers claim it once the owner is heartbeat-stale, not draining or in maintenance, and past the stale-requeue grace, after the affinity ceiling (default 2h), or when the worker
-row is deleted; `codexClaimSecrets` mints a fresh capability and delivers the
-run's current binding (B after an applied switch). The new worker has no local
-retained journal, so the `predecessor_capture` / `quiescence_failed` gate never
-runs and the run proceeds with B, possibly while an unreachable predecessor
-still holds provider credential A, and B too if the switch applied on that host (the apply response delivers B's material: a static API key, or a subscription access token until it expires). Without a switch the same path delivers A
-(the Codex claim path, `codexClaimSecrets`, and `ClaimRun`'s affinity pin have no switch-specific logic; read from the code, not executed).
-The gap is unvalidated and uncredited and goes to the owner as a formal
-decision; fail-closing it (for example refusing or holding a cross-worker Codex claim while the predecessor is unproven) is an option for the owner, its size not assessed, and outside the approved plan. Continuation is never justified by "the host is gone". No new
-credential-delivery protocol was started.
+**Landing amendment (2026-11-20):** #4476, landed by #4500, closes the
+cross-worker Codex reclaim path with a server-side claim-provenance gate
+([ADR-4476](4476-codex-claim-provenance.md)). Once claimed, a Codex run admits
+a fresh claim only from its recorded worker with provenance matching the current
+generation, subject to existing fences. Affinity expiry, stale-worker grace,
+worker deletion and the cross-check bypass cannot admit a peer. Legacy or stale
+provenance refuses every fresh claim; existing-flight readoption remains subject
+to its existing fences, otherwise the owner must cancel. Cancellation alone does
+not release custody. This restriction supplies no quiescence proof and does not
+revoke credentials already delivered to the old host.
+
+**The remaining Codex nonconformance is the same-worker new-incarnation path.**
+Provenance binds a worker id and generation, not a process or pod incarnation.
+A replacement under the same worker id may therefore claim while the previous
+incarnation still runs. Its local `predecessor_capture` cannot observe that
+other pod, so full decision 11 remains unmet. This residual stays unvalidated
+and uncredited; the worker-id restriction must not be called positive takeover
+proof. Claude cross-worker reclaim and the predecessor's forge PAT remain
+separate, unfixed gaps recorded in ADR-4476. Continuation is never justified by
+"the host is gone". No new credential-delivery protocol was started.
 
 Residuals recorded as unvalidated and uncredited, never as proven, including:
 token-absence surfaces with no guard to remove (outside the stopped route),
