@@ -106,7 +106,9 @@ describe("schedulePreviewView specifics", () => {
 
   it("schedule-only refusals use the shared wording", () => {
     expect(scheduleRefusalLabel("invalid_model")).toBe("This model ID is not valid");
-    expect(scheduleRefusalLabel("codex_override_conflict")).toBe("A Codex run cannot use an Anthropic token override");
+    expect(scheduleRefusalLabel("codex_override_conflict")).toBe(
+      "Codex harness cannot use an Anthropic credential override",
+    );
     expect(scheduleRefusalLabel("codex_pool_unavailable")).toBe("No eligible Codex account in the auto-select pool");
   });
 
@@ -120,6 +122,9 @@ describe("schedulePreviewView specifics", () => {
     expect(v.effort?.value).toBe("high");
     expect(v.credential?.value.startsWith("Xy")).toBe(true);
     expect(v.harness?.value).toBe("Claude");
+    const ignored = fixture("default", "sweep pinned to codex with a claude model pin");
+    ignored.harness = { ...ignored.harness!, value: `co${bidi}dex` } as typeof ignored.harness;
+    expect(schedulePreviewView(ignored).ignoredPin?.harness).toBe("codex");
     expect(defaultModelChipSuffix(p)).toContain(" on Claude ");
   });
 
@@ -193,9 +198,8 @@ describe("defaultModelChipSuffix", () => {
     const q = fixture("default", "unpinned sweep");
     const [a, b] = q.alternatives!;
     q.alternatives![0] = { ...a, worker_model: { ...a.worker_model!, source: "schedule_pin" } };
-    expect(defaultModelChipSuffix(q)).toBe(
-      `now ${b.worker_model!.resolved_model} on Codex (predicted, harness chosen when it fires)`,
-    );
+    expect(b.worker_model!.source).not.toBe("schedule_pin");
+    expect(defaultModelChipSuffix(q)).toBeNull();
   });
 
   it("refused or missing model gives null", () => {

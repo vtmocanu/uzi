@@ -63,6 +63,8 @@ import { maskRepoPath } from "../lib/demoMask";
 import { LockIcon } from "./icons";
 import { XIcon, TrashIcon, CopyIcon } from "./icons";
 import { ModelSelect } from "./ModelSelect";
+import { SchedulePreview } from "./SchedulePreview";
+import { schedulePreviewRequest } from "../lib/schedulePreview";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { browserTimezone } from "../lib/timezone";
 import {
@@ -1512,6 +1514,21 @@ export function ScheduleModal({
                 </span>
               </span>
             </div>
+
+            {/* Issue #3260: read-only prediction of what a fire would resolve to. The request is
+                rebuilt every render (it reads the modal's closures); useSchedulePreview dedups by
+                key. It never feeds submit or canSubmit. */}
+            <SchedulePreview
+              request={schedulePreviewRequest({
+                scheduleId: editing?.id,
+                target,
+                harnessPatch: harnessPatch(),
+                credentialPatch: credentialOverridePatch(),
+                model,
+                overrideSubagentModel,
+              })}
+              bothUsable={showHarnessPicker}
+            />
           </fieldset>
 
           {/* Options */}

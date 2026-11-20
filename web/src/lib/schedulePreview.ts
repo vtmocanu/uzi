@@ -17,9 +17,14 @@ import type {
 } from "./apiTypes";
 import { codexRuntimeDefaultLabel, modelSettingSourceLabel } from "./modelSettings";
 import { stripUnsafeChars } from "./safeText";
+import { SCHEDULE_SKIP_REASON_LABELS } from "./scheduleSkipReasons";
 import { REFUSAL_LABELS } from "./startPreview";
 
 type ScheduleRefusal = NonNullable<ScheduleSettingsPreview["refusal"]>;
+
+function sentenceCase(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 // Closed map from a server refusal token to user-facing text. A Record over the contract's
 // union, so a new server token fails the typecheck here.
@@ -27,8 +32,8 @@ const SCHEDULE_REFUSAL_LABELS: Record<ScheduleRefusal, string> = {
   ...REFUSAL_LABELS,
   invalid_model: "This model ID is not valid",
   credential_override_lane_not_switchable: "This kind of run cannot use a different token",
-  codex_override_conflict: "A Codex run cannot use an Anthropic token override",
-  codex_pool_unavailable: "No eligible Codex account in the auto-select pool",
+  codex_override_conflict: sentenceCase(SCHEDULE_SKIP_REASON_LABELS.codex_override_conflict),
+  codex_pool_unavailable: sentenceCase(SCHEDULE_SKIP_REASON_LABELS.codex_pool_unavailable),
 };
 
 export function scheduleRefusalLabel(refusal: ScheduleRefusal): string {
@@ -264,9 +269,11 @@ export function defaultModelChipSuffix(preview: ScheduleSettingsPreview): string
     if (!model) return null;
     return `now ${model.value} on ${harnessName(preview.harness.value)} (predicted)`;
   }
+  const alternatives = preview.alternatives ?? [];
+  if (alternatives.some((a) => a.worker_model?.source === "schedule_pin")) return null;
   const parts: string[] = [];
-  for (const a of preview.alternatives ?? []) {
-    if (a.refusal || a.worker_model?.source === "schedule_pin") continue;
+  for (const a of alternatives) {
+    if (a.refusal) continue;
     const model = modelRow(a.worker_model);
     if (model) parts.push(`${model.value} on ${harnessName(a.harness)}`);
   }
