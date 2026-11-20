@@ -16,7 +16,7 @@
 **Delivery:**
 - One uzi run, one PR, default harness, after Q-spike, H, C, B and P merge.
 - No implementation or validation writes under `.github/workflows/`.
-- Migration `00353_user_planning_claude.sql` is a draft number. Main ends at `00346_checkpoint_attested_source.sql`. Assign the next free number at landing with `task migration:renumber`. Landing step: rewrite any hard-coded migration number in LiveDB tests that the renumber helper reports but does not rewrite (dba 17).
+- Migration `00353_user_planning_claude.sql` is a draft number. (Main was at `00346` when drafted, 2026-10-21; read the live head at landing.) Assign the next free number at landing with `task migration:renumber`. Landing step: rewrite any hard-coded migration number in LiveDB tests that the renumber helper reports but does not rewrite (dba 17).
 - LiveDB tests need Docker.
 - **Dispatch check:** Q-spike's 2026-11-20 live probe demonstrated same-conversation switching (D1). The init-based guard it promised does not hold; section 6 replaces it with a settings barrier (`getSettings()` while the prompt is withheld), characterized credential-free on the tested pin (D18). Dispatchable on that pin once this revision is reviewed. A different SDK/CLI pin must pass section 6's pin-sensitivity test first. A fresh-conversation fallback still requires its own design and review pass.
 
