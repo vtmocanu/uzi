@@ -449,9 +449,14 @@ failover. The API cannot verify replication topology or `fsync` by itself
   vouched promotion set (not merely one synchronous standby) has flushed past
   the commit LSN. Under `ANY 1 (s1,s2)` a commit flushed only on s1 does not
   pass when s2 may be promoted.
-- Single-instance or promotion-set evidence is operator-declared or read by
-  the controller. Reading an HA manager's state would be new controller read
-  authority of the same class as P-4, and is not approved.
+- Single-instance or promotion-set evidence is operator-declared, which adds
+  no authority. Any controller read of it (an HA manager's state, a Postgres
+  operator resource, or a database connection the controller does not have
+  today) would be new controller read authority of the same class as P-4,
+  and is not approved.
+- The vouched promotion set carries a version that the ACK path re-reads
+  after the flush check; a changed version withholds the ACK. Without that,
+  the window between the check and the ACK is an unavoidable race.
 - `fsync` cannot be forced per transaction and rests only on that trust.
 
 **Open problems.**
@@ -463,7 +468,9 @@ failover. The API cannot verify replication topology or `fsync` by itself
   confirm.
 - A withheld ACK leaves A with an unknown release outcome. A STOPs with the
   outcome unknown and retries replay later; it is never described as
-  "custody kept" (D9.4).
+  "custody kept" (D9.4). Named availability cost: if a promotion-set member
+  stays behind, every replay is withheld and A keeps T and the hold until an
+  owner discard or the standby catches up.
 - A synchronous wait cut short by the transaction's own timeout commits
   locally. The check above treats it like any unflushed commit.
 
@@ -665,7 +672,8 @@ which is availability, never an integrity loss.
     PVC.
   - The hold stays retained or parked under ADR-2417.
   - Replay never completes a predecessor release, except that a release the
-    server already committed replays its original ACK (D9.4).
+    server already committed replays its original ACK (D9.4; under P-6's
+    pending reading, only once it is flushed to the promotion set).
   - Named availability cost: one crash after entry disables the pass for that
     PVC.
 - **Legacy eligibility.** Any unattested uid-10003 launch makes the
@@ -747,7 +755,8 @@ lock.
   arrives without a valid fencing token is refused. Today the server accepts
   any older-generation FINAL (ADR-1296 #2969 amendment), so a missing token
   must refuse rather than fall through.
-- A committed release returns its original ACK.
+- A committed release returns its original ACK (D9.4; see P-6 for the
+  pending flushed-commit reading).
 
 **Conflict handling.**
 - Each authority-row transaction sets its own `SET LOCAL lock_timeout` and
@@ -880,7 +889,7 @@ Absence is never inferred.
 | Authority-row lock wait / serialization error | Timeout, error |
 | Server generation | Superseded, not current |
 | Release fence | Refusal (STOP) |
-| Committed release replay | Returns the original ACK, never "custody kept" |
+| Committed release replay | Returns the original ACK, never "custody kept"; under pending P-6, only once flushed to the promotion set |
 | Replication durability (P-6) | Missing topology evidence, or the promotion set not flushed past the commit LSN before any ACK, replay included (pending P-6) |
 | Unorderable lane or startup path | Gated |
 
@@ -890,7 +899,8 @@ Absence is never inferred.
   seccomp are unprivileged self-restrictions.
 - **New controller read authority (pending P-4).** Reading the bound
   PersistentVolume (D8, P-3) needs a cluster-scoped `persistentvolumes` get
-  that the controller does not hold today. It is named here, justified in
+  that the controller does not hold today. So would any controller read of
+  database topology (P-6). It is named here, justified in
   P-4, and not approved.
 - **Rendered fields.** New rendered fields travel the existing pod-spec and
   downward-API channel. The worker trusts the controller, and that trust is
@@ -1075,7 +1085,8 @@ may already hold on base.
 - An ACK is withheld unless every standby in the vouched promotion set has
   flushed past the commit LSN, including a topology change between commit and
   the flush check, and between the check and the ACK (P-6).
-- A replay after a withheld ACK, with the standby still behind, is withheld
+- A replay after a withheld ACK, with any promotion-set standby still
+  behind, is withheld
   again (P-6, subject to the owner's D9.4 reading).
 - The synchronized open-then-unlink alias race (P-1), documented per its
   outcome.
@@ -1158,8 +1169,9 @@ Approval alone does not close P-2, P-5 or P-6.
     `clock_timestamp()` authorization via `LeaseClockNow`;
   - the lease, epoch fencing tokens, generations, superseded set, conditional
     release, replay precedence and conflict handling;
-  - forced `synchronous_commit`, the promotion-set flush check on every ACK path and the
-    controller or HA topology evidence (P-6);
+  - forced `synchronous_commit`, the promotion-set flush check on every ACK
+    path, the versioned promotion set, and operator-declared topology
+    evidence (or controller-read evidence, if P-6's authority is approved);
   - synchronized LiveDB race, lock-across-expiry and crash-point tests.
 
 **Controls and M4:** as specified above.
