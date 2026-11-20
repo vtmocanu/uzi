@@ -355,7 +355,10 @@ describe("sibling-card save responses (#4544)", () => {
 
   it("merges the response values for the sent keys only, and sends exactly the payload", async () => {
     mockApi.getSettings.mockResolvedValue(
-      resp({ docker_repo_allowlist: "repo-uzi", capability_aware_scheduling: "true", ephemeral_lease: "30m", hosted_default_size: "s", hosted_worker_quota: "2" }),
+      resp(
+        { docker_repo_allowlist: "repo-uzi", capability_aware_scheduling: "true", ephemeral_lease: "30m", hosted_default_size: "s", hosted_worker_quota: "2" },
+        { hosted_default_size: "db" },
+      ),
     );
     renderPage();
     const quota = () => screen.getByRole("spinbutton", { name: "Hosted workers per user" }) as HTMLInputElement;
@@ -369,8 +372,8 @@ describe("sibling-card save responses (#4544)", () => {
     fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ docker_repo_allowlist: "repo-two,repo-uzi" }));
     await screen.findByText(/repo allowlist saved/i);
-    // The sent key took the response's value (the server kept only repo-uzi).
-    expect((screen.getByLabelText(/vtmocanu\/two/) as HTMLInputElement).checked).toBe(false);
+    // Unsent keys keep their values and sources (the allowlist card's own checkbox is local
+    // state, so the sent-key merge is asserted on the SettingControl step below instead).
     expect(quota().value).toBe("2");
     expect((screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement).checked).toBe(true);
 
@@ -382,14 +385,21 @@ describe("sibling-card save responses (#4544)", () => {
     await screen.findByText("Capability-aware scheduling setting saved.");
     expect(quota().value).toBe("2");
 
-    // A SettingControl-based control: the default-size selector.
+    // A SettingControl-based control: the default-size selector. The server answers with a
+    // value and a source that differ from what was sent ("m" sent, "l" confirmed, now the
+    // default). SettingControl re-seeds its draft from its `value` prop, which the page
+    // derives from applySaved, so the select showing "l" proves the page took the response
+    // value (not the sent one) and the vanished Reset button proves it took the response source.
+    const resetBtn = () => screen.queryByRole("button", { name: "Reset to default: Default size for new workers" });
+    expect(resetBtn()).toBeTruthy();
     mockApi.updateSettings.mockResolvedValueOnce(
-      resp({ hosted_default_size: "m", ephemeral_lease: "99m" }, { hosted_default_size: "db" }) as never,
+      resp({ hosted_default_size: "l", ephemeral_lease: "99m" }, { hosted_default_size: "default" }) as never,
     );
     fireEvent.change(screen.getByLabelText("Default size for new workers"), { target: { value: "m" } });
     fireEvent.click(screen.getByRole("button", { name: "Save Default size for new workers" }));
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ hosted_default_size: "m" }));
-    await waitFor(() => expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("m"));
+    await waitFor(() => expect(resetBtn()).toBeNull());
+    expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("l");
     expect((screen.getByLabelText("Idle lease") as HTMLInputElement).value).toBe("30m");
   });
 });
