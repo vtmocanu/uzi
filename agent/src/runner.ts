@@ -11277,7 +11277,7 @@ export class RunRunner {
         await journalTerminalReport({
           status: "completed",
           report_only: true,
-          report_md: result.summary,
+          report_md: result.summary === undefined ? undefined : redactText(result.summary),
         });
         runLog.info("run completed report-only (no MR)", { run_id: runId });
         return;
@@ -11543,9 +11543,9 @@ export class RunRunner {
               report_only: true,
               scope_capped: true,
               ...(interlocked ? { branch: runnerClone.branch, head: cappedHead } : {}),
-              report_md:
+              report_md: redactText(
                 result.summary ??
-                "Stopped by operator scope directive before any committed work; nothing to land.",
+                "Stopped by operator scope directive before any committed work; nothing to land."),
             });
             runLog.info("run completed scope-capped with no committed work (no MR)", {
               run_id: runId,
@@ -11636,14 +11636,14 @@ export class RunRunner {
         await journalTerminalReport({
           status: "completed",
           report_only: true,
-          report_md: result.summary,
+          report_md: result.summary === undefined ? undefined : redactText(result.summary),
           // PRD #929 M2: a scheduled prompt run's deliverable can be a structured proposal
           // (title + body) the agent conveyed on signal_done, which the server files as a
           // forge issue. Thread it through ONLY when the agent actually produced one — the
           // key is OMITTED otherwise (spread nothing) so a normal/mr-mode prompt run's
           // completion payload is byte-identical to before.
           ...(result.proposal !== undefined
-            ? { proposal: result.proposal }
+            ? { proposal: redactStrings(result.proposal, redactText) }
             : {}),
         });
         runLog.info("prompt run completed report-only (no MR): zero-diff", {
@@ -17959,7 +17959,13 @@ export class RunRunner {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
         return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
-      gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
+      gatePlan: async (rawPlanMd, rawMilestones, onPlanPersisted, settles, semanticSubmission) => {
+        // The plan and milestone titles are model-authored and reach the api through the semantic
+        // compile, the cross-check candidate and the awaiting_approval/running reports. The api's
+        // scrub is pattern-based and cannot catch a prefixless provider key, so redact every string
+        // here, before any of those consumers, with the run's own secret set.
+        const planMd = flight.redactText(rawPlanMd);
+        const milestones = rawMilestones === undefined ? undefined : redactStrings(rawMilestones, flight.redactText);
         flight.initialPlanningEligible = false;
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
@@ -18816,7 +18822,8 @@ export class RunRunner {
         reportCrossCheckDispositions: (batch: import("./code-cross-check-contract.js").CodeCrossCheckDispositionBatch) =>
           this.runGatedSink(flight, async () => {
             if (!codeGate) throw new Error("code cross-check repair is not active");
-            return codeGate.report(batch);
+            // The model-authored `reason` is POSTed to the api, whose scrub cannot catch a prefixless provider key.
+            return codeGate.report(batch.map(d => ({ ...d, reason: flight.redactText(d.reason) })));
           }),
         codeCrossCheckSummary: () => this.runGatedSink(flight, async () => codeGate?.persistedSummary()),
       } : {}),

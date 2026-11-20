@@ -81,6 +81,10 @@ export interface UziToolsDeps {
    *  renders Create/Dismiss; without it the proposal never reaches the UI. */
   emit(msg: EmittedMessage): void;
   log: Logger;
+  /** The chat run's secret redactor. propose_issue POSTs model-authored text straight to the
+   *  api (not through the batcher), and the api's scrub is pattern-based and cannot catch a
+   *  prefixless provider key, so the text is redacted here first. Absent means identity. */
+  redactText?: (text: string) => string;
 }
 
 /** The raw tool handlers (unit-testable). Each read handler wraps its result as
@@ -103,6 +107,7 @@ export interface UziToolHandlers {
 
 export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
   const { client, runId, emit, log } = deps;
+  const redact = deps.redactText ?? ((t: string) => t);
   return {
     async listRuns(args) {
       try {
@@ -143,9 +148,9 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
         // user's repo id. repo_id is forwarded only as a back-compat fallback.
         const proposal = await client.createProposal(runId, {
           ...(args.repo_path ? { repo_path: args.repo_path } : { repo_id: args.repo_id }),
-          title: args.title,
-          description: args.description ?? "",
-          labels: args.labels ?? [],
+          title: redact(args.title),
+          description: redact(args.description ?? ""),
+          labels: (args.labels ?? []).map(redact),
         });
         // Emit the proposal CARD to the live stream (worker owns the seq). The browser
         // renders Create/Dismiss keyed on payload.id; without this emit the proposal

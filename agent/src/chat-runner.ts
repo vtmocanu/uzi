@@ -193,6 +193,7 @@ export class ChatRunner {
       runId,
       emit: (m) => batcher.emit(m),
       log: runLog,
+      redactText,
     });
 
     // Resolve this run's clocks: the claim config (server-pushed, no drift) wins over
