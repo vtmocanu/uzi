@@ -821,13 +821,6 @@
       }
     ]
   },
-  "injected_env": [
-    {
-      "name": "x",
-      "scope": "x",
-      "secret": true
-    }
-  ],
   "model": "x",
   "effort": "x",
   "model_source": "x",

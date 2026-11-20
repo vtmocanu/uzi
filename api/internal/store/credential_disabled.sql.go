@@ -519,56 +519,6 @@ func (q *Queries) ParkCredentialDisabledRun(ctx context.Context, arg ParkCredent
 	return result.RowsAffected(), nil
 }
 
-const parkRunEnvHistoryUnavailableRun = `-- name: ParkRunEnvHistoryUnavailableRun :execrows
-WITH fresh_restored AS (
-    INSERT INTO run_user_inputs (run_id, kind, body)
-    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
-    FROM runs r
-    WHERE r.id = $2 AND r.worker_id = $3 AND r.claim_generation = $1
-      AND r.claim_released_at IS NULL AND r.status = 'claimed'
-      AND r.policy_fresh_consumed_generation = $1::bigint
-      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
-    RETURNING 1
-)
-UPDATE runs SET
-    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = $1::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
-        THEN true ELSE runs.policy_pending_fresh END,
-    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = $1::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
-        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
-    status = 'paused',
-    status_since = now(),
-    hold_reason = 'run_env_history_unavailable',
-    claim_released_at = now(),
-    codex_cap_hash = NULL,
-    codex_claim_epoch = codex_claim_epoch + 1,
-    health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at = now()
-WHERE runs.id = $2 AND runs.worker_id = $3
-  AND runs.claim_generation = $1
-  AND runs.claim_released_at IS NULL
-  AND runs.status = 'claimed'
-`
-
-type ParkRunEnvHistoryUnavailableRunParams struct {
-	ClaimGeneration int64       `json:"claim_generation"`
-	ID              uuid.UUID   `json:"id"`
-	WorkerID        pgtype.UUID `json:"worker_id"`
-}
-
-// PRD #4416 M2: the claim finisher's park for a run whose repo-variable history cannot be assembled
-// (a receipted secret version is missing or cannot be opened, so the redaction list would be incomplete).
-// It is ParkRunOverrideUnavailableRun's twin with the reason fixed: the same exact-claim fence and the same
-// undelivered-claim shape. No automatic promoter reads this hold (the allowlists in ParkCredentialDisabledRun
-// and the promoter deliberately do not name it): only the owner's resume (ResumePausedRun) leaves it, and the
-// next claim parks again while the version is missing.
-func (q *Queries) ParkRunEnvHistoryUnavailableRun(ctx context.Context, arg ParkRunEnvHistoryUnavailableRunParams) (int64, error) {
-	result, err := q.db.Exec(ctx, parkRunEnvHistoryUnavailableRun, arg.ClaimGeneration, arg.ID, arg.WorkerID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const parkRunOverrideUnavailableRun = `-- name: ParkRunOverrideUnavailableRun :execrows
 WITH fresh_restored AS (
     INSERT INTO run_user_inputs (run_id, kind, body)

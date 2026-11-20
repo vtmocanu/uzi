@@ -25,10 +25,6 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	// runEnv is the assembly record of the repo variables this claim delivers (PRD #4416 M2): which
-	// (var_id, rev) versions are in Secrets.RunEnv / RunEnvRedact. Unexported and never serialized; the
-	// claim's finish transaction compares it with a recomputation and writes the receipts.
-	runEnv *runEnvSnapshot `json:"-"`
 	// PublicationResume (issue #1324) is the active write-ahead publication intent, sent only to
 	// a publication_resume_v1 worker while an enrollment is active. Claim assembly is otherwise
 	// unchanged, including credentials.

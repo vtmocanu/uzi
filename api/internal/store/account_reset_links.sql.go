@@ -137,9 +137,8 @@ const getUserCredentialsResetAt = `-- name: GetUserCredentialsResetAt :one
 SELECT credentials_reset_at FROM users WHERE id = $1
 `
 
-// PRD #3989 M3: the claim finisher's reset marker. A plain read (no row lock of its own); the
-// run-then-users edge of the lock order is the owner share lock a run-env lane run takes in
-// finishRunClaimTx (PRD #4416 M2). NULL means the user never redeemed a reset link.
+// PRD #3989 M3: the claim finisher's reset marker. A plain read (no row lock), so it adds no
+// edge to the run-then-users lock order. NULL means the user never redeemed a reset link.
 func (q *Queries) GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error) {
 	row := q.db.QueryRow(ctx, getUserCredentialsResetAt, id)
 	var credentials_reset_at pgtype.Timestamptz

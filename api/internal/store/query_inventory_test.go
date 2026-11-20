@@ -1111,8 +1111,6 @@ var queryInventory = []queryPin{
 		"store-level park then promote; the workersvc finisher tests (TestFinishRunClaimCredentialDisabledStaleLiveDB) drive it through finishRunClaim"},
 	{"ParkRunOverrideUnavailableRun", "credential_disabled.sql", "TestClaimRunOverrideUnavailableClaudeLiveDB",
 		"../workersvc: Service.Claim -> finishRunClaim parks the exact claim; TestRunOverrideParkRestoresFreshGrantLiveDB asserts the Fresh restore and TestFinishRunOverrideNonExactClaimWritesNothingLiveDB the fence"},
-	{"ParkRunEnvHistoryUnavailableRun", "credential_disabled.sql", "TestRunEnvClaimMissingReceiptedVersionParksLiveDB",
-		"../workersvc: Service.Claim -> finishRunClaim parks the exact claim on run_env_history_unavailable for a deleted receipted version and an AAD-swapped row; the same test reads the hold back and checks no promoter or sweeper moves it"},
 	{"InsertRunOverrideUnavailableMessage", "credential_disabled.sql", "TestClaimRunOverrideUnavailableClaudeLiveDB",
 		"../workersvc: written inside the park transaction; the test reads the message payload back, counts exactly one per park and checks runs.last_seq covers it"},
 	{"ParkCredentialDisabledChatRun", "credential_disabled.sql", unpinnedPin,

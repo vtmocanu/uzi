@@ -128,11 +128,8 @@ type healthFakeStore struct {
 	// satisfyingCIGuard is the canned CountOnlineWorkersSatisfyingCIConfigGuard answer (PRD #2865).
 	satisfyingCIGuard int64
 	// issueKeyMissing is the canned IssueKeyWorkerMissingForRepo answer (PRD #4173); the calls are recorded.
-	issueKeyMissing bool
-	issueKeyCalls   []store.IssueKeyWorkerMissingForRepoParams
-	// runEnvMissing is the canned RunEnvWorkerMissingForRun answer (PRD #4416 M2); the calls are recorded.
-	runEnvMissing        bool
-	runEnvCalls          []store.RunEnvWorkerMissingForRunParams
+	issueKeyMissing      bool
+	issueKeyCalls        []store.IssueKeyWorkerMissingForRepoParams
 	satisfyingCIGuardErr error
 	ciGuardCalls         []uuid.UUID
 	// protocolCalls records every lookup's user id, so a test can prove the rung asks about THIS
@@ -329,10 +326,6 @@ func (f *healthFakeStore) CountOnlineWorkersSatisfyingCIConfigGuard(_ context.Co
 func (f *healthFakeStore) IssueKeyWorkerMissingForRepo(_ context.Context, arg store.IssueKeyWorkerMissingForRepoParams) (bool, error) {
 	f.issueKeyCalls = append(f.issueKeyCalls, arg)
 	return f.issueKeyMissing, nil
-}
-func (f *healthFakeStore) RunEnvWorkerMissingForRun(_ context.Context, arg store.RunEnvWorkerMissingForRunParams) (bool, error) {
-	f.runEnvCalls = append(f.runEnvCalls, arg)
-	return f.runEnvMissing, nil
 }
 func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(_ context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	f.eligCalls = append(f.eligCalls, arg)

@@ -221,61 +221,6 @@ func (q *Queries) ListRunEnvRedactKeysForRun(ctx context.Context, runID uuid.UUI
 	return items, nil
 }
 
-const listRunEnvSecretReceiptVersionsForRun = `-- name: ListRunEnvSecretReceiptVersionsForRun :many
-SELECT rc.var_id, rc.rev, rc.scope, rc.name,
-       v.repo_id, v.ciphertext, v.sealed_with, v.aad_version
-FROM runs r
-JOIN (SELECT DISTINCT run_id, var_id, rev, scope, name FROM run_env_receipts WHERE secret) rc
-  ON rc.run_id = r.id
-LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_id = r.user_id
-WHERE r.id = $1
-ORDER BY rc.var_id, rc.rev
-`
-
-type ListRunEnvSecretReceiptVersionsForRunRow struct {
-	VarID      uuid.UUID   `json:"var_id"`
-	Rev        int32       `json:"rev"`
-	Scope      string      `json:"scope"`
-	Name       string      `json:"name"`
-	RepoID     pgtype.UUID `json:"repo_id"`
-	Ciphertext []byte      `json:"ciphertext"`
-	SealedWith pgtype.Text `json:"sealed_with"`
-	AadVersion pgtype.Int2 `json:"aad_version"`
-}
-
-// The maintenance endpoint's read: every secret version the run holds a receipt for, live or
-// retired (unlike ListRunEnvRedactForRun it does not exclude the effective set), one row per
-// (var_id, rev). LEFT JOINed so a receipted version whose row is gone comes back with NULL
-// ciphertext and the caller answers run_env_history_unavailable instead of delivering less.
-func (q *Queries) ListRunEnvSecretReceiptVersionsForRun(ctx context.Context, runID uuid.UUID) ([]ListRunEnvSecretReceiptVersionsForRunRow, error) {
-	rows, err := q.db.Query(ctx, listRunEnvSecretReceiptVersionsForRun, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListRunEnvSecretReceiptVersionsForRunRow{}
-	for rows.Next() {
-		var i ListRunEnvSecretReceiptVersionsForRunRow
-		if err := rows.Scan(
-			&i.VarID,
-			&i.Rev,
-			&i.Scope,
-			&i.Name,
-			&i.RepoID,
-			&i.Ciphertext,
-			&i.SealedWith,
-			&i.AadVersion,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listRunInjectedEnv = `-- name: ListRunInjectedEnv :many
 SELECT name, scope, secret
 FROM run_env_receipts

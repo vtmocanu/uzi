@@ -1075,12 +1075,6 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// so a run's credential history is complete for both harnesses.
 	}
 
-	// PRD #4416 M2: the run's repo variables, only for a run in the run-env lane. Placed after the
-	// Codex block so a failure carries the minted capability identity (assembleRunEnv wraps it).
-	if err := s.assembleRunEnv(ctx, wkr, run, payload); err != nil {
-		return nil, err
-	}
-
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
 	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
 	// Skipped for a profile-bound run (it has no PR, and stripForIsolation clears it anyway).

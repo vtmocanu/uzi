@@ -30,20 +30,6 @@ WHERE r.id = @run_id
            AND v.retired_at IS NULL AND v.pending_delete_at IS NULL AND v.disabled_at IS NULL)
 ORDER BY rc.var_id, rc.rev;
 
--- name: ListRunEnvSecretReceiptVersionsForRun :many
--- The maintenance endpoint's read: every secret version the run holds a receipt for, live or
--- retired (unlike ListRunEnvRedactForRun it does not exclude the effective set), one row per
--- (var_id, rev). LEFT JOINed so a receipted version whose row is gone comes back with NULL
--- ciphertext and the caller answers run_env_history_unavailable instead of delivering less.
-SELECT rc.var_id, rc.rev, rc.scope, rc.name,
-       v.repo_id, v.ciphertext, v.sealed_with, v.aad_version
-FROM runs r
-JOIN (SELECT DISTINCT run_id, var_id, rev, scope, name FROM run_env_receipts WHERE secret) rc
-  ON rc.run_id = r.id
-LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_id = r.user_id
-WHERE r.id = @run_id
-ORDER BY rc.var_id, rc.rev;
-
 -- name: ListRunEnvEffectiveKeysForRun :many
 -- The (var_id, rev) twin of ListRunEnvEffectiveForRun: no value is read. The claim's finish
 -- transaction recomputes it under the owner fence and compares it with the assembled list.

@@ -1,9 +1,0 @@
-{
-  "max_vars_per_scope": 50,
-  "max_value_bytes": 65536,
-  "max_scope_value_bytes": 262144,
-  "max_retired_versions": 200,
-  "max_retired_bytes": 2097152,
-  "min_secret_len": 8,
-  "max_description_bytes": 1024
-}
