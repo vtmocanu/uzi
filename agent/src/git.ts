@@ -30864,8 +30864,8 @@ try {
         boundary();
         await this.removeOwedFile(barePath, marker, true, REFUSAL_DIRECTORY);
       }
-      // issue #4481: admissions are kept (the seal's process-binding evidence); only an owner discard or the
-      // bare's removal deletes them.
+      // issue #4481: admissions are kept (the seal's process-binding evidence); only the bare's removal
+      // deletes them.
       return "removed";
     });
   }

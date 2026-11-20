@@ -4421,7 +4421,7 @@ export class RunRunner {
     const refused = flight.steering.isCancelled() || flight.steering.claimFence() !== undefined;
     return {
       ...base,
-      signal: AbortSignal.any([base.signal!, ...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
+      signal: AbortSignal.any([base.signal,...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
     };
   }
 
@@ -4430,7 +4430,7 @@ export class RunRunner {
    *  usually already aborted when a cancellation, park or early-terminal cleanup runs, and a flight that is
    *  not cancelled (an early failed/terminal caller) gains nothing from them either. Without a current
    *  maintenance budget the wait is shutdown plus the boundary deadline only. */
-  private cleanupAuthorityWait(boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
+  private cleanupAuthorityWait(boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait & { signal: AbortSignal; timeoutMs: number } {
     const budget = MaintenanceBudget.current();
     return {
       signal: AbortSignal.any([this.shutdownSignal.signal, ...(budget ? [budget.signal] : [])]),

@@ -620,6 +620,22 @@ it("a recorded claim fence still aborts the terminal refusal-release fetch after
   assert.equal(server.heldCalls.length, 0, "no held publication");
 });
 
+it("a claim fence recorded after the first acquisition still aborts the later acquisitions of the release fetch", opts, async t => {
+  const { claim, server, work } = setup(44835);
+  let probe!: AuthorityProbe;
+  const r = runner(failingWork(work, midTurnStop), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  Reflect.set(r, "attemptPaths", true);
+  let flightRef: { steering: object } | undefined;
+  probe = authorityDuringTransfer(t, r, {
+    atStart: flight => { flightRef = flight as { steering: object }; },
+    inWait: () => { if (probe.transactions === 1) Reflect.set(flightRef!.steering, "fence", "released"); },
+  });
+  await r.execute(claim);
+  assert.ok(probe.transactions >= 2, "a later acquisition was exercised after the fence was recorded");
+  assert.ok(probe.transfers.length > 0 && probe.transfers.every(h => h === null), "the transfer released nothing");
+  assert.equal(server.heldCalls.length, 0, "no held publication");
+});
+
 it("shutdown during the terminal refusal-release fetch still aborts it after an owed-cap stop", opts, async t => {
   const { claim, server, work } = setup(44832);
   let probe!: AuthorityProbe;
