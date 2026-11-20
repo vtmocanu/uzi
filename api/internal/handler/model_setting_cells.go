@@ -96,7 +96,7 @@ func planningModelCells(planning, claudeLane, leadClaudePin *string) []apitypes.
 		ResolvedModel: defModel, Source: defSource,
 	}
 	if planning != nil {
-		if m := strings.TrimSpace(*planning); m != "" {
+		if m := strings.TrimSpace(*planning); m != "" && !agenttmpl.CodexRoleModels[m] {
 			cell.ResolvedModel, cell.Source = m, planningSourceUserPlanningDefault
 		}
 	}

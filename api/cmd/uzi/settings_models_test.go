@@ -374,6 +374,34 @@ func TestSettingsGetPlanningRows(t *testing.T) {
 	}
 }
 
+func TestSettingsGetPlanningRowsBuiltinModelAndRuntimeEffort(t *testing.T) {
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		PlanningModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", DefaultSource: "builtin", Source: "builtin"},
+		},
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", DefaultEffort: "runtime", DefaultSource: "user_default", Source: "user_default", Mode: "runtime_default"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got []string
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, "planning ") {
+			got = append(got, f)
+		}
+	}
+	want := []string{
+		"planning model claude Default the SDK decides the SDK decides built-in",
+		"planning effort claude Default runtime default runtime default (value not reported) your choice",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("planning rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 func TestSettingsModelRowsOmitAbsentPlanningCells(t *testing.T) {
 	for _, r := range settingsModelRows(apitypes.UserSettingsDTO{}) {
 		if strings.HasPrefix(r.Setting, "planning") {

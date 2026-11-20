@@ -123,9 +123,13 @@ func effortRow(setting string, c apitypes.EffortSettingCellDTO) settingRow {
 	default:
 		resolved = "unknown"
 	}
+	def := c.DefaultEffort
+	if def == "runtime" {
+		def = modelSettingSource("effort", "runtime_default")
+	}
 	return settingRow{
 		Setting: setting, Harness: c.Harness, Stored: c.Effort,
-		Default: c.DefaultEffort, Resolved: resolved,
+		Default: def, Resolved: resolved,
 		Field: "effort", Source: c.Source,
 	}
 }
@@ -209,9 +213,17 @@ func settingsModelRows(s apitypes.UserSettingsDTO) []settingRow {
 func planningSettingRows(models []apitypes.ModelSettingCellDTO, efforts []apitypes.EffortSettingCellDTO) []settingRow {
 	var rows []settingRow
 	for _, c := range models[:min(len(models), 1)] {
+		// A built-in Claude model is empty: the SDK picks it, so say that rather than print nothing.
+		def, resolved := c.DefaultModel, c.ResolvedModel
+		if def == "" {
+			def = modelSettingSource("note", "sdk_default")
+		}
+		if resolved == "" {
+			resolved = modelSettingSource("note", "sdk_default")
+		}
 		rows = append(rows, settingRow{
 			Setting: "planning model", Harness: c.Harness, Stored: c.Model,
-			Default: c.DefaultModel, Resolved: c.ResolvedModel,
+			Default: def, Resolved: resolved,
 			Field: "planning_model", Source: c.Source,
 		})
 	}

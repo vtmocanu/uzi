@@ -551,6 +551,13 @@ export interface UserSettings {
   /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   summary_models?: ModelSettingCell[];
+  /** Per-user Claude planning model and effort (PRD #3252); null inherits. Optional for
+   *  older servers. */
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
+  /** Read-only resolved planning cells (PRD #3252), claude then codex. Never sent on a PUT. */
+  planning_models?: ModelSettingCell[];
+  planning_efforts?: EffortSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;

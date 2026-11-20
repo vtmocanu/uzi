@@ -102,6 +102,9 @@ func TestPlanningDefaultsFixture(t *testing.T) {
 			if (got.PlanningClaudeModel == nil) != (c.Expect.Model == nil) || (got.PlanningClaudeModel != nil && *got.PlanningClaudeModel != *c.Expect.Model) {
 				t.Errorf("%s: response model = %v, want %v", c.ID, got.PlanningClaudeModel, c.Expect.Model)
 			}
+			if (got.PlanningClaudeEffort == nil) != (c.Expect.Effort == nil) || (got.PlanningClaudeEffort != nil && *got.PlanningClaudeEffort != *c.Expect.Effort) {
+				t.Errorf("%s: response effort = %v, want %v", c.ID, got.PlanningClaudeEffort, c.Expect.Effort)
+			}
 		}
 		markCase(t, seen, c.ID)
 	}
@@ -190,6 +193,15 @@ func TestPlanningCellsResolution(t *testing.T) {
 		{name: "planning values win", lane: textOf(ptr("sonnet")), sharedEffort: textOf(ptr("low")), planModel: textOf(ptr("opus")), planEffort: textOf(ptr("max")),
 			wantDefault: "sonnet", wantDefaultSrc: "user_default", wantResolved: "opus", wantSrc: "user_planning_default",
 			wantEffDefault: "low", wantEffDefSrc: "user_default", wantEffResolved: ptr("max"), wantEffSrc: "user_planning_default", wantEffMod: "explicit"},
+		{name: "stored Codex role planning model is unset", planModel: textOf(ptr("gpt-6-sol")), lane: textOf(ptr("sonnet")),
+			wantDefault: "sonnet", wantDefaultSrc: "user_default", wantResolved: "sonnet", wantSrc: "user_default",
+			wantEffDefault: "medium", wantEffDefSrc: "builtin", wantEffResolved: ptr("medium"), wantEffSrc: "builtin", wantEffMod: "explicit"},
+		{name: "Codex role id in the Claude lane is dropped", lane: textOf(ptr("gpt-6-sol")), pin: textOf(ptr("haiku")),
+			wantDefault: "haiku", wantDefaultSrc: "template", wantResolved: "haiku", wantSrc: "template",
+			wantEffDefault: "medium", wantEffDefSrc: "builtin", wantEffResolved: ptr("medium"), wantEffSrc: "builtin", wantEffMod: "explicit"},
+		{name: "Codex role id in the Claude lane, no pin: builtin", lane: textOf(ptr("gpt-6-sol")),
+			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
+			wantEffDefault: "medium", wantEffDefSrc: "builtin", wantEffResolved: ptr("medium"), wantEffSrc: "builtin", wantEffMod: "explicit"},
 		{name: "runtime default effort with planning effort", sharedEffort: textOf(ptr("runtime")), planEffort: textOf(ptr("high")),
 			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
 			wantEffDefault: "runtime", wantEffDefSrc: "user_default", wantEffResolved: ptr("high"), wantEffSrc: "user_planning_default", wantEffMod: "explicit"},

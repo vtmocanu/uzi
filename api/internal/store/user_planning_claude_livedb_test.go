@@ -37,10 +37,14 @@ func TestPlanningClaudeQueriesLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Setting only the model keeps the effort.
-	if _, err := q.SetUserPlanningClaude(ctx, store.SetUserPlanningClaudeParams{
+	ret, err := q.SetUserPlanningClaude(ctx, store.SetUserPlanningClaudeParams{
 		ID: user.ID, SetModel: true, PlanningClaudeModel: text("sonnet"),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if ret.PlanningClaudeModel.String != "sonnet" || ret.PlanningClaudeEffort.String != "high" {
+		t.Fatalf("RETURNING pair = %+v/%+v, want sonnet/high", ret.PlanningClaudeModel, ret.PlanningClaudeEffort)
 	}
 	settings, err := q.GetUserSettings(ctx, user.ID)
 	if err != nil {
@@ -57,12 +61,15 @@ func TestPlanningClaudeQueriesLiveDB(t *testing.T) {
 	if err != nil || got.PlanningClaudeModel.String != "sonnet" || got.PlanningClaudeEffort.Valid {
 		t.Fatalf("after clearing effort = %+v, %v", got, err)
 	}
-	// Neither flag set is a no-op write.
+	// Neither flag set is a no-op write: set effort first so both fields hold a value.
+	if _, err := q.SetUserPlanningClaude(ctx, store.SetUserPlanningClaudeParams{ID: user.ID, SetEffort: true, PlanningClaudeEffort: text("low")}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := q.SetUserPlanningClaude(ctx, store.SetUserPlanningClaudeParams{ID: user.ID}); err != nil {
 		t.Fatal(err)
 	}
 	got, err = q.GetUserPlanningClaude(ctx, user.ID)
-	if err != nil || got.PlanningClaudeModel.String != "sonnet" {
+	if err != nil || got.PlanningClaudeModel.String != "sonnet" || got.PlanningClaudeEffort.String != "low" {
 		t.Fatalf("no-flag write changed the pair: %+v, %v", got, err)
 	}
 	// The planning pair is independent of the ordinary default_effort lane.
