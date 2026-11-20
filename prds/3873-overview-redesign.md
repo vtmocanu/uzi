@@ -22,7 +22,7 @@
 | #4082 (issue) | Issue work: cross-check state in the run chip ("cross-checking", "cross-check: revise / blocked / unavailable"); target mock `prds/mockups/3873-overview-issue-work-crosscheck.html` | #4078 (same page and fixtures) |
 | #4334 (issue) | Admin Repos chip after People: "N repos active of M" with a People-style popover; target mock committed by its PR (3873-overview-repos-chip.html) | #3877 M1 (landing order) |
 | #4335 (issue) | Agent count: a summary line on the Agents page and an Agents chip after Repos; target mock committed by its PR (3873-overview-agents-count.html) | #4334 (landing order) |
-| #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` (M1), then retire the old one before the next stable (M2) | Verdict recorded 2026-11-14 (promote, with a soak). M2: M1, #4334, #4335 |
+| #3877 (`prds/done/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` (M1), then retire the old one before the next stable (M2) | Done: M1 shipped in #4338; M2 retired the old page (`/overview/classic` redirects to `/dashboard`) |
 
 The preview-era children landed serially in this order: #3878, #3880, #3879, #3881, #4052, #4041, #4040, #4042, #4078, #4082, #3876; #3875 any time after #3880. Then land in this order: **#3877 M1 → #4334 → #4335 → #3877 M2**; the in-flight #4334 and #4335 branches rebase onto M1 (the page moves from `/overview/next` to `/dashboard`) before they merge.
 
