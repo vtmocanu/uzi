@@ -1,4 +1,4 @@
-# ADR-4001: command-uid writer exclusion for the retained predecessor FINAL — an opt-in, kube-rendered Docker-free, restricted-posture compound proof for Claude predecessors
+# ADR-4001: command-uid writer exclusion for the retained predecessor FINAL: an opt-in, kube-rendered Docker-free, restricted-posture compound proof for Claude predecessors
 
 **Status**: Proposed contract, incomplete. Nine owner decisions (D1 to D9) are approved and recorded here. Six items (P-1 to P-6) are recommendations or open problems pending owner decision or a missing mechanism, and are NOT approved. The retained predecessor FINAL pass stays disabled in production (`command_uid_unproven`) until P-1 to P-6 are resolved and a separate implementation issue lands and is verified.
 **Date**: 2026-11-20
@@ -1252,8 +1252,9 @@ Approval alone does not close P-2, P-5 or P-6.
 
 - The retained predecessor FINAL pass stays disabled in production. Older
   generations' guarded holds stay open and counted toward the per-run bound,
-  exactly as before (ADR-2445's 2026-11-11 amendment), until an explicit
-  discard or the future implementation.
+  exactly as before (ADR-2445's 2026-11-11 amendment), until an existing
+  release proof or discard policy closes them. This ADR changes no custody
+  policy.
 - When enabled, the pass applies only to Claude predecessors on an opted-in,
   kube, Docker-free, RWOP, first-container worker. Every other worker keeps
   the gate.
