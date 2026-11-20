@@ -1229,6 +1229,10 @@ type Store interface {
 	// run's non-bypassable custom-model claim clause can never be satisfied. A per-run lookup like
 	// CountOnlineWorkersSatisfyingCodexHarness above, and off the hot path for the same reason.
 	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingPhaseModels backs PRD #3252's queued-reason rung: a Claude lead-lane
+	// run whose owner has a planning value set needs a worker advertising 'claude_phase_models_v1'
+	// (reasonNoPhaseModelsCapableWorker when none is online).
+	CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingJobRunner backs PRD #1908's (D-A) queued-reason rung: a queued
 	// kind='job' run whose owner has NO online non-docker worker advertising 'job_runner_v1' gets
 	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
@@ -1478,6 +1482,9 @@ type Store interface {
 	// claim assembly, keyed on the run owner. The lane matching the already-frozen run
 	// harness replaces the legacy shared default_model; each lane NULL ⇒ inherit.
 	GetUserHarnessModelDefaults(ctx context.Context, id uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error)
+	// The owner's Claude planning model and effort (PRD #3252): read strictly at lead-lane Claude
+	// claim assembly, beside the lane read; blank = "Same as the run".
+	GetUserPlanningClaude(ctx context.Context, id uuid.UUID) (store.GetUserPlanningClaudeRow, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
 	// default `medium` at claim assembly (issue #1157).
@@ -3936,7 +3943,7 @@ func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
 //   - a vanished run (its forge connection cascade-deleted the repo → run) is dropped.
 //
 // A chat spends the owner's default token and has no custom Codex root, so it produces
-// neither errAutoPoolEmpty nor errCustomModelCapabilityMissing and has no arm for them:
+// neither errAutoPoolEmpty, errCustomModelCapabilityMissing nor errPhaseModelsCapabilityMissing and has no arm for them:
 // either would fall through to the default and propagate.
 //
 // The returned error is nil for every handled case (report idle) and non-nil only
@@ -4011,6 +4018,13 @@ var errRunRepoOwnerMismatch = errors.New("the run's repository is not owned by t
 // queued for a capable worker rather than failing or silently running Astra. Its message carries
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
+
+// errPhaseModelsCapabilityMissing marks a Claude lead-lane claim that carries a plan_phase (PRD
+// #3252) on a worker that does not advertise claude_phase_models_v1: the owner set a planning
+// value between ClaimRun's SQL gate and assembly. Transient like errCustomModelCapabilityMissing:
+// the run returns to queued, and the next ClaimRun pass excludes the worker. Its message carries no
+// secret bytes.
+var errPhaseModelsCapabilityMissing = errors.New("worker lacks claude_phase_models_v1 for a Claude planning phase")
 
 // errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
 // the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the

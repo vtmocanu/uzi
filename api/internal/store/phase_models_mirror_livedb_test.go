@@ -1,0 +1,219 @@
+package store_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// phase_models_mirror_livedb_test.go (PRD #3252): one matrix runs the same fixture runs through
+// every query that mirrors the claude_phase_models_v1 claim clause and asserts identical
+// eligibility: ClaimRun (claimant and fleet-spread peer clauses), CountOnlineWorkersClaimableForRun,
+// ListUnplaceableQueuedRunsForEphemeral (through fn_placement_admitting_workers),
+// ListSaturationQueuedRunsForEphemeral, the ListActiveRunsForHealth phase_models_required projection
+// and CountOnlineWorkersSatisfyingPhaseModels. Skipped unless UZI_TEST_DATABASE_URL is set
+// (./e2e/run-store-it.sh).
+
+const phaseCap = "claude_phase_models_v1"
+
+type phaseMatrixCase struct {
+	name     string
+	kind     string // issue, ci_fix, self_improve, prompt, mr_rework, task
+	review   bool   // a task review run (review_target_run_id set)
+	harness  string
+	model    any // users.planning_claude_model
+	effort   any // users.planning_claude_effort
+	required bool
+}
+
+func phaseMatrixCases() []phaseMatrixCase {
+	var out []phaseMatrixCase
+	for _, k := range []string{"issue", "ci_fix", "self_improve", "prompt", "mr_rework", "task"} {
+		out = append(out,
+			phaseMatrixCase{name: k + "/planning model", kind: k, harness: "claude", model: "opus", required: true},
+			phaseMatrixCase{name: k + "/planning effort", kind: k, harness: "claude", effort: "high", required: true},
+			phaseMatrixCase{name: k + "/nothing set", kind: k, harness: "claude"})
+	}
+	out = append(out,
+		phaseMatrixCase{name: "task review is not a planning run", kind: "task", review: true, harness: "claude", model: "opus", effort: "high"})
+	return out
+}
+
+// phaseRun inserts a queued, unowned run of c.kind for the fixture user with required_capabilities
+// {docker} (so the capability-gap trigger's demand gate admits it) and an old status_since (so the
+// saturation debounce admits it).
+func phaseRun(fx *fleetFixture, c phaseMatrixCase) uuid.UUID {
+	fx.t.Helper()
+	id := uuid.New()
+	docker := []string{"docker"}
+	switch {
+	case c.review:
+		target := uuid.New()
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, branch, issue_title, issue_description, status, harness)
+		    VALUES ($1, $2, $3, 'task', $4, 't', 'd', 'completed', $5)`, target, fx.userID, fx.repoID, "uzi/task/"+target.String(), c.harness)
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, branch, review_target_run_id, dispatched_at, issue_title, issue_description, status, harness, required_capabilities, status_since)
+		    VALUES ($1, $2, $3, 'task', $4, $5, now(), 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, "uzi/task/"+id.String(), target, c.harness, docker)
+	case c.kind == "issue" || c.kind == "self_improve":
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, harness, required_capabilities, status_since)
+		    VALUES ($1, $2, $3, $4, $5, 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, c.kind, fx.nextIID(), c.harness, docker)
+	case c.kind == "ci_fix":
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, pipeline_id, pipeline_ref, issue_title, issue_description, status, harness, required_capabilities, status_since)
+		    VALUES ($1, $2, $3, 'ci_fix', $4, $5, 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, fx.nextIID(), "ref-"+id.String(), c.harness, docker)
+	case c.kind == "mr_rework":
+		source := uuid.New()
+		mr := fx.nextIID()
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, branch, mr_iid, mr_state, issue_title, issue_description, status, harness)
+		    VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'opened', 't', 'd', 'completed', $7)`, source, fx.userID, fx.repoID, fx.nextIID(), "agent/issue-"+source.String(), mr, c.harness)
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, pipeline_ref, mr_iid, target_run_id, issue_title, issue_description, status, harness, required_capabilities, status_since)
+		    VALUES ($1, $2, $3, 'mr_rework', $4, $5, $6, 't', 'd', 'queued', $7, $8, now() - interval '1 hour')`, id, fx.userID, fx.repoID, "agent/issue-"+source.String(), mr, source, c.harness, docker)
+	default: // prompt, task
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO runs (id, user_id, repo_id, kind, branch, dispatched_at, issue_title, issue_description, status, harness, required_capabilities, status_since)
+		    VALUES ($1, $2, $3, $4, $5, now(), 't', 'd', 'queued', $6, $7, now() - interval '1 hour')`, id, fx.userID, fx.repoID, c.kind, "uzi/"+c.kind+"/"+id.String(), c.harness, docker)
+	}
+	return id
+}
+
+func phaseWorkerRow(fx *fleetFixture, name string, maxRuns *int32, protos []string) uuid.UUID {
+	fx.t.Helper()
+	id := fx.worker(name, maxRuns, true)
+	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, id, protos)
+	return id
+}
+
+func phaseClaim(fx *fleetFixture, worker uuid.UUID, protos []string) (uuid.UUID, bool) {
+	fx.t.Helper()
+	run, err := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
+		WorkerID:            pgtype.UUID{Bytes: worker, Valid: true},
+		UserID:              fx.userID,
+		AffinityCutoff:      pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+		SpreadCutoff:        pgtype.Timestamptz{Time: time.Now().Add(-9 * time.Second), Valid: true},
+		HeartbeatCutoff:     pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
+		IsDockerWorker:      true,
+		DockerRepoAllowlist: []uuid.UUID{fx.repoID},
+		CapabilityAware:     true,
+		WorkerCaps:          []string{"docker"},
+		WorkerProtocolCaps:  protos,
+	})
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return uuid.Nil, false
+		}
+		fx.t.Fatalf("ClaimRun: %v", err)
+	}
+	return run.ID, true
+}
+
+func phaseHealthRow(fx *fleetFixture, run uuid.UUID) store.ListActiveRunsForHealthRow {
+	fx.t.Helper()
+	rows, err := fx.q.ListActiveRunsForHealth(fx.ctx, []string{"gpt-6-sol"})
+	if err != nil {
+		fx.t.Fatalf("ListActiveRunsForHealth: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == run {
+			return r
+		}
+	}
+	fx.t.Fatalf("run %s not in ListActiveRunsForHealth", run)
+	return store.ListActiveRunsForHealthRow{}
+}
+
+func TestPhaseModelsMirrorMatrixLiveDB(t *testing.T) {
+	iv := leaseInterval(leaseTwoHours)
+	for _, c := range phaseMatrixCases() {
+		t.Run(c.name, func(t *testing.T) {
+			setup := func(withCapable bool, busyIncapable bool) (*fleetFixture, uuid.UUID, uuid.UUID, uuid.UUID) {
+				fx := newFleetFixture(t)
+				optInEphemeral(fx)
+				mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_claude_model = $2, planning_claude_effort = $3 WHERE id = $1`, fx.userID, c.model, c.effort)
+				incapable := phaseWorkerRow(fx, "incapable", capOf(1), []string{})
+				if busyIncapable {
+					fx.holdActive(incapable, 1)
+				}
+				capable := uuid.Nil
+				if withCapable {
+					capable = phaseWorkerRow(fx, "capable", capOf(1), []string{phaseCap})
+				}
+				return fx, phaseRun(fx, c), incapable, capable
+			}
+			want := func(cond bool) int64 {
+				if cond {
+					return 1
+				}
+				return 0
+			}
+
+			// Fleet A: only an incapable worker online.
+			fx, run, incapable, _ := setup(false, false)
+			if h := phaseHealthRow(fx, run); h.PhaseModelsRequired != c.required {
+				t.Fatalf("health phase_models_required = %v, want %v", h.PhaseModelsRequired, c.required)
+			}
+			if n, err := fx.q.CountOnlineWorkersSatisfyingPhaseModels(fx.ctx, fx.userID); err != nil || n != 0 {
+				t.Fatalf("satisfier count with no capable worker = (%d, %v), want 0", n, err)
+			}
+			if n := claimableCount(fx, run, iv); n != want(!c.required) {
+				t.Fatalf("claimable by the incapable worker = %d, want %d", n, want(!c.required))
+			}
+			if gap := listedUnplaceable(fx, 1000, iv); gap[run] != c.required {
+				t.Fatalf("capability-gap trigger listed = %v, want %v", gap[run], c.required)
+			}
+			if id, ok := phaseClaim(fx, incapable, []string{}); ok != !c.required || (ok && id != run) {
+				t.Fatalf("ClaimRun by the incapable worker claimed = %v, want %v", ok, !c.required)
+			}
+
+			// Fleet B: an incapable worker and a capable one, both idle.
+			fx, run, _, capable := setup(true, false)
+			if n, err := fx.q.CountOnlineWorkersSatisfyingPhaseModels(fx.ctx, fx.userID); err != nil || n != 1 {
+				t.Fatalf("satisfier count with one capable worker = (%d, %v), want 1", n, err)
+			}
+			if n := claimableCount(fx, run, iv); n != 2-want(c.required) {
+				t.Fatalf("claimable = %d, want %d", n, 2-want(c.required))
+			}
+			if gap := listedUnplaceable(fx, 1000, iv); gap[run] {
+				t.Fatal("capability-gap trigger listed a run a capable worker can take")
+			}
+			if id, ok := phaseClaim(fx, capable, []string{phaseCap}); !ok || id != run {
+				t.Fatalf("ClaimRun by the capable worker = (%v, %v), want it to claim", id, ok)
+			}
+
+			// Fleet C: only a SATURATED incapable worker. A required run has no capable worker to wait
+			// for, so it is the gap trigger's, not the saturation trigger's; a free run is capable-but-full.
+			fx, run, _, _ = setup(false, true)
+			if sat := listedSaturation(fx, 1000, iv); sat[run] != !c.required {
+				t.Fatalf("saturation trigger listed = %v, want %v", sat[run], !c.required)
+			}
+
+			// Fleet D: only a SATURATED capable worker: capable-but-full for every run.
+			fx = newFleetFixture(t)
+			optInEphemeral(fx)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_claude_model = $2, planning_claude_effort = $3 WHERE id = $1`, fx.userID, c.model, c.effort)
+			busyCapable := phaseWorkerRow(fx, "busy-capable", capOf(1), []string{phaseCap})
+			fx.holdActive(busyCapable, 1)
+			run = phaseRun(fx, c)
+			if sat := listedSaturation(fx, 1000, iv); !sat[run] {
+				t.Fatal("saturation trigger did not list a run waiting on a saturated capable worker")
+			}
+			if gap := listedUnplaceable(fx, 1000, iv); gap[run] {
+				t.Fatal("capability-gap trigger listed a run a (saturated) capable worker could take")
+			}
+
+			// Fleet E: the fleet-spread peer clause. The capable claimant already holds a run and an idle
+			// incapable peer exists; a required run must not be deferred to a peer that cannot claim it.
+			fx = newFleetFixture(t)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_claude_model = $2, planning_claude_effort = $3 WHERE id = $1`, fx.userID, c.model, c.effort)
+			claimant := phaseWorkerRow(fx, "claimant", capOf(4), []string{phaseCap})
+			phaseWorkerRow(fx, "idle-incapable-peer", capOf(4), []string{})
+			fx.holdActive(claimant, 1)
+			run = phaseRun(fx, c)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET updated_at = now(), status_since = now() WHERE id = $1`, run)
+			id, ok := phaseClaim(fx, claimant, []string{phaseCap})
+			if c.required && (!ok || id != run) {
+				t.Fatalf("peer clause: the capable claimant was refused a required run (deferred to an incapable peer)")
+			}
+		})
+	}
+}

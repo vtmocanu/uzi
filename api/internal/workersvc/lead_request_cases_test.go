@@ -81,6 +81,7 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 				Harness: harness, RunModel: text(s.RunModel), RunModelSource: text(s.RunModelSource),
 				RunEffort: text(s.RunEffort), RunEffortSource: text(s.RunEffortSource),
 				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort),
+				PlanningModel: text(s.PlanningModel), PlanningEffort: text(s.PlanningEffort),
 			})
 
 			wantStr := func(key string) string {

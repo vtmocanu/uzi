@@ -77,6 +77,10 @@ type ServerInputs struct {
 	RunEffortSource *string `json:"run_effort_source"`
 	// UserEffort is the owner's per-harness effort column; null is unset.
 	UserEffort *string `json:"user_effort"`
+	// PlanningModel and PlanningEffort are the owner's Claude planning columns (PRD #3252);
+	// null is unset.
+	PlanningModel  *string `json:"planning_model"`
+	PlanningEffort *string `json:"planning_effort"`
 	// TemplateClaude and TemplateCodex are the lead template's stored per-harness pins. The case's own
 	// agents / templateModel are the form the claim delivers after PinForHarness filtering.
 	TemplateClaude *string `json:"template_claude"`

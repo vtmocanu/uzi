@@ -1571,6 +1571,20 @@ WITH checker_template_pins AS MATERIALIZED (
           )
           OR 'codex_custom_model_v1' = ANY(@worker_protocol_caps::text[])
       )
+      -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+      -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+      -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+      -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+      AND (
+          NOT (
+                r.harness = 'claude'
+                AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                AND r.review_target_run_id IS NULL
+                AND r.egress_profile_id IS NULL
+                AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+          )
+          OR 'claude_phase_models_v1' = ANY(@worker_protocol_caps::text[])
+      )
       -- PRD #1908 (D-A): the NON-BYPASSABLE job-runner claim clause, a standalone sibling of the
       -- Codex clauses above. A repo-less 'job' run may be claimed ONLY by a NON-docker worker whose
       -- SELF-REPORTED protocol_capabilities contain 'job_runner_v1'. Every other kind is unaffected.
@@ -1841,6 +1855,20 @@ WITH checker_template_pins AS MATERIALIZED (
                             false)
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
+                )
+                -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+                -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+                AND (
+                    NOT (
+                          r.harness = 'claude'
+                          AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                          AND r.review_target_run_id IS NULL
+                          AND r.egress_profile_id IS NULL
+                          AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                    )
+                    OR 'claude_phase_models_v1' = ANY(p.protocol_capabilities)
                 )
                 -- PRD #1908 (D-A): MIRROR the job-runner claim clause for the peer, or fleet-spread could
                 -- DEFER a job to a docker or old-image peer that could never claim it. Reads the peer's
@@ -11537,6 +11565,14 @@ SELECT id, runs.user_id, status, auto_approve,
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY(@codex_curated_models::text[])),
             false))::boolean AS codex_custom_root,
+       -- PRD #3252: phase_models_required is the SQL-computed predicate every claim mirror carries (a Claude
+       -- lead-lane run whose owner has a planning value set needs 'claude_phase_models_v1'), so the health
+       -- queued-reason rung and the capable-worker filter agree with ClaimRun.
+       (runs.harness = 'claude'
+        AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+        AND runs.review_target_run_id IS NULL
+        AND runs.egress_profile_id IS NULL
+        AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = runs.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL)))::boolean AS phase_models_required,
        (EXISTS (
            SELECT 1 FROM runs r
            WHERE r.id = runs.id
@@ -11925,6 +11961,20 @@ WHERE run.id = @run_id
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   )
+  -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+  -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+  -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+  -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+  AND (
+      NOT (
+            run.harness = 'claude'
+            AND run.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+            AND run.review_target_run_id IS NULL
+            AND run.egress_profile_id IS NULL
+            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = run.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+      )
+      OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+  )
   -- PRD #1906 M5: MIRROR ClaimRun's isolated-lane clause (both ways, the protocol capability,
   -- and no Codex-indicating profile-bound run), reading the candidate's OWN columns.
   AND ((run.egress_profile_id IS NOT NULL) = w.isolated_lane)
@@ -12270,6 +12320,25 @@ WHERE w.user_id = @user_id
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities);
+
+-- name: CountOnlineWorkersSatisfyingPhaseModels :one
+-- PRD #3252: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
+-- 'claude_phase_models_v1' PROTOCOL capability. The planning-phase analogue of
+-- CountOnlineWorkersSatisfyingCustomCodex: it answers "does the fleet have ANY worker that can
+-- execute a Claude planning phase?", not "can THIS run be claimed right now?". It drives the
+-- queued-reason resolver's phase-models rung (reasonNoPhaseModelsCapableWorker): a 0 here for a
+-- phase_models_required queued run means every online worker predates the planning-phase protocol,
+-- so ClaimRun's NON-BYPASSABLE clause can never be satisfied. Reads workers.protocol_capabilities
+-- DIRECTLY, like its siblings. Only called for a phase_models_required queued run already past its
+-- health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  -- The lane half of ClaimRun's isolated-lane clause: a lane worker never claims an unbound run.
+  AND NOT w.isolated_lane
+  AND 'claude_phase_models_v1' = ANY(w.protocol_capabilities);
 
 -- name: CountOnlineWorkersSatisfyingJobRunner :one
 -- PRD #1908 (D-A): how many of a user's ONLINE, non-draining, non-ephemeral, NON-docker workers
@@ -12672,6 +12741,20 @@ WHERE r.status = 'queued'
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
                  )
+                 -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                 -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+                 -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                 -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+                 AND (
+                     NOT (
+                           r.harness = 'claude'
+                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                           AND r.review_target_run_id IS NULL
+                           AND r.egress_profile_id IS NULL
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                     )
+                     OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+                 )
         AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -12765,6 +12848,20 @@ WHERE r.status = 'queued'
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+                 )
+                 -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                 -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+                 -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                 -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+                 AND (
+                     NOT (
+                           r.harness = 'claude'
+                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                           AND r.review_target_run_id IS NULL
+                           AND r.egress_profile_id IS NULL
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                     )
+                     OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
                  )
         AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))

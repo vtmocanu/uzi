@@ -381,12 +381,21 @@ func (s *Service) checkProviderModels(ctx context.Context, q *store.Queries, run
 	if err != nil {
 		return fmt.Errorf("provider model check: user defaults: %w", err)
 	}
-	settings := resolveLeadSettings(LeadSettingsInput{
+	in := LeadSettingsInput{
 		Harness:        HarnessClaude,
 		RunModel:       run.Model,
 		RunModelSource: run.ModelSource,
 		LaneModel:      lanes.DefaultClaudeModel,
-	})
+	}
+	// PRD #3252: a lead-lane claim also ships the owner's planning model, which must map too.
+	if leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+		planning, perr := q.GetUserPlanningClaude(ctx, run.UserID)
+		if perr != nil {
+			return fmt.Errorf("provider model check: planning defaults: %w", perr)
+		}
+		in.PlanningModel, in.PlanningEffort = planning.PlanningClaudeModel, planning.PlanningClaudeEffort
+	}
+	settings := resolveLeadSettings(in)
 	lead, leadFrom := settings.Model.String, "user default"
 	switch settings.ModelSource {
 	case leadcfg.ModelSourceRunOverride, leadcfg.ModelSourceSchedulePin:
@@ -401,6 +410,10 @@ func (s *Service) checkProviderModels(ctx context.Context, q *store.Queries, run
 			leadFrom = "default model"
 		}
 		return &ProviderModelUnmappedError{Model: name, Source: leadFrom}
+	}
+	if plan := settings.Plan; settings.Unhonorable == nil && plan != nil && plan.Model != nil &&
+		plan.ModelSource == string(leadcfg.ModelSourceUserPlanningDefault) && !modelMapped(src.ModelMap, *plan.Model) {
+		return &ProviderModelUnmappedError{Model: *plan.Model, Source: "planning default"}
 	}
 	if run.Kind == runkind.Chat {
 		return nil // a chat claim carries no agent templates
