@@ -150,7 +150,8 @@ import type {
 } from "./protocol.js";
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
-import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
+import { claimRunEnv, deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
+import { claimRunEnvSecretForms } from "./run-env-forms.js";
 import { RecoveryCoordinator, PredecessorAuthorityLost, restorePredecessorHolds, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryCloneKey, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
@@ -6303,6 +6304,9 @@ export class RunRunner {
     // this registration (with the redactors' below) is the only protection for it.
     // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
     if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
+    // PRD #4416: every registered form of each secret run variable and redact-only version (plain values
+    // never). Rebuilt from this claim and evicted at terminal like the others; nothing is persisted.
+    runScopedSecrets.push(...claimRunEnvSecretForms(claim.secrets));
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -13858,6 +13862,7 @@ export class RunRunner {
       ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []),
       this.joinToken,
       gitBasic,
+      ...claimRunEnvSecretForms(claim.secrets),
     ];
     // PRD #1171 M3: APPEND the two Codex canaries (access token + capability) so both
     // redactors scrub them from run-message payloads and out-of-payload strings
@@ -17133,10 +17138,13 @@ export class RunRunner {
         });
       }
     }
+    const runEnv = claimRunEnv(claim);
     const ctx: RunContext = {
       semanticPlanning,
       managedGoWorkDir: flight.managedGoWorkDir,
       runTmpdir: flight.runTmpdir,
+      // PRD #4416: the repo/user variables, receiving lead lanes only (claimRunEnv gates on kind).
+      ...(runEnv ? { runEnv } : {}),
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
           if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");

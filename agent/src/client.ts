@@ -15,6 +15,7 @@ import type { PublicationIntentRequest, PublicationIntentResult } from "./public
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
+import { decodeRunEnvSecrets } from "./run-env-claim.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -2704,6 +2705,13 @@ export class WorkerClient {
         if (provider) {
           this.requireProviderCapability();
           claim.secrets.provider = provider;
+        }
+        // PRD #4416: a malformed run_env / run_env_redact fails the claim closed (RunEnvClaimError names
+        // the field and rule, never a value). The chat claim decoder below deliberately ignores them.
+        if (Object.hasOwn(claim.secrets, "run_env") || Object.hasOwn(claim.secrets, "run_env_redact")) {
+          const decoded = decodeRunEnvSecrets(claim.secrets);
+          claim.secrets.run_env = decoded.runEnv;
+          claim.secrets.run_env_redact = decoded.runEnvRedact;
         }
       }
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.

@@ -195,6 +195,8 @@ import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckTool
 import { buildCodexRunPlan } from "./run-builder.js";
 import { resolveChildTurnDeadlineMs } from "./child-budget.js";
 import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
+import { foldRunEnv, type RunEnvDropHandler, type RunEnvVar } from "../run-env-merge.js";
+import { runEnvDropEmitter } from "../run-env-drop-event.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -3756,6 +3758,8 @@ export class CodexExecutor implements Executor {
           // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
+          ctx.runEnv,
+          runEnvDropEmitter(ctx.emit),
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -8234,11 +8238,20 @@ export function commandSandboxArgv(
  *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
  *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
  *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
+ *   - PRD #4416: `runEnv` (the run's repo/user variables) is folded after `toolEnv` at the lowest
+ *     precedence, see {@link foldRunEnv}; each dropped name is reported through `onRunEnvDrop`.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
+export function buildCommandEnv(
+  tmpdir: string,
+  toolEnv: Record<string, string>,
+  dockerHost?: string,
+  browserDiscovery = false,
+  runEnv?: readonly RunEnvVar[],
+  onRunEnvDrop?: RunEnvDropHandler,
+): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -8256,6 +8269,10 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
+  // PRD #4416: the repo/user variables, lowest precedence (receiving run lane only; the app-server
+  // launch env never gets them). Dropped when the key is present, protected, a git-config carrier or
+  // breaks the shared name rules; the worker keys below win.
+  foldRunEnv(env, runEnv, (k) => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k), onRunEnvDrop);
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;

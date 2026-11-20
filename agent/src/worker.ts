@@ -3,6 +3,7 @@ import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { CLAUDE_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { RUN_ENV_V1 } from "./run-env-claim.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -1077,6 +1078,9 @@ export class Worker {
           // worker advertising it, and client.ts requireProviderCapability still refuses a provider
           // claim on a registration that did not advertise it.
           CLAUDE_PROVIDER_CAPABILITY,
+          // PRD #4416: this image decodes claim run_env fail-closed and merges it into the run
+          // environment. Advertised UNCONDITIONALLY; the api offers run_env only to a worker advertising it.
+          RUN_ENV_V1,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];
