@@ -1,5 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
@@ -54,7 +60,7 @@ export function JudgeSettingsCard({
   sources: Record<string, SettingSource>;
   // The compiled-in defaults from the admin GET, for the read-only "Default · <model> (built-in)" text.
   defaults: Record<string, string>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.judge_enabled === "true");
   const [enforceAll, setEnforceAll] = useState(settings.judge_enforce_all === "true");
@@ -76,7 +82,7 @@ export function JudgeSettingsCard({
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({
+      const payload: UpdateSettingsPayload = {
         judge_enabled: enabled ? "true" : "false",
         // The kill-switch dominates: enforce-all is meaningless with the judge off, so
         // never send it as on when the feature is disabled (mirrors the Gate-2-wins
@@ -84,8 +90,9 @@ export function JudgeSettingsCard({
         judge_enforce_all: enabled && enforceAll ? "true" : "false",
         judge_cooldown_seconds: cooldown.trim(),
         judge_daily_budget: budget.trim(),
-      });
-      onSaved(resp);
+      };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setEnabled(resp.settings.judge_enabled === "true");
       setEnforceAll(resp.settings.judge_enforce_all === "true");
       setCooldown(resp.settings.judge_cooldown_seconds);

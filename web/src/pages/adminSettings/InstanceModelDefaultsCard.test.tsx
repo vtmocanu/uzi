@@ -4,7 +4,13 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { useState } from "react";
 import { InstanceModelDefaultsCard } from "./InstanceModelDefaultsCard";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 
 vi.mock("../../lib/api", async (importOriginal) => {
@@ -40,15 +46,15 @@ const view = (pins: Pins = {}, env: string[] = []): View => {
 const response = (v: View): SettingsResponse =>
   ({ ...v, secrets: {}, defaults: DEFAULTS, slack_status: "disabled" }) as SettingsResponse;
 
-function Harness({ pins, env, onSaved }: { pins?: Pins; env?: string[]; onSaved?: (r: SettingsResponse) => void }) {
+function Harness({ pins, env, onSaved }: { pins?: Pins; env?: string[]; onSaved?: (r: SettingsResponse, sent: UpdateSettingsPayload) => void }) {
   const [v, setV] = useState(view(pins, env));
   return (
     <InstanceModelDefaultsCard
       settings={v.settings}
       sources={v.sources}
       defaults={DEFAULTS}
-      onSaved={(r) => {
-        onSaved?.(r);
+      onSaved={(r, sent) => {
+        onSaved?.(r, sent);
         setV({ settings: r.settings, sources: r.sources });
       }}
     />
@@ -147,7 +153,7 @@ describe("InstanceModelDefaultsCard grid (#3259)", () => {
       summary_model: "sonnet",
       codex_judge_model: "gpt-6-sol",
     });
-    expect(onSaved).toHaveBeenCalledWith(next);
+    expect(onSaved).toHaveBeenCalledWith(next, { summary_model: "sonnet", codex_judge_model: "gpt-6-sol" });
     expect(summaryClaude().value).toBe("sonnet");
     expect(judgeCodex().value).toBe("gpt-6-sol");
     expect(save().disabled).toBe(true);
