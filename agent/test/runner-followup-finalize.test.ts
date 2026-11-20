@@ -25,7 +25,7 @@ import type { ClaimResponse, StateAck, StateRequest } from "../src/protocol.js";
 import { api, client, fakeGitlab, fx, git, installHarness } from "./runner-harness.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 
-installHarness();
+installHarness({}, cleanupTest);
 
 const GEN = 4;
 const REPO_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
@@ -96,9 +96,41 @@ let clock = new FakeClock();
 let armPolicy: (armIndex: number) => boolean = () => true;
 let armCount = 0;
 let currentSteering: SteeringChannel | undefined;
+const executions: Array<{ runner: RunRunner; promise: Promise<void> }> = [];
+
+/** Join before installHarness removes the API and clone paths, including after a thrown assertion. */
+async function cleanupTest(): Promise<void> {
+  try {
+    clock.release();
+    for (const { runner } of executions) runner.shutdown();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(executions.map(e => e.promise)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("followup-finalize execution did not settle during fixture cleanup")), 5_000);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    assert.equal(clock.pending, 0, "fixture cleanup left fake waits pending");
+  } finally {
+    SteeringChannel.prototype.awaitFollowUp = realAwaitFollowUp;
+    executions.length = 0;
+  }
+}
+
+function startExecution(runner: RunRunner, claim: ClaimResponse): Promise<void> {
+  const promise = runner.execute(claim);
+  executions.push({ runner, promise });
+  // Teardown observes failures without replacing the original promise's rejection for its caller.
+  void promise.catch(() => undefined);
+  return promise;
+}
 
 beforeEach(() => {
-  clock = new FakeClock();
+  const c = clock = new FakeClock();
   armPolicy = () => true;
   armCount = 0;
   currentSteering = undefined;
@@ -107,14 +139,29 @@ beforeEach(() => {
     // eslint-disable-next-line typescript/no-this-alias
     currentSteering = this;
     const armIndex = ++armCount;
-    if (armPolicy(armIndex)) clock.advance(idleMs);
+    if (armPolicy(armIndex)) c.advance(idleMs);
     return parked;
   };
 });
-afterEach(() => { SteeringChannel.prototype.awaitFollowUp = realAwaitFollowUp; });
 
 /** Stop and cancel cases: the park must end by that input, never by the idle window. */
 const neverIdle = (): void => { armPolicy = () => false; };
+
+it("fixture cleanup releases a fake wait abandoned by a failing operation", async t => {
+  const c = clock;
+  c.engage();
+  const pending = c.wait(5, undefined, () => false);
+  const original = new Error("injected failure before the explicit clock release");
+  await assert.rejects(async () => { throw original; }, error => error === original);
+  // t.after runs after the harness's afterEach, so this observes the shared teardown.
+  t.after(async () => {
+    const remaining = c.pending;
+    c.release(); // The regression must also clean up when run against the unfixed hooks.
+    await pending;
+    assert.equal(remaining, 0, "fixture cleanup left a fake wait pending");
+    assert.equal(SteeringChannel.prototype.awaitFollowUp, realAwaitFollowUp, "fixture cleanup did not restore the prototype");
+  });
+});
 
 async function mkOutbox(): Promise<Outbox> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-followup-finalize-"));
@@ -347,7 +394,7 @@ async function until(predicate: () => boolean, ms: number): Promise<boolean> {
 
 /** Run to its end or fail at the deadline: a hung run is cancelled so the harness can tear down. */
 async function finish(r: RunRunner, claim: ClaimResponse, ms = 10_000): Promise<void> {
-  const execution = r.execute(claim).then(() => "done" as const);
+  const execution = startExecution(r, claim).then(() => "done" as const);
   const winner = await Promise.race([execution, sleep(ms).then(() => "deadline" as const)]);
   if (winner === "deadline") {
     api.setInputs(claim.run_id, [{ id: 9_000, kind: "cancel", body: null }]);
@@ -360,7 +407,8 @@ async function finish(r: RunRunner, claim: ClaimResponse, ms = 10_000): Promise<
 async function observeThenCancel(r: RunRunner, claim: ClaimResponse, log: { outcomes: FollowUpOutcome[] }, windowMs: number, ms = 10_000): Promise<void> {
   clock.engage();
   let settled = false;
-  const execution = r.execute(claim).then(() => { settled = true; return "done" as const; });
+  const execution = startExecution(r, claim).then(() => { settled = true; return "done" as const; });
+  void execution.catch(() => { settled = true; });
   // The window is FAKE time measured from the first backoff wait: every pending admission backoff is
   // advanced to its deadline until the window has elapsed, so the resend count never depends on the host.
   // A real-time cap that expires is a failure, never a completed window; on any failure the run is
@@ -575,7 +623,6 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     const cap = captureFlight(r);
     await finish(r, claim);
     const cancelSeen = cap.flight?.steering.isCancelled() === true;
-    clock.release();
 
     assert.equal(cancelSeen, true);
     assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
