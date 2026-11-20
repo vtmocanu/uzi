@@ -1,5 +1,11 @@
 import { useLayoutEffect, useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { ApiError, errorMessage } from "../../lib/apiError";
 import { ModelSelect } from "../../components/ModelSelect";
 import { ClaudeIcon, OpenAIIcon } from "../../components/icons";
@@ -90,7 +96,7 @@ export function InstanceModelDefaultsCard({
   sources: Record<string, SettingSource>;
   // The compiled-in defaults from the admin GET, for the "Default · <model> (built-in)" label.
   defaults: Record<string, string>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   // The last server view this card has seen: the baseline each lane's dirtiness is measured
   // against, replaced only by a successful save.
@@ -162,7 +168,7 @@ export function InstanceModelDefaultsCard({
       const payload: Partial<Record<ModelKey, string>> = {};
       for (const l of LANES) if (dirtyOf(l.key)) payload[l.key] = values[l.key];
       const resp = await api.updateSettings(payload);
-      onSaved(resp);
+      onSaved(resp, payload);
       const next: View = { settings: resp.settings, sources: resp.sources };
       setView(next);
       setValues(pinnedValues(next));

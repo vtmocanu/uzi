@@ -25,8 +25,9 @@ function renderCard(
   s: AppSettings = settings,
   sources: Record<string, SettingSource> = unpinned,
   d: Record<string, string> = defaults,
+  onSaved: (...args: unknown[]) => void = vi.fn(),
 ) {
-  return render(<JudgeSettingsCard settings={s} sources={sources} defaults={d} onSaved={vi.fn()} />);
+  return render(<JudgeSettingsCard settings={s} sources={sources} defaults={d} onSaved={onSaved} />);
 }
 
 const save = () => screen.getByRole("button", { name: "Save run judge settings" }) as HTMLButtonElement;
@@ -39,13 +40,23 @@ afterEach(() => {
 
 describe("JudgeSettingsCard policy save (#3259)", () => {
   it("sends exactly the four policy keys and never a model key", async () => {
-    mockApi.updateSettings.mockResolvedValue({ settings: { ...settings, judge_cooldown_seconds: "120" }, sources: {} } as never);
-    renderCard();
+    const resp = { settings: { ...settings, judge_cooldown_seconds: "120" }, sources: {} };
+    mockApi.updateSettings.mockResolvedValue(resp as never);
+    const onSaved = vi.fn();
+    renderCard(settings, unpinned, defaults, onSaved);
     expect(save().disabled).toBe(true);
     fireEvent.change(screen.getByLabelText("Per-user cooldown (seconds)"), { target: { value: "120" } });
     fireEvent.click(save());
     await screen.findByText("Run judge settings saved.");
     expect(mockApi.updateSettings).toHaveBeenCalledWith({
+      judge_enabled: "true",
+      judge_enforce_all: "false",
+      judge_cooldown_seconds: "120",
+      judge_daily_budget: "0",
+    });
+    // onSaved receives the response and the exact payload sent, so the page can
+    // confirm only the keys this request carried.
+    expect(onSaved).toHaveBeenCalledWith(resp, {
       judge_enabled: "true",
       judge_enforce_all: "false",
       judge_cooldown_seconds: "120",

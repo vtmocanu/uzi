@@ -1,5 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 
@@ -14,7 +20,7 @@ export function SummaryControlsCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   // Absent (an older server) reads as on, the server default.
   const saved = settings.now_summary_enabled !== "false";
@@ -33,8 +39,9 @@ export function SummaryControlsCard({
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ now_summary_enabled: String(nowEnabled) });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { now_summary_enabled: String(nowEnabled) };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setNowEnabled(resp.settings.now_summary_enabled !== "false");
       setNotice("Run summary controls saved.");
     } catch (err) {

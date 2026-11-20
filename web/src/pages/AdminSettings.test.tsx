@@ -1836,3 +1836,78 @@ describe("AdminSettings forwards moved worker anchors to Admin → Workers", () 
     expect(nav.querySelector('a[href="#review-bots"]')).not.toBeNull();
   });
 });
+
+describe("sibling-card save responses (#4530)", () => {
+  const judgeToggle = () => screen.getByLabelText(/Enable the run judge for this instance/i) as HTMLInputElement;
+  const judgeSaveButton = () => screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
+
+  it("keeps another card's confirmed key when an older save returns last", async () => {
+    let finishGrid!: (value: ReturnType<typeof response>) => void;
+    mockApi.updateSettings.mockImplementation(patch => {
+      if ("judge_model" in patch) return new Promise(resolve => { finishGrid = resolve; });
+      if ("judge_enabled" in patch) return Promise.resolve(response({ judge_enabled: "true" }));
+      throw new Error("unexpected settings patch");
+    });
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Judge model, Claude"), { target: { value: "haiku" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save model defaults" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ judge_model: "haiku" }));
+    fireEvent.click(judgeToggle());
+    fireEvent.click(judgeSaveButton());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ judge_enabled: "true" })));
+    await waitFor(() => expect(judgeSaveButton().disabled).toBe(true));
+    // The older grid response still carries the pre-judge-save value of judge_enabled.
+    await act(async () => { finishGrid(response({ judge_model: "haiku", judge_enabled: "false" }, {}, { judge_model: "db" })); });
+    expect(judgeToggle().checked).toBe(true);
+    fireEvent.click(judgeToggle());
+    expect(judgeToggle().checked).toBe(false);
+    expect(judgeSaveButton().disabled).toBe(false);
+  });
+
+  it("does not reset the label form, SSO status line or other confirmed keys on a card save", async () => {
+    mockApi.getSettings.mockResolvedValue({
+      ...response({ uzi_label: "uzi" }),
+      oidc_status: "degraded",
+      oidc_provider_name: "Acme ID",
+    });
+    mockApi.updateSettings.mockImplementation(patch => {
+      if ("judge_enabled" in patch) return Promise.resolve(response({ judge_enabled: "true" }));
+      // PUT responses leave the GET-only oidc fields empty and may carry older values.
+      if ("health_stall_seconds" in patch) {
+        return Promise.resolve({
+          // Unsent secret and source entries differ too: they must not leak into page state.
+          ...response(
+            { health_stall_seconds: "901", uzi_label: "older", judge_enabled: "false" },
+            { slack_bot_token: true },
+            { health_queued_seconds: "env" },
+          ),
+          oidc_status: "",
+          oidc_provider_name: "",
+        });
+      }
+      throw new Error("unexpected settings patch");
+    });
+    renderPage();
+    expect(await screen.findByText("Single sign-on (Acme ID)")).toBeTruthy();
+    expect(screen.getAllByText("degraded").length).toBeGreaterThan(0);
+    fireEvent.change(input("uzi label"), { target: { value: "edited" } });
+    fireEvent.click(judgeToggle());
+    fireEvent.click(judgeSaveButton());
+    await waitFor(() => expect(judgeSaveButton().disabled).toBe(true));
+    fireEvent.change(screen.getByLabelText("Stalled after (seconds of silence)"), { target: { value: "901" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save run health" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_stall_seconds: "901" }));
+    await waitFor(() =>
+      expect((screen.getByLabelText("Stalled after (seconds of silence)") as HTMLInputElement).value).toBe("901"),
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save run health" })).toHaveProperty("disabled", true));
+    expect(screen.getByText("Single sign-on (Acme ID)")).toBeTruthy();
+    expect(screen.getAllByText("degraded").length).toBeGreaterThan(0);
+    expect(input("uzi label").value).toBe("edited");
+    expect(judgeToggle().checked).toBe(true);
+    expect(judgeSaveButton().disabled).toBe(true);
+    // secrets and sources merge only the sent keys, too.
+    expect((screen.getByLabelText(/Stuck queued after/i) as HTMLInputElement).disabled).toBe(false);
+    expect(screen.queryByPlaceholderText(/configured ✓/)).toBeNull();
+  });
+});

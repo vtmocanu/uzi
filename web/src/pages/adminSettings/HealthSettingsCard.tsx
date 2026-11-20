@@ -106,7 +106,7 @@ export function HealthSettingsCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.health_enabled === "true");
   const [values, setValues] = useState<Record<string, string>>(() =>
@@ -150,7 +150,7 @@ export function HealthSettingsCard({
     setBusy(true);
     try {
       const resp = await api.updateSettings(payload);
-      onSaved(resp);
+      onSaved(resp, payload);
       setEnabled(resp.settings.health_enabled === "true");
       setValues(Object.fromEntries(HEALTH_FIELDS.map((f) => [f.key, resp.settings[f.key] ?? ""])));
       setNotice("Run-health settings saved.");
