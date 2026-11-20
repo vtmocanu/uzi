@@ -36,14 +36,7 @@ func ccAdmissionSnapshot(t *testing.T, f gatedFixture, round int32) ccAdmissionR
 	return r
 }
 
-// ccApprove decides the round's checker child with the given verdict through the real service.
-func ccApprove(t *testing.T, f gatedFixture, cc store.CrossCheck, verdict string) {
-	t.Helper()
-	f.decide(t, cc, verdict)
-}
-
-func ccRunningRequest(t *testing.T, cc store.CrossCheck, plan string, ms []Milestone) StateRequest {
-	t.Helper()
+func ccRunningRequest(cc store.CrossCheck, plan string, ms []Milestone) StateRequest {
 	generation := int64(1)
 	caps := []string{}
 	tools := []string{}
@@ -60,6 +53,43 @@ func ccAutomaticFixture(t *testing.T, limit int32) gatedFixture {
 	return gatedFixture{env: env, svc: svc, w: w, lead: lead, c: c}
 }
 
+// ccValidSubmitSucceeds submits a valid milestone list on the same fixture after a refusal,
+// tying the refusal to the milestones rather than to the fixture.
+func ccValidSubmitSucceeds(t *testing.T, f gatedFixture) {
+	t.Helper()
+	c := f.c
+	c.Milestones = json.RawMessage(`[{"id":"m1","title":"First"}]`)
+	if _, err := f.svc.SubmitPlanCrossCheck(f.env.ctx, f.w, f.lead, 1, c, 1); err != nil {
+		t.Fatalf("valid milestones refused on the same fixture: %v", err)
+	}
+	if rows, children := f.counts(t); rows != 1 || children != 1 {
+		t.Fatalf("valid submit created rows=%d children=%d", rows, children)
+	}
+}
+
+// ccPreFixDigest returns the candidate digest the pre-fix service would have stored for the
+// fixture's candidate carrying the given canonical milestone bytes. It rebuilds the
+// service-side candidate (normalised, capability/tool sets sorted, inferred-capability
+// policy applied) and is sanity-checked against the digest of the real, valid round-1 row.
+func ccPreFixDigest(t *testing.T, f gatedFixture, valid store.CrossCheck, milestones []byte) []byte {
+	t.Helper()
+	cand, err := NormalizePlanCrossCheckCandidate(f.c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cand.RequiredCapabilities = applyInferredCapabilityPolicy(mustRun(t, f.env, f.lead), sortedSet(cand.RequiredCapabilities))
+	cand.RequiredTools = sortedSet(cand.RequiredTools)
+	if got, err := cand.Digest(); err != nil || hex.EncodeToString(got) != hex.EncodeToString(valid.CandidateDigest) {
+		t.Fatalf("digest helper disagrees with the service: got %x err=%v want %x", got, err, valid.CandidateDigest)
+	}
+	cand.Milestones = milestones
+	d, err := cand.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 func TestCrossCheckMilestoneAdmissionRefusesWithoutRowOrChildLiveDB(t *testing.T) {
 	for _, tc := range invalidMilestoneLists {
 		t.Run("automatic "+tc.name, func(t *testing.T) {
@@ -72,6 +102,7 @@ func TestCrossCheckMilestoneAdmissionRefusesWithoutRowOrChildLiveDB(t *testing.T
 			if rows, children := f.counts(t); rows != 0 || children != 0 {
 				t.Fatalf("refused submit created rows=%d children=%d", rows, children)
 			}
+			ccValidSubmitSucceeds(t, f)
 		})
 		t.Run("gated "+tc.name, func(t *testing.T) {
 			f := newGatedFixture(t, 2)
@@ -83,6 +114,7 @@ func TestCrossCheckMilestoneAdmissionRefusesWithoutRowOrChildLiveDB(t *testing.T
 			if rows, children := f.counts(t); rows != 0 || children != 0 {
 				t.Fatalf("refused gated submit created rows=%d children=%d", rows, children)
 			}
+			ccValidSubmitSucceeds(t, f)
 		})
 	}
 }
@@ -95,18 +127,29 @@ func TestCrossCheckMilestoneAdmissionPreFixAttemptLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ccApprove(t, f, cc, "approve")
-			// Simulate an attempt admitted before the fix: the stored milestones are invalid.
-			f.env.exec(`UPDATE cross_checks SET milestones=$2::jsonb WHERE id=$1`, cc.ID, tc.raw)
+			f.decide(t, cc, "revise")
+			// Simulate an attempt admitted before the fix: the row stores the invalid list in
+			// canonical form (as the pre-fix normaliser produced it) and the digest of that
+			// same candidate, so on the pre-fix service a same-round resubmit is a clean replay.
+			var generic any
+			if err := json.Unmarshal([]byte(tc.raw), &generic); err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := json.Marshal(generic)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := ccPreFixDigest(t, f, cc, canonical)
+			f.env.exec(`UPDATE cross_checks SET milestones=$2::jsonb, candidate_digest=$3 WHERE id=$1`, cc.ID, string(canonical), digest)
 			before := ccAdmissionSnapshot(t, f, 1)
 
 			c := f.c
 			c.Milestones = json.RawMessage(tc.raw)
-			if _, err := f.svc.SubmitPlanCrossCheck(f.env.ctx, f.w, f.lead, 1, c, 1); !errors.Is(err, ErrCrossCheckRefused) {
-				t.Fatalf("same-round resubmission of invalid list: %v", err)
-			}
-			if _, err := f.svc.SubmitPlanCrossCheck(f.env.ctx, f.w, f.lead, 1, c, 2); !errors.Is(err, ErrCrossCheckRefused) {
-				t.Fatalf("round 2 with invalid list: %v", err)
+			for _, round := range []int32{1, 2} {
+				_, err := f.svc.SubmitPlanCrossCheck(f.env.ctx, f.w, f.lead, 1, c, round)
+				if !errors.Is(err, ErrCrossCheckRefused) || errors.Is(err, ErrCrossCheckInterrupted) {
+					t.Fatalf("round %d resubmission of invalid list: want admission refusal, got %v", round, err)
+				}
 			}
 			if rows, children := f.counts(t); rows != 1 || children != 1 {
 				t.Fatalf("resubmission created rows=%d children=%d", rows, children)
@@ -122,12 +165,15 @@ func TestCrossCheckMilestoneAdmissionPreFixAttemptLiveDB(t *testing.T) {
 			}
 			f.latest(t, 1)
 
-			// A running checked-plan write carrying the invalid list fails closed.
+			// A running checked-plan write carrying the invalid list fails closed. This is a
+			// pre-existing invariant kept for rollout, not a proof of the admission check: for
+			// the extra-key case the typed decode drops the key and the refusal comes from the
+			// plan-write SQL matching no row.
 			var invalid []Milestone
 			if err := json.Unmarshal([]byte(tc.raw), &invalid); err != nil {
 				t.Fatal(err)
 			}
-			_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(t, cc, "plan", invalid))
+			_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(cc, "plan", invalid))
 			if applied || !errors.Is(err, ErrInvalidState) {
 				t.Fatalf("running write with invalid list: applied=%v err=%v", applied, err)
 			}
@@ -183,8 +229,8 @@ func TestCrossCheckMilestoneAdmissionValidControlsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ccApprove(t, f, cc, "approve")
-		_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(t, cc, "plan", []Milestone{}))
+		f.decide(t, cc, "approve")
+		_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(cc, "plan", []Milestone{}))
 		if err != nil || !applied {
 			t.Fatalf("running write: applied=%v err=%v", applied, err)
 		}
@@ -200,8 +246,8 @@ func TestCrossCheckMilestoneAdmissionValidControlsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ccApprove(t, f, cc, "approve")
-		_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(t, cc, "plan", want))
+		f.decide(t, cc, "approve")
+		_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(cc, "plan", want))
 		if err != nil || !applied {
 			t.Fatalf("running write: applied=%v err=%v", applied, err)
 		}
@@ -217,7 +263,7 @@ func TestCrossCheckMilestoneAdmissionValidControlsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ccApprove(t, f, cc1, "revise")
+		f.decide(t, cc1, "revise")
 
 		// An invalid round-2 candidate is refused and leaves round 1 alone.
 		bad := f.c
@@ -236,8 +282,8 @@ func TestCrossCheckMilestoneAdmissionValidControlsLiveDB(t *testing.T) {
 		if err != nil || cc2.Round != 2 {
 			t.Fatalf("round 2: round=%d err=%v", cc2.Round, err)
 		}
-		ccApprove(t, f, cc2, "approve")
-		_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(t, cc2, "revised plan", final))
+		f.decide(t, cc2, "approve")
+		_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(cc2, "revised plan", final))
 		if err != nil || !applied {
 			t.Fatalf("running write: applied=%v err=%v", applied, err)
 		}
