@@ -490,6 +490,11 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	// PRD #4416 M2: the run-env claim assembly and the maintenance read. Part of Store so production can never
+	// skip the step on a store lacking them (*store.Queries satisfies both).
+	runEnvReader
+	runEnvReceiptReader
+	ListRunEnvSweepUsers(ctx context.Context, arg store.ListRunEnvSweepUsersParams) ([]uuid.UUID, error)
 	GetWorkerProjectionForOwner(context.Context, store.GetWorkerProjectionForOwnerParams) (store.GetWorkerProjectionForOwnerRow, error)
 	GetRunByIDForUpdate(context.Context, uuid.UUID) (store.Run, error)
 	PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error)
@@ -2227,6 +2232,9 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// runEnvSweepCursor is the last user the retired-variable sweep reached (PRD #4416 M2), guarded by runEnvSweepMu.
+	runEnvSweepMu     sync.Mutex
+	runEnvSweepCursor uuid.UUID
 	// registerAfterBegin is a test seam (nil in production): Register calls it right after its
 	// transaction BEGINs and before it locks the worker row, so a test can pause a registration whose
 	// now() is already fixed while a credential-switch hold is stamped behind it.

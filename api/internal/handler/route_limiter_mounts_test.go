@@ -1034,6 +1034,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/{round}", noLimiter},
 	{"POST", "/api/worker/runs/{id}/cross-check-verdict", noLimiter},
+	{"GET", "/api/worker/runs/{id}/run-env-redact", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the
 	// intent idempotency + the plan stale-write guard rather than a per-user limiter.

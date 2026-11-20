@@ -118,6 +118,9 @@ func (tx *scopedClaimTx) QueryRow(_ context.Context, sql string, args ...any) pg
 		return scopedClaimRow{err: pgx.ErrNoRows}
 	case "LockSecretEnablementForShareNowait":
 		return scopedClaimRow{value: false}
+	case "LockUserVaultStateForShareNowait":
+		// Lead-lane fixture runs take the owner share lock in the finish transaction (PRD #4416 M2).
+		return scopedClaimRow{value: store.LockUserVaultStateForShareNowaitRow{}}
 	case "GetUserCredentialsResetAt":
 		// Scoped-claim fixture users have never redeemed a reset link (NULL marker).
 		return scopedClaimRow{value: pgtype.Timestamptz{}}
@@ -157,7 +160,9 @@ func (tx *scopedClaimTx) Query(_ context.Context, sql string, _ ...any) (pgx.Row
 		if tx.afterTargets != nil {
 			tx.afterTargets()
 		}
-	case "ListWorkerPendingSince", "ListFreshWorkerPendingOutcomeSince", "LockOpenCustodyHoldsForRunWorkerGeneration":
+	case "ListWorkerPendingSince", "ListFreshWorkerPendingOutcomeSince", "LockOpenCustodyHoldsForRunWorkerGeneration",
+		// The fixture repo has no variables: the finish recomputation is empty (PRD #4416 M2).
+		"ListRunEnvEffectiveKeysForRun", "ListRunEnvRedactKeysForRun":
 	default:
 		return nil, fmt.Errorf("unexpected collection query %s", strings.Fields(sql)[2])
 	}

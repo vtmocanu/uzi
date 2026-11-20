@@ -204,11 +204,22 @@ type fakeStore struct {
 	// PRD #1732 D14: claimSecretDisabled is what the finisher's enablement re-check reads for
 	// the resolved credential; claimSecretLockErrs is consumed one per re-check (55P03
 	// staging); claimCredParked records the COMMITTED credential_disabled park.
-	claimSecretDisabled   bool
-	claimSecretLockErrs   []error
-	claimSecretChecks     int
-	claimCredParked       *store.ParkCredentialDisabledRunParams
-	claimOverrideParked   *store.ParkRunOverrideUnavailableRunParams
+	claimSecretDisabled bool
+	claimSecretLockErrs []error
+	claimSecretChecks   int
+	claimCredParked     *store.ParkCredentialDisabledRunParams
+	claimOverrideParked *store.ParkRunOverrideUnavailableRunParams
+	// PRD #4416 M2 run-env finish state: the owner share lock (calls and a queued error), the canned
+	// key recomputations, the committed receipts and the history-unavailable park.
+	runEnvLockCalls  int
+	runEnvLockErrs   []error
+	runEnvLiveKeys   []store.ListRunEnvEffectiveKeysForRunRow
+	runEnvRedactKeys []store.ListRunEnvRedactKeysForRunRow
+	runEnvReceipts   []store.UpsertRunEnvReceiptParams
+	// runEnvLive / runEnvRedact are what assembly reads (ListRunEnvEffectiveForRun / ListRunEnvRedactForRun).
+	runEnvLive            []store.ListRunEnvEffectiveForRunRow
+	runEnvRedact          []store.ListRunEnvRedactForRunRow
+	claimRunEnvParked     *store.ParkRunEnvHistoryUnavailableRunParams
 	claimOverrideMessages []store.InsertRunOverrideUnavailableMessageParams
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
@@ -839,6 +850,15 @@ func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams
 }
 func (f *fakeStore) ParkCredentialDisabledChatRun(context.Context, store.ParkCredentialDisabledChatRunParams) (int64, error) {
 	return 1, nil
+}
+func (f *fakeStore) ListRunEnvEffectiveForRun(context.Context, uuid.UUID) ([]store.ListRunEnvEffectiveForRunRow, error) {
+	return f.runEnvLive, nil
+}
+func (f *fakeStore) ListRunEnvRedactForRun(context.Context, uuid.UUID) ([]store.ListRunEnvRedactForRunRow, error) {
+	return f.runEnvRedact, nil
+}
+func (f *fakeStore) ListRunEnvSecretReceiptVersionsForRun(context.Context, uuid.UUID) ([]store.ListRunEnvSecretReceiptVersionsForRunRow, error) {
+	return nil, nil
 }
 func (f *fakeStore) GetUserCredentialsResetAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, nil

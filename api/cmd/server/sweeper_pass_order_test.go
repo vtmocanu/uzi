@@ -69,3 +69,26 @@ func TestHibernationAutoPassRunsBetweenSettleAndWake(t *testing.T) {
 		t.Fatal("worker_hibernation_auto must be listed after worker_hibernation_settle and before worker_hibernation_wake (issue #4207)")
 	}
 }
+
+// TestRunEnvRetiredSweepRunsAfterTerminalPreservation pins PRD #4416 M2: the retired repo variable
+// sweep is registered, and listed after terminal_preservation, so a preservation that reached a final
+// state on this tick no longer holds its run when the sweep reads the hold predicate. A source-order scan
+// of the inline pass slice in main.go, like its siblings above.
+func TestRunEnvRetiredSweepRunsAfterTerminalPreservation(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	terminal := strings.Index(text, `Name: "terminal_preservation"`)
+	sweep := strings.Index(text, `Name: "run_env_retired_sweep"`)
+	if terminal < 0 || sweep < 0 {
+		t.Fatalf("pass names not found in main.go (terminal_preservation %d, run_env_retired_sweep %d); update this test if they were renamed", terminal, sweep)
+	}
+	if sweep < terminal {
+		t.Fatal("run_env_retired_sweep must be listed AFTER terminal_preservation (PRD #4416 M2)")
+	}
+	if strings.Count(text, `Name: "run_env_retired_sweep"`) != 1 {
+		t.Fatal("run_env_retired_sweep must be registered exactly once")
+	}
+}
