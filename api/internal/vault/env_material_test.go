@@ -23,6 +23,11 @@ type envFixtureRow struct {
 	name   string
 	secret bool
 	plain  string
+	// v2 seals the row under the version 2 context, which also binds varID and rev (set by
+	// seedEnv); false is an M1 row under version 1.
+	v2    bool
+	varID uuid.UUID
+	rev   int32
 }
 
 func (r envFixtureRow) scope() string {
@@ -32,12 +37,28 @@ func (r envFixtureRow) scope() string {
 	return runenv.ScopeRepo
 }
 
-func (r envFixtureRow) kind() string { return runenv.AADKind(r.scope(), r.repo, r.secret, r.name) }
+func (r envFixtureRow) aadVersion() int16 {
+	if r.v2 {
+		return runenv.AADVersion2
+	}
+	return runenv.AADVersion1
+}
+
+func (r envFixtureRow) kind() string {
+	kind, err := runenv.AADFor(int(r.aadVersion()), r.scope(), r.repo, r.secret, r.name, r.varID, int(r.rev))
+	if err != nil {
+		panic(err)
+	}
+	return kind
+}
 
 // seedEnv seals each row with the real seam and stages it in the fake.
 func seedEnv(t *testing.T, v *Vault, st *fakeVaultStore, uid uuid.UUID, rows []envFixtureRow) []envFixtureRow {
 	t.Helper()
 	for i := range rows {
+		if rows[i].v2 {
+			rows[i].varID, rows[i].rev = uuid.New(), int32(i+2) //nolint:gosec // G115: a handful of fixture rows.
+		}
 		m, err := v.Seal(context.Background(), uid, rows[i].kind(), []byte(rows[i].plain), SealForUse)
 		if err != nil {
 			t.Fatal(err)
@@ -49,7 +70,8 @@ func seedEnv(t *testing.T, v *Vault, st *fakeVaultStore, uid uuid.UUID, rows []e
 		}
 		st.mu.Lock()
 		st.envs = append(st.envs, &fakeEnv{id: rows[i].id, userID: uid, repoID: repo, name: rows[i].name,
-			secret: rows[i].secret, ciphertext: m.Ciphertext, sealedWith: m.SealedWith})
+			secret: rows[i].secret, ciphertext: m.Ciphertext, sealedWith: m.SealedWith,
+			aadVersion: rows[i].aadVersion(), varID: rows[i].varID, rev: rows[i].rev})
 		st.mu.Unlock()
 	}
 	return rows
@@ -70,10 +92,10 @@ func fixtureEnvRows() []envFixtureRow {
 	repoA, repoB := uuid.New(), uuid.New()
 	return []envFixtureRow{
 		{repo: &repoA, name: "PAYMENTS_SANDBOX_KEY", secret: true, plain: "sk_test_dummy_value_1"},
-		{repo: &repoA, name: "PAYMENTS_SANDBOX_URL", secret: false, plain: "https://sandbox.example.test"},
-		{repo: &repoB, name: "PAYMENTS_SANDBOX_KEY", secret: true, plain: "sk_test_dummy_value_2"},
+		{repo: &repoA, name: "PAYMENTS_SANDBOX_URL", secret: false, plain: "https://sandbox.example.test", v2: true},
+		{repo: &repoB, name: "PAYMENTS_SANDBOX_KEY", secret: true, plain: "sk_test_dummy_value_2", v2: true},
 		{repo: nil, name: "SHARED_TOKEN", secret: true, plain: "user-scope-secret-1"},
-		{repo: &repoB, name: "EMPTY_PLAIN", secret: false, plain: ""},
+		{repo: &repoB, name: "EMPTY_PLAIN", secret: false, plain: "", v2: true},
 	}
 }
 
@@ -400,6 +422,38 @@ func TestEnvCiphertextCannotMoveBetweenContexts(t *testing.T) {
 	other := uuid.New()
 	if _, err := v.Open(other, base.kind(), m.SealedWith, m.Ciphertext); err == nil {
 		t.Error("ciphertext opened for another owner")
+	}
+}
+
+// A version 2 ciphertext binds var_id and rev: the ciphertext of revision 1 copied into the
+// row of revision 2 of the same variable (same name, repo, scope and flag) does not open.
+func TestEnvV2CiphertextCannotMoveBetweenRevisions(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	ctx := context.Background()
+	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 1}
+	repo := uuid.New()
+	varID := uuid.New()
+	rev1 := envFixtureRow{repo: &repo, name: "TOKEN_A", secret: true, plain: "revision-one-secret", v2: true, varID: varID, rev: 1}
+	rev2 := envFixtureRow{repo: &repo, name: "TOKEN_A", secret: true, plain: "revision-two-secret", v2: true, varID: varID, rev: 2}
+	m1, err := v.Seal(ctx, uid, rev1.kind(), []byte(rev1.plain), SealForUse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := v.Seal(ctx, uid, rev2.kind(), []byte(rev2.plain), SealForUse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := v.Open(uid, rev2.kind(), m2.SealedWith, m2.Ciphertext); err != nil || string(got) != rev2.plain {
+		t.Fatalf("control open of revision 2 failed: %q, %v", got, err)
+	}
+	if got, err := v.Open(uid, rev2.kind(), m1.SealedWith, m1.Ciphertext); err == nil {
+		t.Fatalf("revision 1 ciphertext opened in the revision 2 row: %q", got)
+	}
+	other := rev2
+	other.varID = uuid.New()
+	if got, err := v.Open(uid, other.kind(), m2.SealedWith, m2.Ciphertext); err == nil {
+		t.Fatalf("ciphertext opened under another var_id: %q", got)
 	}
 }
 

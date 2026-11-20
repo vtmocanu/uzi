@@ -267,7 +267,12 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 					id := uuid.UUID(row.RepoID.Bytes)
 					scope, repoID = runenv.ScopeRepo, &id
 				}
-				kind := runenv.AADKind(scope, repoID, row.Secret, row.Name)
+				// The row's own AAD version decides the context it is opened under, and the
+				// reseal below leaves the version alone, so a version 1 row stays version 1.
+				kind, err := runenv.AADFor(int(row.AadVersion), scope, repoID, row.Secret, row.Name, row.VarID, int(row.Rev))
+				if err != nil {
+					return fmt.Errorf("vault: run env row %s: %w", row.ID, ErrInvalidState)
+				}
 				ciphertext, marker, err := v.convertCipher(userID, kind, row.Ciphertext, row.SealedWith, source, sourceBox, targetMode, targetEpoch, private, lazy)
 				if err != nil {
 					return err

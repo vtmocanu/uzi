@@ -49,7 +49,7 @@ func (q *Queries) DeleteRunEnvVarVersion(ctx context.Context, arg DeleteRunEnvVa
 
 const getLiveRunEnvVarByName = `-- name: GetLiveRunEnvVarByName :one
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
-       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND name = $3
   AND retired_at IS NULL AND pending_delete_at IS NULL
@@ -83,13 +83,14 @@ func (q *Queries) GetLiveRunEnvVarByName(ctx context.Context, arg GetLiveRunEnvV
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }
 
 const getLiveRunEnvVarByNameForUpdate = `-- name: GetLiveRunEnvVarByNameForUpdate :one
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
-       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND name = $3
   AND retired_at IS NULL AND pending_delete_at IS NULL
@@ -123,6 +124,7 @@ func (q *Queries) GetLiveRunEnvVarByNameForUpdate(ctx context.Context, arg GetLi
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }
@@ -184,10 +186,10 @@ func (q *Queries) GetRunEnvScopeUsage(ctx context.Context, arg GetRunEnvScopeUsa
 
 const insertRunEnvVar = `-- name: InsertRunEnvVar :one
 INSERT INTO run_env_vars (var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with,
-                          value_bytes, rev, disabled_at)
+                          aad_version, value_bytes, rev, disabled_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-        $9, $10, $11)
-RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
+        $9, $10, $11, $12)
+RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, aad_version, value_bytes, rev,
           disabled_at, pending_delete_at, created_at, updated_at
 `
 
@@ -200,6 +202,7 @@ type InsertRunEnvVarParams struct {
 	Description string             `json:"description"`
 	Ciphertext  []byte             `json:"ciphertext"`
 	SealedWith  string             `json:"sealed_with"`
+	AadVersion  int16              `json:"aad_version"`
 	ValueBytes  int32              `json:"value_bytes"`
 	Rev         int32              `json:"rev"`
 	DisabledAt  pgtype.Timestamptz `json:"disabled_at"`
@@ -213,6 +216,7 @@ type InsertRunEnvVarRow struct {
 	Description     string             `json:"description"`
 	Ciphertext      []byte             `json:"ciphertext"`
 	SealedWith      string             `json:"sealed_with"`
+	AadVersion      int16              `json:"aad_version"`
 	ValueBytes      int32              `json:"value_bytes"`
 	Rev             int32              `json:"rev"`
 	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
@@ -231,6 +235,7 @@ func (q *Queries) InsertRunEnvVar(ctx context.Context, arg InsertRunEnvVarParams
 		arg.Description,
 		arg.Ciphertext,
 		arg.SealedWith,
+		arg.AadVersion,
 		arg.ValueBytes,
 		arg.Rev,
 		arg.DisabledAt,
@@ -244,6 +249,7 @@ func (q *Queries) InsertRunEnvVar(ctx context.Context, arg InsertRunEnvVarParams
 		&i.Description,
 		&i.Ciphertext,
 		&i.SealedWith,
+		&i.AadVersion,
 		&i.ValueBytes,
 		&i.Rev,
 		&i.DisabledAt,
@@ -291,7 +297,7 @@ func (q *Queries) ListRunEnvVarCountsForUser(ctx context.Context, userID uuid.UU
 
 const listRunEnvVarsForRepo = `-- name: ListRunEnvVarsForRepo :many
 
-SELECT id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
+SELECT id, var_id, name, secret, description, ciphertext, sealed_with, aad_version, value_bytes, rev,
        disabled_at, pending_delete_at, created_at, updated_at
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND retired_at IS NULL
@@ -311,6 +317,7 @@ type ListRunEnvVarsForRepoRow struct {
 	Description     string             `json:"description"`
 	Ciphertext      []byte             `json:"ciphertext"`
 	SealedWith      string             `json:"sealed_with"`
+	AadVersion      int16              `json:"aad_version"`
 	ValueBytes      int32              `json:"value_bytes"`
 	Rev             int32              `json:"rev"`
 	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
@@ -341,6 +348,7 @@ func (q *Queries) ListRunEnvVarsForRepo(ctx context.Context, arg ListRunEnvVarsF
 			&i.Description,
 			&i.Ciphertext,
 			&i.SealedWith,
+			&i.AadVersion,
 			&i.ValueBytes,
 			&i.Rev,
 			&i.DisabledAt,
@@ -414,7 +422,7 @@ UPDATE run_env_vars
 SET disabled_at = CASE WHEN $1::boolean THEN coalesce(disabled_at, now()) ELSE NULL END,
     updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
+RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, aad_version, value_bytes, rev,
           disabled_at, pending_delete_at, created_at, updated_at
 `
 
@@ -432,6 +440,7 @@ type SetRunEnvVarDisabledRow struct {
 	Description     string             `json:"description"`
 	Ciphertext      []byte             `json:"ciphertext"`
 	SealedWith      string             `json:"sealed_with"`
+	AadVersion      int16              `json:"aad_version"`
 	ValueBytes      int32              `json:"value_bytes"`
 	Rev             int32              `json:"rev"`
 	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
@@ -452,6 +461,7 @@ func (q *Queries) SetRunEnvVarDisabled(ctx context.Context, arg SetRunEnvVarDisa
 		&i.Description,
 		&i.Ciphertext,
 		&i.SealedWith,
+		&i.AadVersion,
 		&i.ValueBytes,
 		&i.Rev,
 		&i.DisabledAt,
@@ -465,7 +475,7 @@ func (q *Queries) SetRunEnvVarDisabled(ctx context.Context, arg SetRunEnvVarDisa
 const updateRunEnvVarDescription = `-- name: UpdateRunEnvVarDescription :one
 UPDATE run_env_vars SET description = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
+RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, aad_version, value_bytes, rev,
           disabled_at, pending_delete_at, created_at, updated_at
 `
 
@@ -483,6 +493,7 @@ type UpdateRunEnvVarDescriptionRow struct {
 	Description     string             `json:"description"`
 	Ciphertext      []byte             `json:"ciphertext"`
 	SealedWith      string             `json:"sealed_with"`
+	AadVersion      int16              `json:"aad_version"`
 	ValueBytes      int32              `json:"value_bytes"`
 	Rev             int32              `json:"rev"`
 	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
@@ -503,6 +514,7 @@ func (q *Queries) UpdateRunEnvVarDescription(ctx context.Context, arg UpdateRunE
 		&i.Description,
 		&i.Ciphertext,
 		&i.SealedWith,
+		&i.AadVersion,
 		&i.ValueBytes,
 		&i.Rev,
 		&i.DisabledAt,

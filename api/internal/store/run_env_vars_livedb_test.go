@@ -52,7 +52,7 @@ func wantConstraint(t *testing.T, err error, code, constraint string) {
 }
 
 func TestRunEnvVarsConstraintsAndIndexesLiveDB(t *testing.T) {
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_receipts"))
 	user := cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
 	otherRepo := seedEnvRepo(t, pool, user).repo
@@ -88,7 +88,10 @@ func TestRunEnvVarsConstraintsAndIndexesLiveDB(t *testing.T) {
 	if err := envInsert(pool, user, s.repo, "TWO_VERSIONS", true, 2, v, "live"); err != nil {
 		t.Fatal(err)
 	}
-	wantConstraint(t, envInsert(pool, user, s.repo, "OTHER_NAME", true, 3, v, "live"), "23505", "run_env_vars_live_var_key")
+	// A second live version of one variable is refused. (Another name under the same var_id
+	// cannot reach run_env_vars_live_var_key any more: the identity trigger refuses it first,
+	// and under the same name the live-name index answers, so only the code is pinned.)
+	wantConstraint(t, envInsert(pool, user, s.repo, "TWO_VERSIONS", true, 3, v, "live"), "23505", "")
 
 	// CHECKs: name shape, only secrets are retained, sealed_with discriminator, sizes.
 	wantConstraint(t, envInsert(pool, user, s.repo, "lower", true, 1, uuid.New(), "live"), "23514", "run_env_vars_name_check")
@@ -109,7 +112,7 @@ func TestRunEnvVarsConstraintsAndIndexesLiveDB(t *testing.T) {
 }
 
 func TestRunEnvVarsCascadeLiveDB(t *testing.T) {
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_receipts"))
 	user, keep := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
 	other := seedEnvRepo(t, pool, user)
@@ -150,7 +153,7 @@ func TestRunEnvVarsCascadeLiveDB(t *testing.T) {
 
 func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_receipts"))
 	q := New(pool)
 	user, foreign := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
@@ -330,13 +333,13 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 
 func TestRunEnvVarWriteQueriesLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_receipts"))
 	q := New(pool)
 	user, foreign := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
 	repo := pgtype.UUID{Bytes: s.repo, Valid: true}
 	ins, err := q.InsertRunEnvVar(ctx, InsertRunEnvVarParams{VarID: uuid.New(), UserID: user, RepoID: repo, Name: "TOKEN_X", Secret: true,
-		Description: "first", Ciphertext: []byte("c"), SealedWith: "master_aad", ValueBytes: 9, Rev: 1})
+		Description: "first", Ciphertext: []byte("c"), SealedWith: "master_aad", AadVersion: 2, ValueBytes: 9, Rev: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

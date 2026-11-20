@@ -81,6 +81,18 @@ type runEnvConflictError struct{ code, message string }
 
 func (e *runEnvConflictError) Error() string { return e.code + ": " + e.message }
 
+// runEnvHeldByLimit caps held_by_runs in an env_history_full answer.
+const runEnvHeldByLimit = 20
+
+// runEnvHistoryFullError is the env_history_full refusal of a rotation: it names (at most
+// runEnvHeldByLimit of) the runs whose receipts keep the version that would have been retired.
+type runEnvHistoryFullError struct {
+	message string
+	heldBy  []uuid.UUID
+}
+
+func (e *runEnvHistoryFullError) Error() string { return runEnvCodeHistoryFull + ": " + e.message }
+
 // runEnvHeadroomConflict turns a failed vault headroom check into the 409 a run-env save
 // answers with. The vault's own message talks about enabling or disabling the vault, which
 // is not what the caller is doing; any other error is returned unchanged (a 500).
@@ -143,10 +155,17 @@ func writeRunEnvConflict(w http.ResponseWriter, code, message string) {
 // writeRunEnvTxError maps an error out of a write transaction.
 func (h *Handler) writeRunEnvTxError(w http.ResponseWriter, err error, op string) {
 	var conflict *runEnvConflictError
+	var historyFull *runEnvHistoryFullError
 	var pgErr *pgconn.PgError
 	switch {
 	case h.writeVaultStale(w, err):
 	case h.writeVaultLocked(w, err):
+	case errors.As(err, &historyFull):
+		held := historyFull.heldBy
+		if held == nil {
+			held = []uuid.UUID{}
+		}
+		httpx.JSON(w, http.StatusConflict, map[string]any{"error": historyFull.message, "code": runEnvCodeHistoryFull, "held_by_runs": held})
 	case errors.As(err, &conflict):
 		writeRunEnvConflict(w, conflict.code, conflict.message)
 	case errors.Is(err, errRunEnvRepoGone), errors.As(err, &pgErr) && pgErr.Code == "23503":
@@ -205,7 +224,12 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 		dto.ValueWithheld = true
 		return dto, false
 	}
-	kind := runenv.AADKind(runenv.ScopeRepo, &repoID, row.Secret, row.Name)
+	kind, err := runenv.AADFor(int(row.AadVersion), runenv.ScopeRepo, &repoID, row.Secret, row.Name, row.VarID, int(row.Rev))
+	if err != nil {
+		slog.Error("run env aad version", "error", err)
+		dto.ValueWithheld = true
+		return dto, false
+	}
 	plain, err := h.vault.Open(userID, kind, row.SealedWith, row.Ciphertext)
 	if err != nil {
 		dto.ValueWithheld = true
@@ -284,9 +308,8 @@ type putRunEnvRequest struct {
 	Description *string `json:"description"`
 }
 
-// receiptHeld asks whether any run holds a delivery receipt for one version. M1 has
-// no receipts (store.RunEnvVersionHasReceipt answers false); tests replace the seam to
-// reach the retire and pending-deletion paths.
+// receiptHeld asks whether any run holds a secret delivery receipt for one version
+// (store.RunEnvVersionHasReceipt); tests may replace the seam.
 func (h *Handler) receiptHeld(ctx context.Context, q *store.Queries, varID uuid.UUID, rev int32) (bool, error) {
 	if h.runEnvHasReceipt != nil {
 		return h.runEnvHasReceipt(ctx, varID, rev)
@@ -389,7 +412,13 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		old, openErr := h.vault.Open(userID, runenv.AADKind(runenv.ScopeRepo, &repoID, cur.Secret, name), cur.SealedWith, cur.Ciphertext)
+		oldKind, aadErr := runenv.AADFor(int(cur.AadVersion), runenv.ScopeRepo, &repoID, cur.Secret, name, cur.VarID, int(cur.Rev))
+		if aadErr != nil {
+			slog.Error("run env aad version", "error", aadErr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		old, openErr := h.vault.Open(userID, oldKind, cur.SealedWith, cur.Ciphertext)
 		if openErr != nil {
 			if h.writeVaultLocked(w, openErr) {
 				return
@@ -409,7 +438,14 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	material, err := h.vault.Seal(ctx, userID, runenv.AADKind(runenv.ScopeRepo, &repoID, secret, name), value, vault.SealForUse)
+	// The version 2 context binds the variable id and the revision, so both are fixed before
+	// the seal: a new variable mints its id at revision 1, a new version is the live
+	// version's id at the next revision (the transaction below refuses a row that moved).
+	newVarID, newRev := uuid.New(), int32(1)
+	if exists {
+		newVarID, newRev = cur.VarID, cur.Rev+1
+	}
+	material, err := h.vault.Seal(ctx, userID, runenv.AADKindV2(runenv.ScopeRepo, &repoID, secret, name, newVarID, int(newRev)), value, vault.SealForUse)
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -454,7 +490,9 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		}
 		params := store.InsertRunEnvVarParams{
 			UserID: userID, RepoID: repo, Name: name, Secret: secret, Description: description,
-			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith, ValueBytes: int32(newBytes), //nolint:gosec // G115: bounded to 65536 by ValidateValue.
+			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith, AadVersion: runenv.AADVersion2,
+			ValueBytes: int32(newBytes), //nolint:gosec // G115: bounded to 65536 by ValidateValue.
+			VarID:      newVarID, Rev: newRev,
 		}
 		if !exists {
 			if usage.LiveCount+usage.PendingCount >= runenv.MaxVarsPerScope {
@@ -466,7 +504,6 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
 				return runEnvHeadroomConflict(runEnvCodeLimitReached, err)
 			}
-			params.VarID, params.Rev = uuid.New(), 1
 		} else {
 			if usage.ValueBytes-int64(live.ValueBytes)+newBytes > runenv.MaxScopeValueBytes {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("the variables of this repo may hold at most %d bytes of values", runenv.MaxScopeValueBytes)}
@@ -485,7 +522,11 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 				if retired.RetiredCount+1 > runenv.MaxRetiredVersions || retired.ValueBytes+int64(live.ValueBytes) > runenv.MaxRetiredValueBytes {
-					return &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)}
+					holders, err := q.ListRunsHoldingRunEnvVersion(ctx, store.ListRunsHoldingRunEnvVersionParams{VarID: live.VarID, Rev: live.Rev, MaxRuns: runEnvHeldByLimit})
+					if err != nil {
+						return err
+					}
+					return &runEnvHistoryFullError{heldBy: holders, message: fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)}
 				}
 				if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
 					return runEnvHeadroomConflict(runEnvCodeHistoryFull, err)
@@ -508,7 +549,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 			}
-			params.VarID, params.Rev, params.DisabledAt = live.VarID, live.Rev+1, live.DisabledAt
+			params.DisabledAt = live.DisabledAt
 		}
 		inserted, err := q.InsertRunEnvVar(ctx, params)
 		if err != nil {
@@ -535,7 +576,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWriter, userID, repoID uuid.UUID, cur store.RunEnvVar, description string) {
 	row := runEnvRow{
 		ID: cur.ID, VarID: cur.VarID, Name: cur.Name, Secret: cur.Secret, Description: cur.Description,
-		Ciphertext: cur.Ciphertext, SealedWith: cur.SealedWith, ValueBytes: cur.ValueBytes, Rev: cur.Rev,
+		Ciphertext: cur.Ciphertext, SealedWith: cur.SealedWith, AadVersion: cur.AadVersion, ValueBytes: cur.ValueBytes, Rev: cur.Rev,
 		DisabledAt: cur.DisabledAt, PendingDeleteAt: cur.PendingDeleteAt, CreatedAt: cur.CreatedAt, UpdatedAt: cur.UpdatedAt,
 	}
 	if description != cur.Description {
@@ -675,6 +716,7 @@ func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 	if state == apitypes.RunEnvStatePendingDeletion {
 		status = http.StatusAccepted
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, status, apitypes.RunEnvDeleteDTO{State: state})
 }
 

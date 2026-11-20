@@ -1028,7 +1028,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountAdminRoutes(r, forgeLimiter, authLimiter)
 		h.mountForgeRoutes(r, forgeLimiter)
 		h.mountIssueTrackerRoutes(r, forgeLimiter)
-		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
+		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter, authLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
 		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
 		// only) and a per-user limit; read mountV1Routes before adding anything here.

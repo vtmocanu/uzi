@@ -35,6 +35,10 @@ type fakeEnv struct {
 	secret     bool
 	ciphertext []byte
 	sealedWith string
+	// aadVersion 0 reads as version 1 (the M1 rows); varID and rev matter for version 2.
+	aadVersion int16
+	varID      uuid.UUID
+	rev        int32
 }
 
 type fakeVaultStore struct {

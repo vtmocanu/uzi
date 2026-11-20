@@ -107,8 +107,9 @@ ORDER BY b.id;
 
 -- name: LockVaultEnvMaterialBatch :many
 -- Locks the given candidate ids (PRD #4416). Ids that no longer exist are simply absent.
--- Every row is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
-SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with
+-- Every row is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name,
+-- and, for aad_version 2, var_id and rev.
+SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with, e.aad_version, e.var_id, e.rev
 FROM run_env_vars e
 WHERE e.user_id = @user_id AND e.id = ANY(@ids::uuid[])
 ORDER BY e.id

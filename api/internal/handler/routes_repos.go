@@ -13,7 +13,7 @@ import (
 // mountRepoRoutes registers the repos group: list/run-create/task-run/remove/
 // schedules on RequireUser, and the cookie-only board, project-sync and issue
 // routes on RequireAuth.
-func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter *mw.Limiter) {
+func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter, authLimiter *mw.Limiter) {
 	// Repos (PRD #64): GET / (uzi repo list), POST /{id}/runs (uzi run create) and
 	// POST /{id}/task-runs (uzi handoff) are RequireUser; every other repo route is
 	// cookie-only. PATCH /{id} is the F1 admin-write path (repo_skills_enabled /
@@ -143,11 +143,13 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
 			r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 			// Per-repo environment variable writes (PRD #4416): cookie and CSRF only, like every
-			// secret write. Owner-only behind the same preflight as the tool profile.
-			r.Put("/{id}/env/{name}", h.PutRepoEnvVar)
-			r.Post("/{id}/env/{name}/disable", h.DisableRepoEnvVar)
-			r.Post("/{id}/env/{name}/enable", h.EnableRepoEnvVar)
-			r.Delete("/{id}/env/{name}", h.DeleteRepoEnvVar)
+			// secret write. Owner-only behind the same preflight as the tool profile. Each write
+			// runs the vault fence and the history-budget reads, so authLimiter (the per-user
+			// budget the other secret writes use) runs after RequireUser.
+			r.With(authLimiter.PerUserMiddleware).Put("/{id}/env/{name}", h.PutRepoEnvVar)
+			r.With(authLimiter.PerUserMiddleware).Post("/{id}/env/{name}/disable", h.DisableRepoEnvVar)
+			r.With(authLimiter.PerUserMiddleware).Post("/{id}/env/{name}/enable", h.EnableRepoEnvVar)
+			r.With(authLimiter.PerUserMiddleware).Delete("/{id}/env/{name}", h.DeleteRepoEnvVar)
 			r.Get("/{id}/board", h.GetBoard)
 			// Per-user, per-repo board view preferences (PRD #196 M3): the
 			// membership extras override and "show all other issues" toggle, moved

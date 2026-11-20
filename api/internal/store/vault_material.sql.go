@@ -224,7 +224,7 @@ func (q *Queries) LockVaultEnvConnectionsKeyShare(ctx context.Context, userID uu
 }
 
 const lockVaultEnvMaterialBatch = `-- name: LockVaultEnvMaterialBatch :many
-SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with
+SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with, e.aad_version, e.var_id, e.rev
 FROM run_env_vars e
 WHERE e.user_id = $1 AND e.id = ANY($2::uuid[])
 ORDER BY e.id
@@ -243,10 +243,14 @@ type LockVaultEnvMaterialBatchRow struct {
 	Secret     bool        `json:"secret"`
 	Ciphertext []byte      `json:"ciphertext"`
 	SealedWith string      `json:"sealed_with"`
+	AadVersion int16       `json:"aad_version"`
+	VarID      uuid.UUID   `json:"var_id"`
+	Rev        int32       `json:"rev"`
 }
 
 // Locks the given candidate ids (PRD #4416). Ids that no longer exist are simply absent.
-// Every row is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
+// Every row is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name,
+// and, for aad_version 2, var_id and rev.
 func (q *Queries) LockVaultEnvMaterialBatch(ctx context.Context, arg LockVaultEnvMaterialBatchParams) ([]LockVaultEnvMaterialBatchRow, error) {
 	rows, err := q.db.Query(ctx, lockVaultEnvMaterialBatch, arg.UserID, arg.Ids)
 	if err != nil {
@@ -263,6 +267,9 @@ func (q *Queries) LockVaultEnvMaterialBatch(ctx context.Context, arg LockVaultEn
 			&i.Secret,
 			&i.Ciphertext,
 			&i.SealedWith,
+			&i.AadVersion,
+			&i.VarID,
+			&i.Rev,
 		); err != nil {
 			return nil, err
 		}
