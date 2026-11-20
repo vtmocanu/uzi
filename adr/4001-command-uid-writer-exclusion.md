@@ -490,8 +490,10 @@ failover. The API cannot verify replication topology or `fsync` by itself
 - A synchronous wait cut short by the transaction's own timeout commits
   locally. The check above treats it like any unflushed commit.
 
-**Recommendation:** adopt the mechanism once the replay reading is confirmed,
-and accept the topology and `fsync` trust as an owner decision.
+**Recommendation:** adopt the mechanism only once every open problem above
+is closed (the replay reading confirmed, server visibility of an unflushed
+release prevented, promotion admission preserving acknowledged history), and
+accept the topology and `fsync` trust as an owner decision.
 **Alternative:** keep the gate.
 
 ## Mechanism: the compound proof (requirement 1)
@@ -822,7 +824,9 @@ lock.
     Postgres.
 
   This is pending item P-6, whose candidate mechanism and open problems
-  (replay of a withheld ACK, promotion-set coverage) are stated there. Until
+  (replay of a withheld ACK, promotion-set coverage, server visibility of an
+  unflushed release, promotion admission after the final re-read) are
+  stated there. Until
   it closes, the server fence's durability claims are not established.
 - **Storage or power loss.**
   - This relies on Postgres `fsync=on` and `synchronous_commit=on`.
@@ -1000,8 +1004,9 @@ under today's contracts. #4494 Direction 1 motivates it but supplies nothing.
 
 **Capture versus release-authorizing evidence.**
 - An available capture is not release authority. Only the ADR-1296 release
-  evidence classes close a hold, and D5's thin archive FINAL refusal stays in
-  force: a thin capture cannot authorize an archive-backed FINAL.
+  evidence classes close a hold. D5's thin archive FINAL refusal was narrowed
+  by #3727 C2 to a pinned prerequisite closure (ADR-1296's 2026-11-01
+  amendment); thin availability alone supplies no release authority.
 - A cutoff would therefore need release-authorizing evidence at the cut, not
   merely a capture, plus complete original root and head attribution for
   every claim generation through release. Today nothing binds post-cut bytes
@@ -1119,7 +1124,8 @@ may already hold on base.
   session, role or database default is off.
 - An ACK is withheld unless every standby in the vouched promotion set has
   flushed past the commit LSN, including a topology change between commit and
-  the flush check, and between the check and the ACK (P-6).
+  the flush check, and before the final version re-read (P-6). The window
+  after that re-read is the promotion-admission open problem.
 - A replay after a withheld ACK, with any promotion-set standby still
   behind, is withheld
   again (P-6, subject to the owner's D9.4 reading).
@@ -1207,8 +1213,10 @@ Approval alone does not close P-2, P-5 or P-6.
   - the lease, epoch fencing tokens, generations, superseded set, conditional
     release, replay precedence and conflict handling;
   - forced `synchronous_commit`, the promotion-set flush check on every ACK
-    path, the versioned promotion set, and operator-declared topology
-    evidence (or controller-read evidence, if P-6's authority is approved);
+    path, the versioned promotion set, server visibility rules for an
+    unflushed release, promotion admission preserving acknowledged history,
+    and operator-declared topology evidence (or controller-read evidence, if
+    P-6's authority is approved);
   - synchronized LiveDB race, lock-across-expiry and crash-point tests.
 
 **Controls and M4:** as specified above.
