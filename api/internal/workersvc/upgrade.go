@@ -859,7 +859,7 @@ type UpgradeFleetSummary struct {
 // of the app.
 //
 // The classification is the SAME ClassifyUpgrade the worker DTO uses, over the same
-// inputs. That matters more than the small duplication it avoids: if this endpoint
+// inputs, hibernation state included (#4514). That matters more than the small duplication it avoids: if this endpoint
 // counted with its own rules, the badge could say "1 needs attention" beside a list in
 // which nothing is badged, and no test comparing the two would exist to catch it.
 //
@@ -911,6 +911,7 @@ func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, c
 			Signal:              sig,
 			Now:                 now,
 			APIStartedAt:        apiStartedAt,
+			Hibernation:         row.HibernationState,
 		}, p)
 		if !InUpgradeAttentionSet(status) {
 			continue
