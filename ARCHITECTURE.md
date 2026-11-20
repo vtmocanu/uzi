@@ -1876,7 +1876,7 @@ chain in the diagram above, with no intervening `running`.
   release, committed → generation-bound capture, unverifiable → retain), and
   owners can list retained holds and discard one exact held source
   (`GET /api/recovery/holds` + aggregate; `uzi run recovery` /
-  `uzi run discard`; a Dashboard board alert and Workers resolution surface),
+  `uzi run discard`; an Overview held-work card and Workers resolution surface),
   with the per-run custody Slack nudge coalesced into one owner-level
   blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
   [PRD #1296](prds/done/1296-durable-run-recovery.md),
@@ -3173,7 +3173,7 @@ Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
 
 ### Admin in-app health (PRD #1484)
 
-An admin-only, read-only Health tab, Overview card and `uzi admin health`
+An admin-only, read-only Health tab, Overview header health chip and `uzi admin health`
 show the full closed registry of checks over worker rolls/capacity, the queue,
 the controller's own liveness, background loops, the database, integrations,
 and housekeeping. The app-wide Danger banner (with a per-admin 1h snooze)

@@ -173,7 +173,7 @@ afterEach(() => {
   cleanup();
   // Restore real timers so the fake-timer poll tests below cannot leak fake timers
   // into the ~40 real-timer waitFor(...) tests (which would hang their waits). The
-  // Dashboard.test.tsx afterEach does the same for the same reason.
+  // OverviewNext.test.tsx afterEach does the same for the same reason.
   vi.useRealTimers();
   vi.clearAllMocks();
 });
@@ -1727,7 +1727,7 @@ describe("RunsList — queue priority pill + Expedite action (PRD #320 M6)", () 
 });
 
 // PRD #518: the Runs list live-updates by re-fetching every 10s while the tab is
-// visible (usePollWhileVisible), matching Board and Dashboard. These use fake timers
+// visible (usePollWhileVisible), matching Board and the Overview. These use fake timers
 // + advanceTimersByTimeAsync(10000) — the afterEach restores real timers so they do
 // not leak into the real-timer waitFor tests above. useNow is a mocked constant, so
 // advancing 10000ms fires only the poll, never the 1s duration clock.

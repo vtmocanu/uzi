@@ -136,18 +136,12 @@ function dangerAndAttention(): HealthDoc {
   return doc;
 }
 
-// The default Overview puts its header through InShellHeader; the classic page keeps its header in the page.
+// The Overview puts its header through InShellHeader, above the banner stack.
 function DefaultOverviewPage() {
   return <>
     <InShellHeader><h1>Hdr</h1></InShellHeader>
     <p>new overview content</p>
     <Link to="/runs">Go to runs</Link>
-  </>;
-}
-function ClassicPage() {
-  return <>
-    <h1>Classic Hdr</h1>
-    <p>classic content</p>
   </>;
 }
 function RunsPage() {
@@ -163,7 +157,6 @@ async function mountAt(path: string) {
       <AppShell>
         <Routes>
           <Route path="/dashboard" element={<DefaultOverviewPage />} />
-          <Route path="/overview/classic" element={<ClassicPage />} />
           <Route path="/runs" element={<RunsPage />} />
         </Routes>
       </AppShell>
@@ -190,15 +183,6 @@ describe("AppShell banner stack and header slot (PRD #3878)", () => {
     expect(follows(header, danger()!)).toBe(true);
     expect(follows(danger()!, attention()!)).toBe(true);
     expect(follows(attention()!, screen.getByText("new overview content"))).toBe(true);
-  });
-
-  it("renders the classic Overview header below the same banner stack", async () => {
-    mockApi.getAdminHealth.mockResolvedValue(dangerAndAttention());
-    await mountAt("/overview/classic");
-    expect(screen.getAllByRole("alert", { name: "Instance health" })).toHaveLength(1);
-    expect(screen.getAllByRole("status", { name: "Admin health attention" })).toHaveLength(1);
-    expect(follows(danger()!, attention()!)).toBe(true);
-    expect(follows(attention()!, screen.getByRole("heading", { name: "Classic Hdr" }))).toBe(true);
   });
 
   it("renders the stack once, above the content and in the same order, on /runs", async () => {

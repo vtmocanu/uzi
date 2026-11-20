@@ -27,6 +27,7 @@ vi.mock("./api", async (importOriginal) => {
       listUsers: vi.fn(),
       adminRepoActivity: vi.fn(),
       getAgentSource: vi.fn(),
+      getTemplateAllocations: vi.fn(),
     },
   };
 });
@@ -411,7 +412,7 @@ describe("useOverviewData admin agent source", () => {
     expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
   });
 
-  it("never calls the admin read on the classic page or for a non-admin", async () => {
+  it("never calls the admin read without the opt-in or for a non-admin", async () => {
     renderHook(() => useOverviewData());
     await settle();
     expect(mockApi.getAgentSource).not.toHaveBeenCalled();
@@ -601,5 +602,150 @@ describe("useOverviewData recovery holds", () => {
     mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(6));
     await settle(10_000);
     expect(result.current.holds?.aggregate.open_holds).toBe(6);
+  });
+});
+
+describe("useOverviewData personal data and usage", () => {
+  const zeroOutcomes = () => ({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: {} });
+  // A self-usage payload told apart by its lifetime completed count.
+  const usageWith = (completed: number) => {
+    const base = emptySelf();
+    return { ...base, outcomes: { ...base.outcomes, lifetime: { ...zeroOutcomes(), finished: completed, completed } } };
+  };
+  const completedOf = (u: { outcomes: { lifetime: { completed: number } } } | null | undefined) => u?.outcomes.lifetime.completed;
+
+  it("keeps data null when the first load fails, and keeps the last good data when a re-poll fails (#2661 split)", async () => {
+    mockApi.listRuns.mockRejectedValueOnce(new Error("api down"));
+    const { result } = renderHook(() => useOverviewData());
+    await settle();
+    expect(result.current.data).toBeNull();
+    cleanup();
+    const second = renderHook(() => useOverviewData());
+    await settle();
+    expect(second.result.current.data?.runs).toEqual([]);
+    mockApi.listRuns.mockRejectedValueOnce(new Error("poll blip"));
+    await settle(10_000);
+    expect(second.result.current.data?.runs).toEqual([]);
+    expect(second.result.current.runsRefreshFailed).toBe(true);
+  });
+
+  it("requests the summary projection on the first load and on every poll tick (#2661)", async () => {
+    renderHook(() => useOverviewData());
+    await settle();
+    await settle(10_000);
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
+  });
+
+  it("sends exactly the personal first-load requests for a non-admin, with no admin request", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    renderHook(() => useOverviewData());
+    await settle();
+    for (const call of [mockApi.listRuns, mockApi.listWorkers, mockApi.listRepos, mockApi.listAgentTemplates, mockApi.listSecrets, mockApi.listConnections, mockApi.getUsage]) {
+      expect(call).toHaveBeenCalledTimes(1);
+    }
+    for (const call of [mockApi.getAdminUsage, mockApi.adminListRuns, mockApi.listUsers, mockApi.getRecoveryHolds, mockApi.adminRepoActivity, mockApi.getAgentSource]) {
+      expect(call).not.toHaveBeenCalled();
+    }
+  });
+
+  it("loads admin usage for an admin and never the admin run list without the opt-in", async () => {
+    renderHook(() => useOverviewData());
+    await settle();
+    await settle(10_000);
+    expect(mockApi.getAdminUsage).toHaveBeenCalledTimes(1);
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    expect(mockApi.listWorkers).toHaveBeenCalledTimes(2);
+    expect(mockApi.listRepos).toHaveBeenCalledTimes(1);
+    expect(mockApi.adminListRuns).not.toHaveBeenCalled();
+  });
+
+  it("never reads the template allocations, on first load or on a poll (#4335)", async () => {
+    renderHook(() => useOverviewData());
+    await settle(30_000);
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThan(1);
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
+  });
+
+  it("refreshes usage on its own 30 s cadence even when the runs poll fails (#2399)", async () => {
+    mockApi.getUsage.mockResolvedValue(usageWith(14));
+    const { result } = renderHook(() => useOverviewData());
+    await settle();
+    expect(completedOf(result.current.data?.selfUsage)).toBe(14);
+    mockApi.listRuns.mockRejectedValue(new Error("runs unavailable"));
+    mockApi.getUsage.mockResolvedValue(usageWith(0));
+    await settle(30_000);
+    expect(completedOf(result.current.data?.selfUsage)).toBe(0);
+    expect(mockApi.getUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["self", "admin"] as const)("retains the failed %s usage payload while refreshing the other scope (#2399)", async (failed) => {
+    mockApi.getUsage.mockResolvedValue(usageWith(14));
+    mockApi.getAdminUsage.mockResolvedValue({ factory: usageWith(31), users: [], earliest_run: null });
+    const { result } = renderHook(() => useOverviewData());
+    await settle();
+    if (failed === "self") {
+      mockApi.getUsage.mockRejectedValue(new Error("self blip"));
+      mockApi.getAdminUsage.mockResolvedValue({ factory: usageWith(0), users: [], earliest_run: null });
+    } else {
+      mockApi.getAdminUsage.mockRejectedValue(new Error("admin blip"));
+      mockApi.getUsage.mockResolvedValue(usageWith(0));
+    }
+    await settle(30_000);
+    expect(completedOf(result.current.data?.selfUsage)).toBe(failed === "self" ? 14 : 0);
+    expect(completedOf(result.current.data?.adminUsage?.factory)).toBe(failed === "admin" ? 31 : 0);
+    expect(result.current.data?.runs).toEqual([]);
+  });
+
+  it("skips hidden usage ticks and refreshes when the tab becomes visible (#2399)", async () => {
+    renderHook(() => useOverviewData());
+    await settle();
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    await settle(30_000);
+    expect(mockApi.getUsage).toHaveBeenCalledTimes(1);
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(mockApi.getUsage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useOverviewData usage window (PRD #40)", () => {
+  it("defaults to seven days, persists a change, and reads it back on the next mount", async () => {
+    const first = renderHook(() => useOverviewData());
+    await settle();
+    expect(first.result.current.usageWindow).toBe("last_7_days");
+    act(() => first.result.current.changeUsageWindow("lifetime"));
+    expect(first.result.current.usageWindow).toBe("lifetime");
+    expect(localStorage.getItem("uzi.usageWindow")).toBe("lifetime");
+    first.unmount();
+    const second = renderHook(() => useOverviewData());
+    await settle();
+    expect(second.result.current.usageWindow).toBe("lifetime");
+    act(() => second.result.current.changeUsageWindow("last_7_days"));
+    expect(localStorage.getItem("uzi.usageWindow")).toBe("last_7_days");
+  });
+
+  it("falls back to seven days on an invalid stored value", async () => {
+    localStorage.setItem("uzi.usageWindow", "unsupported");
+    const { result } = renderHook(() => useOverviewData());
+    await settle();
+    expect(result.current.usageWindow).toBe("last_7_days");
+  });
+
+  it("survives blocked storage reads and writes without blocking the switch", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("storage blocked");
+    });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage blocked");
+    });
+    const { result } = renderHook(() => useOverviewData());
+    await settle();
+    expect(result.current.usageWindow).toBe("last_7_days");
+    act(() => result.current.changeUsageWindow("lifetime"));
+    expect(result.current.usageWindow).toBe("lifetime");
+    vi.restoreAllMocks();
   });
 });

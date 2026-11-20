@@ -1,4 +1,4 @@
-// Pure helpers shared by the default and classic Overview pages (PRD #3878, #3877).
+// Pure helpers for the Overview page (PRD #3878, #3877).
 // Nothing here fetches or renders.
 
 import {
@@ -14,7 +14,7 @@ import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause, NON_C
 import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
-export const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
+const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
   running: "running",
   awaiting_approval: "needsYou",
   awaiting_input: "needsYou",
@@ -37,7 +37,7 @@ export interface OverviewCounts {
 }
 
 // Executing, queued and parked counts over the non-terminal runs. Buckets on the RAW
-// status, as Dashboard's tile always has, with an account cooldown counted as waiting;
+// status, with an account cooldown counted as waiting;
 // feeding it effective statuses would drop runs. Runs that need the owner (the
 // needsYou bucket) are deliberately not counted here: the decision card covers them.
 export function overviewCounts(runs: ReadonlyArray<Pick<RunSummaryItem, "status" | "health">>): OverviewCounts {
@@ -71,8 +71,8 @@ export function mergeOverviewRows(
 }
 
 // PRD #1349 M6 (D8/D10): the count of the viewer's runs currently self-healing in the
-// recovery_wait park, derived client-side from runs the page already polls. Both Overview
-// pages feed it the viewer's OWN runs only.
+// recovery_wait park, derived client-side from runs the page already polls. The Overview
+// feeds it the viewer's OWN runs only.
 export function ownRecoveryWaitCount(runs: ReadonlyArray<Pick<RunSummaryItem, "status">>): number {
   return runs.filter((r) => r.status === "recovery_wait").length;
 }
@@ -81,7 +81,7 @@ export function ownRecoveryWaitCount(runs: ReadonlyArray<Pick<RunSummaryItem, "s
 // brought online if it is online now OR has ever registered (last_heartbeat_at is stamped
 // at register/heartbeat and never cleared by the offline sweep), so a fleet mid-roll
 // (every worker offline + upgrading) does not reopen the step. Live health stays on the
-// "Workers online N/M" tile.
+// Capacity rail (OverviewNext).
 export function workerJoined(workers: ReadonlyArray<Pick<Worker, "status" | "last_heartbeat_at">>): boolean {
   return workers.some((w) => w.status === "online" || w.last_heartbeat_at != null);
 }

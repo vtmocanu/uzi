@@ -826,29 +826,3 @@ export function PageHeader({
     </div>
   );
 }
-
-// StatTile: dashboard number tile.
-export function StatTile({
-  label,
-  value,
-  hint,
-  to,
-}: {
-  label: string;
-  value: ReactNode;
-  hint?: string;
-  to?: string;
-}) {
-  const body = (
-    <div className="rounded-xl border border-edge bg-surface p-4 transition-colors hover:border-edge-strong">
-      <p className="text-xs font-medium uppercase tracking-wider text-faint">
-        {label}
-      </p>
-      <p className="mt-1.5 text-2xl font-semibold tabular-nums text-fg">
-        {value}
-      </p>
-      {hint && <p className="mt-0.5 text-xs text-faint">{hint}</p>}
-    </div>
-  );
-  return to ? <Link to={to}>{body}</Link> : body;
-}

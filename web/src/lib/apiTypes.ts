@@ -6432,7 +6432,7 @@ export interface RecoveryCustodyHold {
   admission_reason?: string;
 }
 
-// RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
+// RecoveryCustodyAggregate is the owner-level custody summary the Overview Held work card and the
 // one-per-episode Slack DM read. Counts are numeric (0 is meaningful).
 // admission_counted_holds is optional for compatibility with older servers.
 export interface RecoveryCustodyAggregate {

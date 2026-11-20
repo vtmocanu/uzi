@@ -3,7 +3,7 @@
 // run counts) — never re-derive the same fact from cost_usd. A $0 metered total is a
 // REAL reading (a tiny or cache-only call can genuinely price at $0.00), so "cost_usd
 // <= 0 therefore subscription" was always a guess, and it is the guess this module
-// retires. Both halves live here so RunUsage.tsx, UsageCards.tsx and RunsList.tsx
+// retires. Both halves live here so RunUsage.tsx, OverviewUsageCard.tsx and RunsList.tsx
 // share ONE mapping rather than three copies that can drift.
 //
 // cost_status is a Harness/CostStatus-shaped union that a NEWER server can extend

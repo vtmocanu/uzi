@@ -70,7 +70,7 @@ function listRunsFor(): Run[] {
 
 // ── Custody recovery mock (PRD #1349 M6) ──────────────────────────────────────
 // The `?mock=custody` scenario seeds a full spread of owner custody holds — every
-// server-derived attention across several workers — so the board alert and the Workers
+// server-derived attention across several workers — so the Held work card and the Workers
 // resolution surface can be seen and driven offline. Any other scenario reports zero open
 // holds, so the alert self-hides and the existing demos stay clean.
 //
@@ -1371,7 +1371,7 @@ export const runsApi = {
         : [];
     return delay({ publications }, 80);
   },
-  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
+  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the Held work card and
   // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
   // alert self-hides and the other demos stay clean.
   getRecoveryHolds: async () => delay(custodyResponse(), 80),

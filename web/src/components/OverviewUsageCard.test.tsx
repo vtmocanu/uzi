@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, within } from "@testing-library/react"
 import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
 import { OverviewUsageCard } from "./OverviewUsageCard";
-import type { UsageWindow } from "./UsageCards";
+import type { UsageWindow } from "../lib/usageByUser";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
 import { USAGE_SCOPE_NOTE } from "./usageParts";
