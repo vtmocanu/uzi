@@ -338,3 +338,46 @@ func TestSettingsGetSummaryRowsUnknownSource(t *testing.T) {
 		t.Fatalf("unknown source row missing: exit %d %q", code, out)
 	}
 }
+
+func TestSettingsGetPlanningRows(t *testing.T) {
+	stored := "opus"
+	high := "high"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		PlanningModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", Model: &stored, DefaultModel: "sonnet", DefaultSource: "user_default", ResolvedModel: "opus", Source: "user_planning_default"},
+		},
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", DefaultEffort: "medium", DefaultSource: "builtin", ResolvedEffort: &high, Source: "builtin", Mode: "explicit"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	idx := strings.Index(out, "Model settings")
+	if idx < 0 {
+		t.Fatalf("no Model settings table: %q", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out[idx:]), "\n")
+	var got []string
+	for _, l := range lines {
+		if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, "planning ") {
+			got = append(got, f)
+		}
+	}
+	want := []string{
+		"planning model claude Pin · opus sonnet opus your choice",
+		"planning effort claude Default medium high built-in",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("planning rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestSettingsModelRowsOmitAbsentPlanningCells(t *testing.T) {
+	for _, r := range settingsModelRows(apitypes.UserSettingsDTO{}) {
+		if strings.HasPrefix(r.Setting, "planning") {
+			t.Errorf("row %q rendered without a planning cell", r.Setting)
+		}
+	}
+}

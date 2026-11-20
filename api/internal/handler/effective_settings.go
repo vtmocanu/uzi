@@ -231,7 +231,7 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get user settings: %w", err)
 	}
-	pins, _, err := h.crossCheckPinSettings(ctx, userID)
+	pins, _, _, err := h.crossCheckPinSettings(ctx, userID)
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get cross-check pins: %w", err)
 	}

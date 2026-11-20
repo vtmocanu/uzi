@@ -1240,6 +1240,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
+		// PRD #3252: the Claude planning pair (null ⇒ "Same as the run") and its read-only cells.
+		"planning_claude_model", "planning_claude_effort", "planning_models", "planning_efforts",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		// Issue #3719: the user's Codex account mode (default|auto).
