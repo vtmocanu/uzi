@@ -12,8 +12,9 @@ import (
 
 // Issue #4554 live-DB coverage: a checked plan whose post-scrub milestone list is not
 // exactly [{id,title}] objects passing validateMilestones is refused at cross-check
-// admission, before any cross_checks row or checker child exists, and a pre-fix attempt
-// that already stores such a list can neither be resubmitted nor written as a running plan.
+// admission, before any cross_checks row or checker child exists. A pre-fix attempt that
+// already stores such a list cannot be resubmitted, and an approved one cannot be written as
+// a running plan even with its own stored digest.
 
 var invalidMilestoneLists = []struct{ name, raw string }{
 	{"blank id and title", `[{"id":"","title":""}]`},
@@ -179,6 +180,50 @@ func TestCrossCheckMilestoneAdmissionPreFixAttemptLiveDB(t *testing.T) {
 			}
 			if run := mustRun(t, f.env, f.lead); run.PlanMd.Valid || len(run.MilestonesFrozen) != 0 && string(run.MilestonesFrozen) != "null" {
 				t.Fatalf("refused write persisted: plan=%v milestones=%s", run.PlanMd, run.MilestonesFrozen)
+			}
+		})
+	}
+}
+
+// An APPROVED pre-fix attempt storing an invalid list, with the worker presenting that
+// attempt's own stored digest, still cannot be written as a running plan: the write fails
+// closed with ErrInvalidState and persists nothing.
+func TestCrossCheckMilestoneAdmissionApprovedPreFixAttemptLiveDB(t *testing.T) {
+	for _, tc := range invalidMilestoneLists {
+		t.Run(tc.name, func(t *testing.T) {
+			f := ccAutomaticFixture(t, 2)
+			cc, err := f.svc.SubmitPlanCrossCheck(f.env.ctx, f.w, f.lead, 1, f.c, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.decide(t, cc, "approve")
+			var generic any
+			if err := json.Unmarshal([]byte(tc.raw), &generic); err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := json.Marshal(generic)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := ccPreFixDigest(t, f, cc, canonical)
+			f.env.exec(`UPDATE cross_checks SET milestones=$2::jsonb, candidate_digest=$3 WHERE id=$1`, cc.ID, string(canonical), digest)
+			var invalid []Milestone
+			if err := json.Unmarshal([]byte(tc.raw), &invalid); err != nil {
+				t.Fatal(err)
+			}
+			stored := cc
+			stored.CandidateDigest = digest
+			_, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(stored, "plan", invalid))
+			if applied || !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("running write of approved pre-fix attempt: applied=%v err=%v", applied, err)
+			}
+			if run := mustRun(t, f.env, f.lead); run.PlanMd.Valid || len(run.MilestonesFrozen) != 0 && string(run.MilestonesFrozen) != "null" {
+				t.Fatalf("refused write persisted: plan=%v milestones=%s", run.PlanMd, run.MilestonesFrozen)
+			}
+			// Control: the same approved attempt restored to its valid list and digest writes.
+			f.env.exec(`UPDATE cross_checks SET milestones='[]'::jsonb, candidate_digest=$2 WHERE id=$1`, cc.ID, cc.CandidateDigest)
+			if _, applied, err := f.svc.SetState(f.env.ctx, f.w, f.lead, ccRunningRequest(cc, "plan", []Milestone{})); err != nil || !applied {
+				t.Fatalf("control running write: applied=%v err=%v", applied, err)
 			}
 		})
 	}
