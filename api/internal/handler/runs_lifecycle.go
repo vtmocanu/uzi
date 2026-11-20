@@ -634,6 +634,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		applyRevising(&dto, revising[run.ID])
 	}
 	h.overlayPlanCrossCheckSummary(r.Context(), user.ID, run, &dto)
+	h.overlayInjectedEnv(r.Context(), user.ID, run, &dto)
 	// The detail read needs the same live presence signal as the run lists. Reuse the
 	// health probes that the list SQL mirrors, after the viewer gate above, so direct
 	// TUI entry and its metadata refresh do not depend on an older board row.

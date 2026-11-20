@@ -57,6 +57,8 @@ func (e *codexMintedClaimError) Unwrap() error { return e.cause }
 type claimRecoveryIdentity struct {
 	workerID        uuid.UUID
 	recoveryCapable bool
+	// protocolCaps are the claiming worker's protocol capabilities, for the finish-time run_env_v1 re-check.
+	protocolCaps []string
 }
 
 // claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
@@ -77,6 +79,10 @@ type claimFinishQueries interface {
 	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
 	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
 	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
+	// PRD #4416 M2: the owner share lock, the park twin and the run-env key recomputation / receipts.
+	LockUserVaultStateForShareNowait(ctx context.Context, id uuid.UUID) (store.LockUserVaultStateForShareNowaitRow, error)
+	ParkRunEnvHistoryUnavailableRun(ctx context.Context, arg store.ParkRunEnvHistoryUnavailableRunParams) (int64, error)
+	runEnvFinishQueries
 }
 
 // claimFinishTx is one open exact-claim transaction: its statements plus commit/rollback.
@@ -171,7 +177,7 @@ func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Wo
 		h.afterAssembly(ctx, run, payload, err)
 	}
 	return s.finishRunClaim(ctx, run, payload, err,
-		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable})
+		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable, protocolCaps: wkr.ProtocolCapabilities})
 }
 
 // finishRunClaim checks even successful payloads against the exact mint and current
@@ -190,15 +196,17 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// Claude checker stays queued and expires through its own cc.deadline_at path.
 	transient := errors.Is(assemblyErr, store.ErrVaultSealStale) || errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
-		errors.Is(assemblyErr, errReserveHeld)
+		errors.Is(assemblyErr, errReserveHeld) || errors.Is(assemblyErr, errRunEnvCapabilityMissing)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park. So is
 	// errRunOverrideUnavailable (PRD #3250), which parks on its own hold.
+	// PRD #4416 M2: errRunEnvHistoryUnavailable is likewise its own non-terminal classification: it parks
+	// the run on run_env_history_unavailable, never an allowlisted automatic release.
 	// PRD #4320 module 5: a provider claim refusal (revoked binding) is its own non-terminal
 	// classification, like errCredentialDisabled: it parks the run for the owner.
 	_, providerRefused := isProviderClaimRefusal(assemblyErr)
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
-		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !providerRefused {
+		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !errors.Is(assemblyErr, errRunEnvHistoryUnavailable) && !providerRefused {
 		return nil, assemblyErr
 	}
 	for attempt := 1; ; attempt++ {
@@ -360,6 +368,16 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", nil // another transition won; idle with no mutation
 	}
 
+	// PRD #4416 M2: a run in the run-env lane takes the owner row FOR SHARE NOWAIT right after the run
+	// lock (lock order worker, run, users). A variable write or a vault lifecycle change holds that row
+	// FOR UPDATE, so the key recomputation and the receipts below run against a state no writer can be
+	// changing; 55P03 rolls back for finishRunClaim's bounded retry (isLockNotAvailable).
+	if runEnvDeliveredForRun(locked) {
+		if _, err := q.LockUserVaultStateForShareNowait(ctx, locked.UserID); err != nil {
+			return nil, "", err
+		}
+	}
+
 	// The claim snapshot is the no-mint identity. A successful mint, including
 	// one followed by an assembly error, must carry its actual persisted identity.
 	epoch, hash := run.CodexClaimEpoch, run.CodexCapHash
@@ -495,7 +513,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// a distinct non-terminal park that the authority rewrite and the hold class never touch.
 	var overrideErr *runOverrideUnavailableError
 	overrideUnavailable := !credDisabled && errors.As(assemblyErr, &overrideErr)
+	// PRD #4416 M2: a run whose repo-variable history cannot be assembled parks on its own hold, never
+	// rewritten by the authority classification below.
+	runEnvUnavailable := !credDisabled && !overrideUnavailable && errors.Is(assemblyErr, errRunEnvHistoryUnavailable)
 	if overrideUnavailable {
+		holdClass, transient = false, false
+	} else if runEnvUnavailable {
 		holdClass, transient = false, false
 	} else if credDisabled {
 		// A distinct non-terminal outcome: never a transient requeue, never the account
@@ -541,6 +564,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			}
 			decision, origin = serr, "provisioning_failed"
 			holdClass, transient = false, false
+		} else if runEnvErr := settleRunEnv(ctx, q, locked, payload, identity); runEnvErr != nil {
+			// PRD #4416 M2: the variable sets changed since assembly, or the worker cannot take them:
+			// nothing was delivered, so the exact claim is requeued (the requeue path below).
+			if !errors.Is(runEnvErr, errRunEnvStale) && !errors.Is(runEnvErr, errRunEnvCapabilityMissing) {
+				return nil, "", runEnvErr
+			}
+			decision, transient, holdClass = runEnvErr, true, false
 		} else {
 			if locked.Harness == harnessCodex && payload != nil && payload.Secrets.Codex != nil {
 				if err := recordCodexEpoch(ctx, q, locked); err != nil {
@@ -626,6 +656,11 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	var overrideMsg []byte
 	var overrideSeq int32
 	switch {
+	case runEnvUnavailable:
+		// PRD #4416 M2: the ParkRunOverrideUnavailableRun twin with the hold fixed; no feed line.
+		n, err = q.ParkRunEnvHistoryUnavailableRun(ctx, store.ParkRunEnvHistoryUnavailableRunParams{
+			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		})
 	case overrideUnavailable:
 		// The same exact-claim fence as the credential park below; the feed line is written under the
 		// run lock held here, so a rolled-back park leaves no message and a stale claim writes neither.
@@ -713,7 +748,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		s.SettleRetainedCheckpoint(run.ID)
 	}
 	switch {
-	case overrideUnavailable, credDisabled:
+	case overrideUnavailable, credDisabled, runEnvUnavailable:
 		return nil, "paused", nil
 	case !holdClass && !transient:
 		return nil, "failed", nil
@@ -732,8 +767,10 @@ const (
 const codexResetFailureReason = "the bound Codex login is unavailable after your account reset; start a new run"
 
 // claimCredentialsReset reports whether the run's owner redeemed an account reset link after the
-// run was created (PRD #3989). It is a plain read: it takes no users row lock, so it adds no edge to
-// the run-then-users lock order. A missing marker or user is "no".
+// run was created (PRD #3989). It is a plain read: this statement takes no row lock of its own. A
+// run-env lane run holds the owner row FOR SHARE (taken in finishRunClaimTx right after the run lock,
+// order worker, run, users); every other run takes no users lock at all. A missing marker or user is
+// "no".
 func claimCredentialsReset(ctx context.Context, q claimFinishQueries, locked store.Run) (bool, error) {
 	marker, err := q.GetUserCredentialsResetAt(ctx, locked.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {

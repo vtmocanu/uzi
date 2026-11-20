@@ -1028,6 +1028,15 @@ func run() error {
 			Name: "terminal_preservation",
 			Run:  wsvc.SweepTerminalPreservations,
 		},
+		// Retired repo variables (PRD #4416 M2): deletes a retired or pending-deletion run_env_vars row
+		// once no run holding a secret receipt for it is still held (terminal for 24 hours with no open
+		// custody, publication, salvage or preservation record), then the identities nothing names. After
+		// terminal_preservation so a preservation reconciled this tick no longer holds its run. ALWAYS
+		// registered: with no retired rows it is one indexed read, no lock and no write.
+		sweeper.Pass{
+			Name: "run_env_retired_sweep",
+			Run:  wsvc.SweepRunEnvRetired,
+		},
 		// Prerequisite closure always advances existing rows, regardless of admission knobs.
 		// Its extra share before run liveness is at most a 10s pass plus a 5s in-flight
 		// durable outcome tail (15s), independent of WorkerHeartbeatStale and RunTimeout.

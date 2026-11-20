@@ -228,6 +228,13 @@ type CreatedIssueDTO struct {
 	WebURL string `json:"web_url"`
 }
 
+// InjectedEnvDTO is one repo variable a claim delivered to a run (PRD #4416 M2). It carries no value.
+type InjectedEnvDTO struct {
+	Name   string `json:"name"`
+	Scope  string `json:"scope"`
+	Secret bool   `json:"secret"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
 	PolicyHold    *PolicyHoldDTO    `json:"policy_hold,omitempty"`
@@ -1081,6 +1088,11 @@ type RunDTO struct {
 	// SINGLE-RUN READ ONLY, best-effort: set by GET /api/runs/{id} for lead-lane runs (leadcfg.LeadLane)
 	// and absent on every list row and on runs that have no lead agent. Display-only.
 	LeadConfig *RunLeadConfigDTO `json:"lead_config,omitempty"`
+	// InjectedEnv names the repo variables the run's latest claim delivered (PRD #4416 M2), plain and
+	// secret alike: name, scope and the secret flag, never a value. SINGLE-RUN READ ONLY, owner only
+	// (an admin viewing another user's run gets none), absent on every list row and when the claim
+	// delivered nothing. Display-only.
+	InjectedEnv []InjectedEnvDTO `json:"injected_env,omitempty"`
 	// Model is the model frozen onto the run at create time, either chosen when the run was started
 	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
 	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced

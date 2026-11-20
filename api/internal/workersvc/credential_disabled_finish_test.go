@@ -81,7 +81,7 @@ func TestFinishRunClaimRecheckParksDisabledCredential(t *testing.T) {
 		fs, svc, run, id := finishFixture(t)
 		fs.claimRun.AnthropicSecretID = pgconv.UUID(uuid.New())
 		fs.claimSecretDisabled = disabled
-		sent := &ClaimPayload{RunID: run.ID.String(), Secrets: ClaimSecrets{AnthropicOAuthToken: "tok"}}
+		sent := &ClaimPayload{runEnv: &runEnvSnapshot{}, RunID: run.ID.String(), Secrets: ClaimSecrets{AnthropicOAuthToken: "tok"}}
 		got, err := svc.finishRunClaim(context.Background(), run, sent, nil, id)
 		if err != nil || fs.claimSecretChecks != 1 {
 			t.Fatalf("disabled=%t: err=%v checks=%d", disabled, err, fs.claimSecretChecks)
@@ -105,7 +105,7 @@ func TestFinishRunClaimRecheckLockBusyRetries(t *testing.T) {
 	fs, svc, run, id := finishFixture(t)
 	fs.claimRun.AnthropicSecretID = pgconv.UUID(uuid.New())
 	fs.claimSecretLockErrs = []error{busy, busy}
-	sent := &ClaimPayload{RunID: run.ID.String(), Secrets: ClaimSecrets{AnthropicOAuthToken: "tok"}}
+	sent := &ClaimPayload{runEnv: &runEnvSnapshot{}, RunID: run.ID.String(), Secrets: ClaimSecrets{AnthropicOAuthToken: "tok"}}
 	if got, err := svc.finishRunClaim(context.Background(), run, sent, nil, id); err != nil || got != sent {
 		t.Fatalf("busy twice then free = (%v, %v), want the payload", got, err)
 	}

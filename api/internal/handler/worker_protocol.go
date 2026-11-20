@@ -1258,6 +1258,8 @@ func diskBytesOrNil(n *json.Number) *int64 {
 // returns the narrower ChatClaimPayload (no forge PAT). The worker runs the two
 // lanes as independent, concurrent claim loops.
 func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
+	// PRD #4416 M2: a claim response can carry repo variable values; never cache it.
+	w.Header().Set("Cache-Control", "no-store")
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")

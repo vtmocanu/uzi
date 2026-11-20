@@ -1,7 +1,7 @@
 {
   "review": {
     "date": "2026-11-20",
-    "method": "Env names read by claude-agent-sdk 0.3.319 were extracted from the SDK .mjs files and the claude-agent-sdk-linux-x64-musl binary (process.env.X, Bun.env.X, process.env[\"X\"], plus literal Node and Bun runtime control names grepped from the binary). Each name outside the denied prefixes was classified as a harness control, a worker invariant or application configuration. Codex 0.167.0 gets user variables only per command; its app-server environment is worker-owned."
+    "method": "Env names read by claude-agent-sdk 0.3.319 were extracted from the SDK .mjs files and the claude-agent-sdk-linux-x64-musl binary (process.env.X, Bun.env.X, process.env[\"X\"], plus literal Node and Bun runtime control names grepped from the binary). Harness and runtime controls outside the denied prefixes were classified and denied. Allowed names that the harness also reads and that are application configuration are recorded under overlaps where they matter; the remaining allowed names were not individually classified. Codex 0.167.0 gets user variables only per command; its app-server environment is worker-owned."
   },
   "harness_versions": {
     "claude_agent_sdk": "0.3.319",
@@ -402,6 +402,36 @@
       "value": "SSLKEYLOGFILE",
       "invariant": "network_wiring",
       "note": "TLS key log file read by the Node and Bun runtimes; would write session keys to a path the user picks"
+    },
+    {
+      "value": "NODE_CHANNEL_FD",
+      "invariant": "process_loader",
+      "note": "Node child-process IPC channel descriptor read at start-up by the Claude CLI runtime"
+    },
+    {
+      "value": "NODE_UNIQUE_ID",
+      "invariant": "process_loader",
+      "note": "Node cluster worker marker read at start-up by the Claude CLI runtime"
+    },
+    {
+      "value": "NODE_CLUSTER_SCHED_POLICY",
+      "invariant": "process_loader",
+      "note": "Node cluster scheduling policy read at start-up by the Claude CLI runtime"
+    },
+    {
+      "value": "NODE_TEST_CONTEXT",
+      "invariant": "process_loader",
+      "note": "Node test-runner child marker read at start-up by the Claude CLI runtime"
+    },
+    {
+      "value": "NODE_REPL_EXTERNAL_MODULE",
+      "invariant": "process_loader",
+      "note": "Node REPL module loaded in place of the built-in REPL by the Claude CLI runtime"
+    },
+    {
+      "value": "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+      "invariant": "network_wiring",
+      "note": "gRPC TLS root certificate file read by the pinned Claude CLI binary"
     }
   ],
   "denied_prefixes": [
@@ -652,6 +682,42 @@
       "harness": "claude",
       "decision": "allowed",
       "reason": "read by build tools and by the CLI to detect automation; no effect on provider or authentication"
+    },
+    {
+      "name": "OTEL_EXPORTER_OTLP_HEADERS",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application telemetry credential; the CLI exporter only runs after CLAUDE_CODE_ENABLE_TELEMETRY, which the CLAUDE_ prefix denies"
+    },
+    {
+      "name": "TZ",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "time zone read by the runtime and by commands; affects timestamps only, not provider, credential or routing"
+    },
+    {
+      "name": "TERM",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "terminal type read by the CLI and by commands; affects output formatting only"
+    },
+    {
+      "name": "AWS_BEARER_TOKEN_BEDROCK",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "Bedrock bearer token; inert without the denied CLAUDE_CODE_USE_BEDROCK selector, and builds may need it"
+    },
+    {
+      "name": "BUN_CONFIG_REGISTRY",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "the BUN_ prefix also denies Bun package-manager settings (BUN_CONFIG_REGISTRY, BUN_AUTH_TOKEN): Bun is the harness runtime; Bun's installer also honours NPM_CONFIG_REGISTRY / NPM_CONFIG_TOKEN, which stay allowed"
+    },
+    {
+      "name": "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "TLS root file for gRPC read by the pinned Claude CLI binary: network wiring of the harness process"
     }
   ]
 }

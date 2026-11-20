@@ -1333,6 +1333,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/cross-checks/plan/latest", h.WorkerLatestPlanCrossCheck)
 		r.Get("/runs/{id}/cross-checks/plan/{round}", h.WorkerPlanCrossCheckStatus)
 		r.Post("/runs/{id}/cross-check-verdict", h.WorkerCrossCheckVerdict)
+		// PRD #4416 M2: the run-env redact maintenance read (secret values, no-store). Not lane-allowlisted:
+		// an isolated-lane run never receives variables.
+		r.Get("/runs/{id}/run-env-redact", h.WorkerRunEnvRedact)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 		r.Post("/runs/{id}/inputs/ack", h.WorkerRunInputsAck)
 		r.Post("/runs/{id}/inputs/applied", h.WorkerRunInputsApplied)

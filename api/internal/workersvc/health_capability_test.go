@@ -601,3 +601,60 @@ func TestHealthQueuedUnlinkedRepoNeverAsksIssueKeyWorker(t *testing.T) {
 		t.Fatalf("issued %d issue_key lookups for an unlinked run", len(fs.issueKeyCalls))
 	}
 }
+
+// -------------------------------------------------------------------------
+// PRD #4416 M2: the run_env rung. A queued run in the run-env lane whose owner has no online worker
+// reporting run_env_v1 (and has variables to deliver, which the query decides) surfaces
+// reasonNoRunEnvCapableWorker; a run outside the lane never asks.
+
+func runEnvSvc(kind string, egress bool, missing bool) (*healthFakeStore, *Service, store.ListActiveRunsForHealthRow) {
+	r := queuedRunPastThreshold()
+	r.Kind = kind
+	if egress {
+		r.EgressProfileID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	}
+	fs := &healthFakeStore{
+		active:          []store.ListActiveRunsForHealthRow{r},
+		runEnvMissing:   missing,
+		onlineWorkers:   1,
+		freeSlotWorkers: 1,
+	}
+	return fs, healthSvc(fs, defaultHealthSettings()), r
+}
+
+func TestHealthQueuedRunEnvNoCapableWorkerFlagsReason(t *testing.T) {
+	fs, svc, r := runEnvSvc("issue", false, true)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonNoRunEnvCapableWorker {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonNoRunEnvCapableWorker)
+	}
+	if len(fs.runEnvCalls) != 1 || fs.runEnvCalls[0].RunID != r.ID || fs.runEnvCalls[0].UserID != r.UserID {
+		t.Fatalf("run_env lookups = %v, want exactly one for the run and its owner", fs.runEnvCalls)
+	}
+}
+
+func TestHealthQueuedRunEnvWithCapableWorkerFallsThrough(t *testing.T) {
+	fs, svc, r := runEnvSvc("issue", false, false)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonWaitingWorker {
+		t.Fatalf("reason = %q, want the generic %q", w.HealthReason.String, reasonWaitingWorker)
+	}
+}
+
+func TestHealthQueuedRunEnvOutsideLaneNeverAsks(t *testing.T) {
+	for name, tc := range map[string]struct {
+		kind   string
+		egress bool
+	}{"judge": {"judge", false}, "cross_check": {"cross_check", false}, "isolated issue": {"issue", true}} {
+		t.Run(name, func(t *testing.T) {
+			fs, svc, r := runEnvSvc(tc.kind, tc.egress, true)
+			svc.detectRunHealth(context.Background(), t0)
+			if w := lastWrite(t, fs, r.ID); w.HealthReason.String == reasonNoRunEnvCapableWorker {
+				t.Fatal("emitted the run_env reason for a run outside the lane")
+			}
+			if len(fs.runEnvCalls) != 0 {
+				t.Fatalf("issued %d run_env lookups for a run outside the lane", len(fs.runEnvCalls))
+			}
+		})
+	}
+}

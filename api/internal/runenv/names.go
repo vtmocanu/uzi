@@ -100,6 +100,12 @@ var deniedNames = []deniedRule{
 	{"NODE_COMPILE_CACHE", "managed_dirs", "Node compile-cache directory read by the Claude CLI runtime"},
 	{"UV_THREADPOOL_SIZE", "process_loader", "libuv thread-pool size read by the Claude CLI runtime"},
 	{"SSLKEYLOGFILE", "network_wiring", "TLS key log file read by the Node and Bun runtimes; would write session keys to a path the user picks"},
+	{"NODE_CHANNEL_FD", "process_loader", "Node child-process IPC channel descriptor read at start-up by the Claude CLI runtime"},
+	{"NODE_UNIQUE_ID", "process_loader", "Node cluster worker marker read at start-up by the Claude CLI runtime"},
+	{"NODE_CLUSTER_SCHED_POLICY", "process_loader", "Node cluster scheduling policy read at start-up by the Claude CLI runtime"},
+	{"NODE_TEST_CONTEXT", "process_loader", "Node test-runner child marker read at start-up by the Claude CLI runtime"},
+	{"NODE_REPL_EXTERNAL_MODULE", "process_loader", "Node REPL module loaded in place of the built-in REPL by the Claude CLI runtime"},
+	{"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "network_wiring", "gRPC TLS root certificate file read by the pinned Claude CLI binary"},
 }
 
 var deniedPrefixes = []deniedRule{

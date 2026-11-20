@@ -100,7 +100,7 @@ func TestFinishRunClaimCodexBaseline(t *testing.T) {
 			locked.CodexCapHash = hashCodexCapability("baseline-test-capability")
 			bs := &baselineClaimStore{fakeStore: fs, run: locked, writeErr: tc.writeErr, commitErr: tc.commitErr, rollbackErr: tc.rollbackErr, replace: tc.replace}
 			svc := New(bs, nil, testParams())
-			payload := &ClaimPayload{Secrets: ClaimSecrets{Codex: &ClaimCodexSecrets{
+			payload := &ClaimPayload{runEnv: &runEnvSnapshot{}, Secrets: ClaimSecrets{Codex: &ClaimCodexSecrets{
 				AuthMode: codexAuthModeAPIKey, Capability: formatCodexCapability(7, "baseline-test-capability"),
 			}}}
 			got, err := svc.finishRunClaim(context.Background(), run, payload, nil, id)

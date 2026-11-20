@@ -149,6 +149,9 @@ func stripForIsolation(p *ClaimPayload) {
 	p.Secrets.ForgeUsername = ""
 	p.Secrets.Codex = nil
 	p.Secrets.Provider = nil
+	p.Secrets.RunEnv = nil
+	p.Secrets.RunEnvRedact = nil
+	p.runEnv = nil
 	p.Agents = []ClaimAgent{}
 	p.Skills = []ClaimSkill{}
 	p.SkillsDropped = []ClaimSkillDrop{}
