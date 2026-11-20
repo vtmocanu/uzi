@@ -11383,6 +11383,9 @@ SELECT id, runs.user_id, status, auto_approve,
        cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
+       -- Issue #4507: true only while the owner-hold marker names the CURRENT episode (marker = health_since).
+       COALESCE(runs.health_owner_hold_since IS NOT NULL AND runs.health_since IS NOT NULL
+                AND runs.health_owner_hold_since = runs.health_since, false)::boolean AS health_owner_hold_active,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
@@ -11545,12 +11548,27 @@ LIMIT @lim;
 -- COALESCE advances it then and preserves it otherwise. It is never cleared here
 -- (nor by the exit contract), so it damps DM flapping across episodes and API
 -- restarts. The detector remains the single writer of every health column.
+--
+-- Issue #4507: health_owner_hold_since is the episode-keyed owner-hold marker. When
+-- @mark_owner_hold is true it is set to the health_since being written (this episode);
+-- otherwise it is left as is. It is never cleared: it is valid only while it equals the
+-- row's current health_since, so a new episode invalidates it.
 UPDATE runs SET
     health             = @health,
     health_reason      = sqlc.narg('health_reason'),
     health_since       = sqlc.narg('health_since'),
-    health_notified_at = COALESCE(sqlc.narg('health_notified_at'), health_notified_at)
+    health_notified_at = COALESCE(sqlc.narg('health_notified_at'), health_notified_at),
+    health_owner_hold_since = CASE WHEN @mark_owner_hold::boolean THEN sqlc.narg('health_since') ELSE health_owner_hold_since END
 WHERE id = @id AND status = @status;
+
+-- name: MarkRunHealthOwnerHold :execrows
+-- Issue #4507: stamp the owner-hold marker on an EXISTING health episode without rewriting
+-- any other health column (the detector's unchanged-skip branch uses it when the owner hold
+-- begins mid-episode). Guarded by the exact episode the detector read (status, health,
+-- reason, health_since), so it matches zero rows if the episode changed since the read.
+UPDATE runs SET health_owner_hold_since = health_since
+WHERE id = @id AND status = @status AND health = @health AND health_reason = @health_reason
+  AND health_since IS NOT NULL AND health_since = @health_since;
 
 -- name: CountOnlineWorkersForUser :one
 -- How many of a user's workers are online — the queued-run reason resolver uses it

@@ -286,17 +286,25 @@ wait still take precedence. The named reason is quiet while a stale-requeue pin
 or a draining or maintenance hold is in force by its clock, and nudges once when
 that window ends. If the condition behind the window ends early (the drain is
 cleared, or the worker row is deleted or replaced), the single nudge comes at the
-affinity ceiling after the run's last update; a hold that began in another quiet
+affinity ceiling after the run's last update. When the health detector observes a
+draining or maintenance owner hold in force during the episode, it records that on
+the run (a per-episode marker, valid only for the current episode), and the single
+nudge then waits for the affinity ceiling (the run's last update plus
+`WORKER_AFFINITY_CEILING`) even if the stale-requeue grace expired earlier and the
+drain then cleared. An episode held only by the stale-requeue pin still nudges once
+at grace expiry. Only owner holds the detector observed and committed are
+remembered: a hold that starts and clears between two health ticks, or whose marker
+write fails, falls back to the earlier timing, the end of the stale grace when the
+stale pin covered the episode and otherwise the affinity ceiling. This affects
+notification timing only. A hold that began in another quiet
 state (leaving a maintenance intake pause, a Codex admission wait or a reserve)
 nudges once at that point too, and not at all when that ceiling had already
 passed when the episode began. A held run outside any window (for example after a
 normal Resume onto a live worker) nudges on the first health tick, ignoring the
 young-run grace, and counts in `queue.waiting`. The unavailable reason never resolves
 itself, so it nudges on entering it from any state (the nudge cooldown still
-applies). Known timing limitation, deferred from #4500: if stale grace overlaps
-an owner hold that clears after grace expires, the nudge can fire before the
-intended ceiling fallback. Admission, custody and run state are unaffected.
-None of these reasons starts with "waiting until", so `queue.waiting` and
+applies). Admission, custody, credentials and run state are unaffected by the
+nudge timing. None of these reasons starts with "waiting until", so `queue.waiting` and
 `fleet.capacity` count these runs as genuine waits: a routine drain of the last
 worker of a Codex run can raise `queue.waiting` while no nudge is sent. The Slack
 nudge text for `waiting_worker` ("still waiting for a worker to pick it up") does

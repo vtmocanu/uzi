@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -358,6 +359,9 @@ func TestCodexProvenanceQuietHoldNudgesAfterWindow(t *testing.T) {
 	if w.HealthReason.String != wantHeldA || len(b.healthNudges) != 1 || b.healthNudges[0] || w.HealthNotifiedAt.Valid {
 		t.Fatalf("first tick: reason=%q nudges=%v notified=%v, want the quiet held reason", w.HealthReason.String, b.healthNudges, w.HealthNotifiedAt)
 	}
+	if w.MarkOwnerHold || len(fs.marks) != 0 {
+		t.Fatalf("stale-only episode marked an owner hold: MarkOwnerHold=%v marks=%d", w.MarkOwnerHold, len(fs.marks))
+	}
 
 	// Still inside the window: unchanged, no write.
 	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
@@ -388,5 +392,198 @@ func TestCodexProvenanceQuietHoldNudgesAfterWindow(t *testing.T) {
 	svc4, _ := pinSvc(fs4, defaultHealthSettings())
 	if n := svc4.detectRunHealth(context.Background(), after.Add(time.Minute)); n != 0 {
 		t.Fatalf("after the nudge: changed=%d, want 0", n)
+	}
+}
+
+// Issue #4507 helpers: every tick uses a fresh store and service (models an API restart), so the only
+// state carried between ticks is what the test feeds back into the row.
+func ownerHoldTick(t *testing.T, r store.ListActiveRunsForHealthRow, now time.Time) (*healthFakeStore, *fakeBroadcaster, int64) {
+	t.Helper()
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc, b := pinSvc(fs, defaultHealthSettings())
+	return fs, b, svc.detectRunHealth(context.Background(), now)
+}
+
+// overlappingHeldRun is a quiet named Codex hold covered by both the stale pin (grace pinTestGrace,
+// ending t0+19m) and the owner hold (ceiling 2h, ending t0+119m).
+func overlappingHeldRun() store.ListActiveRunsForHealthRow {
+	r := heldCodexRun("A")
+	r.StaleRequeuePinnable = true
+	r.OwnerHoldPinnable = true
+	return r
+}
+
+// The owner hold outlives the stale grace and then clears (a drain ends) before the ceiling: the
+// nudge must wait for the ceiling end, not fire when the hold clears.
+func TestCodexProvenanceOverlappingOwnerHoldNudgesAtCeiling(t *testing.T) {
+	r := overlappingHeldRun()
+	graceEnd := t0.Add(pinTestGrace - time.Minute)
+	ceilingEnd := r.UpdatedAt.Time.Add(2 * time.Hour)
+	drainCleared := graceEnd.Add(10 * time.Minute)
+	if !drainCleared.Before(ceilingEnd) {
+		t.Fatalf("test timeline broken")
+	}
+
+	fs, b, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	if !w.MarkOwnerHold || w.HealthReason.String != wantHeldA || w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] {
+		t.Fatalf("entry: mark=%v reason=%q nudges=%v notified=%v, want a marked quiet entry", w.MarkOwnerHold, w.HealthReason.String, b.healthNudges, w.HealthNotifiedAt)
+	}
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+	r.HealthOwnerHoldActive = true // the projection of the committed mark
+
+	// After the grace, the owner hold still holds: quiet.
+	fs, b, n := ownerHoldTick(t, r, graceEnd.Add(time.Minute))
+	if n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 || len(fs.marks) != 0 {
+		t.Fatalf("after grace, hold in force: changed=%d writes=%d nudges=%v marks=%d, want all quiet", n, len(fs.writes), b.healthNudges, len(fs.marks))
+	}
+
+	// The drain clears. The stale shortcut alone would nudge here; the marker defers it to the ceiling.
+	r.OwnerHoldPinnable = false
+	fs, b, n = ownerHoldTick(t, r, drainCleared)
+	if n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+		t.Fatalf("drain cleared before the ceiling: changed=%d writes=%d nudges=%v, want no write and no nudge", n, len(fs.writes), b.healthNudges)
+	}
+
+	fs, b, n = ownerHoldTick(t, r, ceilingEnd)
+	if n != 1 {
+		t.Fatalf("at the ceiling end: changed=%d, want 1", n)
+	}
+	w2 := lastWrite(t, fs, r.ID)
+	if len(b.healthNudges) != 1 || !b.healthNudges[0] || !w2.HealthNotifiedAt.Valid || w2.HealthReason.String != wantHeldA {
+		t.Fatalf("at the ceiling end: nudges=%v notified=%v reason=%q, want exactly one nudge of the held reason", b.healthNudges, w2.HealthNotifiedAt, w2.HealthReason.String)
+	}
+	if !w2.HealthSince.Time.Equal(r.HealthSince.Time) {
+		t.Fatalf("health_since restamped: %v, want %v", w2.HealthSince, r.HealthSince)
+	}
+
+	r.HealthNotifiedAt = w2.HealthNotifiedAt
+	if _, _, n := ownerHoldTick(t, r, ceilingEnd.Add(time.Minute)); n != 0 {
+		t.Fatalf("after the nudge: changed=%d, want 0", n)
+	}
+}
+
+// An owner hold that begins mid-episode (the episode entered on the stale pin alone) is marked once
+// by the unchanged-skip branch: no health write, no broadcast, not counted.
+func TestCodexProvenanceOwnerHoldBeginsMidEpisodeIsMarked(t *testing.T) {
+	r := heldCodexRun("A")
+	r.StaleRequeuePinnable = true
+	fs, _, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.MarkOwnerHold || len(fs.marks) != 0 {
+		t.Fatalf("stale-only entry marked: MarkOwnerHold=%v marks=%d", w.MarkOwnerHold, len(fs.marks))
+	}
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+
+	r.OwnerHoldPinnable = true
+	fs, b, n := ownerHoldTick(t, r, t0.Add(time.Minute))
+	if n != 0 || len(fs.writes) != 0 || len(b.healths) != 0 {
+		t.Fatalf("mid-episode: changed=%d writes=%d broadcasts=%v, want none", n, len(fs.writes), b.healths)
+	}
+	if len(fs.marks) != 1 {
+		t.Fatalf("marks = %d, want 1", len(fs.marks))
+	}
+	m := fs.marks[0]
+	if m.ID != r.ID || m.Status != r.Status || m.Health != r.Health || m.HealthReason != r.HealthReason || m.HealthSince != r.HealthSince {
+		t.Fatalf("mark = %+v, want the row's id/status/health/reason/since", m)
+	}
+
+	r.HealthOwnerHoldActive = true
+	fs, _, _ = ownerHoldTick(t, r, t0.Add(2*time.Minute))
+	if len(fs.marks) != 0 || len(fs.writes) != 0 {
+		t.Fatalf("already marked: marks=%d writes=%d, want none", len(fs.marks), len(fs.writes))
+	}
+}
+
+// The hold cleared before the grace expired, with the marker committed: the nudge waits for the
+// ceiling, not the grace end.
+func TestCodexProvenanceMarkedHoldClearedBeforeGraceNudgesAtCeiling(t *testing.T) {
+	r := overlappingHeldRun()
+	fs, _, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+	r.HealthOwnerHoldActive = true
+	r.OwnerHoldPinnable = false // hold cleared; the stale pin still inside grace
+
+	if fs, b, n := ownerHoldTick(t, r, t0.Add(5*time.Minute)); n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+		t.Fatalf("inside grace: changed=%d nudges=%v, want quiet", n, b.healthNudges)
+	}
+	if fs, b, n := ownerHoldTick(t, r, t0.Add(pinTestGrace+5*time.Minute)); n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+		t.Fatalf("after grace: changed=%d nudges=%v, want quiet until the ceiling", n, b.healthNudges)
+	}
+	fs, b, n := ownerHoldTick(t, r, r.UpdatedAt.Time.Add(2*time.Hour))
+	if w := lastWrite(t, fs, r.ID); n != 1 || len(b.healthNudges) != 1 || !b.healthNudges[0] || !w.HealthNotifiedAt.Valid {
+		t.Fatalf("at the ceiling: changed=%d nudges=%v, want one nudge", n, b.healthNudges)
+	}
+}
+
+// The marker never applies to the unavailable-provenance reason, which nudges on entry.
+func TestCodexProvenanceUnavailableNeverMarksOwnerHold(t *testing.T) {
+	r := heldCodexRun("")
+	r.OwnerHoldPinnable = true
+	r.Health = healthStalled
+	r.HealthReason = pgtype.Text{String: reasonOutcomeUndelivered, Valid: true}
+	r.HealthSince = ago(2 * time.Hour)
+	fs, b, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.MarkOwnerHold || len(fs.marks) != 0 || !w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || !b.healthNudges[0] {
+		t.Fatalf("mark=%v marks=%d nudges=%v notified=%v, want an unmarked nudge on entry", w.MarkOwnerHold, len(fs.marks), b.healthNudges, w.HealthNotifiedAt)
+	}
+}
+
+// Cooldown still gates the deferred nudge: a nudge stamped before this episode began but still
+// inside the cooldown at the ceiling end suppresses it (the sole blocker here).
+func TestCodexProvenanceMarkedHoldCeilingNudgeRespectsCooldown(t *testing.T) {
+	r := overlappingHeldRun()
+	r.UpdatedAt = ago(100 * time.Minute) // ceiling end t0+20m, inside the 30m cooldown of a t0-1s nudge
+	r.HealthNotifiedAt = pgconv.Time(t0.Add(-time.Second))
+	fs, _, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	if !w.MarkOwnerHold || w.HealthNotifiedAt.Valid {
+		t.Fatalf("entry: mark=%v notified=%v, want a marked quiet entry", w.MarkOwnerHold, w.HealthNotifiedAt)
+	}
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+	r.HealthOwnerHoldActive = true
+	r.OwnerHoldPinnable = false
+	fs, b, n := ownerHoldTick(t, r, r.UpdatedAt.Time.Add(2*time.Hour))
+	if n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+		t.Fatalf("at the ceiling within cooldown: changed=%d nudges=%v, want none", n, b.healthNudges)
+	}
+}
+
+// The pinnable flag alone is not an owner hold: past updated_at + WorkerAffinityCeiling ownerHold is
+// false, so no tick may stamp the marker, whether it writes a new episode or skips an unchanged one.
+func TestCodexProvenancePinnableFlagPastCeilingNeverMarks(t *testing.T) {
+	r := heldCodexRun("A")
+	r.OwnerHoldPinnable = true
+	r.UpdatedAt = ago(3 * time.Hour) // ceiling (2h) ended an hour ago
+
+	fs, _, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.MarkOwnerHold || len(fs.marks) != 0 {
+		t.Fatalf("new episode: MarkOwnerHold=%v marks=%d, want none past the ceiling", w.MarkOwnerHold, len(fs.marks))
+	}
+
+	// Unchanged episode that was already nudged, so the tick takes the skip branch.
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+	r.HealthNotifiedAt = pgconv.Time(t0)
+	fs, _, n := ownerHoldTick(t, r, t0.Add(time.Minute))
+	if n != 0 || len(fs.writes) != 0 || len(fs.marks) != 0 {
+		t.Fatalf("unchanged episode: changed=%d writes=%d marks=%d, want none past the ceiling", n, len(fs.writes), len(fs.marks))
+	}
+}
+
+// Without the marker (the hold began and cleared between ticks, or its write failed) the stale
+// shortcut still applies: the nudge fires at grace expiry.
+func TestCodexProvenanceUnmarkedStaleExpiredNudgesAtGraceEnd(t *testing.T) {
+	r := heldCodexRun("A")
+	r.StaleRequeuePinnable = true
+	fs, _, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+	r.HealthOwnerHoldActive = false
+	fs, b, n := ownerHoldTick(t, r, t0.Add(pinTestGrace+time.Minute))
+	if n != 1 || len(b.healthNudges) != 1 || !b.healthNudges[0] || !lastWrite(t, fs, r.ID).HealthNotifiedAt.Valid {
+		t.Fatalf("changed=%d nudges=%v, want one nudge at grace expiry", n, b.healthNudges)
 	}
 }
