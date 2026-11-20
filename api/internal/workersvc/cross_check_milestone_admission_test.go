@@ -42,6 +42,8 @@ func TestPlanCrossCheckCandidateMilestoneAdmissibility(t *testing.T) {
 		{"blank id and title", `[{"id":"","title":""}]`, refused, "new"},
 		{"extra key", `[{"id":"m1","title":"t","metadata":{"id":12}}]`, refused, "new"},
 		{"capitalized keys", `[{"ID":"m1","Title":"t"}]`, refused, "new"},
+		{"capitalized id key", `[{"ID":"m1","title":"t"}]`, refused, "new"},
+		{"capitalized title key", `[{"id":"m1","Title":"t"}]`, refused, "new"},
 		{"duplicate ids", `[{"id":"m1","title":"a"},{"id":"m1","title":"b"}]`, refused, "new"},
 		{"interior space id", one("m 1", "t"), refused, "new"},
 		{"slash id", one("a/b", "t"), refused, "new"},
