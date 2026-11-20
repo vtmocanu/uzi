@@ -205,7 +205,7 @@ it("frozen held packs and secret scan floors use the work branch, with task conf
       ranges.push(range);
       return { trusted: true, findings: [] };
     };
-    const result = await prepareFrozenHeld({ git: r.cache, barePath: bare, branch: BRANCH, sourceSha: source,
+    const result = await prepareFrozenHeld({ literals: [], git: r.cache, barePath: bare, branch: BRANCH, sourceSha: source,
       policy, deadlineMs: 30_000 });
     assert.ok("pack" in result);
     assert.equal(ranges.length, 1);
@@ -348,7 +348,7 @@ it("held task publication scans new secrets beyond the branch and confirmed key 
       ciGlobs: null, confirmedTip: confirmed, checkpointKey: CHILD_KEY, extraFloors: [] };
     const clean = commit(clone.path, "clean");
     await fixtureFetchTracking(cache, bare, clone.path, BRANCH, CHILD);
-    const good = await prepareFrozenHeld({ git: cache, barePath: bare, branch: BRANCH, sourceSha: clean,
+    const good = await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch: BRANCH, sourceSha: clean,
       policy, deadlineMs: 30_000 });
     assert.ok("pack" in good, "an already published secret stays below the branch floor");
     const calls = shimCalls(scanner).filter(c => c.startsWith("git "));
@@ -356,17 +356,17 @@ it("held task publication scans new secrets beyond the branch and confirmed key 
       "the actual scanner receives both authorized content floors");
     const dirty = commit(clone.path, "new-secret", "new secret", "ghp_" + "b".repeat(36));
     await fixtureFetchTracking(cache, bare, clone.path, BRANCH, CHILD);
-    assert.deepEqual(await prepareFrozenHeld({ git: cache, barePath: bare, branch: BRANCH, sourceSha: dirty,
+    assert.deepEqual(await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch: BRANCH, sourceSha: dirty,
       policy, deadlineMs: 30_000 }), { reason: "secret_found" });
     cmd(clone.path, "reset", "--hard", clean);
     const workflow = commit(clone.path, ".github/workflows/ci.yml");
     await fixtureFetchTracking(cache, bare, clone.path, BRANCH, CHILD);
-    assert.deepEqual(await prepareFrozenHeld({ git: cache, barePath: bare, branch: BRANCH, sourceSha: workflow,
+    assert.deepEqual(await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch: BRANCH, sourceSha: workflow,
       policy, deadlineMs: 30_000 }), { reason: "workflow_change" });
     cmd(clone.path, "reset", "--hard", clean);
     const ci = commit(clone.path, ".gitlab-ci.yml");
     await fixtureFetchTracking(cache, bare, clone.path, BRANCH, CHILD);
-    assert.deepEqual(await prepareFrozenHeld({ git: cache, barePath: bare, branch: BRANCH, sourceSha: ci,
+    assert.deepEqual(await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch: BRANCH, sourceSha: ci,
       policy: { ...policy, ciGlobs: [".gitlab-ci.yml"] }, deadlineMs: 30_000 }), { reason: "ci_config_guard" });
   } finally { fx.cleanup(); }
 });

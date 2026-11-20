@@ -2,6 +2,7 @@ import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import { CLAUDE_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -1071,6 +1072,11 @@ export class Worker {
           // writes Closes #<iid>. Advertised UNCONDITIONALLY: the api offers a run on a linked
           // repo only to a worker advertising it.
           "issue_key_v1",
+          // PRD #4320 / #4505: activated 2026-11-19 with the gateway-redirect risk accepted
+          // (ADR-4320). Advertised UNCONDITIONALLY: the api offers a provider-bound run only to a
+          // worker advertising it, and client.ts requireProviderCapability still refuses a provider
+          // claim on a registration that did not advertise it.
+          CLAUDE_PROVIDER_CAPABILITY,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

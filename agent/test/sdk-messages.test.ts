@@ -1,6 +1,23 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantModelOf, assistantUsageOf, orphanInstanceKind } from "../src/sdk-messages.js";
+import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantModelOf, assistantUsageOf, orphanInstanceKind, providerErrorMessage } from "../src/sdk-messages.js";
+import { makeTextRedactor, providerKeyForms } from "../src/redact.js";
+
+describe("providerErrorMessage redaction order", () => {
+  const KEY = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+  const text = "api error: " + "x".repeat(188) + KEY;
+  it("redacts before the 200-char cut so no key prefix survives", () => {
+    const redactText = makeTextRedactor(providerKeyForms(KEY));
+    const out = providerErrorMessage(401, text, redactText);
+    assert.ok(out.startsWith("provider error: 401 "));
+    for (let n = 8; n <= KEY.length; n++) assert.ok(!out.includes(KEY.slice(0, n)), `prefix ${n} leaked`);
+  });
+  it("identity default is unchanged", () => {
+    const out = providerErrorMessage(401, text);
+    assert.ok(out.includes(KEY.slice(0, 5)));
+    assert.equal(out, providerErrorMessage(401, text, (s) => s));
+  });
+});
 
 // SDK stream events → run_messages (kinds + agent attribution). Built with
 // hand-rolled SDK-shaped objects; no live session.

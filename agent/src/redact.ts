@@ -36,7 +36,36 @@ export const INVISIBLE_SRC = String.raw`\x1b\[[0-?]*[ -/]*[@-~]|[\p{Cc}\p{Cf}]`;
 const INVISIBLE = new RegExp(INVISIBLE_SRC, "gu");
 const INVISIBLE_TEST = new RegExp(INVISIBLE_SRC, "u");
 
+/** Every encoding of `key` a gateway error body is known to echo it in: raw, JSON-escaped, JSON
+ *  with `\/`, the HTML-safe `\u00XX` forms Go's encoding/json emits (both hex cases), and the
+ *  percent-encoded forms (both hex cases, and `+` for a space). Longest first, so a raw
+ *  substring never leaves the surrounding escape characters behind. */
+export function providerKeyForms(key: string): string[] {
+  const json = JSON.stringify(key).slice(1, -1);
+  const htmlSafe = (hex: (s: string) => string): string =>
+    json.replace(/[<>&\u2028\u2029]/g, (c) => `\\u${hex(c.charCodeAt(0).toString(16).padStart(4, "0"))}`);
+  const pct = encodeURIComponent(key);
+  const forms = [
+    key, json, json.replaceAll("/", "\\/"), htmlSafe((h) => h), htmlSafe((h) => h.toUpperCase()),
+    pct, pct.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()),
+  ];
+  if (key.includes(" ")) forms.push(pct.replaceAll("%20", "+"));
+  return [...new Set(forms)].sort((a, b) => b.length - a.length);
+}
+
 export type TextRedactor = (s: string) => string;
+
+/** The api bounds a non_closing reason to 1..500 code points. */
+const NON_CLOSING_REASON_MAX = 500;
+
+/** Redact a non_closing reason, then clamp it to the api's 500 code-point bound (the redaction
+ *  marker can lengthen a short secret). A non-empty reason stays non-empty. */
+export function redactNonClosingReason(redact: TextRedactor, reason: string): string {
+  const out = redact(reason);
+  const points = Array.from(out);
+  return points.length > NON_CLOSING_REASON_MAX ? points.slice(0, NON_CLOSING_REASON_MAX).join("") : out;
+}
+
 export type PayloadRedactor = (payload: Record<string, unknown>) => Record<string, unknown>;
 
 // usableSecrets keeps only strings at/above the length floor; below it an
@@ -103,26 +132,65 @@ function redactAcrossInvisible(text: string, secrets: string[]): string {
   return out + text.slice(cursor);
 }
 
-/**
- * Build a payload redactor over the given secrets. Returns an identity function
- * when no usable secret is supplied, so callers pay nothing when there is nothing
- * to scrub.
- */
-export function makeRedactor(secrets: Array<string | undefined | null>): PayloadRedactor {
-  if (usableSecrets(secrets).length === 0) return (payload) => payload;
-
-  const scrubString = makeTextRedactor(secrets);
-  const walk = (value: unknown): unknown => {
+/** Scrub string values and member names without dropping colliding data. Finite numeric sums merge,
+ * plain records merge recursively, and other collisions retain the later value under a safe
+ * suffix. Reserve real names first so a generated suffix cannot steal an unrelated field.
+ * Bounded diagnostic callers may retain their existing container/depth boundary via descend. */
+export function redactStrings<T>(value: T, scrubString: TextRedactor,
+  descend?: (container: object, depth: number) => boolean): T {
+  // The old walker copies enumerable members of class instances too. Preserve that output,
+  // but only copies originating from plain records may participate in recursive merging.
+  const plainRecords = new WeakSet<object>();
+  const record = (entries: Array<[string, unknown]>, plain: boolean): Record<string, unknown> => {
+    const reserved = new Set(entries.map(([name]) => name));
+    const out = new Map<string, unknown>();
+    for (const [name, next] of entries) {
+      if (!out.has(name)) {
+        out.set(name, next);
+        continue;
+      }
+      const prior = out.get(name);
+      if (typeof prior === "number" && Number.isFinite(prior) &&
+          typeof next === "number" && Number.isFinite(next) && Number.isFinite(prior + next)) {
+        out.set(name, prior + next);
+      } else if (prior !== null && typeof prior === "object" && plainRecords.has(prior) &&
+                 next !== null && typeof next === "object" && plainRecords.has(next)) {
+        // These names/values are already scrubbed; do not run a redactor twice while merging.
+        out.set(name, record([...Object.entries(prior), ...Object.entries(next)], true));
+      } else {
+        let suffix = 2;
+        while (reserved.has(`${name}#${suffix}`) || out.has(`${name}#${suffix}`)) suffix++;
+        out.set(`${name}#${suffix}`, next);
+      }
+    }
+    // fromEntries keeps a literal __proto__ as own data instead of invoking a setter.
+    const result = Object.fromEntries(out);
+    if (plain) plainRecords.add(result);
+    return result;
+  };
+  const walk = (value: unknown, depth = 0): unknown => {
     if (typeof value === "string") return scrubString(value);
-    if (Array.isArray(value)) return value.map(walk);
+    if (value && typeof value === "object" && descend && !descend(value, depth)) return value;
+    if (Array.isArray(value)) return value.map(child => walk(child, depth + 1));
     if (value && typeof value === "object") {
-      const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(value)) out[k] = walk(v);
-      return out;
+      const proto = Object.getPrototypeOf(value);
+      return record(Object.entries(value).map(([name, child]) => [scrubString(name), walk(child, depth + 1)]),
+        proto === Object.prototype || proto === null);
     }
     return value;
   };
-  return (payload) => walk(payload) as Record<string, unknown>;
+  return walk(value) as T;
+}
+
+/**
+ * Build a payload redactor over the given secrets. Returns an identity function
+ * when no usable secret is supplied, so callers pay nothing when there is nothing
+ * to scrub. Member names use the same redaction and collision rules as values.
+ */
+export function makeRedactor(secrets: Array<string | undefined | null>): PayloadRedactor {
+  if (usableSecrets(secrets).length === 0) return (payload) => payload;
+  const scrubString = makeTextRedactor(secrets);
+  return (payload) => redactStrings(payload, scrubString);
 }
 
 /**

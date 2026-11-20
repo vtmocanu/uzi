@@ -29,7 +29,7 @@ function fixture(defaultBranch?: string) {
   const flight = {
     ...initialized,
     runId: "test", runKind: "issue", barePath: "bare", branch: "task",
-    checkpointChainForge: false, runLog: nullLogger(), reportedPublishOutcomes: new Set<string>(),
+    checkpointChainForge: false, runLog: nullLogger(), providerKeyForms: [], reportedPublishOutcomes: new Set<string>(),
     batcher: { emit() {} },
   } as unknown as Parameters<RunRunner["publishCheckpointOutcome"]>[0];
   Object.assign(runner, { requireTrackingOwned: async () => TIP });
@@ -236,7 +236,7 @@ for (const late of ["none", "range", "guard", "preparation"] as const) {
         return { tipOid: TIP, pack: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
       },
     } as unknown as HeldGit;
-    const pending = prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: TIP, policy,
+    const pending = prepareFrozenHeld({ literals: [], git, barePath: "bare", branch: "task", sourceSha: TIP, policy,
       defaultBranch: "server", deadlineMs: 100,
       remediationHold: async () => { checkScope("guard"); now = late === "guard" ? 100 : 60; return false; } });
     if (late === "none") assert.deepEqual(await pending, { pack: Buffer.from("PACK") });
@@ -289,7 +289,7 @@ it("held own budget expires inside real selective preparation and joins disposal
       cancelled(); stdout.destroy(); stderr.destroy(); stdin.destroy(); await completed;
     } };
   }, new AbortController().signal, () => prepareFrozenHeld({
-    git, barePath: "bare", branch: "task", sourceSha: TIP, policy, defaultBranch: "server", deadlineMs: 100,
+    literals: [], git, barePath: "bare", branch: "task", sourceSha: TIP, policy, defaultBranch: "server", deadlineMs: 100,
   }));
   const rejected = assert.rejects(pending, /maintenance deadline/).then(() => { returned = true; });
   try {

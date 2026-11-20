@@ -233,7 +233,7 @@ for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, undefined]) i
     const flight = { runKind: "task", runId: CHILD, claimGeneration: generation,
       checkpointCoordinates: claim().checkpoint_coordinates,
       lastCheckpointRefTip: "confirmed", lastAttemptedCheckpointRefTip: "attempted",
-      reportedPublishOutcomes: new Set(), runLog: { info() {}, warn() {} } };
+      providerKeyForms: [], reportedPublishOutcomes: new Set(), runLog: { info() {}, warn() {} } };
     const outcome = await RunRunner.prototype["publishCheckpointOutcome"].call(
       receiver as unknown as RunRunner,
       flight as unknown as Parameters<RunRunner["publishCheckpointOutcome"]>[0], "bare", BRANCH);

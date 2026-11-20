@@ -882,7 +882,7 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       cancel: new AbortController(),
       lastCheckpointRefTip: undefined,
       lastAttemptedCheckpointRefTip: undefined,
-      reportedPublishOutcomes: new Set<string>(),
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(),
       runLog: nullLogger(),
       batcher: { emit() {} },
       ...over,

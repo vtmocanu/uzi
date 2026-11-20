@@ -2016,6 +2016,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         claimGeneration: ctx.claimGeneration,
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
       // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
       // run-scoped, so the server needs only the client + runId — no RunContext
@@ -2029,6 +2030,7 @@ export class SdkExecutor implements Executor {
         client: this.client,
         runId: ctx.runId,
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
       // PRD #333 M2: the incidental-findings capture tool (mcp__findings__report_-
       // incidental_issue). A PLAIN working tool (POST → emit card → ack, turn
@@ -2043,6 +2045,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         emit: (m) => ctx.emit(m),
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
     }
 
@@ -4706,7 +4709,9 @@ export class SdkExecutor implements Executor {
       // shape every existing deepStrictEqual on this result asserts and blur the
       // wire distinction between "declared nothing" and "field present but empty".
       if (isIssueRun && declaredPrdPath !== undefined) {
-        result.prdDonePath = declaredPrdPath.slice(0, PRD_DONE_PATH_MAX_LEN);
+        // Redact BEFORE the clamp: a provider key straddling the cut would otherwise leave a prefix
+        // that no later whole-key redaction can match.
+        result.prdDonePath = (ctx.redactText?.(declaredPrdPath) ?? declaredPrdPath).slice(0, PRD_DONE_PATH_MAX_LEN);
       }
       // PRD #265 M1: forward the declared finished-milestone ids on `issue` runs only,
       // for the same reasons the PRD path is gated and OMITTED-not-undefined above. The
@@ -5345,6 +5350,7 @@ export class SdkExecutor implements Executor {
       const request: RunTurnRequest = {
         semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
+        redactText: ctx.redactText,
         prompt,
         // The neutral fields below are carried as-is; the placeholders
         // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which
@@ -5477,14 +5483,14 @@ export class SdkExecutor implements Executor {
         const spend = classifySpendLimitTerminal(terminal);
         if (spend) {
           throw new SpendLimitHoldError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText, ctx.redactText),
             spend.detail,
             resumableSessionId(),
           );
         }
         if (!limitFacts && isProviderTransient(terminal)) {
           throw new ProviderTransientError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText, ctx.redactText),
             terminal.apiErrorStatus,
             resumableSessionId(),
           );

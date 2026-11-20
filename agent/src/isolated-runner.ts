@@ -41,7 +41,7 @@ import type { Outbox } from "./outbox.js";
 import type { ClaimResponse, IsolatedFetchClaim, StateRequest } from "./protocol.js";
 import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import { buildIssueContext } from "./prompt.js";
-import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "./redact.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
@@ -220,7 +220,7 @@ export class IsolatedRunner {
     const grant = validGrant(claim.isolated_fetch);
     const token = claim.secrets?.anthropic_oauth_token?.trim() ?? "";
     // Registered before anything can log; evicted in the finally.
-    const runSecrets = [token, claim.secrets?.provider?.credential ?? "", grant?.credential ?? ""].filter((s) => s.length > 0);
+    const runSecrets = [token, ...(claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), grant?.credential ?? ""].filter((s) => s.length > 0);
     for (const s of runSecrets) this.log.addSecret(s);
     this.opts.activeRuns?.add(runId, generation);
 

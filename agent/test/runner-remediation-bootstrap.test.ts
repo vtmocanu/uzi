@@ -92,7 +92,7 @@ async function fixture(enrolled = true) {
       set preserveRecoveryClone(on: boolean) { retention.recoveryClone.setFlight(on); },
       runId: claim.run_id, branch: BRANCH, barePath: bare, worktreePath: clone.path, runnerClone: clone,
       runKind: "issue", claimGeneration: 2, claimGenerations: new Map(),
-      runLog: nullLogger(), batcher: { emit: () => {} }, reportedPublishOutcomes: new Set(),
+      runLog: nullLogger(), batcher: { emit: () => {} }, providerKeyForms: [], reportedPublishOutcomes: new Set(),
       cancel, steering,
       owedAnnounced: { heads: new Set(), archived: new Set() }, inventoryArchiveNotices: new Set(),
       publishedTip: d, checkpointFloor: d,

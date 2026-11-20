@@ -69,7 +69,7 @@ const EXACT_SITES: Record<string, Site[]> = {
   ],
   "diagram-diagnostic.ts": [
     { label: "claim type", line: "secrets: { anthropic_oauth_token?: string; codex?: unknown; provider?: { credential: string } };", count: 1 },
-    { label: "redaction list", line: "const secrets = [claim.secrets.anthropic_oauth_token, claim.secrets.provider?.credential, ...extraSecrets];", count: 1 },
+    { label: "redaction list", line: "const secrets = [claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), ...extraSecrets];", count: 1 },
   ],
   // The fail-closed provider decoder (PRD #4320): reads the OAuth token only to refuse a binding next to it.
   "provider-binding.ts": [

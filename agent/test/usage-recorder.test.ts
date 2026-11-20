@@ -15,6 +15,7 @@ import {
   type UsageClient,
   type UsageWireRequest,
 } from "../src/usage-recorder.js";
+import { makeTextRedactor, providerKeyForms } from "../src/redact.js";
 import { nullLogger } from "./helpers.js";
 
 // Issue #2014 (ADR-2014 D1/D3): the per-leg usage recorder and its bounded, abortable sender.
@@ -576,6 +577,30 @@ describe("MessageBatcher owns the usage drain", () => {
     await batcher.flush();
     assert.equal(usageClient.records.length, 1);
     assert.equal(usageClient.calls[0]!.generation, 4, "stamped with the batcher's claim generation");
+  });
+
+  it("redacts the provider key from a model id before it is posted; a vendor model id is unchanged", async () => {
+    const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const usageClient = new FakeUsageClient();
+    const client = {
+      postMessages: async () => {},
+      postUsage: (...args: Parameters<UsageClient["postUsage"]>) => usageClient.postUsage(...args),
+    } as unknown as WorkerClient;
+    const batcher = new MessageBatcher(client, "run-1", 0, 60_000, nullLogger(), undefined,
+      makeTextRedactor(providerKeyForms(key)), { generation: 4 });
+    const leg = batcher.usage.startLeg();
+    leg.observeAssistant(assistant("m1", { output_tokens: 1 }));
+    leg.observeAssistant({
+      type: "assistant", session_id: "sess-1",
+      message: { id: "m2", model: `corp-${key}`, usage: { output_tokens: 2 }, content: [] },
+    });
+    await batcher.flush();
+    const byId = new Map(usageClient.records.map((r) => [r.message_id, r.model]));
+    assert.equal(byId.get("m1"), "claude-sonnet-5-5");
+    const posted = JSON.stringify(usageClient.calls.map((c) => c.body));
+    for (const f of providerKeyForms(key)) assert.ok(!posted.includes(f), `form leaked: ${f}`);
+    assert.ok(!posted.includes("Hd6y") && !posted.includes("eT8m"));
+    assert.match(String(byId.get("m2")), /^corp-/);
   });
 
   it("close() drains the usage too", async () => {

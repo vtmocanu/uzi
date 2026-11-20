@@ -177,7 +177,7 @@ describe("a zero-range held publication", () => {
   it("prepares a bounded pack that carries the tip commit, after a trusted scan", async () => {
     let scanned: { trusted: boolean; findings: unknown[] } | undefined;
     const out = await prepareFrozenHeld({
-      git: scanCache, barePath: bare, branch: BRANCH, sourceSha: tip, policy, deadlineMs: 60_000,
+      literals: [], git: scanCache, barePath: bare, branch: BRANCH, sourceSha: tip, policy, deadlineMs: 60_000,
       onScan: (s) => { scanned = s; },
     });
     assert.ok("pack" in out, `prepared: ${JSON.stringify("reason" in out ? out.reason : "")}`);
@@ -192,7 +192,7 @@ describe("a zero-range held publication", () => {
 
   it("still refuses a pack over the byte cap", async () => {
     const out = await prepareFrozenHeld({
-      git: scanCache, barePath: bare, branch: BRANCH, sourceSha: tip, policy, deadlineMs: 60_000, maxBytes: 16,
+      literals: [], git: scanCache, barePath: bare, branch: BRANCH, sourceSha: tip, policy, deadlineMs: 60_000, maxBytes: 16,
     });
     assert.deepEqual(out, { reason: "pack_too_large" });
   });

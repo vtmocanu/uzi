@@ -18,6 +18,8 @@ import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
+import { makeTextRedactor, providerKeyForms } from "./redact.js";
+import { redactStrings } from "./publication-intent.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
@@ -44,6 +46,14 @@ import type { ClaimProviderBinding, ClaimResponse, TaskReviewFinding, TaskReview
 // the SDK query AND hard-reject the race, so runModel always settles within the budget
 // and review() falls back to a `failed` review.
 const REVIEW_MODEL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** An error-derived review summary, capped at 500 chars. The claim's provider key is redacted from
+ *  the error text BEFORE the cap, so a key straddling the cut cannot leave a readable prefix. */
+function boundedClaimError(claim: ClaimResponse, prefix: string, err: unknown): string {
+  const credential = claim.secrets?.provider?.credential;
+  const message = credential ? makeTextRedactor(providerKeyForms(credential))(errMessage(err)) : errMessage(err);
+  return `${prefix}${message}`.slice(0, 500);
+}
 
 // The prompt char budget for the diff. The git layer already caps the diff at 512 KiB
 // (REVIEW_DIFF_MAX_BYTES); this is a second, char-domain clamp so a diff of mostly
@@ -145,12 +155,12 @@ export class ReviewRunner {
       ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     scope?.own();
     // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
-    const providerKey = claim.secrets?.provider?.credential;
-    if (providerKey) this.log.addSecret(providerKey);
+    const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const k of providerKeys) this.log.addSecret(k);
     try { await this.executeClaim(claim, signal); }
     finally {
       scope?.close();
-      if (providerKey) this.log.removeSecret(providerKey);
+      for (const k of providerKeys) this.log.removeSecret(k);
     }
   }
 
@@ -278,7 +288,7 @@ export class ReviewRunner {
         run_id: reviewRunId,
         error: errMessage(err),
       });
-      review = { status: "failed", summary: `Review could not be produced: ${errMessage(err)}`.slice(0, 500), findings: [] };
+      review = { status: "failed", summary: boundedClaimError(claim, "Review could not be produced: ", err), findings: [] };
     }
 
     try {
@@ -325,7 +335,13 @@ export class ReviewRunner {
         }
       }
       try {
-        await this.client.postTaskReview(targetId, review, claim.claim_generation, reviewRunId);
+        // The review's summary and findings are model- or error-authored; scrub the claim's provider
+        // key (every encoded form) here, at the one sink, whichever path produced them.
+        const providerCredential = claim.secrets?.provider?.credential;
+        const scrubbed = providerCredential
+          ? redactStrings(review, makeTextRedactor(providerKeyForms(providerCredential)))
+          : review;
+        await this.client.postTaskReview(targetId, scrubbed, claim.claim_generation, reviewRunId);
       } catch (err) {
         // Issue #1423: the server fence refused the write because this flight's claim was
         // superseded (reclaimed at a newer generation), released, reassigned, or its review run
@@ -389,7 +405,7 @@ export class ReviewRunner {
         run_id: claim.run_id,
         error: errMessage(err),
       });
-      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+      return fallbackTaskReview(boundedClaimError(claim, "The reviewer model call did not complete: ", err));
     }
   }
 
@@ -433,7 +449,7 @@ export class ReviewRunner {
         run_id: claim.run_id,
         error: errMessage(err),
       });
-      return fallbackTaskReview(`The reviewer model call did not complete: ${errMessage(err)}`.slice(0, 500));
+      return fallbackTaskReview(boundedClaimError(claim, "The reviewer model call did not complete: ", err));
     }
   }
 

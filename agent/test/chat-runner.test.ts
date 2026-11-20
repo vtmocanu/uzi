@@ -6,6 +6,7 @@ import path from "node:path";
 import type { Options as SdkOptions, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { ChatExecutor, UZI_SRC_DIR, type SdkQueryFn } from "../src/chat-executor.js";
 import { ChatRunner, type ChatRunnerDefaults } from "../src/chat-runner.js";
+import { StubChatExecutor, STUB_CHAT_PROPOSE } from "../src/chat-executor-stub.js";
 import type { ChatInput, ChatInputSource } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { ChatClaimResponse, OutgoingMessage, StateRequest } from "../src/protocol.js";
@@ -379,6 +380,44 @@ describe("ChatRunner — provider gateway key redaction (PRD #4320)", () => {
     const emitted = JSON.stringify(messages);
     assert.ok(!emitted.includes(PROVIDER_KEY), "the key never reaches a chat message");
     assert.ok(emitted.includes("REDACTED"), "it was replaced, not dropped");
+  });
+
+  it("scrubs the escaped-slash JSON and percent-encoded forms of a key containing slashes", async () => {
+    const SLASH_KEY = ["gw", "key", "do-not-scan", "6262", "ab/cd/efgh"].join("-");
+    const jsonSlash = SLASH_KEY.replaceAll("/", "\\/");
+    const pct = encodeURIComponent(SLASH_KEY);
+    const { messages, client } = fakeClient();
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      yield assistantText(`echo {"key":"${jsonSlash}"} and ?k=${pct}`);
+      yield resultSuccess();
+    })();
+    const { logger, added, removed } = secretRecordingLogger();
+    const claim = providerClaim();
+    claim.secrets = { ...claim.secrets, provider: { ...claim.secrets.provider!, credential: SLASH_KEY } };
+    const executor = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+    await new ChatRunner(client, () => executor, logger, 5, DEFAULTS, JOIN, { makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]) }).execute(claim);
+    const emitted = JSON.stringify(messages);
+    assert.ok(!emitted.includes(jsonSlash) && !emitted.includes(pct) && !emitted.includes(SLASH_KEY), "no encoding reaches a chat message");
+    assert.ok(emitted.includes("REDACTED"));
+    assert.ok(added.includes(jsonSlash) && added.includes(pct), "every form registered with the logger");
+    assert.deepEqual([...removed].sort(), [...added].sort(), "and evicted symmetrically");
+  });
+
+  it("propose_issue's createProposal body carries no key form (the chat's redactor reaches the uzi tools)", async () => {
+    const { client } = fakeClient();
+    const proposals: Array<Record<string, unknown>> = [];
+    (client as unknown as Record<string, unknown>)["createProposal"] = async (runId: string, body: Record<string, unknown>) => {
+      proposals.push(body);
+      return { id: "p1", run_id: runId, title: String(body["title"]), description: String(body["description"]), labels: [], status: "pending", created_at: "2026-07-19T00:00:00Z" };
+    };
+    const { logger } = secretRecordingLogger();
+    await new ChatRunner(client, () => new StubChatExecutor(nullLogger()), logger, 5, DEFAULTS, JOIN, {
+      makeSource: () => fakeSource([msg(`${STUB_CHAT_PROPOSE} g/p title-${PROVIDER_KEY}`), { kind: "idle" }]),
+    }).execute(providerClaim());
+    assert.equal(proposals.length, 1);
+    assert.ok(!JSON.stringify(proposals[0]).includes(PROVIDER_KEY), "the key never reaches createProposal");
+    assert.match(String(proposals[0]!["title"]), /^title-/);
   });
 
   async function resultPayloads(claim: ChatClaimResponse): Promise<Record<string, unknown>[]> {

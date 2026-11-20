@@ -177,6 +177,147 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		}
 	})
 
+	// Arm (g) (PRD #4320 / #4505): an online ephemeral worker without claude_provider_v1 bound to a
+	// non-terminal provider-bound run can never claim it, so it is reaped (no deadline) and the run
+	// becomes ephemeral-provisioning demand again.
+	t.Run("(g) incapable online worker bound to a queued provider run: reaped, run listed again", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		optInEphemeral(fx)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-incapable")
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent) // online, well within every deadline
+		if unplaceableRunIDs(fx)[runA] {
+			t.Fatalf("precondition: run %s already served by its ephemeral worker must not be listed", runA)
+		}
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if workerExists(fx, wID) {
+			t.Errorf("worker %s still present: an online worker without %s bound to a provider run should be reaped by clause (g)", wID, claudeProviderCap)
+		}
+		if !unplaceableRunIDs(fx)[runA] {
+			t.Errorf("provider run %s not listed for provisioning after its incapable worker was reaped", runA)
+		}
+	})
+
+	t.Run("(g) capable online worker bound to a queued provider run: NOT reaped", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-capable")
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, wID, []string{claudeProviderCap})
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s advertising %s reaped by clause (g)", wID, claudeProviderCap)
+		}
+	})
+
+	t.Run("(g) incapable online worker bound to a vendor run: NOT reaped", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s bound to a vendor run reaped by clause (g)", wID)
+		}
+	})
+
+	t.Run("(g) incapable worker bound to a provider run but not yet online: NOT reaped", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-booting")
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, time.Time{}) // online_since NULL: not registered yet
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s reaped by clause (g) before it registered", wID)
+		}
+	})
+
+	t.Run("(g) busy incapable worker (holds a non-terminal run): NOT reaped", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-busy")
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+		pointRunAtWorker(fx, uuid.New(), wID, "running")
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s reaped while holding a non-terminal run — the busy guard must still apply to clause (g)", wID)
+		}
+	})
+
+	t.Run("(g) custody-held incapable worker: NOT reaped", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-custody")
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO recovery_custody_holds
+			(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id)
+			VALUES ($1,$2,$3,$4,1,'open',$5,'ident',$5,$4)`, uuid.New(), fx.userID, fx.repoID, runA, wID)
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s reaped while an open custody hold names it — the custody guard must still apply to clause (g)", wID)
+		}
+	})
+
+	t.Run("(g) incapable worker bound to a TERMINAL provider run is reaped by (a), not left", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-terminal")
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'cancelled' WHERE id = $1`, runA)
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if workerExists(fx, wID) {
+			t.Errorf("worker %s still present: a terminal run is reaped by clause (a)", wID)
+		}
+	})
+
+	// Pins the status guard inside arm (g): a TERMINAL provider-bound run does not make an incapable
+	// worker reapable through (g). With a live ephemeral lease, arm (f) spares the worker from (a),
+	// so only (g) could reap it.
+	t.Run("(g) incapable worker with a live lease bound to a TERMINAL provider run: NOT reaped (status guard)", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-terminal-leased")
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, runA)
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET lease_since = now(), lease_repo_id = $2, lease_branch = 'agent/issue-1', draining_since = NULL WHERE id = $1`, wID, fx.repoID)
+
+		lease := pgtype.Interval{Microseconds: int64(time.Hour / time.Microsecond), Valid: true}
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, lease); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s reaped: a live lease on a terminal run is spared by (f) and (g) must not apply to a terminal run", wID)
+		}
+	})
+
 	t.Run("non-ephemeral worker with a terminal run is never touched", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		var persistentID uuid.UUID

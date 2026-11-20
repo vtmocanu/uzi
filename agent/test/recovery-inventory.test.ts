@@ -1526,7 +1526,7 @@ it("B throwing pack stream waits for controlled child exit", async () => {
     Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited }) });
     let settled = false, cancelled = 0;
     Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited, cancel: () => { cancelled++; } }) });
-    const preparing = prepareFrozenHeld({ git: f.git as unknown as HeldGit,
+    const preparing = prepareFrozenHeld({ literals: [], git: f.git as unknown as HeldGit,
       barePath: f.context.barePath, branch: f.record.branch, sourceSha: H,
       policy: f.record.heldPolicy!, deadlineMs: 1000 });
     const checked = assert.rejects(preparing, /stream failed/).then(() => { settled = true; });

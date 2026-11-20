@@ -526,11 +526,16 @@ The Test probe is dialed from the api, ignores proxy variables, never follows a 
 admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
 flag, loopback addresses).
 
-**Activation is blocked.** The pinned Claude CLI follows gateway redirects (a same-origin 307
-re-sends the key in both auth styles; a cross-origin one forwards `x-api-key` and the body), so
-workers do not advertise the capability `claude_provider_v1` and a provider-bound run stays queued
-("no worker that supports model providers is online"). A loopback relay is deferred to a separate
-issue. Design record, route split, inheritance rules and rollback hazards:
+**Activated without the relay (owner decision 2026-11-19).** Workers advertise `claude_provider_v1` by
+default, so a provider-bound run starts on a current worker; an older worker never claims one and
+the run queues ("no worker that supports model providers is online"). The pinned Claude CLI follows
+gateway redirects (the key can be re-sent to another path on the same host under both auth styles,
+and the request body to any `Location` host), so the operator allowlist is the only control on where
+provider traffic starts; the loopback relay (#4496) is parked. Worker-side, the bound key is redacted
+(raw and encoded forms) from model, run, chat and forge-bound output, and an exact-key scan blocks
+any forge upload (branch push, checkpoint packs, held publication) whose objects carry it. Ephemeral
+provisioning counts a provider-bound run as demand and reaps an online ephemeral worker without the
+capability. Design record, route split, inheritance rules and rollback hazards:
 [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md); user docs:
 [docs/providers.md](docs/providers.md).
 
@@ -1352,8 +1357,8 @@ chain in the diagram above, with no intervening `running`.
   provider revision is gone) is final for that run, and a manual resume of either is refused
   with 409. Neither falls back to a vendor credential. A gateway 429 or overload parks an
   issue run as `limit_wait` instead (1, 5, 15 minutes, then the owner). See
-  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Dormant until
-  activation lands: no worker advertises `claude_provider_v1` yet, so a provider run stays queued.
+  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Active on workers that
+  advertise `claude_provider_v1`; an older worker leaves a provider run queued.
 
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,

@@ -74,6 +74,15 @@ describe("Codex runtime discovery uses effective grants", () => {
   });
 });
 
+describe("renderCodexRun carries the run's text redactor onto the lead grants", () => {
+  it("puts the request's redactText on leadGrants (the broker's signal parse reads it there)", () => {
+    const redactText = (s: string): string => s.replaceAll("SECRET", "X");
+    const run = renderCodexRun(runRequest({ redactText }));
+    assert.equal(run.leadGrants.redactText, redactText);
+    assert.equal(renderCodexRun(runRequest()).leadGrants.redactText, undefined);
+  });
+});
+
 /** A HarnessAgent with sane defaults, overridable per test. */
 function agent(overrides: Partial<HarnessAgent> = {}): HarnessAgent {
   return {

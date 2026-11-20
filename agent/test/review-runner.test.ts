@@ -7,6 +7,7 @@ import type { AdviceRequest, AdviceUsageSnapshot } from "../src/harness.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 
 import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt, hasProviderCostForEveryModel } from "../src/review-runner.js";
+import { providerKeyForms } from "../src/redact.js";
 import { CODEX_TASK_REVIEW_MODEL } from "../src/codex/task-review-model.js";
 import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -370,6 +371,55 @@ describe("ReviewRunner", () => {
     assert.deepEqual(added, [key]);
     assert.deepEqual(removed, [key]);
   });
+
+  // The posted review is the sink that holds the invariant: a prep-phase error that echoes the
+  // provider key must not reach postTaskReview. Assembled at runtime from fragments.
+  it("redacts the provider key from a prep-failure review before posting it", async () => {
+    const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff\n");
+    git.ensureClone = (async () => { throw new Error(`clone refused for header ${key}`); }) as typeof git.ensureClone;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
+    const provider = {
+      provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+      auth_style: "bearer", credential: key, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+    };
+    await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", anthropic_oauth_token: "", provider } as never }));
+    assert.ok(calls.review, "a failed review was still posted");
+    assert.match(calls.review!.review.summary, /^Review could not be produced: clone refused for header /);
+    const posted = JSON.stringify(calls.review!.review);
+    for (const f of providerKeyForms(key)) assert.ok(!posted.includes(f), `form leaked: ${f}`);
+    assert.ok(!posted.includes("Hd6y") && !posted.includes("eT8m"), "no key fragment leaked");
+  });
+
+  // The 500-char cap on an error-derived summary must not cut through the key: the key is redacted
+  // BEFORE the cap, so no readable prefix (8+ chars) of it survives in the posted review.
+  // The "model call failure" site is covered by the model pass sanitizing the error first (so this
+  // case does not isolate boundedClaimError there); the "prep failure" site isolates it.
+  for (const site of ["prep failure", "model call failure (model pass sanitizes first)"] as const) {
+    it(`a provider key straddling the 500-char cap leaks no prefix (${site})`, async () => {
+      const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+      const prefix = site === "prep failure" ? "Review could not be produced: " : "The reviewer model call did not complete: ";
+      const message = "x".repeat(490 - prefix.length) + key;
+      assert.ok(`${prefix}${message}`.slice(0, 500).includes(key.slice(0, 10)) && !`${prefix}${message}`.slice(0, 500).includes(key), "fixture straddles the cut");
+      const { client, calls } = fakeClient();
+      const { git } = fakeGit("diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-old\n+new\n");
+      let queryFn = forbiddenQueryFn();
+      if (site === "prep failure") git.ensureClone = (async () => { throw new Error(message); }) as typeof git.ensureClone;
+      // eslint-disable-next-line require-yield
+      else queryFn = (async function* () { throw new Error(message); }) as unknown as SdkQueryFn;
+      const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+      const provider = {
+        provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+        auth_style: "bearer", credential: key, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+      };
+      await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", anthropic_oauth_token: "", provider } as never }));
+      assert.ok(calls.review, "a failed review was still posted");
+      const posted = JSON.stringify(calls.review!.review);
+      assert.ok(calls.review!.review.summary.startsWith(prefix), calls.review!.review.summary);
+      for (let n = 8; n <= key.length; n++) assert.ok(!posted.includes(key.slice(0, n)), `key prefix of length ${n} leaked`);
+    });
+  }
 
   // Lane-acceptance: a capability worker's review run is ACCEPTED by a generation-fencing api.
   // Reverting the threading routes the mutating reports to `refused` (409) and reddens this.
