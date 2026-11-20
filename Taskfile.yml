@@ -362,7 +362,7 @@ tasks:
       # edit that would tear down the wrong project reddens here instead of on a host.
       - task: test:e2e-reclaim
       # hermetic sibling of test:e2e-reclaim (PRD #966 M2): a fake docker/curl/psql, no
-      # daemon. It exercises the e2e phase-registry driver's fail-soft/quarantine/provides
+      # daemon. It exercises the e2e phase-registry driver's fail-soft/end-of-phase boundary/provides
       # semantics AND guards the tally (>= 8 cases, c == p) so a gutted driver test cannot
       # read green. Before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:e2e-driver

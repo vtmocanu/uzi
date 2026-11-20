@@ -145,7 +145,7 @@ case "$GHLOG_CT" in text/plain*) : ;; *) fail "job-log blob content-type must be
 pass "job logs return a 302 → text/plain blob (D5 shape) ✓"
 
 # The ci_fix run above only proves the Fix-CI START GATE; nothing waits for it, and this lane
-# is short, so it was still queued when the phase ended and the quarantine logged a LEAK
+# is short, so it was still queued when the phase ended and the end-of-phase boundary flagged it as residue
 # (seen in CI). Cancel it and let the cancel land before the phase exits.
 apipost "/api/runs/$GHFIX/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 settle_runs_terminal 30 "$GHFIX"

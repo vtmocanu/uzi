@@ -7,6 +7,7 @@
 # requires: REPO_ID UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
+# handoff-holds: FRESH_ID
 # mutates:  -
 # restores: -
 # =============================================================================
@@ -349,7 +350,9 @@ printf '%s' "$AFTER_SNAPSHOT" | jq -e --arg h "$FRESH_ID" '[.holds[]? | select(.
 pass "episode cleared: blocked_runs=0, open_holds=$AFTER_OPEN, admission_counted_holds=$AFTER_COUNTED (< $LIMIT); fresh hold $FRESH_ID remains open"
 
 # --- 5) cleanup: leave the owner as we found it (self-cleaning; phases 73-76 run after this one) ---
-# Cancel the wedge run so the end-of-phase quarantine finds nothing to reap, then remove
+# Cancel the wedge run so the driver's end-of-phase boundary finds no non-terminal run or worker
+# row left from it. The wedge run's fresh hold (FRESH_ID) stays open by design (the cancel keeps
+# its evidence) and is declared to the boundary through the `handoff-holds:` header. Then remove
 # ONLY this phase's seed fixtures (matched by SEED_IDENT, in any state). The seeds carry
 # no captures/chunks, so a plain delete is FK-safe; the standalone reset script is for the
 # throwaway store-it/e2e DB boundary, not this in-suite fixture cleanup.

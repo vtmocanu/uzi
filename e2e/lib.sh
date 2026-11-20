@@ -970,7 +970,7 @@ cleanup() {
   # A red run KEEPS its scratch dir so the per-phase artifacts/ the driver captured
   # survive for post-mortem (and #967's upload). "Red" = a non-zero exit $code OR the
   # driver's `$RUNROOT/.keep-rundir` sentinel, which the driver `touch`es on ANY
-  # FAIL/LEAK — so a non-strict LEAK, which exits 0, still keeps the dir per D5. The
+  # FAIL (a failed end-of-phase boundary is a FAIL), per D5. The
   # existing KEEP (KEEP_RUNDIR) path keeps it unconditionally and is handled first.
   if [ -n "$KEEP" ]; then
     exit $code
@@ -1095,15 +1095,32 @@ db_psql() {
 }
 # db_psql_rows SQL — like db_psql but PRESERVES row boundaries (one row per line).
 # db_psql collapses newlines (tr -d '\r\n') for scalar reads; use THIS for any
-# query whose result is enumerated row-by-row (the quarantine id sweep, the
+# query whose result is enumerated row-by-row (the driver boundary's samples, the
 # multi-row artifact dumps) so 2+ rows don't fuse into one garbage token. It strips
 # only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
-# (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. PGPW
-# is the memoized module var db_psql uses.
-db_psql_rows() {
-  [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
-}
+# (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. The
+# password comes from PGPW when set, else is read from ENVFILE on every call (this function
+# never writes PGPW: its body is a subshell).
+#
+# Optional SECS (a positive integer, else return 1) bounds the whole read: the compose exec runs
+# under `timeout --signal=KILL SECS` (or `gtimeout`); with neither installed it prints
+# 'db_psql_rows: no timeout limiter' to stderr and returns non-zero rather than run unbounded.
+# The body is a ( ... ) subshell with its own `set -o pipefail`, so a psql/compose failure or a
+# limiter kill is the function's exit status instead of being masked by the strip filter, and the
+# option never leaks into the caller. (PGPW is therefore re-read per call; the grep is cheap.)
+db_psql_rows() (
+  set -o pipefail
+  local pw="$PGPW" secs="${2:-}" lim=()
+  [ -n "$pw" ] || pw="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
+  if [ -n "$secs" ]; then
+    case "$secs" in *[!0-9]*) return 1 ;; esac
+    [ "$((10#$secs))" -gt 0 ] || return 1
+    if command -v timeout >/dev/null 2>&1; then lim=(timeout --signal=KILL "$secs")
+    elif command -v gtimeout >/dev/null 2>&1; then lim=(gtimeout --signal=KILL "$secs")
+    else echo 'db_psql_rows: no timeout limiter' >&2; return 1; fi
+  fi
+  ${lim[@]+"${lim[@]}"} "${COMPOSE[@]}" exec -T -e PGPASSWORD="$pw" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+)
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
 # race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board
@@ -1150,6 +1167,21 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 # asserting a 422 (the uzi run-eligibility gate refusing a non-uzi issue).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# boundary_cancel PATH SECS EVIDENCE_PREFIX — the end-of-phase boundary's one-shot run cancel
+# (e2e/driver.sh). Bounded by curl --max-time SECS, and every outcome is kept as evidence files:
+# PREFIX.body (response), PREFIX.http (status), PREFIX.stderr, PREFIX.exit (curl's exit status).
+# Returns 0 iff curl exited 0 AND the status is 2xx; a timeout (curl 28), a transport failure and a
+# 4xx/5xx all return 1, and the caller reads PREFIX.exit/.http to tell them apart.
+boundary_cancel() {
+  local rc=0 code
+  curl -sS --max-time "$2" -o "$3.body" -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
+    -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+    -d '{"kind":"cancel","body":""}' > "$3.http" 2> "$3.stderr" || rc=$?
+  printf '%s\n' "$rc" > "$3.exit"
+  [ "$rc" -eq 0 ] || return 1
+  code="$(cat "$3.http")"
+  case "$code" in 2??) return 0 ;; *) return 1 ;; esac
+}
 
 # wait_http — poll /api/health until the stack answers. Instrumented (PRD #97 M9b)
 # even though it is defined ABOVE record_margin: bash resolves function names at call
@@ -1758,7 +1790,8 @@ run_claimed_at() { apiget "/api/runs/$1" | jq -r '.run.claimed_at // empty'; }
 # settle_runs_terminal TIMEOUT RUN... — best-effort wait for each run a phase cancelled to
 # become terminal (completed/failed/cancelled) before the phase exits. A cancel to a run with a
 # live worker is only ENQUEUED; the worker applies it at its next poll, so a phase that exits
-# right after its cleanup cancels hands the driver's quarantine a still-live run and logs a LEAK.
+# right after its cleanup cancels hands the driver's end-of-phase boundary a still-live run, which
+# it cancels again and (if it does not settle in time) FAILs the phase.
 # Never fails a phase: it returns 0 whatever happens, and empty ids are skipped. Each status
 # read is a single curl capped at 5s (run_status_quick, no retry), so a hung api cannot stretch
 # the wait much past TIMEOUT.

@@ -16,8 +16,10 @@
 # 🔴 THE FLOOR IS 8. PRD #966 M2 specifies eight named driver behaviours, each
 # watched red under a named mutation (SC2, "N >= 8"): (1) errexit-safe subshell,
 # (2) provides round-trip, (3) requires-miss names both phases, (4) env: token
-# validation, (5) critical-stop + suspect_cascade, (6) quarantine LEAK + DB
-# fallback, (7) ONLY/SKIP honour critical, (8) fault injection + artifact shapes.
+# validation, (5) critical-stop + suspect_cascade, (6) the end-of-phase boundary
+# (undeclared residue that does not settle, a rejected cancel or an unverifiable read
+# FAILs the phase, #2892; it replaced the non-fatal quarantine LEAK and its DB fallback), (7) ONLY/SKIP honour
+# critical, (8) fault injection + artifact shapes.
 # The test emits more than 8 cases (several behaviours split into a/b sub-cases,
 # and later milestones add more), so it passes with headroom; the floor catches a
 # driver test that regressed BELOW its designed coverage, not one that grew.

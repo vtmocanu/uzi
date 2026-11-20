@@ -234,8 +234,8 @@ pass "board cached the NEWEST run (failure) over the older success — id-DESC [
 #    unit-covered (workersvc.TestBuildFailureSnapshotIncludesForgejoFailureJobs).
 # The admin setting ci_autofix_enabled defaults ON (#1109), and the CIAutoFix poller treats a
 # ci_fix run's own fix branch like an agent branch: the re-failure posted on it below makes
-# the poller open a SECOND ci_fix of its own just as this phase ends, which the quarantine
-# logs as a LEAK (seen in CI). This phase drives the MANUAL Fix-CI path, so disable the
+# the poller open a SECOND ci_fix of its own just as this phase ends, which the end-of-phase boundary
+# flags as residue (seen in CI). This phase drives the MANUAL Fix-CI path, so disable the
 # poller for the loop; the trap restores the shipped default even if an assertion fails.
 apiput /api/admin/settings '{"settings":{"ci_autofix_enabled":"false"}}' >/dev/null
 trap 'apiput /api/admin/settings '\''{"settings":{"ci_autofix_enabled":"true"}}'\'' >/dev/null 2>&1 || true' EXIT

@@ -44,7 +44,7 @@ docker compose --profile agent up    # additionally start a worker (needs join t
                         # `down -v` and never `-p uzi`.
 ```
 
-- **Read `run-e2e.sh`'s summary table, not its cleanup line.** A quarantine `LEAK` row keeps the rundir and prints `[cleanup] red run — rundir kept`, yet by default the suite exits 0 with `All E2E checks passed.`: only a `FAIL` row fails it, unless `E2E_STRICT_LEAKS=1` makes a LEAK fail too (`e2e/README.md`).
+- **Read `run-e2e.sh`'s summary table.** Undeclared residue (a non-terminal run, worker row or open hold) left at a phase's boundary, or an unverifiable boundary read, makes that phase a `FAIL` row; later rows carry ` [ran after contaminated boundary: <slug>]` (`e2e/README.md`, *End-of-phase boundary*).
 
 ### smoke.sh recipe
 
