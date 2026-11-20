@@ -25,6 +25,9 @@ The omitted-model group first measures a fresh default and chooses an explicit
 nondefault model from the supplied A/B pair before omitting it on resume. This
 avoids mistaking an identical vendor default for session-model retention. Its
 fourth turn checks that a fresh session still has the original default.
+The cold Codex switch control omits the additional turn-level model override, so
+the runtime's resume response is checked without a second override masking it.
+This control is separate from production model omission, which is not applicable.
 
 The macOS Codex entry uses the pinned Linux runner image and the locally prepared
 `cdx3246-deps` and `cdx3246-codex` volumes. Preparation uses the unchanged

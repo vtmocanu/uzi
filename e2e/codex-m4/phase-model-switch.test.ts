@@ -32,6 +32,7 @@ before(async () => {
   fs.writeFileSync(path.join(home, "config.toml"), config.buildCodexLoopbackTestConfigToml({ model: A, projectPath: cwd, authMode: "api_key" }, fake.baseUrl));
   warm = await PhaseCodex.open(bin, home, cwd, credential, config.CODEX_M3B_LOOPBACK_PROVIDER_NAME);
   const s = await warm.thread(A);
+  observed.thread = s.thread.id;
   const accounting = await import(pathToFileURL(path.resolve(process.env.CODEX_M4_SRC ?? "src", "codex/token-accounting.ts")).href) as typeof import("../../agent/src/codex/token-accounting.js");
   const accountant = new accounting.CodexUsageAccountant();
   accountant.registerThread(s.thread.id, A, false);
@@ -59,28 +60,37 @@ before(async () => {
   await warm.thread(A, s.thread.id);
   feed(await warm.turn(s.thread.id, A, "Repeat it again.", "high"), A);
   observed.replan = fake.requests.at(-1)!.model;
-  const groups: Array<{ id: string; omitted: undefined | null }> = [];
+  // Separate control: a model supplied again on turn/start would mask an ignored resume override.
+  const control = await warm.thread(A);
+  await warm.turn(control.thread.id, A, "Warm resume effectiveness control.", "high");
+  const controlReport = await warm.thread(B, control.thread.id);
+  await warm.turn(control.thread.id, undefined, "Use the resumed model without another model override.", "medium");
+  observed.warmControl = { report: controlReport.model, wire: fake.requests.at(-1)!.model };
+  const groups: Array<{ id: string; omitted: undefined | null; nonce: string }> = [];
   const effortWire: unknown[] = [];
   for (const omitted of [undefined, null]) {
+    const groupNonce = `${nonce}-${omitted === null ? "null" : "omitted"}`;
     const thread = await warm.thread(A);
-    await warm.turn(thread.thread.id, A, nonce, "high");
+    await warm.turn(thread.thread.id, A, groupNonce, "high");
     await warm.thread(B, thread.thread.id);
     await warm.turn(thread.thread.id, B, "Repeat it.", omitted);
     effortWire.push(fake.requests.at(-1)!.reasoning);
     await warm.turn(thread.thread.id, A, "Repeat it.", "high");
-    groups.push({ id: thread.thread.id, omitted });
+    groups.push({ id: thread.thread.id, omitted, nonce: groupNonce });
   }
   await warm.close();
   cold = await PhaseCodex.open(bin, home, cwd, credential, config.CODEX_M3B_LOOPBACK_PROVIDER_NAME);
   const count = fake.requests.length;
   const reclaimed = await cold.thread(B, s.thread.id);
   assert.equal(fake.requests.length, count, "resume itself sends no Responses request");
-  const next = await cold.turn(s.thread.id, B, "Repeat the nonce.", "medium");
+  const next = await cold.turn(s.thread.id, undefined, "Repeat the nonce.", "medium");
   observed.cold = { reclaimed, wire: fake.requests.at(-1), before: count, after: fake.requests.length };
   observed.accountedCold = feed(next, B);
   for (const group of groups) {
-    await cold.thread(B, group.id);
+    const reply = await cold.thread(B, group.id);
+    assert.equal(reply.thread.id, group.id);
     await cold.turn(group.id, B, "Repeat it.", group.omitted);
+    assert.match(JSON.stringify(fake.requests.at(-1)!.input), new RegExp(group.nonce), "cold effort reset retains its own group's history");
     effortWire.push(fake.requests.at(-1)!.reasoning);
   }
   observed.efforts = effortWire;
@@ -99,6 +109,7 @@ for (const [key, title] of Object.entries(PHASE_MODEL_TITLES)) test(title, { ski
     assert.equal((switched.wire.reasoning as { effort: string }).effort, "medium");
     assert.match(JSON.stringify(switched.wire.input), new RegExp(nonce));
   } else if (key === "reclaim") {
+    assert.equal(coldResult.reclaimed.thread.id, observed.thread);
     assert.equal(coldResult.reclaimed.model, B); assert.equal(coldResult.wire.model, B);
     assert.match(JSON.stringify(coldResult.wire.input), new RegExp(nonce));
   } else if (key === "replan") assert.equal(observed.replan, A);
@@ -110,6 +121,7 @@ for (const [key, title] of Object.entries(PHASE_MODEL_TITLES)) test(title, { ski
   else {
     assert.equal(switched.priorRequests, 1);
     assert.equal(coldResult.after, coldResult.before + 1);
+    assert.deepEqual(observed.warmControl, { report: A, wire: A });
   }
   recordEvidence(title, "pass");
 });
@@ -120,6 +132,6 @@ test("Codex phase case 6: today's shared accountant attributes switched usage to
   const coldResult = observed.cold as { reclaimed: { model: string }; wire: { model?: unknown } };
   console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.167.0", efforts: observed.efforts, requests: observed.requests,
     warmResumeModel: warmResult.resumed.model, warmRequestModel: warmResult.wire.model,
-    coldResumeModel: coldResult.reclaimed.model, coldRequestModel: coldResult.wire.model,
+    coldResumeModel: coldResult.reclaimed.model, coldRequestModelWithoutTurnOverride: coldResult.wire.model, warmControl: observed.warmControl,
     switchedModelAccounting: observed.accounted })}`);
 });

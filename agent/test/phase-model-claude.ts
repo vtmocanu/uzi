@@ -16,11 +16,17 @@ export class PhaseClaude {
   readonly cwd = path.join(this.root, "cwd");
   readonly plugin = path.join(this.root, "plugin");
   readonly events: string[] = [];
+  readonly timeline: Array<{ event: string; atMs: number }> = [];
+  private readonly started = performance.now();
   private readonly children = new Set<ChildProcess>();
   constructor(readonly providerEnv: Record<string, string>) {
     for (const dir of [this.home, this.cwd, this.plugin]) fs.mkdirSync(dir);
     fs.mkdirSync(path.join(this.plugin, ".claude-plugin"));
     fs.writeFileSync(path.join(this.plugin, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "phase-proof", version: "1.0.0" }));
+  }
+  mark(event: string): void {
+    this.events.push(event);
+    this.timeline.push({ event, atMs: performance.now() - this.started });
   }
   async turn(input: {
     prompt: string | AsyncIterable<SDKUserMessage>; model?: string; effort?: Options["effort"];
@@ -65,7 +71,7 @@ export class PhaseClaude {
       for await (const frame of q) {
         if (frame.type === "assistant") result.thinkingBlocks += frame.message.content.filter(b => b.type === "thinking" || b.type === "redacted_thinking").length;
         if (frame.type === "system" && frame.subtype === "init") {
-          this.events.push("init");
+          this.mark("init");
           result.session = frame.session_id;
           result.model = frame.model;
           result.cli = frame.claude_code_version;

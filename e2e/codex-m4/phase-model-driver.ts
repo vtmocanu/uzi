@@ -56,9 +56,9 @@ export class PhaseCodex {
       ...(threadId ? { threadId, excludeTurns: true } : { ephemeral: false }),
     }, { signal: AbortSignal.timeout(20_000) });
   }
-  async turn(threadId: string, model: string, prompt: string, effort?: string | null): Promise<{ turnId: string; notes: CodexNotification[]; text: string }> {
+  async turn(threadId: string, model: string | undefined, prompt: string, effort?: string | null): Promise<{ turnId: string; notes: CodexNotification[]; text: string }> {
     const reply = await this.transport.request<{ turn: { id: string } }>("turn/start", {
-      threadId, model, environments: [], input: [{ type: "text", text: prompt }],
+      threadId, ...(model !== undefined ? { model } : {}), environments: [], input: [{ type: "text", text: prompt }],
       ...(effort !== undefined ? { effort } : {}),
     }, { signal: AbortSignal.timeout(20_000) });
     const notes: CodexNotification[] = [];

@@ -102,7 +102,8 @@ async function main(): Promise<void> {
       if (++group.count > 4) throw new Error("probe turn budget exceeded");
       const effort = group.name === "switch-reclaim-replan" ? args.effortB : group.omission;
       check();
-      const observation = observe(await cold.turn(group.thread, args.modelB, "Repeat the remembered nonce exactly.", effort), group.thread, args.modelB, effort);
+      const model = group.name === "switch-reclaim-replan" ? undefined : args.modelB;
+      const observation = observe(await cold.turn(group.thread, model, "Repeat the remembered nonce exactly.", effort), group.thread, model, effort);
       group.turns.push(observation);
       if (!observation.nonceObserved) throw new Error("provider did not complete the cold nonce control");
     }
@@ -119,7 +120,7 @@ async function main(): Promise<void> {
     if (Buffer.byteLength(summary) > 64 * 1024) { console.error("probe report byte budget exceeded"); process.exitCode = 1; }
     else console.log(summary);
   }
-  function observe(result: Awaited<ReturnType<PhaseCodex["turn"]>>, thread: string, model: string, effort?: string | null) {
+  function observe(result: Awaited<ReturnType<PhaseCodex["turn"]>>, thread: string, model: string | undefined, effort?: string | null) {
     let replay = true;
     const usage: unknown[] = [];
     for (const note of result.notes) {
@@ -129,7 +130,7 @@ async function main(): Promise<void> {
         usage.push({ total: note.usage.total, last: note.usage.last, replay, attributedModel: attributed?.model });
       }
     }
-    return { requestedModel: model, requestedEffort: effort === undefined ? "omitted" : effort, status: "completed", usage, nonceObserved: result.text.includes(nonce) };
+    return { requestedModel: model ?? "omitted-resume-effectiveness-control", requestedEffort: effort === undefined ? "omitted" : effort, status: "completed", usage, nonceObserved: result.text.includes(nonce) };
   }
 }
 void main().catch(error => { console.error(probeError(error)); process.exitCode = 1; });
