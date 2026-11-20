@@ -18,7 +18,9 @@ import { runsApi } from "./runs";
 import { crossChecksApi } from "./crossChecks";
 import { chatApi } from "./chat";
 import { secretsApi } from "./secrets";
+import { providersApi } from "./providers";
 import { workersApi } from "./workers";
+import { workerSizesApi } from "./workerSizes";
 import { settingsApi } from "./settings";
 import { healthApi } from "./health";
 import { maintenanceApi } from "./maintenance";
@@ -50,6 +52,9 @@ export const mockApi = {
   // ── Secrets ─────────────────────────────────────────────────────────────────
   ...secretsApi,
 
+  // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
+  ...providersApi,
+
   ...agentsApi,
 
   ...forgeApi,
@@ -61,6 +66,8 @@ export const mockApi = {
 
   // ── Workers ─────────────────────────────────────────────────────────────────
   ...workersApi,
+  // ── Admin worker sizes (PRD #4213) ───────────────────────────────────────────
+  ...workerSizesApi,
 
   ...runsApi,
   ...crossChecksApi,

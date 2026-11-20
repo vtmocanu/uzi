@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -23,11 +25,11 @@ import (
 // so the caller can report a clean, actionable message. Stdin and stderr are
 // connected to the process so an interactive credential helper can prompt on a
 // push/delete (the user's own creds — PRD #400 Decision 6); stdout is captured so
-// a value read like `git remote get-url origin` is returned rather than printed.
+// a value read like `git remote get-url --push --all origin` is returned rather than printed.
 // stderr is BOTH streamed (so the prompt is visible) and captured (so the error
 // message is clean) via an io.MultiWriter.
 func realGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...) //nolint:gosec // G204: the CLI's own git shell-out seam — `git <args>` where args are internal command literals (`git remote get-url origin`, `push … uzi/task/<id>`), never remote/untrusted input; running the operator's git with the operator's creds is the intended behaviour (PRD #400 M3).
+	cmd := exec.Command("git", args...) //nolint:gosec // G204: the CLI's own git shell-out seam — `git <args>` where args are internal command literals (`git remote get-url --push --all origin`, `push … uzi/task/<id>`), never remote/untrusted input; running the operator's git with the operator's creds is the intended behaviour (PRD #400 M3).
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -110,6 +112,22 @@ type Env struct {
 	// forks git. Same injection-seam contract as NewClient above.
 	Git func(dir string, args ...string) (string, error)
 
+	// SSHConfig runs `ssh <args>` (always `-G ... -- host`) and returns its stdout, capped
+	// at 64 KiB; `uzi handoff` uses it to learn which host an ssh origin really resolves
+	// to. ssh -G does not connect, but it EVALUATES the user's ssh config, including
+	// `Match exec` blocks that can run local commands. DefaultEnv wires realSSHConfig;
+	// tests inject a fake that records argv, so no test forks ssh. A nil seam reports an
+	// error through the sshConfig accessor, which handoff treats as an unresolved host.
+	// The probe mirrors the ssh git push starts: run from the worktree root, with git's
+	// repository-local variables removed from the environment (sshProbe).
+	SSHConfig func(ctx context.Context, p sshProbe) (string, error)
+
+	// LookupEnv is the presence-aware environment lookup (a variable that is set but
+	// empty is distinguishable from an unset one). `uzi handoff` reads GIT_SSH and
+	// GIT_SSH_COMMAND through it. DefaultEnv wires os.LookupEnv; a nil seam reads as
+	// unset, never os.LookupEnv, for the same isolation reason as Getenv.
+	LookupEnv func(string) (string, bool)
+
 	// Brew runs `brew <args>` for the TUI startup update prompt (PRD #1251 M1): brew
 	// detection (`brew --prefix --installed <formula>` for both formulas) and the
 	// selected formula upgrade hand-off on foreground exit. foreground==false captures output quietly for a
@@ -181,6 +199,8 @@ func DefaultEnv() Env {
 		ReadVaultPassword:  readVaultTerminalPassword,
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Git:                realGit,
+		SSHConfig:          realSSHConfig,
+		LookupEnv:          os.LookupEnv,
 		Brew:               realBrew,
 		Executable:         os.Executable,
 		InstalledCLI:       realInstalledCLI,
@@ -200,6 +220,117 @@ func (e Env) getenv(k string) string {
 		return ""
 	}
 	return e.Getenv(k)
+}
+
+// envSet is the nil-safe presence check over Env.LookupEnv: a nil seam reads as unset.
+// It reports set even for an empty value.
+func (e Env) envSet(k string) bool {
+	if e.LookupEnv == nil {
+		return false
+	}
+	_, ok := e.LookupEnv(k)
+	return ok
+}
+
+// sshConfig is the nil-safe accessor for Env.SSHConfig: a nil seam is an error.
+func (e Env) sshConfig(ctx context.Context, p sshProbe) (string, error) {
+	if e.SSHConfig == nil {
+		return "", errors.New("ssh config lookup is unavailable")
+	}
+	return e.SSHConfig(ctx, p)
+}
+
+// sshConfigMaxOutput caps the stdout realSSHConfig will accept from ssh -G.
+const sshConfigMaxOutput = 64 << 10
+
+var errSSHConfigOverflow = errors.New("ssh -G output exceeds 64 KiB")
+
+// sshCapture collects stdout up to a byte cap; on overflow it cancels the command's
+// context and every later write fails.
+type sshCapture struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	max    int
+	over   bool
+	cancel context.CancelFunc
+}
+
+func (c *sshCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.over {
+		return 0, errSSHConfigOverflow
+	}
+	if room := c.max - c.buf.Len(); len(p) > room {
+		c.buf.Write(p[:room])
+		c.over = true
+		c.cancel()
+		return room, errSSHConfigOverflow
+	}
+	return c.buf.Write(p)
+}
+
+// sshProbe is one ssh -G invocation shaped like the ssh git push starts: git chdirs to
+// the worktree root and removes its repository-local variables before running ssh, so
+// relative paths and environment tests in a `Match exec` rule see the same values.
+type sshProbe struct {
+	dir   string   // worktree root (git rev-parse --show-toplevel)
+	unset []string // git rev-parse --local-env-vars
+	args  []string // -G [-l user] [-p port] -- host command
+}
+
+// newSSHConfigCmd builds the ssh command: argv only, run in p.dir, stdin not connected
+// and stderr discarded (nil), WaitDelay bounding pipe waits after a kill. Its
+// environment is uzi's minus p.unset, never nil.
+func newSSHConfigCmd(ctx context.Context, p sshProbe) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "ssh", p.args...) //nolint:gosec // G204: argv-only `ssh -G [-l user] [-p port] -- host`; handoff validates host/user/port against a leading '-' and passes `--` before the host, and runs no shell.
+	cmd.WaitDelay = time.Second
+	cmd.Dir = p.dir
+	cmd.Env = envWithout(os.Environ(), p.unset)
+	return cmd
+}
+
+// envWithout returns environ minus every KEY=... entry whose KEY is in unset. The result
+// is never nil, so exec never falls back to the full inherited environment.
+func envWithout(environ, unset []string) []string {
+	drop := make(map[string]bool, len(unset))
+	for _, k := range unset {
+		drop[k] = true
+	}
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		k, _, _ := strings.Cut(kv, "=")
+		if !drop[k] {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// realSSHConfig is the production Env.SSHConfig. ssh -G does not connect, but it
+// EVALUATES the user's ssh config, including `Match exec` blocks that can run local
+// commands: it is configuration evaluation, not a side-effect-free lookup. The ctx
+// kills the direct ssh child and WaitDelay bounds the pipe waits; neither guarantees
+// that descendants started by a Match exec block terminate.
+func realSSHConfig(ctx context.Context, p sshProbe) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := newSSHConfigCmd(ctx, p)
+	c := &sshCapture{max: sshConfigMaxOutput, cancel: cancel}
+	cmd.Stdout = c
+	err := cmd.Run()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.over {
+		return "", errSSHConfigOverflow
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return "", cerr
+	}
+	if err != nil {
+		return "", err
+	}
+	return c.buf.String(), nil
 }
 
 // globalFlags are the persistent flags shared by every command.
@@ -309,6 +440,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newWhoamiCmd(env, gf),
 		newVaultCmd(env, gf),
 		newSettingsCmd(env, gf),
+		newAgentTemplateCmd(env, gf),
 		newRunCmd(env, gf),
 		newPRCmd(env, gf),
 		newCICmd(env, gf),
@@ -318,6 +450,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newFindingsCmd(env, gf),
 		newWorkerCmd(env, gf),
 		newTokenCmd(env, gf),
+		newProviderCmd(env, gf),
 		newRateLimitsCmd(env, gf),
 		newMemoryCmd(env, gf),
 		newDocsCmd(env, gf),

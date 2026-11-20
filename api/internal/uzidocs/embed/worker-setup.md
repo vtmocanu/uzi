@@ -353,7 +353,10 @@ object then reports `state` and `reason` (fixed tokens), `layout`, the counts
 `examined`, `kept` by reason, `eligible` (admitted at census time; a leaf
 demoted before its delete is also counted under `kept`), `deleted`, `residue`
 and `helper_failed`, and the flags `estimate_partial`, `list_overflow` and
-`not_idle_after`. The byte figures `eligible_allocated_bytes_estimate`,
+`not_idle_after`. Per-run `run-<uuid>` leaves (#4420) add the kept reasons `run_active`,
+`run_retained`, `run_unknown`, `run_unreadable`, `run_local_active` and `run_local_unknown`,
+and `run_local_sources` (counts by fixed source token); see
+[per-run TMPDIR leaves](run-recovery.md#per-run-tmpdir-leaves-4420). The byte figures `eligible_allocated_bytes_estimate`,
 `deleted_allocated_bytes_estimate` and `shared_bytes` (hard-linked files) come
 from allocated blocks, and `statfs_free_delta_unattributed` is the change in
 available bytes across the delete loop from all writers, so none of them proves
@@ -432,7 +435,8 @@ command or claim fails with "this worker is quarantined (...)". Some checks do n
 stop the run when they block (a milestone checkpoint, a pause, a limit or wall park,
 a completion hold, a shutdown requeue, the terminal retire). A run that continues
 fails at a later step in one of the two ways above; a park or requeue stands and the
-run resumes on another worker, or here after the restart; at the terminal retire the
+run resumes on another worker (never a Codex run at generation 1 or later, which only
+its recorded worker may resume; see [Codex runs held for their last worker](./run-recovery.md#codex-runs-held-for-their-last-worker)), or here after the restart; at the terminal retire the
 run has already reported. The failed run's clone, its generation
 hold, its recovery pins and its journal are kept. Nothing is uploaded and no
 custody is released while the worker is quarantined, so the run's held work is

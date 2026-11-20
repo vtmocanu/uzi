@@ -11,7 +11,6 @@ import {
   type VaultStatus,
   type VaultDisableResponse,
 } from "../../lib/api";
-import { WORKER_SIZES } from "../../lib/workerSizes";
 import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
@@ -28,6 +27,7 @@ import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
+import { mockClaudeProviderId } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -39,6 +39,7 @@ import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from 
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
 import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
+import { mockSizeSpec } from "./workerSizes";
 
 // PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
 // validation: CODEX_CURATED_MODELS (lib/codexModels.ts, PRD #3245) and the Claude
@@ -103,6 +104,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   light_theme: null,
   dark_theme: null,
   typeface: null,
+  // Opt-in animated sidebar icons; null = inherit the (off) instance default.
+  sidebar_motion: null,
   sidebar_token_ids: [],
   // PRD #1209 M3: LINKED Codex subscription accounts surfaced on the sidebar rail — the
   // Codex sibling of sidebar_token_ids. Default-only (empty).
@@ -116,6 +119,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_harness: null,
   // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
   judge_runs_on: null,
+  // PRD #4320: provider the Claude lane runs on; null = vendor Claude ladder.
+  claude_provider_id: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
@@ -174,6 +179,9 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #4207: automatic hibernation of idle workers, default OFF, 14-day threshold.
   worker_hibernation_auto: "false",
   worker_hibernation_idle_after: "336h",
+  // PRD #4395: keep one warm worker per pool and hibernate the surplus, default OFF, 2h.
+  worker_hibernation_surplus: "false",
+  worker_hibernation_surplus_idle_after: "2h",
   hosted_worker_quota: "2",
   // PRD #4212: ephemeral cap/size/lease and the persistent-worker default size.
   ephemeral_max_per_user: "2",
@@ -307,6 +315,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.light_theme === null || typeof u.light_theme === "string") &&
     (u.dark_theme === null || typeof u.dark_theme === "string") &&
     (u.typeface === null || typeof u.typeface === "string") &&
+    // Optional so a pre-feature blob stays valid; absent reads as inherit (off).
+    (u.sidebar_motion === undefined || u.sidebar_motion === null || typeof u.sidebar_motion === "boolean") &&
     // Optional so a pre-#700 blob stays valid; absent/null reads as the default-ON state.
     (u.mr_rework_enabled === undefined ||
       u.mr_rework_enabled === null ||
@@ -595,6 +605,10 @@ export function setMockCodexCatalogSample(sample: MockCodexCatalogSample): void 
   mockCodexCatalogSample = sample;
 }
 
+// The mock's compiled default for animated sidebar icons (off), the value a null
+// override resolves against; mirrors the server's compiled default.
+const MOCK_SIDEBAR_MOTION_DEFAULT = false;
+
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -635,7 +649,11 @@ function mySettingsResponse(): { settings: UserSettings } {
   const reserve = me
     ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
     : {};
-  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
+  // settings blob) so it can never outlive the in-memory provider list it points into.
+  const claude_provider_id = mockClaudeProviderId();
+  const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -670,6 +688,18 @@ function slackLinkResponse(): { slack: SlackLink } {
 // non-default value or was saved explicitly, else "default" (the demo has no env overlay).
 const EPHEMERAL_WORKER_KEYS = new Set(["ephemeral_max_per_user", "ephemeral_default_size", "hosted_default_size", "ephemeral_lease"]);
 const explicitWorkerKeys = new Set<string>();
+
+/**
+ * The default-size settings keys whose STORED value is the size `name`, sorted by key, as
+ * the api's delete guard reads app_settings (PRD #4213): a key at its compiled-in default and
+ * never saved is not stored, so it names nothing.
+ */
+export function mockStoredSizeSettings(name: string): string[] {
+  return (["ephemeral_default_size", "hosted_default_size"] as const).filter((key) => {
+    const stored = explicitWorkerKeys.has(key) || appSettings[key] !== SEED_APP_SETTINGS[key];
+    return stored && (appSettings[key] ?? "").trim() === name;
+  });
+}
 
 // settingsResponse builds the admin SettingsResponse from the mock's current
 // state: readable non-secret values, per-secret configured flags, and per-key
@@ -767,17 +797,20 @@ export function sessionBody() {
       light_theme: resolved.light,
       dark_theme: resolved.dark,
       typeface: resolved.typeface,
+      sidebar_motion: userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT,
       overrides: {
         mode: userSettings.appearance_mode,
         light_theme: userSettings.light_theme,
         dark_theme: userSettings.dark_theme,
         typeface: userSettings.typeface,
+        sidebar_motion: userSettings.sidebar_motion ?? null,
       },
       defaults: {
         mode: appSettings.default_appearance_mode,
         light_theme: appSettings.default_light_theme,
         dark_theme: appSettings.default_dark_theme,
         typeface: appSettings.default_typeface,
+        sidebar_motion: MOCK_SIDEBAR_MOTION_DEFAULT,
       },
     },
     // Deprecated single-theme trio (PRD #21), derived from the resolved appearance so
@@ -1058,6 +1091,7 @@ export const settingsApi = {
         key === "ephemeral_workers_enabled" ||
         key === "worker_hibernation_enabled" ||
         key === "worker_hibernation_auto" ||
+        key === "worker_hibernation_surplus" ||
         key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
@@ -1088,6 +1122,23 @@ export const settingsApi = {
           throw new ApiError(400, "worker_hibernation_idle_after: must be between 1h and 2160h");
         }
         nonSecret.worker_hibernation_idle_after = value;
+        continue;
+      }
+      if (key === "worker_hibernation_surplus_idle_after") {
+        // PRD #4395: same Go time.ParseDuration subset as idle_after, bounded 15m..336h.
+        const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, "µs": 1e-6, ns: 1e-9 };
+        const comp = "(\\d+(?:\\.\\d*)?|\\.\\d+)(ns|us|µs|ms|h|m|s)";
+        const m0 = new RegExp(`^([-+]?)(0|(?:${comp})+)$`).exec(value.trim());
+        if (!m0) {
+          throw new ApiError(400, 'worker_hibernation_surplus_idle_after: must be a duration like "2h"');
+        }
+        let seconds = 0;
+        for (const m of m0[2].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
+        if (m0[1] === "-") seconds = -seconds;
+        if (seconds < 15 * 60 || seconds > 336 * 3600) {
+          throw new ApiError(400, "worker_hibernation_surplus_idle_after: must be between 15m and 336h");
+        }
+        nonSecret.worker_hibernation_surplus_idle_after = value;
         continue;
       }
       if (key === "custody_hold_limit") {
@@ -1121,8 +1172,10 @@ export const settingsApi = {
           if (m0) for (const m of m0[1].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
           if (!m0) throw new ApiError(400, 'ephemeral_lease: must be a duration like "30m"');
           if (seconds > 2 * 3600) throw new ApiError(400, "ephemeral_lease: must be between 0s and 2h");
-        } else if (!(WORKER_SIZES as readonly string[]).includes(t)) {
-          throw new ApiError(400, `${key}: must be one of ${WORKER_SIZES.join(", ")}`);
+        } else if (!mockSizeSpec(t)) {
+          // Any size in the one mock size list, builtin or admin-added (PRD #4213 M3), as
+          // the api's write checks its size table; the text is the api's.
+          throw new ApiError(400, `${key}: unknown worker size`);
         }
         explicitWorkerKeys.add(key);
         (nonSecret as Record<string, string>)[key] = t;
@@ -1752,6 +1805,13 @@ export const settingsApi = {
         throw new ApiError(400, "typeface: must be one of system, plex");
       }
       next = { ...next, typeface: patch.typeface };
+    }
+    if (patch.sidebar_motion !== undefined) {
+      // Tri-state: true/false sets, null clears back to inherit; anything else is a 400.
+      if (patch.sidebar_motion !== null && typeof patch.sidebar_motion !== "boolean") {
+        throw new ApiError(400, "sidebar_motion: must be a boolean or null");
+      }
+      next = { ...next, sidebar_motion: patch.sidebar_motion };
     }
     if (patch.sidebar_token_ids !== undefined) {
       // Whole-set replace, mirroring how the real handler would treat a list

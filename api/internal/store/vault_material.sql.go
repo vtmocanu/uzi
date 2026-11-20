@@ -18,6 +18,12 @@ WITH secrets AS (
            coalesce(sum(octet_length(s.ciphertext)), 0)::bigint AS ciphertext_bytes,
            coalesce(max(octet_length(s.ciphertext)), 0)::bigint AS max_row_bytes
     FROM user_secrets s WHERE s.user_id = $1
+), env AS (
+    -- PRD #4416: run_env_vars rows (live, retired and pending deletion) are vault material.
+    SELECT count(*)::bigint AS material_rows,
+           coalesce(sum(octet_length(e.ciphertext)), 0)::bigint AS ciphertext_bytes,
+           coalesce(max(octet_length(e.ciphertext)), 0)::bigint AS max_row_bytes
+    FROM run_env_vars e WHERE e.user_id = $1
 ), accounts AS (
     SELECT (count(*) + count(a.recovery_sealed))::bigint AS material_rows,
            coalesce(sum(octet_length(a.sealed_login)::bigint
@@ -26,10 +32,10 @@ WITH secrets AS (
                         + coalesce(octet_length(a.recovery_sealed), 0)::bigint), 0)::bigint AS max_row_bytes
     FROM codex_provider_account a WHERE a.user_id = $1
 )
-SELECT (secrets.material_rows + accounts.material_rows)::bigint AS material_rows,
-       (secrets.ciphertext_bytes + accounts.ciphertext_bytes)::bigint AS ciphertext_bytes,
-       greatest(secrets.max_row_bytes, accounts.max_row_bytes)::bigint AS max_row_bytes
-FROM secrets CROSS JOIN accounts
+SELECT (secrets.material_rows + env.material_rows + accounts.material_rows)::bigint AS material_rows,
+       (secrets.ciphertext_bytes + env.ciphertext_bytes + accounts.ciphertext_bytes)::bigint AS ciphertext_bytes,
+       greatest(secrets.max_row_bytes, env.max_row_bytes, accounts.max_row_bytes)::bigint AS max_row_bytes
+FROM secrets CROSS JOIN env CROSS JOIN accounts
 `
 
 type GetVaultMaterialTotalsRow struct {
@@ -51,6 +57,9 @@ SELECT EXISTS (
     SELECT 1 FROM user_secrets s
     WHERE s.user_id = $1 AND s.sealed_with IN ('master', 'master_aad')
     UNION ALL
+    SELECT 1 FROM run_env_vars e
+    WHERE e.user_id = $1 AND e.sealed_with IN ('master', 'master_aad')
+    UNION ALL
     SELECT 1 FROM codex_provider_account a
     WHERE a.user_id = $1
       AND (a.sealed_with IN ('master', 'master_aad')
@@ -70,6 +79,51 @@ func (q *Queries) HasMasterVaultMaterial(ctx context.Context, userID uuid.UUID) 
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const listVaultEnvMaterialCandidates = `-- name: ListVaultEnvMaterialCandidates :many
+WITH candidates AS MATERIALIZED (
+    SELECT e.id, octet_length(e.ciphertext)::bigint AS ciphertext_bytes
+    FROM run_env_vars e
+    WHERE e.user_id = $1
+      AND ($2::uuid IS NULL OR e.id > $2::uuid)
+    ORDER BY e.id LIMIT 64
+), bounded AS (
+    SELECT id, sum(ciphertext_bytes) OVER (ORDER BY id) AS batch_bytes
+    FROM candidates
+)
+SELECT b.id FROM bounded b
+WHERE b.batch_bytes <= 1048576
+ORDER BY b.id
+`
+
+type ListVaultEnvMaterialCandidatesParams struct {
+	UserID  uuid.UUID   `json:"user_id"`
+	AfterID pgtype.UUID `json:"after_id"`
+}
+
+// The bounded page window (at most 64 ids whose cumulative ciphertext fits 1 MiB) of the
+// owner's env rows after the cursor, ids only and no lock. The caller locks exactly these
+// ids with LockVaultEnvMaterialBatch and advances its cursor to the last candidate id,
+// so rows that vanish between the two statements cannot end the scan early.
+func (q *Queries) ListVaultEnvMaterialCandidates(ctx context.Context, arg ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listVaultEnvMaterialCandidates, arg.UserID, arg.AfterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockVaultAccountMaterialBatch = `-- name: LockVaultAccountMaterialBatch :many
@@ -129,6 +183,120 @@ func (q *Queries) LockVaultAccountMaterialBatch(ctx context.Context, arg LockVau
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockVaultEnvConnectionsKeyShare = `-- name: LockVaultEnvConnectionsKeyShare :many
+SELECT c.id FROM forge_connections c
+WHERE c.id IN (SELECT r.connection_id FROM repos r
+               WHERE r.id IN (SELECT e.repo_id FROM run_env_vars e
+                              WHERE e.user_id = $1 AND e.repo_id IS NOT NULL))
+ORDER BY c.id
+FOR KEY SHARE OF c
+`
+
+// Lock-order fence, step 1 (see convertMaterial). Repo delete (DeleteRepoForUser) and
+// forge-connection delete (DeleteForgeConnectionForUser) cascade run_env_vars rows
+// without the secret-mutation lock. KEY SHARE on the connections that own the owner's
+// env-bearing repos, in id order, blocks a connection delete until commit.
+func (q *Queries) LockVaultEnvConnectionsKeyShare(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockVaultEnvConnectionsKeyShare, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockVaultEnvMaterialBatch = `-- name: LockVaultEnvMaterialBatch :many
+SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with
+FROM run_env_vars e
+WHERE e.user_id = $1 AND e.id = ANY($2::uuid[])
+ORDER BY e.id
+FOR UPDATE OF e
+`
+
+type LockVaultEnvMaterialBatchParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	Ids    []uuid.UUID `json:"ids"`
+}
+
+type LockVaultEnvMaterialBatchRow struct {
+	ID         uuid.UUID   `json:"id"`
+	RepoID     pgtype.UUID `json:"repo_id"`
+	Name       string      `json:"name"`
+	Secret     bool        `json:"secret"`
+	Ciphertext []byte      `json:"ciphertext"`
+	SealedWith string      `json:"sealed_with"`
+}
+
+// Locks the given candidate ids (PRD #4416). Ids that no longer exist are simply absent.
+// Every row is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
+func (q *Queries) LockVaultEnvMaterialBatch(ctx context.Context, arg LockVaultEnvMaterialBatchParams) ([]LockVaultEnvMaterialBatchRow, error) {
+	rows, err := q.db.Query(ctx, lockVaultEnvMaterialBatch, arg.UserID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LockVaultEnvMaterialBatchRow{}
+	for rows.Next() {
+		var i LockVaultEnvMaterialBatchRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RepoID,
+			&i.Name,
+			&i.Secret,
+			&i.Ciphertext,
+			&i.SealedWith,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockVaultEnvReposKeyShare = `-- name: LockVaultEnvReposKeyShare :many
+SELECT r.id FROM repos r
+WHERE r.id IN (SELECT e.repo_id FROM run_env_vars e
+               WHERE e.user_id = $1 AND e.repo_id IS NOT NULL)
+ORDER BY r.id
+FOR KEY SHARE OF r
+`
+
+// Lock-order fence, step 2: KEY SHARE on the owner's env-bearing repos, in id order,
+// blocks a repo delete until commit. Taken after the connections and before any env row lock.
+func (q *Queries) LockVaultEnvReposKeyShare(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockVaultEnvReposKeyShare, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -218,6 +386,32 @@ func (q *Queries) ResealVaultAccountMaterial(ctx context.Context, arg ResealVaul
 		arg.SealedWith,
 		arg.RecoverySealed,
 		arg.RecoverySealedWith,
+		arg.UserID,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resealVaultEnvMaterial = `-- name: ResealVaultEnvMaterial :execrows
+UPDATE run_env_vars SET ciphertext = $1, sealed_with = $2
+WHERE user_id = $3 AND id = $4
+`
+
+type ResealVaultEnvMaterialParams struct {
+	Ciphertext []byte    `json:"ciphertext"`
+	SealedWith string    `json:"sealed_with"`
+	UserID     uuid.UUID `json:"user_id"`
+	ID         uuid.UUID `json:"id"`
+}
+
+// Crypto only: preserve revision, flags and timestamps.
+func (q *Queries) ResealVaultEnvMaterial(ctx context.Context, arg ResealVaultEnvMaterialParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resealVaultEnvMaterial,
+		arg.Ciphertext,
+		arg.SealedWith,
 		arg.UserID,
 		arg.ID,
 	)

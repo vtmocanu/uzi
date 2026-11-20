@@ -1,0 +1,160 @@
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
+)
+
+// Provider source and run-creation refusal reasons (PRD #4320 module 4). Each rides the
+// httpx.ErrorReason envelope as {"error": "<message>", "reason": "<code>"}.
+const (
+	reasonProviderSourceUnusable        = "provider_source_unusable"
+	reasonProviderLaneUnsupported       = "provider_lane_unsupported"
+	reasonProviderModelUnmapped         = "provider_model_unmapped"
+	reasonProviderBindingStale          = "provider_binding_stale"
+	reasonProviderDestinationNotAllowed = "provider_destination_not_allowed"
+
+	claudeSourceUnusableMessagePrefix    = "the provider cannot be the Claude source: "
+	claudeSourceUnusableRunMessagePrefix = "your Claude source is a model provider that cannot serve a run: "
+)
+
+// providerSourceReasonText names a ProviderSourceUnusableError reason for the user.
+func providerSourceReasonText(reason string) string {
+	switch reason {
+	case workersvc.SourceUnusableRetired:
+		return "the provider is retired"
+	case workersvc.SourceUnusableBaseURL:
+		return "its base URL is not on the operator allowlist"
+	case workersvc.SourceUnusableKeyMissing:
+		return "it has no key"
+	case workersvc.SourceUnusableKeyDisabled:
+		return "its key is disabled"
+	case workersvc.SourceUnusableProviderMissing:
+		return "the provider no longer exists"
+	default:
+		return "the provider is not usable"
+	}
+}
+
+// writeProviderCreateRefusal answers the typed provider refusals of run creation (409, stable
+// reason codes) and reports whether it wrote one. A caller's error switch calls it before its
+// default arm.
+func writeProviderCreateRefusal(w http.ResponseWriter, err error) bool {
+	var unusable *workersvc.ProviderSourceUnusableError
+	var unmapped *workersvc.ProviderModelUnmappedError
+	switch {
+	case errors.As(err, &unusable):
+		httpx.ErrorReason(w, http.StatusConflict,
+			claudeSourceUnusableRunMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
+	case errors.Is(err, workersvc.ErrProviderSourceUnusable):
+		httpx.ErrorReason(w, http.StatusConflict, "your Claude source is a model provider that cannot serve a run", reasonProviderSourceUnusable)
+	case errors.Is(err, workersvc.ErrProviderLaneUnsupported):
+		httpx.ErrorReason(w, http.StatusConflict,
+			"this run type does not support a model-provider Claude source yet", reasonProviderLaneUnsupported)
+	case errors.As(err, &unmapped):
+		httpx.ErrorReason(w, http.StatusConflict,
+			"the provider's model map does not map "+quoteModel(unmapped.Model)+" ("+unmapped.Source+"); map it or change the model", reasonProviderModelUnmapped)
+	case errors.Is(err, workersvc.ErrProviderModelUnmapped):
+		httpx.ErrorReason(w, http.StatusConflict, "the provider's model map does not map a model this run uses", reasonProviderModelUnmapped)
+	case errors.Is(err, workersvc.ErrProviderBindingStale):
+		httpx.ErrorReason(w, http.StatusConflict,
+			"the provider key or revision this run was bound to changed; start a new run", reasonProviderBindingStale)
+	case errors.Is(err, workersvc.ErrProviderDestinationNotAllowed):
+		httpx.ErrorReason(w, http.StatusConflict,
+			"the provider's base URL is no longer on the operator allowlist", reasonProviderDestinationNotAllowed)
+	default:
+		return false
+	}
+	return true
+}
+
+// quoteModel renders a model name for a message (names are validated tokens, never secrets).
+func quoteModel(m string) string { return "\"" + m + "\"" }
+
+// SetMyClaudeProviderSource is PUT /api/me/providers/claude-source: it selects (or, with null,
+// clears) the caller's Claude model-provider source. The selection is refused unless the provider
+// is the caller's, not retired, its current base URL is on the operator allowlist and it has an
+// enabled key (409 provider_source_unusable); a foreign or unknown provider is a 404. It runs under
+// the per-user secret-mutation lock and applies the SAME usability rules run creation does
+// (workersvc.ResolveClaudeProviderSource), by writing the selection and reading it back in the one
+// transaction, so a refusal rolls the write back.
+func (h *Handler) SetMyClaudeProviderSource(w http.ResponseWriter, r *http.Request) {
+	user, ok := userForProviderRoute(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ProviderID json.RawMessage `json:"provider_id"`
+	}
+	if !decodeProviderBody(w, r, &req) {
+		return
+	}
+	var want *uuid.UUID
+	switch string(req.ProviderID) {
+	case "":
+		httpx.Error(w, http.StatusBadRequest, "provider_id is required: a provider id, or null to clear the source")
+		return
+	case "null":
+	default:
+		var raw string
+		if err := json.Unmarshal(req.ProviderID, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "provider_id must be a provider id or null")
+			return
+		}
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "provider_id must be a provider id or null")
+			return
+		}
+		want = &id
+	}
+	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
+		if want == nil {
+			_, err := q.SetUserClaudeProviderSource(r.Context(), store.SetUserClaudeProviderSourceParams{SetSource: true, ID: user.ID})
+			return err
+		}
+		// An unknown or foreign provider violates the composite (owner, provider) foreign key.
+		if _, err := q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: *want, OwnerUserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errProviderNotFound
+			}
+			return err
+		}
+		if _, err := q.SetUserClaudeProviderSource(r.Context(), store.SetUserClaudeProviderSourceParams{
+			SetSource: true, ProviderID: pgconv.UUID(*want), ID: user.ID,
+		}); err != nil {
+			return err
+		}
+		res, err := workersvc.ResolveClaudeProviderSource(r.Context(), q, user.ID, h.cfg.ProviderBaseURLAllowed)
+		if err != nil {
+			return err
+		}
+		return res.Err() // unusable: the transaction rolls the selection back
+	})
+	if err != nil {
+		var unusable *workersvc.ProviderSourceUnusableError
+		switch {
+		case errors.As(err, &unusable):
+			httpx.ErrorReason(w, http.StatusConflict,
+				claudeSourceUnusableMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
+		case writeProviderError(w, err):
+		default:
+			internalProviderError(w, "set claude provider source", err)
+		}
+		return
+	}
+	out := map[string]any{"claude_provider_id": nil}
+	if want != nil {
+		out["claude_provider_id"] = want.String()
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}

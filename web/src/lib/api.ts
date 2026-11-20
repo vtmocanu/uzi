@@ -32,6 +32,9 @@ import type {
   AdminMaintenance,
   MaintenanceState,
   AdminDockerAllowlistRepos,
+  AdminWorkerSizes,
+  AdminWorkerSizeWrite,
+  WorkerSizeSpec,
   AdminCodexRateLimits,
   AdminRateLimits,
   AdminUsage,
@@ -156,6 +159,10 @@ import type {
   TemplateAllocation,
   TemplateAllocationsInput,
   TemplateSkills,
+  RunEnvDeleteResult,
+  RunEnvList,
+  RunEnvVar,
+  RunEnvWriteInput,
   ToolAllowlistEntry,
   ToolAllowlistWriteInput,
   TriageCounts,
@@ -166,6 +173,12 @@ import type {
   Worker,
   CodexAccountMode,
   HibernationResult,
+  CreateProviderInput,
+  ProviderAuthStyle,
+  ProviderDTO,
+  ProviderModelMap,
+  ProvidersList,
+  ProviderProbe,
 } from "./apiTypes";
 export type * from "./apiTypes";
 export { DEFAULT_AUTOPILOT_LABEL, RATE_LIMIT_SOURCES } from "./apiTypes";
@@ -697,6 +710,32 @@ const realApi = {
     return request<{ user: User }>("PUT", "/me/judge", body);
   },
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
+  // Custom providers (PRD #4320 M3). Cookie session like the secrets routes; the key
+  // is write-only (PUT /key) and never comes back in any response.
+  listProviders: () => request<ProvidersList>("GET", "/me/providers"),
+  createProvider: (input: CreateProviderInput) =>
+    request<{ provider: ProviderDTO }>("POST", "/me/providers", {
+      ...input,
+      engine: "claude",
+      protocol: "anthropic_messages",
+    }),
+  patchProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
+    request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}`, body),
+  patchProviderEndpoint: (id: string, body: { base_url?: string; auth_style?: ProviderAuthStyle }) =>
+    request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}/endpoint`, body),
+  putProviderKey: (id: string, key: string) =>
+    request<{ provider: ProviderDTO }>("PUT", `/me/providers/${id}/key`, { key }),
+  deleteProviderKey: (id: string) => request<null>("DELETE", `/me/providers/${id}/key`),
+  setProviderKeyEnabled: (id: string, enabled: boolean) =>
+    request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}/key/enabled`, { enabled }),
+  retireProvider: (id: string) => request<{ provider: ProviderDTO }>("POST", `/me/providers/${id}/retire`),
+  deleteProvider: (id: string) => request<null>("DELETE", `/me/providers/${id}`),
+  // PUT /me/providers/claude-source: select a provider as the Claude source, or null to
+  // return to Anthropic. A 409 reason provider_source_unusable names why it cannot serve.
+  setClaudeProviderSource: (providerId: string | null) =>
+    request<{ claude_provider_id: string | null }>("PUT", "/me/providers/claude-source", { provider_id: providerId }),
+  testProvider: (id: string) =>
+    request<{ probe: ProviderProbe }>("POST", `/me/providers/${id}/test`),
   testSecret: (kind: "anthropic_token" | "codex_auth" | "openai_api_key", id: string) =>
     request<TestSecretResult>("POST", `/me/secrets/${kind}/${id}/test`),
   // PRD #104 M2 token CRUD. create/rename/set-default/rotate/delete are all
@@ -945,15 +984,47 @@ const realApi = {
       packages,
     }),
 
+  // Per-repo run environment variables (PRD #4416 M1). Owner-only; writes carry the
+  // CSRF header through request(). A secret's value is write-only.
+  listRepoEnv: (repoId: string) =>
+    request<RunEnvList>("GET", `/repos/${repoId}/env`),
+  putRepoEnv: (repoId: string, name: string, input: RunEnvWriteInput) =>
+    request<{ variable: RunEnvVar }>(
+      "PUT",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}`,
+      input,
+    ),
+  disableRepoEnv: (repoId: string, name: string) =>
+    request<{ variable: RunEnvVar }>(
+      "POST",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}/disable`,
+    ),
+  enableRepoEnv: (repoId: string, name: string) =>
+    request<{ variable: RunEnvVar }>(
+      "POST",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}/enable`,
+    ),
+  deleteRepoEnv: (repoId: string, name: string) =>
+    request<RunEnvDeleteResult>(
+      "DELETE",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}`,
+    ),
+
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
   listConnections: () =>
     request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
-  createConnection: (baseUrl: string, token: string, forgeType = "gitlab") =>
+  // replace=true is the explicit opt-in to rotate an EXISTING connection's
+  // credential. Without it the API refuses a create that targets an already
+  // connected user + forge type + base URL with 409 forge_connection_exists, so a
+  // user who re-submits the same host cannot silently destroy the token they
+  // already had.
+  createConnection: (baseUrl: string, token: string, forgeType = "gitlab", replace = false) =>
     request<{ connection: ForgeConnection }>("POST", "/forge/connections", {
       base_url: baseUrl,
       token,
       forge_type: forgeType,
+      ...(replace ? { replace: true } : {}),
     }),
   verifyConnection: (id: string) =>
     request<{ connection: ForgeConnection }>(
@@ -1238,6 +1309,21 @@ const realApi = {
   // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
   // kind-blind on purpose, so there is no hosted delete to add here.
   hostedConfig: () => request<HostedConfig>("GET", "/workers/hosted/config"),
+  // Admin worker sizes (PRD #4213). The read is open to every admin; the edit and reset are
+  // cookie-only writes the api refuses with 409 (read_only_reason) until a fresh controller
+  // report advertises admin-size support, and with 400 { fields } on a value it cannot save.
+  getAdminWorkerSizes: () => request<AdminWorkerSizes>("GET", "/admin/worker-sizes"),
+  updateAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+  resetAdminWorkerSize: (name: string) =>
+    request<AdminWorkerSizeWrite>("POST", `/admin/worker-sizes/${encodeURIComponent(name)}/reset`),
+  // PRD #4213 M3: PUT on an absent name creates the size (201); the editor checks locally
+  // that the name is new, since the same PUT on an existing name edits it.
+  createAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+  // 409 {reason: "builtin" | "in_use", used_by: {workers, settings}} when the size cannot go.
+  deleteAdminWorkerSize: (name: string) =>
+    request<{ deleted: string }>("DELETE", `/admin/worker-sizes/${encodeURIComponent(name)}`),
   /**
    * Provision a hosted worker: one the CONTROLLER runs in the cluster.
    *

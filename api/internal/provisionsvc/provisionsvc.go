@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -41,6 +42,9 @@ const (
 	KindGuardBlocked
 	// KindInternal: a database or crypto failure, already logged (500).
 	KindInternal
+	// KindConflict: the request conflicts with the repo's history (409): it was
+	// linked to an issue tracker before it was removed from uzi.
+	KindConflict
 )
 
 // Error is the typed failure of every Service method. Message is safe to
@@ -64,6 +68,7 @@ type Store interface {
 	GetForgeConnectionForUser(ctx context.Context, arg store.GetForgeConnectionForUserParams) (store.ForgeConnection, error)
 	UpsertRepo(ctx context.Context, arg store.UpsertRepoParams) (store.Repo, error)
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
+	LockRepoForEnableForUser(ctx context.Context, arg store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error)
 	EnableRepoForUser(ctx context.Context, arg store.EnableRepoForUserParams) (store.Repo, error)
 	DeletePendingGuardrailOverrideRequestsForRepo(ctx context.Context, repoID uuid.UUID) error
 	forgesvc.BoardColumnStore
@@ -89,6 +94,46 @@ type Service struct {
 	guard          Guard
 	baseURLAllowed func(raw string) bool
 	log            *slog.Logger // nil: slog.Default() at each call
+	// begin and bind run a unit of work in one transaction (see UseTransactions).
+	begin TxBeginner
+	bind  func(pgx.Tx) Store
+}
+
+// TxBeginner opens a transaction; *pgxpool.Pool satisfies it.
+type TxBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// UseTransactions makes EnableRepo hold the repo row lock (PRD #4173 D13)
+// while it seeds the board columns and flips the repo on: begin opens a
+// transaction and bind returns the Store whose statements run in it
+// (store.Queries.WithTx in production). Without it EnableRepo runs on the
+// Service's own Store with no lock, which cannot order the enable against a
+// concurrent issue tracker link, so production wiring always sets it. A nil
+// begin or bind leaves transactions off; pass a nil interface, never a typed
+// nil such as a nil *pgxpool.Pool. It returns s for chaining and must be called before
+// the Service is shared.
+func (s *Service) UseTransactions(begin TxBeginner, bind func(pgx.Tx) Store) *Service {
+	s.begin, s.bind = begin, bind
+	return s
+}
+
+// inTx runs fn in one transaction (READ COMMITTED, the pool default), rolling
+// back when fn fails and committing otherwise. With transactions off it runs fn
+// on the Service's own Store.
+func (s *Service) inTx(ctx context.Context, fn func(Store) error) error {
+	if s.begin == nil || s.bind == nil {
+		return fn(s.q)
+	}
+	tx, err := s.begin.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // a no-op after a successful Commit
+	if err := fn(s.bind(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // New wires a Service. baseURLAllowed is Config.ForgeBaseURLAllowed.
@@ -270,11 +315,24 @@ func (s *Service) DiscoverRepos(ctx context.Context, userID, connID uuid.UUID) (
 }
 
 // EnableRepo turns a repo on: the live guard (honouring the repo's override),
-// then the default board columns when the repo has none, then the flip, then
-// best-effort settlement of pending override requests. A guard block returns
+// then, in one transaction holding the repo row lock, the default board
+// columns when the repo has none and the flip, then best-effort settlement of
+// pending override requests after the commit. A guard block returns
 // KindGuardBlocked with the verdict; a forge that refuses the column labels
 // returns KindBadGateway and leaves the repo disabled. Disabling is not
 // gated and stays with the caller.
+//
+// The row lock is the enable's half of PRD #4173 D13: it conflicts with the
+// lock the issue tracker link takes, and whether the repo is linked is read
+// only after it is held. A link that committed first is seen under the lock,
+// so only the column rows are written and the forge gets no label request; a
+// link that arrives later waits for this transaction and is then refused. The
+// forge label requests therefore run while the row lock and one pool
+// connection are held. The forge HTTP timeout bounds each request, not the
+// whole seed: a seed makes several (a project lookup, a label listing, one
+// create per missing label), so the hold can be several timeouts long. The
+// guard runs before the transaction: it makes
+// network calls of its own and reads nothing the link changes.
 func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (store.Repo, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
@@ -303,33 +361,51 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		return store.Repo{}, &Error{Kind: KindGuardBlocked, Message: "this repo cannot be enabled", Guard: res}
 	}
 
-	// Columns before the flip: if the forge refuses the labels, the repo stays
-	// disabled rather than enabled with a board no card can resolve against.
 	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
 	if err != nil {
 		s.logger().Error("build forge for connection", "error", err)
 		return store.Repo{}, internal()
 	}
-	// PRD #4173 D3: board columns are labels, on the issue-tracker half.
-	var tr forge.IssueTracker = f
-	if err := forgesvc.EnsureBoardColumns(ctx, s.q, tr, row.ID, row.ForgeProjectID); err != nil {
-		var seedErr *forgesvc.LabelSeedError
-		if errors.As(err, &seedErr) {
-			return store.Repo{}, &Error{Kind: KindBadGateway, Message: "could not seed board labels on the forge: " + seedErr.Error()}
-		}
-		s.logger().Error("ensure board columns", "error", err)
-		return store.Repo{}, internal()
-	}
 
-	// EnableRepoForUser also records the first-import intent (a 'waiting' import the
-	// poller runs; issue #4399), so the enable never imports issues itself.
-	repo, err := s.q.EnableRepoForUser(ctx, store.EnableRepoForUserParams{ID: repoID, UserID: userID})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return store.Repo{}, &Error{Kind: KindNotFound, Message: "repo not found"}
+	// Columns before the flip: if the forge refuses the labels, the repo stays
+	// disabled rather than enabled with a board no card can resolve against.
+	var repo store.Repo
+	err = s.inTx(ctx, func(q Store) error {
+		lock, err := q.LockRepoForEnableForUser(ctx, store.LockRepoForEnableForUserParams{ID: repoID, UserID: userID})
+		if err != nil {
+			return err
 		}
-		s.logger().Error("set repo enabled", "error", err)
-		return store.Repo{}, internal()
+		// A project linked to an issue tracker before it was removed keeps that issue source: it
+		// is refused here, before any label work reaches the forge (the repos trigger from
+		// migration 00467 refuses the flip too, and enableError maps it the same way).
+		if lock.SourceLocked {
+			return removedLinkedRepoError()
+		}
+		// PRD #4173 D3: board columns are labels, on the issue-tracker half. A repo linked to an
+		// external issue tracker records the column rows only: uzi creates no labels or tags
+		// there (writes arrive in M5), and the forge's project is not where its issues live.
+		// The choice reads the locked row, not the one read before the guard.
+		if lock.IssueTrackerConnectionID.Valid {
+			if err := forgesvc.EnsureBoardColumnRows(ctx, q, row.ID); err != nil {
+				s.logger().Error("ensure board column rows", "error", err)
+				return internal()
+			}
+		} else if err := forgesvc.EnsureBoardColumns(ctx, q, forge.IssueTracker(f), row.ID, row.ForgeProjectID); err != nil {
+			var seedErr *forgesvc.LabelSeedError
+			if errors.As(err, &seedErr) {
+				return &Error{Kind: KindBadGateway, Message: "could not seed board labels on the forge: " + seedErr.Error()}
+			}
+			s.logger().Error("ensure board columns", "error", err)
+			return internal()
+		}
+		// EnableRepoForUser also records the first-import intent (a 'waiting' import the
+		// poller runs; issue #4399), so the enable never imports issues itself and the row
+		// lock is not held across one.
+		repo, err = q.EnableRepoForUser(ctx, store.EnableRepoForUserParams{ID: repoID, UserID: userID})
+		return err
+	})
+	if err != nil {
+		return store.Repo{}, s.enableError(err)
 	}
 
 	// A successful enable makes any pending override request moot. Best effort:
@@ -338,4 +414,33 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		s.logger().Warn("set repo enabled: settle pending override request", "error", err)
 	}
 	return repo, nil
+}
+
+// removedLinkedRepoSQLState is the SQLSTATE the repos trigger from migration 00467 raises when
+// a repo that was linked to an issue tracker before its removal is enabled unlinked.
+const removedLinkedRepoSQLState = "UZ414"
+
+// removedLinkedRepoError is the 409 for a project that was linked to an issue tracker before
+// it was removed from uzi.
+func removedLinkedRepoError() *Error {
+	return &Error{Kind: KindConflict, Message: "this project was linked to an issue tracker before it was removed from uzi; its issue source cannot change, so it cannot be enabled or linked again"}
+}
+
+// enableError maps an EnableRepo transaction failure to the typed error the
+// caller returns: a typed *Error passes through, a missing row is not found,
+// the removed-linked-repo refusal is a conflict, and anything else is logged and becomes internal.
+func (s *Service) enableError(err error) *Error {
+	var te *Error
+	if errors.As(err, &te) {
+		return te
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &Error{Kind: KindNotFound, Message: "repo not found"}
+	}
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == removedLinkedRepoSQLState {
+		return removedLinkedRepoError()
+	}
+	s.logger().Error("enable repo", "error", err)
+	return internal()
 }

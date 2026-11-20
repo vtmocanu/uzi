@@ -55,7 +55,15 @@ type ClaimPayload struct {
 	// IssueIID is the worked issue for an issue run, null for a ci_fix run (which
 	// has no issue). IssueTitle/IssueDescription always carry a human summary (for
 	// ci_fix, a synthesized one) so the run stays displayable and self-contained.
-	IssueIID         *int64 `json:"issue_iid"`
+	IssueIID *int64 `json:"issue_iid"`
+	// IssueKey is the issue tracker's key (PRD #4173, ABC-12) of an issue run on a repo
+	// linked to an external issue tracker: the repo link's project short name and
+	// IssueIID. Omitted (not null, not "") for every other claim, which is how the
+	// worker knows a claim is non-closing by the repo link; the field is not sensitive,
+	// so an isolated claim keeps it. A worker that does not advertise issue_key_v1 cannot
+	// claim a run on a linked repo (ClaimRun's standalone clause), so no claim reaches a
+	// worker that would ignore this field and write Closes #<iid>.
+	IssueKey         string `json:"issue_key,omitempty"`
 	IssueTitle       string `json:"issue_title"`
 	IssueDescription string `json:"issue_description"`
 	// IssueComments is the structured, bot/system-filtered, bounded snapshot of the
@@ -542,6 +550,13 @@ type ClaimSecrets struct {
 	// BYTE-IDENTICAL to today's wire (no `codex` key), and an old worker that never
 	// learns the key keeps working. Never logged — it carries a usable access token.
 	Codex *ClaimCodexSecrets `json:"codex,omitempty"`
+	// Provider is the model-provider binding of a PROVIDER-BOUND run (PRD #4320 module 5), present
+	// ONLY then and exclusive with AnthropicOAuthToken (which is "" on such a claim) and Codex:
+	// assertClaimSecretsExclusive refuses a payload carrying both. omitempty is load-bearing: every
+	// vendor claim leaves it nil so its emitted JSON is BYTE-IDENTICAL to today's wire (no `provider`
+	// key, not null, not empty; snapshot-tested). Only a worker advertising claude_provider_v1 is
+	// offered such a claim. Never logged: it carries the usable gateway key.
+	Provider *ClaimProviderBinding `json:"provider,omitempty"`
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run

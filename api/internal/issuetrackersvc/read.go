@@ -34,8 +34,28 @@ func (s *Service) Get(ctx context.Context, userID, connID uuid.UUID) (Connection
 }
 
 // Delete removes one of the user's connections; a missing or foreign id is NotFound.
+// A connection that a repo links to is a Conflict (checked first, and again by the
+// foreign key when a link lands in between): a link cannot be removed.
 func (s *Service) Delete(ctx context.Context, userID, connID uuid.UUID) error {
+	// The owner-scoped read first, so a foreign id is NotFound and the link count
+	// below can never reveal that another user's connection exists.
+	if _, err := s.getRow(ctx, userID, connID); err != nil {
+		return err
+	}
+	linked, err := s.q.CountReposLinkedToIssueTrackerConnection(ctx, connID)
+	if err != nil {
+		s.log.Error("count repos linked to issue tracker connection", "error", err)
+		return internal()
+	}
+	if linked > 0 {
+		return errConnectionLinked
+	}
 	n, err := s.q.DeleteIssueTrackerConnectionForUser(ctx, store.DeleteIssueTrackerConnectionForUserParams{ID: connID, UserID: userID})
+	if isForeignKeyViolation(err) {
+		// A repo linked between the count and the delete: the repos foreign key
+		// refuses the delete, which is the same answer.
+		return errConnectionLinked
+	}
 	if err != nil {
 		s.log.Error("delete issue tracker connection", "error", err)
 		return internal()

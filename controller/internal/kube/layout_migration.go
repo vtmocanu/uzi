@@ -1,6 +1,8 @@
 package kube
 
 import (
+	"context"
+
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
@@ -127,15 +129,15 @@ const layoutMigrationReason = "layout_migration_custody"
 // admitted. A worker that is not held, not drifted, not observed with a Deployment,
 // or whose template cannot be resolved gets no entry (the materializer's own drift
 // arm independently refuses to patch a held worker).
-func (m *Materializer) surfaceEphemeralLayoutHold(t *rollTick, w protocol.DesiredWorker, obs reconcile.ObservedWorker) {
+func (m *Materializer) surfaceEphemeralLayoutHold(ctx context.Context, t *rollTick, w protocol.DesiredWorker, obs reconcile.ObservedWorker) {
 	if !w.Ephemeral || !obs.HasDeployment || !migrationHeld(w, obs.RunnerLayout) {
 		return
 	}
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
 		return
 	}
-	target := RenderDeployment(m.cfg, w, spec)
+	target := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	if obs.SpecHash == target.Spec.Template.Annotations[AnnotationSpecHash] && obs.Generation == w.Generation {
 		return
 	}

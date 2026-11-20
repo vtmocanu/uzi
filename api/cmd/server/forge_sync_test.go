@@ -74,6 +74,15 @@ func (s *wiringStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
 	}
 	return ids, nil
 }
+func (s *wiringStore) ListEnabledLinkedRepoIDs(context.Context) ([]uuid.UUID, error) {
+	ids := []uuid.UUID{}
+	for _, r := range s.rows {
+		if r.IssueTrackerConnectionID.Valid {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids, nil
+}
 func (s *wiringStore) RecoveryStorageHealth(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
 	return []store.RecoveryStorageHealthRow{{}}, nil
 }
@@ -427,4 +436,47 @@ func TestPollerForgeSyncRuntimeToggleStaleInflight(t *testing.T) {
 
 func (s *wiringStore) ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error) {
 	return nil, nil
+}
+
+// TestHandlerInvalidatorResetsBothSyncRegistries pins that the handler's invalidator
+// clears the forge.sync and the issue_tracker.sync history of a repo, so a re-enabled
+// linked repo shows pending on both checks.
+func TestHandlerInvalidatorResetsBothSyncRegistries(t *testing.T) {
+	_, _, st, _, clock, _ := newSyncWiring(t, 1, time.Minute)
+	id := st.rows[0].ID
+	st.rows[0].IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	engine := poller.New(nil, st, time.Minute, 10)
+	cfg := wireForgeSync(engine, clock.now)
+	cfg.Store = st
+	cfg.Now = clock.now
+	sink := &invalidateSink{}
+	wireHandlerForgeSync(sink, cfg)
+	cfg.ForgeSyncRegistry.Begin(id)(true, forge.ErrorClassOther)
+	cfg.IssueTrackerSyncRegistry.Begin(id)(true, forge.ErrorClassOther)
+	svc := healthsvc.New(cfg)
+	pending := func(checkID string) string {
+		t.Helper()
+		doc, err := svc.Evaluate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range doc.Checks {
+			if c.ID == checkID {
+				return c.Evidence[1].Value
+			}
+		}
+		t.Fatalf("missing %s", checkID)
+		return ""
+	}
+	for _, c := range []string{"forge.sync", "issue_tracker.sync"} {
+		if got := pending(c); got != "0" {
+			t.Fatalf("%s pending before invalidation = %s, want 0", c, got)
+		}
+	}
+	sink.invalidate(id)
+	for _, c := range []string{"forge.sync", "issue_tracker.sync"} {
+		if got := pending(c); got != "1" {
+			t.Fatalf("%s pending after invalidation = %s, want 1", c, got)
+		}
+	}
 }

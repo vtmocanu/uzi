@@ -500,6 +500,40 @@ a Bearer-reachable mint would let a stolen CLI token replace a user's
 credentials. See [docs/anthropic-token.md](docs/anthropic-token.md) for the
 user-facing flow and `prds/done/104-named-anthropic-tokens.md` for the rationale.
 
+## Custom model providers (PRD #4320)
+
+A user can register an Anthropic-compatible gateway as a **provider** (`model_providers`
+with immutable `model_provider_revisions`) and select it as their Claude source
+(`users.claude_provider_id`). Its key is a separate vault kind, `anthropic_compatible_key`,
+never a default and never auto-eligible, so it cannot reach Anthropic and a subscription token
+cannot reach a gateway. The trust boundary is the operator allowlist
+`UZI_PROVIDER_ALLOWED_BASE_URLS`: exact URLs with a path, enforced **by the api only** at
+save/edit, the Test probe, run creation and the issue and chat claims. The worker validates the
+binding's shape and holds no copy of the list.
+
+A run freezes its binding (`runs.model_provider_*`: provider, revision, key mode, key secret,
+the key's `enablement_rev`) in the create transaction. There is deliberately no foreign key from
+`runs` to the provider tables, so a revoked binding is detected at the next claim and parks the
+run (`provider_destination_not_allowed`, or `provider_binding_stale`), never nulled into a
+vendor fallback. A provider run's claim carries one `provider` object and no
+`anthropic_oauth_token`; the worker maps it onto the SDK env in `buildSdkEnv`. Issue runs wait out
+a gateway 429 or overload as `limit_wait` (`provider_gateway_limit`) on a 1, 5, 15 minute
+schedule and then for the owner; chat ends the turn instead. Usage is recorded with
+`cost_status='unreported'`. The judge, job, cross-check and isolated lanes refuse provider-sourced
+owners (`provider_lane_unsupported`).
+
+The Test probe is dialed from the api, ignores proxy variables, never follows a redirect and
+admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
+flag, loopback addresses).
+
+**Activation is blocked.** The pinned Claude CLI follows gateway redirects (a same-origin 307
+re-sends the key in both auth styles; a cross-origin one forwards `x-api-key` and the body), so
+workers do not advertise the capability `claude_provider_v1` and a provider-bound run stays queued
+("no worker that supports model providers is online"). A loopback relay is deferred to a separate
+issue. Design record, route split, inheritance rules and rollback hazards:
+[adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md); user docs:
+[docs/providers.md](docs/providers.md).
+
 ## Claude rate-limit visibility (PRD #53)
 
 A background engine (`api/internal/usagepoller`, the same `Boot()` immediate
@@ -1038,7 +1072,11 @@ and it is not re-checked.
 
 With findings, the lead gets one repair turn and reports a disposition per
 finding through `report_cross_check_dispositions` (worker-authenticated,
-write-once). The worker renders the outcome into the MR description's "Code
+write-once). When every finding is a minor `Coverage uncertainty:` verification
+caveat, or no implementation iteration is left, no repair turn runs and
+the worker finalizes with an empty batch, so each finding is recorded as
+not reported (`CodeCrossCheckGate.done` in
+`agent/src/code-cross-check-gate.ts`). The worker renders the outcome into the MR description's "Code
 cross-check" section (`renderCodeCrossCheck` in `agent/src/pr-description.ts`);
 the run page and `uzi run get` read the same stored summary.
 
@@ -1264,7 +1302,9 @@ chain in the diagram above, with no intervening `running`.
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
   carries off the worker and adoption peels back to uncommitted (exact recovery
-  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`;
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`,
+  except that a claimed Codex run is never given to another worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md);
   the marker never commits core dumps or files over 8 MiB, and one under a
   verified coverage wrapper is peeled at successor adopt). A
   resumed run whose plan is provably reviewed and whose work recovered continues
@@ -1304,6 +1344,17 @@ chain in the diagram above, with no intervening `running`.
   not claimed until the new vault exists and is unlocked. See
   [docs/vault-threat-model.md](docs/vault-threat-model.md#admin-issued-account-reset).
 
+- **claimed → paused (`provider_destination_not_allowed` / `provider_binding_stale`)**
+  (PRD #4320): a provider-bound run whose frozen binding was revoked is refused at its next
+  claim, never inside a held claim. `provider_destination_not_allowed` (the operator removed
+  the URL from `UZI_PROVIDER_ALLOWED_BASE_URLS`) is re-queued by the promoter once the URL is
+  allowed again; `provider_binding_stale` (its key was rotated, disabled or deleted, or its
+  provider revision is gone) is final for that run, and a manual resume of either is refused
+  with 409. Neither falls back to a vendor credential. A gateway 429 or overload parks an
+  issue run as `limit_wait` instead (1, 5, 15 minutes, then the owner). See
+  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Dormant until
+  activation lands: no worker advertises `claude_provider_v1` yet, so a provider run stays queued.
+
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,
   no plan, no question and no completion signal) is
@@ -1334,7 +1385,8 @@ chain in the diagram above, with no intervening `running`.
   rather than failing. An owner/worker/actual-Git-origin cooldown filters new
   claims until due, then serializes one ordinary recovery trial. Expiry is
   unverified; safe early affinity escape requires complete guarded source
-  disposition evidence. These placement hints grant no execution or custody
+  disposition evidence (never for a claimed Codex run, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)). These placement hints grant no execution or custody
   authority. A forge outage met later, while publishing finished work (#1324),
   parks the run in the same status with `recovery_wait_phase=publication`
   instead: the agent saves an HMAC-sealed write-ahead intent and enrolls it
@@ -1463,8 +1515,24 @@ chain in the diagram above, with no intervening `running`.
   `refs/uzi-recovery/<run-id>` ref rather than deleting or overwriting it. See
   [ADR-1810](adr/1810-checkpoint-retention-follows-custody.md).
   This same affinity leg is what lets a **paused** run's `resume` fall open
-  to a different worker once the pinned one is stale or gone; see
+  to a different worker once the pinned one is stale or gone (not for a Codex run at
+  generation >= 1, which stays held for its recorded worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)); see
   [ADR-1190](adr/1190-run-pause-invariants.md).
+
+- **Codex claim provenance** ([ADR-4476](adr/4476-codex-claim-provenance.md), issue #4476).
+  `runs` records the worker and generation of the last admitted Codex claim
+  (`claim_provenance_worker_id`, `claim_provenance_generation`). `ClaimRun` and its
+  provisioning/wake mirrors admit a Codex-indicating run at `claim_generation >= 1`
+  only for that worker at the current generation, through
+  `fn_codex_claim_provenance_admits`; a trigger (`trg_runs_claim_provenance_guard`)
+  lets the pair change only in an admitted `+1` claim. The affinity ceiling, the
+  stale-requeue grace, a deleted owner row, forge-origin owner pins and the
+  cross-check exemption do not override it, so the run waits for its worker
+  or is cancelled by the owner. Run health reports `waiting_worker` with "held for
+  worker NAME" or "predecessor provenance unavailable" (`workersvc/health.go`).
+  Claude runs are unchanged. There is no backfill and no rollback fence, and
+  predecessor quiescence is not proven (see the ADR's residuals).
 
 - **The checkpoint net survives a branch behind `main` on `.github/workflows`**
   ([PRD #1062](prds/done/1062-checkpoint-durability-completion.md), completing
@@ -1482,7 +1550,7 @@ chain in the diagram above, with no intervening `running`.
   run stays pinned to its prior worker while that worker's row exists and it is
   either draining or heartbeating, bounded by `WORKER_AFFINITY_CEILING` (default
   2h of queue dwell after promotion). A deleted worker, a stale non-draining
-  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it.
+  worker (after `WORKER_STALE_REQUEUE_GRACE` for a run the stale-worker sweeper requeued), or an expired ceiling lets another eligible worker claim it, except a Codex run already claimed once, which only the worker recorded for its current generation may claim ([ADR-4476](adr/4476-codex-claim-provenance.md)).
   `WORKER_AFFINITY_GRACE` (default 2m) remains the chat lane's grace.
   A run the stale-worker sweeper requeued is additionally held for its previous
   worker, while that worker's row exists, for `WORKER_STALE_REQUEUE_GRACE` (default
@@ -2658,6 +2726,19 @@ locks. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
 
+Sizes themselves live in the api's `worker_sizes` table as integers (CPU and
+memory request and limit, data and DinD disk). The api seeds and refreshes the
+shipped sizes at boot, and admins edit, add and remove sizes on **Admin →
+Workers**; the default-size settings may name any existing size, while the env
+and chart overrides stay limited to shipped names because they are validated
+before the table exists. The integers ride inline on each `DesiredWorker`, and the
+controller resolves a worker's resources from them, falling back to its
+compiled-in presets only when they are absent. It refuses values above its chart
+ceilings and reports `size_refused` or `pvc_rejected`, which surface in Admin
+health. A size a worker or a default-size setting references cannot be deleted.
+See [ADR-4213](adr/4213-admin-worker-sizes.md) and
+[PRD #4213](prds/4213-admin-worker-sizes.md).
+
 **Codex on a hosted worker needs a third identity, and that is opt-in.** The
 restricted-tier namespace above starts every worker single-uid, which is one
 identity short of what the Codex harness's fail-closed launcher requires (a
@@ -3125,9 +3206,15 @@ thresholds and the notice contract.
 
 Issue-sync failure streaks have shipped as `forge.sync`
 ([#2203](https://github.com/vtmocanu/uzi/issues/2203)), separate from deferred
-freshness. The private `api/cmd/server/forge_sync.go` wiring used by startup and
-tests connects `poller.SetSyncAttempt` to an empty process-local
-`healthsvc.SyncRegistry` after seed and before polling, and gives health the
+freshness. A repo linked to an
+issue tracker reports its issue-sync streaks to a second registry that feeds
+`issue_tracker.sync`; for such a repo `forge.sync` measures a cheap code-host
+probe (one project lookup per poll tick) instead, so a revoked forge token and
+an issue tracker outage show on different checks, and the code-host steps run
+whatever the probe returns. The private `api/cmd/server/forge_sync.go` wiring used by startup and
+tests connects `poller.SetSyncAttempt` and `poller.SetIssueTrackerSyncAttempt`
+to two empty process-local `healthsvc.SyncRegistry` values after seed and
+before polling (the handler's repo-sync invalidator resets both), and gives health the
 same engine's effective interval. Each repo attempt binds at `syncRepo`
 start; client-construction failures and returned `FullSync`/`IncrementalSync`
 outcomes feed the registry. Success is reported before sibling sync work,

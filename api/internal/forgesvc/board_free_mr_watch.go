@@ -19,15 +19,16 @@ import (
 // preserved) and, on the opened->closed / ->merged edge, cancels an in-flight rework via the
 // existing cancelReworkOnClosedMR (issue #853 contract, reused verbatim). Reads the run set
 // from ListBoardFreeMRStateWatchCandidates, which self-evicts a run once its mr_state is
-// terminal.
+// terminal, except a linked repo's closed issue-lane run (below).
 //
-// SCOPE BOUNDARY (PRD #908 design, "self-bounding like Lane B"): closed AND merged are
-// terminal for this lane — the candidate query drops a run at mr_state='closed', so a
-// board-free MR that a reviewer closes then REOPENS is not re-watched and does not regain
-// mr_rework eligibility. That is deliberate: unlike the issue lane's board-coupled Lane A
-// (which keeps watching a closed-issue run for the reopen edge), a board-free recorder that
-// kept polling closed MRs forever would reintroduce the unbounded-growth cost the design
-// rejected. There is therefore no closed->opened arm below (unlike syncOneMRState).
+// SCOPE BOUNDARY (PRD #908 design, "self-bounding like Lane B"): for issue-less and
+// scheduled-lane runs closed AND merged are terminal — the candidate query drops such a run at
+// mr_state='closed', so a closed-then-reopened board-free MR is not re-watched. The exception
+// is a repo linked to an external issue tracker (PRD #4173 M4): its issue-lane runs also stay
+// candidates at mr_state='closed' (latest run of the issue only, and only while the cached
+// issue is opened), so the reopen is recorded
+// back to 'opened' by the default arm below and mr_rework regains eligibility. A closed MR
+// that is still closed is a no-transition and fires no side effect.
 //
 // Like SyncMRStates it never returns a per-candidate error (log-and-skip); only a failure
 // to enumerate candidates surfaces to the poller.

@@ -791,3 +791,35 @@ func TestAutopilotBotAssignedAfterLabelNotDoubleFired(t *testing.T) {
 		t.Fatalf("no new trigger should be written for a stale event, got %+v", st.upserts)
 	}
 }
+
+// TestAutopilotTerminalConsumerGateBusyLeavesEventUnrecorded pins issue #4488: a terminal-ref
+// retirement briefly holding the repo's consumer gate refuses the create with
+// ErrTerminalConsumerGateBusy (nothing created). Contention must never consume the label event:
+// no record, no comment, and the next tick creates the run.
+func TestAutopilotTerminalConsumerGateBusyLeavesEventUnrecorded(t *testing.T) {
+	st := &apStore{
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
+		cc:         ccOwner("alice", true, true),
+	}
+	runs := &apRuns{err: errors.Join(workersvc.ErrTerminalConsumerGateBusy, errors.New("lock timeout"))}
+	f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}}
+
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("CreateAutopilotRun calls = %d, want 1", len(runs.calls))
+	}
+	if len(st.upserts) != 0 || len(f.notes) != 0 {
+		t.Fatalf("a busy gate must leave the event unrecorded and silent, upserts=%+v notes=%+v", st.upserts, f.notes)
+	}
+
+	runs.err = nil // the hold ended
+	detectWith(st, runs, f)
+
+	if len(runs.calls) != 2 {
+		t.Fatalf("CreateAutopilotRun calls after the next tick = %d, want 2 (retried)", len(runs.calls))
+	}
+	if len(st.upserts) != 1 || st.upserts[0].LastEventID != 100 {
+		t.Fatalf("the retried create must record event 100 once, upserts=%+v", st.upserts)
+	}
+}

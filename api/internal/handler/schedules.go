@@ -54,6 +54,10 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: no schedule on a never-enabled repo.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
+		return
+	}
 	user, _ := mw.UserFromContext(r.Context())
 
 	var req apitypes.ScheduleRequest
@@ -135,6 +139,9 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		CredentialOverrideSecretID: credCols.secretID,
 	})
 	if err != nil {
+		if writeIfNeverEnabled(w, err) {
+			return
+		}
 		slog.Error("create run schedule", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -249,8 +256,13 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		if repoint {
 			// Ownership mirror (create parity, PRD #344 D3): 404 on a foreign/absent repo.
 			// No enabled/guardrail/blocked gate is added here — those run at fire time.
-			if _, rerr := qw.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
+			target, rerr := qw.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID})
+			if rerr != nil {
 				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			// PRD 4173 D13: a schedule may not be repointed at a never-enabled repo.
+			if refuseNeverEnabled(w, target.AwaitingFirstEnable, target.IssueSourceLocked) {
 				return
 			}
 			// A schedule with CI-watch episode history keeps it only against the repo whose
@@ -351,6 +363,9 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusConflict, "another repo in this schedule's group already uses that repo")
 				return
 			}
+			if writeIfNeverEnabled(w, err) {
+				return
+			}
 			slog.Error("update run schedule", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -448,7 +463,7 @@ func (h *Handler) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
 // RunScheduleNow fires an owner-scoped schedule immediately through the shared seam
 // (POST /api/schedules/{id}/run-now), WITHOUT advancing or parking it — a manual extra
 // fire must not disturb the recurring cadence. It maps the scheduler's error sentinels
-// to HTTP codes: repo gone → 404, malformed config → 400, transient → 502.
+// to HTTP codes (writeRunScheduleNowError).
 func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 	user, id, ok := h.scheduleParam(w, r)
 	if !ok {
@@ -465,15 +480,7 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.scheduler.RunNow(r.Context(), s)
 	if err != nil {
-		switch {
-		case errors.Is(err, workersvc.ErrRepoNotFound):
-			httpx.Error(w, http.StatusNotFound, "the schedule's repo is disconnected or no longer owned by you")
-		case errors.Is(err, schedsvc.ErrBadConfig):
-			httpx.Error(w, http.StatusBadRequest, "the schedule's configuration is invalid")
-		default:
-			slog.Error("run schedule now", "schedule", s.ID.String(), "error", err)
-			httpx.Error(w, http.StatusBadGateway, "could not fire the schedule")
-		}
+		writeRunScheduleNowError(w, s.ID, err)
 		return
 	}
 	resp := runNowResponse(out)
@@ -764,4 +771,24 @@ func scheduleWithHarness(sched store.RunSchedule, cols scheduleHarnessColumns) s
 	}
 	sched.Harness = cols.value
 	return sched
+}
+
+// writeRunScheduleNowError maps a RunNow error: a busy terminal consumer gate → 503 with
+// Retry-After (issue #4488, retryable, nothing was created), repo gone → 404, never enabled →
+// its refusal, malformed config → 400, anything else (transient) → 502.
+func writeRunScheduleNowError(w http.ResponseWriter, scheduleID uuid.UUID, err error) {
+	if writeTerminalConsumerGateRefusal(w, err) {
+		return
+	}
+	switch {
+	case errors.Is(err, workersvc.ErrRepoNotFound):
+		httpx.Error(w, http.StatusNotFound, "the schedule's repo is disconnected or no longer owned by you")
+	case errors.Is(store.MapNeverEnabled(err), store.ErrRepoNeverEnabled):
+		writeNeverEnabled(w, err)
+	case errors.Is(err, schedsvc.ErrBadConfig):
+		httpx.Error(w, http.StatusBadRequest, "the schedule's configuration is invalid")
+	default:
+		slog.Error("run schedule now", "schedule", scheduleID.String(), "error", err)
+		httpx.Error(w, http.StatusBadGateway, "could not fire the schedule")
+	}
 }

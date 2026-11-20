@@ -153,6 +153,14 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Get("/egress-profiles", h.AdminListEgressProfiles)
 			r.Get("/egress-profiles/{name}", h.AdminGetEgressProfile)
 		})
+		// Hosted worker sizes (PRD #4213 M2): the editor's read. Browser-session only (PRD: no
+		// new CLI-readable route), so any Bearer, uza_ included, 401s before the handler.
+		// Cookie-only so no CLI token can read it; any admin browser session may read.
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireAuth())
+			r.Use(mw.RequireAdmin)
+			r.Get("/worker-sizes", h.AdminListWorkerSizes)
+		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireAuth())
@@ -169,6 +177,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// RequireAdmin, target from the path, never the body.
 			r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 			r.Put("/settings", h.UpdateSettings)
+			// Hosted worker sizes (PRD #4213 M2): edit and reset an existing size. Cookie-only
+			// (a uza_ Bearer 401s before the handler, CSRF applies); the actor is the session
+			// user. Refused 409 until a fresh controller report advertises admin-size support.
+			r.Put("/worker-sizes/{name}", h.AdminPutWorkerSize)
+			r.Post("/worker-sizes/{name}/reset", h.AdminResetWorkerSize)
+			// PRD #4213 M3: PUT also creates an absent size; DELETE removes an unused admin size.
+			r.Delete("/worker-sizes/{name}", h.AdminDeleteWorkerSize)
 			// Worker hibernation (PRD #4205): admin-only sleep and wake of a persistent hosted
 			// worker. Cookie-only so a uza_ Bearer 401s and CSRF applies; the actor is the
 			// session user and the target comes from the path.

@@ -12,6 +12,9 @@ const (
 	KindBadGateway
 	// KindInternal: a database or crypto failure, already logged (500).
 	KindInternal
+	// KindConflict: the request is well formed but the current state refuses it,
+	// for example linking a repo that was already enabled (HTTP 409).
+	KindConflict
 )
 
 // Error is the typed failure of every Service method. Message is safe to show
@@ -27,3 +30,5 @@ func (e *Error) Error() string { return e.Message }
 func internal() *Error { return &Error{Kind: KindInternal, Message: "internal error"} }
 
 func notFound() *Error { return &Error{Kind: KindNotFound, Message: "connection not found"} }
+
+func conflict(msg string) *Error { return &Error{Kind: KindConflict, Message: msg} }

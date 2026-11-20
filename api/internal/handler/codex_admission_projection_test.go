@@ -28,7 +28,10 @@ func TestCodexAdmissionBoardProjection(t *testing.T) {
 		{"owner handoff", true, "codex_overload", "overload", "handoff setup has not finished", "handoff setup has not finished", true},
 		{"owner vault", true, "codex_overload", "overload", "your vault is locked, so this run can't start", "your vault is locked, so this run can't start", true},
 		{"owner custody", true, "codex_overload", "overload", "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity", "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity", true},
-		{"owner custody unavailable", true, "codex_overload", "overload", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", true},
+		{"owner custody unavailable", true, "codex_overload", "overload", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings", true},
+		// Issue #4423: a row persisted by an older server still carries the legacy Admin → Instance
+		// custody text until the next health tick rewrites it; it keeps the same precedence.
+		{"owner custody unavailable legacy text", true, "codex_overload", "overload", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", true},
 		// PRD #3522: the weekly reserve outranks an open cooldown for the owner and, like it, is owner-only.
 		{"owner reserve over cooldown", true, "weekly_reserve", "rate_limit", "weekly usage reserve: 72% >= 70%", "weekly usage reserve: 72% >= 70%", true},
 		{"shared reserve", false, "weekly_reserve", "", "weekly usage reserve: 72% >= 70%", "", false},

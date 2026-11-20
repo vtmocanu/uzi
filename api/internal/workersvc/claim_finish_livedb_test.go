@@ -27,15 +27,17 @@ import (
 
 // codexClaimFix is the observed-case prelude: a subscription Codex run first claimed by worker A
 // at generation 1, then requeued by the sweeper with worker_id still A, started three hours ago
-// with banked pause, plus a Codex-capable claimant B. The owner ALSO holds a default Anthropic
-// token, so any Claude fallback would be visible.
+// with banked pause, plus a second Codex-capable worker B that is never recorded in the run's
+// claim provenance, so a Codex run is admitted only to A. With olderHold the gen-1 hold's live
+// holder is B, which a codex_account_unavailable park must move worker_id to. The owner ALSO
+// holds a default Anthropic token, so any Claude fallback would be visible.
 type codexClaimFix struct {
 	env                codexTestEnv
 	userID, repoID     uuid.UUID
 	aliasID, accountID uuid.UUID
 	workerA, workerB   uuid.UUID
 	runID              uuid.UUID
-	holdA              uuid.UUID // the gen-1 hold on A; uuid.Nil when not seeded
+	holdA              uuid.UUID // the gen-1 hold (original worker A, live holder B); uuid.Nil when not seeded
 	access             string    // the linked login's access token at seed time
 	svc                *Service
 }
@@ -51,9 +53,26 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 		WHERE user_secret_id = $1`, f.aliasID).Scan(&fx.accountID); err != nil {
 		t.Fatalf("read linked account: %v", err)
 	}
-	env.exec(`UPDATE runs SET claim_generation = 1, status = 'claimed', codex_cap_hash = NULL WHERE id = $1`, f.runID)
+	// One UPDATE from generation 0 is the run's first claim as the provenance trigger sees it:
+	// worker A holds generation 1 and is the only worker a Codex run at generation 1 admits.
+	env.exec(`UPDATE runs SET claim_generation = 1, status = 'claimed', codex_cap_hash = NULL,
+		worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 1
+		WHERE id = $1`, f.runID, fx.workerA)
+	// A is the claimant now, so it is registered as a live Codex-capable worker (B's shape).
+	env.exec(`UPDATE workers SET protocol_capabilities = $2, last_heartbeat_at = now(),
+		snapshot_register_nonce = 'nonce-A', snapshot_epoch = 0 WHERE id = $1`, fx.workerA,
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
+	fx.workerB = uuid.New()
+	env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities,
+		last_heartbeat_at, snapshot_register_nonce, snapshot_epoch)
+		VALUES ($1, $2, $3, $4, 'online', $5, now(), 'nonce-B', 0)`,
+		fx.workerB, f.userID, "wb-"+fx.workerB.String(), fx.workerB[:],
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
 	if olderHold {
 		fx.holdA = claimRecoveryHold(t, env, f.runID, fx.workerA, 1)
+		// The older open hold's live holder is the foreign worker B (A's original hold was
+		// handed to B), so the exact-claim park must move worker_id from the claimant A to B.
+		env.exec(`UPDATE recovery_custody_holds SET live_worker_id = $2 WHERE id = $1`, fx.holdA, fx.workerB)
 	}
 	// The sweeper's provisional requeue keeps worker_id for affinity and preserves the
 	// capability; this fixture already seeded a NULL hash above. A stale
@@ -63,22 +82,16 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 		recovery_retry_not_before = now() - interval '1 hour',
 		started_at = now() - interval '3 hours', budget_paused_seconds = 120,
 		updated_at = now() - interval '3 hours' WHERE id = $1`, f.runID, fx.workerA)
-	fx.workerB = uuid.New()
-	env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities,
-		last_heartbeat_at, snapshot_register_nonce, snapshot_epoch)
-		VALUES ($1, $2, $3, $4, 'online', $5, now(), 'nonce-B', 0)`,
-		fx.workerB, f.userID, "wb-"+fx.workerB.String(), fx.workerB[:],
-		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
 	fx.svc = New(env.q, env.box, testParams())
 	fx.svc.SetVault(env.vlt)
 	fx.svc.SetTxBeginner(env.pool)
 	return fx
 }
 
-// claimant returns worker B as Claim sees it; capable controls recovery_archive_v1.
+// claimant returns worker A (the provenance-recorded claimant) as Claim sees it; capable controls recovery_archive_v1.
 func (fx *codexClaimFix) claimant(t *testing.T, capable bool) store.Worker {
 	t.Helper()
-	w := wkrRow(t, fx.env, fx.workerB)
+	w := wkrRow(t, fx.env, fx.workerA)
 	w.ProtocolCapabilities = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
 	if capable {
 		w.ProtocolCapabilities = append(w.ProtocolCapabilities, capability.RecoveryArchiveV1)
@@ -91,13 +104,14 @@ func (fx *codexClaimFix) setAccount(t *testing.T, set string) {
 	fx.env.exec(`UPDATE codex_provider_account SET `+set+` WHERE id = $1`, fx.accountID)
 }
 
-// holdB returns worker B's hold at generation 2 (the one this claim opened), or uuid.Nil.
-func (fx *codexClaimFix) holdB(t *testing.T) uuid.UUID {
+// holdClaimant returns the claimant's (worker A) hold at generation 2, the one this claim opened,
+// or uuid.Nil.
+func (fx *codexClaimFix) holdClaimant(t *testing.T) uuid.UUID {
 	t.Helper()
 	var id uuid.UUID
 	// original_worker_id is immutable provenance; a release nulls only the live FKs.
 	err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT id FROM recovery_custody_holds
-		WHERE run_id = $1 AND generation = 2 AND original_worker_id = $2`, fx.runID, fx.workerB).Scan(&id)
+		WHERE run_id = $1 AND generation = 2 AND original_worker_id = $2`, fx.runID, fx.workerA).Scan(&id)
 	if err != nil {
 		return uuid.Nil
 	}
@@ -126,6 +140,15 @@ func (fx *codexClaimFix) assertNoClaudeFallback(t *testing.T, payload *ClaimPayl
 	}
 }
 
+// parkedWorker is the worker a codex_account_unavailable park leaves worker_id on: the newest open
+// custody holder (B, holdA's live holder) when the older hold is seeded, else the claimant A.
+func (fx *codexClaimFix) parkedWorker() uuid.UUID {
+	if fx.holdA != uuid.Nil {
+		return fx.workerB
+	}
+	return fx.workerA
+}
+
 // assertParked checks the full D2 park field set on the run.
 func (fx *codexClaimFix) assertParked(t *testing.T, before store.Run, wantWorker uuid.UUID) store.Run {
 	t.Helper()
@@ -151,12 +174,13 @@ func (fx *codexClaimFix) assertParked(t *testing.T, before store.Run, wantWorker
 	return r
 }
 
-// TestClaimObservedCaseReplayParksLiveDB is the M1 regression: the #1582 replay. Gen-1 hold on
-// worker A, run requeued with worker_id A, then a cold claim by capable worker B at generation 2
-// whose account is quarantined after ClaimRun's gate (the race the gate cannot see). The claim
-// must park the run on codex_account_unavailable, release ONLY B's gen-2 hold, keep A's gen-1
-// hold, prefer A, and deliver nothing. On the unfixed code the run is failed
-// credential_unavailable and both holds stay open.
+// TestClaimObservedCaseReplayParksLiveDB is the M1 regression: the #1582 replay, reshaped for the
+// Codex claim provenance of issue #4476. The gen-1 hold's original worker is A (the recorded
+// claimant) but its live holder is B; the run was requeued with worker_id A, then A claims it at
+// generation 2 and its account is quarantined after ClaimRun's gate (the race the gate cannot
+// see). The claim must park the run on codex_account_unavailable, release ONLY A's gen-2 hold,
+// keep the older hold open, move worker_id to the older hold's live holder B (D4), and deliver
+// nothing. On the unfixed code the run is failed credential_unavailable and both holds stay open.
 func TestClaimObservedCaseReplayParksLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	fx := newCodexClaimFix(t, env, true)
@@ -170,14 +194,14 @@ func TestClaimObservedCaseReplayParksLiveDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	fx.assertNoClaudeFallback(t, payload)
-	r := fx.assertParked(t, before, fx.workerA)
+	r := fx.assertParked(t, before, fx.parkedWorker())
 	if r.ClaimGeneration != 2 {
 		t.Fatalf("claim_generation = %d, want 2 (the cold claim)", r.ClaimGeneration)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	gen2 := fx.holdB(t)
+	gen2 := fx.holdClaimant(t)
 	if gen2 == uuid.Nil {
-		t.Fatal("the gen-2 hold B's claim opened is missing")
+		t.Fatal("the gen-2 hold the claim opened is missing")
 	}
 	assertClaimRecoveryHold(t, env, gen2, "released", true)
 
@@ -185,17 +209,17 @@ func TestClaimObservedCaseReplayParksLiveDB(t *testing.T) {
 	// run at g. The worker blocks (does not retire) its terminal journal on that reason, which is
 	// only sound if ownership cannot return at the same generation. After the park above:
 	one, two := int64(1), int64(2)
-	// (1) B claimed generation 2 but the park moved the run to A, so B is not the owner.
-	if _, applied, err := fx.svc.SetState(env.ctx, wkrRow(t, env, fx.workerB), fx.runID, StateRequest{State: "failed", ClaimGeneration: &two}); applied || !errors.Is(err, ErrRunNotOwned) {
-		t.Fatalf("B gen-2 terminal report: applied=%v err=%v, want not applied + ErrRunNotOwned", applied, err)
+	// (1) A claimed generation 2 but the park moved the run to B, so A is not the owner.
+	if _, applied, err := fx.svc.SetState(env.ctx, wkrRow(t, env, fx.workerA), fx.runID, StateRequest{State: "failed", ClaimGeneration: &two}); applied || !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("A gen-2 terminal report: applied=%v err=%v, want not applied + ErrRunNotOwned", applied, err)
 	}
-	// (2) A owns the row but at generation 2: its gen-1 report is stale and changes nothing.
-	if _, applied, err := fx.svc.SetState(env.ctx, wkrRow(t, env, fx.workerA), fx.runID, StateRequest{State: "failed", ClaimGeneration: &one}); applied || !errors.Is(err, ErrStaleClaim) {
-		t.Fatalf("A gen-1 terminal report: applied=%v err=%v, want not applied + ErrStaleClaim", applied, err)
+	// (2) B owns the row but at generation 2: its gen-1 report is stale and changes nothing.
+	if _, applied, err := fx.svc.SetState(env.ctx, wkrRow(t, env, fx.workerB), fx.runID, StateRequest{State: "failed", ClaimGeneration: &one}); applied || !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("B gen-1 terminal report: applied=%v err=%v, want not applied + ErrStaleClaim", applied, err)
 	}
 	after := mustRun(t, env, fx.runID)
-	if after.Status != "recovery_wait" || after.ClaimGeneration != 2 || !after.WorkerID.Valid || uuid.UUID(after.WorkerID.Bytes) != fx.workerA {
-		t.Fatalf("run after rejected reports = status %s gen %d worker %v, want recovery_wait gen 2 worker A", after.Status, after.ClaimGeneration, after.WorkerID)
+	if after.Status != "recovery_wait" || after.ClaimGeneration != 2 || !after.WorkerID.Valid || uuid.UUID(after.WorkerID.Bytes) != fx.workerB {
+		t.Fatalf("run after rejected reports = status %s gen %d worker %v, want recovery_wait gen 2 worker B", after.Status, after.ClaimGeneration, after.WorkerID)
 	}
 	// (3) The park itself cannot run a second time at the same generation, for either worker.
 	for name, w := range map[string]uuid.UUID{"B": fx.workerB, "A": fx.workerA} {
@@ -225,11 +249,11 @@ func TestClaimPreMintQuarantineUsesSnapshotIdentityLiveDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	fx.assertNoClaudeFallback(t, payload)
-	r := fx.assertParked(t, before, fx.workerB)
+	r := fx.assertParked(t, before, fx.parkedWorker())
 	if r.CodexClaimEpoch != claimed.CodexClaimEpoch+1 {
 		t.Fatalf("epoch = %d, want the snapshot epoch %d + 1 (no mint happened)", r.CodexClaimEpoch, claimed.CodexClaimEpoch)
 	}
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }
 
 // TestClaimQuarantineAfterSuccessfulAssemblyParksLiveDB (b): a quarantine landing after a
@@ -255,7 +279,7 @@ func TestClaimQuarantineAfterSuccessfulAssemblyParksLiveDB(t *testing.T) {
 			}}
 			var snap *ActiveSnapshot
 			if withSnapshot {
-				snap = &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: "nonce-B", Active: []ActiveRunEntry{}}
+				snap = &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: "nonce-A", Active: []ActiveRunEntry{}}
 			}
 			payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), snap)
 			if err != nil {
@@ -265,9 +289,9 @@ func TestClaimQuarantineAfterSuccessfulAssemblyParksLiveDB(t *testing.T) {
 				t.Fatal("assembly hook never ran")
 			}
 			fx.assertNoClaudeFallback(t, payload)
-			fx.assertParked(t, before, fx.workerA)
+			fx.assertParked(t, before, fx.parkedWorker())
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 		})
 	}
 }
@@ -317,7 +341,7 @@ func TestClaimRevocationAfterAssemblyFailsLiveDB(t *testing.T) {
 				t.Fatalf("terminal row: hash=%x move_pending=%v cause=%v", r.CodexCapHash, r.MovePendingSince, r.RecoveryWaitCause)
 			}
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 		})
 	}
 }
@@ -345,7 +369,7 @@ func TestClaimSameWorkerRemintIsIdleLiveDB(t *testing.T) {
 			var wire string
 			mutate := func() {
 				if tc.remint {
-					wire = env.mintCap(t, fx.runID, fx.workerB)
+					wire = env.mintCap(t, fx.runID, fx.workerA)
 				}
 				fx.setAccount(t, "coord_state = 'quarantined'")
 			}
@@ -361,8 +385,8 @@ func TestClaimSameWorkerRemintIsIdleLiveDB(t *testing.T) {
 				t.Fatalf("Claim = (%v, %v), want idle", payload != nil, err)
 			}
 			if !tc.remint {
-				fx.assertParked(t, before, fx.workerB)
-				assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+				fx.assertParked(t, before, fx.parkedWorker())
+				assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 				return
 			}
 			epoch, secret, ok := parseCodexCapability(wire)
@@ -376,14 +400,14 @@ func TestClaimSameWorkerRemintIsIdleLiveDB(t *testing.T) {
 				t.Fatalf("newer claim mutated: status=%s epoch=%d (want %d) cause=%v origin=%v",
 					r.Status, r.CodexClaimEpoch, epoch, r.RecoveryWaitCause, r.FailOrigin)
 			}
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 		})
 	}
 }
 
 // TestClaimStaleGenerationMintIsFencedLiveDB (PRD #1590 review): the capability mint is fenced on
-// claim_generation. Worker B claims the run at generation G, the claim is requeued (the real
-// RequeueClaimedRunToQueued, which keeps worker_id = B), and B reclaims it through Service.Claim
+// claim_generation. Worker A claims the run at generation G, the claim is requeued (the real
+// RequeueClaimedRunToQueued, which keeps worker_id = A), and A reclaims it through Service.Claim
 // as G+1. Right after G+1 minted, the stale generation-G attempt resumes through the REAL
 // codexClaimSecrets: it must refuse with errRunVanished and leave G+1's capability (hash and
 // epoch) untouched, so G+1's release barrier still sees its own mint and delivers the payload.
@@ -394,13 +418,13 @@ func TestClaimStaleGenerationMintIsFencedLiveDB(t *testing.T) {
 	fx := newCodexClaimFix(t, env, false)
 	wkr := fx.claimant(t, false)
 
-	// Generation G: B's first claim, paused before its mint (nothing assembled yet).
+	// Generation G: A's first claim, paused before its mint (nothing assembled yet).
 	runAtG, err := env.q.ClaimRun(env.ctx, claimRunParamsFor(wkr))
 	if err != nil {
 		t.Fatalf("ClaimRun (generation G): %v", err)
 	}
-	if runAtG.ID != fx.runID || uuid.UUID(runAtG.WorkerID.Bytes) != fx.workerB {
-		t.Fatalf("ClaimRun claimed run %s for worker %v, want %s for B", runAtG.ID, runAtG.WorkerID, fx.runID)
+	if runAtG.ID != fx.runID || uuid.UUID(runAtG.WorkerID.Bytes) != fx.workerA {
+		t.Fatalf("ClaimRun claimed run %s for worker %v, want %s for A", runAtG.ID, runAtG.WorkerID, fx.runID)
 	}
 	// The claim is requeued the way the sweeper does it: status back to queued, worker_id kept.
 	if n, err := env.q.RequeueClaimedRunToQueued(env.ctx, fx.runID); err != nil || n != 1 {
@@ -433,7 +457,7 @@ func TestClaimStaleGenerationMintIsFencedLiveDB(t *testing.T) {
 	}
 	fx.svc.claimHooks = hooks
 
-	// Generation G+1: B reclaims the requeued run through the real claim path.
+	// Generation G+1: A reclaims the requeued run through the real claim path.
 	payload, err := fx.svc.Claim(env.ctx, wkr, nil)
 	fx.svc.claimHooks = nil
 	if !hookRan || !replayFired {
@@ -500,7 +524,7 @@ func TestClaimAmbiguousMintNoMutationLiveDB(t *testing.T) {
 		wrapJudgeCodexClaimError(errCodexMintAmbiguous),
 	} {
 		payload, err := fx.svc.finishRunClaim(env.ctx, run, nil, cause,
-			claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+			claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 		if payload != nil || !errors.Is(err, errCodexMintAmbiguous) {
 			t.Fatalf("finishRunClaim = (%v, %v), want (nil, errCodexMintAmbiguous)", payload != nil, err)
 		}
@@ -511,7 +535,7 @@ func TestClaimAmbiguousMintNoMutationLiveDB(t *testing.T) {
 		t.Fatalf("ambiguous mint mutated the run: status=%s epoch=%d", after.Status, after.CodexClaimEpoch)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 }
 
 // claimRunParamsFor mirrors the params Service.Claim builds for w (claimRunParams plus the
@@ -554,8 +578,8 @@ func TestClaimVerifiedReloginAfterAssemblyParksLiveDB(t *testing.T) {
 				t.Fatalf("Claim: %v", err)
 			}
 			fx.assertNoClaudeFallback(t, payload)
-			fx.assertParked(t, before, fx.workerA)
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+			fx.assertParked(t, before, fx.parkedWorker())
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 		})
 	}
@@ -626,8 +650,8 @@ func TestClaimHoldClassRecoveredBeforeFinishParksLiveDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	fx.assertNoClaudeFallback(t, payload)
-	fx.assertParked(t, before, fx.workerA)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	fx.assertParked(t, before, fx.parkedWorker())
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }
 
 // TestClaimLockNotAvailableNoMutationLiveDB (j, N4): a concurrent writer holding the account row
@@ -665,7 +689,7 @@ func TestClaimLockNotAvailableNoMutationLiveDB(t *testing.T) {
 		string(r.CodexCapHash) != string(afterAssembly.CodexCapHash) || !r.UpdatedAt.Time.Equal(afterAssembly.UpdatedAt.Time) {
 		t.Fatalf("55P03 mutated the claim: status=%s epoch=%d (want %d)", r.Status, r.CodexClaimEpoch, afterAssembly.CodexClaimEpoch)
 	}
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 }
 
@@ -698,7 +722,7 @@ func TestClaimTerminalAssemblyFencedLiveDB(t *testing.T) {
 				t.Fatalf("status=%s origin=%v move_pending=%v, want failed/%s", r.Status, r.FailOrigin, r.MovePendingSince, tc.origin)
 			}
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 		})
 	}
 }
@@ -724,10 +748,10 @@ func TestClaimCapableAndIncapableClaimantsParkLiveDB(t *testing.T) {
 				t.Fatalf("Claim: %v", err)
 			}
 			fx.assertNoClaudeFallback(t, payload)
-			fx.assertParked(t, before, fx.workerA)
+			fx.assertParked(t, before, fx.parkedWorker())
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 			if capable {
-				assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+				assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 			} else if n := fx.countHolds(t, 2); n != 0 {
 				t.Fatalf("an incapable claim has %d gen-2 holds, want 0", n)
 			}
@@ -763,13 +787,13 @@ func TestFinishRunClaimHoldCountMatrixLiveDB(t *testing.T) {
 			case tc.extra < 0:
 				env.exec(`DELETE FROM recovery_custody_holds WHERE run_id = $1 AND generation = $2`, fx.runID, run.ClaimGeneration)
 			case tc.extra > 0:
-				claimRecoveryHold(t, env, fx.runID, fx.workerB, run.ClaimGeneration)
+				claimRecoveryHold(t, env, fx.runID, fx.workerA, run.ClaimGeneration)
 			}
 			fx.setAccount(t, "coord_state = 'quarantined'")
 			before := mustRun(t, env, fx.runID)
 			payload, err := fx.svc.finishRunClaim(env.ctx, run, nil,
 				fmt.Errorf("%w: %w", errCredentialUnavailable, ErrCodexAccountQuarantined),
-				claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: tc.capable})
+				claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: tc.capable})
 			if payload != nil {
 				t.Fatal("finishRunClaim delivered a payload")
 			}
@@ -777,7 +801,7 @@ func TestFinishRunClaimHoldCountMatrixLiveDB(t *testing.T) {
 				if err != nil {
 					t.Fatalf("finishRunClaim: %v", err)
 				}
-				fx.assertParked(t, before, fx.workerA)
+				fx.assertParked(t, before, fx.parkedWorker())
 				return
 			}
 			if !errors.Is(err, errClaimRecoveryCustody) {
@@ -801,7 +825,7 @@ func TestFinishRunClaimHoldCountMatrixLiveDB(t *testing.T) {
 
 // TestClaimLostBetweenClaimAndFinishIsIdleLiveDB (n): a cancel, a reclaim by another worker, or a
 // same-worker generation bump between the claim and its finish wins: the claim is idle, nothing is
-// written (even though the account is quarantined), and B's hold is left for its owner.
+// written (even though the account is quarantined), and the claimant's own hold is left for its owner.
 func TestClaimLostBetweenClaimAndFinishIsIdleLiveDB(t *testing.T) {
 	for _, tc := range []struct{ name, set string }{
 		{"cancel", "status = 'cancelled'"},
@@ -815,7 +839,8 @@ func TestClaimLostBetweenClaimAndFinishIsIdleLiveDB(t *testing.T) {
 			fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(context.Context, store.Run, *ClaimPayload, error) {
 				fx.setAccount(t, "coord_state = 'quarantined'")
 				if strings.Contains(tc.set, "$2") {
-					env.exec(`UPDATE runs SET `+tc.set+` WHERE id = $1`, fx.runID, fx.workerA)
+					// Simulated state: another worker wins the row between the claim and its finish.
+					env.exec(`UPDATE runs SET `+tc.set+` WHERE id = $1`, fx.runID, fx.workerB)
 				} else {
 					env.exec(`UPDATE runs SET `+tc.set+` WHERE id = $1`, fx.runID)
 				}
@@ -830,7 +855,7 @@ func TestClaimLostBetweenClaimAndFinishIsIdleLiveDB(t *testing.T) {
 				r.ClaimGeneration != won.ClaimGeneration || r.RecoveryWaitCause.Valid || r.FailOrigin.Valid {
 				t.Fatalf("the winning transition was overwritten: status=%s (want %s)", r.Status, won.Status)
 			}
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 		})
 	}
@@ -841,7 +866,7 @@ func TestClaimLostBetweenClaimAndFinishIsIdleLiveDB(t *testing.T) {
 // capability authorizes a release or a start-refresh against the parked run.
 func TestParkedCodexRunRefusesCredentialOpsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
-	fx := newCodexClaimFix(t, env, false) // warm: the park keeps worker_id = B, the presenter
+	fx := newCodexClaimFix(t, env, false) // warm: the park keeps worker_id = A, the presenter
 	var wire string
 	fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
 		if err != nil || p == nil || p.Secrets.Codex == nil {
@@ -855,8 +880,8 @@ func TestParkedCodexRunRefusesCredentialOpsLiveDB(t *testing.T) {
 		t.Fatalf("Claim = (%v, %v), want idle (parked)", payload != nil, err)
 	}
 	r := mustRun(t, env, fx.runID)
-	if r.Status != "recovery_wait" || r.WorkerID != pgconv.UUID(fx.workerB) {
-		t.Fatalf("status=%s worker=%v, want recovery_wait on B", r.Status, r.WorkerID)
+	if r.Status != "recovery_wait" || r.WorkerID != pgconv.UUID(fx.workerA) {
+		t.Fatalf("status=%s worker=%v, want recovery_wait on A", r.Status, r.WorkerID)
 	}
 	// Recover the account, so only the revoked capability can explain a refusal.
 	fx.setAccount(t, "coord_state = 'idle'")
@@ -942,5 +967,5 @@ func TestClaimOwnerMismatchFailsFencedLiveDB(t *testing.T) {
 		t.Fatalf("failure reason %q leaks the other user's repo or user id", reason)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }

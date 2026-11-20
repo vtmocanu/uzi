@@ -175,7 +175,6 @@ func TestControllerStatusPacingPersistenceLiveDB(t *testing.T) {
 	receipt = receipt.Add(time.Hour)
 	post("readiness", nil)
 	post("", nil)
-	post("fleet", map[string]any{"state": "completed"})
 	var state string
 	var pacingAt, ordinary time.Time
 	if err := pool.QueryRow(context.Background(), `SELECT pacing->>'state',pacing_observed_at,observed_at FROM worker_upgrade_reports WHERE worker_id=$1`, id).Scan(&state, &pacingAt, &ordinary); err != nil {
@@ -184,9 +183,12 @@ func TestControllerStatusPacingPersistenceLiveDB(t *testing.T) {
 	if state != "held" || !pacingAt.Equal(original) || !ordinary.Equal(receipt) {
 		t.Fatalf("state=%s pacingAt=%v ordinary=%v", state, pacingAt, ordinary)
 	}
-	post("fleet", nil)
+	// A fleet report whose pacing is invalid is discarded as absent, so it clears the
+	// stored pacing exactly like a fleet report without one; the row itself still lands.
+	receipt = receipt.Add(time.Hour)
+	post("fleet", map[string]any{"state": "completed"})
 	var cleared bool
-	if err := pool.QueryRow(context.Background(), `SELECT pacing IS NULL AND pacing_observed_at IS NULL FROM worker_upgrade_reports WHERE worker_id=$1`, id).Scan(&cleared); err != nil || !cleared {
-		t.Fatalf("clear=%v err=%v", cleared, err)
+	if err := pool.QueryRow(context.Background(), `SELECT pacing IS NULL AND pacing_observed_at IS NULL, observed_at FROM worker_upgrade_reports WHERE worker_id=$1`, id).Scan(&cleared, &ordinary); err != nil || !cleared || !ordinary.Equal(receipt) {
+		t.Fatalf("clear=%v ordinary=%v err=%v", cleared, ordinary, err)
 	}
 }

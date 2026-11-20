@@ -194,8 +194,11 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park. So is
 	// errRunOverrideUnavailable (PRD #3250), which parks on its own hold.
+	// PRD #4320 module 5: a provider claim refusal (revoked binding) is its own non-terminal
+	// classification, like errCredentialDisabled: it parks the run for the owner.
+	_, providerRefused := isProviderClaimRefusal(assemblyErr)
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
-		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) {
+		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !providerRefused {
 		return nil, assemblyErr
 	}
 	for attempt := 1; ; attempt++ {
@@ -401,6 +404,23 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			return nil, "", err
 		}
 	}
+	// PRD #4320 module 5 (D9): a PROVIDER-BOUND run's claim is re-checked here, under the run lock held
+	// above, against the frozen binding: the key row is locked FOR SHARE NOWAIT (55P03 rolls back for
+	// finishRunClaim's bounded retry, a missing row is stale) and the frozen URL must still be on the
+	// operator allowlist. A refusal (from assembly, or found now) delivers nothing and parks the run
+	// `paused` with hold_reason = the literal; it never falls back to a vendor credential. Revocation
+	// applies at this claim only: a claim already delivered is never re-checked.
+	providerRefusal, _ := isProviderClaimRefusal(assemblyErr)
+	if providerRefusal == nil && assemblyErr == nil && payload != nil && providerBoundRun(locked) {
+		reason, rerr := s.lockedProviderRefusal(ctx, q, locked)
+		if rerr != nil {
+			return nil, "", rerr
+		}
+		if reason != "" {
+			providerRefusal = &providerClaimRefusal{Reason: reason}
+			payload, assemblyErr = nil, providerRefusal
+		}
+	}
 	// PRD #3989 review rework: an account reset deletes the owner's secrets in the same
 	// transaction that stamps credentials_reset_at, under the run lock held here, and the FK
 	// clears runs.anthropic_secret_id. Every Anthropic lane records that id before it puts a
@@ -449,6 +469,10 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// errCheckerPinUnavailable above). A user with no marker, or a run created after it, keeps
 	// today's terminal failure.
 	parkReason := holdCredentialDisabled
+	if providerRefusal != nil {
+		// Parked through the same exact-claim park as a disabled credential, with the provider reason.
+		credDisabled, parkReason = true, providerRefusal.Reason
+	}
 	if !credDisabled && errors.Is(assemblyErr, errNoModelCredential) &&
 		run.Kind != runkind.Job && run.Kind != runkind.Judge && run.Kind != runkind.CrossCheck {
 		reset := resetSeen

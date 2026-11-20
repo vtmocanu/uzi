@@ -238,6 +238,40 @@ var knownInstructions = []knownInstruction{
 			"resolution check is the complete bar for a help reference.",
 	},
 	{
+		command:  "uzi provider create",
+		evidence: evidenceGoTest,
+		where:    "TestProviderListEmptyShowsAllowedURLs",
+		note: "RUNTIME: `uzi provider list` on an enabled server with no providers points at " +
+			"the create verb (provider.go). TestProviderListEmptyShowsAllowedURLs runs the real " +
+			"cobra command against a fake client and asserts the hint is printed.",
+	},
+	{
+		command:  "uzi provider list",
+		evidence: evidenceGoTest,
+		where:    "TestProviderNameOrIDResolution",
+		note: "RUNTIME: an unknown provider name points at the list verb (provider.go), as does " +
+			"a create without --base-url (listing the allowed URLs). TestProviderNameOrIDResolution " +
+			"and TestProviderCreateRejectsBadFlags run the real cobra command against a fake " +
+			"client and assert the messages name it.",
+	},
+	{
+		command:  "uzi provider use",
+		evidence: evidenceGoTest,
+		where:    "TestProviderUseRefusesUnusableBeforeWrite",
+		note: "RUNTIME: refusing a keyless or key-disabled provider names the fix and the retry " +
+			"command `uzi provider use <id>` (provider.go). TestProviderUseRefusesUnusableBeforeWrite " +
+			"runs the real cobra command against a fake client and asserts the retry command is " +
+			"printed with the provider's id.",
+	},
+	{
+		command:  "uzi provider test",
+		evidence: evidenceGoTest,
+		where:    "TestProviderCreateSendsMapAndHintsKey",
+		note: "RUNTIME: `uzi provider create` ends with a next-step hint naming the test verb " +
+			"(provider.go). TestProviderCreateSendsMapAndHintsKey runs the real cobra command " +
+			"against a fake client and asserts the hint is printed.",
+	},
+	{
 		command:  "uzi token pool",
 		evidence: evidenceHelpOnly,
 		// ARRIVED WITH PRD #111 M3. `uzi worker set-token --auto` names the command
@@ -317,6 +351,15 @@ var knownInstructions = []knownInstruction{
 			"TestDiskOwnerActionsSinglePOST executes the real cobra command against an HTTP " +
 			"fixture, asserting one bodyless Resume POST, queued success and refusal/error exits. " +
 			"This is CLI/HTTP evidence; the fixture is not a booted API.",
+	},
+	{
+		command:  "uzi vault unlock",
+		evidence: evidenceGoTest,
+		where:    "TestVaultUnlockPrompt",
+		note: "RUNTIME: `uzi repo env list` prints it to stderr when the list reports vault_locked " +
+			"(repo.go vaultLockedNote), on its own indented line, with the caller's --context/--url appended. " +
+			"TestVaultUnlockPrompt executes the real cobra command against a fake client, " +
+			"asserting the password prompt, one unlock call and \"Vault unlocked.\".",
 	},
 	{
 		command:  "uzi run cancel",
@@ -416,7 +459,59 @@ var knownInstructions = []knownInstruction{
 		// RESOLVES, and `uzi findings release` is a real subcommand exercised by TestFindingsRelease.
 		note: "HELP: the `uzi findings release` usage line (findings.go).",
 	},
+	{
+		command:  "uzi settings set",
+		evidence: evidenceHelpOnly,
+		note: "HELP: the usage lines of `uzi settings set`'s Long help (settings_model_write.go). " +
+			"The path resolving is the complete bar for a help reference.",
+	},
+	{
+		command:  "uzi settings reset",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi settings set`'s and `uzi settings reset`'s help name the undo verb " +
+			"(settings_model_write.go). The path resolving is the complete bar.",
+	},
+	{
+		command:  "uzi agent-template set",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi agent-template reset`'s Long help cross-links `set` (agent_template.go). " +
+			"The path resolving is the complete bar for a help reference.",
+	},
+	{
+		command:  "uzi agent-template reset",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi agent-template set`'s Long help names the undo verb (agent_template.go). " +
+			"The path resolving is the complete bar.",
+	},
+	{
+		command:  "uzi agent-template set reviewer --harness claude <model-id>",
+		evidence: evidenceHelpOnly,
+		note:     "HELP: a usage line of `uzi agent-template set`'s Long help (agent_template.go).",
+	},
+	{
+		command:  "uzi agent-template set reviewer --harness codex <model-id>",
+		evidence: evidenceHelpOnly,
+		note:     "HELP: a usage line of `uzi agent-template set`'s Long help (agent_template.go).",
+	},
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi agent-template show",
+		evidence: evidenceGoTest,
+		where:    "TestAgentTemplateServerMessagesEndToEnd",
+		note: "RUNTIME: the template_commit_unknown message (statusError in uzicli/client.go) tells " +
+			"the user to check with `uzi agent-template show`. TestAgentTemplateServerMessagesEndToEnd " +
+			"runs the real cobra command against an HTTP fixture answering the typed 500, asserts " +
+			"the message and exit 6, then executes the named show command against the same fixture.",
+	},
+	{
+		command:  "uzi settings get",
+		evidence: evidenceGoTest,
+		where:    "TestSettingsSetServerMessagesEndToEnd",
+		note: "RUNTIME: the settings_commit_unknown message (statusError in uzicli/client.go) tells " +
+			"the user to check with `uzi settings get`. TestSettingsSetServerMessagesEndToEnd " +
+			"runs the real cobra command against an HTTP fixture answering the typed 500 and " +
+			"asserts the message and exit 6.",
+	},
 	{
 		command:  "uzi findings release %s --confirm-no-issue",
 		evidence: evidenceGoTest,

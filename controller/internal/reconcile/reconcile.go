@@ -56,6 +56,8 @@ type ClaimObservation struct {
 	// RollAnnotation is the uzi.dev/image-roll annotation value on the claim.
 	RollAnnotation        string
 	RollAnnotationPresent bool
+	// PlacementNew is true when the claim carries uzi.dev/placement: new.
+	PlacementNew bool
 }
 
 // ObservedWorker is one hosted worker's state as it currently exists in the
@@ -109,6 +111,9 @@ type ObservedWorker struct {
 	DeploymentResourceVersion string
 	DeploymentUID             string
 	DeploymentTerminating     bool
+	// MaintenanceRollAnnotation is the raw reservation from the fresh Deployment
+	// list for fenced maintenance, empty when no reservation was read. Not on the wire.
+	MaintenanceRollAnnotation string
 	DinDPVCUID                string
 	DinDPVCLive               bool
 	DinDPVCPhase              string
@@ -121,9 +126,13 @@ type ObservedWorker struct {
 	DinDClaim *ClaimObservation
 	// NixClaim is the observed /nix claim (any state), read only by the hibernation
 	// arm's non-destructive expansion of an undersized retained claim.
-	NixClaim       *ClaimObservation
-	PodsKnown      bool
-	WorkerPodCount int
+	NixClaim *ClaimObservation
+	// TerminatingClaims retains namespace/name identities for the wake scale-up
+	// gate. The legacy scalar claim fields above merge same-ID objects across
+	// namespaces and cannot prove which lane's claim is being deleted.
+	TerminatingClaims map[string]bool `json:"-"`
+	PodsKnown         bool
+	WorkerPodCount    int
 	// TerminalPodCount is how many of the WorkerPodCount pods are in phase Succeeded or
 	// Failed (an evicted pod, say). A terminal phase is not proof that containers have
 	// exited: kubelet eviction publishes Failed before it kills them. Informational for
@@ -215,6 +224,10 @@ type ObservedWorker struct {
 	SchedulerCapacityReason string                  `json:"-"`
 	SchedulerMountedClaims  map[string]bool         `json:"-"` // namespace/name keys
 	SchedulerPendingClaims  []SchedulerPendingClaim `json:"-"`
+	// TimeoutDeferredClaims holds namespace/name keys of Pending claims whose bind-timeout
+	// is deferred because the worker is deliberately held at zero replicas under an open
+	// roll reservation (WaitForFirstConsumer claims cannot bind without a pod).
+	TimeoutDeferredClaims map[string]bool `json:"-"`
 }
 
 // RunnerLayout classifies where a Docker worker's pods keep the run workdir
@@ -238,6 +251,8 @@ type SchedulerPendingClaim struct {
 	Namespace string
 	Name      string
 	CreatedAt time.Time
+	// StorageClassName is the claim's spec.storageClassName ("" when unset).
+	StorageClassName string
 }
 
 // RollHealth is one worker's roll state as read from its pod, and it is the answer
@@ -398,7 +413,7 @@ func (l *Loop) Tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	observed, err := l.materializer.Observe(ctx)
+	observed, err := l.materializer.Observe(WithDesiredWorkers(ctx, resp.Workers))
 	if err != nil {
 		return err
 	}
@@ -418,6 +433,13 @@ func (l *Loop) Tick(ctx context.Context) error {
 	// must never be able to take down the thing it observes.
 	l.report(ctx, observed, resp.Workers)
 	return reconcileErr
+}
+
+// Refusal is a per-tick size refusal or PVC rejection for one worker (PRD #4213):
+// Kind is protocol.BlockingKindSizeRefused or BlockingKindPVCRejected.
+type Refusal struct {
+	Kind   string
+	Reason string
 }
 
 // report sends per-worker roll health, if a reporter is wired.
@@ -444,6 +466,29 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	}
 	workers := make([]protocol.WorkerStatus, 0, len(observed))
 	reported := make(map[string]bool, len(observed))
+	// A worker the controller refused to render (size_refused) or whose claim the
+	// apiserver rejected (pvc_rejected) reports stuck with that reason (PRD #4213). It is
+	// emitted first and marked reported so it outranks the hibernation suppression and the
+	// observed-row loop below: an edited size that cannot render must never read as
+	// settled, and a parked or ephemeral worker would otherwise strand silently. Only
+	// workers in this poll's desired snapshot get a row.
+	if source, ok := l.materializer.(interface {
+		SizeRefusals() map[string]Refusal
+	}); ok {
+		if refusals := source.SizeRefusals(); len(refusals) > 0 {
+			for _, w := range desired {
+				r, ok := refusals[w.ID]
+				if !ok || reported[w.ID] {
+					continue
+				}
+				reported[w.ID] = true
+				kind, reason := r.Kind, r.Reason
+				workers = append(workers, protocol.WorkerStatus{
+					ID: w.ID, Phase: protocol.PhaseStuck, BlockingKind: &kind, BlockingReason: &reason,
+				})
+			}
+		}
+	}
 	// A worker that is preparing to hibernate or is hibernated has no pod on purpose;
 	// a roll-health row for it (even the synthetic rolling-gap one below) would show a
 	// deliberately parked worker as an upgrade in progress. Mark it reported so neither
@@ -499,6 +544,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 		WorkerImageTag:      l.workerImageTag,
 		Workers:             workers,
 		Hibernation:         protocol.HibernationProtocolVersion,
+		AdminSizes:          protocol.AdminSizesProtocolVersion,
 	}
 	if err := l.reporter.Report(ctx, report); err != nil {
 		l.log.Warn("reporting roll health failed; reconciliation is unaffected", "error", err, "workers", len(workers))

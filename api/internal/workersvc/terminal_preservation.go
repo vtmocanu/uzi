@@ -151,6 +151,15 @@ type terminalHooks struct {
 	afterObserve  func(observedAt *time.Time) // after the forge observation, before tx-R1
 	afterDelete   func() error                // after the remote delete, before tx-R2; an error ends the item there
 	retireMaxAge  time.Duration               // replaces retireObservationMaxAge when non-zero
+	// beforeRetiringCommit runs in terminalRetireDecide after MarkTerminalPreservationRetiring and
+	// before tx-R1's COMMIT. Test-only; nil in production.
+	beforeRetiringCommit func()
+	// afterRetireGate runs in terminalLockRunForRetire right after the consumer gate was acquired.
+	// Test-only; nil in production.
+	afterRetireGate func()
+	// retireBounds replaces the server-side hold bounds of tx-R1 (tests only, to avoid multi-second
+	// sleeps); nil in production.
+	retireBounds *terminalRetireBounds
 }
 
 func (h terminalHooks) prepareFn() func(context.Context, pushbroker.TerminalPackOptions) (*pushbroker.PreparedTerminalPack, error) {
@@ -190,11 +199,13 @@ func (h terminalHooks) deleteFn() func(context.Context, pushbroker.DeleteTermina
 
 // TerminalLifetimeForges is the forge surface the lifetime classification reads through: the issue
 // side comes from IssueTrackerForRepo and the pull request side from CodeHostForRepo, exactly the
-// repo-side split *forgesvc.Service implements. workersvc cannot import forgesvc (a cycle), so the
-// service type-asserts the ForgeBuilder it was given (SetForges) to this interface.
+// repo-side split *forgesvc.Service implements. Both resolve the repo through the owner-scoped
+// lookup (PRD #4173 D5), so a linked repo's issue side is its issue tracker. workersvc cannot
+// import forgesvc (a cycle), so the service type-asserts the ForgeBuilder it was given (SetForges)
+// to this interface.
 type TerminalLifetimeForges interface {
-	IssueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error)
-	CodeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error)
+	IssueTrackerForRepo(ctx context.Context, userID, repoID uuid.UUID) (forge.IssueTracker, error)
+	CodeHostForRepo(ctx context.Context, userID, repoID uuid.UUID) (forge.CodeHost, error)
 }
 
 // TerminalLifetime is a run's lifetime classification (issue #4007): which forge object bounds how
@@ -264,7 +275,7 @@ func (s *Service) terminalLifetime(ctx context.Context, run store.Run) TerminalL
 	}
 	switch l.Class {
 	case terminalLifetimeIssue:
-		tracker, err := fg.IssueTrackerForRepo(lctx, repoID, binding.ForgeType, binding.BaseUrl, binding.TokenCiphertext)
+		tracker, err := fg.IssueTrackerForRepo(lctx, run.UserID, repoID)
 		if err != nil || tracker == nil {
 			return l
 		}
@@ -273,7 +284,7 @@ func (s *Service) terminalLifetime(ctx context.Context, run store.Run) TerminalL
 			l.ClosedProven, l.Disposition = true, TerminalDispositionClosedIssue
 		}
 	case terminalLifetimePR:
-		host, err := fg.CodeHostForRepo(lctx, repoID, binding.ForgeType, binding.BaseUrl, binding.TokenCiphertext)
+		host, err := fg.CodeHostForRepo(lctx, run.UserID, repoID)
 		if err != nil || host == nil {
 			return l
 		}

@@ -142,6 +142,55 @@ export interface SecretDependents {
   enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
 }
 
+// ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+
+export interface ProviderModelEntry {
+  model: string;
+  context_window?: number;
+}
+
+// haiku is required by the server; the other roles are optional.
+export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
+  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
+>;
+
+export type ProviderAuthStyle = "bearer" | "x_api_key";
+
+export interface ProviderProbe {
+  auth_result: "ok" | "rejected" | "inconclusive";
+  tool_result?: "passed" | "not_supported" | "inconclusive" | "not_run";
+  probed_at: string;
+}
+
+export interface ProviderDTO {
+  id: string;
+  name: string;
+  engine: "claude";
+  retired: boolean;
+  current_revision: number;
+  protocol: "anthropic_messages";
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+  has_key: boolean;
+  key_enabled: boolean;
+  probe: ProviderProbe | null;
+}
+
+export interface ProvidersList {
+  enabled: boolean;
+  allowed_base_urls: string[];
+  providers: ProviderDTO[];
+}
+
+export interface CreateProviderInput {
+  name: string;
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+}
+
 // TestSecretResult is the flat, sanitized response from the explicit credential Test action.
 export interface TestSecretResult {
   status: "ok" | "rejected" | "permission_denied" | "inconclusive";
@@ -258,7 +307,9 @@ type EffectiveCredentialSource =
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
   | "credential_override_harness_unsupported" | "credential_override_invalid"
-  | "model_incompatible_with_harness";
+  | "model_incompatible_with_harness" | "provider_source_unusable"
+  | "provider_lane_unsupported" | "provider_model_unmapped" | "provider_binding_stale"
+  | "provider_destination_not_allowed" | "credential_override_provider_source";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -384,7 +435,10 @@ export interface StartPreview {
 
 /** PRD #3254 M3: the schedule preview's refusals, the start-preview set plus the save-step
  *  (invalid_model, credential_override_lane_not_switchable) and fire-step (codex_override_conflict,
- *  codex_pool_unavailable) ones, mirroring handler/effective_settings_schedule.go and the
+ *  codex_pool_unavailable) ones; the PRD #4320 provider refusals (provider_source_unusable,
+ *  provider_lane_unsupported, provider_model_unmapped, provider_binding_stale,
+ *  provider_destination_not_allowed, credential_override_provider_source) are in EffectiveRefusal
+ *  and so in this union too. It mirrors handler/effective_settings_schedule.go and the
  *  scheduler's skip reasons it maps. */
 type ScheduleRefusal =
   | EffectiveRefusal | "invalid_model" | "credential_override_lane_not_switchable"
@@ -507,6 +561,13 @@ export interface UserSettings {
   light_theme: string | null;
   dark_theme: string | null;
   typeface: string | null;
+  /** Raw per-user opt-in for animated sidebar icons; null = inherit the instance
+   *  default (off). Optional for older servers: absent reads as off, never as a
+   *  stored false. */
+  sidebar_motion?: boolean | null;
+  /** Resolved sidebar-icon animation flag (override else the server default).
+   *  Read-only; never sent on a PUT. Optional for older servers. */
+  effective_sidebar_motion?: boolean;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
    *  Absent (older server) reads as []: default-only, the pre-feature look. */
@@ -541,6 +602,10 @@ export interface UserSettings {
   /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
    *  claude|codex when set. Always present on the wire, like default_harness. */
   judge_runs_on: Harness | null;
+  /** Provider the Claude lane runs on (PRD #4320); null = the vendor Claude ladder. Always on the
+   *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
+   *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
+  claude_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -580,6 +645,9 @@ export interface UserSettingsPatch {
   light_theme?: string | null;
   dark_theme?: string | null;
   typeface?: string | null;
+  /** Sidebar icon animations: absent keeps, true/false sets, null clears back to
+   *  inherit. */
+  sidebar_motion?: boolean | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
   /** Replaces the whole sidebar Codex-account set (null clears it); absent leaves it.
@@ -866,6 +934,8 @@ export interface Repo {
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
+  /** Live environment variables (enabled and disabled; not those pending deletion). */
+  env_var_count: number;
   id: string;
   connection_id: string;
   forge_project_id: number;
@@ -1140,6 +1210,49 @@ export interface ToolAllowlistEntry {
   updated_at: string;
 }
 
+// Per-repo run environment variables (PRD #4416 M1). A secret's value is never
+// returned: `value` is null for it. A plain value is null only while the vault is
+// locked (`value_withheld`).
+export type RunEnvState = "enabled" | "disabled" | "pending_deletion";
+
+export interface RunEnvVar {
+  var_id: string;
+  name: string;
+  secret: boolean;
+  description: string;
+  value: string | null;
+  value_withheld: boolean;
+  state: RunEnvState;
+  rev: number;
+  disabled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RunEnvCounts {
+  total: number;
+  disabled: number;
+  pending_deletion: number;
+  limit: number;
+}
+
+export interface RunEnvList {
+  variables: RunEnvVar[];
+  counts: RunEnvCounts;
+  vault_locked: boolean;
+}
+
+/** Write body: every field optional; an omitted value keeps the stored one. */
+export interface RunEnvWriteInput {
+  value?: string;
+  secret?: boolean;
+  description?: string;
+}
+
+export interface RunEnvDeleteResult {
+  state: "deleted" | "pending_deletion";
+}
+
 export interface ToolAllowlistWriteInput {
   name?: string; // create only; ignored on update
   pinned_version?: string;
@@ -1218,6 +1331,8 @@ export interface LatestRun {
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
   // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused",
   // 'credentials_reset' (PRD #3989) likewise reads "waiting: credentials were reset", and
+  // 'provider_destination_not_allowed' / 'provider_binding_stale' (PRD #4320) read "provider URL not allowed: waiting" /
+  // "provider binding changed: start a new run", and
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
@@ -1240,6 +1355,10 @@ export interface Card {
   title: string;
   state: string;
   labels: string[];
+  // The issue tracker's readable id (e.g. "ABC-12", PRD 4173 M4), set only for a repo linked
+  // to an issue tracker. Shown in place of `#iid`, and a keyed card is eligible by its
+  // issue tracker tag, so the board treats it as uzi's without the `uzi` label.
+  issue_key?: string;
   // Forge user ids assigned to the issue (PRD #767 M5). The board widens "is this card
   // uzi's to run" to "carries the `uzi` label OR the board's bot is one of these ids",
   // so this rides the card alongside labels. A current server always sends [] not null,
@@ -1434,11 +1553,17 @@ export interface AppSettings {
   // duration (default "336h", valid 1h..2160h). Optional for older responses.
   worker_hibernation_auto?: string;
   worker_hibernation_idle_after?: string;
+  // Warm reserve (PRD #4395): "true"/"false", default "false", effective only while
+  // enabled and auto are both "true". surplus_idle_after is a Go duration (default
+  // "2h", valid 15m..336h); the server uses min(surplus_idle_after, idle_after).
+  worker_hibernation_surplus?: string;
+  worker_hibernation_surplus_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Ephemeral worker admin settings (PRD #4212). Optional for older responses.
   // ephemeral_max_per_user: integer 0..20, default "2"; ephemeral_default_size and
-  // hosted_default_size: a worker size name (s, m, l, l-highmem), defaults "m" and "l";
+  // hosted_default_size: a worker size name, defaults "m" and "l" (writes accept any size
+  // that exists, builtin or admin-added; "<key>: unknown worker size" otherwise, PRD #4213);
   // ephemeral_lease: Go duration 0..2h, default "2h".
   ephemeral_max_per_user?: string;
   ephemeral_default_size?: string;
@@ -1740,17 +1865,22 @@ export interface AppearanceState {
   light_theme: string;
   dark_theme: string;
   typeface: string;
+  /** Resolved sidebar-icon animation flag. Optional for older servers: only a
+   *  strict `true` reads as on. */
+  sidebar_motion?: boolean;
   overrides: {
     mode: string | null;
     light_theme: string | null;
     dark_theme: string | null;
     typeface: string | null;
+    sidebar_motion?: boolean | null;
   };
   defaults: {
     mode: string;
     light_theme: string;
     dark_theme: string;
     typeface: string;
+    sidebar_motion?: boolean;
   };
 }
 
@@ -2476,6 +2606,7 @@ export type ScheduleSkipReason =
   | "already_running"
   | "description_too_large"
   | "fetch_failed"
+  | "consumer_gate_busy"
   | "vault_locked"
   | "self_improve_mr_cap_reached"
   | "open_mr_exists"
@@ -2486,6 +2617,12 @@ export type ScheduleSkipReason =
   | "no_usable_credential"
   | "credential_disabled"
   | "codex_pool_unavailable"
+  | "provider_source_unusable"
+  | "provider_lane_unsupported"
+  | "provider_model_unmapped"
+  | "provider_binding_stale"
+  | "provider_destination_not_allowed"
+  | "credential_override_provider_source"
   | "ci_green"
   | "ci_already_handled"
   | "ci_halted_no_progress"
@@ -2951,11 +3088,15 @@ export interface Worker {
   status: string; // "offline" | "online"
   // Hosted workers (PRD #58). kind is never null — the column is NOT NULL DEFAULT
   // 'external' — so every worker carries one and a pre-#58 row reports "external".
-  // hosted_size is the preset name ("s"|"m"|"l"|"l-highmem", lowercase on the wire) and is null
-  // for an external worker. hosted_generation is deliberately not here: it is
-  // controller-internal and the DTO does not carry it.
+  // hosted_size is the size name (lowercase on the wire; the builtins are s, m, l and
+  // l-highmem, and admins edit what each buys, PRD #4213) and is null for an external worker.
+  // hosted_generation is deliberately not here: it is controller-internal and the DTO does
+  // not carry it.
   kind: "external" | "hosted";
   hosted_size: string | null;
+  // hosted_size's resolved integers (PRD #4213), so an admin-edited size shows its real
+  // quantities. Omitted for an external worker and when no size row of that name exists.
+  hosted_size_spec?: WorkerSizeSpec;
   // Whether this hosted worker carries the rootless-DinD sidecar (PRD #83 M3).
   // Absent/undefined or null for an external worker (docker is not applicable),
   // false for a hosted worker without the sidecar, true for a docker-capable one.
@@ -3219,6 +3360,119 @@ export interface HostedConfig {
   // Admin-chosen size the provision form preselects (PRD #4212). Optional: an older API
   // omits it, and an unknown name is ignored by the form.
   default_size?: string;
+  // Every size a worker can be provisioned at, in display order, with its resolved
+  // integers (PRD #4213). Optional: an older API omits it, and the form then falls back to
+  // the builtin sizes.
+  sizes?: HostedConfigSize[];
+}
+
+/**
+ * A hosted worker size's six resolved integers (PRD #4213): CPU in millicores, memory in
+ * MiB, disks in GiB. Every size display reads these; no client parses a quantity string.
+ */
+export interface WorkerSizeSpec {
+  cpu_request_millicores: number;
+  cpu_limit_millicores: number;
+  memory_request_mib: number;
+  memory_limit_mib: number;
+  data_gib: number;
+  dind_data_gib: number;
+}
+
+/** One entry of HostedConfig.sizes: a size name plus its integers. */
+export interface HostedConfigSize extends WorkerSizeSpec {
+  name: string;
+}
+
+/** One row of GET /admin/worker-sizes. shipped is the builtin default, null for an admin-added size. */
+export interface AdminWorkerSize extends WorkerSizeSpec {
+  name: string;
+  display_order: number;
+  builtin: boolean;
+  customized: boolean;
+  shipped: WorkerSizeSpec | null;
+  updated_at: string;
+}
+
+/** A binding ceiling: the smallest applicable integer and the chart value that moves it. */
+export interface WorkerSizeCeiling {
+  value: number;
+  chart_path: string;
+}
+
+/** The ceilings sizes are validated against. A null entry means no chart ceiling applies. */
+export interface WorkerSizeCeilings {
+  cpu_limit_millicores: WorkerSizeCeiling | null;
+  memory_limit_mib: WorkerSizeCeiling | null;
+  data_gib: WorkerSizeCeiling | null;
+  dind_data_gib: WorkerSizeCeiling | null;
+  // workers.docker.dindDataSize overrides the per-size DinD claim, so dind_data_gib has no ceiling.
+  dind_overridden: boolean;
+  // Tiers the ceilings were minimized over; null when the api does not know.
+  enabled_tiers: string[] | null;
+}
+
+/** A non-blocking note on a size write. */
+export interface WorkerSizeWarning {
+  kind: string; // "disk_lowered"
+  field: string;
+  message: string;
+}
+
+/**
+ * A quota advisory for one size and tier. quota_unavailable means the api cannot compare,
+ * never that the size fits. tier is "" when the enabled tiers are unknown.
+ */
+export interface WorkerSizeAdvisory {
+  size: string;
+  tier: string;
+  kind: "quota_unavailable" | "quota_zero" | "quota_exceeded";
+  field: string;
+  message: string;
+}
+
+/**
+ * A worker the cluster would not run at its size (PRD #4213): the controller refused the
+ * size (size_refused, e.g. above a controller ceiling) or the cluster rejected one of its
+ * volume claims (pvc_rejected). reason is the controller's own text.
+ */
+export interface WorkerSizeRefusal {
+  size: string;
+  worker_id: string;
+  worker_name: string;
+  kind: "size_refused" | "pvc_rejected";
+  reason: string;
+  reported_at: string;
+}
+
+/** GET /admin/worker-sizes. */
+export interface AdminWorkerSizes {
+  sizes: AdminWorkerSize[];
+  ceilings: WorkerSizeCeilings;
+  editable: boolean;
+  read_only_reason: string | null;
+  read_only_code: string | null;
+  advisories: WorkerSizeAdvisory[];
+  max_sizes: number;
+  /** Always an array on a current api; absent from an older one, which reads as none. */
+  refusals?: WorkerSizeRefusal[];
+}
+
+/** PUT /admin/worker-sizes/{name} and POST /admin/worker-sizes/{name}/reset. */
+export interface AdminWorkerSizeWrite {
+  size: AdminWorkerSize;
+  warnings: WorkerSizeWarning[];
+  advisories: WorkerSizeAdvisory[];
+}
+
+/**
+ * The 409 body of DELETE /admin/worker-sizes/{name}: a builtin size (reset it instead), or a
+ * size still in use by hosted workers and/or named by a stored default-size setting key.
+ */
+export interface WorkerSizeDeleteRefusal {
+  error: string;
+  reason: "builtin" | "in_use";
+  used_by?: { workers: number; settings: string[] };
 }
 
 export type RunStatus =
@@ -3674,6 +3928,12 @@ export interface Run {
       truncated: boolean;
     }[];
   };
+  /** PRD #4320: the custom model provider this run was bound to; null for a vendor (Anthropic)
+   *  run. Owner-scoped DTOs only; optional so a build talking to an older server reads absent as null. */
+  provider_id?: string | null;
+  /** The provider's name for display. null for a vendor run OR when the provider has since been
+   *  deleted (provider_id is then still set). UNTRUSTED user text: render as escaped plain text. */
+  provider_name?: string | null;
   /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
   repo_path?: string;
   /** Frozen repo inference policy; explicit requirements take precedence. */

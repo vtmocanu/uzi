@@ -24,7 +24,7 @@ setup() {
   cp "$ROOT/scripts/npm-audit-exceptions.mjs" "$CASE_DIR/scripts/"
   cp "$ROOT/scripts/fixtures/npm-audit/web.json" "$CASE_DIR/audit.json"
   cp "$ROOT/scripts/fixtures/npm-audit/web-lock.json" "$CASE_DIR/web/package-lock.json"
-  printf '%s\n' '{"scripts":{"audit":"npm audit --audit-level=high --include=dev"}}' >"$CASE_DIR/web/package.json"
+  cp "$ROOT/scripts/fixtures/npm-audit/web-package.json" "$CASE_DIR/web/package.json"
   printf 'component\tghsa\tpackage\trange\tmax_severity\trecheck_by\tissue\nweb\tGHSA-fc5q-39xc-vjpf\tpicomatch\t<=4.0.7\thigh\t%s\t#4435\n' "$today" >"$CASE_DIR/scripts/npm-audit-exceptions.tsv"
   : >"$CASE_DIR/calls"
   cat >"$CASE_DIR/bin/npm" <<'STUB'
@@ -108,6 +108,16 @@ setup prod findings
 node -e 'const fs=require("node:fs"),r=JSON.parse(fs.readFileSync(process.argv[1]));r.packages["node_modules/picomatch"].dev=false;process.stdout.write(JSON.stringify(r))' "$ROOT/scripts/fixtures/npm-audit/web-lock.json" >"$CASE_DIR/web/package-lock.json"
 check 1
 has 'production occurrence'
+setup manifest-lock-mismatch findings
+node -e 'const fs=require("node:fs"),r=JSON.parse(fs.readFileSync(process.argv[1]));r.dependencies.knip=r.devDependencies.knip;delete r.devDependencies.knip;process.stdout.write(JSON.stringify(r))' "$CASE_DIR/web/package.json" >"$CASE_DIR/changed-package.json"
+mv "$CASE_DIR/changed-package.json" "$CASE_DIR/web/package.json"
+check 2
+has 'manifest and lockfile disagree; regenerate the lockfile'
+setup missing-lock-root findings
+node -e 'const fs=require("node:fs"),r=JSON.parse(fs.readFileSync(process.argv[1]));delete r.packages[""];process.stdout.write(JSON.stringify(r))' "$CASE_DIR/web/package-lock.json" >"$CASE_DIR/changed-lock.json"
+mv "$CASE_DIR/changed-lock.json" "$CASE_DIR/web/package-lock.json"
+check 2
+has 'manifest and lockfile disagree; regenerate the lockfile'
 for scenario_name in network no-report text-bad-status bad-json json-status json-network; do
   setup "$scenario_name" "$scenario_name"
   check 2

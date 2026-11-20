@@ -124,7 +124,7 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   // devbox.json/lock from the failed attempt lingers.
   const install = async (packages: string[]): Promise<ProvisionRunResult> => {
     ctx.emit({ kind: "status", agent: "worker", payload: { text: `provisioning ${packages.length} tool(s): ${packages.join(", ")}` } });
-    const res = await provision({ packages, runDir: provisionDir, homeDir: deps.homeDir }, { log: deps.log });
+    const res = await provision({ packages, runDir: provisionDir, homeDir: deps.homeDir, ...(ctx.runTmpdir ? { runTmpdir: ctx.runTmpdir } : {}) }, { log: deps.log });
     ctx.emit({ kind: "status", agent: "worker", payload: { text: "tools provisioned" } });
     return { toolEnv: res.toolEnv, provisionDir };
   };

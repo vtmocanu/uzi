@@ -107,11 +107,14 @@ func TestListIssuesClientSideFilters(t *testing.T) {
 		}
 		return out
 	}
-	if got := iids(forge.ListIssuesOptions{Labels: []string{"bug"}}); !slices.Equal(got, []int64{1, 5, 6}) {
-		t.Errorf("label filter = %v, want [1 5 6]", got)
+	// Changed on purpose: a listing with labels is sorted by update instant
+	// ascending on the client (issue 6 is the oldest), where it used to keep the
+	// server's order.
+	if got := iids(forge.ListIssuesOptions{Labels: []string{"bug"}}); !slices.Equal(got, []int64{6, 1, 5}) {
+		t.Errorf("label filter = %v, want [6 1 5]", got)
 	}
-	if got := iids(forge.ListIssuesOptions{Labels: []string{"bug"}, State: forge.StateOpened}); !slices.Equal(got, []int64{1, 6}) {
-		t.Errorf("opened filter = %v, want [1 6]", got)
+	if got := iids(forge.ListIssuesOptions{Labels: []string{"bug"}, State: forge.StateOpened}); !slices.Equal(got, []int64{6, 1}) {
+		t.Errorf("opened filter = %v, want [6 1]", got)
 	}
 	if got := iids(forge.ListIssuesOptions{Labels: []string{"bug"}, State: forge.StateClosed}); !slices.Equal(got, []int64{5}) {
 		t.Errorf("closed filter = %v, want [5]", got)

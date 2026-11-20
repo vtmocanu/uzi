@@ -67,6 +67,11 @@ type UserSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
+	// SidebarMotion and EffectiveSidebarMotion mirror the animated-sidebar-icons opt-in
+	// (issue #4510): the raw choice (null = not chosen) and the resolved flag. Fidelity
+	// only; there is no CLI setter.
+	SidebarMotion          *bool `json:"sidebar_motion"`
+	EffectiveSidebarMotion bool  `json:"effective_sidebar_motion"`
 	// DefaultHarness is the CLI decode mirror of the per-user default harness (PRD #1429
 	// M1 / D3); null = "Default · automatic" (#3845: chosen per run by weekly limits when both
 	// harnesses are usable). `uzi settings get` displays it; there is deliberately no CLI
@@ -76,6 +81,9 @@ type UserSettingsDTO struct {
 	// #3257); null = same as the run. `uzi settings get` displays it; writes are
 	// cookie-only until #3264.
 	JudgeRunsOn *string `json:"judge_runs_on"`
+	// ClaudeProviderID is the CLI decode mirror of the provider the owner's Claude lane runs on
+	// (PRD #4320); null = the vendor Claude ladder. Read-only: set via the provider source route.
+	ClaudeProviderID *string `json:"claude_provider_id"`
 	// DefaultClaudeModel and DefaultCodexModel are the CLI decode mirrors of the retained
 	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
 	DefaultClaudeModel *string `json:"default_claude_model"`

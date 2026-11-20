@@ -231,6 +231,11 @@ const (
 	// NON-BYPASSABLE block: ClaimRun's standalone guard clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
+	// reasonNoIssueKeyCapableWorker (PRD #4173) is emitted for a queued run on a LINKED repo
+	// whose owner has no online worker self-reporting 'issue_key_v1': ClaimRun's standalone
+	// issue_key clause can never be satisfied until a worker that renders references by
+	// issue_key (and never closes #<iid>) comes online.
+	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	reasonNoAgentSourceRequestCapableWorker = "no regular online worker accepting new intake honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
@@ -247,8 +252,17 @@ const (
 	// D3-fixed user-visible text. In M5A only internal test-only Codex rows exist, so this rung is
 	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
-	reasonNoCodexCapableWorker  = "no Codex-capable worker is online"
-	reasonNoCurrentCodexRuntime = "no worker with the current Codex runtime is online; waiting for the worker roll"
+	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
+	// reasonNoProviderCapableWorker (PRD #4320 module 5) is emitted for a PROVIDER-BOUND queued run
+	// (runs.model_provider_key_mode set) whose owner has NO online worker advertising the
+	// 'claude_provider_v1' protocol capability. Like reasonNoCodexCapableWorker it names a
+	// NON-BYPASSABLE block: ClaimRun's dedicated provider clause sits outside fn_worker_can_claim,
+	// required_capabilities and the capability-aware kill-switch, so the run waits until a worker that
+	// supports provider claims comes online (the hosted fleet is pinned separately from the app tier,
+	// so provider runs need the next worker roll). Maps to the SAME healthWaitingWorker enum
+	// (runs.health_reason is free text).
+	reasonNoProviderCapableWorker = "no worker that supports model providers is online; waiting for a worker roll"
+	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -312,8 +326,8 @@ const (
 	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it. The
 	// variant is chosen by the run OWNER's is_admin (repoNotDockerAllowedReason), so an admin
 	// viewing someone else's run sees the owner's variant, not their own.
-	reasonRepoNotDockerAllowedAdmin  = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist"
-	reasonRepoNotDockerAllowedMember = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist"
+	reasonRepoNotDockerAllowedAdmin  = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Workers → Docker worker repo allowlist"
+	reasonRepoNotDockerAllowedMember = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Workers → Docker worker repo allowlist"
 	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
 	// the custody-hold admission limit — they hold >= the custody_hold_limit setting's
 	// admission-counted open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
@@ -331,7 +345,13 @@ const (
 	// (claimLane fails closed on an unreadable limit), so no custody-gated run is admitted and
 	// the honest cause is the instance-wide setting, not the owner's holds or the fleet. Same
 	// healthWaitingWorker enum; no nudge (see detectRunHealth).
-	reasonCustodyLimitUnavailable = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"
+	reasonCustodyLimitUnavailable = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings"
+	// reasonCustodyLimitUnavailableLegacy is a compatibility READER only, never emitted: the
+	// pre-#4423 wording of reasonCustodyLimitUnavailable, from before the custody hold limit
+	// moved to Admin → Workers (#4212). A run row persisted by an older server keeps this text
+	// until the next health tick rewrites it, and QueuedReasonPrecedesCodexAdmission must give
+	// it the same precedence as the current text. Stored values are not rewritten.
+	reasonCustodyLimitUnavailableLegacy = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"
 	// reasonCodexAccountUnavailable (PRD #1590 M2, D2) is emitted for a queued Codex subscription
 	// run that ClaimRun's account gate excludes: its linked account is quarantined, or a re-login
 	// on its alias is in flight or has just linked the same identity with newer material. No
@@ -525,7 +545,19 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	var changed int64
 	for _, r := range runs {
 		target, reason := s.healthTargetFor(ctx, now, r, th)
-		if r.Health == target && textEq(r.HealthReason, reason) &&
+		// Issue #4476: a provenance hold that began inside a quiet window (see quietCodexHold below)
+		// keeps the same reason text after the window ends, so the unchanged-reason skip would never
+		// nudge it. Once the window has passed and this episode was never nudged, re-evaluate it.
+		// Only the named reason can start quiet (the unavailable one nudges on entry), only an
+		// episode a window could have covered by time qualifies (quietWindowCoveredEpisode), the
+		// window must have ended (quietWindowEnded), and the cooldown gates it here too, so a
+		// cooled-down run is not rewritten every tick.
+		quietHoldEnded := r.Health == target && textEq(r.HealthReason, reason) &&
+			isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText &&
+			!s.quietCodexHold(now, r, reason) && s.quietWindowCoveredEpisode(r) && s.quietWindowEnded(now, r) &&
+			r.HealthSince.Valid && (!r.HealthNotifiedAt.Valid || r.HealthNotifiedAt.Time.Before(r.HealthSince.Time)) &&
+			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
+		if r.Health == target && textEq(r.HealthReason, reason) && !quietHoldEnded &&
 			(target != healthPublicationWithheld || r.HealthSince.Valid && r.PublicationWithheldSince.Valid && r.HealthSince.Time.Equal(r.PublicationWithheldSince.Time)) {
 			continue // nothing changed — skip the write (and, later, its broadcast)
 		}
@@ -569,7 +601,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Issue #4257: publication_withheld never nudges itself, so a run leaving it into a real fault
 		// (stalled, looping, ...) is a new episode no earlier DM described: nudge-eligible, cooldown applies.
 		leftWithheld := r.Health == healthPublicationWithheld && target != healthPublicationWithheld && target != healthOK
-		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || (leftAccountCooldown && independentFault)) &&
+		// Issue #4476: the unavailable-provenance hold never resolves on its own, so entering it from
+		// any other state nudges (cooldown applies), like entry into the per-run custody bound. The
+		// only state-keyed suppression it must beat is leftAdmission below; every other suppression
+		// is keyed on a reason or target the unavailable text never matches.
+		enteredProvenanceUnavailable := reason == codexProvenanceUnavailableText && !textEq(r.HealthReason, reason)
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || enteredProvenanceUnavailable || quietHoldEnded || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -607,7 +644,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Leaving a Codex admission wait is also quiet (the run restarts its clock), EXCEPT when it
 		// enters the per-run custody bound (#4162): that is the run's own condition, so it nudges
 		// like any other entry into the bound, e.g. after an admin lowers custody_hold_limit.
-		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || (leftAdmission && !enteredRunBound) || target == healthWaitingAccountCooldown {
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || (leftAdmission && !enteredRunBound && !enteredProvenanceUnavailable) || target == healthWaitingAccountCooldown {
 			nudge = false
 		}
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
@@ -623,6 +660,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
 		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
+			nudge = false
+		}
+		// Issue #4476: a held Codex run naming its recorded worker is quiet while the
+		// stale-requeue or draining/maintenance window would also hold the run (a routine
+		// roll); after the windows it nudges like any stuck run. The unavailable-provenance
+		// reason never resolves on its own, so it is never suppressed.
+		if s.quietCodexHold(now, r, reason) {
 			nudge = false
 		}
 		// A live plan or code cross-check is expected waiting. A worker-pickup nudge would
@@ -1337,7 +1381,7 @@ type healthEligibilityResult struct {
 func QueuedReasonPrecedesCodexAdmission(reason string) bool {
 	switch reason {
 	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit, apitypes.ReasonCustodyRunHoldBound,
-		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
+		reasonCustodyLimitUnavailable, reasonCustodyLimitUnavailableLegacy, reasonCodexAccountUnavailable:
 		return true
 	default:
 		return false
@@ -1425,6 +1469,12 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// of them excludes lane workers. Placed after the owner-account blocks, which still gate it.
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
+	}
+	// Issue #4476: a Codex run held by claim provenance outranks the manual-cordon, owner-hold and
+	// stale-requeue-pin texts below, which all promise "another worker may take it after that"
+	// (false here). Account prerequisites already ran before this point and still outrank it.
+	if r.CodexProvenanceHeld {
+		return codexProvenanceHoldReason(r.CodexProvenanceWorkerName, r.CodexProvenanceRestartRequired)
 	}
 	// Availability and manual diagnostics share one projection. Manual intent must
 	// remain visible alongside an automatic owner hold, but a claimable continuation
@@ -1551,6 +1601,20 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			return reasonNoCIConfigGuardCapableWorker
 		}
 	}
+	// PRD #4173: a run on a LINKED repo with no online issue_key_v1 worker is unplaceable; a
+	// failed read falls through like the rungs above.
+	if r.RepoLinked && r.RepoID.Valid {
+		if q, ok := s.q.(interface {
+			IssueKeyWorkerMissingForRepo(context.Context, store.IssueKeyWorkerMissingForRepoParams) (bool, error)
+		}); ok {
+			missing, merr := q.IssueKeyWorkerMissingForRepo(ctx, store.IssueKeyWorkerMissingForRepoParams{RepoID: uuid.UUID(r.RepoID.Bytes), UserID: r.UserID})
+			if merr != nil {
+				slog.Error("health: check issue_key_v1 workers for linked repo", "run_id", r.ID, "error", merr)
+			} else if missing {
+				return reasonNoIssueKeyCapableWorker
+			}
+		}
+	}
 	sourceCapablePeerConfirmed := false
 	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
 		if q, ok := s.q.(interface {
@@ -1626,6 +1690,19 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			slog.Error("health: count current Codex runtime workers", "run_id", r.ID, "error", currentErr)
 		} else if current == 0 {
 			return reasonNoCurrentCodexRuntime
+		}
+	}
+	// PRD #4320 module 5: a PROVIDER-BOUND run whose owner has NO online worker advertising
+	// claude_provider_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable provider clause can never be
+	// satisfied). Placed right after the Codex rungs for the same reason they sit ahead of the
+	// priority-class re-label. r.ModelProviderKeyMode is the claim clause's own discriminator, so the
+	// pill and the claim can never disagree. Read errors fall through.
+	if r.ModelProviderKeyMode.Valid {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoProviderCapableWorker
 		}
 	}
 	// PRD #1551 M4 (D6): a CUSTOM-Codex-root run whose owner has NO online worker advertising BOTH
@@ -1901,6 +1978,11 @@ func (s *Service) youngQueuedTarget(ctx context.Context, now time.Time, r store.
 	// Profile-specific placement reasons are not early health flags.
 	if r.EgressProfileID.Valid {
 		return healthOK, ""
+	}
+	// Issue #4476: a provenance-held Codex run is never claimable by another worker, so it carries
+	// the held reason from the first tick instead of waiting out the young-run grace.
+	if r.CodexProvenanceHeld {
+		return healthWaitingWorker, codexProvenanceHoldReason(r.CodexProvenanceWorkerName, r.CodexProvenanceRestartRequired)
 	}
 	_, stalePinned := s.staleRequeuePin(now, r)
 	_, ownerHeld := s.ownerHold(now, r)
@@ -2293,6 +2375,91 @@ func isStaleRequeuePinReason(reason string) bool {
 			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that") ||
 			strings.HasSuffix(reason, " to return"+heldRepoAgentSourceGapSuffix) ||
 			strings.HasSuffix(reason, " to finish draining or maintenance"+heldRepoAgentSourceGapSuffix))
+}
+
+const (
+	codexProvenanceHoldPrefix      = "held for worker "
+	codexProvenanceHoldSuffix      = ": wait for it or cancel the run; only the worker that last ran this Codex run may resume it"
+	codexProvenanceRestartSuffix   = ": restart it or cancel the run; its previous process was released; only the worker that last ran this Codex run may resume it"
+	codexProvenanceUnavailableText = "held: predecessor provenance unavailable; cancel the run; no worker may resume this Codex run"
+)
+
+// codexProvenanceHoldReason renders the waiting reason for a Codex run ClaimRun refuses to offer
+// to any other worker (issue #4476). name is the recorded provenance worker, never runs.worker_id;
+// "" means the provenance is missing or stale, so no worker may resume the run. The text is a pure
+// function of the recorded name and restart fence, so unchanged state has stable text.
+func codexProvenanceHoldReason(name string, restart bool) string {
+	if name == "" {
+		return codexProvenanceUnavailableText
+	}
+	if restart {
+		return codexProvenanceHoldPrefix + name + codexProvenanceRestartSuffix
+	}
+	return codexProvenanceHoldPrefix + name + codexProvenanceHoldSuffix
+}
+
+// quietCodexHold reports a provenance hold naming its recorded worker while the stale-requeue or
+// draining/maintenance window would also hold the run (a routine roll or a short stale return):
+// expected waiting, so not nudged. The unavailable-provenance reason never resolves on its own and
+// is never quiet. When the window ends, detectRunHealth nudges the episode once (quietHoldEnded).
+func (s *Service) quietCodexHold(now time.Time, r store.ListActiveRunsForHealthRow, reason string) bool {
+	if !isCodexProvenanceHoldReason(reason) || reason == codexProvenanceUnavailableText {
+		return false
+	}
+	_, pinned := s.staleRequeuePin(now, r)
+	_, ownerHeld := s.ownerHold(now, r)
+	return pinned || ownerHeld
+}
+
+// quietWindowCoveredEpisode reports whether a window could have covered this episode by time: the
+// owner-hold end (updated_at + WorkerAffinityCeiling, see ownerHold) or the stale-requeue pin end
+// (min of status_since + WorkerStaleRequeueGrace and that ceiling, see staleRequeuePin) is after
+// health_since. The pinnable flags are deliberately ignored: they can drop mid-window (worker row
+// replaced, drain ended, origin-owner pins flipped) and the run would then stay silent forever.
+// The pin end never exceeds the ceiling end, so the ceiling end alone decides. A recent updated_at
+// therefore still nudges once at the time-window end (accepted).
+func (s *Service) quietWindowCoveredEpisode(r store.ListActiveRunsForHealthRow) bool {
+	if !r.HealthSince.Valid || !r.UpdatedAt.Valid {
+		return false
+	}
+	return r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling).After(r.HealthSince.Time)
+}
+
+// quietWindowEnded reports whether the window that could have quieted the episode is over. With a
+// owner-hold flag still set (and quietCodexHold already false), the window ended by its own clock
+// (the ceiling end), so it is over. A stale-requeue flag proves nothing alone (it outlives the
+// grace): the pin end (min of status_since + grace and the ceiling end) must be after health_since
+// and passed. Otherwise the run waits for the affinity ceiling end (updated_at +
+// WorkerAffinityCeiling), the latest instant any window can run to. It is only meaningful together
+// with quietWindowCoveredEpisode.
+func (s *Service) quietWindowEnded(now time.Time, r store.ListActiveRunsForHealthRow) bool {
+	if r.OwnerHoldPinnable {
+		return true
+	}
+	if !r.UpdatedAt.Valid {
+		return false
+	}
+	ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling)
+	// stale_requeue_pinnable has no time component in SQL and stays true long after the grace, so the
+	// flag alone proves nothing: the pin end must lie after health_since (it covered the episode)
+	// and have passed.
+	if s.p.WorkerStaleRequeueGrace > 0 && r.StaleRequeuePinnable && r.StatusSince.Valid && r.HealthSince.Valid {
+		pinEnd := r.StatusSince.Time.Add(s.p.WorkerStaleRequeueGrace)
+		if ceilingEnd.Before(pinEnd) {
+			pinEnd = ceilingEnd
+		}
+		if pinEnd.After(r.HealthSince.Time) && !now.Before(pinEnd) {
+			return true
+		}
+	}
+	return !now.Before(ceilingEnd)
+}
+
+// isCodexProvenanceHoldReason matches the wait, restart and unavailable texts.
+func isCodexProvenanceHoldReason(reason string) bool {
+	return reason == codexProvenanceUnavailableText ||
+		(strings.HasPrefix(reason, codexProvenanceHoldPrefix) &&
+			(strings.HasSuffix(reason, codexProvenanceHoldSuffix) || strings.HasSuffix(reason, codexProvenanceRestartSuffix)))
 }
 
 func isCodeCrossCheckWaitingReason(reason string) bool {

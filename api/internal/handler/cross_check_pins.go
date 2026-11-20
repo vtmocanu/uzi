@@ -95,8 +95,16 @@ func (h *Handler) saveCrossCheckPins(ctx context.Context, patches []store.PatchU
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	q := store.New(tx)
-	// Acquire cell locks in the same order for every saveCrossCheckPins request.
+	if err := saveCrossCheckPinsTx(ctx, store.New(tx), patches); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// saveCrossCheckPinsTx writes the pin patches through q, which must be bound to the caller's
+// transaction. It sorts the patches in place so every writer takes the cell row locks in the
+// same order (stage, then harness); a caller that also locks the users row takes that lock first.
+func saveCrossCheckPinsTx(ctx context.Context, q *store.Queries, patches []store.PatchUserCrossCheckPinParams) error {
 	sort.Slice(patches, func(i, j int) bool {
 		if patches[i].Stage != patches[j].Stage {
 			return patches[i].Stage < patches[j].Stage
@@ -108,7 +116,7 @@ func (h *Handler) saveCrossCheckPins(ctx context.Context, patches []store.PatchU
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // crossCheckPinSettings returns the four pin cells and, as a second value, the lead

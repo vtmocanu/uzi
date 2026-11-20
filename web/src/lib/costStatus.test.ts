@@ -81,6 +81,29 @@ describe("costHeadline / costSubLabel / costCellText", () => {
   });
 });
 
+describe("provider runs (PRD #4320 M7)", () => {
+  it("fold to unknown, never a dollar figure, whatever cost_usd carries", () => {
+    for (const status of ["unreported", "metered", ""] as const) {
+      const d = costDisplay(status, 3.5, true);
+      expect(d.kind).toBe("unknown");
+      expect(d.dollars).toBeUndefined();
+    }
+  });
+
+  it("render Unknown with a custom-provider sub-label, not Unavailable or $0", () => {
+    const d = costDisplay("unreported", 0, true);
+    expect(costHeadline(d)).toBe("Unknown");
+    expect(costSubLabel(d, "claude")).toBe("custom provider · cost not reported");
+    expect(costCellText(d)).toBe("n/a");
+  });
+
+  it("a vendor run (flag false or omitted) is unchanged", () => {
+    expect(costDisplay("unreported", 0, false).kind).toBe("unavailable");
+    expect(costHeadline(costDisplay("unreported", 0))).toBe("Unavailable");
+    expect(costDisplay("metered", 1.87).dollars).toBe("$1.87");
+  });
+});
+
 describe("aggregateDisclosure (PRD #1429 D7 mixed aggregate)", () => {
   it("an all-metered window (0/0) discloses nothing — byte-identical empty text", () => {
     const d = aggregateDisclosure(0, 0);

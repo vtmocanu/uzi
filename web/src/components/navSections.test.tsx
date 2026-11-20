@@ -42,7 +42,7 @@ describe("navSections", () => {
 
   it("advertises exactly the 14 unconditional Admin Settings sections", () => {
     expect([...ADMIN_SETTINGS_ANCHOR_IDS]).toEqual([
-      "vault-policy", "forge-labels", "run-judge", "run-summaries", "agent-source", "maintenance",
+      "vault-policy", "model-defaults", "forge-labels", "run-judge", "run-summaries", "agent-source", "maintenance",
       "updates", "slack", "run-health", "review-bots",
       "completion-interlock", "github-project-sync", "fetch-caps",
     ]);
@@ -54,9 +54,9 @@ describe("navSections", () => {
     expect(anchors.some((a) => a.label === "Admin › Settings › Agent source")).toBe(true);
   });
 
-  it("advertises the six worker-fleet sections under Admin › Workers, none under Settings", () => {
+  it("advertises the seven worker-fleet sections under Admin › Workers, none under Settings", () => {
     const ids = [
-      "docker-allowlist", "hosted-worker-quota", "custody-hold-limit",
+      "docker-allowlist", "worker-sizes", "hosted-worker-quota", "custody-hold-limit",
       "ephemeral-workers", "worker-hibernation", "capability-scheduling",
     ];
     expect([...ADMIN_WORKERS_ANCHOR_IDS]).toEqual(ids);

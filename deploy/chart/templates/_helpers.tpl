@@ -526,6 +526,79 @@ true
 {{- end }}
 
 {{- /*
+  uzi.validateProviderBaseURLEntry: the shape check for a providers.allowedBaseURLs entry
+  (PRD #4320). Unlike uzi.validateBaseURLEntry, a provider entry is an EXACT base URL WITH
+  a path (https://gateway.example.com/anthropic), because the api matches a provider's URL
+  against it character for character (scheme and host case-folded, one trailing slash
+  ignored). It only ever fails; include it as
+  `{{- include "uzi.validateProviderBaseURLEntry" (dict "key" ... "pos" ... "entry" ...) -}}`.
+  Mirrors the api's providers.NormalizeBaseURL where a template can: https only; printable
+  ASCII only; no userinfo, query, fragment, percent sign, semicolon, backslash, comma or
+  whitespace (the list is joined with "," into one env var), no empty or dot path
+  segments. What a template cannot judge (a trailing-dot host, a numeric-shorthand IPv4
+  host, an unspecified or link-local IP literal, a loopback host) renders here and is
+  refused by the api at boot. No message prints the entry, which can carry credentials.
+*/}}
+{{- define "uzi.validateProviderBaseURLEntry" -}}
+{{- $raw := toString .entry }}
+{{- $where := printf "%s entry %d" .key (int .pos) }}
+{{- if contains "@" $raw }}
+{{- fail (printf "%s: must not contain userinfo (user@ or user:password@)" $where) }}
+{{- end }}
+{{- if regexMatch "[,\\s]" $raw }}
+{{- fail (printf "%s: must not contain a comma or whitespace (the entries are joined with \",\" into UZI_PROVIDER_ALLOWED_BASE_URLS; list each URL as its own entry)" $where) }}
+{{- end }}
+{{- if contains "?" $raw }}
+{{- fail (printf "%s: has a query; only an https URL with a path is allowed" $where) }}
+{{- end }}
+{{- if contains "#" $raw }}
+{{- fail (printf "%s: has a fragment; only an https URL with a path is allowed" $where) }}
+{{- end }}
+{{- if contains "%" $raw }}
+{{- fail (printf "%s: must not contain percent-encoding" $where) }}
+{{- end }}
+{{- if contains ";" $raw }}
+{{- fail (printf "%s: must not contain a semicolon" $where) }}
+{{- end }}
+{{- if contains "\\" $raw }}
+{{- fail (printf "%s: must not contain a backslash" $where) }}
+{{- end }}
+{{- if not (regexMatch "^[\\x21-\\x7E]+$" $raw) }}
+{{- fail (printf "%s: must contain only printable ASCII characters (non-ASCII hosts use the xn-- form)" $where) }}
+{{- end }}
+{{- if not (regexMatch "^(?i:https)://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?(/.*)?$" $raw) }}
+{{- fail (printf "%s: must be an absolute https URL with a host, e.g. https://gateway.example.com/anthropic" $where) }}
+{{- end }}
+{{- $path := regexReplaceAll "^[^:]+://[^/]*" $raw "" }}
+{{- if regexMatch "(^|/)[.][.]?(/|$)" $path }}
+{{- fail (printf "%s: path must not contain dot segments" $where) }}
+{{- end }}
+{{- if contains "//" $path }}
+{{- fail (printf "%s: path must not contain empty segments" $where) }}
+{{- end }}
+{{- end }}
+
+{{- /*
+  uzi.providerAllowedBaseURLs: providers.allowedBaseURLs (PRD #4320) as a JSON list, every
+  entry validated fail-CLOSED by uzi.validateProviderBaseURLEntry. Entries are returned as
+  given. Nothing derives a worker egress rule from it (the api, not a worker, dials a
+  provider's base URL for the Test probe). Consumers:
+  `fromJsonArray (include "uzi.providerAllowedBaseURLs" .)`.
+*/}}
+{{- define "uzi.providerAllowedBaseURLs" -}}
+{{- $out := list }}
+{{- range $i, $e := (.Values.providers).allowedBaseURLs }}
+{{- include "uzi.validateProviderBaseURLEntry" (dict "key" "providers.allowedBaseURLs" "pos" (add1 $i) "entry" $e) -}}
+{{- $out = append $out $e }}
+{{- end }}
+{{- toJson $out }}
+{{- end }}
+
+{{- define "uzi.apiProviderExtraCADir" -}}
+/etc/uzi/provider-extra-ca
+{{- end -}}
+
+{{- /*
   uzi.validateFQDNEgress: the shared preconditions for every FQDN-egress provider.
   An empty forge list would leave the api on its built-in default forge while the egress
   policy allows none, silently blocking clone/fetch on the kube-native tier.
@@ -953,6 +1026,268 @@ true
 {{- $base = add $base 1 -}}
 {{- end -}}
 {{- $base -}}
+{{- end -}}
+
+{{- /*
+  uzi.decMulN: a decimal digit string (no sign) multiplied by a small positive integer
+  factor (at most 3125 = 5^5), as a digit string. Same schoolbook method as
+  uzi.decMul1024: every intermediate is at most 9 x 3125 + carry, a few thousand, so
+  nothing approaches int64. Argument: a dict with "s" (the digits) and "f" (the factor).
+*/ -}}
+{{- define "uzi.decMulN" -}}
+{{- $s := .s -}}
+{{- $f := int .f -}}
+{{- $n := len $s -}}
+{{- $carry := 0 -}}
+{{- $out := "" -}}
+{{- range $i := until $n -}}
+{{- $d := atoi (substr (int (sub (sub $n 1) $i)) (int (sub $n $i)) $s) -}}
+{{- $t := add (mul $d $f) $carry -}}
+{{- $out = printf "%d%s" (mod $t 10) $out -}}
+{{- $carry = div $t 10 -}}
+{{- end -}}
+{{- if $carry -}}
+{{- $out = printf "%d%s" $carry $out -}}
+{{- end -}}
+{{- $out -}}
+{{- end -}}
+
+{{- /*
+  uzi.quantityFloorRaw: the exact parse behind uzi.quantityFloorUnits. Prints ONE status
+  token and never fails: "N:<n>" (n a non-negative integer, possibly 0), "NEG" (negative),
+  "BAD" (not a quantity, or over 100 characters), "OVF" (the floored result is >= 10^18).
+  Argument: a dict with "value" and "unit" ("milli" | "MiB" | "GiB" | "count").
+
+  Method, no floats anywhere. The value is D x 10^p, D a digit string with no leading or
+  trailing zeros (fraction digits, SI suffix and decimal exponent fold into p). The unit
+  conversion is a power of two, e: milli = x 1000 x 2^(10k), MiB = x 2^(10k-20), GiB =
+  x 2^(10k-30), k the binary suffix's power (Ki=1 ... Ei=6, none/SI = 0). A negative e is
+  a multiplication by 5^|e| and a shift of p by -|e| (x/2^j = x*5^j/10^j), a positive e is
+  a multiplication by 2^e, both on the digit string via uzi.decMulN, so the arithmetic is
+  exact and the result is the integer part of D x 10^p, a leading-digits slice. Nothing
+  derives from uzi.quantityToBytes, which rounds UP to whole bytes: 1048575500m is 1048575.5
+  bytes, so it rounds to 1048576 bytes = 1 MiB, while the floor in MiB is 0.
+  Overflow is detected, never wrapped: len(D)+p > 40 is rejected before any multiplication
+  (the value is then >= 10^39 / 2^30 > 10^18), and the integer part must have at most 18
+  digits, so atoi only ever sees a value below 10^18 < 2^63. The 100 character cap bounds
+  D, so the work is bounded whatever the input. Exponent digits past 18 clamp to 18 nines,
+  which keeps the outcome (a large positive p is OVF, a large negative p floors to 0).
+  "count" is a plain non-negative integer of at most 18 digits (a deployments quota).
+*/ -}}
+{{- define "uzi.quantityFloorRaw" -}}
+{{- $raw := printf "%v" .value -}}
+{{- $unit := .unit -}}
+{{- $st := "" -}}
+{{- $res := "0" -}}
+{{- if gt (len $raw) 100 -}}
+{{- $st = "BAD" -}}
+{{- else if eq $unit "count" -}}
+{{- if not (regexMatch "^[0-9]+$" $raw) -}}
+{{- $st = "BAD" -}}
+{{- else -}}
+{{- $digits := regexReplaceAll "^0+" $raw "" -}}
+{{- if gt (len $digits) 18 -}}
+{{- $st = "OVF" -}}
+{{- else if $digits -}}
+{{- $res = $digits -}}
+{{- end -}}
+{{- end -}}
+{{- else if not (regexMatch "^[+-]?[0-9]*[.]?[0-9]*(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E|[eE][+-]?[0-9]+)?$" $raw) -}}
+{{- $st = "BAD" -}}
+{{- else -}}
+{{- $neg := hasPrefix "-" $raw -}}
+{{- $body := regexReplaceAll "^[+-]" $raw "" -}}
+{{- $mant := regexFind "^[0-9]*[.]?[0-9]*" $body -}}
+{{- $suffix := trimPrefix $mant $body -}}
+{{- if not (regexMatch "[0-9]" $mant) -}}
+{{- $st = "BAD" -}}
+{{- else -}}
+{{- $parts := splitList "." $mant -}}
+{{- $ipart := index $parts 0 -}}
+{{- $fpart := "" -}}
+{{- if gt (len $parts) 1 -}}
+{{- $fpart = index $parts 1 -}}
+{{- end -}}
+{{- $m := regexReplaceAll "^0+" (printf "%s%s" $ipart $fpart) "" -}}
+{{- if eq $m "" -}}
+{{- /* zero: the result is 0 whatever the suffix */ -}}
+{{- else if $neg -}}
+{{- $st = "NEG" -}}
+{{- else -}}
+{{- $tz := len (regexFind "0*$" $m) -}}
+{{- $m = substr 0 (int (sub (len $m) $tz)) $m -}}
+{{- $p := sub $tz (len $fpart) -}}
+{{- $bin := dict "Ki" 1 "Mi" 2 "Gi" 3 "Ti" 4 "Pi" 5 "Ei" 6 -}}
+{{- $si := dict "n" -9 "u" -6 "m" -3 "" 0 "k" 3 "M" 6 "G" 9 "T" 12 "P" 15 "E" 18 -}}
+{{- $k := 0 -}}
+{{- if hasKey $bin $suffix -}}
+{{- $k = int (get $bin $suffix) -}}
+{{- else if hasKey $si $suffix -}}
+{{- $p = add $p (get $si $suffix) -}}
+{{- else -}}
+{{- $es := regexFind "[0-9]+$" $suffix -}}
+{{- $es = regexReplaceAll "^0+" $es "" -}}
+{{- if gt (len $es) 18 -}}
+{{- $es = "999999999999999999" -}}
+{{- end -}}
+{{- $ev := int64 (atoi (default "0" $es)) -}}
+{{- if hasPrefix "-" (substr 1 (len $suffix) $suffix) -}}
+{{- $ev = sub 0 $ev -}}
+{{- end -}}
+{{- $p = add $p $ev -}}
+{{- end -}}
+{{- $e := mul $k 10 -}}
+{{- if eq $unit "milli" -}}
+{{- $p = add $p 3 -}}
+{{- else if eq $unit "MiB" -}}
+{{- $e = sub $e 20 -}}
+{{- else if eq $unit "GiB" -}}
+{{- $e = sub $e 30 -}}
+{{- end -}}
+{{- if gt (add (len $m) $p) 40 -}}
+{{- $st = "OVF" -}}
+{{- else -}}
+{{- if lt $e 0 -}}
+{{- $j := int (sub 0 $e) -}}
+{{- $p = sub $p $j -}}
+{{- range $i := until (int (div $j 5)) -}}
+{{- $m = include "uzi.decMulN" (dict "s" $m "f" 3125) -}}
+{{- end -}}
+{{- $f := 1 -}}
+{{- range $i := until (int (mod $j 5)) -}}
+{{- $f = mul $f 5 -}}
+{{- end -}}
+{{- $m = include "uzi.decMulN" (dict "s" $m "f" $f) -}}
+{{- else if gt $e 0 -}}
+{{- range $i := until (int (div $e 10)) -}}
+{{- $m = include "uzi.decMulN" (dict "s" $m "f" 1024) -}}
+{{- end -}}
+{{- $f := 1 -}}
+{{- range $i := until (int (mod $e 10)) -}}
+{{- $f = mul $f 2 -}}
+{{- end -}}
+{{- $m = include "uzi.decMulN" (dict "s" $m "f" $f) -}}
+{{- end -}}
+{{- $ip := "" -}}
+{{- if ge $p 0 -}}
+{{- $ip = printf "%s%s" $m (repeat (int $p) "0") -}}
+{{- else if gt (len $m) (sub 0 $p) -}}
+{{- $ip = substr 0 (int (sub (len $m) (sub 0 $p))) $m -}}
+{{- end -}}
+{{- if gt (len $ip) 18 -}}
+{{- $st = "OVF" -}}
+{{- else if $ip -}}
+{{- $res = $ip -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $st -}}{{- $st -}}{{- else -}}N:{{ $res }}{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.quantityFloorUnits: a Kubernetes quantity -> floor(value in unit) as a base-10
+  integer string. Argument: a dict with "path" (the values path, for the error), "value",
+  "unit" ("milli" | "MiB" | "GiB" | "count"), "allowZero" (bool) and "soft" (bool).
+  An empty or unset value prints nothing in either mode (the caller then renders no env).
+  Hard mode (soft false), the ceilings: malformed, negative, zero-result (unless
+  allowZero) or overflowing values fail the render naming the path.
+  Soft mode (soft true), the quotas: malformed, negative or overflowing values print
+  nothing and never fail; the advisory consumer then reports the quota as unavailable.
+  allowZero true prints "0" for zero and for values that floor to zero.
+*/ -}}
+{{- define "uzi.quantityFloorUnits" -}}
+{{- $raw := printf "%v" .value -}}
+{{- if and (ne $raw "") (ne $raw "<nil>") -}}
+{{- $r := include "uzi.quantityFloorRaw" (dict "value" .value "unit" .unit) -}}
+{{- $isN := hasPrefix "N:" $r -}}
+{{- $n := trimPrefix "N:" $r -}}
+{{- if .soft -}}
+{{- if and $isN (or .allowZero (ne $n "0")) -}}{{- $n -}}{{- end -}}
+{{- else if and $isN (or .allowZero (ne $n "0")) -}}
+{{- $n -}}
+{{- else if $isN -}}
+{{- fail (printf "%s=%q floors to zero %s, so the ceiling it sets is unusable. Raise it to at least one whole %s." .path $raw .unit .unit) -}}
+{{- else if eq $r "OVF" -}}
+{{- fail (printf "%s=%q is too large: its value in %s must stay below 10^18." .path $raw .unit) -}}
+{{- else -}}
+{{- fail (printf "%s must be a positive Kubernetes quantity (e.g. 4, 500m, 32Gi, 50Gi, 1.5Gi), got %q" .path $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.workerSizeEnv: the api Deployment's hosted-worker size env (PRD #4213), as a YAML
+  list body, plus the validation of every enabled tier's LimitRange ceilings (it is also
+  included from worker-invariants.yaml so a bad ceiling fails the render there, whether or
+  not the api is rendered). Ceilings (cpu millicores, memory MiB, PVC GiB; the isolated
+  lane has no PVC ceiling, its /data is ephemeralWorkerDataSize) are floored integers and
+  fail the render when malformed or zero. Quota values (requests cpu millicores, requests
+  memory MiB, deployments) are soft: zero renders "0", an unparsable one renders no env
+  for that key and never fails, because the namespace templates quote these values into a
+  ResourceQuota as-is on installs that predate this. An empty ceiling or quota value
+  renders no env for that key.
+*/ -}}
+{{- define "uzi.workerSizeEnv" -}}
+{{- $specs := list (dict "tier" "restricted" "upper" "RESTRICTED" "prefix" "workers" "cfg" .Values.workers "pvc" true) -}}
+{{- if .Values.workers.docker.enabled -}}
+{{- $specs = append $specs (dict "tier" "docker" "upper" "DOCKER" "prefix" "workers.docker" "cfg" .Values.workers.docker "pvc" true) -}}
+{{- end -}}
+{{- if include "uzi.isolatedLaneEnabled" . -}}
+{{- $specs = append $specs (dict "tier" "isolated" "upper" "ISOLATED" "prefix" "workers.isolatedLane" "cfg" .Values.workers.isolatedLane "pvc" false) -}}
+{{- end -}}
+{{- $tiers := list -}}
+{{- range $s := $specs -}}
+{{- $tiers = append $tiers $s.tier -}}
+{{- end }}
+- name: UZI_WORKER_SIZE_TIERS
+  value: {{ join "," $tiers | quote }}
+{{- range $s := $specs }}
+{{- $lr := $s.cfg.limitRange | default dict }}
+{{- if $lr.enabled }}
+{{- $max := $lr.max | default dict }}
+{{- $cpu := include "uzi.quantityFloorUnits" (dict "path" (printf "%s.limitRange.max.cpu" $s.prefix) "value" $max.cpu "unit" "milli") }}
+{{- if $cpu }}
+- name: UZI_WORKER_SIZE_CEILING_{{ $s.upper }}_CPU_MILLICORES
+  value: {{ $cpu | quote }}
+{{- end }}
+{{- $mem := include "uzi.quantityFloorUnits" (dict "path" (printf "%s.limitRange.max.memory" $s.prefix) "value" $max.memory "unit" "MiB") }}
+{{- if $mem }}
+- name: UZI_WORKER_SIZE_CEILING_{{ $s.upper }}_MEMORY_MIB
+  value: {{ $mem | quote }}
+{{- end }}
+{{- if $s.pvc }}
+{{- $pvc := include "uzi.quantityFloorUnits" (dict "path" (printf "%s.limitRange.maxPVCStorage" $s.prefix) "value" $lr.maxPVCStorage "unit" "GiB") }}
+{{- if $pvc }}
+- name: UZI_WORKER_SIZE_CEILING_{{ $s.upper }}_PVC_GIB
+  value: {{ $pvc | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $q := $s.cfg.quota | default dict }}
+{{- if $q.enabled }}
+{{- $qcpu := include "uzi.quantityFloorUnits" (dict "path" "quota.requestsCPU" "value" $q.requestsCPU "unit" "milli" "allowZero" true "soft" true) }}
+{{- if $qcpu }}
+- name: UZI_WORKER_SIZE_QUOTA_{{ $s.upper }}_REQUESTS_CPU_MILLICORES
+  value: {{ $qcpu | quote }}
+{{- end }}
+{{- $qmem := include "uzi.quantityFloorUnits" (dict "path" "quota.requestsMemory" "value" $q.requestsMemory "unit" "MiB" "allowZero" true "soft" true) }}
+{{- if $qmem }}
+- name: UZI_WORKER_SIZE_QUOTA_{{ $s.upper }}_REQUESTS_MEMORY_MIB
+  value: {{ $qmem | quote }}
+{{- end }}
+{{- $qdep := include "uzi.quantityFloorUnits" (dict "path" "quota.deployments" "value" $q.deployments "unit" "count" "allowZero" true "soft" true) }}
+{{- if $qdep }}
+- name: UZI_WORKER_SIZE_QUOTA_{{ $s.upper }}_DEPLOYMENTS
+  value: {{ $qdep | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.workers.docker.enabled .Values.workers.docker.dindDataSize }}
+- name: UZI_WORKER_DIND_DATA_SIZE_OVERRIDDEN
+  value: "1"
+{{- end }}
 {{- end -}}
 
 {{- /*

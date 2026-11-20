@@ -7,7 +7,7 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  forge_connections.forge_type gitlab->forgejo (test DB); +1 forgejo connection row via connect POST; $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (recreates api); fake forgejo-version pinned 15.0.4 in both <16 legs; admin ci_autofix_enabled->false for the Fix-CI loop
+# mutates:  forge_connections.forge_type gitlab->forgejo (test DB); +1 forgejo connection row via connect POST, then its token_ciphertext rotated by the replace=true leg; $ENVFILE+=E2E_FORGE_POLL_INTERVAL=2s,FORGE_RECONCILE_EVERY=2 (recreates api); fake forgejo-version pinned 15.0.4 in both <16 legs; admin ci_autofix_enabled->false for the Fix-CI loop
 # restores: fake forgejo-version->16.0.0; admin ci_autofix_enabled->true around the Fix-CI loop (explicit restores + EXIT-trap fail-safes)
 # PRD #65 M9 — the Forgejo lane (UZI_E2E_FORGE=forgejo). A FOCUSED lifecycle
 # against the same fake's /api/v1 table, run INSTEAD of the GitLab suite. Skipped
@@ -87,10 +87,40 @@ GC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e",
 [ "$GC" = 201 ] || fail "forgejo connect (good >=16) expected 201, got $GC ($(cat "$FJGOOD"))"
 [ "$(jq -r '.connection.forge_type // empty' "$FJGOOD")" = forgejo ] || fail "created connection is not forge_type=forgejo: $(cat "$FJGOOD")"
 pass "forgejo connect POST created a connection against a good >=16 instance (VerifyToken + scope gate pass) ✓"
-# b) < 16.0.0 -> refused at VerifyToken's version gate (not created).
+
+# The row the remaining legs either protect (duplicate) or rotate (replace). Reads
+# the ciphertext's md5 rather than the bytes: token_ciphertext is a bytea whose
+# sealed form is non-UTF8, and the md5 is what makes "unchanged" a cheap compare.
+FJCONN_ID="$(jq -r '.connection.id' "$FJGOOD")"
+fj_row_fingerprint() {
+  db_psql "SELECT md5(token_ciphertext) || ' ' || bot_username FROM forge_connections WHERE id='$FJCONN_ID'"
+}
+
+# a2) duplicate: the SAME target without replace=true is refused 409 and leaves the
+# existing row untouched. Before the guard this POST silently rotated the stored
+# credential, so the fingerprint compare is the assertion that matters — a 409 that
+# still wrote would be worse than no guard.
+say "forgejo connect POST refuses a duplicate target and leaves the stored credential alone"
+FJDUP="$RUNROOT/fj-dup.json"
+FJBEFORE="$(fj_row_fingerprint)"
+DC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-rotated-pat-000"}' "$FJDUP")"
+[ "$DC" = 409 ] || fail "a duplicate forgejo connect must be refused 409, got $DC ($(cat "$FJDUP"))"
+jq -e '.code == "forge_connection_exists"' "$FJDUP" >/dev/null 2>&1 \
+  || fail "the 409 must carry code=forge_connection_exists: $(cat "$FJDUP")"
+[ "$(jq -r '.connection_id // empty' "$FJDUP")" = "$FJCONN_ID" ] \
+  || fail "the 409 must name the existing connection $FJCONN_ID: $(cat "$FJDUP")"
+[ "$(fj_row_fingerprint)" = "$FJBEFORE" ] \
+  || fail "a refused duplicate must not touch the row (ciphertext/bot identity changed: $FJBEFORE -> $(fj_row_fingerprint))"
+pass "duplicate forgejo connect 409s naming the existing connection, credential untouched ✓"
+
+# b) < 16.0.0 -> refused at VerifyToken's version gate (not created). replace=true
+# is belt-and-braces: the create-only path validates BEFORE it reaches the insert,
+# so this leg currently hits the version gate either way — but pinning replace=true
+# keeps the leg about the save-time gate alone, so it cannot silently turn into a
+# duplicate-target 409 if that ordering ever changes.
 fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null   # 2nd <16 leg; EXIT trap already armed above
 FJLOW="$RUNROOT/fj-low.json"
-LC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000"}' "$FJLOW")"
+LC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000","replace":true}' "$FJLOW")"
 case "$LC" in 2*) fail "forgejo connect against a <16 instance must be refused, got $LC ($(cat "$FJLOW"))";; esac
 # Assert the ACTUAL version-downgrade finding (D4), not the bare word "version" (PRD #97
 # M3): the old `\|version` alternative was a false-green — nearly every forge error body
@@ -105,11 +135,29 @@ pass "forgejo connect POST refused against a < 16.0.0 instance, naming the requi
 fake_post /_e2e/forgejo-version '{"version":"16.0.0+gitea-1.22.0"}' >/dev/null  # restore
 trap - EXIT  # explicit restore done; drop the fail-safe
 # c) over-privileged token -> 422 + violations (D6b save-time scope block).
+#    replace=true for the same reason as (b): the scope block is a validation step,
+#    so it fires before the insert either way, and pinning replace=true keeps this
+#    leg about the scope block rather than about the duplicate guard.
 FJOVER="$RUNROOT/fj-over.json"
-OC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-overpriv-pat-0000"}' "$FJOVER")"
+OC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-overpriv-pat-0000","replace":true}' "$FJOVER")"
 [ "$OC" = 422 ] || fail "forgejo connect (over-privileged) expected 422, got $OC ($(cat "$FJOVER"))"
 jq -e '.violations | length > 0' "$FJOVER" >/dev/null 2>&1 || fail "422 body missing violations: $(cat "$FJOVER")"
+[ "$(fj_row_fingerprint)" = "$FJBEFORE" ] \
+  || fail "a refused over-privileged replace must not touch the row ($FJBEFORE -> $(fj_row_fingerprint))"
 pass "forgejo connect POST 422s an over-privileged token with violations (D6b scope block) ✓"
+
+# d) replacement: the SAME target with replace=true and a good token rotates the
+#    stored credential. This is the other half of the guard — a 409 that could never
+#    be overridden would strand a user whose token was revoked.
+say "forgejo connect POST replaces the credential when replace=true"
+FJREPL="$RUNROOT/fj-replace.json"
+RC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-rotated-pat-000","replace":true}' "$FJREPL")"
+[ "$RC" = 201 ] || fail "a replace=true connect expected 201, got $RC ($(cat "$FJREPL"))"
+[ "$(jq -r '.connection.id // empty' "$FJREPL")" = "$FJCONN_ID" ] \
+  || fail "replace=true must rotate the existing connection $FJCONN_ID, not create another: $(cat "$FJREPL")"
+[ "$(fj_row_fingerprint)" != "$FJBEFORE" ] \
+  || fail "replace=true must rewrite the stored ciphertext (row unchanged: $FJBEFORE)"
+pass "replace=true rotated the existing connection's credential in place ✓"
 
 # 3) Bring the worker online (same path as the GitLab lane).
 say "issue a worker join token and bring the worker online"
@@ -186,8 +234,8 @@ pass "board cached the NEWEST run (failure) over the older success — id-DESC [
 #    unit-covered (workersvc.TestBuildFailureSnapshotIncludesForgejoFailureJobs).
 # The admin setting ci_autofix_enabled defaults ON (#1109), and the CIAutoFix poller treats a
 # ci_fix run's own fix branch like an agent branch: the re-failure posted on it below makes
-# the poller open a SECOND ci_fix of its own just as this phase ends, which the quarantine
-# logs as a LEAK (seen in CI). This phase drives the MANUAL Fix-CI path, so disable the
+# the poller open a SECOND ci_fix of its own just as this phase ends, which the end-of-phase boundary
+# flags as residue (seen in CI). This phase drives the MANUAL Fix-CI path, so disable the
 # poller for the loop; the trap restores the shipped default even if an assertion fails.
 apiput /api/admin/settings '{"settings":{"ci_autofix_enabled":"false"}}' >/dev/null
 trap 'apiput /api/admin/settings '\''{"settings":{"ci_autofix_enabled":"true"}}'\'' >/dev/null 2>&1 || true' EXIT

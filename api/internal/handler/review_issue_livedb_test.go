@@ -290,6 +290,14 @@ func TestFileIssueOwnerHappyPathLiveDB(t *testing.T) {
 	if cached != 1 {
 		t.Errorf("issues cache rows = %d, want 1 (the just-created issue)", cached)
 	}
+	// The file path's cache write stores issue_key NULL: only the linked sync writes it (D10).
+	row, err := store.New(pool).GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: f.ownerRepo, ForgeIssueIid: iid})
+	if err != nil {
+		t.Fatalf("read cached issue: %v", err)
+	}
+	if row.IssueKey.Valid {
+		t.Errorf("the file path cached issue_key %q, want NULL", row.IssueKey.String)
+	}
 }
 
 // ── Authz: a non-owner non-admin cannot even see the review → 404 (never a leak) ─────────

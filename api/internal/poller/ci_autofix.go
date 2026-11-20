@@ -302,6 +302,11 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 				slog.Warn("poller: ci-autofix start comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 			}
 		}
+	case errors.Is(err, workersvc.ErrTerminalConsumerGateBusy):
+		// Issue #4488: a terminal-ref retirement briefly holds the repo's consumer gate and nothing
+		// was created. Unlike the swallow arm below this must NOT record the pipeline: the failing
+		// pipeline stays a candidate and the next tick retries.
+		slog.Debug("poller: ci-autofix deferred, terminal consumer gate busy", "repo", r.PathWithNamespace, "ref", ref)
 	case errors.Is(err, workersvc.ErrActiveFixExists), errors.Is(err, workersvc.ErrBranchInUse):
 		// A race with the manual Fix-CI button (or an issue run on the branch): swallow,
 		// no comment, do not advance the counter.

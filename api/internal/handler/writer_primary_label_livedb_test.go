@@ -251,6 +251,22 @@ func TestCreateIssueWritesUziLabelLiveDB(t *testing.T) {
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201; body=%s", rr.Code, rr.Body.String())
 	}
+	// The create path's cache write stores issue_key NULL: only the linked sync writes it (D10).
+	var created struct {
+		Card struct {
+			IID int64 `json:"iid"`
+		} `json:"card"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil || created.Card.IID == 0 {
+		t.Fatalf("decode created card: %v body=%s", err, rr.Body.String())
+	}
+	row, err := store.New(f.pool).GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: f.repoID, ForgeIssueIid: created.Card.IID})
+	if err != nil {
+		t.Fatalf("the created issue was not cached: %v", err)
+	}
+	if row.IssueKey.Valid {
+		t.Fatalf("the create path cached issue_key %q, want NULL", row.IssueKey.String)
+	}
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
 	if len(stub.createLabels) != 1 || stub.createLabels[0] != wantUziLabel {

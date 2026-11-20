@@ -200,7 +200,7 @@ for (const [label, settings, expected] of [
   test(`issue #3382: a guarded command launches with the configured Go concurrency (${label}) from a buildSdkEnv cliEnv`, { timeout: 10000 }, async () => {
     try {
       configureGoConcurrency(settings);
-      const h = harness({ cliEnv: buildSdkEnv("oauth-secret", "/home/runner", { PATH: "/provisioned/go/bin" }) });
+      const h = harness({ cliEnv: buildSdkEnv({ kind: "oauth", token: "oauth-secret" }, "/home/runner", { PATH: "/provisioned/go/bin" }) });
       assert.match(text(await h.call({ command: "echo hi" })), /^Exit code: 0/);
       assert.equal(h.specs.length, 1);
       const env = h.specs[0]!.env as Record<string, string | undefined>;

@@ -1,0 +1,105 @@
+{
+  "schema": 1,
+  "invocation": {
+    "argv": [
+      "task",
+      "test:codex-provider-spike"
+    ],
+    "working_directory": "repository-root"
+  },
+  "source_base_revision": "96d73a61f2e4b37138fb27a928ca535e9b6b6801",
+  "source_files_sha256": [
+    {
+      "path": "e2e/codex-provider-spike/driver.ts",
+      "sha256": "5a46022f49b466ddfaeb55c6f2757c12a4e44f5138a67a86ed34f734fbf2c11d"
+    },
+    {
+      "path": "e2e/codex-provider-spike/fake-provider.ts",
+      "sha256": "60dcc9a3f8d2693b2d14f3d1fecd8b0697739dcbca2d7c1152337466e431ff91"
+    },
+    {
+      "path": "e2e/codex-provider-spike/fixture.test.ts",
+      "sha256": "264f81c5fa76450edc4c7ee2c04529ca93d5825978a4e5219666f9ec2402b82a"
+    },
+    {
+      "path": "e2e/codex-provider-spike/ownership.ts",
+      "sha256": "551dcf2f8db1bc92d324daff4470a62f6a0c047b0e4dda6cbb5a064ea4c144e1"
+    },
+    {
+      "path": "e2e/codex-provider-spike/policy.test.ts",
+      "sha256": "12bce969d3043ad439f640b468a6c70bf4e6e251020a490a303bb75765c546a3"
+    },
+    {
+      "path": "e2e/codex-provider-spike/runner.ts",
+      "sha256": "7ee06c92d4281efbba157b6a9dec80bfb650964ba5cfa58fdf1d12f14da53599"
+    },
+    {
+      "path": "e2e/codex-provider-spike/timers.ts",
+      "sha256": "237cdef004f5faa5de113dcfe485d7e9f270323c6c695b87931206bd9f6ad629"
+    },
+    {
+      "path": "e2e/codex-provider-spike/tsconfig.json",
+      "sha256": "1114142cb3d1520a82cf5a687a97f80231deb0fbfd9758f4f7628d72709698c4"
+    },
+    {
+      "path": "Taskfile.yml",
+      "sha256": "dda75f1a44f30eb7f2d5a9c220263454c0a9bfee72aecd40d4dea33d5a22237f"
+    },
+    {
+      "path": "agent/package-lock.json",
+      "sha256": "5cacad55fd255cd5a1ed53f1775ca5d0ab3fdbc0b0db16f8679e9129f559d532"
+    },
+    {
+      "path": "agent/codex/codex-package.lock",
+      "sha256": "b62a8b3b3887a55a24c4d02fe7c4ed23cc606f323af0cf2ea785e6d3b4c4ea02"
+    }
+  ],
+  "exit_status": 0,
+  "output_file": "evidence.json",
+  "output_sha256": "2e4f34dd259d067b85079dbd915348c0f0e8789578e290c667c357ab30365393",
+  "runtime_version": "0.167.0",
+  "runtime_source_commit": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
+  "row_count": 36,
+  "execution": {
+    "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--name",
+      "cdr-4493-spike-codex",
+      "--network",
+      "none",
+      "--cpus",
+      "4",
+      "--user",
+      "10001:10001",
+      "-v",
+      "/private/tmp/uzi-fix-4493-codex-buddy:/work",
+      "-v",
+      "cdr-4493-spike-deps-codex:/work/agent/node_modules",
+      "-v",
+      "cdr-4493-spike-scratch-codex:/work/.uzi",
+      "-w",
+      "/work",
+      "-e",
+      "GOFLAGS",
+      "-e",
+      "UZI_AGENT_TEST_CONCURRENCY",
+      "-e",
+      "GIT_CONFIG_GLOBAL=/dev/null",
+      "-e",
+      "GIT_CONFIG_SYSTEM=/dev/null",
+      "--entrypoint",
+      "/bin/bash",
+      "ghcr.io/vtmocanu/uzi/agent-base:0.87.0-rc.18",
+      "-c",
+      "task test:codex-provider-spike"
+    ],
+    "image_digest": "sha256:0a363f3646d74950c23bd89b040253e030a3a4371e31183f2d476d8f722de4e4",
+    "platform": "linux/arm64",
+    "network": "none",
+    "GOFLAGS": "-p=2",
+    "UZI_AGENT_TEST_CONCURRENCY": "2",
+    "elapsed_ms": 94770
+  }
+}

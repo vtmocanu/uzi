@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -102,9 +103,15 @@ func (f *fakeVaultStore) HasMasterVaultMaterial(_ context.Context, id uuid.UUID)
 			return true, nil
 		}
 	}
+	for _, e := range f.envs {
+		if e.userID == id && (e.sealedWith == store.SealedWithMaster || e.sealedWith == store.SealedWithMasterAAD) {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 func (f *fakeVaultStore) GetVaultMaterialTotals(_ context.Context, id uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
+	f.record("GetVaultMaterialTotals")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var t store.GetVaultMaterialTotalsRow
@@ -119,17 +126,54 @@ func (f *fakeVaultStore) GetVaultMaterialTotals(_ context.Context, id uuid.UUID)
 			t.MaxRowBytes = n
 		}
 	}
+	for _, e := range f.envs {
+		if e.userID != id {
+			continue
+		}
+		n := int64(len(e.ciphertext))
+		t.MaterialRows++
+		t.CiphertextBytes += n
+		if n > t.MaxRowBytes {
+			t.MaxRowBytes = n
+		}
+	}
 	return t, nil
+}
+
+// totalsHookStore wraps the fixture so a test can act between the conversion's first
+// measurement of the owner's material and the end of its env batches, which is where a
+// repo delete (cascading env rows without the secret-mutation lock) can land. after is
+// called once, right after the first GetVaultMaterialTotals; skewFresh, when set,
+// is added to the rows of every later measurement.
+type totalsHookStore struct {
+	*fakeVaultStore
+	after     func()
+	skewFresh int64
+	calls     int
+}
+
+func (s *totalsHookStore) GetVaultMaterialTotals(ctx context.Context, id uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
+	t, err := s.fakeVaultStore.GetVaultMaterialTotals(ctx, id)
+	s.calls++
+	if s.calls == 1 && s.after != nil {
+		s.after()
+	}
+	if s.calls > 1 {
+		t.MaterialRows += s.skewFresh
+	}
+	return t, err
 }
 
 // No account rows are seeded by this crypto fixture.
 func (f *fakeVaultStore) LockVaultAccountMaterialBatch(context.Context, store.LockVaultAccountMaterialBatchParams) ([]store.LockVaultAccountMaterialBatchRow, error) {
+	f.record("LockVaultAccountMaterialBatch")
 	return nil, nil
 }
 func (f *fakeVaultStore) ResealVaultAccountMaterial(context.Context, store.ResealVaultAccountMaterialParams) (int64, error) {
 	return 0, errors.New("fake: account reseal unsupported")
 }
 func (f *fakeVaultStore) LockVaultSecretMaterialBatch(_ context.Context, arg store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error) {
+	f.record("LockVaultSecretMaterialBatch")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var matching []*fakeSecret
@@ -161,6 +205,108 @@ func (f *fakeVaultStore) ResealVaultSecretMaterial(_ context.Context, arg store.
 		}
 	}
 	return 0, nil
+}
+func (f *fakeVaultStore) LockVaultEnvConnectionsKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockVaultEnvConnectionsKeyShare")
+	return nil, nil
+}
+func (f *fakeVaultStore) LockVaultEnvReposKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockVaultEnvReposKeyShare")
+	return nil, nil
+}
+func (f *fakeVaultStore) ListVaultEnvMaterialCandidates(_ context.Context, arg store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var matching []*fakeEnv
+	for _, e := range f.envs {
+		if e.userID == arg.UserID && (!arg.AfterID.Valid || bytes.Compare(e.id[:], arg.AfterID.Bytes[:]) > 0) {
+			matching = append(matching, e)
+		}
+	}
+	sort.Slice(matching, func(i, j int) bool { return bytes.Compare(matching[i].id[:], matching[j].id[:]) < 0 })
+	var out []uuid.UUID
+	var size int64
+	for _, e := range matching {
+		size += int64(len(e.ciphertext))
+		if int64(len(out)) == maxBatchRows || size > maxBatchBytes {
+			break
+		}
+		out = append(out, e.id)
+	}
+	return out, nil
+}
+func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
+	f.record("LockVaultEnvMaterialBatch")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var matching []*fakeEnv
+	for _, e := range f.envs {
+		if e.userID != arg.UserID {
+			continue
+		}
+		for _, id := range arg.Ids {
+			if id == e.id {
+				matching = append(matching, e)
+				break
+			}
+		}
+	}
+	sort.Slice(matching, func(i, j int) bool { return bytes.Compare(matching[i].id[:], matching[j].id[:]) < 0 })
+	var out []store.LockVaultEnvMaterialBatchRow
+	for _, e := range matching {
+		out = append(out, store.LockVaultEnvMaterialBatchRow{ID: e.id, RepoID: e.repoID, Name: e.name, Secret: e.secret,
+			Ciphertext: append([]byte(nil), e.ciphertext...), SealedWith: e.sealedWith})
+	}
+	return out, nil
+}
+
+// candidateHookStore lets a test act between the env candidate listing and the row
+// lock, which is where a cascade delete can remove a whole page. after runs once, right
+// after the first non-empty candidate list is returned.
+type candidateHookStore struct {
+	*fakeVaultStore
+	after func(candidates []uuid.UUID)
+	fired bool
+	// afterIDs records the AfterID cursor of every listing call, in call order.
+	afterIDs []pgtype.UUID
+}
+
+func (s *candidateHookStore) ListVaultEnvMaterialCandidates(ctx context.Context, arg store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	s.afterIDs = append(s.afterIDs, arg.AfterID)
+	ids, err := s.fakeVaultStore.ListVaultEnvMaterialCandidates(ctx, arg)
+	if err == nil && len(ids) > 0 && !s.fired && s.after != nil {
+		s.fired = true
+		s.after(ids)
+	}
+	return ids, err
+}
+func (f *fakeVaultStore) ResealVaultEnvMaterial(_ context.Context, arg store.ResealVaultEnvMaterialParams) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.envs {
+		if e.id == arg.ID && e.userID == arg.UserID {
+			e.ciphertext = append([]byte(nil), arg.Ciphertext...)
+			e.sealedWith = arg.SealedWith
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+func (f *fakeVaultStore) DeleteAllRunEnvVarsForOwner(_ context.Context, id uuid.UUID) (int64, error) {
+	f.record("DeleteAllRunEnvVarsForOwner")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var kept []*fakeEnv
+	var n int64
+	for _, e := range f.envs {
+		if e.userID == id {
+			n++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	f.envs = kept
+	return n, nil
 }
 func (f *fakeVaultStore) ClaimVaultLockNotice(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
 	return id, nil

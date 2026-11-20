@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,54 @@ func TestWorkersHighmemKindCode(t *testing.T) {
 		if got := m.workerKind(r); got != tc.kind {
 			t.Errorf("size %q: got %q want %q", tc.size, got, tc.kind)
 		}
+	}
+}
+
+func TestWorkersAdminSizeKindCode(t *testing.T) {
+	m := workersScene(true, "workers-list-120")
+	for _, tc := range []struct {
+		name string
+		size *string
+		kind string
+	}{
+		{"admin-added", sp("xs"), "host·XS"},
+		{"truncated to 8 cells with ellipsis", sp("extra-large-thing"), "host·EXTRA-L…"},
+		{"distinguishable prefix", sp("gpu-a100x"), "host·GPU-A10…"},
+		{"exactly 8 stays whole", sp("gpu-a100"), "host·GPU-A100"},
+		{"escape sequence sanitized", sp("a\x1b[31mb\x07c"), ""},
+		{"empty", sp(""), "host·?"},
+		{"absent", nil, "host·?"},
+	} {
+		r := workerRow{w: apitypes.WorkerDTO{Kind: "hosted", HostedSize: tc.size}}
+		got := m.workerKind(r)
+		if strings.ContainsAny(got, "\x1b\x07") {
+			t.Errorf("%s: control char reached the kind cell: %q", tc.name, got)
+		}
+		if tc.kind != "" && got != tc.kind {
+			t.Errorf("%s: got %q want %q", tc.name, got, tc.kind)
+		}
+		if n := visualWidth(strings.TrimPrefix(got, "host·")); n > 8 {
+			t.Errorf("%s: size code %q exceeds 8 cells", tc.name, got)
+		}
+	}
+}
+
+func TestWorkersDetailShowsSizeQuantities(t *testing.T) {
+	m := workerRenderModel(true)
+	m.workers.rows[0].w.HostedSize = sp("xs")
+	m.workers.rows[0].w.HostedSizeSpec = &apitypes.WorkerSizeSpec{
+		CPURequestMillicores: 250, CPULimitMillicores: 1000, MemoryRequestMiB: 1024, MemoryLimitMiB: 2048, DataGiB: 5,
+	}
+	lines, _ := m.workerDetailLines(time.Now())
+	text := stripANSI(strings.Join(lines, "\n"))
+	if !regexp.MustCompile(`(?m)^\s+size\s+xs · 0\.25–1 CPU · 1–2 GiB RAM · 5 GiB data$`).MatchString(text) {
+		t.Fatalf("detail lacks the size row with quantities:\n%s", text)
+	}
+	m.workers.rows[0].w.HostedSizeSpec = nil
+	lines, _ = m.workerDetailLines(time.Now())
+	text = stripANSI(strings.Join(lines, "\n"))
+	if !regexp.MustCompile(`(?m)^\s+size\s+xs$`).MatchString(text) || strings.Contains(text, "CPU") {
+		t.Fatalf("spec-less detail should show the bare name:\n%s", text)
 	}
 }
 
@@ -66,7 +115,7 @@ func TestWorkersHighmemDetailShowsFullSize(t *testing.T) {
 	m := workerRenderModel(true)
 	m.workers.rows[0].w.HostedSize = sp("l-highmem")
 	lines, _ := m.workerDetailLines(time.Now())
-	if !strings.Contains(stripANSI(strings.Join(lines, "\n")), "size l-highmem") {
+	if !regexp.MustCompile(`(?m)^\s+size\s+l-highmem`).MatchString(stripANSI(strings.Join(lines, "\n"))) {
 		t.Fatalf("detail lost the full size:\n%s", stripANSI(strings.Join(lines, "\n")))
 	}
 }

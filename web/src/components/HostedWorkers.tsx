@@ -16,12 +16,16 @@ import { errorMessage } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "./ui";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES } from "../lib/workerTemplates";
-import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeOptionLabel } from "../lib/workerSizes";
+import { DEFAULT_WORKER_SIZE, sizeChoices, sizeOptionLabel, type NamedWorkerSize } from "../lib/workerSizes";
 
-// The size the form starts at: the admin's default when it names a known preset, else the
-// built-in default. An older API omits the field; a newer one may ship a name this build lacks.
-function effectiveDefaultSize(configured: string | undefined): string {
-  return (WORKER_SIZES as readonly string[]).includes(configured ?? "") ? (configured as string) : DEFAULT_WORKER_SIZE;
+// The size the form starts at: the admin's default when it names a size the config lists,
+// else the built-in default when listed, else the first listed size. An older API omits the
+// default (and the list, which then falls back to the builtins).
+function effectiveDefaultSize(configured: string | undefined, sizes: readonly NamedWorkerSize[]): string {
+  const listed = (name: string | undefined) => sizes.some((s) => s.name === name);
+  if (listed(configured)) return configured as string;
+  if (listed(DEFAULT_WORKER_SIZE) || sizes.length === 0) return DEFAULT_WORKER_SIZE;
+  return sizes[0].name;
 }
 
 export function HostedWorkers({
@@ -59,7 +63,10 @@ export function HostedWorkers({
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
   // The admin's default size (HostedConfig.default_size) is applied when the config
   // arrives. The form renders nothing until then, so the user cannot have picked a size yet.
-  const defaultSize = effectiveDefaultSize(config?.default_size);
+  // The sizes come from the same one-shot config read (PRD #4213: they are admin-editable
+  // data), so a freshly mounted form always shows the current quantities.
+  const sizes = sizeChoices(config?.sizes);
+  const defaultSize = effectiveDefaultSize(config?.default_size, sizes);
   // Opt into a Docker-in-Docker sidecar (PRD #83 M3). Off by default: the
   // plain worker is the common case, docker is the extra one you ask for.
   const [docker, setDocker] = useState(false);
@@ -100,7 +107,7 @@ export function HostedWorkers({
       .then((cfg) => {
         if (live) {
           setConfig(cfg);
-          setSize(effectiveDefaultSize(cfg.default_size));
+          setSize(effectiveDefaultSize(cfg.default_size, sizeChoices(cfg.sizes)));
         }
         // manual = enabled AND self-service quota left; anything else is { manual: false }.
         reportAvailability(!!cfg.enabled && cfg.quota > 0);
@@ -217,15 +224,14 @@ export function HostedWorkers({
             <div className="min-w-[18rem]">
               <Field label="Size">
                 <Select aria-label="Hosted worker size" value={size} onChange={(e) => setSize(e.target.value)}>
-                  {WORKER_SIZES.map((s) => (
-                    // "M — up to 4 CPU / 12Gi RAM / 25Gi disk". The quantities are IN the
-                    // option, not in a table elsewhere, because the point is to inform the
-                    // choice at the moment it is made — before M6 this select offered three
-                    // bare letters and a user picking one was picking blind.
+                  {sizes.map((s) => (
+                    // "M — up to 4 CPU / 12Gi RAM / 25Gi disk", from the size's own integers.
+                    // The quantities are IN the option, not in a table elsewhere, because the
+                    // point is to inform the choice at the moment it is made.
                     //
                     // Upper-cased for reading only — the value stays the lowercase wire
                     // spelling, which is the one the api accepts.
-                    <option key={s} value={s}>
+                    <option key={s.name} value={s.name}>
                       {sizeOptionLabel(s)}
                     </option>
                   ))}

@@ -99,6 +99,27 @@ forge:
 issueTracker:
   allowedBaseURLs: []
 
+# --- providers: the operator allowlist for user-defined model providers (PRD #4320) -----
+#
+# Renders into the api's UZI_PROVIDER_ALLOWED_BASE_URLS env. A user may create a provider
+# (an Anthropic-compatible gateway with its own key) only at a base URL that EQUALS one
+# of these entries exactly, path included: https://gateway.example.com/anthropic allows
+# that URL (and the same with a trailing slash) and nothing under or beside it. Each entry
+# must be https; userinfo, a query, a fragment, percent-encoding, a semicolon, a backslash,
+# dot or empty path segments, a comma or whitespace fail the render (the message never
+# echoes the entry); the api re-validates at boot. Empty (the default) turns the feature
+# off. It never feeds the worker egress lists: a worker's network access to the gateway is
+# yours to open, and the api itself must reach the gateway (the Test button dials from the
+# api, directly, ignoring HTTPS_PROXY/HTTP_PROXY, and admits private gateway addresses).
+# The compose-only loopback dev flag (UZI_PROVIDER_ALLOW_LOOPBACK) has no chart value, and
+# setting it in api.config fails the render: in a cluster it would let the probe reach the
+# api's own local ports. Set this
+# per-cluster instead of api.config.UZI_PROVIDER_ALLOWED_BASE_URLS (setting BOTH fails the
+# render, see api-configmap.yaml). A gateway behind a private CA also needs
+# workers.extraCA, which the provider Test probe trusts too (see there).
+providers:
+  allowedBaseURLs: []
+
 # --- releaseCheck: the periodic GitHub release-availability check (PRD #836) -------
 #
 # The api periodically polls GitHub's releases API for vtmocanu/uzi and surfaces an
@@ -509,6 +530,10 @@ workers:
   # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
   # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
   # reprovisioning is still what delivers the CA to it.
+  # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
+  # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
+  # no other api client; the api refuses to boot if the file is unreadable or holds no
+  # certificate, and rolls when the inline pem changes.
   extraCA:
     pem: ""
     configMap:
@@ -534,6 +559,11 @@ workers:
   # owner-authorized exception to the otherwise namespace-only RBAC. Set create to false
   # (for example where a cluster admin owns RBAC) and expansion fails closed: the
   # controller logs class-lookup-forbidden and leaves every existing claim untouched.
+  # The same read lets the controller confirm WaitForFirstConsumer for the paused-restore
+  # bind-timeout exemption (#4468); with it disabled the exemption does not apply, a
+  # waiting paced restore's claims can be reported stranded after the bind timeout, and
+  # that report keeps the restore unadmitted at zero replicas, so its claims cannot bind
+  # and its roll pool stays held until the read is restored or an operator intervenes.
   storageClassRead:
     create: true
 
@@ -727,7 +757,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.15"
+    tag: "0.87.0-rc.18"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -778,6 +808,32 @@ workers:
   # the workers the same way a nodeSelector change does. The controller validates the
   # list at boot. The api, web and controller pods are not affected.
   tolerations: []
+  # An opt-in second placement for moving workers to a new node pool (for example a
+  # dedicated, tainted pool in another storage zone). Off by default: empty renders
+  # no env and nothing changes. When set, the controller stamps a worker volume it
+  # creates with `uzi.dev/placement: new` unless that worker still has an unstamped
+  # volume (a legacy worker's missing volume is recreated unstamped), and ONLY a worker
+  # whose volumes are all stamped uses it; every other worker keeps the global
+  # nodeSelector/tolerations above. Setting it rolls no worker still on the global
+  # placement; changing it, or re-setting it with different values, rolls already-stamped
+  # workers through normal roll admission. A roll does not move their volumes: retarget
+  # only to nodes that can attach every stamped worker's existing volumes; otherwise do
+  # not retarget (the per-worker procedure cannot move already-stamped workers).
+  #
+  # Both fields REPLACE (never merge with) the global ones for such a worker: keep
+  # `kubernetes.io/arch: amd64` in nodeSelector and repeat any global toleration still
+  # needed. A tolerations-only newPlacement renders no nodeSelector at all.
+  #
+  # Moving each worker is a manual, per-worker procedure that permanently deletes its
+  # volumes: see docs/hosted-workers.md "Moving workers to a new node pool". When no
+  # unstamped worker remains, copy newPlacement into workers.nodeSelector and
+  # workers.tolerations FIRST, then clear newPlacement; clearing it earlier sends
+  # stamped workers back to the old nodes. Helm merges maps, so an empty
+  # `nodeSelector: {}` keeps the amd64 default: use `nodeSelector: null` when the new
+  # placement has none, and render the chart to confirm before clearing newPlacement.
+  newPlacement:
+    nodeSelector: {}
+    tolerations: []
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
   # the chart creates the PriorityClass AND the controller stamps its name onto every
   # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
@@ -936,8 +992,9 @@ workers:
   # the same key in api.config or api.secretEnv fails the render.
   ephemeralLease: ~
   # Issue #2412: a run-bound worker needs one run's memory headroom, not a
-  # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
-  # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l, l-highmem; invalid values fail
+  # persistent L worker's two-run budget. The shipped defaults for M reserve 8Gi
+  # instead of 14Gi while both presets request 1 CPU and can burst to 4 CPU
+  # (admins can edit these size quantities under Admin -> Workers, PRD #4213). Valid values: s, m, l, l-highmem; invalid values fail
   # chart rendering. Existing workers keep their stored size; persistent workers
   # still preselect L.
   #
@@ -969,6 +1026,12 @@ workers:
   secretMountPathAllowUnversionedImage: false
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
+  #
+  # The size quantities named in these comments (`l` = 1 CPU / 14Gi and so on) are the
+  # SHIPPED DEFAULTS of the built-in sizes: admins can edit them and define their own
+  # (PRD #4213), and the api validates each against the LimitRange ceilings below, which
+  # the chart hands it as integers (uzi.workerSizeEnv). The budgets below are sized on
+  # the defaults, so re-check them after raising a size.
   #
   # CPU and memory are budgeted on `l` (the persistent default, ADR-2240;
   # ephemeral workers default to the smaller `m`, #2412): 20 workers x 1 CPU
@@ -1037,7 +1100,8 @@ workers:
   # The backstop, never the source: every hosted worker pod arrives from the
   # controller with explicit requests + limits from its size preset.
   #
-  # `max` MUST stay >= the LARGEST preset's limits (l-highmem = 4 CPU / 32Gi) or that preset
+  # `max` MUST stay >= the LARGEST size's limits (the default l-highmem = 4 CPU / 32Gi; an
+  # admin-defined size above `max` is refused by the api) or that size
   # stops being admissible — which would surface as a worker that provisions and never
   # appears. maxPVCStorage likewise >= l's /data (50Gi) and >= ephemeralWorkerDataSize
   # (a run-bound worker's /data, 40Gi).
@@ -1096,9 +1160,15 @@ workers:
     # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
     scratchDeletion: true
     # Default-on per-startup observation records for `.retire-*` retirement scratch parents
-    # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
-    # controller reconciliation; takes effect at the next worker startup.
+    # (they delete nothing; retireScratchReclaim below gates the epoch's retire-scratch phase). false renders
+    # worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after controller reconciliation; takes effect at the
+    # next worker startup.
     retireScratchOutcomes: true
+    # Default-on verified-epoch retire-scratch phase (uid-split Docker workers only): it deletes
+    # no bound `.retire-*` parent and clears the binding of a gone one; unbound parents stay kept; binding writes continue either way. false renders worker
+    # UZI_RETIRE_SCRATCH_RECLAIM=0 after controller reconciliation (a no-op on older worker
+    # images); takes effect at the next worker startup.
+    retireScratchReclaim: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:
@@ -1191,7 +1261,7 @@ workers:
     # ephemeral storage.
     #
     # Sized for the 10 workers deployments advertises. CPU and memory are budgeted on
-    # `l` (persistent default, ADR-2240; ephemeral default `m`, #2412),
+    # the shipped default `l` size (admins can edit sizes, PRD #4213; persistent default, ADR-2240; ephemeral default `m`, #2412),
     # plus all sidecars from render.go/render_dind.go. `l-highmem` (24Gi request, 32Gi
     # limit) is deliberately not fleet-budgeted: it consumes more of this shared budget,
     # a quota hit shows as the Deployment's ReplicaFailure, and operators must check node
@@ -1253,7 +1323,7 @@ workers:
       max:
         cpu: "4"
         memory: 32Gi
-      # FOUR claimants sit at or under this ceiling: `l`'s DataSize (50Gi) exactly,
+      # FOUR claimants sit at or under this ceiling: the default `l` size's DataSize (50Gi) exactly,
       # the DinD data root (per-preset up to 50Gi, exactly at the ceiling for
       # `l`/`l-highmem`, or workers.docker.dindDataSize when set), nixSize and a
       # run-bound worker's /data (20Gi nix; workers.ephemeralWorkerDataSize is 40Gi). Raising any of them
@@ -1388,7 +1458,7 @@ workers:
       node: []
     # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
     # workers are run-bound (one run, then removed). CPU and memory ceilings cover
-    # ten `l` workers from render.go (the ephemeral default is the smaller
+    # ten `l` workers from render.go (the shipped default `l` size; the ephemeral default is the smaller
     # `m`, #2412, but a run may ask for `l`): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
     # `l-highmem` (24Gi request, 32Gi limit) is deliberately not fleet-budgeted: it
     # consumes more of this shared budget, a quota hit shows as the Deployment's
@@ -1402,7 +1472,8 @@ workers:
       requestsStorage: 600Gi
       persistentVolumeClaims: "20"
       deployments: "10"
-    # `max` must stay >= the largest worker preset's limits (l-highmem = 4 CPU / 32Gi).
+    # `max` must stay >= the largest worker size's limits (the default l-highmem = 4 CPU / 32Gi;
+    # admin-defined sizes are validated against it).
     # This lane is run-bound, so maxPVCStorage must admit ephemeralWorkerDataSize and
     # the 20Gi nix claim.
     limitRange:

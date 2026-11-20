@@ -117,6 +117,8 @@
   "own_agents": null,
   "anthropic_secret_id": null,
   "anthropic_secret_label": null,
+  "provider_id": null,
+  "provider_name": null,
   "anthropic_select_reason": null,
   "anthropic_headroom_pct": null,
   "wait_on_limit": false,

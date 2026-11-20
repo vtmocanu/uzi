@@ -720,6 +720,8 @@
   ],
   "anthropic_secret_id": "x",
   "anthropic_secret_label": "x",
+  "provider_id": "x",
+  "provider_name": "x",
   "anthropic_select_reason": "x",
   "anthropic_headroom_pct": 1,
   "usage": {

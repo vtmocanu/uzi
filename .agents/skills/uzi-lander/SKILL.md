@@ -237,7 +237,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    owner acceptance outside the milestones and not ask); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
-   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
+   keep polling (`limit_wait` and `pool_wait` resume on their own, except a provider gateway `limit_wait` with a null `retry_not_before`, which waits for the owner and stops the poller (`STOP=limit_wait:provider_gateway_limit`); a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
    `worker_requeue_exhausted`, `retained_recovery_adoption_failed` and `retained_continuation_unwitnessed` (each regardless of retry timing),
    `worker_memory_pressure` (regardless of remaining interventions),
    `anthropic_spend_limit` (owner Resume after raising the limit, `uzi run set-token` (switchable kinds only; not chat, judge, self_improve or job), or Cancel),
@@ -278,6 +278,14 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
    | 10 | active ci_fix, even with green CI, or recent terminal ci_fix while CI is red | follow *CI-fix branch ownership*; plain red without either remains exit 1 |
    | 12 | `RESULT=gh_rate_limited`: GitHub core or GraphQL allowance exhausted | re-arm after `GH_RETRY_AT`; never treat this as ready, findings, or CodeRabbit quota |
+   | 13 | `--since` observed an author-attention signal | inspect the push, human activity or CI approval request; never merge on this exit |
+
+   When waiting for a contributor, run `S/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA 60 60`.
+   It watches head changes, the PR author's comments/reviews/thread replies after startup,
+   and head CI requiring approval. Pass `--after ISO8601` to use an explicit discussion cutoff,
+   such as your review time. Ignore other humans, bots and edits to older comments; the mode
+   neither requests reviews nor approves CI. Read [review-signals.md](references/review-signals.md)
+   for the watermark and exit contract. Re-arm readiness separately after reviewing the response.
 
    Let an auto-review that is already running finish; never re-trigger it. Greptile skips a
    conflicting PR and a head pushed after its trigger: trigger on the final head. `--reviewer` also

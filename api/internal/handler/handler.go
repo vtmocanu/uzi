@@ -30,10 +30,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
@@ -54,6 +56,11 @@ type Handler struct {
 	vaultUnlockLimiter   *mw.Limiter
 	secretTestOnce       sync.Once
 	secretTestClients    *secretTestClients
+	// providerProbeOnce builds providerProber and providerProbeLimiter on first use (see
+	// providerProbe); a test may pin either before the first call.
+	providerProbeOnce    sync.Once
+	providerProber       *providers.Prober
+	providerProbeLimiter *providers.ProbeLimiter
 	pool                 *pgxpool.Pool
 	q                    *store.Queries
 	cfg                  config.Config
@@ -64,9 +71,26 @@ type Handler struct {
 	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
 	// (PRD #1910 D7). nil in production: New leaves it unset.
 	oauthBeginTx func(ctx context.Context) (pgx.Tx, error)
+	// modelSettingsBeginTx and modelSettingsReadback are test seams of PUT /api/me/model-settings.
+	// A non-nil modelSettingsBeginTx replaces h.pool.Begin, so a LiveDB test can hand the route a
+	// transaction whose Commit reports an error after (or instead of) applying; a non-nil
+	// modelSettingsReadback replaces the post-commit settings read, so a test can fail it. Both
+	// are nil in production: New leaves them unset.
+	modelSettingsBeginTx  func(ctx context.Context) (pgx.Tx, error)
+	modelSettingsReadback func(r *http.Request, userID uuid.UUID) (userSettingsDTO, error)
+	// templatePinsBeginTx and templatePinsReadback are the same kind of test seams for
+	// PUT /api/me/agent-templates/{id}/model-pins (PRD #3264 M3): a non-nil begin replaces
+	// h.pool.Begin, a non-nil readback replaces the post-commit row read. Both nil in production.
+	templatePinsBeginTx  func(ctx context.Context) (pgx.Tx, error)
+	templatePinsReadback func(ctx context.Context, id uuid.UUID) (store.AgentTemplate, error)
 	// secretBeginTx supplies a real transaction for secret mutations in tests.
 	// Production uses pool.BeginTx; withSecretLock enforces READ COMMITTED.
 	secretBeginTx func(ctx context.Context) (pgx.Tx, error)
+	// runEnvHasReceipt, when non-nil, replaces store.RunEnvVersionHasReceipt as the answer to
+	// "does any run hold a delivery receipt for this variable version" (PRD #4416), so a
+	// test can reach the retire and pending-deletion paths before M2 adds receipts. nil in
+	// production.
+	runEnvHasReceipt func(ctx context.Context, varID uuid.UUID, rev int32) (bool, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset
 	// agent-template handlers so their DB touch can be faked in a unit test without a
 	// live database (issue #223). nil in production — New leaves it unset and the
@@ -188,6 +212,9 @@ type Handler struct {
 	// — which is mounted only when WORKER_HOSTING_ENABLED is true, so it stays nil
 	// on a compose stack and in every test that does not exercise hosting.
 	hsvc *hostedsvc.Service
+	// issueTrackers serves the issue tracker connection routes and the repo link
+	// (PRD #4173 M4); set by SetIssueTrackerService. Left unset, those routes answer 503.
+	issueTrackers *issuetrackersvc.Service
 	// usagePoker pokes the rate-limit poller when a user saves/replaces their
 	// Anthropic token (PRD #53 D3b), so their meters appear within seconds instead
 	// of up to a full poll interval; a vault-ready transition pokes every enabled
@@ -349,6 +376,10 @@ type ProjectSyncer interface {
 // github-project-sync routes then return a clean 500 rather than panic.
 func (h *Handler) SetProjectSync(p ProjectSyncer) { h.projectSync = p }
 
+// SetIssueTrackerService wires the issue tracker connection and link service (PRD #4173 M4)
+// after construction. Safe to leave unset: its routes then answer 503 rather than panic.
+func (h *Handler) SetIssueTrackerService(s *issuetrackersvc.Service) { h.issueTrackers = s }
+
 // SetAgentSourceReconciler wires the agent-source reconciler (PRD #602 M4) after
 // construction. Safe to leave unset — the admin agent-source endpoints then return a
 // clean 500 rather than panic (struct-literal test handlers that don't exercise them).
@@ -490,24 +521,30 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 	return h.q
 }
 
-// issueTrackerForRepo builds the issue-tracker half of a repo's forge, going through
-// the injected forgeFactory when one is set and otherwise through
-// forgesvc.Service.IssueTrackerForRepo. It returns a nil issue tracker whenever err != nil,
-// on both paths. nil-safe only when a factory is injected; in production h.svc is
-// always wired.
-func (h *Handler) issueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {
+// issueTrackerForRepo builds the issue-tracker half of a repo's forge for the repo's
+// owner (PRD #4173 DL-5). link is the repo row's issue_tracker_connection_id: the
+// injected forgeFactory test seam is taken only for an unlinked row (a linked row
+// through it is an error, so no test or wiring gap can reach the forge for a linked
+// repo); otherwise forgesvc.Service.IssueTrackerForRepo resolves the row itself. It
+// returns a nil issue tracker whenever err != nil. nil-safe only when a factory is
+// injected; in production h.svc is always wired.
+func (h *Handler) issueTrackerForRepo(ctx context.Context, userID, repoID uuid.UUID, link pgtype.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {
 	if h.forgeFactory != nil {
+		if link.Valid {
+			return nil, forgesvc.ErrLinkedRepoUnresolvable
+		}
 		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	}
-	return h.svc.IssueTrackerForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
+	return h.svc.IssueTrackerForRepo(ctx, userID, repoID)
 }
 
-// codeHostForRepo is issueTrackerForRepo for the code-host half.
-func (h *Handler) codeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
+// codeHostForRepo is issueTrackerForRepo for the code-host half; the link never
+// changes it (S2), so the factory seam is taken for linked rows too.
+func (h *Handler) codeHostForRepo(ctx context.Context, userID, repoID uuid.UUID, _ pgtype.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
 	if h.forgeFactory != nil {
 		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
 		if err != nil {
@@ -515,7 +552,7 @@ func (h *Handler) codeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeTy
 		}
 		return f, nil
 	}
-	return h.svc.CodeHostForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
+	return h.svc.CodeHostForRepo(ctx, userID, repoID)
 }
 
 // memo returns the process-wide forge-view read memo (PRD #1255 M2b), constructing
@@ -642,6 +679,15 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 	// too (PRD #590 M1): the run-now scheduler is nil-safe on the vault (treated as always
 	// unlocked), so a manual self_improve run-now never skips on a vault it cannot see here.
 	scheduler := schedsvc.New(q, wsvc, svc, set, nil, nil, 0, slog.Default())
+	// A manual run-now on an issue or sweep schedule of a repo linked to an issue tracker
+	// resolves its issue side through the same Sources the background scheduler in main.go
+	// gets; without it issueSide fails closed with issuesource.ErrNotWired and the run-now
+	// answers 502 (PRD #4173 DL-5). svc is checked for nil first: a nil *forgesvc.Service
+	// stored in the interface would be non-nil and panic on first use (handler tests
+	// construct a Handler with no forgesvc).
+	if svc != nil {
+		scheduler.SetIssueSources(svc)
+	}
 	scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
 	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
 }
@@ -981,6 +1027,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountAgentRoutes(r)
 		h.mountAdminRoutes(r, forgeLimiter, authLimiter)
 		h.mountForgeRoutes(r, forgeLimiter)
+		h.mountIssueTrackerRoutes(r, forgeLimiter)
 		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
 		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer

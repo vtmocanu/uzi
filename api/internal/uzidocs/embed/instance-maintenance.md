@@ -50,7 +50,7 @@ no burst of Slack nudges is sent for the backlog.
 | Work | While maintenance is on |
 |---|---|
 | A run never claimed before (`claim_generation` 0), of any kind: issue, prompt, sweep, schedule, chat, chat Continue, judge, CI-fix, MR rework, task review and then-fix phases, `/api/v1` job, recovery successor, Slack-created runs and chats | Created as usual and stays `queued`. No worker claims it and no ephemeral pod is started for it. |
-| A run claimed at least once | Keeps going: finishes, resumes after approval, input, follow-up, limit, pool, recovery or wall-clock waits, and may be requeued and re-claimed by any worker that accepts it, an ephemeral replacement included. |
+| A run claimed at least once | Keeps going: finishes, resumes after approval, input, follow-up, limit, pool, recovery or wall-clock waits, and may be requeued and re-claimed by any worker that accepts it, an ephemeral replacement included (a Codex run is re-claimed only by the worker recorded for its current claim, and by none if it has no recorded provenance; see [Codex runs held for their last worker](./run-recovery.md#codex-runs-held-for-their-last-worker)). |
 | A cross-check child | Counts as admitted: it can only be claimed while its lead is claimed or running (or, for a code check, an interactive task lead at `awaiting_followup`). |
 | Persistent workers | Unchanged. They simply find nothing new to claim. |
 

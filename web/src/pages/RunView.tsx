@@ -21,7 +21,7 @@ import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { changedMilestones } from "../lib/milestoneReset";
 import { MilestoneResetHistory } from "./runView/MilestoneResetHistory";
-import { canToggleWaitOnLimit, formatCountdown, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
+import { canToggleWaitOnLimit, formatCountdown, isProviderGatewayLimit, providerGatewayLimitDetail, providerGatewayLimitHeadline, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
 import {
   budgetRightLabel,
   extendBudgetView,
@@ -693,6 +693,7 @@ export function LimitWaitPanel({
   canSteer = true,
   onToggle,
   onStop,
+  onResume,
 }: {
   run: Run;
   busy: boolean;
@@ -709,6 +710,9 @@ export function LimitWaitPanel({
   // was the faintest text on the page (4.56 contrast) and named a control the user
   // then had to hunt for past the whole activity feed.
   onStop: () => void;
+  // PRD #4320: owner Resume of a provider gateway-limit park (the only limit_wait the server lets
+  // its owner resume). Omitted by the settings-disclosure mount, which never shows a parked run.
+  onResume?: () => void;
 }) {
   const parked = run.status === "limit_wait";
   // Only while parked: off the park there is no clock, and a 1s interval running
@@ -778,6 +782,7 @@ export function LimitWaitPanel({
   // tokens can pay for it". Naming a second credential specifically would be a guess —
   // the DTO carries no field saying which leg of the computation won.
   const resumesEarly = hasReset && Number.isFinite(retryMs) && retryMs < resetsMs;
+  const gateway = isProviderGatewayLimit(run.rate_limit_type);
 
   // Seconds on a multi-hour horizon are noise (web-ux nit): toLocaleString() renders
   // "01:37:11" for an instant that is only known to within a poll interval anyway.
@@ -815,10 +820,15 @@ export function LimitWaitPanel({
               which is the kind that stops the next person from checking.) */}
           <p role="status" className="text-sm font-semibold text-warn">
             <span aria-hidden="true">⏸ </span>
-            {`Paused on ${usageLimitPhrase(run.harness)}`}
+            {gateway ? providerGatewayLimitHeadline() : `Paused on ${usageLimitPhrase(run.harness)}`}
           </p>
           <p className="mt-0.5 text-xs text-muted">
-            {countdown ? (
+            {gateway ? (
+              <>
+                {providerGatewayLimitDetail(run.retry_not_before, now)}
+                {attemptClause && ` ${attemptClause}`}
+              </>
+            ) : countdown ? (
               <>
                 Resumes in <span className="tabular-nums text-fg">{countdown}</span>
                 {resumesEarly && windowClause ? (
@@ -833,7 +843,7 @@ export function LimitWaitPanel({
               // into a negative would read as a fault where there is none.
               <>Resuming shortly.{windowClause && ` ${capitalise(windowClause)}.`}</>
             )}
-            {attemptClause && ` ${attemptClause}`}
+            {!gateway && attemptClause && ` ${attemptClause}`}
           </p>
           {/* Keep the recovery limits legible alongside the Stop control. */}
           <p className="mt-1.5 text-xs text-muted">
@@ -849,6 +859,9 @@ export function LimitWaitPanel({
             side they wrap as one unit and stay legible from 390px up. */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {toggle}
+          {gateway && canSteer && onResume && (
+            <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          )}
           {/* Non-owner (#183): no live Stop — inert text stating who can, never a greyed
               button that 404s. Mirrors the PlanPanel/QuestionPanel non-owner branches. */}
           {canSteer ? (
@@ -2573,6 +2586,10 @@ export function RunView() {
               ? "credential_disabled"
             : run?.status === "paused" && run.hold_reason === "credentials_reset"
               ? "credentials_reset"
+            : run?.status === "paused" && run.hold_reason === "provider_destination_not_allowed"
+              ? "provider_destination_not_allowed"
+            : run?.status === "paused" && run.hold_reason === "provider_binding_stale"
+              ? "provider_binding_stale"
             : run?.status === "paused" && run.hold_reason === "credential_switch_settling"
               ? "credential_switch_settling"
             : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
@@ -2649,6 +2666,10 @@ export function RunView() {
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
             : parkKey === "credentials_reset"
               ? "The run is waiting because your account's credentials were reset. Add a credential in Settings and the run resumes automatically."
+            : parkKey === "provider_destination_not_allowed"
+              ? "The operator no longer allows this run's provider URL. The run waits for the operator to allow the URL again and then continues by itself. Resume is not available; you can Cancel the run."
+            : parkKey === "provider_binding_stale"
+              ? "The run's provider or its key changed after the run was created, so it cannot continue. Resume is not available. Cancel the run and start a new one, which uses the current key."
             : parkKey === "base_attestation_missing"
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "repo_agent_source_unavailable"
@@ -3041,7 +3062,8 @@ export function RunView() {
               <RunHarnessDecision run={run} />
               {/* Only a requested or released switch adds a second token chip. The
                   stored choice and applied history live in Run settings. */}
-              {(run.credential_switch === "requested" || run.credential_switch === "released") && (
+              {/* A provider run spends no Anthropic token and the server refuses credential switches on it. */}
+              {!run.provider_id && (run.credential_switch === "requested" || run.credential_switch === "released") && (
                 <RunCredentialOverride run={run} />
               )}
               {settingsStates.map(state => <Badge key={state} tone="neutral">{state}</Badge>)}
@@ -3312,6 +3334,11 @@ export function RunView() {
             busy={busy}
             canSteer={canSteer}
             onStop={() => cancelRun()}
+            onResume={() => act(async (isCurrent) => {
+              const requestRunId = run.id;
+              await api.resumeRun(requestRunId);
+              if (isCurrent()) await refreshRun();
+            })}
             onToggle={(enabled) =>
               act(async () => {
                 await api.setRunWaitOnLimit(run.id, enabled);
@@ -3549,7 +3576,7 @@ export function RunView() {
           {/* PRD #1429 M4b (D7): the server-truthed per-run cost_status, distinct from
               the client-derived `usage` above — "" on a pre-M1 run reads defensively
               as cost-unavailable inside the panel, never as a complete $0. */}
-          <RunUsagePanel usage={usage} costStatus={run.usage?.cost_status ?? ""} harness={run.harness} />
+          <RunUsagePanel usage={usage} costStatus={run.usage?.cost_status ?? ""} harness={run.harness} provider={!!run.provider_id} />
         </Card>
       )}
 

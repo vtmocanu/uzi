@@ -36,7 +36,7 @@ const EXACT_SITES: Record<string, Site[]> = {
     { label: "seed: the flight SecretSet", line: "claim.secrets.anthropic_oauth_token,", count: 1 },
     { label: "seed: the CredentialHolder", line: "credential: claim.secrets.anthropic_oauth_token", count: 1 },
     { label: "seed: the CredentialHolder", line: "? new CredentialHolder({ token: claim.secrets.anthropic_oauth_token, ordinal: 0 }) : undefined,", count: 1 },
-    { label: "presence flag only (no value used)", line: "claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,", count: 1 },
+    { label: "presence flag only (no value used; a provider claim is Claude too)", line: "claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.provider),", count: 1 },
     { label: "seed: the context's initial token (rebound by the helper)", line: "oauthToken: claim.secrets.anthropic_oauth_token,", count: 1 },
     { label: "rebind: the helper points the context at the holder", line: "ctx.oauthToken = flight.credential!.current().token;", count: 1 },
     { label: "the editor pass's claim view built from the holder", line: "? { ...claim, secrets: { ...claim.secrets, anthropic_oauth_token: descCredential.token } }", count: 1 },
@@ -46,10 +46,11 @@ const EXACT_SITES: Record<string, Site[]> = {
     { label: "plan summary: credentialFor snapshot", line: 'const cred = this.credentialFor(ctx, ctx.oauthToken ?? "");', count: 1 },
     { label: "drive rebind", line: "drive.state.rebindDrive = (token) => { drive.oauthToken = token; };", count: 1 },
     { label: "phaseSetup reads the (rebound) context at drive start", line: "const oauthToken = ctx.oauthToken?.trim();", count: 1 },
-    { label: "phaseSetup reads the (rebound) context at drive start", line: "if (!oauthToken) {", count: 1 },
-    { label: "phaseSetup reads the (rebound) context at drive start", line: "const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir);", count: 1 },
-    { label: "drive carrier fields", line: "oauthToken,", count: 2 },
-    { label: "drive carrier fields", line: "!!oauthToken &&", count: 1 },
+    { label: "phaseSetup reads the (rebound) context at drive start (a provider run has no token)", line: "if (!oauthToken && !ctx.provider) {", count: 1 },
+    { label: "phaseSetup builds the SdkCredential: the provider binding, else the OAuth token", line: 'const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };', count: 1 },
+    { label: "drive carrier fields", line: 'oauthToken: oauthToken ?? "",', count: 1 },
+    { label: "drive carrier fields", line: "oauthToken,", count: 1 },
+    { label: "summaries are on for an OAuth token or a provider binding", line: "(!!oauthToken || !!ctx.provider) &&", count: 1 },
     { label: "intent summary: credentialFor snapshot", line: "const cred = this.credentialFor(ctx, oauthToken);", count: 1 },
     { label: "rebindCredential", line: "const token = (ctx.credential?.().token ?? ctx.oauthToken)?.trim();", count: 1 },
     { label: "rebindCredential", line: "ctx.oauthToken = token;", count: 1 },
@@ -57,22 +58,23 @@ const EXACT_SITES: Record<string, Site[]> = {
   // The delivery editor pass reads its token from the claim VIEW the runner builds from the holder at the
   // publication's start (runner.ts `descClaim`).
   "summary-runner.ts": [
-    { label: "claim view type", line: "readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown };", count: 1 },
+    { label: "claim view type", line: "readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown; readonly provider?: ClaimProviderBinding };", count: 1 },
     { label: "the editor pass's token, from the holder-built claim view", line: "const token = claim.secrets.anthropic_oauth_token?.trim();", count: 1 },
   ],
   // Pure types and the redaction-secret list (no model call is made with the value).
   "executor.ts": [{ label: "type", line: "oauthToken?: string;", count: 1 }],
-  "sdk-env.ts": [
-    { label: "env builder parameter", line: "oauthToken: string,", count: 1 },
-    { label: "env builder value", line: "CLAUDE_CODE_OAUTH_TOKEN: oauthToken,", count: 1 },
-  ],
   "protocol.ts": [
     { label: "type", line: "anthropic_oauth_token?: string;", count: 1 },
     { label: "type", line: "anthropic_oauth_token: string;", count: 1 },
   ],
   "diagram-diagnostic.ts": [
-    { label: "claim type", line: "secrets: { anthropic_oauth_token?: string; codex?: unknown };", count: 1 },
-    { label: "redaction list", line: "const secrets = [claim.secrets.anthropic_oauth_token, ...extraSecrets];", count: 1 },
+    { label: "claim type", line: "secrets: { anthropic_oauth_token?: string; codex?: unknown; provider?: { credential: string } };", count: 1 },
+    { label: "redaction list", line: "const secrets = [claim.secrets.anthropic_oauth_token, claim.secrets.provider?.credential, ...extraSecrets];", count: 1 },
+  ],
+  // The fail-closed provider decoder (PRD #4320): reads the OAuth token only to refuse a binding next to it.
+  "provider-binding.ts": [
+    { label: "decoder: the exclusivity check reads the token", line: "const oauth = secrets.anthropic_oauth_token;", count: 1 },
+    { label: "decoder: the refusal names the field", line: 'if (oauth !== undefined && oauth !== null && oauth !== "") throw new ProviderBindingError("provider next to an anthropic_oauth_token");', count: 1 },
   ],
   "now-summary.ts": [],
 };

@@ -138,6 +138,11 @@ type Materializer struct {
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
 	// which live in this package.
 	now func() time.Time
+	// refusals is this tick's per-worker size refusals / PVC rejections (PRD #4213),
+	// reset at the start of every Reconcile and read by the fleet report. See
+	// recordRefusal.
+	refusalMu sync.Mutex
+	refusals  map[string]reconcile.Refusal
 }
 
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
@@ -146,6 +151,44 @@ type Materializer struct {
 // recycle carries the M4 disk self-heal toggle + cooldown (see RecyclePolicy).
 func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, drain DrainPolicy, recycle RecyclePolicy, log *slog.Logger) *Materializer {
 	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, recycle: recycle, log: log, now: time.Now}
+}
+
+// resolveWorker is the ONE place a desired worker becomes a preset.Spec (PRD #4213):
+// it uses the integers the api sent on DesiredWorker.Resources when present, else the
+// compiled-in builtin for the size name. Every render, hash and PVC-size path goes
+// through it, so a size edit reaches the pod template, the spec-hash and the claims
+// identically; resolve_guard_test.go fails the build on any other resolver.Resolve call.
+func (m *Materializer) resolveWorker(w protocol.DesiredWorker) (preset.Spec, error) {
+	var res *preset.Resources
+	if r := w.Resources; r != nil {
+		res = &preset.Resources{
+			CPURequestMillicores: r.CPURequestMillicores,
+			CPULimitMillicores:   r.CPULimitMillicores,
+			MemoryRequestMiB:     r.MemoryRequestMiB,
+			MemoryLimitMiB:       r.MemoryLimitMiB,
+			DataGiB:              r.DataGiB,
+			DinDDataGiB:          r.DinDDataGiB,
+		}
+	}
+	spec, err := m.resolver.ResolveDesired(w.Template, w.Size, res)
+	if err != nil {
+		var invalid *preset.InvalidResourcesError
+		if errors.As(err, &invalid) {
+			err = &RefusedError{Reason: fmt.Sprintf("size refused: invalid %s %d", invalid.Field, invalid.Value)}
+		}
+	} else {
+		err = m.checkSizeCeilings(w, spec)
+	}
+	if err != nil {
+		var refused *RefusedError
+		if errors.As(err, &refused) {
+			// Recorded here, at the one resolve seam, so every call site (render, roll
+			// planning, drain, migration, claim expansion) reports the same refusal.
+			m.recordRefusal(w.ID, protocol.BlockingKindSizeRefused, refused.Reason)
+		}
+		return preset.Spec{}, err
+	}
+	return spec, nil
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -183,6 +226,10 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 		pods:                map[string][]corev1.Pod{},
 		blocked:             map[string]bool{},
 		deploymentNamespace: map[string]string{},
+		deployments:         map[string]*appsv1.Deployment{},
+		dataClaims:          map[string]*corev1.PersistentVolumeClaim{},
+		claimMounts:         map[string]bool{},
+		incomplete:          map[string]bool{},
 	}
 	for _, ns := range namespaces {
 		if err := m.observeNamespace(ctx, ns, byID, deploymentCounts, &capacityEvidence); err != nil {
@@ -190,8 +237,10 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 		}
 	}
 
+	classCache := map[string]bool{}
 	out := make([]reconcile.ObservedWorker, 0, len(byID))
 	for _, o := range byID {
+		o.TimeoutDeferredClaims = m.timeoutDeferredClaims(ctx, o, &capacityEvidence, deploymentCounts[o.ID], classCache)
 		// Capacity uniqueness is proved only after every configured namespace fold.
 		recordSchedulerCapacity(o, capacityEvidence.pods[o.ID], capacityEvidence.deploymentNamespace[o.ID], capacityEvidence.podListFailed || capacityEvidence.blocked[o.ID] || deploymentCounts[o.ID] != 1)
 		out = append(out, *o)
@@ -225,11 +274,21 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 		}
 		var timedOut []target
 		for _, t := range targets {
+			// A direct-field claim whose bind-timeout is deferred (paused restore) falls
+			// through to the namespace-qualified scan below, which skips deferred keys.
+			if t.phase == string(corev1.ClaimPending) && t.created != nil && len(w.TimeoutDeferredClaims) > 0 {
+				for _, claim := range w.SchedulerPendingClaims {
+					if claim.Name == t.name && claim.CreatedAt.Equal(*t.created) && w.TimeoutDeferredClaims[claim.Namespace+"/"+claim.Name] {
+						t.phase, t.created = "", nil
+						break
+					}
+				}
+			}
 			// A later namespace fold may hide an older Pending claim of the same
 			// name. Retain legacy volume priority while checking every observed claim.
 			if t.phase != string(corev1.ClaimPending) || t.created == nil || m.now().Sub(*t.created) < pvcBindTimeout {
 				for _, claim := range w.SchedulerPendingClaims {
-					if claim.Name == t.name && m.now().Sub(claim.CreatedAt) >= pvcBindTimeout {
+					if claim.Name == t.name && m.now().Sub(claim.CreatedAt) >= pvcBindTimeout && !w.TimeoutDeferredClaims[claim.Namespace+"/"+claim.Name] {
 						t.phase, t.created = string(corev1.ClaimPending), &claim.CreatedAt
 						break
 					}
@@ -250,7 +309,7 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 		}
 		capacity := w.SchedulerCapacityReason != ""
 		for _, claim := range w.SchedulerPendingClaims {
-			if m.now().Sub(claim.CreatedAt) < pvcBindTimeout {
+			if m.now().Sub(claim.CreatedAt) < pvcBindTimeout || w.TimeoutDeferredClaims[claim.Namespace+"/"+claim.Name] {
 				continue
 			}
 			if !w.SchedulerMountedClaims[claim.Namespace+"/"+claim.Name] {
@@ -306,6 +365,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	if err != nil {
 		return fmt.Errorf("list deployments in %s: %w", ns, err)
 	}
+	if deployments.Continue != "" {
+		capacityEvidence.incomplete[ns] = true
+	}
 	for i := range deployments.Items {
 		d := &deployments.Items[i]
 		id, ours := IsOurs(d.Labels)
@@ -316,6 +378,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o := get(id)
 		deploymentCounts[id]++
 		capacityEvidence.deploymentNamespace[id] = ns
+		capacityEvidence.deployments[id] = d
 		o.HasDeployment = true
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
@@ -356,6 +419,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims in %s: %w", ns, err)
 	}
+	if pvcs.Continue != "" {
+		capacityEvidence.incomplete[ns] = true
+	}
 	for i := range pvcs.Items {
 		p := &pvcs.Items[i]
 		id, ours := IsOurs(p.Labels)
@@ -369,11 +435,22 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// flight would otherwise read the doomed volume's size as live. Compute the flag
 		// once and let each case decide what it means for that claim.
 		terminating := p.DeletionTimestamp != nil
+		if terminating && (p.Name == dataPVCName(id) || p.Name == nixPVCName(id) || p.Name == dindDataPVCName(id)) {
+			if o.TerminatingClaims == nil {
+				o.TerminatingClaims = map[string]bool{}
+			}
+			o.TerminatingClaims[ns+"/"+p.Name] = true
+		}
 		if !terminating && p.Status.Phase == corev1.ClaimPending && (p.Name == nixPVCName(id) || p.Name == dataPVCName(id) || p.Name == dindDataPVCName(id)) {
-			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time})
+			class := ""
+			if p.Spec.StorageClassName != nil {
+				class = *p.Spec.StorageClassName
+			}
+			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time, StorageClassName: class})
 		}
 		switch p.Name {
 		case dataPVCName(id):
+			capacityEvidence.dataClaims[ns+"/"+p.Name] = p
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
 			dataClaim := claimObservationOf(ns, id, p)
 			o.DataClaim = &dataClaim // any state, Terminating included (issue #3890)
@@ -432,6 +509,11 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			"namespace", ns, "error", err)
 		return nil
 	}
+	if pods.Continue != "" {
+		// An incomplete pod list cannot prove the absence of a consumer.
+		capacityEvidence.incomplete[ns] = true
+	}
+	recordClaimMounts(capacityEvidence, ns, pods.Items)
 	byWorker := map[string][]corev1.Pod{}
 	// claimUsers maps a PVC claim name to the uids of every pod in the namespace, labelled
 	// or not, that mounts it: a writer the worker's own label never shows (hibernation
@@ -665,6 +747,7 @@ func (m *Materializer) flagOrphan(kind, name, ns string) {
 // FULL desired list, before anything is resolved or rendered, so no later failure
 // can silently shrink it.
 func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.DesiredWorker, observed []reconcile.ObservedWorker) error {
+	m.resetRefusals()
 	// Pass 1: the desired set. EVERY id, unconditionally — no resolve, no render, no
 	// error can remove one from here.
 	desiredIDs := make(map[string]bool, len(desired))
@@ -688,6 +771,10 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	for _, o := range observed {
 		observedByID[o.ID] = o
 	}
+
+	// Freeze each worker's placement decision from THIS tick's observation, before any
+	// PVC is created or deleted below, so every render in the tick agrees.
+	ctx = context.WithValue(ctx, placementTickKey{}, m.placementDecisions(desired, observedByID))
 
 	var errs []error
 	tick, order := m.planRoll(ctx, desired, observedByID)
@@ -718,11 +805,20 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				continue // Unknown mutations require a new observation before sibling work.
 			}
 			if !e.admitted {
-				// Independent fenced maintenance is allowed even while image admission waits.
+				// Independent fenced maintenance and mutation-free wake settlement
+				// are allowed even while image admission waits.
 				if ns, err := m.cfg.Placement(w); err == nil {
-					if spec, err := m.resolver.Resolve(w.Template, w.Size); err == nil {
+					if spec, err := m.resolveWorker(w); err == nil {
 						if e.blocked == "" {
-							if _, err := m.reconcileDinD(ctx, w, obs, ns, spec); err != nil {
+							var err error
+							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
+								// The wake's own mutation guard still requires e.admitted.
+								// A ready participant needs only to report settlement.
+								err = m.hibernateWake(ctx, w, e.o, ns, spec)
+							} else {
+								_, err = m.reconcileDinD(ctx, w, obs, ns, spec)
+							}
+							if err != nil {
 								uncertain[key] = true
 								errs = append(errs, err)
 							}
@@ -942,8 +1038,38 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 }
 
 // ensurePVCs creates each of the worker's claims the observation says is missing,
-// treating AlreadyExists as success. It never deletes or resizes anything.
-func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
+// treating AlreadyExists as success unless newPlacement is set, where it reports deferred
+// (see below). It never deletes or resizes anything.
+//
+// With newPlacement set, new claims are stamped uzi.dev/placement=new only when the
+// worker's tick decision says stamped (no claim exists, or every existing one is
+// stamped). A Terminating claim holds back every create: during a staggered deletion the
+// decision counts the Terminating claim, so a create made now could be UNSTAMPED, and
+// that unstamped replacement would pin the worker to the legacy placement for good.
+// Inconsistent presence evidence also defers: never mint claims using a placement
+// decision that counted a claim now marked absent. A fresh tick must decide from
+// the current claim set.
+func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) (deferred bool, err error) {
+	placementSet := m.cfg.NewPlacementSet()
+	stamp := false
+	if placementSet {
+		for _, c := range []struct {
+			has   bool
+			claim *reconcile.ClaimObservation
+		}{
+			{obs.HasDataPVC, obs.DataClaim},
+			{obs.HasNixPVC, obs.NixClaim},
+			{obs.HasDinDDataPVC, obs.DinDClaim},
+		} {
+			if !c.has && c.claim != nil {
+				return true, nil
+			}
+			if c.has && c.claim != nil && c.claim.Terminating {
+				return false, nil
+			}
+		}
+		stamp = m.placementStampedFor(ctx, w, obs)
+	}
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
 		switch pvc.Name {
 		case dataPVCName(w.ID):
@@ -959,15 +1085,30 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 				continue
 			}
 		}
+		if stamp {
+			if pvc.Annotations == nil {
+				pvc.Annotations = map[string]string{}
+			}
+			pvc.Annotations[AnnotationPlacement] = placementNew
+		}
 		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+			m.recordPVCRejection(w.ID, pvc.Name, err)
+			return false, fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+		}
+		if err != nil && placementSet {
+			// AlreadyExists does not prove the existing claim carries the stamp we
+			// attempted, and this tick's decision was made without it. Defer further
+			// provisioning (no more claims or Deployment render) until the next
+			// observation decides placement.
+			m.log.Info("pvc already exists but is not attributed to the worker; deferring", "worker_id", w.ID, "pvc", pvc.Name)
+			return true, nil
 		}
 		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
 			m.recordEpochMint(ctx, w.ID, created)
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // withinRecycleCooldown reports whether the worker's disk volumes were minted too
@@ -1015,8 +1156,15 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		return nil
 	}
 
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
+		if IsRefused(err) {
+			// Same posture as an unknown preset: render nothing, touch nothing, keep the
+			// worker desired. The reason reaches the fleet report via recordRefusal.
+			m.log.Warn("desired worker's size is refused; skipping its RENDER only (its existing objects are deliberately left alone)",
+				"worker_id", w.ID, "reason", err.Error())
+			return nil
+		}
 		if preset.IsUnknown(err) {
 			// Log and skip RENDERING. The worker stays desired (see Reconcile's contract),
 			// so its existing objects are untouched and it is picked up the moment this
@@ -1054,8 +1202,17 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// may scale a parked worker or delete its volumes. The claims are still created if
 	// missing, and the Secret above is never touched.
 	if w.Hibernation != nil {
-		if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
+		deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec)
+		if err != nil {
 			return err
+		}
+		if deferred {
+			// Claim attribution blocks provisioning and wake, not the guarded stop
+			// of a Deployment we already own. Never create or retarget one here.
+			if obs.HasDeployment && w.Hibernation.State == protocol.HibernationPreparing {
+				return m.reconcileHibernation(ctx, w, obs, ns, spec)
+			}
+			return nil
 		}
 		// A worker with no Deployment is placed only over claims live at the render
 		// size (deploymentPlacementBlocked), so an undersized retained claim must be
@@ -1133,7 +1290,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// The dind data root (issue #224 M-a) is a THIRD claim, and only for a docker worker:
 	// RenderPVCs emits it only when w.Docker, so this loop never sees it for a plain one
 	// and its gate cannot mis-fire there.
-	if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
+	if deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec); deferred || err != nil {
 		return err
 	}
 
@@ -1145,7 +1302,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	}
 
 	// The Deployment.
-	dep := RenderDeployment(m.cfg, w, spec)
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	if e := rollFrom(ctx, w.ID); e != nil {
 		dep = e.target.DeepCopy()
 	}

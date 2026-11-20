@@ -238,9 +238,11 @@ func detailSuffix(detail string) string {
 // isPackageSentinel reports whether err is one of this package's fixed
 // sentinels; only those may stay in an error chain.
 func isPackageSentinel(err error) bool {
-	for _, s := range packageSentinels {
-		if err == s {
-			return true
+	for _, list := range [][]error{packageSentinels, listingCeilings} {
+		for _, s := range list {
+			if err == s {
+				return true
+			}
 		}
 	}
 	return false

@@ -512,6 +512,142 @@ html[data-pinned-block] {
   }
 }
 
+/* Sidebar icon motion (issue #4510): opt-in, one-shot SVG part animations for the sidebar's
+   13 top-level destinations (sidebarMotion.tsx supplies the glyphs and toggles `nm-play` on a
+   row's svg from hover, keyboard focus and click). This section is deliberately UNLAYERED so
+   it is not outranked by Tailwind's layered utilities. Every rule sits inside the
+   no-preference media query AND under the root `data-motion="on"` attribute (stamped from the
+   user's Appearance setting), so with the setting off, or under prefers-reduced-motion,
+   nothing here matches and no animation runs; turning the setting off, or reduced motion on,
+   mid-flight cancels a play in progress. All animations are finite and use fill-mode none:
+   after the last frame the svg is back to its plain rest glyph. Each icon's total (parts,
+   repeats, delays) is 0.7s to 1.8s. Only svg parts move; the icon's wrapper span and the
+   collapsed-rail dots never transform. Where a glyph has a moving copy (class nm-orig hides
+   the original, the copy starts identical), nothing is drawn twice. Accent colour comes from
+   here, never from an SVG attribute: rgb(var(--brand)). */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes nm-hide { from, to { opacity: 0; } }
+  @keyframes nm-show { from, to { opacity: 1; } }
+  /* Inline svgs keep the UA overflow:hidden; parts that travel past the 24px box (chat pop,
+     findings legs, docs ribbon) must not clip at their peak. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play { overflow: visible; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="overview"] { --nm-d: 1100ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] { --nm-d: 830ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="runs"] { --nm-d: 1700ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="schedules"] { --nm-d: 1800ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="chat"] { --nm-d: 700ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="agents"] { --nm-d: 800ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] { --nm-d: 900ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] { --nm-d: 1660ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="judge"] { --nm-d: 1220ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="settings"] { --nm-d: 1600ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="admin"] { --nm-d: 1600ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="docs"] { --nm-d: 1500ms; }
+
+  /* Pressed: the whole svg dips for 60ms; part animations are on its children. */
+  :root[data-motion="on"] a:active svg[data-nav-motion] { transform: scale(.86); transition: transform 60ms; }
+
+  /* Overview 1100ms ease-out: the doorway fills with the accent, then fades back. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="overview"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="overview"] .nm-door { animation: nm-door var(--nm-d) cubic-bezier(.2, .8, .2, 1); }
+  @keyframes nm-door {
+    0%, 100% { opacity: 1; fill: transparent; stroke: currentColor; }
+    30%, 65% { opacity: 1; fill: rgb(var(--brand)); stroke: rgb(var(--brand)); }
+  }
+
+  /* Repos 830ms spring: one board column dips, the other stretches (copies; the joined original hides). */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] .nm-col-a { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-col-a var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] .nm-col-b { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-col-b var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
+  @keyframes nm-col-a { 0%, 100% { opacity: 1; } 50% { opacity: 1; transform: translateY(2px); } }
+  @keyframes nm-col-b { 0%, 100% { opacity: 1; } 50% { opacity: 1; transform: translateY(-2px) scaleY(1.3); } }
+
+  /* Runs 1700ms ease-in-out: the activity line retraces (a pathLength=1 copy). */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="runs"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="runs"] .nm-trace { stroke-dasharray: 1 2; animation: nm-trace var(--nm-d) cubic-bezier(.45, 0, .25, 1); }
+  @keyframes nm-trace {
+    from { opacity: 1; stroke-dashoffset: 1; }
+    to { opacity: 1; stroke-dashoffset: 0; }
+  }
+
+  /* Findings 3 x 260ms: each side's legs rock; the body never moves. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="findings"] .nm-legs-l { transform-box: fill-box; transform-origin: 100% 50%; animation: nm-leg-l 260ms ease-in-out 3; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="findings"] .nm-legs-r { transform-box: fill-box; transform-origin: 0% 50%; animation: nm-leg-r 260ms ease-in-out 3; }
+  @keyframes nm-leg-l { 50% { transform: rotate(14deg); } }
+  @keyframes nm-leg-r { 50% { transform: rotate(-14deg); } }
+
+  /* Schedules 1800ms, 12 steps: the minute hand makes one turn; the hour hand holds still. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="schedules"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="schedules"] .nm-hour { animation: nm-show var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="schedules"] .nm-minute { transform-box: view-box; transform-origin: 12px 12px; animation: nm-show var(--nm-d) linear, nm-minute var(--nm-d) steps(12, end); }
+  @keyframes nm-minute { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  /* Chat 700ms spring: the bubble pops and tilts from its tail corner. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="chat"] .nm-bubble { transform-box: view-box; transform-origin: 3px 21px; animation: nm-pop var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
+  @keyframes nm-pop { 0%, 100% { transform: none; } 45% { transform: scale(1.12) rotate(-6deg); } }
+
+  /* Agents 800ms spring: the antenna bobs, both eyes blink. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="agents"] .nm-antenna { animation: nm-bob var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="agents"] .nm-eye { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-blink var(--nm-d) ease-in-out; }
+  @keyframes nm-bob { 40% { transform: translateY(-2px); } }
+  @keyframes nm-blink { 40%, 60% { transform: scaleY(.1); } }
+
+  /* Skills 900ms spring: the big sparkle twists, the small ones twinkle (the second 190ms late). */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-star { transform-box: view-box; transform-origin: 12px 12px; animation: nm-twist var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-mini { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-twinkle var(--nm-d) ease-in-out; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-mini2 { animation-name: nm-twinkle2; }
+  @keyframes nm-twist { 50% { transform: rotate(25deg) scale(1.1); } }
+  /* Both copies span the whole 900ms (the original is hidden that long); the second twinkles
+     190ms after the first, so it holds still until 21%. */
+  @keyframes nm-twinkle { 0%, 79%, 100% { opacity: 1; transform: none; } 24% { opacity: .2; transform: scale(.5); } 55% { opacity: 1; transform: scale(1.3); } }
+  @keyframes nm-twinkle2 { 0%, 21%, 100% { opacity: 1; transform: none; } 45% { opacity: .2; transform: scale(.5); } 76% { opacity: 1; transform: scale(1.3); } }
+
+  /* Workers 2 x 830ms: the two rack LEDs blink in the accent, one after the other. The
+     original LED path hides for the whole play; each copy runs the full duration (the delay is
+     in its keyframes) and is always drawn: accent and wider in its own half, plain otherwise. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led1 { animation: nm-led1 var(--nm-d) steps(1, end); }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led2 { animation: nm-led2 var(--nm-d) steps(1, end); }
+  @keyframes nm-led1 {
+    0%, 49.9% { opacity: 1; stroke: rgb(var(--brand)); stroke-width: 4; }
+    50%, 100% { opacity: 1; stroke: currentColor; stroke-width: 2; }
+  }
+  @keyframes nm-led2 {
+    0%, 49.9% { opacity: 1; stroke: currentColor; stroke-width: 2; }
+    50%, 99.9% { opacity: 1; stroke: rgb(var(--brand)); stroke-width: 4; }
+    100% { opacity: 1; stroke: currentColor; stroke-width: 2; }
+  }
+
+  /* Judge 1220ms damped: the beam and both pans tilt left, right, then settle; the post holds. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="judge"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="judge"] .nm-post { animation: nm-show var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="judge"] .nm-beam-bar { animation: nm-show var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="judge"] .nm-beam { transform-box: view-box; transform-origin: 12px 5px; animation: nm-weigh var(--nm-d) cubic-bezier(.2, .8, .2, 1); }
+  @keyframes nm-weigh { 25% { transform: rotate(-8deg); } 60% { transform: rotate(5deg); } 85% { transform: rotate(-2deg); } }
+
+  /* Settings 1600ms ease-in-out: the gear turns a quarter. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="settings"] .nm-gear { transform-box: view-box; transform-origin: 12px 12px; animation: nm-turn var(--nm-d) cubic-bezier(.45, 0, .25, 1); }
+  @keyframes nm-turn { to { transform: rotate(90deg); } }
+
+  /* Admin: the shield swells for 1400ms while a check draws over it and fades, 1600ms in all. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="admin"] .nm-shield { transform-box: view-box; transform-origin: 12px 12px; animation: nm-guard 1400ms cubic-bezier(.45, 0, .25, 1); }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="admin"] .nm-check { stroke-dasharray: 1 2; animation: nm-check var(--nm-d) cubic-bezier(.45, 0, .25, 1); }
+  @keyframes nm-guard { 45% { transform: scale(1.1); } }
+  @keyframes nm-check {
+    0% { opacity: 1; stroke-dashoffset: 1; }
+    60% { opacity: 1; stroke-dashoffset: 0; }
+    100% { opacity: 0; stroke-dashoffset: 0; }
+  }
+
+  /* Docs 1500ms ease-in-out: an accent ribbon drops from the top edge, then tucks back. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="docs"] .nm-ribbon { fill: rgb(var(--brand)); stroke: rgb(var(--brand)); stroke-width: 1.5; animation: nm-ribbon var(--nm-d) cubic-bezier(.45, 0, .25, 1); }
+  @keyframes nm-ribbon {
+    0%, 100% { opacity: 0; transform: translateY(-6px); }
+    30%, 70% { opacity: 1; transform: translateY(0); }
+  }
+}
+
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
    consistent with the dark theme — the @tailwindcss/typography plugin is not a
    dependency. Interactive/asset elements (a, img, table) are handled in

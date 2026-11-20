@@ -146,6 +146,21 @@ no durable redelivery. A crash or dropped DM can therefore lose an alert; API
 replicas observing the same change can send duplicates. This is notification
 only: it does not promote a parked run, switch accounts or change a resume time.
 
+## A custom provider's gateway rate limit
+
+A run that uses a [custom model provider](providers.md) has no subscription window to wait on. If its gateway keeps answering 429 or overloaded, the run parks as `limit_wait` with the reason "provider gateway limit" and retries on a fixed schedule instead of a reset time:
+
+| Gateway parks since you last resumed the run | The run retries |
+|---|---|
+| first | 1 minute later |
+| second | 5 minutes later |
+| third | 15 minutes later |
+| fourth and later | never on its own; it waits for you |
+
+uzi shows the retry time, or "waiting for you to resume" once automatic retries stop. It never shows a subscription reset time, and it does not read or change your Claude token pool. **Resume** (web, `uzi run resume`) re-queues the run from any of these parks and starts the schedule over; **Cancel** ends it. The wait for you has no time limit, and the retry budget and maximum park (`RUN_LIMIT_MAX_WAITS`, `RUN_LIMIT_MAX_PARK`) do not apply to it. A run set not to wait out limits fails instead of parking. Provider chats never park: the gateway error is shown in the chat.
+
+Resume applies only to this kind of park. A subscription `limit_wait` still resumes on its own.
+
 ## Not the same as waiting for a pooled token or an empty model turn
 
 A **`limit_wait`** pause (this page), a **`pool_wait`** hold and a

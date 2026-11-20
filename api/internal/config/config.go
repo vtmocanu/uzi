@@ -23,9 +23,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
-	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 )
 
 // defaultDBMaxConns is the pgx pool size when neither DB_MAX_CONNS nor the DATABASE_URL
@@ -195,6 +196,20 @@ type Config struct {
 	// tracker host. EMPTY by default, which means no connection can be created:
 	// IssueTrackerBaseURLAllowed is false for every URL.
 	IssueTrackerAllowedBaseURLs []string
+	// ProviderAllowedBaseURLs is the operator allowlist of exact model-provider base URLs, WITH
+	// path (PRD #4320, UZI_PROVIDER_ALLOWED_BASE_URLS). Entries are normalized by
+	// providers.NormalizeBaseURL; a provider URL matches only an equal entry (no prefix or segment
+	// matching). Empty or unset means the feature is off: no provider can be created.
+	ProviderAllowedBaseURLs []string
+	// ProviderAllowLoopback (UZI_PROVIDER_ALLOW_LOOPBACK, default false) is the explicit dev flag
+	// that lets a loopback host, and http for it, appear in the allowlist and in a provider URL.
+	ProviderAllowLoopback bool
+	// ProviderExtraCAFile (UZI_PROVIDER_EXTRA_CA_FILE) is the path of an extra PEM CA bundle the
+	// provider Test probe trusts in addition to the system roots; empty means system roots only.
+	// ProviderExtraCAPEM is that file's content, read and parsed at boot (an unreadable file or
+	// one with no certificate refuses boot). Only the probe client uses it.
+	ProviderExtraCAFile string
+	ProviderExtraCAPEM  []byte
 	// ForgePollInterval is the per-enabled-repo incremental poll cadence.
 	ForgePollInterval time.Duration
 	// ForgeReconcileEvery is the number of incremental polls between full
@@ -793,6 +808,13 @@ type Config struct {
 	// which is today's behavior.
 	HostedWorkerVersion string
 
+	// WorkerSizeCeilings and WorkerSizeQuota are the chart-rendered cluster limits a hosted
+	// worker size is validated against (PRD #4213; UZI_WORKER_SIZE_* env, see
+	// worker_sizes.go). Ceilings are strict at boot; quota is advisory and degrades to
+	// "unavailable" when absent or malformed.
+	WorkerSizeCeilings builtin.Ceilings
+	WorkerSizeQuota    builtin.Quota
+
 	// Ephemeral worker auto-provisioning knobs (PRD #529 M2). The feature is gated by
 	// TWO switches beyond these — the instance kill-switch (app_settings
 	// ephemeral_workers_enabled) and the per-user opt-in (users.ephemeral_workers_enabled)
@@ -1050,6 +1072,22 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.IssueTrackerAllowedBaseURLs = issueTrackerAllowed
+	// PRD #4320: the model-provider allowlist (exact URL with path), default EMPTY (feature off).
+	cfg.ProviderAllowLoopback, err = parseBool("UZI_PROVIDER_ALLOW_LOOPBACK", false)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ProviderAllowedBaseURLs, err = parseProviderAllowlist(getenv("UZI_PROVIDER_ALLOWED_BASE_URLS", ""), cfg.ProviderAllowLoopback)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ProviderExtraCAFile = strings.TrimSpace(getenv("UZI_PROVIDER_EXTRA_CA_FILE", ""))
+	if cfg.ProviderExtraCAFile != "" {
+		cfg.ProviderExtraCAPEM, err = loadProviderExtraCA(cfg.ProviderExtraCAFile)
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
@@ -1518,15 +1556,23 @@ func Load() (Config, error) {
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
 	// fall back to "m" with a boot warning so a typo cannot silently disable the feature.
 	cfg.EphemeralDefaultSize = strings.TrimSpace(getenv("UZI_EPHEMERAL_DEFAULT_SIZE", "m"))
-	if !workersize.Valid(cfg.EphemeralDefaultSize) {
-		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a known worker size preset; falling back to \"m\"",
-			"configured", cfg.EphemeralDefaultSize, "valid", workersize.Names)
+	// Builtins only, by design (PRD #4213): the size table is not readable at config load, so
+	// the env may name a shipped preset only. That is also what lets a size delete skip the env
+	// overlay: a builtin cannot be deleted. An admin-set ephemeral_default_size may name any
+	// existing size (checked at write time inside the settings transaction).
+	if !builtin.ValidBuiltin(cfg.EphemeralDefaultSize) {
+		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a builtin worker size preset; falling back to \"m\"",
+			"configured", cfg.EphemeralDefaultSize, "valid", builtin.Names())
 		cfg.EphemeralDefaultSize = "m"
 	}
 	// PRD #422: the concrete pinned hosted-worker image tag (deploy's workers.image.tag),
 	// used as the hosted-worker upgrade-badge target. Optional, unvalidated at load (empty
 	// falls back to the api's own release at classification time — today's behavior).
 	cfg.HostedWorkerVersion = getenv("HOSTED_WORKER_VERSION", "")
+	// PRD #4213: the chart-rendered ceilings and quota the admin size editor validates against.
+	if err := loadWorkerSizeLimits(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). parseInt/parseInt64/
 	// parseDuration all floor at >0, so a non-positive or malformed override falls back
@@ -2305,6 +2351,56 @@ func parseBaseURLAllowlist(envName, raw string) ([]string, error) {
 		out = append(out, norm)
 	}
 	return out, nil
+}
+
+// parseProviderAllowlist parses UZI_PROVIDER_ALLOWED_BASE_URLS (PRD #4320): a comma list of
+// exact provider base URLs WITH path. It is the path-aware sibling of parseBaseURLAllowlist, which
+// refuses paths and so cannot be reused. Each entry is normalized by providers.NormalizeBaseURL
+// (https only; loopback and http for it only when allowLoopback; query, fragment, userinfo, dot
+// segments, percent-encoding, semicolons, backslashes and non-ASCII refused), then deduplicated.
+// A bad entry is a hard boot error naming the variable and the entry's position, never its text.
+// An empty list returns nil: the feature is off.
+func parseProviderAllowlist(raw string, allowLoopback bool) ([]string, error) {
+	var out []string
+	seen := map[string]struct{}{}
+	pos := 0
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pos++
+		norm, err := providers.NormalizeBaseURL(part, allowLoopback)
+		if err != nil {
+			return nil, fmt.Errorf("UZI_PROVIDER_ALLOWED_BASE_URLS entry %d: %w", pos, err)
+		}
+		if _, dup := seen[norm]; dup {
+			continue
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	return out, nil
+}
+
+// loadProviderExtraCA reads the UZI_PROVIDER_EXTRA_CA_FILE bundle and requires it to hold at
+// least one parseable certificate, so a typo or a truncated mount refuses boot instead of leaving
+// every private-CA gateway probing "inconclusive". The error names the variable, never the content.
+func loadProviderExtraCA(path string) ([]byte, error) {
+	pem, err := os.ReadFile(path) //nolint:gosec // G304: an operator-set path, read once at boot
+	if err != nil {
+		return nil, fmt.Errorf("UZI_PROVIDER_EXTRA_CA_FILE is unreadable: %w", err)
+	}
+	if err := providers.CheckCABundle(pem); err != nil {
+		return nil, fmt.Errorf("UZI_PROVIDER_EXTRA_CA_FILE: %w", err)
+	}
+	return pem, nil
+}
+
+// ProviderBaseURLAllowed reports the allowlist entry candidate matches exactly (PRD #4320), and
+// false when the list is empty (feature off) or nothing matches.
+func (c Config) ProviderBaseURLAllowed(candidate string) (string, bool) {
+	return providers.MatchAllowed(c.ProviderAllowedBaseURLs, candidate, c.ProviderAllowLoopback)
 }
 
 // ProductSkillsBaseURLAllowed reports whether raw normalizes to an allowlisted product-skills

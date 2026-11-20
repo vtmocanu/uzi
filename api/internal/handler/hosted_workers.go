@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
@@ -22,6 +23,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -40,6 +42,10 @@ import (
 // allowance of hosted workers. Raised by provisionHostedWorker's count, under the
 // lock that makes that count trustworthy.
 var errHostedQuotaExceeded = errors.New("hosted worker quota exceeded")
+
+// errUnknownHostedSize is raised by provisionHostedWorker when the requested size row is
+// absent once its FOR SHARE lock is taken (never created, or deleted since the early check).
+var errUnknownHostedSize = errors.New("unknown worker size")
 
 // ProvisionHostedWorker creates a hosted worker: a worker whose container the
 // CONTROLLER runs in the cluster (PRD #58). It mints the join token, but — unlike
@@ -101,7 +107,10 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	size := strings.TrimSpace(req.Size)
-	if !workersize.Valid(size) {
+	// Cheap format gate first; membership is a database fact now (PRD #4213: sizes are
+	// admin-managed rows) and is checked below, after the policy gates, so a request that
+	// would be refused anyway never costs a query.
+	if !builtin.WellFormed(size) {
 		httpx.Error(w, http.StatusBadRequest, "unknown worker size")
 		return
 	}
@@ -148,8 +157,23 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	known, err := workersize.Exists(r.Context(), h.q, size)
+	if err != nil {
+		slog.Error("provision hosted worker: reading worker sizes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !known {
+		httpx.Error(w, http.StatusBadRequest, "unknown worker size")
+		return
+	}
+
 	wkr, err := h.provisionHostedWorker(r.Context(), user.ID, name, template, size, req.Docker, quota)
 	if err != nil {
+		if errors.Is(err, errUnknownHostedSize) {
+			httpx.Error(w, http.StatusBadRequest, "unknown worker size")
+			return
+		}
 		if errors.Is(err, errHostedQuotaExceeded) {
 			// State, not policy: the user can delete a hosted worker and retry. Mirrors
 			// ErrWorkerHasActiveRuns → 409.
@@ -165,9 +189,9 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 	// No "token" field, deliberately — see this handler's doc comment. The DTO is the
 	// same one the worker list returns, so the caller sees kind/hosted_size and can
 	// render the row it just created.
-	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
-	})
+	dto := workerDTOFromWorker(wkr, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayHostedSizeSpec(r.Context(), &dto)
+	httpx.JSON(w, http.StatusCreated, map[string]any{"worker": dto})
 }
 
 // derivedHostedWorkerName builds a display name for a provision that supplied none
@@ -234,6 +258,19 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
 		store.HostedProvisionLockClass, hostedProvisionLockObjID(userID)); err != nil {
 		return store.Worker{}, err
+	}
+
+	// FOR SHARE on the size row, still before any write: a size delete needs FOR UPDATE on the
+	// same row, so it cannot commit between this check and CreateHostedWorker below, and a
+	// delete that committed first makes this refuse. The pre-transaction Exists check is only a
+	// cheap early answer; this is the authoritative one. Lock order: this user's provision
+	// advisory lock, then the size row (a delete takes the size advisory lock, then the row).
+	present, err := store.LockWorkerSizeShared(ctx, tx, size)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	if !present {
+		return store.Worker{}, errUnknownHostedSize
 	}
 
 	n, err := qtx.CountHostedWorkersForUser(ctx, userID)
@@ -313,10 +350,11 @@ func hostedProvisionLockObjID(userID uuid.UUID) int32 {
 // discovering it from a 403. Session-authenticated; it exposes only operator-set
 // policy, which is the same thing ForgeConfig does with the SSRF allowlist.
 //
-// The type and size LISTS are deliberately not here: this repo's pattern for a
-// curated registry the UI must render is a web-side mirror constant
-// (web/src/lib/workerTemplates.ts mirrors workertmpl.Names), and M5 adds the size
-// list the same way.
+// The template LIST is deliberately not here: it stays a web-side mirror constant
+// (web/src/lib/workerTemplates.ts mirrors workertmpl.Names). The SIZE list is here (PRD
+// #4213): sizes are admin-editable data, so the web reads each size's name and resolved
+// integers from this response rather than mirroring them. It stays cookie-only: the CLI
+// and TUI read a worker's resolved size from the worker DTO's hosted_size_spec instead.
 func (h *Handler) HostedConfig(w http.ResponseWriter, r *http.Request) {
 	// The quota is reported even when hosting is off. It is operator-set policy
 	// either way, and a client that reads enabled=false must not render a provision
@@ -340,7 +378,20 @@ func (h *Handler) HostedConfig(w http.ResponseWriter, r *http.Request) {
 		slog.Error("hosted default size setting", "error", err)
 		defaultSize = settings.DefaultHostedDefaultSize
 	}
+	sizes := []apitypes.HostedConfigSizeDTO{}
+	if h.q != nil {
+		rows, err := workersize.List(r.Context(), h.q)
+		if err != nil {
+			slog.Error("hosted config sizes", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		for _, row := range rows {
+			sizes = append(sizes, apitypes.HostedConfigSizeDTO{Name: row.Name, WorkerSizeSpec: specToDTO(rowSpec(row))})
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
+		"sizes":             sizes,
 		"enabled":           h.cfg.WorkerHostingEnabled,
 		"docker_enabled":    h.cfg.WorkerHostingEnabled && h.cfg.WorkerDockerEnabled,
 		"quota":             quota,

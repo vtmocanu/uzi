@@ -55,6 +55,10 @@ func newEphemeralFixture(t *testing.T, optIn bool) *ephemeralFixture {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	// PRD #4213 M3: a provision and a default-size write now check the size row exists.
+	if err := store.ReconcileBuiltinWorkerSizes(ctx, pool); err != nil {
+		t.Fatalf("seed builtin sizes: %v", err)
+	}
 
 	fx := &ephemeralFixture{t: t, ctx: ctx, pool: pool, q: store.New(pool), box: newHandlerTestBox(t), userID: uuid.New(), repoID: uuid.New()}
 	connID := uuid.New()

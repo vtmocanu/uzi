@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -81,6 +82,10 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable, row.IssueSourceLocked); err != nil {
+		return store.Run{}, err
+	}
 
 	// Linked handoffs validate directly against the owner's forge project. They do not
 	// depend on cached board membership, labels, issue state, or a PRD link.
@@ -96,7 +101,10 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		if err != nil {
 			return store.Run{}, ErrForgeBuild
 		}
-		var tr forge.IssueTracker = f
+		tr, err := issuesource.For(ctx, s.issueSources, row.IssueTrackerConnectionID.Valid, userID, repoID, f)
+		if err != nil {
+			return store.Run{}, ErrForgeBuild
+		}
 		fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		issue, err := forge.GetIssueBounded(fetchCtx, tr, row.ForgeProjectID, *continuedIssueIID)
 		cancel()
@@ -182,12 +190,19 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 			BudgetMaxIterations: budgetIters,
 			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
 			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 			// PRD #35: the OWNER's default. A handoff has no per-request wait_on_limit
 			// override today, so nil resolves to the user's users.wait_on_limit — the same
 			// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
 			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 		})
-	})
+	}, taskConsumerGateOrigin(continued.Valid, repoID))
 	if err != nil {
 		return store.Run{}, taskCreateError(err)
 	}
@@ -271,7 +286,16 @@ var ErrTaskReviewAlreadyActive = errors.New("a review run is already active for 
 // closed with ErrNoCredentialForHarness rather than creating a stranded row.
 func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targetRunID uuid.UUID, branch, baseBranch string, targetHarness Harness) (store.Run, error) {
 	id := uuid.New()
+	origin, err := s.inheritOrigin(ctx, userID, targetRunID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	origin.ConsumerGateRepo = gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &targetHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// After the gate: the target must still exist in the gate's repository.
+		if err := requireGateTargetRepo(ctx, q, targetRunID, origin.ConsumerGateRepo); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
 			RunID:       id,
 			UserID:      userID,
@@ -282,8 +306,15 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 			IssueTitle:  deriveTaskReviewTitle(branch),
 			// PRD #1429 M3 (D4): the inherited target-run harness, frozen in-tx.
 			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	})
+	}, origin)
 	if err != nil {
 		return store.Run{}, taskCreateError(err)
 	}
@@ -337,7 +368,16 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 		description = strings.ToValidUTF8(description[:keep], "") + marker
 	}
 
+	origin, err := s.inheritOrigin(ctx, userID, originalRunID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	origin.ConsumerGateRepo = gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &originalHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// After the gate: the original must still exist in the gate's repository.
+		if err := requireGateTargetRepo(ctx, q, originalRunID, origin.ConsumerGateRepo); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
 			RunID:            id,
 			UserID:           userID,
@@ -348,15 +388,22 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 			IssueTitle:       deriveThenFixTitle(branch),
 			IssueDescription: description,
 			// PRD #1429 M3 (D4): the inherited original-task harness, frozen in-tx.
-			Harness:             string(resolved.Harness),
-			BudgetWallSeconds:   budgetWall,
-			BudgetMaxIterations: budgetIters,
+			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
+			BudgetWallSeconds:        budgetWall,
+			BudgetMaxIterations:      budgetIters,
 			// PRD #35: stamp the owner's usage-limit-parking default, same as CreateTaskRun —
 			// otherwise a fix run falls to the column DEFAULT false and stops on a limit even
 			// when the owner (and the original handoff) opted into parking.
 			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 		})
-	})
+	}, origin)
 	if err != nil {
 		return store.Run{}, taskCreateError(err)
 	}
@@ -434,4 +481,14 @@ func taskCreateError(err error) error {
 		}
 	}
 	return err
+}
+
+// taskConsumerGateOrigin gates a task create only when it continues an issue: that run matches a
+// terminal source's same-issue check (continued_issue_iid), so it is a consumer (issue #4488,
+// ADR-4007 T3). A plain task matches no blocker predicate and takes no gate.
+func taskConsumerGateOrigin(continuesIssue bool, repoID uuid.UUID) harnessCreationOrigin {
+	if !continuesIssue {
+		return harnessCreationOrigin{}
+	}
+	return harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)}
 }

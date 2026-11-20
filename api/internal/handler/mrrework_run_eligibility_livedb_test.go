@@ -75,7 +75,7 @@ func newReworkRig(t *testing.T, st settings.Store, ttl time.Duration) *reworkRig
 		t.Fatal(err)
 	}
 	f := &reworkForge{answers: map[int64]forge.AuthorEligibility{}}
-	h.svc = forgesvc.NewWithForgeBuilder(nil, box, time.Second, nil,
+	h.svc = forgesvc.NewWithForgeBuilder(q, box, time.Second, nil,
 		func(forge.Type, string, string, time.Duration) (forge.Forge, error) { return f, nil })
 	h.box = box
 	tx := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})

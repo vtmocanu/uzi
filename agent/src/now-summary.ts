@@ -210,7 +210,7 @@ export interface NowSummaryDeps {
   /** The model pass. Production passes runReadOnlyModelPass. */
   runPass(opts: ReadOnlyModelPassOpts): Promise<string>;
   /** The pass options the controller does not own: token, homeRoot, queryFn, log. */
-  pass: Pick<ReadOnlyModelPassOpts, "token" | "homeRoot" | "queryFn">;
+  pass: Pick<ReadOnlyModelPassOpts, "token" | "provider" | "homeRoot" | "queryFn">;
   /** Issue #4201: the run's live credential (token + epoch ordinal). Read ONCE at each call's start: the call
    *  uses that token and every frame it emits carries that ordinal, even when an in-place switch lands
    *  while the call is in flight. Absent (a stub, a test) keeps `pass.token` and the base epoch. */

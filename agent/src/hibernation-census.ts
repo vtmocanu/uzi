@@ -59,7 +59,7 @@ import type {
   CensusResult, DockerInventory, HibernationCensus, HibernationFingerprint, InventoryEntry,
 } from "./hibernation-inventory.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
-import { classifyScratchCensus, protectedLeaves, type CensusEntry, type KeptReason } from "./pod-epoch-scratch.js";
+import { RUN_SCRATCH_LEAF_RE, classifyScratchCensus, protectedLeaves, type CensusEntry, type KeptReason } from "./pod-epoch-scratch.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 
 const MAX_NODES = 500_000;
@@ -865,6 +865,10 @@ async function classifyScratch(deps: HibernationCensusDeps, dataDir: string, tre
   let disposable = 0;
   for (const leaf of leaves) {
     const name = lastSegment(leaf.rel);
+    // A run's TMPDIR leaf is judged by the scratch phase's run-leaf retention judgement (server lifecycle, holds and the
+    // local run-retention classifier). This census does not apply that judgement, so it cannot tell an ended run's leaf
+    // from a retained one and reports every run leaf as protected rather than disposable.
+    if (RUN_SCRATCH_LEAF_RE.test(name)) { entry(leaf.rel, "protected", "run_scratch"); continue; }
     if (admitted.has(name)) { disposable++; continue; }
     // Re-derive the single kept reason with the same classifier on this leaf alone.
     const one = classifyScratchCensus({

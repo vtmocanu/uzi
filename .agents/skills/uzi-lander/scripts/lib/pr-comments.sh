@@ -61,8 +61,9 @@ def status_only:
         or ($b | contains("<!-- auto-generated comment: rate limited by coderabbit.ai -->"))
         or ($b | contains("<!-- CodeRabbit review command invocation:"))
         # The answer to the cr-rate-limit.sh quota query, matched as the WHOLE body: any
-        # extra text (a mixed reply with feedback) still needs an ack.
-        or ($b | test("^\\s*<!-- This is an auto-generated reply by CodeRabbit -->\\s*Your \\[plan\\]\\([^)\\s]*\\) includes PR reviews subject to \\[rate limits\\]\\([^)\\s]*\\)\\. (More reviews will be available in [0-9]+ minutes?|Reviews are available now)\\.\\s*$"))))
+        # extra text (a mixed reply with feedback) still needs an ack. CodeRabbit may lead
+        # with a version marker (<!-- coderabbit-ai-generated:v1 -->, PR #4446).
+        or ($b | test("^\\s*(<!-- coderabbit-ai-generated:v[0-9]+ -->\\s*)?<!-- This is an auto-generated reply by CodeRabbit -->\\s*Your \\[plan\\]\\([^)\\s]*\\) includes PR reviews subject to \\[rate limits\\]\\([^)\\s]*\\)\\. (More reviews will be available in [0-9]+ minutes?|Reviews are available now)\\.\\s*$"))))
     or ($u == "greptile-apps[bot]" and (
         ($b | contains("<!-- greptile_comment -->"))
         or ($b | contains("<!-- greptile_outside_diff -->"))));
@@ -84,6 +85,37 @@ _prc_sha() {
 
 # open_threads_json THREAD_NODES -> JSON array of thread items. rc 1 on unreadable input.
 open_threads_json() { printf '%s' "$1" | jq -c "$PRC_JQ"' open_threads' 2>/dev/null; }
+
+# iso8601_epoch TIMESTAMP -> epoch seconds, allowing fractions and numeric offsets.
+iso8601_epoch() {
+  jq -enr --arg t "$1" '
+    $t | capture("^(?<date>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<fraction>\\.[0-9]+)?(?<zone>Z|[+-][0-9]{2}:[0-9]{2})$") as $p
+    | ($p.date + "Z" | fromdateiso8601) as $base
+    | if ($base | strftime("%Y-%m-%dT%H:%M:%S")) != $p.date then error("invalid date") else
+        (if $p.zone == "Z" then 0 else
+          ($p.zone[1:3] | tonumber) as $h | ($p.zone[4:6] | tonumber) as $m
+          | if $h > 23 or $m > 59 then error("invalid offset") else
+              ($h * 3600 + $m * 60) * (if $p.zone[0:1] == "+" then 1 else -1 end)
+            end end) as $offset
+        | $base + (("0" + ($p.fraction // "")) | tonumber) - $offset
+      end' 2>/dev/null
+}
+
+# new_author_activity_json PAGINATED_JSON KIND AFTER_EPOCH AUTHOR -> first new author's
+# numeric id, or null. Include empty review bodies and thread replies. Unlike merge
+# acknowledgements, creation time governs activity; editing an old comment is not new.
+new_author_activity_json() {
+  printf '%s' "$1" | jq -cs --arg kind "$2" --argjson since "$3" --arg author "$4" '
+    [ .[][]
+      | select(.user.login == $author)
+      | if .user.type == "Bot" then empty
+        elif .user.type != "User" then error("unknown author type")
+        elif $kind == "review" and .submitted_at == null and .state == "PENDING" then empty
+        else (if $kind == "review" then .submitted_at else .created_at end | fromdateiso8601) as $time
+          | select($time > $since)
+          | .id | if type == "number" then . else error("invalid activity id") end
+        end ] | first // null' 2>/dev/null
+}
 
 # code_scanning_open REPO PR -> sets CS_STATE (ok|unavailable|unknown), CS_ITEMS (alert
 # items, [] unless ok) and CS_NOTE (why, for unavailable/unknown). Always rc 0.

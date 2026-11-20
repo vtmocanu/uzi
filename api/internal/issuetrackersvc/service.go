@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -14,9 +15,17 @@ import (
 // Querier is the slice of *store.Queries the service uses.
 type Querier interface {
 	UpsertIssueTrackerConnection(ctx context.Context, arg store.UpsertIssueTrackerConnectionParams) (store.IssueTrackerConnection, error)
+	InsertIssueTrackerConnectionIfAbsent(ctx context.Context, arg store.InsertIssueTrackerConnectionIfAbsentParams) (store.IssueTrackerConnection, error)
 	ListIssueTrackerConnectionsByUser(ctx context.Context, userID uuid.UUID) ([]store.IssueTrackerConnection, error)
 	GetIssueTrackerConnectionForUser(ctx context.Context, arg store.GetIssueTrackerConnectionForUserParams) (store.IssueTrackerConnection, error)
 	DeleteIssueTrackerConnectionForUser(ctx context.Context, arg store.DeleteIssueTrackerConnectionForUserParams) (int64, error)
+	LockIssueTrackerConnectionByIdentityForUpdate(ctx context.Context, arg store.LockIssueTrackerConnectionByIdentityForUpdateParams) (store.IssueTrackerConnection, error)
+	LockIssueTrackerConnectionForShareForUser(ctx context.Context, arg store.LockIssueTrackerConnectionForShareForUserParams) (store.IssueTrackerConnection, error)
+	CountReposLinkedToIssueTrackerConnection(ctx context.Context, connectionID uuid.UUID) (int64, error)
+	GetRepoIssueSourceForUser(ctx context.Context, arg store.GetRepoIssueSourceForUserParams) (store.GetRepoIssueSourceForUserRow, error)
+	LockRepoForLinkForUser(ctx context.Context, arg store.LockRepoForLinkForUserParams) (store.LockRepoForLinkForUserRow, error)
+	RepoStoresIssueNumber(ctx context.Context, repoID uuid.UUID) (bool, error)
+	SetRepoIssueTrackerLink(ctx context.Context, arg store.SetRepoIssueTrackerLinkParams) (store.Repo, error)
 }
 
 var _ Querier = (*store.Queries)(nil)
@@ -32,6 +41,9 @@ type Service struct {
 	allowed   func(string) bool
 	newDriver NewDriverFunc
 	log       *slog.Logger
+	// begin and bind run a unit of work in one transaction (see UseTransactions).
+	begin TxBeginner
+	bind  func(pgx.Tx) Querier
 }
 
 // New builds a Service. allowed reports whether a normalized base URL is on the

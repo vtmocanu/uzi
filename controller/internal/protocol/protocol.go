@@ -37,15 +37,31 @@ type PollResponse struct {
 	Workers []DesiredWorker `json:"workers"`
 }
 
+// SizeResources is one size's resolved quantities as plain integers (PRD #4213): CPU in
+// millicores, memory in MiB, disks in GiB. Mirrors the api's hostedsvc.SizeResources.
+type SizeResources struct {
+	CPURequestMillicores int64 `json:"cpu_request_millicores"`
+	CPULimitMillicores   int64 `json:"cpu_limit_millicores"`
+	MemoryRequestMiB     int64 `json:"memory_request_mib"`
+	MemoryLimitMiB       int64 `json:"memory_limit_mib"`
+	DataGiB              int64 `json:"data_gib"`
+	DinDDataGiB          int64 `json:"dind_data_gib"`
+}
+
 // DesiredWorker is one hosted worker's desired state.
 type DesiredWorker struct {
 	RollEvidence   *RollEvidence `json:"roll_evidence,omitempty"`
 	DrainingReason *string       `json:"draining_reason,omitempty"`
 	ID             string        `json:"id"`
 	Template       string        `json:"template"`
-	// Size is the preset NAME (s/m/l/l-highmem). Resolving it to cpu/memory/PVC quantities is
-	// this side's job: the api is not allowed to know what a pod spec looks like.
+	// Size is the size NAME (s/m/l/l-highmem for the shipped sizes). The resolved
+	// integers ride alongside it in Resources (PRD #4213); a DesiredWorker without them
+	// comes from an older api, and this side then uses its compiled-in builtin values
+	// for the name. Mirrors the api's hostedsvc.DesiredWorker.Size.
 	Size string `json:"size"`
+	// Resources is the size's resolved integers (PRD #4213); nil from an older api.
+	// Mirrors the api's hostedsvc.DesiredWorker.Resources.
+	Resources *SizeResources `json:"resources,omitempty"`
 	// Docker is the rootless-DinD sidecar opt-in (PRD #83 M3). true → render this
 	// worker with a privileged DinD native sidecar in the dedicated
 	// `enforce: privileged` namespace (UZI_WORKER_DOCKER_NAMESPACE); false → #58's
@@ -163,6 +179,10 @@ const (
 	HibernationCleaning   = "cleaning"
 
 	HibernationProtocolVersion = 2
+
+	// AdminSizesProtocolVersion is the admin-size support version this controller speaks
+	// (PRD #4213), advertised in StatusReport.AdminSizes.
+	AdminSizesProtocolVersion = 1
 )
 
 // HibernationTransition is the body the controller reports for one step of a
@@ -274,6 +294,10 @@ type StatusReport struct {
 	// Hibernation is the highest hibernation protocol version this controller speaks
 	// (PRD #4205); omitted by a controller that predates the feature.
 	Hibernation int `json:"hibernation,omitempty"`
+	// AdminSizes is the controller's admin-size support version (PRD #4213); the api
+	// refuses size edits unless a fresh fleet report advertises it. Omitted (0) by a
+	// controller that predates the feature.
+	AdminSizes int `json:"admin_sizes,omitempty"`
 }
 
 // The closed phase enum, and it is the WIRE contract: the api matches on these
@@ -290,6 +314,17 @@ const (
 	PhaseStuck = "stuck"
 	// PhaseSettled: the pod matching the deployment's spec hash is Ready.
 	PhaseSettled = "settled"
+)
+
+// BlockingKind values the controller emits for a worker it will not (or cannot) render
+// because of an admin-defined size (PRD #4213). They ride WorkerStatus.BlockingKind on a
+// PhaseStuck row with PodPhase "" (no pod is involved).
+const (
+	// BlockingKindSizeRefused: the size's integers are invalid or exceed a tier ceiling,
+	// so nothing is rendered for the worker; its existing objects are left alone.
+	BlockingKindSizeRefused = "size_refused"
+	// BlockingKindPVCRejected: the apiserver rejected a claim create for the worker.
+	BlockingKindPVCRejected = "pvc_rejected"
 )
 
 // WorkerStatus is one hosted worker's roll health.

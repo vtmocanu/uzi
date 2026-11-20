@@ -227,7 +227,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), statusCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), workerSlots(w), workerCrossCheckSlots(w), reportedRunsCell(w), largestRunCell(w), outboxCell(w),
+					w.ID, cellText(w.Name), statusCell(w), sizeCell(w), uptimeCell(w), version, upgradeCell(w), bindModeCell(w), workerSlots(w), workerCrossCheckSlots(w), reportedRunsCell(w), largestRunCell(w), outboxCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -253,7 +253,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// LARGEST RUN is PRD #1809 M6 (D8): the HOME size of the worker's largest run, so one
 			// run growing toward filling the data volume is visible before it does. "-" when the
 			// worker reports no run sizes; also before OUTBOX.
-			if err := p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "ROLL", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows); err != nil {
+			if err := p.Table([]string{"ID", "NAME", "STATUS", "SIZE", "UPTIME", "VERSION", "ROLL", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows); err != nil {
 				return err
 			}
 			for _, w := range workers {
@@ -528,7 +528,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				if p.Format == uzicli.FormatJSON {
 					return p.JSON(w)
 				}
-				if err := p.Table([]string{"ID", "NAME", "STATUS"}, [][]string{{cellText(w.ID), cellText(w.Name), statusCell(w)}}); err != nil {
+				if err := p.Table([]string{"ID", "NAME", "STATUS", "SIZE"}, [][]string{{cellText(w.ID), cellText(w.Name), statusCell(w), sizeCell(w)}}); err != nil {
 					return err
 				}
 				printWorkerManualDetail(p, w)
@@ -544,6 +544,42 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	cmd.AddCommand(list, get, rm, setToken, cordon, uncordon)
 	return cmd
+}
+
+// sizeCell is the SIZE column: a hosted worker's size name (untrusted, an admin can add
+// sizes) through cellText, "-" for an external worker or one without a size.
+func sizeCell(w apitypes.WorkerDTO) string {
+	if w.Kind != "hosted" {
+		return "-"
+	}
+	if s := cellText(strOr(w.HostedSize, "")); s != "" {
+		return capCell(s, 16)
+	}
+	return "-"
+}
+
+// workerSizeSpecText renders a size's quantities in human units, e.g.
+// "0.25–1 CPU · 1–2 GiB RAM · 5 GiB data"; "" when the api sent no spec (older api).
+func workerSizeSpecText(s *apitypes.WorkerSizeSpec) string {
+	if s == nil {
+		return ""
+	}
+	num := func(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+	rng := func(a, b float64) string {
+		if a == b {
+			return num(a)
+		}
+		return num(a) + "–" + num(b)
+	}
+	parts := []string{
+		rng(float64(s.CPURequestMillicores)/1000, float64(s.CPULimitMillicores)/1000) + " CPU",
+		rng(float64(s.MemoryRequestMiB)/1024, float64(s.MemoryLimitMiB)/1024) + " GiB RAM",
+		num(float64(s.DataGiB)) + " GiB data",
+	}
+	if s.DinDDataGiB > 0 {
+		parts = append(parts, num(float64(s.DinDDataGiB))+" GiB dind")
+	}
+	return strings.Join(parts, " · ")
 }
 
 // statusCell annotates the STATUS column for `uzi worker list` so a cordoned/draining

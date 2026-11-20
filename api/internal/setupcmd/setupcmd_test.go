@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -86,6 +87,8 @@ type fakeStore struct {
 	// getRepoErr makes GetRepoForUser fail; provisionsvc logs that error
 	// through slog, the path a scrub test needs.
 	getRepoErr error
+	// setEnabledErr makes EnableRepoForUser fail, as the database does when a trigger refuses the flip.
+	setEnabledErr error
 	// onGetRepo, when set, runs at the start of GetRepoForUser, so a test can
 	// hold one run inside the enable step while another run starts.
 	onGetRepo func()
@@ -160,8 +163,14 @@ func (s *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserPara
 	}
 	return store.GetRepoForUserRow{ID: r.ID, ForgeProjectID: r.ForgeProjectID, PathWithNamespace: r.PathWithNamespace, ForgeType: "github", BaseUrl: testBase}, nil
 }
+func (s *fakeStore) LockRepoForEnableForUser(context.Context, store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error) {
+	return store.LockRepoForEnableForUserRow{}, nil
+}
 func (s *fakeStore) EnableRepoForUser(_ context.Context, a store.EnableRepoForUserParams) (store.Repo, error) {
 	s.writes++
+	if s.setEnabledErr != nil {
+		return store.Repo{}, s.setEnabledErr
+	}
 	s.flips[a.ID]++
 	r := s.repos[a.ID]
 	r.Enabled = true
@@ -477,6 +486,24 @@ func TestRunRefusedColumnLabelsKeepTheRepoDisabled(t *testing.T) {
 	}
 	if n := h.st.flipsFor("acme/app"); n != 0 {
 		t.Errorf("a repo without columns was enabled (%d flips)", n)
+	}
+}
+
+// A repo that was linked to an issue tracker before its removal cannot be enabled unlinked: the
+// database refuses with SQLSTATE UZ414, provisionsvc maps it to a conflict, and setup reports it as
+// refused (the repo's history forbids the change), not as a failed step.
+func TestRunRemovedLinkedRepoEnableIsRefused(t *testing.T) {
+	h := newHarness()
+	h.st.setEnabledErr = &pgconn.PgError{Code: "UZ414", Message: "repo was linked to an issue tracker before it was removed"}
+	code := h.run(context.Background(), baseArgs("--repos", "acme/app")...)
+	if code != ExitFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if got := repoStatus(h.report(t), "acme/app"); got != StatusRefused {
+		t.Errorf("repo = %q, want %q", got, StatusRefused)
+	}
+	if n := h.st.flipsFor("acme/app"); n != 0 {
+		t.Errorf("a refused repo was enabled (%d flips)", n)
 	}
 }
 

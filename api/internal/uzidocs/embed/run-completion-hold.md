@@ -334,7 +334,10 @@ run (2 hours by default; see
 [ARCHITECTURE.md's Run lifecycle](../ARCHITECTURE.md#run-lifecycle)). A hold
 that outlives that ceiling, or whose worker is gone, still resumes — but as a
 fresh session against the recovered Git work, the same as any cross-worker
-resume, not a continued conversation.
+resume, not a continued conversation. A Codex run that has been claimed once is
+the exception: no other worker takes it, so it stays held for its last worker
+until that worker returns or you cancel it (no worker may take a legacy run with
+no recorded provenance; see [Codex runs held for their last worker](./run-recovery.md#codex-runs-held-for-their-last-worker)).
 
 The run page and `uzi run get --json` surface this plainly as
 `hold_context: unavailable(same_worker_only)` rather than implying the hold

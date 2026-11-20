@@ -367,8 +367,21 @@ chart is unchanged because it surfaces no `WORKER_*` timing env; the bundled com
 `.env.example` carry the variable, and the e2e compose stack defaults it to `0s` so its
 stale-requeue-then-peer-claim phases keep their timing.
 
+## Amendment — issue #4476: Codex runs are no longer released to a peer (2026-11-19)
+
+D3a's fall-open arms (a deleted owner row, a heartbeat-stale non-draining owner, the
+`WORKER_AFFINITY_CEILING` expiry, and the #2705 stale-requeue grace lapsing) no longer
+offer a **Codex-indicating run at `claim_generation >= 1`** to another worker. `ClaimRun`
+admits it only for the worker recorded as the claimant of its current generation
+(`runs.claim_provenance_worker_id` / `claim_provenance_generation`), and none of those
+arms overrides that gate. Claude runs and a Codex run that was never claimed keep the
+behaviour described above. A held run waits for its recorded worker or is cancelled by the
+owner. See [ADR-4476](4476-codex-claim-provenance.md).
+
 ## Consequences
 
+- **Codex exception (issue #4476, 2026-11-19):** the fall-open bullets below do not apply to a
+  Codex-indicating run at generation >= 1; it stays held for its last worker (ADR-4476).
 - **A `limit_wait` park whose original worker survives** now resumes **on that worker** — recovering both session and tree with zero new git machinery — for a park lasting far beyond 2 minutes, because the affinity leg keeps it pinned while the worker is heartbeat-fresh or draining through a routine roll. This is the common multi-hour-park case.
 - **A routine roll preserves affinity**: the draining worker keeps its row and PVC, so the parked run stays pinned and the replacement pod reclaims it. A teardown (row deleted), or a stale non-draining worker, falls open immediately; M2's checkpoint then carries the committed tree to the re-claiming worker. No stuck run (PRD R1), no re-implement.
 - **`WORKER_AFFINITY_CEILING` (default 2h)** joins `WORKER_AFFINITY_GRACE`, `WORKER_SPREAD_GRACE` and `WORKER_HEARTBEAT_STALE` as a claim-timing knob. It governs the run lane only; chat keeps `WORKER_AFFINITY_GRACE`.

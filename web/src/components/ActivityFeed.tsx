@@ -4,7 +4,7 @@ import { planCheckEventText } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Run, RunMessage } from "../lib/api";
-import { usageLimitPhrase } from "../lib/limitWait";
+import { PROVIDER_GATEWAY_LIMIT, usageLimitPhrase } from "../lib/limitWait";
 import { formatTokens } from "../lib/formatTokens";
 import { prefs } from "../lib/prefs";
 import { isRevisingRun } from "../lib/runBadge";
@@ -373,9 +373,14 @@ function agentOneLiner(latest: RunMessage | undefined, detail?: PlanCrossCheckSu
     // without the surrounding row's context. The window, reset and attempt are on
     // the feed row itself, where they go through the closed lookup.
     case "limit_wait":
-      return "Paused on a usage limit";
+      // PRD #4320: a closed comparison against one fixed literal, never an interpolation.
+      return (latest.payload as { rate_limit_type?: unknown } | null)?.rate_limit_type === PROVIDER_GATEWAY_LIMIT
+        ? "Waiting on a provider gateway rate limit"
+        : "Paused on a usage limit";
     case "limit_hit":
-      return "Hit a usage limit";
+      return (latest.payload as { rate_limit_type?: unknown } | null)?.rate_limit_type === PROVIDER_GATEWAY_LIMIT
+        ? "Hit a provider gateway rate limit"
+        : "Hit a usage limit";
     // PRD #634: the worker acknowledged an operator scope directive and finalized the
     // committed slice at the ceiling. `text` is worker-authored; it renders here as a
     // plain escaped string child (same as the `status`/`text` cases above), truncated to
@@ -897,9 +902,13 @@ export function ActivityFeed({
                   // the region fires once, at the park, and the run view's countdown
                   // is the surface that stays true as the clock moves.
                   meaningful.kind === "limit_wait"
-                  ? `Run paused on ${usageLimitPhrase(run.harness)}`
+                  ? (meaningful.payload as { rate_limit_type?: unknown } | null)?.rate_limit_type === PROVIDER_GATEWAY_LIMIT
+                    ? "Run waiting on a provider gateway rate limit"
+                    : `Run paused on ${usageLimitPhrase(run.harness)}`
                   : meaningful.kind === "limit_hit"
-                    ? `Run hit ${usageLimitPhrase(run.harness)}`
+                    ? (meaningful.payload as { rate_limit_type?: unknown } | null)?.rate_limit_type === PROVIDER_GATEWAY_LIMIT
+                      ? "Run hit a provider gateway rate limit"
+                      : `Run hit ${usageLimitPhrase(run.harness)}`
                     : // Fixed phrase, matching the limit_* treatment: the steer_ack
                       // payload is worker-authored, and this is read aloud out of
                       // context, so it interpolates nothing from the payload.

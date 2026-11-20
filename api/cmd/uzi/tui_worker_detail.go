@@ -411,8 +411,11 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	case "external", "hosted":
 		kind = w.Kind
 	}
+	size, sizeSpec := "", ""
 	if w.Kind == "hosted" {
-		kind += " · size " + m.renderer.Plain(t.hostedSize, width)
+		// The full size name lives here; the list's KIND cell shows a bounded code.
+		size = m.renderer.Plain(t.hostedSize, max(1, width-16))
+		sizeSpec = workerSizeSpecText(w.HostedSizeSpec)
 	}
 	if w.Ephemeral {
 		lease := "?"
@@ -425,6 +428,22 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		kind += " · ephemeral · lease " + lease
 	}
 	kv("kind", kind)
+	if w.Kind == "hosted" {
+		if size == "" {
+			size = "?"
+		}
+		// Quantities share the row when they fit; otherwise they continue on an
+		// aligned row, clamped with an ellipsis, so a long name cannot clip them.
+		avail := max(1, width-16)
+		if sizeSpec == "" {
+			kv("size", size)
+		} else if visualWidth(size+" · "+sizeSpec) <= avail {
+			kv("size", size+" · "+sizeSpec)
+		} else {
+			kv("size", size)
+			kv("", clampVisual(sizeSpec, avail))
+		}
+	}
 	if m.board.admin {
 		kv("owner", m.renderer.Plain(t.workerOwner, width))
 	}

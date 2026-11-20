@@ -23,6 +23,7 @@ type resetStore interface {
 	LockOwnerRunsForReset(context.Context, uuid.UUID) ([]uuid.UUID, error)
 	LockOwnerSecretsForReset(context.Context, uuid.UUID) ([]uuid.UUID, error)
 	DeleteAllUserSecretsForOwner(context.Context, uuid.UUID) (int64, error)
+	DeleteAllRunEnvVarsForOwner(context.Context, uuid.UUID) (int64, error)
 	DeleteAllCodexProviderAccountsForOwner(context.Context, uuid.UUID) (int64, error)
 	ClearSidebarCodexAccounts(context.Context, uuid.UUID) error
 }
@@ -30,7 +31,7 @@ type resetStore interface {
 var _ resetStore = (*store.Queries)(nil)
 
 // Reset destroys the owner's vault material and leaves the account protected with
-// no wrapper: every user_secrets row and codex_provider_account row (whatever its
+// no wrapper: every user_secrets row, run_env_vars row and codex_provider_account row (whatever its
 // sealing marker), the wrapper, and the sidebar account ids go, and the vault
 // epoch advances. It never reads or reuses a cached DEK; the owner's cached key is
 // evicted on every outcome.
@@ -109,6 +110,11 @@ func resetTx(ctx context.Context, q Store, owner uuid.UUID, fn func(context.Cont
 		return err
 	}
 	if _, err := rq.DeleteAllUserSecretsForOwner(ctx, owner); err != nil {
+		return err
+	}
+	// PRD #4416: run environment variables (live, retired and pending deletion) are
+	// vault material too; their ciphertext is unreadable after the wrapper goes.
+	if _, err := rq.DeleteAllRunEnvVarsForOwner(ctx, owner); err != nil {
 		return err
 	}
 	if _, err := rq.DeleteAllCodexProviderAccountsForOwner(ctx, owner); err != nil {

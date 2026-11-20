@@ -225,7 +225,9 @@ runs. The worker keeps its clone and HOME; verified local captures can
 contain unpublished work. These are not a guarantee of recovery after
 losing that worker's storage: another worker can recover published work or
 an available verified recovery copy, not an unverified capture or every
-latest edit. Pending pause requests are satisfied and cleared by this hold.
+latest edit. A Codex run that has been claimed once is never taken by another
+worker; it stays held for its last worker until the owner cancels it
+([Codex runs held](./run-recovery.md#codex-runs-held-for-their-last-worker)). Pending pause requests are satisfied and cleared by this hold.
 
 Typed reporting requires the negotiated `recovery_cause_provider_outage`
 feature. Old workers, or new workers against an API without it, send untyped
@@ -320,7 +322,8 @@ owner extension first.
    held parks keep source custody; an available earlier archive may omit latest
    local work. Losing the original storage can still lose that work. Another
    worker may resume from a published checkpoint after worker loss or affinity
-   expiry without the original local recovery journal.
+   expiry without the original local recovery journal (not a Codex run that has
+   been claimed once, which only its last worker may resume).
 
 Finite retry timestamps, including due ones, mean timed recovery. A NULL retry
 means an owner hold with no countdown; omitted timing means unknown. Default
@@ -424,7 +427,8 @@ log follow and the watcher stop for the owner decision; explicit `--until` keeps
 its status set. Retained sources can block image rolls and occupy storage; each
 fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
-loss or affinity expiry may use a published checkpoint behind the retained work.
+loss or affinity expiry may use a published checkpoint behind the retained work
+(except a Codex run that has been claimed once, which no peer takes).
 
 A temporary API connection problem during the worker's read-only ownership
 check, after the successor was verified and journaled, is retried in place
@@ -586,8 +590,9 @@ page shows "unwitnessed continuation hold" with Resume and Cancel.
 Resume requeues the run on the same worker (its local sources stay there) and
 starts a new requeue episode. The worker registration that was released cannot
 claim it again: the run continues only after that worker re-registers (for
-example after its own restart) or on a different worker once the original
-worker's claim affinity lapses (or it goes stale). A re-registration is
+example after its own restart) or, for a Claude run, on a different worker once the original
+worker's claim affinity lapses (or it goes stale). A Codex run that has been
+claimed once is held for the original worker and is never offered to another. A re-registration is
 not proof that the earlier source use ended. The worker still refuses a source
 that is in use, and a repeated refusal is bounded again in the new episode.
 Nothing restarts the worker for you.
@@ -631,7 +636,13 @@ a new checkpoint or an available recovery archive.
 An **online** worker is heartbeating to uzi; it may still be unable to reach
 the forge directly. An applied exhausted clone/fetch retry group updates a
 cooldown for that authenticated owner, worker and canonical actual Git
-origin. Repositories sharing that origin share the cooldown on that worker;
+origin. A publication park after an exhausted transient failure (see
+[Forge unreachable while publishing](#forge-unreachable-while-publishing))
+updates it too: the stamped Git origin for a push or base refresh, the
+API origin for merge request creation. Its retry time is then the later of the
+capped backoff and that origin's cooldown. A worker-reported publication
+hold updates no cooldown, since the forge did not fail.
+Repositories sharing that origin share the cooldown on that worker;
 another worker or origin has its own admission decision.
 
 Before the cooldown is due, that worker cannot claim the affected origin.
@@ -644,7 +655,8 @@ reservation while leaving reachability unverified. Legacy workers without
 direct success reporting serialize the origin during the active flight;
 a stopped flight does not keep a perpetual reservation.
 
-A sibling can bypass ordinary affinity immediately only with complete
+A sibling can bypass ordinary affinity immediately (never for a Codex run that
+has been claimed once, which only its last worker claims) only with complete
 immutable guarded positive FINAL/source dispositions for generations 1..G
 and no open hold in any generation. Missing or nonguarded history,
 multiple/conflicting sources and local-only work remain protected.
@@ -726,15 +738,17 @@ permission errors, history or movement proofs, local git errors, aborts and
 residue blocks. The hops after the merge request exists are unchanged and
 are not covered: description publish, title read/write and PR-head verify.
 
-One refusal that looks permanent is retried: a push refused only with git's
-bare `! [remote rejected] <src> -> <dst> (failed)` line, with no other
-diagnostic (observed from GitHub; reason undocumented, and whether it is transient is unproven). It is treated as
+Two refusals that look permanent are retried: a push refused only with git's
+bare `! [remote rejected] <src> -> <dst> (failed)` or
+`! [remote rejected] <src> -> <dst> (missing necessary objects)` line, with no
+other diagnostic (both observed from GitHub; reasons undocumented, and whether
+they are transient is unproven). Either is treated as
 transient and the same non-forced push is retried on the same schedule, with
 the full publication proof on every attempt. If it keeps failing, it is
 classified `publication_forge_unreachable` like any other exhausted push. Any
 other reason, a `[rejected]` line, authentication, protected-branch or hook
 refusals, workflow scope and push protection stay permanent. A deterministic
-refusal that prints only `(failed)` is therefore retried too: a run that is not
+refusal that prints only one of those two reasons is therefore retried too: a run that is not
 enrolled pays about 31 s of backoff before failing, and an enrolled run retries
 until a publication park at or past the hold threshold
 (`RUN_PROVIDER_PARK_MAX_DURATION`); the threshold is checked only at park

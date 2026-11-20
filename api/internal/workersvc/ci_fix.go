@@ -183,6 +183,10 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable, row.IssueSourceLocked); err != nil {
+		return store.Run{}, err
+	}
 	// #66 D1 layer 2: the shared service-layer guardrail. Covers both the manual
 	// Fix-CI button and the automatic ci-autofix poller (createCIFixRun is shared).
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
@@ -279,8 +283,15 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 			AutoApprove: autoApprove,
 			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
 			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	})
+	}, harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)})
 	if err != nil {
 		if isUniqueViolation(err) {
 			return store.Run{}, ErrActiveFixExists

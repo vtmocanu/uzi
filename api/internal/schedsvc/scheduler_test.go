@@ -1536,8 +1536,10 @@ func TestSkipReasonForErr(t *testing.T) {
 	// credential_disabled; issue #2853 added harness_label_conflict and harness_label_invalid).
 	// PRD #2865 added the eleven ci_watch reasons (ci_green .. ci_config_changed).
 	// Issue #3719 added codex_pool_unavailable.
-	if len(AllSkipReasons) != 26 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 26", len(AllSkipReasons))
+	// PRD #4320 M4 added the six provider-source reasons.
+	// Issue #4488's narrowed partial-fire outcome adds consumer_gate_busy.
+	if len(AllSkipReasons) != 33 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 33", len(AllSkipReasons))
 	}
 }
 

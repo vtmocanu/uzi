@@ -1,4 +1,5 @@
 import type { AdminWorker, HealthCheck, HealthDoc } from "../../lib/api";
+import { builtinSizeSpec } from "./workerSizes";
 import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
@@ -30,6 +31,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "loops", scope: "instance", group: "control", title: "Background loops", doc: null },
   { id: "forge.ciwatch", scope: "owner", group: "integrations", title: "CI watch capacity", doc: null },
   { id: "forge.sync", scope: "owner", group: "integrations", title: "Forge issue sync", doc: null },
+  { id: "issue_tracker.sync", scope: "owner", group: "integrations", title: "Issue tracker sync", doc: null },
   { id: "slack.socket", scope: "owner", group: "integrations", title: "Slack socket", doc: null },
   { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
   { id: "maintenance.active", scope: "instance", group: "housekeeping", title: "Maintenance mode", doc: "instance-maintenance" },
@@ -61,6 +63,7 @@ const OK_SUMMARY: Record<string, string> = {
   loops: "All 4 background loops are ticking.",
   "forge.ciwatch": "Every repo's run branches fit within the CI watch cap.",
   "forge.sync": "0 of 3 failing; 0 pending.",
+  "issue_tracker.sync": "0 of 1 failing; 0 pending.",
   "slack.socket": "Slack socket is connected.",
   "schedules.paused": "No user has paused schedules while owning enabled ones.",
   "maintenance.active": "uzi is not in maintenance mode.",
@@ -353,6 +356,7 @@ function stuckHosted(over: Partial<AdminWorker>): AdminWorker {
     status: "offline",
     kind: "hosted",
     hosted_size: "l",
+    hosted_size_spec: builtinSizeSpec("l"),
     docker: false,
     busy: false,
     active_runs: 0,
@@ -422,6 +426,7 @@ function healthyHosted(over: Partial<AdminWorker>): AdminWorker {
     status: "online",
     kind: "hosted",
     hosted_size: "l",
+    hosted_size_spec: builtinSizeSpec("l"),
     docker: false,
     busy: false,
     active_runs: 0,

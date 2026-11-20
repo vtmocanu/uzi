@@ -89,8 +89,10 @@ func (fx *compactPolicyFx) seedRun() uuid.UUID {
 	fx.t.Helper()
 	id := uuid.New()
 	fx.exec(`INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,kind,status,harness,worker_id,claim_generation,session_id,started_at)
-		VALUES($1,$2,$3,$4,'policy fixture','desc','issue','running','codex',$5,1,'original-session',now())`,
+		VALUES($1,$2,$3,$4,'policy fixture','desc','issue','running','codex',$5,0,'original-session',now())`,
 		id, fx.owner, fx.repo, 36070+int64(id[0])+int64(id[1])*256, fx.workerID)
+	// The run was claimed once by this worker: generation 1 with its provenance recorded.
+	seedClaimProvenance(fx.t, fx.exec, id, fx.workerID, 1)
 	return id
 }
 

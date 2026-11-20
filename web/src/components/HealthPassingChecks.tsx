@@ -19,7 +19,7 @@ function areaFor(id: string): Area {
   if (id.startsWith("fleet.")) return "Workers";
   if (id.startsWith("queue.")) return "Queue";
   if (id.startsWith("controller.") || id === "db" || id.startsWith("db.") || id === "loops" || id.startsWith("maintenance.")) return "Platform";
-  if (id.startsWith("forge.") || id.startsWith("board.") || id.startsWith("slack.")) return "Forge and Slack";
+  if (id.startsWith("forge.") || id.startsWith("issue_tracker.") || id.startsWith("board.") || id.startsWith("slack.")) return "Forge and Slack";
   if (id.startsWith("schedules.")) return "Schedules";
   if (id.startsWith("custody.") || id.startsWith("recovery.")) return "Recovery";
   if (id.startsWith("release.") || id.startsWith("agentsource.") || id.startsWith("pricing.")) return "Releases and pricing";

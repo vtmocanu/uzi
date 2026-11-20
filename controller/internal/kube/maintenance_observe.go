@@ -46,12 +46,14 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 	o.DeploymentUID = ""
 	o.DeploymentResourceVersion = ""
 	o.DeploymentTerminating = false
+	o.MaintenanceRollAnnotation = ""
 	o.SpecHash, o.Generation = "", 0
 	o.DeploymentNodeSelector = nil
 	if o.HasDeployment {
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
+		o.MaintenanceRollAnnotation = d.Annotations[annotationRoll]
 		o.SpecHash = d.Spec.Template.Annotations[AnnotationSpecHash]
 		o.DeploymentNodeSelector = d.Spec.Template.Spec.NodeSelector
 		o.Generation, _ = strconv.ParseInt(d.Spec.Template.Annotations[AnnotationGeneration], 10, 64)
@@ -83,7 +85,10 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 	o.DinDPVCUID, o.DinDPVCPhase = "", ""
 	o.DinDPVCLive = false
 	o.DinDPVCCreatedAt = nil
+	o.DinDClaim = nil
 	if o.HasDinDDataPVC {
+		claim := claimObservationOf(ns, id, p)
+		o.DinDClaim = &claim
 		o.DinDPVCUID = string(p.UID)
 		o.DinDPVCLive = p.DeletionTimestamp == nil
 		o.DinDPVCPhase = string(p.Status.Phase)

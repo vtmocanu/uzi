@@ -271,6 +271,17 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Codex gets no separate presence pre-check. Keyed on the RESOLVED judge harness, not
 	// the target's: a Claude target judged on Codex needs no Anthropic token, a Codex target
 	// judged on Claude does.
+	// PRD #4320 (judge lane): an owner whose Claude source is a model provider has no judge until
+	// PRD #4322, whatever harness the judge would run on. Checked before the vendor-token presence
+	// check so a provider-only owner (no Anthropic token) sees the provider reason, not a missing
+	// credential. The atomic create below refuses the same way and covers a source selected after
+	// this read.
+	if rq, ok := s.harnessStore(); ok {
+		if lerr := s.refuseProviderLane(ctx, rq, run.UserID); errors.Is(lerr, ErrProviderLaneUnsupported) || errors.Is(lerr, ErrProviderSourceUnusable) {
+			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
+			return
+		}
+	}
 	if judgeHarness != HarnessCodex {
 		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
 			UserID: run.UserID,
@@ -302,6 +313,10 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		if err := s.lockJudgeTargetForCreate(ctx, q, run.ID); err != nil {
 			return store.Run{}, err
 		}
+		// Issue #4488: the target must still exist in the repository whose gate was taken.
+		if err := requireGateTargetRepo(ctx, q, run.ID, run.RepoID); err != nil {
+			return store.Run{}, err
+		}
 		judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID:           run.UserID,
 			TargetRunID:      pgconv.UUID(run.ID),
@@ -314,7 +329,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	})
+	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: run.RepoID}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -322,6 +337,13 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		if errors.Is(err, errJudgeCreateIsolation) {
 			slog.Warn("judge enqueue: judge creation is not READ COMMITTED, no judge created and no skip recorded", "run", run.ID)
+			return
+		}
+		if errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
+			// PRD #4320: a provider-sourced owner has no judge until PRD #4322; not a failure, and
+			// (PRD #1429 D4) the refusal needs a visible reason.
+			slog.Info("judge enqueue: owner's Claude source is a model provider, no judge created", "run", run.ID, "error", err)
+			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
 			return
 		}
 		if reason, ok := judgeSkipReasonFor(err); ok {
@@ -333,6 +355,12 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			slog.Info("judge enqueue: judge harness has no usable credential, skipping judge",
 				"run", run.ID, "harness", judgeHarness, "reason", reason)
 			s.recordJudgeSkip(ctx, run.ID, judgeHarness, reason)
+			return
+		}
+		if errors.Is(err, ErrTerminalConsumerGateBusy) {
+			// Issue #4488: the repository's consumer gate stayed busy for the whole bounded wait.
+			// Nothing was created and this fire-once hook does not retry (ADR-4007 T3 residual limit).
+			slog.Warn("judge enqueue: terminal consumer gate busy, no judge created", "run", run.ID, "error", err)
 			return
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
@@ -392,6 +420,11 @@ func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
 			// visible reason is not accepted.
 			slog.Debug("task review enqueue: inherited harness has no usable credential, skipping review",
 				"run", run.ID, "harness", run.Harness)
+			return
+		}
+		if errors.Is(err, ErrTerminalConsumerGateBusy) {
+			// Issue #4488: see maybeEnqueueJudge; the fire-once hook does not retry.
+			slog.Warn("task review enqueue: terminal consumer gate busy, no review created", "run", run.ID, "error", err)
 			return
 		}
 		slog.Warn("task review enqueue: create review run", "run", run.ID, "error", err)
@@ -475,6 +508,11 @@ func (s *Service) maybeEnqueueThenFix(ctx context.Context, reviewRun store.Run) 
 			// visible reason is not accepted.
 			slog.Debug("then-fix enqueue: inherited harness has no usable credential, skipping fix",
 				"review_run", reviewRun.ID, "target", original.ID, "harness", original.Harness)
+			return
+		}
+		if errors.Is(err, ErrTerminalConsumerGateBusy) {
+			// Issue #4488: see maybeEnqueueJudge; the fire-once hook does not retry.
+			slog.Warn("then-fix enqueue: terminal consumer gate busy, no fix created", "review_run", reviewRun.ID, "target", original.ID, "error", err)
 			return
 		}
 		slog.Warn("then-fix enqueue: create fix run", "review_run", reviewRun.ID, "target", original.ID, "error", err)

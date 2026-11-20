@@ -407,6 +407,8 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       // Decision 1: docker-cli + compose + buildx go into `base` (both templates); the
       // CLIENT only — there is NO `dockerd` in any image, the daemon is the sidecar.
       assert.match(text, /apk add[^\n]*\bdocker-cli\b/, `${name}/Dockerfile must apk add docker-cli`);
+      assert.match(text, /apk add[^\n]*\bacl\b/, `${name}/Dockerfile must apk add acl (#4486)`);
+      assert.ok(text.includes("test -x /usr/bin/getfacl"), `${name}/Dockerfile must assert /usr/bin/getfacl is executable (#4486)`);
       assert.match(text, /apk add[^\n]*\bdocker-cli-compose\b/, `${name}/Dockerfile must apk add docker-cli-compose (compose v2)`);
       assert.match(text, /apk add[^\n]*\bdocker-cli-buildx\b/, `${name}/Dockerfile must apk add docker-cli-buildx`);
       assert.doesNotMatch(text, /\bapk add[^\n]*\bdockerd\b/, `${name}/Dockerfile must NOT install dockerd (the daemon is the sidecar)`);

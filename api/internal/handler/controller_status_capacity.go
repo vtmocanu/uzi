@@ -49,7 +49,9 @@ func rawBlockingKind(reported hostedsvc.WorkerStatus, raw json.RawMessage) strin
 			return ""
 		}
 	}
-	var ws hostedsvc.WorkerStatus
+	// statusRow keeps the optional pacing raw, so a mistyped pacing diagnostic cannot
+	// fail this decode and erase the cause (#4467).
+	var ws statusRow
 	if json.Unmarshal(raw, &ws) != nil || ws.ID != reported.ID {
 		// The handler already validated reported.ID; it must come from this row,
 		// rather than a reused element from an earlier workers array.
@@ -69,5 +71,5 @@ func rawBlockingKind(reported hostedsvc.WorkerStatus, raw json.RawMessage) strin
 	if ws.BlockingReason != nil {
 		sig.BlockingReason = *ws.BlockingReason
 	}
-	return workersvc.EffectiveBlockingKind(sig)
+	return workersvc.StoredBlockingKind(sig)
 }

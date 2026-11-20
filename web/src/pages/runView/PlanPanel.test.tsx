@@ -941,8 +941,8 @@ describe("plan comparison boundaries", () => {
 });
 
 describe("PlanPanel — repo capability hint and Docker allowlist (#3391)", () => {
-  const MEMBER = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist";
-  const ADMIN = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist";
+  const MEMBER = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Workers → Docker worker repo allowlist";
+  const ADMIN = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Workers → Docker worker repo allowlist";
   const hintRe = /This repo doesn't require/;
   function repoFor(over: Partial<Repo> = {}): Repo {
     return { id: "repo1", required_capabilities: [], docker_allowlisted: true, ...over } as unknown as Repo;
@@ -1016,6 +1016,16 @@ describe("PlanPanel — repo capability hint and Docker allowlist (#3391)", () =
     panel({ repo: repoFor({ docker_allowlisted: false, required_capabilities: ["docker"] }), isAdmin: true });
     expect(screen.getByText(ADMIN)).toBeTruthy();
     expect(screen.queryByText(MEMBER)).toBeNull();
+  });
+
+  it("points both allowlist variants to Admin → Workers, where the allowlist lives (#4423)", () => {
+    for (const isAdmin of [false, true]) {
+      panel({ repo: repoFor({ docker_allowlisted: false, required_capabilities: ["docker"] }), isAdmin });
+      const line = screen.getByText(/isn't on the Docker worker repo allowlist/);
+      expect(line.textContent).toContain("Admin → Workers → Docker worker repo allowlist");
+      expect(line.textContent).not.toContain("Admin → Instance");
+      cleanup();
+    }
   });
 
   it("states the allowlist gap even to a viewer who cannot steer", () => {

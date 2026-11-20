@@ -5,6 +5,8 @@ import { decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, 
 import { buildAutomaticRevisionPrompt } from "./prompt.js";
 
 export type CodeCrossCheckSummary = CodeCrossCheckRecord | { incomplete: string };
+/** Raw title prefix of a code-checker verification caveat; matched exactly, with no trimming. */
+const COVERAGE_CAVEAT_PREFIX = "Coverage uncertainty:";
 function maskSupersededAdvice(row: CodeCrossCheckRecord): CodeCrossCheckRecord {
   return { ...row, findings: [], ...(row.dispositions ? { dispositions: [] } : {}) };
 }
@@ -116,8 +118,12 @@ export class CodeCrossCheckGate {
     const row = first ? this.remember(await checkCode(this.options)) : await this.read();
     if (!this.current(row)) return { action: "proceed" };
     // With no implementation iteration left the findings are advisory only: skip the repair and fall
-    // through to the empty finalizer, which records every finding as not_reported.
-    if (first && row.findings.length > 0 && row.finalized_at == null && opts.repairAvailable !== false) {
+    // through to the empty finalizer, which records every finding as not_reported. The same holds
+    // when every finding is a minor verification caveat (exact `Coverage uncertainty:` title prefix, the
+    // pr-description grouping rule): it names checks the read-only checker could not perform, so a
+    // repair turn could change nothing.
+    if (first && row.findings.length > 0 && row.finalized_at == null && opts.repairAvailable !== false
+      && !row.findings.every(f => f.severity === "minor" && f.title.startsWith(COVERAGE_CAVEAT_PREFIX))) {
       this.repairSignal = new AbortController();
       this.active = row;
       return { action: "repair", followUp: buildAutomaticRevisionPrompt("code", { findings: row.findings }) };

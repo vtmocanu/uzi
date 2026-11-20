@@ -32,7 +32,7 @@ func TestCodexAdmissionCrossCheckClaimLiveDB(t *testing.T) {
 			mustExec(ctx, t, f.pool, `UPDATE runs SET codex_secret_id=$2,codex_auth_mode='subscription',codex_material_revision=0
 				WHERE id=$1`, fx.checkerID, alias)
 			if resume {
-				mustExec(ctx, t, f.pool, "UPDATE runs SET claim_generation=2,worker_id=$2 WHERE id=$1", fx.checkerID, f.workerID)
+				seedClaimProvenance(ctx, t, f.pool, fx.checkerID, f.workerID, 2)
 			}
 			before, err := f.q.GetRunByID(ctx, fx.checkerID)
 			if err != nil {

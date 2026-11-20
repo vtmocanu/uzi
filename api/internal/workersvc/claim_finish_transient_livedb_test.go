@@ -17,7 +17,7 @@ import (
 // against a real Postgres: RequeueClaimAssemblyExact's queued and pool_wait arms, its exact-claim
 // fence, its judge refusal, and the lock-time authority override of a transient outcome. The
 // transient outcome is the real one: the owner's Codex lane flips to a custom model between
-// ClaimRun's gate and assembly, and claimant B lacks codex_custom_model_v1, so assembleClaim
+// ClaimRun's gate and assembly, and claimant A lacks codex_custom_model_v1, so assembleClaim
 // returns errCustomModelCapabilityMissing. Skipped unless UZI_TEST_DATABASE_URL is set; run via
 // ./e2e/run-store-it.sh.
 
@@ -74,14 +74,14 @@ func TestClaimTransientRequeueQueuedLiveDB(t *testing.T) {
 	if len(r.CodexCapHash) != 0 || r.CodexClaimEpoch != assembled.CodexClaimEpoch+1 {
 		t.Fatalf("capability not revoked: hash=%x epoch=%d (assembly left %d)", r.CodexCapHash, r.CodexClaimEpoch, assembled.CodexClaimEpoch)
 	}
-	if r.WorkerID != pgconv.UUID(fx.workerB) || r.ClaimGeneration != assembled.ClaimGeneration || r.Health != "ok" {
-		t.Fatalf("worker=%v gen=%d health=%s, want B/%d/ok", r.WorkerID, r.ClaimGeneration, r.Health, assembled.ClaimGeneration)
+	if r.WorkerID != pgconv.UUID(fx.workerA) || r.ClaimGeneration != assembled.ClaimGeneration || r.Health != "ok" {
+		t.Fatalf("worker=%v gen=%d health=%s, want A/%d/ok", r.WorkerID, r.ClaimGeneration, r.Health, assembled.ClaimGeneration)
 	}
 	if !r.StatusSince.Time.After(assembled.StatusSince.Time) {
 		t.Fatalf("status_since not advanced: %v (claimed at %v)", r.StatusSince, assembled.StatusSince)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }
 
 // TestClaimTransientRevocationFailsLiveDB (PRD #1590 N6 (a)): a transient assembly outcome plus
@@ -116,7 +116,7 @@ func TestClaimTransientRevocationFailsLiveDB(t *testing.T) {
 		t.Fatalf("capability not revoked: hash=%x epoch=%d", r.CodexCapHash, r.CodexClaimEpoch)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }
 
 // TestClaimTransientQuarantineParksLiveDB (PRD #1590 N6 (b)): a transient assembly outcome plus a
@@ -139,9 +139,9 @@ func TestClaimTransientQuarantineParksLiveDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	fx.assertNoClaudeFallback(t, payload)
-	fx.assertParked(t, before, fx.workerA)
+	fx.assertParked(t, before, fx.parkedWorker())
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }
 
 // TestFinishRunClaimPoolWaitArmLiveDB (PRD #1590 D2, PRD #754 M4): an empty auto pool on the
@@ -161,7 +161,7 @@ func TestFinishRunClaimPoolWaitArmLiveDB(t *testing.T) {
 			before.StartedAt, before.BudgetPausedSeconds)
 	}
 	payload, err := fx.svc.finishRunClaim(env.ctx, run, nil, errAutoPoolEmpty,
-		claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+		claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 	if err != nil || payload != nil {
 		t.Fatalf("finishRunClaim = (%v, %v), want idle", payload != nil, err)
 	}
@@ -175,11 +175,11 @@ func TestFinishRunClaimPoolWaitArmLiveDB(t *testing.T) {
 	if len(r.CodexCapHash) != 0 || r.CodexClaimEpoch != before.CodexClaimEpoch+1 {
 		t.Fatalf("capability not revoked: hash=%x epoch=%d (before %d)", r.CodexCapHash, r.CodexClaimEpoch, before.CodexClaimEpoch)
 	}
-	if r.WorkerID != pgconv.UUID(fx.workerB) || r.ClaimGeneration != run.ClaimGeneration {
-		t.Fatalf("worker=%v gen=%d, want B/%d", r.WorkerID, r.ClaimGeneration, run.ClaimGeneration)
+	if r.WorkerID != pgconv.UUID(fx.workerA) || r.ClaimGeneration != run.ClaimGeneration {
+		t.Fatalf("worker=%v gen=%d, want A/%d", r.WorkerID, r.ClaimGeneration, run.ClaimGeneration)
 	}
 	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
-	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+	assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "released", true)
 }
 
 // skewedFinishStore opens the exact-claim transaction on the real pool, but hands
@@ -236,7 +236,7 @@ func TestRequeueClaimAssemblyExactFenceLiveDB(t *testing.T) {
 			before := mustRun(t, env, fx.runID)
 			svc := New(skewedFinishStore{Store: env.q, pool: env.pool, skew: tc.skew}, env.box, testParams())
 			payload, err := svc.finishRunClaim(env.ctx, run, nil, tc.cause,
-				claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+				claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 			if payload != nil || !errors.Is(err, errClaimRecoveryStale) {
 				t.Fatalf("finishRunClaim = (%v, %v), want (nil, errClaimRecoveryStale)", payload != nil, err)
 			}
@@ -245,7 +245,7 @@ func TestRequeueClaimAssemblyExactFenceLiveDB(t *testing.T) {
 				r.CodexClaimEpoch != before.CodexClaimEpoch || !r.StartedAt.Time.Equal(before.StartedAt.Time) {
 				t.Fatalf("a fenced-out requeue mutated the run: status=%s epoch=%d (before %d)", r.Status, r.CodexClaimEpoch, before.CodexClaimEpoch)
 			}
-			assertClaimRecoveryHold(t, env, fx.holdB(t), "open", false)
+			assertClaimRecoveryHold(t, env, fx.holdClaimant(t), "open", false)
 			assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
 		})
 	}
@@ -258,13 +258,13 @@ func TestFinishRunClaimJudgePoolWaitRefusedLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	fx := newCodexClaimFix(t, env, false)
 	env.exec(`UPDATE runs SET status = 'completed' WHERE id = $1`, fx.runID)
-	judgeID := env.seedCodexJudgeRun(t, fx.userID, fx.workerB, fx.runID)
+	judgeID := env.seedCodexJudgeRun(t, fx.userID, fx.workerA, fx.runID)
 	if err := fx.svc.FreezeCodexBinding(env.ctx, fx.userID, judgeID, fx.aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding on the judge: %v", err)
 	}
 	judge := mustRun(t, env, judgeID)
 	payload, err := fx.svc.finishRunClaim(env.ctx, judge, nil, errAutoPoolEmpty,
-		claimRecoveryIdentity{workerID: fx.workerB, recoveryCapable: true})
+		claimRecoveryIdentity{workerID: fx.workerA, recoveryCapable: true})
 	if payload != nil || !errors.Is(err, errClaimRecoveryStale) {
 		t.Fatalf("finishRunClaim = (%v, %v), want (nil, errClaimRecoveryStale)", payload != nil, err)
 	}

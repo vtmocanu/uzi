@@ -48,7 +48,7 @@ describe("TokenPicker — always renders the four states", () => {
   ])("renders inherit/default/auto plus one option per token with %s", (_name, tokens, pinnedCount) => {
     renderPicker({ mode: "inherit" }, tokens);
     // The three account-level states are present regardless of how many tokens exist.
-    expect(screen.getByRole("option", { name: /Inherit the worker/ })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /Default · worker's token/ })).toBeTruthy();
     expect(screen.getByRole("option", { name: /Use my default token/ })).toBeTruthy();
     expect(screen.getByRole("option", { name: /Auto-select from my pool/ })).toBeTruthy();
     // Plus exactly one pin option per token — 3 base options + the pinned ones.
@@ -157,24 +157,7 @@ describe("TokenPicker — disabled tokens (PRD #1732)", () => {
 describe("TokenPicker — inherit option text (issue #3256)", () => {
   it("defaults the inherit option to the worker's token wording", () => {
     const { select } = renderPicker({ mode: "inherit" }, []);
-    expect(select.options[0]?.text).toBe("Inherit the worker's token");
-    expect(select.options[0]?.value).toBe("mode:inherit");
-  });
-
-  it("renders a caller-supplied inheritLabel without changing the emitted selection", () => {
-    const onChange = vi.fn();
-    render(
-      <TokenPicker
-        value={{ mode: "default" }}
-        onChange={onChange}
-        tokens={[]}
-        label="Anthropic token"
-        inheritLabel="Default · worker's token (worker binding)"
-      />,
-    );
-    const select = screen.getByLabelText("Anthropic token") as HTMLSelectElement;
     expect(select.options[0]?.text).toBe("Default · worker's token (worker binding)");
-    fireEvent.change(select, { target: { value: "mode:inherit" } });
-    expect(onChange).toHaveBeenCalledWith({ mode: "inherit" });
+    expect(select.options[0]?.value).toBe("mode:inherit");
   });
 });

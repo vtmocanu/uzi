@@ -30,7 +30,7 @@ import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; //
 import { CODEX_SUMMARY_EFFORT, DEFAULT_CODEX_SUMMARY_MODEL } from "./codex/summary-model.js"; // leaf value import
 import { isCodexRoleModel } from "./codex/render.js";
 import type { DeliveryContext } from "./pr-description-context.js";
-import type { PrDescriptionDiagram } from "./protocol.js";
+import type { ClaimProviderBinding, PrDescriptionDiagram } from "./protocol.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
 
 /** Why a Codex intent or plan summary was skipped because the run's Codex credential could not be
@@ -99,6 +99,9 @@ export interface IntentSummaryInput {
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
   claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
   token: string;
+  /** PRD #4320: the provider binding of a provider-bound run; the pass then runs under it (not `token`) and
+   *  its model resolves through the bound map, so an unmapped summary model skips the pass. */
+  provider?: ClaimProviderBinding;
   /** The resolved summary model. Claude lane: used as is. Codex lane (#3248): used when it is a
    *  Codex role model, else the built-in fallback (an older server sends the Claude value). */
   model: string;
@@ -145,7 +148,7 @@ export interface DeliverySummaryClaimView {
   readonly claim_generation?: number;
   /** The resolved Claude summary model (PRD #362); unused on a Codex claim. */
   readonly summary_model?: string | null;
-  readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown };
+  readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown; readonly provider?: ClaimProviderBinding };
 }
 
 export interface DeliverySummaryInput {
@@ -300,7 +303,7 @@ export class SummaryRunner {
     };
     const timeoutMs = Math.min(this.modelTimeoutMs, input.deadlineMs - this.now());
     if (!(timeoutMs > 0)) return fail("the publication's summary deadline is spent");
-    let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null;
+    let harness: Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "codex"> | null;
     try {
       harness = this.deliveryHarness(input.claim, fail, input.claimGeneration);
     } catch (err) {
@@ -350,7 +353,7 @@ export class SummaryRunner {
     claim: DeliverySummaryClaimView,
     fail: (reason: "Codex claim but no Codex advice-harness factory is wired" | "the claim carries no Anthropic token") => null,
     claimGeneration?: number,
-  ): Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null {
+  ): Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "codex"> | null {
     const selection = selectCodexBinding({ codex: claim.secrets.codex });
     if (selection.kind === "codex") {
       if (!this.codexAdviceHarnessFactory) return fail("Codex claim but no Codex advice-harness factory is wired");
@@ -360,8 +363,11 @@ export class SummaryRunner {
       };
     }
     const token = claim.secrets.anthropic_oauth_token?.trim();
-    if (!token) return fail("the claim carries no Anthropic token");
     const model = claim.summary_model?.trim() ?? "";
+    // PRD #4320: a provider-bound claim runs the pass under its binding; the fixed "haiku" default (or the
+    // claim's summary model) resolves through the bound map in the pass, and an unmapped one skips the pass.
+    if (claim.secrets.provider) return { provider: claim.secrets.provider, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };
+    if (!token) return fail("the claim carries no Anthropic token");
     return { token, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };
   }
 
@@ -438,7 +444,7 @@ export class SummaryRunner {
     let onCodex = false;
     try {
       const selection = selectCodexBinding({ codex: input.claim?.secrets.codex });
-      let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "effort" | "codex">;
+      let harness: Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
         onCodex = true;
         if (!this.codexAdviceHarnessFactory) throw new Error("Codex claim but no Codex advice-harness factory is wired");
@@ -458,7 +464,7 @@ export class SummaryRunner {
           },
         };
       } else {
-        harness = { token: input.token, model: input.model };
+        harness = { token: input.token, ...(input.provider ? { provider: input.provider } : {}), model: input.model };
       }
       return await runReadOnlyModelPass({
         ...harness,

@@ -13,7 +13,8 @@ import (
 // activities. Events are oldest first, one per added or removed tag; ID is the
 // 1-based position in that order. Tags follow readLabel, as in issue reads: the
 // eligibility tag is reported under the stored eligibility name, a tag the
-// token's account owns under its own name, and any other tag is left out.
+// token's account owns under its own name, and any other tag is left out, and so
+// is a tag whose name labelNameProblem refuses.
 func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]forge.LabelEvent, error) {
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
@@ -40,7 +41,7 @@ func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID
 			if err != nil {
 				return err
 			}
-			if !ok {
+			if !ok || labelNameProblem(name) {
 				continue
 			}
 			out = append(out, forge.LabelEvent{

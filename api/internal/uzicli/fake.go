@@ -379,6 +379,36 @@ type FakeClient struct {
 	Effective    *apitypes.EffectiveSettingsDTO
 	EffectiveErr error
 
+	// PutModelSettings capture (PRD #3264): ModelSettingsCalls counts the writes (zero proves a
+	// command refused before any request), LastModelSettingsPatch is a copy of the last patch
+	// (a nil value is a clear). ModelSettingsResult, when set, is the canned reply; otherwise the
+	// patch is applied to Settings and that is returned. PutModelSettingsErr wins over the blanket
+	// Err while the capture still proves the write was reached.
+	ModelSettingsCalls     int
+	LastModelSettingsPatch map[string]*string
+	ModelSettingsResult    *ModelSettingsResult
+	PutModelSettingsErr    error
+	// PutCrossCheckPins capture: the same counters and canned reply as above, shared with
+	// ModelSettingsCalls/ModelSettingsResult/PutModelSettingsErr; LastCrossCheckPins is a copy of
+	// the last cells sent. Without a canned reply the cells are applied to Settings.CrossCheckPins.
+	LastCrossCheckPins []CrossCheckPinWire
+
+	// Agent-template pin capture (PRD #3264 M3). AgentTemplates is what the list answers (also
+	// updated by a write); AgentTemplateListErr fails the list; AgentTemplateListCalls and
+	// AgentTemplatePutCalls count requests (zero proves a refusal before any request);
+	// LastAgentTemplateID and LastAgentTemplatePatch record the last write (a nil value is a
+	// clear); AgentTemplatePutResult is a canned reply and AgentTemplatePutErr fails the write
+	// (it wins over the blanket Err while the capture still proves the write was reached).
+	AgentTemplates          []AgentTemplatePins
+	AgentTemplateListErr    error
+	AgentTemplateListCalls  int
+	AgentTemplatePutCalls   int
+	LastAgentTemplateID     string
+	LastAgentTemplatePatch  map[string]*string
+	AgentTemplatePutResult  *AgentTemplatePinsResult
+	AgentTemplatePutErr     error
+	AgentTemplateListResult *AgentTemplateListResult
+
 	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
 	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.
 	SchedulePreview    *apitypes.ScheduleSettingsPreviewDTO
@@ -390,6 +420,23 @@ type FakeClient struct {
 	ReserveCalls     int
 	LastReservePct   *int
 	LastReservePause bool
+
+	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
+	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
+	// what the command sent.
+	ProviderList        apitypes.ProviderListDTO
+	ProviderResult      apitypes.ProviderDTO
+	ProviderProbe       *apitypes.ProviderProbeDTO
+	LastProviderCreate  *apitypes.ProviderCreateRequest
+	LastProviderPatch   *apitypes.ProviderPatchRequest
+	LastProviderID      string
+	ProviderRetireCalls int
+	ProviderTestCalls   int
+	// ProviderSourceCalls counts SetClaudeProviderSource; LastProviderSource is the id it was last
+	// asked to select (nil = clear) and ProviderSourceSet says it was called at all.
+	ProviderSourceCalls int
+	ProviderSourceSet   bool
+	LastProviderSource  *string
 
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO
@@ -640,6 +687,11 @@ type FakeClient struct {
 	GetProjectSyncStatusErr     error
 	LastResyncProjectSyncRepoID string
 	ResyncProjectSyncErr        error
+
+	// Repo run variables (PRD #4416): ListRepoEnv returns RepoEnvResult (or Err) and
+	// records the repo id it was asked about.
+	RepoEnvResult         apitypes.RunEnvListDTO
+	LastListRepoEnvRepoID string
 
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun

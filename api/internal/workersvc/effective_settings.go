@@ -151,7 +151,9 @@ func (s *Service) PredictHarness(ctx context.Context, userID uuid.UUID, explicit
 		switch {
 		case automaticHarnessEligible(res, explicit, origin, policy):
 			out.Harness, out.ChosenAtCreate, out.Policy = "", true, PredictPolicyAutomaticWeeklyReset
-		case res.DefaultUnset || !policy.HarnessOverflowEnabled || !origin.eligible(policy):
+		case res.ClaudeSourceSet || res.DefaultUnset || !policy.HarnessOverflowEnabled || !origin.eligible(policy):
+			// A set Claude provider source is excluded from automatic choice and overflow (PRD #4320
+			// D13), exactly as evaluateCreationOverflow does.
 			// The pure D11 answer stands: no policy can move the harness.
 		default:
 			applies, aerr := s.overflowApplies(ctx, q, userID, res)
@@ -185,6 +187,9 @@ func predictRule(r harnessRule) string {
 // creation excludes overflow when the default Codex subscription is structurally unavailable (the
 // Claude run must not fail on an unavailable destination). It reads no limit evidence.
 func (s *Service) overflowApplies(ctx context.Context, q predictStore, userID uuid.UUID, res resolvedHarness) (bool, error) {
+	if res.ClaudeSourceSet {
+		return false, nil // mirrors evaluateCreationOverflow's exclusion for a set Claude provider source
+	}
 	otherHarness := HarnessClaude
 	if res.Harness == HarnessClaude {
 		otherHarness = HarnessCodex
@@ -216,6 +221,11 @@ func (s *Service) overflowApplies(ctx context.Context, q predictStore, userID uu
 // chosen when a worker claims it; a Codex run binds its credential at creation (the default
 // credential, or, in account mode auto with a configured pool, an account picked by headroom).
 func predictCredential(res resolvedHarness) *CredentialPrediction {
+	if res.ProviderSource != nil {
+		// A provider-sourced Claude run spends the provider's frozen key, which is neither an
+		// Anthropic token nor a Codex credential: no vendor credential is predicted.
+		return nil
+	}
 	if res.Harness != HarnessCodex || res.Codex == nil {
 		return &CredentialPrediction{Kind: CredentialKindAnthropic, Source: CredentialSourceClaimSelection, FixedAt: FixedAtClaim}
 	}

@@ -1286,8 +1286,8 @@ type slowIssueForges struct {
 	d time.Duration
 }
 
-func (s slowIssueForges) IssueTrackerForRepo(ctx context.Context, repoID uuid.UUID, ft, base string, tok []byte) (forge.IssueTracker, error) {
-	tr, err := s.termForges.IssueTrackerForRepo(ctx, repoID, ft, base, tok)
+func (s slowIssueForges) IssueTrackerForRepo(ctx context.Context, userID, repoID uuid.UUID) (forge.IssueTracker, error) {
+	tr, err := s.termForges.IssueTrackerForRepo(ctx, userID, repoID)
 	return slowIssueTracker{IssueTracker: tr, d: s.d}, err
 }
 

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -29,6 +30,7 @@ type Store interface {
 	ListForgeConnectionsByUser(ctx context.Context, userID uuid.UUID) ([]store.ForgeConnection, error)
 	UpsertForgeConnection(ctx context.Context, arg store.UpsertForgeConnectionParams) (store.ForgeConnection, error)
 	UpsertRepo(ctx context.Context, arg store.UpsertRepoParams) (store.Repo, error)
+	LockRepoForEnableForUser(ctx context.Context, arg store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error)
 	SetRepoEnabledForUser(ctx context.Context, arg store.SetRepoEnabledForUserParams) (store.Repo, error)
 	forgesvc.BoardColumnStore
 }
@@ -163,6 +165,19 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 				"repo", path, "base_url", cfg.SeedForgeBaseURL)
 			continue
 		}
+		// A project linked to an issue tracker before it was removed keeps that issue
+		// source, so its enable is refused (migration 00467). Ask before any label
+		// write reaches the forge, as provisionsvc.EnableRepo does, and leave the repo
+		// disabled: failing boot here would repeat on every restart. A database error
+		// is boot-fatal, like every other seed database error.
+		lock, err := q.LockRepoForEnableForUser(ctx, store.LockRepoForEnableForUserParams{ID: repo.ID, UserID: user.ID})
+		if err != nil {
+			return fmt.Errorf("seed forge: lock repo %q for enable: %w", path, err)
+		}
+		if lock.SourceLocked {
+			warnSourceLocked(path)
+			continue
+		}
 		// A repo turned on without board columns strands its cards (no column
 		// resolves, so an automated move reads as a person's). Create the default
 		// columns before the enable, as the web enable and setup do (PRD #3760,
@@ -184,6 +199,13 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 			Enabled: true,
 			UserID:  user.ID,
 		}); err != nil {
+			// Backstop for the repos trigger refusing the flip (SQLSTATE UZ414) between
+			// the lookup above and here.
+			var pe *pgconn.PgError
+			if errors.As(err, &pe) && pe.Code == "UZ414" {
+				warnSourceLocked(path)
+				continue
+			}
 			return fmt.Errorf("seed forge: enable repo %q: %w", path, err)
 		}
 		enabled++
@@ -194,4 +216,11 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 		"bot_username", identity.Username, "projects", len(projects),
 		"repos_enabled", enabled, "repos_requested", len(cfg.SeedForgeRepos))
 	return nil
+}
+
+// warnSourceLocked logs that a requested repo stays disabled because its project
+// was linked to an issue tracker before it was removed.
+func warnSourceLocked(path string) {
+	slog.Warn("seed forge: the project was linked to an issue tracker before it was removed; its issue source cannot change, so the repo stays disabled",
+		"repo", path)
 }

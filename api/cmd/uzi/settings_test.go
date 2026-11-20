@@ -203,8 +203,9 @@ func TestSettingsGetTokenGET(t *testing.T) {
 func TestSettingsReadOnlyAndErrors(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 	cmd := findCmd(root, "settings")
-	if cmd == nil || len(cmd.Commands()) != 4 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil || findCmd(cmd, "codex-mode") == nil || findCmd(cmd, "harness-overflow") == nil {
-		t.Fatal("settings must expose only get, reserve, codex-mode and harness-overflow")
+	if cmd == nil || len(cmd.Commands()) != 6 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil || findCmd(cmd, "codex-mode") == nil ||
+		findCmd(cmd, "harness-overflow") == nil || findCmd(cmd, "set") == nil || findCmd(cmd, "reset") == nil {
+		t.Fatal("settings must expose only get, reserve, codex-mode, harness-overflow, set and reset")
 	}
 	for _, args := range [][]string{{"settings", "set"}, {"settings", "reset"}, {"settings", "get", "extra"}} {
 		if _, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), args...); code == 0 {

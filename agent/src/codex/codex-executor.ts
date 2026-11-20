@@ -288,13 +288,14 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
 /** Keys a provisioned `toolEnv` entry may NEVER set in the credential-free command env.
  *  UNIONS the command boundary literals (PATH/TMPDIR/LANG/HOME — the scrubbed command
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
- *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
- *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR (a copy,
+ *  not an import) of that exported PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
+ *  the Node CA key NODE_EXTRA_CA_CERTS + the browser flag and the two browser discovery paths;
+ *  the mirror is pinned by agent/test/run-env-names.test.ts), plus Docker endpoint/configuration keys owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
-const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
+export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   // Command boundary literals.
   "PATH",
   "TMPDIR",
@@ -312,11 +313,25 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "GOCACHE",
   "npm_config_cache",
   "NPM_CONFIG_CACHE",
-  // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (module-private there; cannot be imported).
+  // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (exported there; copied here, not imported).
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // PRD #4320 module 6: the provider-mode routing, model and context-window keys.
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+  "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   "AGENT_BROWSER_ARGS",
+  // Defence in depth: a provisioned toolEnv can never point a command's Node TLS trust at a
+  // file of its choosing. Nothing on the Codex path sets it.
+  "NODE_EXTRA_CA_CERTS",
   // Issue #3907: the browser discovery keys (sdk-env.ts protects them too; set only by
   // buildCommandEnv's browserDiscovery flag, never by a provisioned toolEnv).
   ...Object.keys(BROWSER_DISCOVERY_ENV),
@@ -7250,7 +7265,7 @@ export class CodexExecutor implements Executor {
   /** Issue #1866 M2: `facts` appends the run-start environment facts block (empty ⇒ unchanged). */
   private planPrompt(ctx: RunContext, facts?: EnvFacts): string {
     const head = ctx.issueIid != null
-      ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+      ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid, ctx.issueKey), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
       : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${head}\n\n${review}` : head;
@@ -7329,7 +7344,7 @@ export class CodexExecutor implements Executor {
           "</approved_plan>",
         ].join("\n")
       : approved ? approved : ctx.issueIid != null
-        ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+        ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid, ctx.issueKey), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
         : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
     // Empty ⇒ unchanged (a fresh branch).

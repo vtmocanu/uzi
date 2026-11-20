@@ -152,14 +152,14 @@ func (f *termForges) ForgeForConnection(string, string, []byte) (forge.Forge, er
 	return nil, errors.New("ForgeForConnection must not serve the lifetime read")
 }
 
-func (f *termForges) IssueTrackerForRepo(_ context.Context, _ uuid.UUID, _, _ string, _ []byte) (forge.IssueTracker, error) {
+func (f *termForges) IssueTrackerForRepo(_ context.Context, _, _ uuid.UUID) (forge.IssueTracker, error) {
 	f.mu.Lock()
 	f.issueCalls++
 	f.mu.Unlock()
 	return termIssueTracker{f: f}, nil
 }
 
-func (f *termForges) CodeHostForRepo(_ context.Context, _ uuid.UUID, _, _ string, _ []byte) (forge.CodeHost, error) {
+func (f *termForges) CodeHostForRepo(_ context.Context, _, _ uuid.UUID) (forge.CodeHost, error) {
 	f.mu.Lock()
 	f.hostCalls++
 	f.mu.Unlock()

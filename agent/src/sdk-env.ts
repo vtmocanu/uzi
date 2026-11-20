@@ -29,11 +29,23 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } f
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
  *  HOME, and the two ANTHROPIC_* keys pinned to undefined so nothing outranks the
  *  OAuth token in the SDK's auth precedence. */
-const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
+export const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // PRD #4320 module 6: the provider-mode routing and model keys. A provisioned tool env may never
+  // repoint the CLI at another gateway, remap a model alias, or move the context window.
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+  "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   // The CLI's extra CA bundle (UZI_CLI_CA_FILE below). Worker-set; a provisioned var must
   // never point the CLI's TLS trust at a file of its choosing.
   "NODE_EXTRA_CA_CERTS",
@@ -69,11 +81,30 @@ export interface SdkAttemptEnv {
   cloneKey: string;
 }
 
+/** One mapped gateway model of a provider binding (the wire shape of ClaimProviderModel). */
+export interface SdkProviderModel {
+  model: string;
+  context_window?: number;
+}
+
+/** PRD #4320 module 6: the credential the Claude CLI runs under. `oauth` is the vendor subscription
+ *  token; `provider` is a frozen gateway binding. Every spawn site builds its env from one of these,
+ *  so a provider run can never fall back to an OAuth token by omission. */
+export type SdkCredential =
+  | { kind: "oauth"; token: string }
+  | {
+      kind: "provider";
+      baseUrl: string;
+      authStyle: "bearer" | "x_api_key";
+      key: string;
+      modelMap: { opus?: SdkProviderModel; sonnet?: SdkProviderModel; haiku: SdkProviderModel; fable?: SdkProviderModel };
+    };
+
 /** Exactly the keys the SDK subprocess is allowed to see. The index signature
  *  carries the PRD #18 M3 provisioned tool vars, which are added ONLY from
  *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
  *  LOCALE_ARCHIVE) — never a blind merge of devbox's shellenv. */
-export interface SdkEnv {
+export interface OAuthSdkEnv {
   CLAUDE_CODE_OAUTH_TOKEN: string;
   HOME: string;
   PATH: string | undefined;
@@ -82,10 +113,62 @@ export interface SdkEnv {
   [key: string]: string | undefined;
 }
 
+/** The provider-mode env: no OAuth token, the gateway base URL and exactly one auth key. */
+export interface ProviderSdkEnv {
+  CLAUDE_CODE_OAUTH_TOKEN: undefined;
+  ANTHROPIC_BASE_URL: string;
+  HOME: string;
+  PATH: string | undefined;
+  ANTHROPIC_API_KEY: string | undefined;
+  ANTHROPIC_AUTH_TOKEN: string | undefined;
+  [key: string]: string | undefined;
+}
+
+export type SdkEnv = OAuthSdkEnv | ProviderSdkEnv;
+
+const MODEL_ALIAS_ENV = {
+  opus: "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+} as const;
+
+/** The smallest `context_window` among ALL mapped models, or undefined when none is set (PRD #4320
+ *  Decision Log: CLAUDE_CODE_MAX_CONTEXT_TOKENS is process-wide, so every mapped slot counts). */
+function smallestContextWindow(modelMap: Extract<SdkCredential, { kind: "provider" }>["modelMap"]): number | undefined {
+  let min: number | undefined;
+  for (const m of Object.values(modelMap)) {
+    const w = m?.context_window;
+    if (typeof w === "number" && (min === undefined || w < min)) min = w;
+  }
+  return min;
+}
+
+/** The credential-specific keys of {@link buildSdkEnv}, in the order the OAuth env always had them. */
+function credentialEnv(credential: SdkCredential): Record<string, string | undefined> {
+  if (credential.kind === "oauth") {
+    return { CLAUDE_CODE_OAUTH_TOKEN: credential.token, ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
+  }
+  const env: Record<string, string | undefined> = {
+    CLAUDE_CODE_OAUTH_TOKEN: undefined,
+    ANTHROPIC_BASE_URL: credential.baseUrl,
+    ANTHROPIC_API_KEY: credential.authStyle === "x_api_key" ? credential.key : undefined,
+    ANTHROPIC_AUTH_TOKEN: credential.authStyle === "bearer" ? credential.key : undefined,
+  };
+  for (const [alias, key] of Object.entries(MODEL_ALIAS_ENV)) {
+    env[key] = credential.modelMap[alias as keyof typeof MODEL_ALIAS_ENV]?.model;
+  }
+  env.ANTHROPIC_SMALL_FAST_MODEL = credential.modelMap.haiku.model;
+  env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  const window = smallestContextWindow(credential.modelMap);
+  if (window !== undefined) env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(window);
+  return env;
+}
+
 /**
  * Build the sparse env handed to `query({ options: { env } })`.
  *
- * @param oauthToken the Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN)
+ * @param credential the OAuth token (CLAUDE_CODE_OAUTH_TOKEN) or the frozen provider binding (PRD #4320)
  * @param homeDir    the pinned HOME (a dir on $UZI_DATA_DIR) for session persistence
  * @param toolEnv    PRD #18 M3: allowlisted vars from devbox provisioning. Already
  *                   filtered by provision.ts (only PROVISION_ENV_ALLOWLIST keys),
@@ -106,17 +189,20 @@ export interface SdkEnv {
  *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
  *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
  *                   this parameter (a provisioned GOTMPDIR behaves as before).
+ * @param runTmpdir  issue #4420: the run-owned scratch leaf (`RunContext.runTmpdir`). When set it
+ *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
  */
 export function buildSdkEnv(
-  oauthToken: string,
+  credential: SdkCredential,
   homeDir: string,
   toolEnv: Record<string, string> = {},
   dockerHost?: string,
   attempt?: SdkAttemptEnv,
   goWorkDir?: string,
+  runTmpdir?: string,
 ): SdkEnv {
-  const env: SdkEnv = {
-    CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
+  const env = {
+    ...credentialEnv(credential),
     HOME: homeDir,
     // The RUNNER PATH (PRD #51 M4): the /nix-bearing image PATH under the split (the
     // agent's Bash resolves git/bash/coreutils + provisioned tools), NOT the worker's
@@ -128,8 +214,6 @@ export function buildSdkEnv(
     // resolves the $PATH back-ref against it), so it PREPENDS tool bins to the image PATH
     // rather than substituting a foreign one.
     PATH: runnerPath(),
-    ANTHROPIC_API_KEY: undefined,
-    ANTHROPIC_AUTH_TOKEN: undefined,
     // --no-sandbox is MANDATORY under the PRD #51 hardening: the browser runs as an
     // unprivileged uid with cap_drop:ALL + no-new-privileges, which makes Chromium's
     // setuid sandbox impossible, so it must be disabled or the launch fails. Putting the
@@ -146,9 +230,9 @@ export function buildSdkEnv(
     // to the uzi-chromium wrapper. FONTCONFIG / XDG / idle-timeout vars STAY in the
     // shim and the wrapper.
     AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage",
-  };
+  } as unknown as SdkEnv;
   // 5-bis: the agent's scratch on the runner's private 0700 TMPDIR under the split.
-  const tmp = runnerTmpdir();
+  const tmp = runTmpdir ?? runnerTmpdir();
   if (tmp) env.TMPDIR = tmp;
   if (process.env.UZI_SQLC_DIR) env.UZI_SQLC_DIR = process.env.UZI_SQLC_DIR;
   // Fold in the provisioned tool env. Only allowlisted keys reach here; PATH (if
@@ -224,6 +308,7 @@ export function buildCheckEnv(
   homeDir: string,
   toolEnv?: Record<string, string>,
   goWorkDir?: string,
+  runTmpdir?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
@@ -237,7 +322,7 @@ export function buildCheckEnv(
     GIT_TERMINAL_PROMPT: "0",
   };
   // 5-bis: check scratch on the runner's private 0700 TMPDIR under the split.
-  const tmp = runnerTmpdir(source);
+  const tmp = runTmpdir ?? runnerTmpdir(source);
   if (tmp) env.TMPDIR = tmp;
   if (source.UZI_SQLC_DIR) env.UZI_SQLC_DIR = source.UZI_SQLC_DIR;
   // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer

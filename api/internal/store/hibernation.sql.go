@@ -268,6 +268,25 @@ func (q *Queries) GetHibernationWake(ctx context.Context, runID uuid.UUID) (Hibe
 	return i, err
 }
 
+const hibernationWakeProvenanceAdmits = `-- name: HibernationWakeProvenanceAdmits :one
+SELECT COALESCE(fn_codex_claim_provenance_admits(r, $1::uuid), false)::boolean AS admitted
+FROM runs r WHERE r.id = $2
+`
+
+type HibernationWakeProvenanceAdmitsParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	RunID    uuid.UUID `json:"run_id"`
+}
+
+// Read after LockRunForShare on the same READ COMMITTED transaction. The separate
+// statement observes any claim/requeue committed while the run lock was awaited.
+func (q *Queries) HibernationWakeProvenanceAdmits(ctx context.Context, arg HibernationWakeProvenanceAdmitsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hibernationWakeProvenanceAdmits, arg.WorkerID, arg.RunID)
+	var admitted bool
+	err := row.Scan(&admitted)
+	return admitted, err
+}
+
 const hibernationWakeSuppresses = `-- name: HibernationWakeSuppresses :one
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
@@ -590,6 +609,8 @@ CROSS JOIN LATERAL (
            AND (r.kind <> 'job'
                 OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                     AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+           -- Issue #4476: ClaimRun's Codex claim-provenance clause.
+           AND fn_codex_claim_provenance_admits(r, w.id)
            -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
            AND (r.kind = 'cross_check' OR r.worker_id IS NULL OR r.worker_id = w.id
                 OR r.updated_at < $5::timestamptz
@@ -710,6 +731,7 @@ FROM hibernation_wakes hw
 JOIN runs r ON r.id = hw.run_id
 JOIN workers w ON w.id = hw.worker_id
 WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
+   OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
 ORDER BY hw.worker_id, hw.run_id
 LIMIT $1
 `
@@ -720,9 +742,10 @@ type ListStaleHibernationWakesRow struct {
 }
 
 // Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
-// longer queued. A run that left 'queued' (claimed, cancelled, finished) qualifies, and so does a row
-// whose worker is hibernated or preparing again (the wake can no longer serve the run). A row whose
-// worker settled to none is kept while the run is queued, so the run never wakes a worker twice.
+// longer queued or no longer admits its recorded worker under claim provenance. A run that left
+// 'queued' (claimed, cancelled, finished) qualifies, and so does a row whose worker is hibernated
+// or preparing again (the wake can no longer serve the run). An awake worker's row is kept while
+// the queued run still admits it, so one pending run never wakes a valid worker twice.
 // A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 func (q *Queries) ListStaleHibernationWakes(ctx context.Context, maxRows int32) ([]ListStaleHibernationWakesRow, error) {
 	rows, err := q.db.Query(ctx, listStaleHibernationWakes, maxRows)
@@ -1170,25 +1193,37 @@ func (q *Queries) SetHibernationInventoryStatus(ctx context.Context, arg SetHibe
 }
 
 const upsertControllerHibernationAdvertisement = `-- name: UpsertControllerHibernationAdvertisement :exec
-INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
-VALUES (1, $1, $2, $1, $3)
+INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds,
+                                      admin_sizes_version, admin_sizes_advertised_at)
+VALUES (1, $1, $2, $1, $3, $4, $1)
 ON CONFLICT (id) DO UPDATE SET
     hibernation_version = EXCLUDED.hibernation_version,
     hibernation_advertised_at = EXCLUDED.hibernation_advertised_at,
-    poll_interval_seconds = EXCLUDED.poll_interval_seconds
+    poll_interval_seconds = EXCLUDED.poll_interval_seconds,
+    admin_sizes_version = EXCLUDED.admin_sizes_version,
+    admin_sizes_advertised_at = EXCLUDED.admin_sizes_advertised_at
 `
 
 type UpsertControllerHibernationAdvertisementParams struct {
 	AdvertisedAt        pgtype.Timestamptz `json:"advertised_at"`
 	HibernationVersion  pgtype.Int4        `json:"hibernation_version"`
 	PollIntervalSeconds pgtype.Int4        `json:"poll_interval_seconds"`
+	AdminSizesVersion   pgtype.Int4        `json:"admin_sizes_version"`
 }
 
-// Record the controller's hibernation protocol version and poll interval from a status
-// report, stamped with the api's own receipt clock. Admission reads it back to refuse a
-// hibernate when no controller that understands the feature has reported recently.
+// Record the controller's hibernation protocol version, admin-size support version and poll
+// interval from a FLEET status report, stamped with the api's own receipt clock. Admission
+// reads the hibernation version back to refuse a hibernate when no controller that understands
+// the feature has reported recently; the admin-size version (PRD #4213, 0 is an honest "this
+// controller ignores DesiredWorker.Resources") is written in the same statement so the two
+// advertisements can never disagree about which report they came from.
 func (q *Queries) UpsertControllerHibernationAdvertisement(ctx context.Context, arg UpsertControllerHibernationAdvertisementParams) error {
-	_, err := q.db.Exec(ctx, upsertControllerHibernationAdvertisement, arg.AdvertisedAt, arg.HibernationVersion, arg.PollIntervalSeconds)
+	_, err := q.db.Exec(ctx, upsertControllerHibernationAdvertisement,
+		arg.AdvertisedAt,
+		arg.HibernationVersion,
+		arg.PollIntervalSeconds,
+		arg.AdminSizesVersion,
+	)
 	return err
 }
 
@@ -1364,9 +1399,13 @@ UPDATE workers SET
     last_wake_settled_at = $28,
     hibernation_blocked_reason = $29,
     hibernation_blocked_at = $30,
-    hibernation_blocked_since = $31
-WHERE id = $32
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, last_wake_settled_at, hibernation_blocked_reason, hibernation_blocked_at, hibernation_blocked_since
+    hibernation_blocked_since = $31,
+    hibernation_origin_op_id = $32,
+    hibernation_admit_origin = $33,
+    hibernation_wake_origin = $34,
+    last_manual_wake_settled_at = $35
+WHERE id = $36
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, last_wake_settled_at, hibernation_blocked_reason, hibernation_blocked_at, hibernation_blocked_since, memory_authority_lost_at, hibernation_origin_op_id, hibernation_admit_origin, hibernation_wake_origin, last_manual_wake_settled_at, memory_authority_held_at
 `
 
 type WriteWorkerHibernationParams struct {
@@ -1401,6 +1440,10 @@ type WriteWorkerHibernationParams struct {
 	HibernationBlockedReason   pgtype.Text        `json:"hibernation_blocked_reason"`
 	HibernationBlockedAt       pgtype.Timestamptz `json:"hibernation_blocked_at"`
 	HibernationBlockedSince    pgtype.Timestamptz `json:"hibernation_blocked_since"`
+	HibernationOriginOpID      pgtype.UUID        `json:"hibernation_origin_op_id"`
+	HibernationAdmitOrigin     pgtype.Text        `json:"hibernation_admit_origin"`
+	HibernationWakeOrigin      pgtype.Text        `json:"hibernation_wake_origin"`
+	LastManualWakeSettledAt    pgtype.Timestamptz `json:"last_manual_wake_settled_at"`
 	ID                         uuid.UUID          `json:"id"`
 }
 
@@ -1443,6 +1486,10 @@ func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHib
 		arg.HibernationBlockedReason,
 		arg.HibernationBlockedAt,
 		arg.HibernationBlockedSince,
+		arg.HibernationOriginOpID,
+		arg.HibernationAdmitOrigin,
+		arg.HibernationWakeOrigin,
+		arg.LastManualWakeSettledAt,
 		arg.ID,
 	)
 	var i Worker
@@ -1553,6 +1600,12 @@ func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHib
 		&i.HibernationBlockedReason,
 		&i.HibernationBlockedAt,
 		&i.HibernationBlockedSince,
+		&i.MemoryAuthorityLostAt,
+		&i.HibernationOriginOpID,
+		&i.HibernationAdmitOrigin,
+		&i.HibernationWakeOrigin,
+		&i.LastManualWakeSettledAt,
+		&i.MemoryAuthorityHeldAt,
 	)
 	return i, err
 }

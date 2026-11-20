@@ -25,6 +25,7 @@ import type { ActivitySettle, CheckActivityRecorder } from "./cross-check-activi
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ClaimResponse } from "./protocol.js";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { CODE_VERDICT_SCHEMA, PLAN_VERDICT_SCHEMA, codeCrossCheckBrief, codeCrossCheckBriefWithGuidance, codeGuidanceOf, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
@@ -163,7 +164,7 @@ export function buildClaudeCrossCheckOptions(input: {
   const options: SdkOptions = {
     cwd: input.cwd,
     // A full replacement: only these keys reach the SDK child (sdk-env.ts).
-    env: isolateSdkEnv(buildSdkEnv(input.oauthToken, input.homeDir)) as unknown as Record<string, string | undefined>,
+    env: isolateSdkEnv(buildSdkEnv({ kind: "oauth", token: input.oauthToken }, input.homeDir)) as unknown as Record<string, string | undefined>,
     // Guardrail invariant #6 (semgrep/settings-sources-isolation.yml): nothing from disk, so a
     // cloned repo's .claude/ can grant the checker nothing. Keep this a LITERAL.
     settingSources: [],
@@ -438,6 +439,7 @@ export class ClaudeCrossCheck {
     activity?: CheckActivityRecorder): Promise<string> {
     if (claim.kind !== "cross_check") throw new Error("cross-check requires a cross_check claim");
     if (claim.secrets.codex) throw new Error("cross-check Claude path refuses a Codex credential");
+    if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);
     const token = claim.secrets.anthropic_oauth_token?.trim();
     if (!token) throw new CrossCheckCheckerUnavailableError();
     const prompt = crossCheckPrompt(claim);

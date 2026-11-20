@@ -137,7 +137,8 @@ or `na`.
 - A **stale or missing liveness signal is `unknown`, never `ok`.** A health
   page that reads green while it is actually blind is worse than one that
   says it cannot tell. `forge.sync` measures completed attempt outcomes,
-  not the freshness of a prior success; see [Forge issue-sync failures](#forge-issue-sync-failures).
+  not the freshness of a prior success, and `issue_tracker.sync` does the same for repos linked to an issue tracker; see [Forge issue-sync failures](#forge-issue-sync-failures)
+  and [Issue tracker sync failures](#issue-tracker-sync-failures).
 - A check that **cannot apply on this deployment** (no hosted workers, Slack
   not configured) is `na`. It stays in the checks list — it never disappears
   and never silently counts as passing.
@@ -190,7 +191,7 @@ suppressed banner.
 
 Thresholds below are named constants in code
 (`api/internal/healthsvc/thresholds.go`), not admin-configurable settings,
-except `forge.sync`, whose windows follow the effective forge poll interval.
+except `forge.sync` and `issue_tracker.sync`, whose windows follow the effective forge poll interval.
 
 ### Workers
 
@@ -204,7 +205,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
 | `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | `na` when no hosted workers are configured |
 | `fleet.hibernation_cleanup` | Whether a [hibernating worker's cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) has an unknown settlement, which keeps the worker's claims fenced (scope `instance`) | — | any attempt's settlement is unknown; it stays until the same attempt reports or the controller observes its pod stopped, and blocks the worker's delete | `na` when no hosted workers are configured |
-| `fleet.hibernation` | Idle persistent hosted workers that [automatic hibernation](hosted-workers.md#automatic-hibernation) could not hibernate, and workers kept awake only by long-parked runs (title "Automatic hibernation", scope `instance`); the evidence is an exact "Workers" count, then up to 50 worker lines in total, idle workers first and then parked ones, such as `worker <name> idle 20d, hibernation blocked: recovery custody hold`, `worker <name> idle 20d, hibernation blocked: controller refused (roll reservation)` or `worker <name> blocked: assigned run parked (<run id prefix>, paused)`, and a "More" line when more than 50 match | an idle persistent hosted worker past `worker_hibernation_idle_after` has a recorded hibernation refusal (custody hold, manual cordon, maintenance, image roll, draining, intake fenced, a queued run waking it, controller not advertising hibernation, no pod identity, controller refused; for controller refused the evidence names the controller's reason as `controller refused (<label>)`, one of roll reservation, roll blocked, disk pressure, DinD maintenance, busy, layout migration held, roll evidence unavailable or roll cohort cleanup pending, and an unknown code shows sanitized and cut to at most 20 bytes; see [Diagnosing a blocked hibernation or a stuck roll](hosted-workers.md#diagnosing-a-blocked-hibernation-or-a-stuck-roll)), or a worker's only assigned runs are parked (`recovery_wait`, `paused`, `limit_wait`) for longer than the threshold; it clears once the blocker is gone and the worker hibernates | — | `unknown` when the settings or the query cannot be read; `na` when no hosted workers are configured or automatic hibernation is off (`worker_hibernation_enabled` and `worker_hibernation_auto` must both be on) |
+| `fleet.hibernation` | Idle persistent hosted workers that [automatic hibernation](hosted-workers.md#automatic-hibernation) could not hibernate, and workers kept awake only by long-parked runs (title "Automatic hibernation", scope `instance`); the evidence is an exact "Workers" count, then up to 50 worker lines in total, idle workers first and then parked ones, such as `worker <name> idle 20d, hibernation blocked: recovery custody hold`, `worker <name> idle 20d, hibernation blocked: controller refused (roll reservation)` or `worker <name> blocked: assigned run parked (<run id prefix>, paused)`, and a "More" line when more than 50 match | an idle persistent hosted worker past `worker_hibernation_idle_after` has a recorded hibernation refusal (custody hold, manual cordon, maintenance, image roll, draining, intake fenced, a queued run waking it, controller not advertising hibernation, no pod identity, controller refused; for controller refused the evidence names the controller's reason as `controller refused (<label>)`, one of roll reservation, roll blocked, disk pressure, DinD maintenance, busy, layout migration held, roll evidence unavailable or roll cohort cleanup pending, and an unknown code shows sanitized and cut to at most 20 bytes; see [Diagnosing a blocked hibernation or a stuck roll](hosted-workers.md#diagnosing-a-blocked-hibernation-or-a-stuck-roll)), or a worker's only assigned runs are parked (`recovery_wait`, `paused`, `limit_wait`) for longer than the threshold; it clears once the blocker is gone and the worker hibernates. With the [surplus warm reserve](hosted-workers.md#owner-wide-long-clock) on, a pooled worker counts as idle past the threshold only by its owner-wide long clock, and a refusal recorded by the surplus rule alone does not raise the check | — | `unknown` when the settings or the query cannot be read; `na` when no hosted workers are configured or automatic hibernation is off (`worker_hibernation_enabled` and `worker_hibernation_auto` must both be on) |
 | `fleet.hibernation_retirement` | A **dry run** of [volume retirement](hosted-workers.md#volume-retirement-dry-run-m1) for workers that have been hibernated a long time (scope `instance`). Nothing is deleted: it says which workers a later release could retire and which are blocked, and why | a worker past the 21-day (504 hour) retirement period is blocked, or more than 50 workers are hibernated so only the oldest 50 were evaluated (the summary says "evaluated 50 of N (oldest first)"); each evidence row is a short worker id with `blocked by <code> (<source>)` (a missing receipt names the retained source and the run, `<kind>:<path> run <id>`, cut to fit, so a long path can hide the run), followed by `; class policy <policy>, actual PV unverified` when the inventory recorded the claims, or, for a worker nothing blocks, a fixed sentence that it "would retire only after M2 verifies" the actual PV reclaim policy and that no pod ran between observations (flagged when the StorageClass policy is `Retain` or unknown), `not yet eligible: <time> left` (blocker and class policy appended as for a blocked worker), or `cancelled: wake requested`; at most 10 rows, blocked workers first | — | `na` when no worker is hibernated or waking; `unknown` when the evaluation itself fails |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
@@ -264,6 +265,43 @@ whose only worker died, `fleet.capacity` reports danger about max(`WORKER_STALE_
 When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the run, or the worker
 row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
 genuine wait again.
+
+A queued Codex run that has already been claimed is held for the worker that last
+ran it (issue #4476, [ADR-4476](../adr/4476-codex-claim-provenance.md)); no stale-requeue
+grace, affinity ceiling, deleted owner row or cross-check exemption releases it to
+another worker. It shows `waiting_worker` with a recorded-worker or unavailable reason: "held for worker
+<name>: wait for it or cancel the run; only the worker that last ran this Codex run
+may resume it" (the name comes from the recorded claim provenance, or the worker id
+when that worker row was deleted). If that worker is still fenced by its released
+registration nonce, the reason instead says "restart it or cancel the run; its
+previous process was released"; waiting alone cannot clear that fence. A new
+registration nonce restores ordinary waiting advice. "held: predecessor provenance unavailable;
+cancel the run; no worker may resume this Codex run" is shown for a run with no usable
+provenance (any Codex run at generation 1 or later when the rule deployed,
+including a paused or parked one, or a run claimed by an older api). The reason is
+shown from the first evaluation, after the isolated egress lane blocker and before
+the manual cordon, owner hold and stale-requeue pin reasons; the account
+prerequisites above, the intake pause, the weekly reserve and the Codex admission
+wait still take precedence. The named reason is quiet while a stale-requeue pin
+or a draining or maintenance hold is in force by its clock, and nudges once when
+that window ends. If the condition behind the window ends early (the drain is
+cleared, or the worker row is deleted or replaced), the single nudge comes at the
+affinity ceiling after the run's last update; a hold that began in another quiet
+state (leaving a maintenance intake pause, a Codex admission wait or a reserve)
+nudges once at that point too, and not at all when that ceiling had already
+passed when the episode began. A held run outside any window (for example after a
+normal Resume onto a live worker) nudges on the first health tick, ignoring the
+young-run grace, and counts in `queue.waiting`. The unavailable reason never resolves
+itself, so it nudges on entering it from any state (the nudge cooldown still
+applies). Known timing limitation, deferred from #4500: if stale grace overlaps
+an owner hold that clears after grace expires, the nudge can fire before the
+intended ceiling fallback. Admission, custody and run state are unaffected.
+None of these reasons starts with "waiting until", so `queue.waiting` and
+`fleet.capacity` count these runs as genuine waits: a routine drain of the last
+worker of a Codex run can raise `queue.waiting` while no nudge is sent. The Slack
+nudge text for `waiting_worker` ("still waiting for a worker to pick it up") does
+not match the unavailable reason; this is a known inconsistency. Owner action: wait
+for the named worker, restart it when the reason requests that, or `uzi run cancel <id>`.
 
 A queued run whose previous worker is draining or in active maintenance instead shows
 "waiting until <time, RFC3339 UTC> for its previous worker <name> to finish draining or
@@ -413,7 +451,8 @@ are the normal notice's: the same "Enable run-health detection"
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
-| `forge.sync` | Completed poller issue-sync outcomes for each currently enabled repo; `I` is the effective poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-repo enumeration fails, or any repo is pending without warn/danger; `na` when no repos are enabled |
+| `forge.sync` | Completed poller issue-sync outcomes for each currently enabled repo (for a repo linked to an issue tracker, the code-host probe instead); `I` is the effective poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-repo enumeration fails, or any repo is pending without warn/danger; `na` when no repos are enabled |
+| `issue_tracker.sync` | Completed poller linked-issue-sync outcomes for each currently enabled repo linked to an issue tracker; `I` is the effective forge poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled linked repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-linked-repo enumeration fails, or any repo is pending without warn/danger; `na` when no enabled repo is linked to an issue tracker |
 | `forge.ciwatch` | Whether a repo has more eligible run branches than the CI watch's per-repo cap (`CI_WATCH_MAX_REFS`), so some go unwatched | any repo over the cap | — | `na` when the CI watch is disabled (`CI_WATCH_MAX_REFS=0`) |
 | `slack.socket` | The Slack socket's connection state | configured but disconnected for 5+ minutes | — | `na` when Slack is not configured |
 
@@ -463,6 +502,12 @@ and `other`. Warn/danger actions use the latest failure class:
 | `server_error` / `rate_limited` | forge-side; check the forge's status and rate limits, and wait. |
 | `other` | read the api logs for `poller:` errors. |
 
+For a repo linked to an issue tracker, `forge.sync` does not measure the
+issue sync. It measures a cheap code-host probe (one project lookup per linked
+repo per poll tick), so a revoked forge token turns `forge.sync` red and an
+issue tracker outage does not. The poller's code-host steps (MR watching, CI
+autofix and the like) run whatever the probe returns.
+
 #### Membership, resets, and consistency
 
 The authoritative membership read selects only currently enabled repo IDs
@@ -500,6 +545,28 @@ These are bounded observations, not a globally ordered snapshot:
   becomes visible through that cache.
 - A last success without further attempts does not become a freshness
   failure. Poller liveness remains the separate `loops` check.
+
+### Issue tracker sync failures
+
+`issue_tracker.sync` is the counterpart of `forge.sync` for repos linked to an
+issue tracker. It covers the poller's issue tracker client construction and the
+returned outcome of the linked issue sync for each currently enabled repo that
+is linked to an issue tracker; unlinked repos stay with `forge.sync`. It is
+evaluated right after `forge.sync` and has the same owner scope, evidence
+bounds, severity rules, `I` window (the effective forge poll interval),
+membership and reset behavior described above, over linked repos only. It is
+`na` when no enabled repo is linked to an issue tracker. When the poller cannot
+build the repo's forge client, no issue tracker attempt is recorded that tick
+(`forge.sync` fails instead), so a linked repo whose forge connection is broken
+from the start stays pending here. Warn/danger actions use the latest failure
+class:
+
+| Class | Action |
+|---|---|
+| `timeout` | check reachability of the issue tracker from the api pod. |
+| `auth` | the issue tracker connection's token is invalid or lacks access; re-check the issue tracker connection. |
+| `server_error` / `rate_limited` | issue-tracker side; check the issue tracker's status and rate limits, and wait. |
+| `other` | read the api logs for `poller: linked issue sync` and `poller: build linked issue tracker` errors. |
 
 ### Housekeeping
 
@@ -657,8 +724,8 @@ Two checks shown in the accepted mock are **deferred**, not shipped:
 - **Per-forge-connection sync freshness** — whether a connection's issue/board
   sync is current. `synced_at`/`last_synced_at` exist per cached issue, per
   pipeline row, and per repo, but never per forge connection, so there is no
-  per-connection bookkeeping to read yet. The delivered `forge.sync` check
-  measures per-repo poller failure streaks, not this independent freshness
+  per-connection bookkeeping to read yet. The delivered `forge.sync` and
+  `issue_tracker.sync` checks measure per-repo poller failure streaks, not this independent freshness
   signal or a fix for an underlying transport problem.
 
 - **Database volume usage** — the volume's free space, WAL growth, or a full

@@ -151,6 +151,12 @@ for invalid in unknown M L-HIGHMEM; do
   expect_fail "invalid size $invalid" 'workers.ephemeralDefaultSize must be one of s, m, l, l-highmem' \
     --set "workers.ephemeralDefaultSize=$invalid"
 done
+# A well-formed admin-added size name (e.g. xs) must still be refused here: the
+# env value is validated at api boot before the size table exists in the store,
+# so the chart accepts built-ins only. An admin-set ephemeral_default_size on
+# Admin -> Workers may name any existing size.
+expect_fail "custom size xs" 'workers.ephemeralDefaultSize must be one of s, m, l, l-highmem' \
+  --set "workers.ephemeralDefaultSize=xs"
 if helm template uzi "$CHART" --set api.secretEnv.UZI_EPHEMERAL_DEFAULT_SIZE=another-key > "$WORK/duplicate.yaml" 2> "$WORK/duplicate.err"; then
   echo "FAIL: secretEnv duplicated the chart-owned ephemeral size" >&2
   exit 1

@@ -10,6 +10,7 @@ import type { ChatInput, ChatInputSource } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { ChatClaimResponse, OutgoingMessage, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { secretRecordingLogger } from "./runner-harness.js";
 
 // The ChatRunner is exercised with a fake in-memory client (state + message
 // captures), a fake input source (scripted ChatInputs — the ChatSteering channel is
@@ -347,5 +348,71 @@ describe("ChatRunner — resume preflight (issue #105)", () => {
     await runnerWithHome(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), fakeSource([msg("q"), { kind: "idle" }]))
       .execute(baseClaim({ resume_of_run_id: "prior-run", session_id: SID }));
     assert.strictEqual(options[0]!.resume, SID, "no HOME configured ⇒ the claim's id passes through unchanged");
+  });
+});
+
+describe("ChatRunner — provider gateway key redaction (PRD #4320)", () => {
+  // Assembled at runtime: no provider-token-shaped literal in source.
+  const PROVIDER_KEY = ["gw", "key", "do-not-scan", "5151", "abcdefgh"].join("-");
+  const providerClaim = (): ChatClaimResponse => baseClaim({
+    secrets: {
+      anthropic_oauth_token: "",
+      provider: {
+        provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+        auth_style: "bearer", credential: PROVIDER_KEY, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+      },
+    },
+  });
+
+  it("registers the key with the logger, evicts it on terminal, and scrubs it from emitted messages", async () => {
+    const { messages, client } = fakeClient();
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      yield assistantText(`the gateway echoed ${PROVIDER_KEY}`);
+      yield resultSuccess();
+    })();
+    const { logger, added, removed } = secretRecordingLogger();
+    const executor = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+    await new ChatRunner(client, () => executor, logger, 5, DEFAULTS, JOIN, { makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]) }).execute(providerClaim());
+    assert.ok(added.includes(PROVIDER_KEY), "the provider key was registered with the logger");
+    assert.ok(removed.includes(PROVIDER_KEY), "and evicted when the chat ended");
+    const emitted = JSON.stringify(messages);
+    assert.ok(!emitted.includes(PROVIDER_KEY), "the key never reaches a chat message");
+    assert.ok(emitted.includes("REDACTED"), "it was replaced, not dropped");
+  });
+
+  async function resultPayloads(claim: ChatClaimResponse): Promise<Record<string, unknown>[]> {
+    const { messages, client } = fakeClient();
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      yield assistantText("answer");
+      yield {
+        type: "result", subtype: "success", is_error: false, session_id: "sess-1", total_cost_usd: 0.42,
+        usage: { input_tokens: 11, output_tokens: 7 },
+        modelUsage: { "corp-sonnet": { inputTokens: 11, outputTokens: 7, costUSD: 0.42 } },
+      } as unknown as SDKMessage;
+    })();
+    const executor = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+    await new ChatRunner(client, () => executor, nullLogger(), 5, DEFAULTS, JOIN, { makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]) }).execute(claim);
+    return messages.map((m) => m.payload).filter((p) => "modelUsage" in p);
+  }
+
+  it("a provider chat keeps result tokens but drops both vendor cost fields", async () => {
+    const payloads = await resultPayloads(providerClaim());
+    assert.strictEqual(payloads.length, 1, "exactly one result frame carries modelUsage");
+    const p = payloads[0]!;
+    assert.ok(!Object.hasOwn(p, "total_cost_usd"), "total_cost_usd is stripped");
+    const mu = (p["modelUsage"] as Record<string, Record<string, unknown>>)["corp-sonnet"]!;
+    assert.ok(!Object.hasOwn(mu, "costUSD"), "modelUsage costUSD is stripped");
+    assert.strictEqual(mu["inputTokens"], 11);
+    assert.strictEqual(mu["outputTokens"], 7);
+  });
+
+  it("a vendor chat keeps its cost unchanged", async () => {
+    const payloads = await resultPayloads(baseClaim());
+    assert.strictEqual(payloads.length, 1);
+    const p = payloads[0]!;
+    assert.strictEqual(p["total_cost_usd"], 0.42);
+    assert.strictEqual((p["modelUsage"] as Record<string, Record<string, unknown>>)["corp-sonnet"]!["costUSD"], 0.42);
   });
 });

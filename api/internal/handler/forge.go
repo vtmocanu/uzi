@@ -223,6 +223,13 @@ type createConnectionRequest struct {
 	ForgeType string `json:"forge_type"`
 	BaseURL   string `json:"base_url"`
 	Token     string `json:"token"`
+	// Replace is the explicit opt-in to rotate an EXISTING connection's credential.
+	// Without it, a create that targets a (user, forge_type, base_url) already
+	// connected is refused with 409 rather than silently overwriting the stored
+	// token and bot identity. The Settings form reads as "add a repo", so a user
+	// re-submitting the same host would otherwise destroy the credential they
+	// already had. A plain bool, so absence means "do not replace".
+	Replace bool `json:"replace"`
 }
 
 // CreateConnection connects (or reconnects/rotates) a bot PAT. It validates the
@@ -242,20 +249,62 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := h.provisioner().ConnectForge(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
-	if err != nil {
-		var pe *provisionsvc.Error
-		if errors.As(err, &pe) && pe.Kind == provisionsvc.KindOverPrivileged {
-			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error":      pe.Message,
-				"violations": pe.Violations,
-			})
+	// A create that targets an already-connected (user, forge_type, base_url) must
+	// not silently rotate that connection's credential. The Settings form reads as
+	// "add a repo", so a user re-submitting the same host would otherwise destroy
+	// the token and bot identity they already had. Refuse with 409 and name the
+	// existing connection, so the caller can either enable a repo on it (the thing
+	// they probably meant) or re-submit with replace=true to rotate it deliberately.
+	//
+	// The refusal is the store's create-only insert, not a read followed by an
+	// upsert. ON CONFLICT DO NOTHING makes it atomic, so two concurrent creates
+	// cannot both pass a lookup and have the second overwrite the first. The cost is
+	// that a duplicate now pays the token verification before the conflict is
+	// detected, where a pre-flight lookup could have refused it for free; the
+	// atomicity is worth more than the saved round trip, and the create-only path
+	// shares validateConnection with the upsert path so the two cannot drift.
+	//
+	// h.q == nil is the validation-only test seam (issue #223): there is no store to
+	// be atomic against, and validation is all those tests reach.
+	prov := h.provisioner()
+	if req.Replace || h.q == nil {
+		conn, err := prov.ConnectForge(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
+		if err != nil {
+			writeConnectError(w, err)
 			return
 		}
-		writeProvisionError(w, err)
+		httpx.JSON(w, http.StatusCreated, map[string]any{"connection": connToDTO(conn)})
+		return
+	}
+	conn, created, err := prov.ConnectForgeCreateOnly(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
+	if err != nil {
+		writeConnectError(w, err)
+		return
+	}
+	if !created {
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error":         "a connection to this forge already exists; enable a repository on it, or resend with replace=true to rotate its credential",
+			"code":          "forge_connection_exists",
+			"connection_id": conn.ID.String(),
+		})
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"connection": connToDTO(conn)})
+}
+
+// writeConnectError maps a connect failure to its wire response: the
+// over-privileged 422 carries the violations the form renders, everything else
+// goes through the shared provisioning mapping.
+func writeConnectError(w http.ResponseWriter, err error) {
+	var pe *provisionsvc.Error
+	if errors.As(err, &pe) && pe.Kind == provisionsvc.KindOverPrivileged {
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":      pe.Message,
+			"violations": pe.Violations,
+		})
+		return
+	}
+	writeProvisionError(w, err)
 }
 
 // ListConnections returns the current user's forge connections.
@@ -596,6 +645,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// A store error degrades gracefully (empty map → field stays nil), never failing
 	// the whole list, matching the docker-allowlist direction.
 	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list projects")
+	envCounts := h.envVarCountsForUser(r.Context(), user.ID, "list projects")
 	// PRD #1432: the member's latest override-request per repo, so a not-yet-enabled
 	// blocked repo can surface what they already asked for. Non-fatal on error — this
 	// is enrichment like GuardrailBlocked, so a store failure logs and leaves the map
@@ -610,6 +660,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
+		d.EnvVarCount = envCounts[rp.ID]
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		d.DockerAllowlisted = allowSet[rp.ID]
@@ -737,8 +788,10 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once, keyed by
 	// repo id, degrading gracefully on a store error (see syncLinksForRepos).
 	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list repos")
+	envCounts := h.envVarCountsForUser(r.Context(), user.ID, "list repos")
 	for _, rp := range repos {
 		d := repoToDTO(rp)
+		d.EnvVarCount = envCounts[rp.ID]
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		d.DockerAllowlisted = allowSet[rp.ID]
@@ -852,7 +905,9 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		h.requestInitialImport(id)
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+	dto := repoToDTO(repo)
+	dto.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
+	httpx.JSON(w, http.StatusOK, map[string]any{"repo": dto})
 }
 
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data
@@ -1509,7 +1564,9 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	response := map[string]any{"repo": repoToDTO(repo)}
+	repoDTO := repoToDTO(repo)
+	repoDTO.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
+	response := map[string]any{"repo": repoDTO}
 	var overlap []string
 	for _, cap := range repo.RequiredCapabilities {
 		if slices.Contains(repo.IgnoredInferredCapabilities, cap) {
@@ -1523,9 +1580,15 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 // provisioner builds the shared provisioning service over the handler's
-// collaborators. It is cheap, so it is built per call.
+// collaborators. It is cheap, so it is built per call. The enable runs in a
+// transaction over h.pool (PRD #4173 D13); a handler without a pool leaves
+// transactions off.
 func (h *Handler) provisioner() *provisionsvc.Service {
-	return provisionsvc.New(h.q, h.svc, h.pcheck, h.cfg.ForgeBaseURLAllowed)
+	svc := provisionsvc.New(h.q, h.svc, h.pcheck, h.cfg.ForgeBaseURLAllowed)
+	if h.pool != nil {
+		svc.UseTransactions(h.pool, func(tx pgx.Tx) provisionsvc.Store { return h.q.WithTx(tx) })
+	}
+	return svc
 }
 
 // writeProvisionError maps a provisionsvc error to the status and body the
@@ -1544,6 +1607,8 @@ func writeProvisionError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusNotFound, pe.Message)
 	case provisionsvc.KindBadGateway:
 		httpx.Error(w, http.StatusBadGateway, pe.Message)
+	case provisionsvc.KindConflict:
+		httpx.Error(w, http.StatusConflict, pe.Message)
 	default:
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}

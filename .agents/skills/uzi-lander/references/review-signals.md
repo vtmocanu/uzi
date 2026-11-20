@@ -1,5 +1,24 @@
 # Review-bot signals: what is pollable, per bot, per head
 
+## Wait for a contributor
+
+Run `scripts/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA [--after ISO8601] [interval] [max_polls]`.
+Exit 13 (`RESULT=author_attention`) names `head_changed`, `author_activity` or
+`ci_approval_required`. Inspect the signal; this mode never establishes merge-readiness.
+It uses the same poll budget, unknown handling (exit 9), timeout (2) and GitHub quota
+handback (12), without polling merge gates or requesting a review.
+
+Use the reviewed commit's full 40-hex SHA. Count only activity from the PR author login,
+excluding bots: issue comments, submitted reviews (including empty bodies), and inline
+replies. The default discussion cutoff is watcher startup, at whole-second resolution;
+activity at or before it does not trigger. Pass `--after ISO8601` to catch author activity
+strictly after an explicit moment, such as your review time. Include seconds and `Z` or
+a signed `HH:MM` UTC offset; fractional seconds are accepted. The cutoff stays fixed
+across polls. Other humans, pending reviews and edits to older comments do not count.
+A changed head or an approval-required pull-request workflow run on the head triggers
+immediately, regardless of the discussion cutoff. Re-arm
+readiness after reviewing updates; exit 13 never approves CI or authorizes a merge.
+
 Everything here is measured on this repo (PRs #1421, #1426, #1428, 2026-09-16/17, plus
 the earlier CodeRabbit measurements cited in `coderabbit-triage.md`). `scripts/watch-pr.sh`,
 `scripts/pr-findings.sh`, `scripts/takeover.sh` and `scripts/cr-rate-limit.sh` implement
@@ -52,7 +71,7 @@ started that way is not seen until its check-run exists.
 |---|---|---|
 | Review threads | GraphQL `reviewThreads` | EVERY unresolved, non-outdated thread blocks (`threads=`), whoever opened it: CodeRabbit, Greptile, a human, CodeQL (`github-advanced-security`; #1817: 3 threads the bot counts missed). `--reviewer` never waives one; resolve it. Bot identity is an exact login (GraphQL `coderabbitai`, REST `coderabbitai[bot]`), never a prefix. |
 | Code-scanning alerts | `repos/O/R/code-scanning/alerts?ref=refs/pull/N/head&state=open` (paginated) | Every open alert blocks; an alert can exist without a thread. On #1817 the head listed 5 while `main`'s own open alert was not among them. The FIRST request failing with `404 no analysis found` (measured on repos without CodeQL) or a 403 naming Advanced Security / code scanning as not enabled = `unavailable`, counted as none and printed. Any other failure, a failure after a page was read, or `403 You are not authorized` (measured on another org's repo), is an unknown lookup. |
-| Issue comments | `issues/N/comments` | Any author. Excluded only: `coderabbitai[bot]` bodies carrying `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->`, `<!-- walkthrough_start -->`, `<!-- auto-generated comment: rate limited by coderabbit.ai -->` or `<!-- CodeRabbit review command invocation:` (its reply to a review command), and its reply to the `@coderabbitai rate limit` query when the WHOLE body is the marker plus the fixed quota sentence ending in "More reviews will be available in N minute(s)." or "Reviews are available now." (extra text keeps it must-ack); `greptile-apps[bot]` bodies carrying `<!-- greptile_comment -->` or `<!-- greptile_outside_diff -->` (gated by Greptile's own tally); a body that is only a bot trigger (`@coderabbitai review` / `full review` / `rate limit` / `reviews remaining?` / `ignore` / `pause` / `resume`, `@greptileai review`, `@greptile review`; case and spacing free, no extra words). |
+| Issue comments | `issues/N/comments` | Any author. Excluded only: `coderabbitai[bot]` bodies carrying `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->`, `<!-- walkthrough_start -->`, `<!-- auto-generated comment: rate limited by coderabbit.ai -->` or `<!-- CodeRabbit review command invocation:` (its reply to a review command), and its reply to the `@coderabbitai rate limit` query when the WHOLE body is the reply marker (optionally preceded by `<!-- coderabbit-ai-generated:vN -->`) plus the fixed quota sentence ending in "More reviews will be available in N minute(s)." or "Reviews are available now." (extra text keeps it must-ack); `greptile-apps[bot]` bodies carrying `<!-- greptile_comment -->` or `<!-- greptile_outside_diff -->` (gated by Greptile's own tally); a body that is only a bot trigger (`@coderabbitai review` / `full review` / `rate limit` / `reviews remaining?` / `ignore` / `pause` / `resume`, `@greptileai review`, `@greptile review`; case and spacing free, no extra words). |
 | Review bodies | `pulls/N/reviews` | Any author, any non-empty body. A CodeRabbit body with findings (tally, `Outside diff range`, grouped or nitpick sections) is never excluded. |
 
 Comments and review bodies block until acknowledged. Excerpt rows (`--list`, the watchers,

@@ -25,6 +25,7 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipAlreadyRunning:          true,
 		SkipDescriptionTooLarge:     true,
 		SkipFetchFailed:             true,
+		SkipConsumerGateBusy:        true,
 		SkipVaultLocked:             true,
 		SkipSelfImproveMRCapReached: true,
 		SkipOpenMRExists:            true,
@@ -35,6 +36,13 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipNoUsableCredential:      true,
 		SkipCredentialDisabled:      true,
 		SkipCodexPoolUnavailable:    true,
+		// PRD #4320 M4: provider-source creation refusals.
+		SkipProviderSourceUnusable:           true,
+		SkipProviderLaneUnsupported:          true,
+		SkipProviderModelUnmapped:            true,
+		SkipProviderBindingStale:             true,
+		SkipProviderDestinationNotAllowed:    true,
+		SkipCredentialOverrideProviderSource: true,
 		// PRD #2865: the ci_watch fire path.
 		SkipCIGreen:            true,
 		SkipCIAlreadyHandled:   true,

@@ -35,6 +35,7 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   already_running: "neutral",
   description_too_large: "neutral",
   fetch_failed: "warning",
+  consumer_gate_busy: "warning",
   // A locked owner vault (self_improve, PRD #590) is benign and self-resolving: the
   // cycle re-fires on schedule once the vault is unlocked, so it reads neutral like the
   // other self-resolving skips.
@@ -63,6 +64,13 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   credential_disabled: "warning",
   // #3719: Codex auto mode with a pool but no eligible account. Actionable in Settings.
   codex_pool_unavailable: "warning",
+  // PRD #4320 M4: a provider-sourced owner's fire was refused at creation. Owner-fixable.
+  provider_source_unusable: "warning",
+  provider_lane_unsupported: "warning",
+  provider_model_unmapped: "warning",
+  provider_binding_stale: "warning",
+  provider_destination_not_allowed: "warning",
+  credential_override_provider_source: "warning",
   // PRD #2865 (ci_watch): self-resolving outcomes of a CI-repair fire read neutral; a halted
   // episode or a repo without a default branch needs the owner, so it reads amber.
   ci_green: "neutral",

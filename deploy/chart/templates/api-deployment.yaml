@@ -55,6 +55,13 @@ spec:
         # Roll the pod when the non-secret config (ConfigMap) changes. Secret
         # changes are synced by the Infisical operator (restart the pod to pick up).
         checksum/config: {{ include (print $.Template.BasePath "/api-configmap.yaml") . | sha256sum }}
+        {{- if include "uzi.workerExtraCAConfigMap" . }}
+        {{- $extraCA := .Values.workers.extraCA | default dict }}
+        # The api reads UZI_PROVIDER_EXTRA_CA_FILE once at boot: roll it when the inline bundle, or
+        # the referenced ConfigMap name or key, changes. An in-place edit of an existing ConfigMap
+        # needs a restart, as for the controller.
+        checksum/provider-extra-ca: {{ if $extraCA.pem }}{{ $extraCA.pem | sha256sum }}{{ else }}{{ printf "%s/%s" ($extraCA.configMap | default dict).name (($extraCA.configMap | default dict).key | default "ca.crt") | sha256sum }}{{ end }}
+        {{- end }}
       labels:
         {{- include "uzi.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: api
@@ -188,6 +195,12 @@ spec:
             # a non-empty pin also tells health checks to expect controller reports.
             - name: HOSTED_WORKER_VERSION
               value: {{ .Values.workers.image.tag | quote }}
+            # PRD #4213: the enabled worker tiers, their LimitRange ceilings and quotas as
+            # integers (cpu millicores, memory MiB, PVC GiB), so the api can validate admin
+            # hosted-worker sizes. See uzi.workerSizeEnv for the contract.
+            {{- with include "uzi.workerSizeEnv" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- end }}
             # PRD #837 M4 disk-pressure threshold. The api derives a hosted worker's
             # `disk_pressure` boolean by comparing each reported volume's used/total
@@ -197,6 +210,12 @@ spec:
             # this rendering even when an existing values file omits the key.
             - name: UZI_DISK_PRESSURE_THRESHOLD
               value: {{ .Values.api.diskPressureThreshold | default 0.90 | quote }}
+            {{- if include "uzi.workerExtraCAConfigMap" . }}
+            # workers.extraCA is ALSO trusted by the provider Test probe (PRD #4320 section 8), and
+            # by that client only: the api's other outbound calls keep the system roots.
+            - name: UZI_PROVIDER_EXTRA_CA_FILE
+              value: {{ printf "%s/ca.crt" (include "uzi.apiProviderExtraCADir" .) | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
           {{- with .Values.api.startupProbe }}
@@ -220,6 +239,11 @@ spec:
               mountPath: {{ include "uzi.apiTLSDir" . }}
               readOnly: true
             {{- end }}
+            {{- if include "uzi.workerExtraCAConfigMap" . }}
+            - name: provider-extra-ca
+              mountPath: {{ include "uzi.apiProviderExtraCADir" . }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -232,5 +256,16 @@ spec:
           secret:
             secretName: {{ include "uzi.apiTLSSecretName" . }}
             defaultMode: 0400
+        {{- end }}
+        {{- with include "uzi.workerExtraCAConfigMap" . }}
+        # A CA bundle is public material, so a ConfigMap, projected by key. The same bundle the
+        # controller relays to hosted workers.
+        - name: provider-extra-ca
+          configMap:
+            name: {{ . }}
+            items:
+              {{- $extra := $.Values.workers.extraCA | default dict }}
+              - key: {{ if $extra.pem }}ca.crt{{ else }}{{ ($extra.configMap | default dict).key | default "ca.crt" }}{{ end }}
+                path: ca.crt
         {{- end }}
 {{- end }}

@@ -202,8 +202,22 @@ func bindSourcePublication(ctx context.Context, tx pgx.Tx, w store.Worker, run s
 	if err != nil {
 		return err
 	}
+	// PRD #4173: a run on a repo linked to an external issue tracker closes no forge
+	// issue by its merge request, so its publication is non-closing by the repo link,
+	// not by anything the worker reported or the issue row says. The link is read in
+	// this transaction, but what keeps it consistent with the stamp is PRD #4173 D13: a
+	// repo's issue source is never relinked or unlinked once it is in use, so the link a
+	// run was started under is the link read here.
+	if !run.RepoID.Valid {
+		return ErrInvalidState
+	}
+	repo, err := store.New(tx).GetRepoByID(ctx, run.RepoID.Bytes)
+	if err != nil {
+		return fmt.Errorf("read the run's repo link: %w", err)
+	}
+	linked := repo.IssueTrackerProjectShort.Valid && repo.IssueTrackerProjectShort.String != ""
 	intent := "closing"
-	if restricted || req.SourcePublication.NonClosing {
+	if restricted || linked || req.SourcePublication.NonClosing {
 		intent = "non_closing"
 	}
 	stamp := SourcePublicationIntent{1, *req.ClaimGeneration, *req.Branch, *req.MrIID, req.SourcePublication.PublishedHead, req.SourcePublication.NonClosing, intent}

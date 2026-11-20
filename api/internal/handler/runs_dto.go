@@ -463,6 +463,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.AnthropicSecretID = &s
 	}
 	dto.AnthropicSecretLabel = textPtrValue(r.AnthropicSecretLabel.Valid, r.AnthropicSecretLabel.String)
+	// PRD #4320: the bound model provider's id. The name is a read-time overlay
+	// (overlayProviderNames); runToDTO stays pure.
+	dto.ProviderID = uuidPtrValue(r.ModelProviderID)
 	if r.CodexSecretID.Valid {
 		s := uuid.UUID(r.CodexSecretID.Bytes).String()
 		dto.CodexSecretID = &s
@@ -816,6 +819,43 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 				l := *hold.Label
 				d.CodexSecretLabel = &l
 			}
+		}
+	}
+}
+
+// overlayProviderNames sets provider_name on runs bound to a custom model provider (PRD #4320).
+// runToDTO maps provider_id independently. One batched read covers every bound run in the call and
+// matches each provider under the run's own owner, so a name never crosses users; only the owner
+// and admin run reads call it, never the shared board. A deleted provider (or a failed lookup,
+// which is logged) leaves the name null while the id stays.
+func (h *Handler) overlayProviderNames(ctx context.Context, dtos ...*apitypes.RunDTO) {
+	var ids []uuid.UUID
+	byID := make(map[uuid.UUID][]*apitypes.RunDTO)
+	for _, d := range dtos {
+		if d == nil || d.ProviderID == nil {
+			continue
+		}
+		id, err := uuid.Parse(d.ID)
+		if err != nil {
+			continue
+		}
+		if _, seen := byID[id]; !seen {
+			ids = append(ids, id)
+		}
+		byID[id] = append(byID[id], d)
+	}
+	if len(ids) == 0 || h.wsvc == nil {
+		return
+	}
+	names, err := h.wsvc.ProviderNamesForRuns(ctx, ids)
+	if err != nil {
+		slog.Error("run provider names", "runs", len(ids), "error", err)
+		return
+	}
+	for id, name := range names {
+		for _, d := range byID[id] {
+			n := name
+			d.ProviderName = &n
 		}
 	}
 }

@@ -3,7 +3,10 @@
 # UZI_WORKER_NODE_SELECTOR as documented, and refuses a value that is neither a map
 # nor null. Also asserts workers.tolerations renders into UZI_WORKER_TOLERATIONS
 # (absent by default and when empty or null) and refuses a value that is neither a
-# list nor null.
+# list nor null. Also asserts the opt-in workers.newPlacement renders into
+# UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR / UZI_WORKER_NEW_PLACEMENT_TOLERATIONS (both
+# absent by default, when empty, and when newPlacement is null) and refuses a
+# newPlacement that is not a map, or a field of the wrong type.
 #
 # usage: scripts/assert-worker-node-selector-render.sh [chart-dir]
 #   e.g. scripts/assert-worker-node-selector-render.sh deploy/chart
@@ -174,5 +177,74 @@ for bad in false 0 '""' '{}' '{"key":"uzi"}'; do
     fail=1
   fi
 done
+
+# --- workers.newPlacement -> UZI_WORKER_NEW_PLACEMENT_* ----------------------------
+
+# env_value <env name>: the rendered value, verbatim, or nothing.
+env_value() {
+  awk -v want="- name: $1" '
+    $0 ~ ("^[[:space:]]*" want "$") { hit = 1; next }
+    hit && /value:/ { sub(/^[[:space:]]*value:[[:space:]]*/, ""); print; exit }
+  ' "$WORK/out"
+}
+
+NP_SEL=UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR
+NP_TOL=UZI_WORKER_NEW_PLACEMENT_TOLERATIONS
+
+# expect_np <case> <want selector or ""> <want tolerations or ""> [helm args...]
+expect_np() {
+  _case="$1"; _wsel="$2"; _wtol="$3"; shift 3
+  render "$@" || { echo "BROKEN (newPlacement $_case): helm template failed:" >&2; cat "$WORK/err" >&2; exit 2; }
+  require_controller "newPlacement $_case"
+  _gsel=$(env_value "$NP_SEL"); _gtol=$(env_value "$NP_TOL")
+  if [ "$_gsel" = "$_wsel" ] && [ "$_gtol" = "$_wtol" ]; then
+    echo "OK (newPlacement $_case): selector='${_gsel:-<absent>}' tolerations='${_gtol:-<absent>}'"
+  else
+    echo "FAIL (newPlacement $_case): selector='${_gsel:-<absent>}' tolerations='${_gtol:-<absent>}', want selector='${_wsel:-<absent>}' tolerations='${_wtol:-<absent>}'" >&2
+    fail=1
+  fi
+  # The global placement must be undisturbed by any newPlacement case.
+  if [ "$(selector_value)" != "$AMD64" ]; then
+    echo "FAIL (newPlacement $_case): UZI_WORKER_NODE_SELECTOR = '$(selector_value)', want $AMD64" >&2
+    fail=1
+  fi
+}
+
+NP_SEL_WANT='"{\"kubernetes.io/arch\":\"amd64\",\"pool\":\"new\"}"'
+NP_TOL_WANT='"[{\"effect\":\"NoSchedule\",\"key\":\"pool\",\"operator\":\"Equal\",\"value\":\"new\"}]"'
+
+expect_np "default" "" ""
+expect_np "empty fields" "" "" --set-json 'workers.newPlacement={"nodeSelector":{},"tolerations":[]}'
+expect_np "null" "" "" --set-json 'workers.newPlacement=null'
+expect_np "null fields" "" "" --set-json 'workers.newPlacement={"nodeSelector":null,"tolerations":null}'
+expect_np "nodeSelector set" "$NP_SEL_WANT" "" \
+  --set-json 'workers.newPlacement.nodeSelector={"kubernetes.io/arch":"amd64","pool":"new"}'
+expect_np "tolerations set" "" "$NP_TOL_WANT" \
+  --set-json 'workers.newPlacement.tolerations=[{"key":"pool","operator":"Equal","value":"new","effect":"NoSchedule"}]'
+expect_np "both set" "$NP_SEL_WANT" "$NP_TOL_WANT" \
+  --set-json 'workers.newPlacement.nodeSelector={"kubernetes.io/arch":"amd64","pool":"new"}' \
+  --set-json 'workers.newPlacement.tolerations=[{"key":"pool","operator":"Equal","value":"new","effect":"NoSchedule"}]'
+
+# expect_refused <case> <message fragment> [helm args...]
+expect_refused() {
+  _case="$1"; _msg="$2"; shift 2
+  if render "$@"; then
+    echo "FAIL ($_case): rendered instead of refusing" >&2
+    fail=1
+  elif grep -q "$_msg" "$WORK/err"; then
+    echo "OK ($_case): render refused"
+  else
+    echo "FAIL ($_case): render failed, but not with the expected guard:" >&2
+    cat "$WORK/err" >&2
+    fail=1
+  fi
+}
+
+expect_refused "newPlacement scalar" "workers.newPlacement must be a map" --set-json 'workers.newPlacement="x"'
+expect_refused "newPlacement list" "workers.newPlacement must be a map" --set-json 'workers.newPlacement=[]'
+expect_refused "newPlacement.nodeSelector scalar" "workers.newPlacement.nodeSelector must be a map" \
+  --set-json 'workers.newPlacement.nodeSelector="x"'
+expect_refused "newPlacement.tolerations map" "workers.newPlacement.tolerations must be a list" \
+  --set-json 'workers.newPlacement.tolerations={"a":"b"}'
 
 exit "$fail"

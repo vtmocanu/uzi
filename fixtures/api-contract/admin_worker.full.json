@@ -45,6 +45,14 @@
   "status": "x",
   "kind": "x",
   "hosted_size": "x",
+  "hosted_size_spec": {
+    "cpu_request_millicores": 1,
+    "cpu_limit_millicores": 1,
+    "memory_request_mib": 1,
+    "memory_limit_mib": 1,
+    "data_gib": 1,
+    "dind_data_gib": 1
+  },
   "docker": true,
   "ephemeral": true,
   "ephemeral_lease_expires_at": "2020-01-02T03:04:05Z",

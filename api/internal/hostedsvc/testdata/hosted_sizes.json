@@ -1,8 +1,40 @@
 {
   "sizes": [
-    "s",
-    "m",
-    "l",
-    "l-highmem"
+    {
+      "name": "s",
+      "cpu_request_millicores": 250,
+      "cpu_limit_millicores": 1000,
+      "memory_request_mib": 2048,
+      "memory_limit_mib": 4096,
+      "data_gib": 5,
+      "dind_data_gib": 20
+    },
+    {
+      "name": "m",
+      "cpu_request_millicores": 1000,
+      "cpu_limit_millicores": 4000,
+      "memory_request_mib": 8192,
+      "memory_limit_mib": 12288,
+      "data_gib": 25,
+      "dind_data_gib": 20
+    },
+    {
+      "name": "l",
+      "cpu_request_millicores": 1000,
+      "cpu_limit_millicores": 4000,
+      "memory_request_mib": 14336,
+      "memory_limit_mib": 20480,
+      "data_gib": 50,
+      "dind_data_gib": 50
+    },
+    {
+      "name": "l-highmem",
+      "cpu_request_millicores": 1000,
+      "cpu_limit_millicores": 4000,
+      "memory_request_mib": 24576,
+      "memory_limit_mib": 32768,
+      "data_gib": 50,
+      "dind_data_gib": 50
+    }
   ]
 }

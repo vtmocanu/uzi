@@ -14,6 +14,7 @@ import type { GitCache } from "../src/git.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
 import type { ClaimResponse, StateAck, StateRequest, TaskReviewRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { secretRecordingLogger } from "./runner-harness.js";
 import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
 
 const PASS_HOME_ROOT = testOwnedPassHomeRoot();
@@ -351,6 +352,23 @@ describe("ReviewRunner", () => {
     await runner.execute(reviewClaim({ review_target_run_id: null, claim_generation: 4 }));
     assert.equal(calls.states.at(-1)?.body.status, "failed");
     assert.equal(calls.states.at(-1)?.body.claim_generation, 4, "the failed report carries the claim generation");
+  });
+
+  // PRD #4320: a provider-bound review registers its gateway key with the worker log for the claim
+  // and evicts it afterwards. Assembled at runtime: no provider-token-shaped literal in source.
+  it("registers a provider claim's gateway key with the logger and evicts it when the review ends", async () => {
+    const key = ["gw", "key", "do-not-scan", "6262", "abcdefgh"].join("-");
+    const { client } = fakeClient();
+    const { git } = fakeGit("diff\n");
+    const { logger, added, removed } = secretRecordingLogger();
+    const runner = new ReviewRunner(client, git, logger, { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
+    const provider = {
+      provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+      auth_style: "bearer", credential: key, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+    };
+    await runner.execute(reviewClaim({ review_target_run_id: null, secrets: { forge_pat: "pat", anthropic_oauth_token: "", provider } as never }));
+    assert.deepEqual(added, [key]);
+    assert.deepEqual(removed, [key]);
   });
 
   // Lane-acceptance: a capability worker's review run is ACCEPTED by a generation-fencing api.

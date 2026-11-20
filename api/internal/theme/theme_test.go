@@ -228,3 +228,24 @@ func TestDefaultIsEmber(t *testing.T) {
 		t.Fatal("Default must itself be a valid theme")
 	}
 }
+
+func TestResolveSidebarMotion(t *testing.T) {
+	t.Parallel()
+	yes, no := true, false
+	cases := []struct {
+		name     string
+		override *bool
+		fallback bool
+		want     bool
+	}{
+		{"nil falls back to off", nil, false, false},
+		{"nil falls back to on", nil, true, true},
+		{"explicit true", &yes, false, true},
+		{"explicit false beats fallback on", &no, true, false},
+	}
+	for _, tc := range cases {
+		if got := ResolveSidebarMotion(tc.override, tc.fallback); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

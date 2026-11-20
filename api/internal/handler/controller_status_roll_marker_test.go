@@ -85,11 +85,18 @@ func TestControllerStatusRollMarkerAuthority(t *testing.T) {
 	}
 }
 
-func TestControllerStatusBadPacingStillDropsEntryWithMarker(t *testing.T) {
+func TestControllerStatusBadPacingKeepsEntryAndMarker(t *testing.T) {
 	st := &statusStore{rows: 1}
 	postStatus(t, st, `{"kind":"fleet","workers":[{"id":"`+markerWorkerID+`","phase":"settled","pacing":{"state":"completed"},"roll_marker":{"state":"present"}}]}`)
-	if len(st.upserts) != 0 {
-		t.Fatal("bad pacing must still drop the entry")
+	if len(st.upserts) != 1 {
+		t.Fatalf("bad pacing must not drop the entry: %d upserts", len(st.upserts))
+	}
+	p := st.upserts[0]
+	if p.Pacing != nil || !p.UpdatePacing {
+		t.Fatalf("pacing must be discarded and cleared by the fleet report: %+v", p)
+	}
+	if !p.UpdateRollMarker || p.RollMarker == nil {
+		t.Fatalf("marker must persist: %+v", p)
 	}
 }
 

@@ -91,12 +91,14 @@ func TestManualCompletedReservationNextAdmission(t *testing.T) {
 					}
 				} else {
 					// Capability changes separate coverage pools. The x-only
-					// canary remains healthy in its own pool; the xy candidate
-					// must reach the coverage decision in its pool, with a free
-					// slot, rather than fail on canary incarnation proof.
+					// canary remains healthy in its own pool, but it fences no
+					// Deployment in the xy pool, where w2's incomplete
+					// reservation has no canary: that pool holds instead of
+					// admitting w3 as a fresh canary. The hold names no worker (#4467: a
+					// pool-level reason carries no synthetic worker identity).
 					p := outcomes["w3"]
-					if len(patches) != 0 || r != nil || p == nil || p.BlockingReason == nil || *p.BlockingReason != "no usable coverage: w1 capability_mismatch" || p.BlockingWorkerID == nil || *p.BlockingWorkerID != "w1" {
-						t.Fatalf("missing-y control did not reach coverage rejection: patches=%v marker=%+v outcome=%+v", patches, r, p)
+					if len(patches) != 0 || r != nil || p == nil || p.BlockingReason == nil || *p.BlockingReason != "participant reservation without canary; explicit recovery required" || p.BlockingWorkerID != nil {
+						t.Fatalf("missing-y control did not hold the canary-less pool: patches=%v marker=%+v outcome=%+v", patches, r, p)
 					}
 					if p.CanaryID != nil {
 						t.Fatalf("manual participant counted as canary: %+v", p)

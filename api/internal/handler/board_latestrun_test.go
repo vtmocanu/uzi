@@ -31,6 +31,11 @@ func TestSharedBoardLatestRunExcludesCodexCredential(t *testing.T) {
 		if strings.Contains(name, "secret") || strings.Contains(strings.ToLower(f.Name), "secret") {
 			t.Fatalf("shared board DTO field %s (json %q) names a credential", f.Name, name)
 		}
+		// PRD #4320: a custom provider's id and user-authored name are owner-or-admin
+		// scoped, so neither may ride the shared board DTO.
+		if strings.Contains(name, "provider") || strings.Contains(strings.ToLower(f.Name), "provider") {
+			t.Fatalf("shared board DTO field %s (json %q) names a custom provider", f.Name, name)
+		}
 	}
 }
 

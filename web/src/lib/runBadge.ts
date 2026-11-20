@@ -173,6 +173,11 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
 export const NON_COMPLETION_HOLDS = {
   credential_disabled: { tone: "warning", label: "waiting: credential disabled", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
   credentials_reset: { tone: "warning", label: "waiting: credentials were reset", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  // PRD #4320 module 5: a provider-bound run whose next claim was refused (D9). Neither is owner-resumable:
+  // the destination hold re-queues by itself once the operator allows the URL again; the stale hold is final
+  // (the provider or its key changed after the run was created), so the owner cancels and starts a new run.
+  provider_destination_not_allowed: { tone: "warning", label: "provider URL not allowed: waiting", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  provider_binding_stale: { tone: "warning", label: "provider binding changed: start a new run", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
   provider_unavailable: { tone: "warning", label: "provider unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: false, ownerActionsLink: true },
   codex_policy_hold: { tone: "warning", label: "Codex policy hold", ownerResumable: false, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "never", historyParkLabel: true, ownerActionsLink: false },
   base_attestation_missing: { tone: "warning", label: "base unverified: owner hold", ownerResumable: false, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
@@ -653,13 +658,23 @@ export function displayHealthReason(run: Pick<HealthFlaggable, "health_reason">)
     ? null : reason || null;
 }
 
+// reasonCustodyLimitUnavailable in api/internal/workersvc/health.go (issue #4423 points it to
+// Admin → Workers, where the custody hold limit lives since #4212).
+const CUSTODY_LIMIT_UNAVAILABLE =
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings";
+// Legacy compatibility reader only: the pre-#4423 wording, which an older API can still send
+// during a rolling upgrade. It must keep the same precedence as the current text.
+const CUSTODY_LIMIT_UNAVAILABLE_LEGACY =
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings";
+
 export function queuedBlockerPrecedesCodexAdmission(run: { status: string; health_reason?: string | null }): boolean {
   // Mirror the blockers before admission in queuedReasonWithEligibility (health.go).
   return run.status === "queued" && [
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
     "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
-    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+    CUSTODY_LIMIT_UNAVAILABLE,
+    CUSTODY_LIMIT_UNAVAILABLE_LEGACY,
     // apitypes.ReasonCustodyRunHoldBound (api/internal/apitypes/recovery.go).
     "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
     "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
@@ -932,6 +947,22 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detai
         tone: "warning",
         pulse: false,
         title: "An admin reset this account and its credentials were deleted. The run resumes by itself once you add a credential in Settings.",
+      };
+    case "provider_destination_not_allowed":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.provider_destination_not_allowed,
+        tone: "warning",
+        pulse: false,
+        title: "The operator no longer allows this run's provider URL. The run resumes by itself once it is allowed again, or Cancel it.",
+      };
+    case "provider_binding_stale":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.provider_binding_stale,
+        tone: "warning",
+        pulse: false,
+        title: "The provider or its key changed after this run was created, so it cannot continue. Cancel it and start a new run, which uses the current key.",
       };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration

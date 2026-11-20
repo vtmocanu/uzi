@@ -156,10 +156,15 @@ func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uu
 func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string, manual, advance *ReviewPlan, recheck *reworkRecheck) (store.Run, error) {
 	// Repo-ownership / existence check, mirroring createCIFixRun so an unknown repo is
 	// a clean ErrRepoNotFound rather than an FK error at INSERT.
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable, row.IssueSourceLocked); err != nil {
 		return store.Run{}, err
 	}
 
@@ -195,7 +200,15 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 	}
 	sourceHarness := Harness(sourceRun.Harness)
 
+	// PRD #4320: the rework is a successor of its source run, so it copies the source run's provider
+	// binding (or, for a vendor source, resolves vendor credentials without the owner's provider
+	// source), never the owner's current source.
+	gate := gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &sourceHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// Issue #4488: after the consumer gate, the source run must still exist in the gate's repo.
+		if err := requireGateTargetRepo(ctx, q, sourceRunID, gate); err != nil {
+			return store.Run{}, err
+		}
 		// Issue #1626: serialize against an issue-run create on the same agent branch. The
 		// run-branch lock is the closure's first statement (same (repo, ref) key the issue run
 		// for N takes on agent/issue-N, store.RunBranchLockClass); the check below is a new
@@ -253,6 +266,13 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 				TriggerSource:    triggerSource,
 				// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 				Harness: string(resolved.Harness),
+				// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+				// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+				ModelProviderID:          bindingOf(resolved).ProviderID,
+				ModelProviderRevision:    bindingOf(resolved).Revision,
+				ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+				ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+				ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 			})
 			if err != nil || advance == nil {
 				return run, err
@@ -298,8 +318,15 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			PendingSupersededBy: encodeKeys(manual.PendingSupersededBy),
 			// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	})
+	}, harnessCreationOrigin{InheritFrom: &sourceRun, ConsumerGateRepo: gate})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// WHERE NOT EXISTS matched an active cross-kind ci_fix sibling on this pipeline_ref:

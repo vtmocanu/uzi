@@ -46,8 +46,9 @@ SELECT allowed_job_types
 -- claimable only by a worker that also advertises 'job_files_v1'.
 -- egress_profile_id (PRD #1976 M1) binds the job to a site list: NULL = unbound, the unchanged path;
 -- set = a profile-bound job that only an isolated-lane worker advertising 'isolated_job_v1' claims.
-INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness, job_protocol, egress_profile_id)
-VALUES (@run_id, @user_id, 'job', @job_type, @issue_title, @issue_description, true, '{}', sqlc.narg('budget_wall_seconds'), 'manual', @harness, sqlc.narg('job_protocol')::smallint, sqlc.narg('egress_profile_id')::uuid)
+-- model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
+INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness, job_protocol, egress_profile_id, model_provider_key_mode)
+VALUES (@run_id, @user_id, 'job', @job_type, @issue_title, @issue_description, true, '{}', sqlc.narg('budget_wall_seconds'), 'manual', @harness, sqlc.narg('job_protocol')::smallint, sqlc.narg('egress_profile_id')::uuid, NULL::text)
 RETURNING *;
 
 -- name: CreateJobInput :exec

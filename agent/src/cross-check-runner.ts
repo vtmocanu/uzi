@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { RequestError, type WorkerClient, type PlanCrossCheckFindings } from "./client.js";
 import type { ClaimResponse } from "./protocol.js";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import type { GitCache, CodeSnapshotBootCandidate } from "./git.js";
 import type { Logger } from "./log.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
@@ -217,7 +218,10 @@ export class CrossCheckRunner {
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
-      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.codex?.capability];
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.provider?.credential, claim.secrets.codex?.capability];
+      // PRD #4320: the cross-check lane cannot serve a provider until PRD #4322; the server refuses it
+      // first, this is the worker's second layer. Reported as an unavailable checker, never run.
+      if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);
       const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
         makeRedactor(secrets), makeTextRedactor(secrets), {
           ...(this.opts.outbox ? { outbox: this.opts.outbox } : {}),

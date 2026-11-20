@@ -87,6 +87,42 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		})
 	})
 
+	// Model providers (PRD #4320 M1): user-defined Anthropic-compatible endpoints. Reads, create,
+	// the name/model-map edit and retire are RequireUser (a CLI `uzi provider` command can drive
+	// them): none reveals or replaces a credential, and the destination they can set is bound to
+	// the operator allowlist. Everything that handles the key or moves the destination (key
+	// set/rotate/delete/enable, the endpoint edit, delete) stays cookie-only, DELIBERATELY, for the
+	// same reason /me/secrets writes are: a stolen uzc_ must not replace a key or repoint the
+	// destination the key is sent to.
+	r.Route("/me/providers", func(r chi.Router) {
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireUser())
+			r.Get("/", h.ListMyProviders)
+			r.Post("/", h.CreateMyProvider)
+			r.Get("/{id}", h.GetMyProvider)
+			r.Patch("/{id}", h.PatchMyProvider)
+			r.Post("/{id}/retire", h.RetireMyProvider)
+			// The Claude provider source (PRD #4320 M4): selecting or clearing which provider the
+			// caller's Claude runs use. RequireUser (a CLI `uzi provider use` can drive it, plan
+			// decision P1): it reveals no key and cannot move a destination, and a select is
+			// refused unless the provider is the caller's, usable and allowlisted. A static path,
+			// matched ahead of /{id}.
+			r.Put("/claude-source", h.SetMyClaudeProviderSource)
+			// The Test probe sends the stored key to the stored (allowlisted) destination and
+			// returns only two outcome words, so a Bearer caller can run it but cannot read the
+			// key or move the destination. Rate-limited by its own in-memory admission limiter.
+			r.Post("/{id}/test", h.TestMyProvider)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireAuth())
+			r.Put("/{id}/key", h.PutMyProviderKey)
+			r.Delete("/{id}/key", h.DeleteMyProviderKey)
+			r.Patch("/{id}/key/enabled", h.PatchMyProviderKeyEnabled)
+			r.Patch("/{id}/endpoint", h.PatchMyProviderEndpoint)
+			r.Delete("/{id}", h.DeleteMyProvider)
+		})
+	})
+
 	// CLI token management (PRD #64): the credential the `uzi` CLI presents as a
 	// Bearer token. Cookie-only, DELIBERATELY (Decision 16) — never RequireUser:
 	// a Bearer-reachable CRUD would let a stolen uzc_ mint replacements (revocation
@@ -233,6 +269,47 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// Harness overflow chooses among the caller's existing harness credentials. Like
 	// account mode, it is owner-scoped and Bearer-reachable; cookie writes require CSRF.
 	r.With(h.requireUser()).Put("/me/harness-overflow", h.SetHarnessOverflowEnabled)
+
+	// Current-user model and effort defaults (PRD #3264, `uzi settings set|reset`): a closed
+	// allowlist of the worker-model lanes, ordinary effort, judge and summary models and the
+	// judge harness, written in one transaction. RequireUser, so a uzc_ CLI Bearer works;
+	// PUT /me/settings (the whole settings surface) stays cookie-only above.
+	//
+	// Two different arguments cover the fields.
+	//
+	// The worker model and effort lanes are NON-ADDITIVE: per-run model/effort overrides
+	// already exist on requireUser POST /repos/{id}/runs and schedule create, so a Bearer
+	// that sets default_effort=max only raises the spend of runs the user already consented
+	// to. CAVEAT, as for /me/rate-limits (D23): this rests on those routes staying
+	// RequireUser; if that authority is ever narrowed, revisit this mount.
+	//
+	// The judge and summary lanes (judge_model, codex_judge_model, summary_model,
+	// codex_summary_model), judge_runs_on and cross_check_pins (the checker's per-stage,
+	// per-harness model and effort) are a DELIBERATE NEW Bearer authority: before this route
+	// they were writable only through cookie-only PutMySettings, and CreateRun takes no judge,
+	// summary or checker override. They redirect which model, effort or harness
+	// already-enabled judge, summary and cross-check work uses and never enable it (pins cannot
+	// turn cross-check on): the consent switches
+	// (/me/judge, /me/cross-check, autopilot, ...) stay cookie-only and the handler's
+	// allowlist rejects their keys. The authority is bounded by a token that can already
+	// create runs and spend.
+	//
+	// A uza_ admin token reaches handlers with IsAdmin=true; that is irrelevant here, the
+	// handler has no admin branch and the identity is the authenticated user, never the body.
+	r.With(h.requireUser()).Put("/me/model-settings", h.PutMyModelSettings)
+
+	// The caller's own agent templates for the CLI (PRD #3264 M3): a restricted list (identity,
+	// the two model pins, customized, editable; no prompt body, description or tools) and a
+	// pin-only write. Owner-scoped and Bearer-reachable, and only for the caller's OWN
+	// scope='user' templates: builtin and global templates stay web/admin-only through the
+	// cookie-only /api/agent-templates routes, and the pin route answers 403 for them even to
+	// an admin. A uza_ admin_ro token reaches handlers with IsAdmin=true, but neither handler
+	// has an admin branch (the list passes IsAdmin=false), so the list hides other users'
+	// templates even from an admin (D4, D5). Pins only choose a model for a template the
+	// caller already owns and can already edit in full in the web UI; the same Bearer cannot
+	// reach the prompt, tools or description.
+	r.With(h.requireUser()).Get("/me/agent-templates", h.ListMyAgentTemplates)
+	r.With(h.requireUser()).Put("/me/agent-templates/{id}/model-pins", h.PutMyAgentTemplateModelPins)
 
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.

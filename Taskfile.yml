@@ -362,7 +362,7 @@ tasks:
       # edit that would tear down the wrong project reddens here instead of on a host.
       - task: test:e2e-reclaim
       # hermetic sibling of test:e2e-reclaim (PRD #966 M2): a fake docker/curl/psql, no
-      # daemon. It exercises the e2e phase-registry driver's fail-soft/quarantine/provides
+      # daemon. It exercises the e2e phase-registry driver's fail-soft/end-of-phase boundary/provides
       # semantics AND guards the tally (>= 8 cases, c == p) so a gutted driver test cannot
       # read green. Before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:e2e-driver
@@ -1723,6 +1723,23 @@ tasks:
       # renders UZI_ADMIN_RUN_DEBUG, reserved against api.config/api.secretEnv), same
       # no-workflow-edit wiring.
       - ./scripts/assert-admin-run-debug-render.sh
+      # Also runs the provider render check (PRD #4320: providers.allowedBaseURLs renders
+      # UZI_PROVIDER_ALLOWED_BASE_URLS, workers.extraCA reaches the api pod for the provider
+      # Test probe), same no-workflow-edit wiring.
+      - ./scripts/assert-provider-chart-render.sh
+      # Also runs the worker size ceiling render check (PRD #4213: per-tier ceiling and
+      # quota env for the api, exact floor conversion, zero quota accepted, malformed
+      # ceilings refused) and the ephemeral lease/size render check, so CI's helm-chart
+      # job enforces both without a workflow edit.
+      - ./scripts/assert-worker-size-ceilings-render.sh
+      - ./scripts/assert-ephemeral-lease-render.sh
+
+  render:worker-size-ceilings-check:
+    desc: assert the chart renders the api's worker size ceiling and quota env (exact floor, zero quota accepted, malformed ceilings refused) and the controller's cpu/memory ceilings
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline,
+      # needs helm + yq. Also run by render:openshift-check.
+      - ./scripts/assert-worker-size-ceilings-render.sh
 
   render:pvc-expansion-check:
     desc: assert the chart renders the PVC expansion surface (DinD data-size env, ceiling guards, the get-only StorageClass ClusterRole)
@@ -1784,6 +1801,14 @@ tasks:
       # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
       # non-vacuous, see the script header.
       - ./scripts/assert-worker-extra-ca-render.sh
+
+  render:provider-check:
+    desc: assert providers.allowedBaseURLs renders (off by default, path kept, bad entries refused) and workers.extraCA reaches the api pod
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous. Also run by render:openshift-check, which
+      # CI's helm-chart job runs.
+      - ./scripts/assert-provider-chart-render.sh
 
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment
@@ -2789,7 +2814,6 @@ tasks:
       - task: render:openshift-check
       - task: render:drain-knobs-check
       - task: render:ephemeral-docker-check
-      - task: render:ephemeral-lease-check
       # Reuse the tracked-tree scanner and its canaries instead of adding a weaker
       # diff-only scanner. The parent supplies code coverage, not new-text scanning.
       - task: scan:secrets
@@ -3569,6 +3593,14 @@ tasks:
           UZI_M3B_DOCKERFILE="agent/templates/${template}/Dockerfile" \
             ../e2e/codex-m3b/run-lifecycle.sh
         done
+
+  test:codex-provider-spike:
+    desc: Offline pinned-runtime custom Responses provider characterization (standalone only)
+    dir: agent
+    cmds:
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-provider-spike/tsconfig.json
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-concurrency=1 --test-timeout=120000 ../e2e/codex-provider-spike/*.test.ts
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx ../e2e/codex-provider-spike/runner.ts
 
   test:codex-m4:
     desc: PRD 1287 C5 - strict Codex/Claude M4 conformance gate (claude/U + codex/U + codex/P)

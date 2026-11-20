@@ -34,7 +34,12 @@ severity are capped. Reported lock nodes are combined with independently found
 package occurrences, including real-name aliases; every occurrence must be
 development-only. Missing nodes, unsupported schemas, unresolved roots and malformed
 policy are instrument failures, never proof of safety. Rooted cycles are supported.
-A real unexcepted finding retains findings exit 1 even if other evidence is broken.
+A component with exception rows must have identical dependency keys and specs in
+its manifest and lockfile root (dependencies, devDependencies, optionalDependencies
+and peerDependencies). A missing root or disagreement fails as an instrument error
+before stale development classifications can authorize an exception.
+Within supported, consistent inputs, a real unexcepted finding retains findings
+exit 1 even if other advisory evidence is broken.
 
 Expired and unused rows fail, including on clean audits. Advisory disappearance
 or a downgrade below the threshold requires removal or review of the row. A changed
@@ -70,3 +75,10 @@ dependencies or raising the threshold would suppress unrelated findings. Fork,
 git and file overrides add unreviewed code and can remove dependency coverage from
 the registry audit. Adding a third-party allowlist tool would still require the
 lockfile proof and would add a dependency to the gate itself.
+
+## Update 2026-11-18: rows removed
+
+GitHub withdrew GHSA-fc5q-39xc-vjpf on 2026-11-18, so npm audit stopped reporting it,
+and both rows became unused and failed the gate as designed. Both rows were removed,
+the exceptions file keeps only its header, and #4435 is closed. The mechanism stays
+for future rows under the approval rule above.

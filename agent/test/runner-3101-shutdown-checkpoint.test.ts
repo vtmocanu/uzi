@@ -136,13 +136,19 @@ it("#3101 actual Runner late admission inherits the original deadline across rep
   }
 });
 
-for (const finish of ["none", "seeded", "live"] as const) {
+for (const finish of ["none", "seeded", "live", "tracked_default"] as const) {
   it(finish === "none"
     ? "#3101 shutdown checkpoint preserves newer C and dirty work with a genuinely absent installer promise"
-    : `#3101 ${finish} finish before shutdown preserves newer C and dirty work with a genuinely absent installer promise`, async () => {
+    : finish === "tracked_default"
+      // #4439: the worker's tracked default already reaches the advanced workflow blob, and the
+      // earlier checkpoint is confirmed, so the selective pack omits that blob; the receiver
+      // must hold it the way the forge does (formerly an interleaving-dependent sibling flake).
+      ? "#3101 shutdown checkpoint omitting tracked-default blobs still preserves C, dirty work and the overlay"
+      : `#3101 ${finish} finish before shutdown preserves newer C and dirty work with a genuinely absent installer promise`, async () => {
     client.protocolFeatures = ["run_checkpoint_durability"];
-    const iid = finish === "none" ? 310102 : finish === "seeded" ? 310105 : 310106;
-    const proof = shutdownContentProof(fx, client, iid);
+    const iid = finish === "none" ? 310102 : finish === "seeded" ? 310105 : finish === "live" ? 310106 : 310109;
+    const proof = shutdownContentProof(fx, client, iid, undefined, "overlay",
+      finish === "tracked_default" ? { trackedDefaultBare: () => git.barePathFor(fx.originPath) } : {});
     const started = deferred();
     let rig: CodexRig | undefined;
     let context: RunContext | undefined;
@@ -205,7 +211,7 @@ for (const finish of ["none", "seeded", "live"] as const) {
           route(kind: string, body: undefined, id: number): void;
         }).route("stop", undefined, 310106);
       }
-      if (finish !== "none") {
+      if (finish === "seeded" || finish === "live") {
         assert.deepEqual(await active.steering.awaitFollowUp(10_000),
           { kind: "ended", reason: "stopped" });
         assert.equal(context!.signal!.aborted, false, "finish leaves the current provider turn alive");

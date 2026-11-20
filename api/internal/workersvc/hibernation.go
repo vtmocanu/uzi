@@ -37,10 +37,6 @@ const (
 	hibernationTextMax           = 500
 	// hibernationResourceVersionMax bounds the opaque Kubernetes resourceVersion.
 	hibernationResourceVersionMax = 64
-	// hibernationPollClampMin/Max bound the controller-reported poll interval used to
-	// size the advertisement freshness window.
-	hibernationPollClampMin = 1
-	hibernationPollClampMax = 300
 )
 
 // Refusal codes: the stable strings returned in the 409 body of a hibernate refusal.
@@ -137,6 +133,9 @@ type HibernationAutoSettings interface {
 	HibernationSettings
 	WorkerHibernationAuto(ctx context.Context) (bool, error)
 	WorkerHibernationIdleAfter(ctx context.Context) (time.Duration, error)
+	// Warm-reserve surplus hibernation (issue #4395).
+	WorkerHibernationSurplus(ctx context.Context) (bool, error)
+	WorkerHibernationSurplusIdleAfter(ctx context.Context) (time.Duration, error)
 }
 
 // SetHibernationAutoSettings wires the automatic pass's settings reader. Call once at startup.
@@ -179,6 +178,10 @@ func writeHibernation(ctx context.Context, q *store.Queries, w store.Worker) (st
 		CleanupReconcileSeq:        w.CleanupReconcileSeq,
 		CleanupReconciledAt:        w.CleanupReconciledAt,
 		LastWakeSettledAt:          w.LastWakeSettledAt,
+		HibernationOriginOpID:      w.HibernationOriginOpID,
+		HibernationAdmitOrigin:     w.HibernationAdmitOrigin,
+		HibernationWakeOrigin:      w.HibernationWakeOrigin,
+		LastManualWakeSettledAt:    w.LastManualWakeSettledAt,
 		HibernationBlockedReason:   w.HibernationBlockedReason,
 		HibernationBlockedAt:       w.HibernationBlockedAt,
 		HibernationBlockedSince:    w.HibernationBlockedSince,
@@ -198,18 +201,28 @@ func clearWakeEvidence(w *store.Worker) {
 // moveToWaking applies the Wake rules to a locked row that is not awake: fresh op id,
 // fresh wake_requested_at, cleared wake evidence and error; the admission pod uid and
 // scaling_down_at are KEPT because settlement depends on them. A row already waking is
-// left exactly as it is. It reports whether the row changed.
+// left as it is, except that a manual or demand origin upgrades a warm wake origin (joinWakeOrigin,
+// same op id, wake_requested_at and readiness evidence). It reports whether the row changed.
+// origin is the WakeOrigin* of the caller; a new op carries it as its only origin marker, after
+// carryManualGrace has banked the grace the replaced markers earned.
 //
 // A cache prune attempt that is not settled is never abandoned here (PRD #4206): a requested
 // attempt has run nothing and settles at once as skipped/cancelled; a started or unknown one only
 // has cancellation requested, and keeps fencing claims until its settlement is confirmed.
-func moveToWaking(w *store.Worker, now time.Time, reason string) bool {
+func moveToWaking(w *store.Worker, now time.Time, reason, origin string) bool {
 	cancelled := requestCleanupCancel(w, now)
 	if w.HibernationState == "waking" {
+		if cur := validWakeOrigin(w); joinWakeOrigin(cur, origin) != cur {
+			w.HibernationWakeOrigin = pgconv.TextOrNull(joinWakeOrigin(cur, origin))
+			return true
+		}
 		return cancelled
 	}
+	carryManualGrace(w)
+	op := uuid.New()
 	w.HibernationState = "waking"
-	w.HibernationOpID = hibernationUUID(uuid.New())
+	w.HibernationOpID = hibernationUUID(op)
+	stampWakeOrigin(w, op, origin)
 	w.WakeRequestedAt = pgconv.Time(now)
 	clearWakeEvidence(w)
 	if reason != "" {
@@ -250,6 +263,10 @@ func (s *Service) trySettle(w *store.Worker, now time.Time) bool {
 		// re-hibernated until it has been idle for the full threshold again. The blocked
 		// columns are left as they are.
 		w.LastWakeSettledAt = pgconv.Time(now)
+		// Owner-wide long anchor input (issue #4395): only a manual wake is manual-grade.
+		if validWakeOrigin(w) == WakeOriginManual {
+			w.LastManualWakeSettledAt = pgconv.Time(now)
+		}
 	}
 	return settled
 }
@@ -269,10 +286,7 @@ func (s *Service) hibernationTx(ctx context.Context, workerID uuid.UUID, fn func
 	if err != nil {
 		return err
 	}
-	if err := fn(q, w); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return finishHibernationTx(ctx, tx, func() error { return fn(q, w) }, s.hibernationAfterCommit, workerID)
 }
 
 // sanitizeHibernationText strips terminal sequences and flattens raw, then reports
@@ -297,7 +311,7 @@ func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, w
 		} else if code != "" {
 			return &HibernationRefusal{Code: code}
 		}
-		op := admitHibernation(&w, now, "")
+		op := admitHibernation(&w, now, "", AdmitOriginManual)
 		row, err := writeHibernation(ctx, q, w)
 		if err != nil {
 			return err
@@ -316,8 +330,13 @@ func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, w
 // and the automatic pass (issue #4207), so both write the same hibernation and cleanup
 // columns; both clear the automatic pass's blocked columns, since the worker is no longer
 // blocked from hibernating.
-func admitHibernation(w *store.Worker, now time.Time, reason string) uuid.UUID {
+//
+// origin is the AdmitOrigin* of the caller. The op's markers replace the previous op's, so
+// carryManualGrace runs first.
+func admitHibernation(w *store.Worker, now time.Time, reason, origin string) uuid.UUID {
+	carryManualGrace(w)
 	op := uuid.New()
+	stampAdmitOrigin(w, op, origin)
 	w.HibernationState = "preparing"
 	w.HibernationOpID = hibernationUUID(op)
 	w.HibernationRequestedAt = pgconv.Time(now)
@@ -415,23 +434,15 @@ func (s *Service) hibernateRefusal(ctx context.Context, q *store.Queries, w stor
 }
 
 func hibernationAdvertisementFresh(adv store.GetControllerHibernationAdvertisementRow, now time.Time) bool {
-	if !adv.HibernationVersion.Valid || adv.HibernationVersion.Int32 < hibernationAdvertisedVersion ||
-		!adv.HibernationAdvertisedAt.Valid {
-		return false
-	}
-	return now.Sub(adv.HibernationAdvertisedAt.Time) < 2*hibernationPollInterval(adv)
+	return AdvertisementFresh(adv.HibernationVersion, adv.HibernationAdvertisedAt, adv.PollIntervalSeconds,
+		hibernationAdvertisedVersion, now)
 }
 
-// hibernationPollInterval is the controller's advertised poll interval clamped to
-// [hibernationPollClampMin, hibernationPollClampMax] seconds, the clamp the advertisement
-// freshness window and the inventory observation-gap bound share. An absent interval reads as
-// the maximum.
+// hibernationPollInterval is the controller's advertised poll interval clamped (see
+// AdvertisementPollInterval), the clamp the advertisement freshness window and the
+// inventory observation-gap bound share.
 func hibernationPollInterval(adv store.GetControllerHibernationAdvertisementRow) time.Duration {
-	poll := int64(hibernationPollClampMax)
-	if adv.PollIntervalSeconds.Valid {
-		poll = min(max(int64(adv.PollIntervalSeconds.Int32), hibernationPollClampMin), hibernationPollClampMax)
-	}
-	return time.Duration(poll) * time.Second
+	return AdvertisementPollInterval(adv.PollIntervalSeconds)
 }
 
 // WakeWorker moves any non-none worker to waking. actor is nil for a system wake (no
@@ -448,7 +459,11 @@ func (s *Service) WakeWorker(ctx context.Context, actor *HibernationActor, worke
 			return ErrHibernationConflict
 		}
 		now := s.now()
-		if !moveToWaking(&w, now, reason) {
+		wakeOrigin := WakeOriginSystem
+		if actor != nil {
+			wakeOrigin = WakeOriginManual
+		}
+		if !moveToWaking(&w, now, reason, wakeOrigin) {
 			out = w
 			return nil
 		}
@@ -582,7 +597,7 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 				// worker and needs no marker: its settle stamps the grace anchor.
 				noteHibernationBlocked(&w, BlockedControllerRefused, now)
 			} else {
-				moveToWaking(&w, now, t.Reason)
+				moveToWaking(&w, now, t.Reason, WakeOriginSystem)
 			}
 			changed = true
 		case TransitionScalingDown:
@@ -760,7 +775,7 @@ func (s *Service) HibernationSettlePass(ctx context.Context) (int64, error) {
 				w.CleanupPhase == CleanupPhaseStarted || w.CleanupPhase == CleanupPhaseUnknown {
 				return false, nil
 			}
-			moveToWaking(&w, now, "preparation deadline")
+			moveToWaking(&w, now, "preparation deadline", WakeOriginSystem)
 			_, err := writeHibernation(ctx, q, w)
 			return err == nil, err
 		})
@@ -779,7 +794,7 @@ func (s *Service) HibernationSettlePass(ctx context.Context) (int64, error) {
 				if w.HibernationState != "hibernated" && w.HibernationState != "preparing" {
 					return false, nil
 				}
-				moveToWaking(&w, now, "hibernation disabled")
+				moveToWaking(&w, now, "hibernation disabled", WakeOriginSystem)
 				_, err := writeHibernation(ctx, q, w)
 				return err == nil, err
 			})

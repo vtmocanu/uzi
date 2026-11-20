@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
-import { createCaptureContext, GitCache, type EpochDiscardProof } from "../src/git.js";
+import { createCaptureContext, GitCache, type EpochDiscardProof, type GitCacheOptions } from "../src/git.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { runnerCommand } from "../src/runner-uid.js";
 import { MaintenanceResources } from "../src/recovery-maintenance.js";
@@ -63,8 +63,8 @@ it("runner Git keeps a boundary abort ahead of partial stderr classification", a
   }), error => (error as Error).constructor.name === "GitBoundaryAbortError");
 });
 
-function fixture(deleteLaunch = false, identity: Identity = "worker_pat") {
-  const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger());
+function fixture(deleteLaunch = false, identity: Identity = "worker_pat", options: GitCacheOptions = {}) {
+  const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger(), undefined, options);
   const internal = git as unknown as PrivateCache;
   let pending = 0, stopped = false, inherited = 0, alive = true, killed = 0;
   const scope: PodEpochReclaimScope = {
@@ -217,6 +217,91 @@ it("admits only source/bare inventories and bounded worker trusted closure comma
       assert.throws(() => internal.preflightEpochNative("/usr/bin/git", ["-C", cwd, ...args], {}, identity), /unaudited/);
   });
   assert.equal(f.inherited(), 0);
+});
+
+const GETFACL_PREFIX = ["--absolute-names", "--physical", "--skip-base", "--numeric", "--"];
+const GETFACL_ENV = { PATH: "/usr/bin:/bin", LC_ALL: "C" };
+
+it("admits exactly the audited getfacl shape of a group-writable managed bare, and nothing near it", async () => {
+  const f = fixture();
+  const internal = f.git as unknown as {
+    preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv, identity: Identity): NodeJS.ProcessEnv;
+  };
+  const data = path.join(process.env.TMPDIR!, "cache");
+  const repos = path.join(data, "repos");
+  const inside = path.join(repos, "one.git", "objects", "ab", "c".repeat(38));
+  await f.internal.withEpochNativeReads(f.proof, async () => {
+    const run = (args: string[], env: NodeJS.ProcessEnv = GETFACL_ENV, identity: Identity = "worker_pat", command = "/usr/bin/getfacl") =>
+      internal.preflightEpochNative(command, args, env, identity);
+    // Admitted: the exact prefix, the ancestors and any canonical path under the repos root; the environment is returned as is.
+    assert.deepEqual(run([...GETFACL_PREFIX, repos, data, inside]), GETFACL_ENV);
+    assert.deepEqual(run([...GETFACL_PREFIX, repos]), GETFACL_ENV);
+    const refused: [string, () => unknown][] = [
+      ["an extra flag", () => run(["--recursive", ...GETFACL_PREFIX, repos])],
+      ["an extra flag after the prefix", () => run([...GETFACL_PREFIX, "-R", repos])],
+      ["a missing flag", () => run(["--absolute-names", "--physical", "--numeric", "--", repos])],
+      ["a reordered prefix", () => run(["--physical", "--absolute-names", "--skip-base", "--numeric", "--", repos])],
+      ["no path", () => run([...GETFACL_PREFIX])],
+      ["a relative path", () => run([...GETFACL_PREFIX, "repos/one.git"])],
+      ["a path outside the repos root and the ancestors", () => run([...GETFACL_PREFIX, repos, "/etc/passwd"])],
+      ["the parent of the data directory", () => run([...GETFACL_PREFIX, repos, path.dirname(data)])],
+      ["a sibling prefix of the repos root", () => run([...GETFACL_PREFIX, repos + "-other"])],
+      ["a noncanonical path", () => run([...GETFACL_PREFIX, path.join(repos, "..", "..", "etc")])],
+      ["a trailing slash", () => run([...GETFACL_PREFIX, repos + "/"])],
+      ["a path with a NUL", () => run([...GETFACL_PREFIX, repos + "\0x"])],
+      ["more paths than one chunk", () => run([...GETFACL_PREFIX, repos, data, ...Array.from({ length: 513 }, (_, i) => path.join(repos, `p${i}`))])],
+      ["another binary", () => run([...GETFACL_PREFIX, repos], GETFACL_ENV, "worker_pat", "/usr/bin/setfacl")],
+      ["a binary of another directory", () => run([...GETFACL_PREFIX, repos], GETFACL_ENV, "worker_pat", "/bin/getfacl")],
+      ["the runner identity", () => run([...GETFACL_PREFIX, repos], GETFACL_ENV, "command")],
+      ["a runner-wrapped form", () => run(["/usr/bin/getfacl", ...GETFACL_PREFIX, repos], GETFACL_ENV, "command",
+        runnerCommand("/usr/bin/getfacl", []).command === "/usr/bin/getfacl" ? "/bin/setpriv" : runnerCommand("/usr/bin/getfacl", []).command)],
+      ["a setpriv wrapper", () => run(["--reuid=10002", "/usr/bin/getfacl", ...GETFACL_PREFIX, repos], GETFACL_ENV, "worker_pat", "/bin/setpriv")],
+      ["an extra environment variable", () => run([...GETFACL_PREFIX, repos], { ...GETFACL_ENV, LD_PRELOAD: "/tmp/evil" })],
+      ["a missing environment variable", () => run([...GETFACL_PREFIX, repos], { PATH: "/usr/bin:/bin" })],
+      ["another locale", () => run([...GETFACL_PREFIX, repos], { ...GETFACL_ENV, LC_ALL: "en_US.UTF-8" })],
+      ["another PATH", () => run([...GETFACL_PREFIX, repos], { ...GETFACL_ENV, PATH: "/tmp:/usr/bin" })],
+    ];
+    for (const [name, attempt] of refused) assert.throws(attempt, /unaudited/, name);
+  });
+  assert.equal(f.inherited(), 0);
+});
+
+it("the getfacl override is admitted only when it was configured, and then it replaces the production path", async () => {
+  const absent = path.join(process.env.TMPDIR!, "absent-getfacl");
+  const args = [...GETFACL_PREFIX, path.join(process.env.TMPDIR!, "cache", "repos")];
+  for (const configured of [false, true]) {
+    const f = fixture(false, "worker_pat", configured ? { managedBareGetfaclBin: absent } : {});
+    const internal = f.git as unknown as {
+      preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv, identity: Identity): NodeJS.ProcessEnv;
+    };
+    await f.internal.withEpochNativeReads(f.proof, async () => {
+      const probe = (command: string) => () => internal.preflightEpochNative(command, args, GETFACL_ENV, "worker_pat");
+      assert.throws(probe(configured ? "/usr/bin/getfacl" : absent), /unaudited/);
+      assert.deepEqual(probe(configured ? absent : "/usr/bin/getfacl")(), GETFACL_ENV);
+    });
+  }
+});
+
+it("the getfacl launch spawns exactly the audited argv and environment, as the worker", async () => {
+  const f = fixture();
+  const data = path.join(process.env.TMPDIR!, "cache");
+  const args = [...GETFACL_PREFIX, path.join(data, "repos"), data];
+  const seen: { command: string; args: string[]; env: NodeJS.ProcessEnv }[] = [];
+  let launch!: () => void;
+  const launched = new Promise<void>(resolve => { launch = resolve; });
+  f.internal.epochNativeTestDependencies = { ...f.internal.epochNativeTestDependencies,
+    spawn: ((command: string, argv: string[], options: { env: NodeJS.ProcessEnv }) => {
+      seen.push({ command, args: [...argv], env: { ...options.env } });
+      launch();
+      return f.child as unknown as ChildProcess;
+    }) as unknown as typeof spawn };
+  const result = f.internal.withEpochNativeReads(f.proof, () =>
+    f.internal.execScoped("/usr/bin/getfacl", args, { env: { ...GETFACL_ENV }, maxBuffer: 4096 }, "worker_pat"));
+  await launched;
+  f.gone(); f.exit(); f.close();
+  assert.deepEqual(await result, { stdout: "", stderr: "" });
+  assert.deepEqual(seen, [{ command: "/usr/bin/getfacl", args, env: GETFACL_ENV }]);
+  f.scope.assertSettled();
 });
 
 it("exit starts group cleanup before close; success waits for descendant absence and IO", async () => {

@@ -76,7 +76,31 @@ var (
 	ErrCredentialOverrideHarnessUnsupported = errors.New("credential override unsupported on codex harness")
 	ErrCredentialOverridePinnedNeedsSecret  = errors.New("credential override pinned mode requires a token")
 	ErrCredentialOverrideInvalidMode        = errors.New("invalid credential override mode")
+	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the owner's Claude source is a model
+	// provider, whose run uses the provider key, so a vendor credential override is refused. It
+	// wraps ErrCredentialOverrideHarnessUnsupported, so every consumer that already refuses that
+	// keeps refusing; the handler adds the provider wording.
+	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the Claude source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
 )
+
+// refuseOverrideForProviderOwner refuses a vendor credential override when the owner selected a
+// Claude provider source (usable or not): the create is a provider run or refuses outright, never
+// a vendor run carrying an override. q is asserted for the source read; a surface that cannot read
+// the source fails closed (an error, never nil), so an override never rides an unchecked owner.
+func refuseOverrideForProviderOwner(ctx context.Context, q any, userID uuid.UUID) error {
+	r, ok := q.(providerSourceReader)
+	if !ok {
+		return errors.New("credential override: the query surface cannot read the provider source")
+	}
+	row, err := r.GetUserClaudeProviderSource(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("credential override: provider source: %w", err)
+	}
+	if row.ProviderID.Valid {
+		return ErrCredentialOverrideProviderSource
+	}
+	return nil
+}
 
 // ErrCredentialDisabled is the D5 refusal (PRD #1732): a NEW explicit assignment named a
 // credential the owner has disabled. Every explicit-assignment path returns it BEFORE its
@@ -99,6 +123,12 @@ var ErrCredentialDisabled = errors.New("credential is disabled; enable it in Set
 // credential_disabled skip) for a disabled pin, and nil otherwise; a pin whose credential was
 // deleted keeps today's behaviour (the FK nulled it, so it inherits).
 func checkStoredOverrideEnabled(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, o *CredentialOverride) error {
+	if o != nil {
+		// PRD #4320 D8: a stored override (a schedule's) never rides a provider-sourced owner's run.
+		if err := refuseOverrideForProviderOwner(ctx, q, userID); err != nil {
+			return err
+		}
+	}
 	if o == nil || o.Mode != CredentialOverrideModePinned || o.SecretID == nil {
 		return nil
 	}
@@ -182,6 +212,12 @@ func (s *Service) validateCredentialOverride(ctx context.Context, userID uuid.UU
 	return validateCredentialOverrideOn(ctx, s.q, userID, kind, harness, mode, secretID)
 }
 
+// validateRunSwitchOverride is the live-switch validation of SetRunCredential: the same validator
+// without the create-time provider-owner refusal (see validateCredentialOverrideCore).
+func (s *Service) validateRunSwitchOverride(ctx context.Context, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
+	return validateCredentialOverrideCore(ctx, s.q, userID, kind, harness, mode, secretID, false)
+}
+
 // credentialSecretMetaReader is the one read the validator makes (the pinned-mode secret
 // lookup), so a caller already inside a transaction can pass its tx-bound Store.
 type credentialSecretMetaReader interface {
@@ -193,6 +229,15 @@ type credentialSecretMetaReader interface {
 // tx-bound Store so the pinned lookup does not take a second pool connection while the
 // closure holds the run-branch advisory lock.
 func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
+	return validateCredentialOverrideCore(ctx, q, userID, kind, harness, mode, secretID, true)
+}
+
+// validateCredentialOverrideCore is the one validator. refuseProvider (create, schedule and
+// effective-settings callers) refuses every non-inherit override for an owner whose Claude source
+// is a model provider (PRD #4320 D8); the live-switch caller (SetRunCredential) passes false and
+// applies its own rule, because a vendor run of a provider-sourced owner may still be re-pointed
+// at another vendor token (only the run's own binding and the `default` switch are refused).
+func validateCredentialOverrideCore(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID, refuseProvider bool) (*CredentialOverride, error) {
 	// D10: chat, judge and self_improve follow their own ladders and are not switchable; a job
 	// (PRD #1908 D-E) resolves its credential as its owner via the worker-binding ladder, never a pin.
 	switch kind {
@@ -203,6 +248,13 @@ func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaRea
 	// the harness and no cross-harness resume exists (a later PRD lifts this).
 	if harness == harnessCodex {
 		return nil, ErrCredentialOverrideHarnessUnsupported
+	}
+	if refuseProvider && mode != CredentialOverrideModeInherit {
+		// PRD #4320 D8: no vendor override for a provider-sourced owner (create --token, a
+		// per-run or per-schedule pin, the effective-settings preview). Inherit clears and stays legal.
+		if err := refuseOverrideForProviderOwner(ctx, q, userID); err != nil {
+			return nil, err
+		}
 	}
 	switch mode {
 	case CredentialOverrideModeInherit:

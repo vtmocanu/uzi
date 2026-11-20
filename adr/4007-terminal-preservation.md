@@ -122,8 +122,152 @@ result returns before any credential resolution, forge call or write. Lanes:
   tx1) re-reads the locked run and discards the decision if any of them changed.
   A run that gained an issue or MR is classified by it at the next observation.
 
-Lock order wherever several are taken: worker, run, hold, preservation,
+Lock order wherever several are taken: **consumer gate** (always the first lock
+of its transaction; admissions take it shared with a bounded wait, retirement
+only try-takes it exclusively, under server-side timeouts set before it, and
+never waits for it; see "T3" below); then, on the run-creation path, the
+per-user secret-mutation lock (shared), the model-provider row share, the
+closure locks (run-branch, pinned-override share, judge target) and the
+post-insert credential and alias fences; then worker, run, hold, preservation,
 contribution.
+
+### T3: consumer admissions serialize with retirement (#4488)
+
+tx-R1 reads the protections (`GetTerminalRetireBlocker`,
+`HasCrossRunLiveConsumer`) under the source run's `FOR NO KEY UPDATE NOWAIT`
+lock, at READ COMMITTED. Nothing a consumer admission does conflicts with that
+lock: FK dependents take only `FOR KEY SHARE`, and same-issue and MR/branch
+consumers share no row with the source. A consumer committed between the
+protection read and the `live -> retiring` commit was therefore missed. T3
+closes that check-then-act race with one advisory lock per repository,
+`TerminalConsumerGateLockClass` (`0x757A7463`, "uztc"; objid = fnv32a of the
+repository UUID, `store.TerminalConsumerGateObjID`).
+
+- **Admissions** take it **shared** as the first statement after an explicit
+  `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`, before any other lock of
+  the transaction, with a bounded wait (`lock_timeout` 6 s, restored after the
+  gate so every later wait is unchanged). Shared holders never conflict, so
+  admissions never serialize with each other. The helper refuses a non-
+  transaction connection and any isolation other than READ COMMITTED.
+- **Retirement** (only the decide path, `terminalRetireDecide`, through
+  `terminalLockRunForRetire`) sets server-side bounds first
+  (`transaction_timeout`, `statement_timeout`,
+  `idle_in_transaction_session_timeout`), then **try**-takes the gate
+  exclusively in its own statement, then takes the existing NOWAIT run lock and
+  the preservation row. A failed try retires nothing and records
+  `retire kept: consumer_gate_busy`. Its rechecks run as separate statements
+  after the try, so each sees every admission that held the gate. The bound,
+  reconcile, unknown, foreign and finish lanes do not take it: after
+  `retiring` the decision is already irrevocable. Any future owner escape that
+  writes `live -> retiring` must go through the same function.
+- **Waiter priority.** PostgreSQL makes a new lock request conflict with queued
+  waiters as well as holders, so while an admission is queued every later
+  try-exclusive fails. It waits behind at most one exclusive holder; durable
+  commit I/O is not bounded by the pre-commit budgets below.
+- **Retirement hold bound.** The gate is a transaction-scoped lock, so a
+  stalled or killed tx-R1 can only be freed by the server. On PostgreSQL 17 and
+  later tx-R1 sets `transaction_timeout = 4s` (with `statement_timeout = 2500ms`
+  and `idle_in_transaction_session_timeout = 2s`). Earlier versions (the chart
+  pins 16) have no `transaction_timeout`: they set `statement_timeout = 150ms`
+  and `idle_in_transaction_session_timeout = 150ms`, and the preservation row
+  `lock_timeout` drops to 120ms (below the statement timeout, so contention
+  stays busy). tx-R1 makes at most 14 round trips after the gate (8 statements,
+  6 of them parameterised and possibly preceded by a Prepare on a cold
+  connection), giving a pre-commit budget of 150ms + 14 x (150ms + 150ms) = 4.35s.
+  Invariant (asserted by a unit test over the production values): the
+  pre-commit budget must stay below the admissions' 6s gate wait. This does not
+  bound durable COMMIT: PostgreSQL disables the transaction timeout before
+  durability and releases locks after the WAL flush
+  ([source](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/access/transam/xact.c)).
+  A stalled commit may therefore make admissions busy; testing and any stronger
+  protocol are deferred before enablement. Marker durability remains required.
+  Enabling retirement on
+  PostgreSQL 16 also needs the protection query to fit those per-statement
+  limits at real volume (indexes such as `cross_checks(checker_run_id)` and
+  `runs(resume_of_run_id)`, part of the slice C/D protection-query work).
+- **Why not a source-row lock.** A row lock on the target deadlocked against an
+  FK cascade in #3257 (`api/internal/store/queries/judge.sql`, the
+  `LockRunForJudge` note); the gate is an advisory lock no cascade takes.
+
+**Audit (the plan checkpoint, at 6ac884bd7).** Every `INSERT INTO runs` in
+`api/internal/store/queries/*.sql` (15 inserts) and every post-insert write of
+an association column (only `SetRunCompleted` and `ReconcileRunMR`; `repo_id`
+is never updated) was classified:
+
+| Family | Class |
+|---|---|
+| Issue runs (manual, scheduled, autopilot, chat start), self-improve, continued-issue tasks | gated; same-issue consumers (`issue_iid` / `continued_issue_iid`) |
+| Then-fix and review children, MR rework | gated; keyed on the target run's repository, revalidated after the gate (a cross-repo relationship is refused) |
+| CI fix | gated; matches `mr_run_active` by `pipeline_ref` |
+| Judge (auto, rerun, manual) | gated on the target's repository; a repo-less target takes no gate |
+| `ReconcileRunMR` | gated in its own transaction: it is status-agnostic and can give a nonterminal ci_fix (inserted with `mr_iid` NULL) an `mr_iid` that matches another source's `mr_run_active` |
+| Plan and code cross-checks (incl. the failure record) | already serialized: admission locks the nonterminal lead `FOR UPDATE`, which conflicts with the NOWAIT lock, and a nonterminal lead keeps on `run_nonterminal` |
+| Active snapshot | already serialized: `LockFrozenWorkerSnapshotRuns` takes `FOR UPDATE OF r` before it can add a `claim_live` row |
+| `SetRunCompleted` on the source | already serialized: own-row lock vs NOWAIT, plus the association re-check |
+| `SetRunCompleted` on a consumer, prompt and CI repair, claim, resume, promoter | non-consumers: they set no association column, or touch only already-counted nonterminal runs |
+| Chat continuation, chat and job runs | non-consumers: repo-less (`runs_kind_shape`), and preservations carry `repo_id NOT NULL` |
+
+Recorded misses, not widened here: a source linked only by
+`continued_issue_iid` gets no same-issue check (it runs only when the source
+has an `issue_iid`), and a ci_fix with `ci_fix_mr_iid` set but `mr_iid` NULL is
+matched only by branch.
+
+**Retirement-first contract.** No admission or association path reads
+`refs/uzi-terminal/` (the namespace is read only by publish, pushbroker,
+verification and retention code). A matching protection is therefore a
+conservative keep, never proof that the consumer needs the ref. When retirement
+commits first, the admission waits on the gate for one bounded hold and then
+proceeds unchanged; the preservation stays `retiring` and is never reopened (the
+00448 guard allows only `deleted` or `abandoned` next); an ordinary fresh run
+is never blocked; and truthful evidence is kept: `ReconcileRunMR` keeps its
+status-agnostic SQL and its unchanged row-lock wait, so a late MR or branch
+report on a `retiring` or `deleted` source still records.
+
+**Post-commit detachment of the worker terminal report.** After the state
+transaction commits, the gated `ReconcileRunMR`, the authoritative re-read that
+gates the hook block, and the fire-once judge, task-review and then-fix
+dispatches run on `context.WithoutCancel` of the request context, with **no
+aggregate or per-hook deadline**. Those hooks warn-and-swallow and never retry,
+and the judge target lock wait has no timeout of its own, so any new overall deadline
+could drop an otherwise successful fire-once admission even with retirement
+disabled. The only new wait is the gate's, bounded as above; at most two gated
+writers run per report (`ReconcileRunMR` plus one hook: judge kinds and task
+kinds are disjoint, and review and then-fix are mutually exclusive).
+
+**Caller semantics.** Gate contention (timeout or cancellation) is
+`ErrTerminalConsumerGateBusy`: HTTP admissions answer 503
+with `Retry-After: 1`, the pollers and the scheduler leave the trigger
+unrecorded (CI autofix never maps it to the errors that record a pipeline), and
+a schedule that has started nothing in that fire is not advanced. A sweep fire
+that already started runs records the busy candidate as a visible
+`consumer_gate_busy` skip,
+stops and advances (holding it would re-fire the whole sweep), so a one-time
+sweep does not retry that candidate.
+
+Delivery scope was narrowed for #4488: preserving the original cap and avoiding
+replay across partial-fire retries needs durable per-fire candidate progress.
+That design is deferred to #4512, with design review before implementation. The owner
+can start the skipped issue manually or explicitly re-fire the sweep as a new
+fire. The active-run/open-MR guards are not per-fire idempotency after a run ends.
+Unattempted candidates after the busy one are not claimed as individually skipped.
+The final partial-outcome write uses a cancellation-detached five-second context,
+so the canceled gate wait does not itself discard that outcome. Creation and
+advancement remain separate commits: a crash or failed advance can still leave
+the schedule due and replay partial work. No restart-safe per-fire guarantee is
+claimed until the follow-up supplies durable progress.
+
+**Residual limits.** A fire-once hook or `ReconcileRunMR` still drops its work
+on a genuine database fault, as every other database error there already does;
+a durable retry is not built. A busy repository can defer retirement
+indefinitely; that is safe, because the preservation is kept.
+Detachment has a cost: before T3 a worker disconnect (including its client-side HTTP timeout)
+cancelled the post-commit waits; now a stuck row-lock or judge-lock holder keeps
+the report's handler goroutine and pool connection (and, inside a gated write,
+the shared gate, so retirement keeps `consumer_gate_busy` for that repository)
+until the holder ends. The gate wait itself stays bounded; the downstream waits
+are unbounded exactly as long as their holder is. A fire-once hook whose gate
+wait times out, including during a stalled durable commit, logs and drops its
+admission, as every other database error there does.
 
 ### Reopen semantics (narrowed)
 
@@ -138,10 +282,11 @@ committed. The interval is bounded by the 15 s maximum observation age.
 `terminalRetirementEnabled` is a constant `false`, not a setting. While off, a
 due `live` or `retiring` row is only pushed out (one scheduling write; no forge
 call, no lifetime read, no delete), so every terminal ref is retained in this
-delivery. Enabling it needs work that is not built: a consumer-admission fence,
-a complete protection list, and indexes for the protection query (slices C and
-D). A constant keeps the irrevocable delete unreachable by configuration error
-until those exist. Tests enable the lane through an unexported hook only.
+delivery. Enabling it needs work that is not built: a complete protection
+list and indexes for the protection query (slices C and D). The
+consumer-admission fence is built (T3 above): admissions always take its shared
+lock, which contends with nothing until the retire lane runs. A constant keeps
+the irrevocable delete unreachable by configuration error until those exist. Tests enable the lane through an unexported hook only.
 
 ### Gate scoping: the completed-release gate
 
@@ -212,9 +357,9 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
   production-dark)" below); the remainder is deferred. B must not advertise `recovery_terminal_preservation_v1` before D's owner
   escape for removal-blocking refs lands.
 - **C**: reclaim and custody.
-- **C/D**: retirement enablement: a consumer-admission fence, a complete
-  protection list, the indexes for the protection query, and then flipping the
-  constant.
+- **C/D**: retirement enablement: a complete protection list (the
+  consumer-admission fence is built, T3 #4488), the indexes for the
+  protection query, and then flipping the constant.
 - **D**: activation, and an owner escape for removal-blocking refs, with CLI.
 - **E**: fleet rollout.
 - **Purge** of finished rows.
@@ -251,7 +396,8 @@ of the two new completion reasons is the one part that is not gated (see
   deletes nothing; removal of incomplete private refs is slice C's.
 - **Still deferred.** The T4 shared excluded-origin fence, D's owner escape
   with CLI (including clearing a `localBlock`), one-worker activation and
-  startup disable (including upgrade-time pending journals), retirement (T3),
+  startup disable (including upgrade-time pending journals), retirement
+  enablement (the T3 consumer gate is built, #4488),
   reclaim and custody (C, including G12), fleet rollout (E), hosted
   acceptance, the named follow-up "#4007 slice B2-contracts" (the kept labels'
   output-contract analysis and the G7 callers) and the #4001 predecessor

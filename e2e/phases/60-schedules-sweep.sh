@@ -169,4 +169,4 @@ pass "B's swept run $RUN_B completed through the stub"
 # --- pause, delete, leave nothing non-terminal -------------------------------
 uzi_cli schedule pause "$SID" >/dev/null || fail "schedule pause failed (exit $?)"
 uzi_cli schedule delete "$SID" >/dev/null || fail "schedule delete failed (exit $?)"
-pass "paused then deleted schedule $SID; both swept runs terminal (quarantine-clean)"
+pass "paused then deleted schedule $SID; both swept runs terminal (boundary-clean)"

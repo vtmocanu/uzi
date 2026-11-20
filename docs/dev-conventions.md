@@ -654,6 +654,9 @@ scenarios are mutually exclusive by construction. Known values:
   otherwise collapse after approval. Now fixtures illustrate intended work
   from titles and role labels. Prompt tests check instructions and fences;
   live model wording remains a maintainer spot-check.
+- `providers` — `/settings?mock=providers` turns the model-providers feature on with one
+  seeded provider (PRD #4320), so the Settings Custom providers card shows its list, the allowed
+  URLs and the Test result lines. Without it the demo shows the feature off.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).
 - `truncated-backlog` — `/judge?mock=truncated-backlog` puts the
@@ -749,6 +752,10 @@ scenarios are mutually exclusive by construction. Known values:
   staged-review (four changes), and sync-disabled states. The configured count
   comes from the same mock template list in all three. Turn on the separate
   `uzi_demo_mode` toggle to mask the source URL and ref in screenshots (#4367).
+- `sizes-readonly` — `/admin/workers?mock=sizes-readonly#worker-sizes`: the
+  Worker sizes editor is read-only (`controller_unsupported`, with the api's
+  reason), and every size save or reset is refused with the api's 409 body
+  (#4213).
 
 ### What keeps the mock build current
 

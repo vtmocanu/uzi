@@ -145,6 +145,14 @@ func cliMintToken(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, scope stri
 // (RequireAuth), so their success/gate paths are reachable only this way.
 func cookieReq(t *testing.T, router http.Handler, method, path, jwt, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return cookieReqPrepared(t, router, method, path, jwt, body)()
+}
+
+// cookieReqPrepared builds the request on the calling (test) goroutine, where a failure may
+// t.Fatal, and returns a closure that only serves it and never touches t, so it is safe to
+// run on another goroutine.
+func cookieReqPrepared(t *testing.T, router http.Handler, method, path, jwt, body string) func() *httptest.ResponseRecorder {
+	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
@@ -155,9 +163,11 @@ func cookieReq(t *testing.T, router http.Handler, method, path, jwt, body string
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	return rec
+	return func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
 }
 
 // cliSeedJudgedRun seeds a forge connection, a repo, a completed run owned by
@@ -491,6 +501,7 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 	user := cliSeedUser(t, pool, false)
 	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
 	runID := uuid.New()
+	tplID := pinsSeedTemplate(t, pool, "builtin", uuid.Nil, nil, nil)
 
 	cases := []struct {
 		name, method, path string
@@ -522,6 +533,15 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		// RequireUser so a uzc_ can read it (see TestCLIReachesSettingsOverBearerLiveDB),
 		// but the PUT write path stayed cookie-only and must NOT have travelled with it.
 		{"settings write (split group, PUT stays cookie-only)", http.MethodPut, "/api/me/settings"},
+		// PRD #3264 M3: the pin route under /api/me is Bearer-reachable, but the full template edit
+		// (prompt, tools, description, builtin and global rows) stays cookie-only.
+		{"template full edit (only the pin route is Bearer-reachable)", http.MethodPut, "/api/agent-templates/" + runID.String()},
+		// The template READ routes stay cookie-only too (D5): they return prompt bodies, which an
+		// admin_ro token must not be able to read for other users' templates. Only the pin routes
+		// under /api/me are Bearer-reachable.
+		{"template list (prompt bodies, D5)", http.MethodGet, "/api/agent-templates"},
+		{"template get (prompt body, D5)", http.MethodGet, "/api/agent-templates/" + tplID.String()},
+		{"template rendered (prompt body, D5)", http.MethodGet, "/api/agent-templates/" + tplID.String() + "/rendered"},
 	}
 	for _, tc := range cases {
 		rec := bearerReq(router, tc.method, tc.path, uzc)
@@ -591,6 +611,112 @@ func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
 	// not authenticated→public.
 	if rec := bearerReq(router, http.MethodGet, "/api/me/settings", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated GET /api/me/settings = %d, want 401", rec.Code)
+	}
+}
+
+// TestCLIReachesModelSettingsOverBearerLiveDB pins the PRD #3264 mount: PUT /api/me/model-settings is
+// RequireUser, so a uzc_ Bearer writes the caller's own model defaults (the write is real: the
+// stored column changes), a cookie without the CSRF header is refused, and an unauthenticated
+// request is 401. The generic PUT /api/me/settings stays cookie-only (see
+// TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB), and the consent switches are not reachable
+// through this route.
+func TestCLIReachesModelSettingsOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	rec := bearerReqBody(router, http.MethodPut, "/api/me/model-settings", uzc, `{"default_effort":"runtime","judge_model":"haiku"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/me/model-settings over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"settings"`) {
+		t.Fatalf("response carries no settings object: %s", body)
+	}
+	var effort, judge *string
+	if err := pool.QueryRow(context.Background(), `SELECT default_effort, judge_model FROM users WHERE id = $1`, user).Scan(&effort, &judge); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if effort == nil || *effort != "runtime" || judge == nil || *judge != "haiku" {
+		t.Fatalf("stored default_effort=%v judge_model=%v, want runtime and haiku", effort, judge)
+	}
+
+	// A consent switch is not in the allowlist, even over a valid Bearer.
+	rec = bearerReqBody(router, http.MethodPut, "/api/me/model-settings", uzc, `{"judge_enabled":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("judge_enabled over Bearer = %d, want 400\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// A cookie session without the CSRF header is refused at the CSRF check.
+	jwt := cliMintJWT(t, pool, user)
+	req := httptest.NewRequest(http.MethodPut, "/api/me/model-settings", strings.NewReader(`{"default_effort":"low"}`))
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
+	req.Header.Set("Content-Type", "application/json")
+	noCSRF := httptest.NewRecorder()
+	router.ServeHTTP(noCSRF, req)
+	if noCSRF.Code != http.StatusForbidden {
+		t.Fatalf("cookie PUT without CSRF = %d, want 403\nbody: %s", noCSRF.Code, noCSRF.Body.String())
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT default_effort FROM users WHERE id = $1`, user).Scan(&effort); err != nil || effort == nil || *effort != "runtime" {
+		t.Fatalf("stored default_effort after the CSRF-less cookie PUT = %v (err %v), want runtime unchanged", effort, err)
+	}
+	// With the CSRF header the cookie path writes.
+	if rec := cookieReq(t, router, http.MethodPut, "/api/me/model-settings", jwt, `{"default_effort":"low"}`); rec.Code != http.StatusOK {
+		t.Fatalf("cookie PUT with CSRF = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT default_effort FROM users WHERE id = $1`, user).Scan(&effort); err != nil || effort == nil || *effort != "low" {
+		t.Fatalf("stored default_effort after cookie write = %v (err %v), want low", effort, err)
+	}
+
+	if rec := bearerReqBody(router, http.MethodPut, "/api/me/model-settings", "", `{"default_effort":"low"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated PUT /api/me/model-settings = %d, want 401", rec.Code)
+	}
+}
+
+// TestCLIReachesAgentTemplatePinsOverBearerLiveDB pins the PRD #3264 M3 mounts: GET
+// /api/me/agent-templates and PUT /api/me/agent-templates/{id}/model-pins are RequireUser (a uzc_
+// Bearer reaches both and the write is real), a cookie session without the CSRF header is refused
+// on the PUT, and neither is public.
+func TestCLIReachesAgentTemplatePinsOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	id := pinsSeedTemplate(t, pool, "user", user, nil, nil)
+	path := "/api/me/agent-templates/" + id.String() + "/model-pins"
+
+	rec := bearerReq(router, http.MethodGet, "/api/me/agent-templates", uzc)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), id.String()) {
+		t.Fatalf("GET /api/me/agent-templates over Bearer = %d, want 200 listing the own template\nbody: %s", rec.Code, rec.Body.String())
+	}
+	rec = bearerReqBody(router, http.MethodPut, path, uzc, `{"model":"opus"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT model-pins over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if v := pinStr(pinsReadRow(t, pool, id).model); v != "opus" {
+		t.Fatalf("stored model = %q, want opus", v)
+	}
+
+	// A cookie session without the CSRF header is refused at the CSRF check and writes nothing.
+	jwt := cliMintJWT(t, pool, user)
+	req := httptest.NewRequest(http.MethodPut, path, strings.NewReader(`{"model":"haiku"}`))
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
+	req.Header.Set("Content-Type", "application/json")
+	noCSRF := httptest.NewRecorder()
+	router.ServeHTTP(noCSRF, req)
+	if noCSRF.Code != http.StatusForbidden {
+		t.Fatalf("cookie PUT without CSRF = %d, want 403\nbody: %s", noCSRF.Code, noCSRF.Body.String())
+	}
+	if v := pinStr(pinsReadRow(t, pool, id).model); v != "opus" {
+		t.Fatalf("stored model after the CSRF-less PUT = %q, want opus", v)
+	}
+	if rec := cookieReq(t, router, http.MethodPut, path, jwt, `{"model":"haiku"}`); rec.Code != http.StatusOK {
+		t.Fatalf("cookie PUT with CSRF = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	if rec := bearerReq(router, http.MethodGet, "/api/me/agent-templates", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /api/me/agent-templates = %d, want 401", rec.Code)
+	}
+	if rec := bearerReqBody(router, http.MethodPut, path, "", `{"model":"low"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated PUT model-pins = %d, want 401", rec.Code)
 	}
 }
 

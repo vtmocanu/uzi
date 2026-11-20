@@ -2,6 +2,7 @@ import type {
   AdminWorker,
   Worker,
 } from "../../lib/api";
+import { builtinSizeSpec } from "./workerSizes";
 import { daysAgo, minsAgo, minsAhead } from "./time";
 import { mockAdmin } from "./users";
 
@@ -132,6 +133,7 @@ export const mockWorkers: Worker[] = [
     status: "offline",
     kind: "hosted",
     hosted_size: "m",
+    hosted_size_spec: builtinSizeSpec("m"),
     docker: false,
     busy: false,
     active_runs: 0,
@@ -254,6 +256,7 @@ export const mockWorkers: Worker[] = [
     status: "online",
     kind: "hosted",
     hosted_size: "m",
+    hosted_size_spec: builtinSizeSpec("m"),
     docker: true,
     // PRD #84 M1/M4: the server-authoritative capability set. This docker-capable hosted
     // worker advertises "docker", so the Workers page shows the capability chip AND — were a
@@ -310,6 +313,7 @@ export const mockWorkers: Worker[] = [
     status: "online",
     kind: "hosted",
     hosted_size: "m",
+    hosted_size_spec: builtinSizeSpec("m"),
     docker: true,
     capabilities: ["docker"],
     busy: true,
@@ -360,6 +364,7 @@ export const mockWorkers: Worker[] = [
     status: "online",
     kind: "hosted",
     hosted_size: "s",
+    hosted_size_spec: builtinSizeSpec("s"),
     docker: false,
     busy: false,
     active_runs: 0,
@@ -416,6 +421,7 @@ export const mockWorkers: Worker[] = [
     status: "online",
     kind: "hosted",
     hosted_size: "m",
+    hosted_size_spec: builtinSizeSpec("m"),
     docker: true,
     capabilities: ["docker"],
     ephemeral: true,

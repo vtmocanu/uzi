@@ -74,8 +74,10 @@ func TestResolveTagIDsTakesTheFirstTagTheAccountOwns(t *testing.T) {
 		t.Fatalf("resolveTagIDs = %v, %v; want the first tag the account owns, 5-2", ids, err)
 	}
 	labels, err := y.ListLabels(context.Background(), 1)
-	if err != nil || len(labels) != 1 || labels[0].Name != "dup" {
-		t.Fatalf("ListLabels = %+v, %v; want one dup", labels, err)
+	// ListLabels now reports the stored eligibility name first, then the tags the
+	// account owns, each name once, so the duplicate collapses to one dup.
+	if err != nil || len(labels) != 2 || labels[0].Name != youtracktest.EligibilityTagName || labels[1].Name != "dup" {
+		t.Fatalf("ListLabels = %+v, %v; want the eligibility name and one dup", labels, err)
 	}
 }
 
