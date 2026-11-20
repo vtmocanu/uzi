@@ -9247,19 +9247,33 @@ export class GitCache {
       try {
         const incoming = await this.withLock(barePath, acquireIncoming);
         if (incoming === undefined) return closedResult;
-        return await withSourceAuthority(() => this.withLock(barePath, async () => {
-          const authenticated = await authenticate();
-          try {
-            if (await this.resolveCommitStrict(barePath, stage) !== incoming)
-              throw new Error("checkpoint private stage changed before promotion");
-            await this.requireOwedCommit(barePath, incoming);
-          } catch (cause) {
-            // The expected oid is the acquired incoming: a stage that moved fails the CAS and is retained.
-            await dropFailedStage(incoming, cause);
-            throw cause;
+        // Set once promotion owns the stage, or once the in-lock checks below already dropped it.
+        let settled = false;
+        try {
+          return await withSourceAuthority(() => this.withLock(barePath, async () => {
+            let authenticated: boolean;
+            try {
+              authenticated = await authenticate();
+              if (await this.resolveCommitStrict(barePath, stage) !== incoming)
+                throw new Error("checkpoint private stage changed before promotion");
+              await this.requireOwedCommit(barePath, incoming);
+            } catch (cause) {
+              // The expected oid is the acquired incoming: a stage that moved fails the CAS and is retained.
+              settled = true;
+              await dropFailedStage(incoming, cause);
+              throw cause;
+            }
+            settled = true;
+            return promoteIncoming(incoming, authenticated);
+          }));
+        } catch (cause) {
+          // A refused or failed second authority acquisition, or a failed second bare lock, never reached the
+          // in-lock checks: re-take the lock for the one CAS attempt (a boundary abort is left to the evidence rules).
+          if (!settled && !this.boundaryAbortError(cause)) {
+            await this.withLock(barePath, () => dropFailedStage(incoming, cause)).catch(() => undefined);
           }
-          return promoteIncoming(incoming, authenticated);
-        }));
+          throw cause;
+        }
       } finally { this.liveImportStages.delete(stage); }
     };
     return opts.checkpointImportMode === "milestone"

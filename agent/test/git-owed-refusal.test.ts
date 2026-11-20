@@ -1449,6 +1449,38 @@ describe("issue4481 a failed import deletes its own attributed stage", { timeout
       assert.deepEqual(sincoming(), []);
     });
 
+    const failingSecondAuthority = (failure: () => Error): FetchAgentBranchOptions => {
+      let phases = 0;
+      return { ...sopts, withSourceAuthority: async <T>(action: () => Promise<T>) => { if (++phases === 2) throw failure(); return action(); } };
+    };
+
+    it("a refused second source authority deletes the stage, and the gate keeps its normal decision", async () => {
+      scommit("next head");
+      await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, failingSecondAuthority(() => new Error("injected authority refusal"))), /injected authority refusal/);
+      assert.deepEqual(sincoming(), []);
+      assert.notDeepEqual(await cache.refusalReleaseGate(sbare, SRUN, 1, sbase), { kind: "ineligible", reason: "refusal import in progress" });
+    });
+
+    it("an ordinary authenticate failure in the second lock section deletes the stage", async () => {
+      scommit("next head");
+      const internals = cache as unknown as { remediationSourceUnderLock: (...args: unknown[]) => Promise<unknown> };
+      const original = internals.remediationSourceUnderLock.bind(cache);
+      let calls = 0;
+      internals.remediationSourceUnderLock = async (...args) => { if (++calls === 2) throw new Error("injected producing-source failure"); return original(...args); };
+      try {
+        await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, sopts), /injected producing-source failure/);
+      } finally { internals.remediationSourceUnderLock = original; }
+      assert.ok(calls >= 2, "the second authentication section ran");
+      assert.deepEqual(sincoming(), []);
+    });
+
+    it("a boundary stop from the second source authority leaves the stage in place", async () => {
+      const head = scommit("next head");
+      await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, failingSecondAuthority(() => new CheckpointSoftDeadlineError())),
+        (e: unknown) => e instanceof CheckpointSoftDeadlineError);
+      assert.deepEqual(sincoming().map((l) => l.split(" ")[1]), [head]);
+    });
+
     it("the real import is a live import between its two lock sections and not after it completes", async () => {
       scommit("next head");
       const gateAt = (): Promise<RefusalReleaseGate> => cache.refusalReleaseGate(sbare, SRUN, 1, sbase);
