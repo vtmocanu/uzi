@@ -4404,6 +4404,23 @@ export class RunRunner {
     };
   }
 
+  /** The wait for A of the terminal refusal-release fetch after an owed-limit stop (issue #4481). The stop
+   *  aborts the flight's cancel, lifecycle and terminal lifecycle signals itself, so none of them can
+   *  gate the release (the same reasoning as {@link cleanupAuthorityWait}). A cancel or claim fence that
+   *  is already recorded, shutdown, and the boundary deadline (and maintenance budget) still refuse; the
+   *  terminal lifecycle signal joins only while the stop has not aborted it. A cancel that arrives only
+   *  after the transfer began is not observed by this wait. */
+  private owedStopReleaseWait(flight: RunFlight): AuthorityWait {
+    const budget = MaintenanceBudget.current();
+    const terminal = flight.steering.terminalLifecycleSignal();
+    const refused = flight.steering.isCancelled() || flight.steering.claimFence() !== undefined;
+    return {
+      signal: AbortSignal.any([this.shutdownSignal.signal, ...(budget ? [budget.signal] : []),
+        ...(refused ? [AbortSignal.abort()] : []), ...(terminal.aborted ? [] : [terminal])]),
+      timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, budget?.remainingMs() ?? Infinity)),
+    };
+  }
+
   /** The wait for A at an authorized cancellation/park cleanup: shutdown and the current independent
    *  maintenance budget only. The flight's cancel/lifecycle signals are deliberately absent: they are
    *  usually already aborted when a cancellation, park or early-terminal cleanup runs, and a flight that is
@@ -23334,8 +23351,12 @@ export class RunRunner {
     if (prior) return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, prior.head, check);
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
-      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        heldCapture ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) } : undefined);
+      // issue #4481: stopForOwedLimit aborts the flight's cancel, lifecycle and terminal lifecycle signals,
+      // so the default authority wait would reject the refused head's release fetch at once.
+      const sourceWait: AuthorityWait | undefined = heldCapture
+        ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) }
+        : flight.owedLimitStop !== undefined ? this.owedStopReleaseWait(flight) : undefined;
+      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined, sourceWait);
       check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });

@@ -8324,3 +8324,63 @@ for (const kind of ["held_publication", "settled"] as const) {
     });
   }
 }
+
+// issue #4481 m3 review: the settled/held lane of the accepted-FINAL recovery drives recoverAcceptedFinalBeforeGate directly,
+// because every other way of reaching it is stopped upstream (settledRefusesWork / finalHoldAllowsReplay) before the lane.
+async function settledLaneFixture(receiptDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+  const { f, before } = await pendingReceiptFixture();
+  const disposition = { kind: "settled" as const, coverage_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+  const settlement = {
+    run_id: "run-1", hold_id: HOLD_ID, repo_id: REPO_ID, generation: 7, state: "released",
+    original_worker_id: "original", original_worker_identity: "original", inventory_guarded: true,
+    run_status: "failed", current_claim_generation: 7, claim_released: true,
+    release_evidence: "publication", final_receipt: { ...disposition, coverage_digest: receiptDigest },
+  };
+  // The record already carries the observed settlement (heldOperationState returns "settled" for it without a receipt check).
+  await patchAuthenticated(f, before, { finalRequest: { disposition, evidence: "publication" } as never,
+    exactHoldBinding: { holdId: HOLD_ID, repoId: REPO_ID }, holdSettlement: settlement as never,
+    originalRoots: [], coverageDigest: disposition.coverage_digest });
+  const record = (await f.coordinator.inspect("run-1"))[0]!;
+  Object.assign(f.git, INELIGIBLE_GATE);
+  const rec = f.make();
+  const lane = (prove: () => Promise<boolean>) =>
+    (Reflect.get(rec, "recoverAcceptedFinalBeforeGate") as (r: RecoveryRecord, p: () => Promise<boolean>) => Promise<unknown>).call(rec, record, prove);
+  return { f, rec, lane };
+}
+
+it("#4481 settled lane control: the exact settled receipt and a proven-inactive run are acknowledged without a POST", async () => {
+  const { f, lane } = await settledLaneFixture();
+  try {
+    const finals = f.finals.length;
+    assert.equal(await lane(async () => true), "acked");
+    assert.equal(f.finals.length, finals);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+it("#4481 settled lane: a settlement carrying a different receipt than the saved FINAL is not acknowledged", async () => {
+  const { f, lane } = await settledLaneFixture("e".repeat(64));
+  try {
+    const finals = f.finals.length;
+    assert.equal(await lane(async () => true), undefined);
+    assert.equal(f.finals.length, finals);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+it("#4481 settled lane: an unproven source is not acknowledged", async () => {
+  const { f, lane } = await settledLaneFixture();
+  try {
+    assert.equal(await lane(async () => false), undefined);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+it("#4481 settled lane: an active run is not acknowledged", async () => {
+  const { f, rec, lane } = await settledLaneFixture();
+  try {
+    Reflect.set(rec, "inactiveInventory", async () => false);
+    assert.equal(await lane(async () => true), undefined);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});

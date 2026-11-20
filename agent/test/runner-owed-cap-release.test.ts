@@ -543,3 +543,76 @@ it("N1: an unguarded run at the cap with a successful terminal fetch follows the
   assert.equal(git["refusalGenerationClosed"]({ runId: claim.run_id, generation: GENERATION }), false, "the generation was never fenced");
   assert.deepEqual(refusalFiles().filter(n => n.startsWith("admission-")), []);
 });
+
+/** One more commit and checkpoint after the roots: the cap refuses it inside the turn, and the runner stops the flight. */
+async function midTurnStop(ctx: RunContext): Promise<void> {
+  commit(ctx.worktreePath, "mid-turn.txt");
+  await ctx.checkpoint!({ reap: false });
+}
+
+interface AuthorityProbe { transactions: number; waits: (AbortSignal | undefined)[]; transfers: (string | null)[]; stopped: boolean[] }
+
+/** Installs a source authority that refuses an aborted wait signal, only for the duration of each terminal
+ *  transfer (the rest of the flight runs without one), so the producing-source authority wait is really
+ *  exercised. `atStart` runs as the transfer begins; `inWait` runs inside the authority wait, as a shutdown arriving mid-transfer would. */
+function authorityDuringTransfer(t: TestContext, r: ReturnType<typeof runner>, when: { atStart?: (flight: unknown) => void; inWait?: () => void } = {}): AuthorityProbe {
+  const probe: AuthorityProbe = { transactions: 0, waits: [], transfers: [], stopped: [] };
+  const original = Reflect.get(r, "transferRestorePointToTrustedBare") as (...a: unknown[]) => Promise<string | null>;
+  t.mock.method(r as unknown as Record<string, (...a: unknown[]) => Promise<string | null>>, "transferRestorePointToTrustedBare",
+    async function (this: unknown, ...a: unknown[]) {
+      const flight = a[0] as { cancel: AbortController; owedLimitStop?: unknown };
+      when.atStart?.(flight);
+      probe.stopped.push(flight.cancel.signal.aborted && flight.owedLimitStop !== undefined);
+      Reflect.set(r, "authority", {
+        withTransaction: async (fn: () => Promise<unknown>, wait: { signal?: AbortSignal } = {}) => {
+          probe.transactions++;
+          probe.waits.push(wait.signal);
+          when.inWait?.();
+          if (wait.signal?.aborted) throw new Error("source authority wait aborted");
+          return fn();
+        },
+        recordAdmissions: (_sink: Set<string>, fn: () => Promise<unknown>) => fn(),
+      });
+      try { const out = await original.apply(this, a); probe.transfers.push(out); return out; }
+      finally { Reflect.set(r, "authority", undefined); }
+    });
+  return probe;
+}
+
+it("an owed-cap stop does not abort the terminal refusal-release fetch's source authority wait", opts, async t => {
+  const { claim, server, work } = setup(44830);
+  let probe!: AuthorityProbe;
+  const r = await runFailed(claim, work, midTurnStop, runner => { Reflect.set(runner, "attemptPaths", true); probe = authorityDuringTransfer(t, runner); });
+  assert.ok(probe.stopped.length > 0 && probe.stopped.every(Boolean), "the owed-limit stop had aborted the flight before each terminal transfer");
+  assert.ok(probe.transactions > 0, "the producing-source authority wait was exercised");
+  assert.ok(probe.transfers.length > 0 && probe.transfers.every(h => h !== null && h === probe.transfers[0]), "the refused head was released");
+  assert.equal(server.heldCalls.length, 1, "held publication proceeded");
+  await redrive(r);
+  assert.equal(server.acked(), 1);
+});
+
+it("a recorded cancel still aborts the terminal refusal-release fetch after an owed-cap stop", opts, async t => {
+  const { claim, server, work } = setup(44831);
+  let probe!: AuthorityProbe;
+  await runFailed(claim, work, midTurnStop, runner => {
+    Reflect.set(runner, "attemptPaths", true);
+    probe = authorityDuringTransfer(t, runner, {
+      atStart: flight => (flight as { steering: { markCancelled(): void } }).steering.markCancelled(),
+    });
+  });
+  assert.ok(probe.transactions > 0, "the authority wait was exercised");
+  assert.ok(probe.transfers.length > 0 && probe.transfers.every(h => h === null), "the cancelled transfer released nothing");
+  assert.equal(server.heldCalls.length, 0, "no held publication");
+});
+
+it("shutdown during the terminal refusal-release fetch still aborts it after an owed-cap stop", opts, async t => {
+  const { claim, server, work } = setup(44832);
+  let probe!: AuthorityProbe;
+  await runFailed(claim, work, midTurnStop, runner => {
+    Reflect.set(runner, "attemptPaths", true);
+    probe = authorityDuringTransfer(t, runner, { inWait: () => (Reflect.get(runner, "shutdownSignal") as AbortController).abort() });
+  });
+  assert.ok(probe.transactions > 0, "the authority wait was exercised");
+  assert.ok(probe.transfers.length > 0 && probe.transfers.every(h => h === null), "the shut-down transfer released nothing");
+  assert.equal(server.heldCalls.length, 0, "no held publication");
+});
