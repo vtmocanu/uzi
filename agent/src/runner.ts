@@ -3551,6 +3551,8 @@ export interface RunnerOptions {
   codexFinalizeBoundaryDeadlineMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
+  /** TEST-ONLY (issue #4536): clock for every time read of the run's SteeringChannel (follow-up idle window, receipt deadlines); default Date.now. */
+  steeringNow?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
    *  paired with a clearTimeout canceller. Lets a test arm and OBSERVE the per-run
    *  answer budget deterministically — the per-run-vs-per-question distinction is a
@@ -3777,6 +3779,8 @@ export class RunRunner {
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
   private readonly now: () => number;
+  /** TEST-ONLY (issue #4536): see RunnerOptions.steeringNow. */
+  private readonly steeringNow: (() => number) | undefined;
   /** PRD #88: injectable answer-deadline timer (defaults to setTimeout/clearTimeout),
    *  so a test can arm and observe the per-run answer budget without a wall-clock race. */
   private readonly setTimer: (cb: () => void, ms: number) => () => void;
@@ -4103,6 +4107,7 @@ export class RunRunner {
         ? opts.codexFinalizeBoundaryDeadlineMs
         : CODEX_FINALIZE_BOUNDARY_DEADLINE_MS;
     this.now = opts.now ?? (() => Date.now());
+    this.steeringNow = opts.steeringNow;
     const realTimer = (cb: () => void, ms: number): (() => void) => {
       const t = setTimeout(cb, ms);
       t.unref?.();
@@ -13862,6 +13867,7 @@ export class RunRunner {
         // signal ONLY when it targets THIS claim (a signal for a superseded claim is ignored).
         onCancel: () => { this.observeCancellation(flight); },
         claimGeneration,
+        now: this.steeringNow,
       },
     );
     // Issue #4201: an applied in-place switch makes steering replace its (spent) cancel controller;
