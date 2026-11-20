@@ -316,6 +316,33 @@ func TestCrossCheckNonIssueMilestonesSeededLegacyAttemptLiveDB(t *testing.T) {
 	}
 }
 
+// A legacy row (valid non-empty list, keyed on the received milestones) written at lead
+// generation 1 must NOT satisfy a replay at generation 2: the generation check is part of the
+// match, so the legacy digest alone never admits a cross-generation replay.
+func TestCrossCheckNonIssueMilestonesLegacyCrossGenerationLiveDB(t *testing.T) {
+	const raw = `[{"id":"m1","title":"  Title  "}]`
+	for _, kind := range ccNINonIssueKinds {
+		t.Run(kind, func(t *testing.T) {
+			f := ccNIFixture(t, kind, "claude", false)
+			c := f.c
+			c.Milestones = json.RawMessage(raw)
+			ccNISeedLegacyAttempt(t, f, c, raw)
+			before := ccAdmissionSnapshot(t, f, 1)
+			f.setGeneration(2)
+			_, err := f.svc.SubmitPlanCrossCheck(f.env.ctx, f.w, f.lead, 2, c, 1)
+			if !errors.Is(err, ErrCrossCheckInterrupted) {
+				t.Fatalf("cross-generation legacy replay: want ErrCrossCheckInterrupted, got %v", err)
+			}
+			if rows, children := f.counts(t); rows != 1 || children != 1 {
+				t.Fatalf("rows=%d children=%d, want 1/1", rows, children)
+			}
+			if after := ccAdmissionSnapshot(t, f, 1); after != before {
+				t.Fatalf("row changed: %+v -> %+v", before, after)
+			}
+		})
+	}
+}
+
 func cloneForNI(c PlanCrossCheckCandidate) PlanCrossCheckCandidate {
 	c.RequiredCapabilities = append([]string(nil), c.RequiredCapabilities...)
 	c.RequiredTools = append([]string(nil), c.RequiredTools...)
