@@ -27,7 +27,7 @@ Amendment 2026-11-20 (#4555): milestones belong to issue runs only. When a non-i
 - Malformed received milestones have no such legacy identity. If the stored attempt does not match, the retry keeps the earlier refusal rather than `interrupted`.
 - The handler resolves the lead kind only when the milestones fail normalization; a lookup fault answers 409 `cross-check refused`.
 - The approved-plan write keeps exact binding, because workers report the server's canonical candidate. Non-issue implement prompts and code cross-checks therefore see `[]`.
-- During a mixed api roll, an older replica replaying a new `[]` attempt answers `interrupted`, so the run goes to the human gate.
+- During a mixed api roll, an older replica replaying a new `[]` attempt answers `interrupted`, or 400 `candidate_invalid` for milestones it rejects, so the run goes to a refusal or the human gate. The legacy retry identity is not computed when a semantic identity is bound.
 
 `SetRunAutopilotPlan` in `api/internal/store/queries/runtime.sql` binds the latest plan-stage APPROVE to an opposite-harness `cross_check` child, current lead claim generation, server digest and matching approval-bearing fields. It freezes those fields in the guarded write. `SetRunRunning`, completion and progress guards prevent bypass through adjacent state reports. These are server storage/lifecycle guarantees; they cannot prevent arbitrary execution by a worker that ignores a refusal. Capability claim gates exclude unaware workers, and the worker treats a refused handoff as fatal.
 
