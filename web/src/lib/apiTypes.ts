@@ -1349,6 +1349,7 @@ export interface LatestRun {
   // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
   // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
   // 'run_override_unavailable' (issue #3250) reads "model choice unavailable: owner hold". The set of
+  // 'phase_switch_unavailable' (issue #3252) reads "planning switch unavailable: owner hold". The set of
   // these non-completion holds is NON_COMPLETION_HOLDS in lib/runBadge.ts.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
@@ -4653,7 +4654,9 @@ export interface Run {
    *  on that harness, otherwise Cancel and start a new run with a different choice.
    *  The non-completion holds (credential_disabled, credentials_reset, provider_unavailable,
    *  codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable, the two token-switch
-   *  holds, iteration_budget_exhausted and run_override_unavailable; NOT completion_blocked,
+   *  holds, iteration_budget_exhausted, run_override_unavailable and phase_switch_unavailable
+   *  (issue #3252: the runtime did not switch planning to implementation model or effort; owner
+   *  Resume retries on a new claim, otherwise Cancel); NOT completion_blocked,
    *  budget_exhausted or weekly_reserve) form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
    *  tone, label and owner-resumability (fixtures/hold-reasons/presentation.json).
    *  Render an unrecognised value honestly.

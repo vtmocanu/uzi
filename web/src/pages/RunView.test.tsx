@@ -2194,6 +2194,40 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
   });
 
+  // Issue #3252: the runtime did not switch between the planning and implementation model or
+  // effort. PhaseSwitchHoldPanel is the only Resume/Cancel control for this hold.
+  it("a phase-switch hold renders its own hold text, not a completion panel", async () => {
+    renderPage({ ...PAUSED, hold_reason: "phase_switch_unavailable" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByText("planning switch unavailable: owner hold").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+    expect(screen.queryByText("Completion blocked")).toBeNull();
+  });
+
+  it("a phase-switch hold shows a visible panel with Resume and Cancel", async () => {
+    const { refreshRun, submit } = renderPage({ ...PAUSED, hold_reason: "phase_switch_unavailable" }, true);
+    const heading = await screen.findByRole("heading", { name: "Planning switch unavailable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/did not switch between the planning and implementation model or effort/i)).toBeTruthy();
+    expect(panel.getByText(/does not resume automatically/i)).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    expect(panel.queryByRole("button", { name: /stop/i })).toBeNull();
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a phase-switch hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "phase_switch_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Planning switch unavailable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText("Only the run owner can Resume or Cancel this hold.")).toBeTruthy();
+    expect(panel.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
     const { refreshRun } = renderPage(PAUSED, true);
     await screen.findByText("Add rate limiting");
@@ -6644,6 +6678,7 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     ["credential_switch_settling", true],
     ["credential_switch_unsettled", true],
     ["run_override_unavailable", false],
+    ["phase_switch_unavailable", false],
   ] as const)("a paused run held on %s with a live completion phase shows the panel: %s", (hold, shown) => {
     const { container } = render(<CompletionStatePanel run={run({ status: "paused", completion_phase: "checking", hold_reason: hold })} />);
     expect(container.textContent?.includes("Completion state") ?? false).toBe(shown);
@@ -6660,6 +6695,7 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     ["credential_switch_settling", true],
     ["credential_switch_unsettled", true],
     ["run_override_unavailable", false],
+    ["phase_switch_unavailable", false],
   ] as const)("a retained %s marker on a non-paused run with no phase shows the panel: %s", (hold, shown) => {
     const { container } = render(<CompletionStatePanel run={run({ status: "queued", completion_phase: "", hold_reason: hold })} />);
     expect(container.textContent?.includes("Completion state") ?? false).toBe(shown);

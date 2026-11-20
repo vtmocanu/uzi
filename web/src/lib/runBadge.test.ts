@@ -1795,6 +1795,17 @@ describe("non-completion holds (fixtures/hold-reasons/presentation.json)", () =>
     expect(needsHumanAttention("credential_disabled")).toBe(false);
     expect(needsHumanAttention("credentials_reset")).toBe(false);
   });
+
+  it("phase_switch_unavailable is a static warning badge that needs the owner", () => {
+    const b = runBadge(run({ status: "paused", hold_reason: "phase_switch_unavailable" }), NOW);
+    expect(b).toMatchObject({
+      kind: "badge",
+      label: "planning switch unavailable: owner hold",
+      tone: "warning",
+      pulse: false,
+    });
+    expect(needsHumanAttention("phase_switch_unavailable")).toBe(true);
+  });
 });
 
 it.each(["source_end_declined", "private-unknown-detail", null] as const)("board badge renders only closed source-end detail %s", detail => {
