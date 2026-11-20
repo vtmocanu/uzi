@@ -320,6 +320,353 @@ step is `published` or `recorded`. The gate is a
 compile-time constant that is off, so this is production-dark. See
 [ADR-4007](4007-terminal-preservation.md).
 
+## Amendment (2026-11-19, #4481)
+
+**Problem.** At the 64-head owed cap (`MAX_OWED_CANDIDATES_PER_RUN`) the worker
+refuses to pin another head and stops the run. For a failed inventory-guarded
+code-publishing run the terminal fetch-back that transfers the clone head into the
+trusted bare was refused with it, so the freeze never ran and the custody hold
+stayed open until an owner ran `uzi run recovery` or `uzi run discard`. The
+existing held V2 publication and FINAL (or the archive fallback) could not
+release it because nothing proved the refused head was kept.
+
+**Mechanism.** A refused head is kept and recorded instead of dropped.
+
+- The head stays alive under a refused ref
+  `refs/uzi-incoming/<run>/<generation>/refused-<sha>`. Only the fetch paths
+  (P1, P2) also leave a run-attributed stage ref
+  `refs/uzi-incoming/<run>/<generation>/import-<processNonce>-<uuid>`; P3-P7 leave only the
+  refused ref.
+- It is recorded in a durable ledger under `<bare>/info/uzi-refusals/`.
+  That directory is deliberate: older workers throw on unknown names in
+  `uzi-owed` and block on unknown top-level bare directories, but ignore
+  `info/`.
+- The worker's terminal transfer (`transferAtOwedCap`) then proceeds only when
+  the refused head is the clone head and the durable gate
+  (`refusalReleaseGate`) is `eligible`; the head is anchored as on the ordinary
+  path and the freeze runs with it as the current source. The existing held
+  publication and FINAL (or archive fallback) release the hold unchanged.
+  No new server contract, capability or endpoint is involved.
+
+Records under `info/uzi-refusals/` (all written with fsync, rename, directory
+fsync and read-back):
+
+| Record | Role |
+| --- | --- |
+| `admission-<run>-<gen>.json` | Write-once provenance for one generation, carrying a per-worker-process nonce. Never overwritten. |
+| `refusals-<run>.json` | The ledger of refused heads (generation, SHA, producer path), bound to run, branch and bare. |
+| `final-<run>-<gen>.json` | Write-once release seal: source SHA, evidence digest, process nonce. |
+| `cleanup-<run>-<gen>.json` | Write-once cleanup intent listing the exact stages and ledger entries to delete. |
+| `incomplete-<run>.json` | Durable marker that refusal recording failed for the run. Never cleaned up. |
+| `owedpath-<run>-<gen>.json` | Write-once marker that this generation reached or was about to fill the owed cap. Removed last by generation cleanup. |
+
+**Producer audit.** All seven `pinOwedUnderLock` call sites record a cap
+refusal at one chokepoint (`recordRefusalUnderLock`, under the bare lock,
+before the refusal is thrown). The fetch stage path (P2, at the fetch site)
+additionally records the incoming head directly through the same function when
+no refusal for it was noted, an eighth direct recording call. A recording
+failure never changes what is thrown and claims nothing. The `refused-<sha>`
+ref write and the ledger append are independent steps: a failed ref write
+still attempts the ledger append. If either write fails, or the seal listing
+fails, or the ledger is invalid, unbound or full, or the owed-path marker write
+fails, the run is latched in-process
+(`refusalRecordingFailed`) and its gate and seal are ineligible ("refusal
+recording failed in this process") for the worker process lifetime. The same
+failure (seal-directory read, refused-ref write, ledger write or owed-path marker write) also writes a
+durable `info/uzi-refusals/incomplete-<run>.json` marker
+(`markRefusalIncomplete`, best effort, never throws, independent of the other
+recording steps). While the marker is present the gate, and so the seal, is
+ineligible for that run ("refusal history incomplete"), checked before the
+`none` check and across worker restarts; cleanup never deletes the marker. The
+restart rule still makes a successor ineligible while the run's owed pins stay
+at the cap or any durable refusal evidence exists.
+
+**Owed-path marker (owner decision, binding).** The restart residual is closed
+fail-closed, not accepted. A write-once `owedpath-<run>-<gen>.json` in
+`info/uzi-refusals` (`ensureOwedPathMarker`) is written before the pin that
+fills a positive-generation context's owed cap, and on the refusal branch if
+absent. A marker failure on the pin path refuses that pin as a generic
+`preservation_failed` ("owed path marker write failed"), never as the cap. While
+a marker at or below the releasing generation G exists, the gate never answers
+`none`: it requires admissions written by the current worker process for
+every generation 1..G. After a worker-process change, or with an absent
+admission, the run therefore keeps its hold for the owner, even if every
+refusal write failed and the pins later drop below the cap. Runs that never
+filled the cap write no marker and are unchanged. Generation cleanup removes
+the markers at or below its generation last, after the files. Older-worker
+boundary: a generation an older worker filled to the cap has no marker; it
+gets one only if a refusal happens later on the new worker. The gate's
+tracking-tip rule (the run's own branch tracking ref must be covered) is an
+extra check that matters for P3 (same run) and P7; it is not what protects the
+other paths.
+
+| Path | Producer |
+| --- | --- |
+| P1 | `fetchAgentBranch`, unobserved tracking head |
+| P2 | promotion of an incoming head (fetch, `updateTrackingRef`, `updateRemediationTrackingRef`) |
+| P3 | displaced historical owner |
+| P4 | ancestor-branch clearing |
+| P5 | remediation `ownedTip` |
+| P6 | remediation marker `executionTip` |
+| P7 | `retainCurrentOwedCandidate` |
+
+Admission (provenance) is written only by the runner's authenticated flight
+admission (`admitRefusalProvenance`, one attempt per flight, inventory-guarded
+code-publishing kinds with a positive generation), never by these paths.
+
+**The gate** returns `none`, `eligible` or `ineligible`. `eligible` requires:
+an admission for every generation 1..G written by the current worker process;
+a ledger that, if present, parses and is bound to the run and bare, with its
+branch matching the admissions; no `incomplete-<run>.json` marker (valid or
+not, it is final and is checked before the `none` check); no temporary residue
+of this run (or unattributed) in the directory; every stage and refused tip present in the ledger; every refused head
+an ancestor of, or equal to, the release source (or pinned under
+`refs/uzi-owed`); and the run-owned tracking tip covered. `none` means no
+refusal evidence, the pin count below the cap and no owed-path marker at or
+below G: the ordinary path, unchanged.
+The gate is consulted on every inventory-guarded release but is a no-op
+(`none`) for a run with no refusal evidence below the cap and no owed-path marker at or below that generation; a run with earlier
+recorded refusals, or exactly at the cap, needs complete admissions even if its
+terminal fetch succeeded. The gate runs before the freeze, before archive capture or upload, before the
+held publish, and inside the coverage proof before every guarded FINAL.
+
+**Seal.** `sealRefusalRelease` runs the gate and writes `final-` once, before
+the first FINAL. Every retry must match it (digest, source, process) or the
+FINAL is not sent (`refusal_seal`, classified as an integrity refusal). An
+existing seal is compared even when current evidence has disappeared (gate
+`none`): empty evidence hashes to the empty digest, which differs from what the
+seal fixed, so the result is a mismatch and custody is kept. With no seal
+and gate `none`, nothing is written.
+
+**Fence.** After the terminal import on the cap path, and also after a
+successful terminal import of an inventory-guarded code-publishing run whose gate is not `none` (refusal evidence exists or
+the run is at the cap; the path is re-proved through the cap transfer), an in-process fence
+(`closeRefusalGeneration`) refuses further producing fetches and tracking
+updates (P1-P6) for that run at generation at or below the closed one.
+`retainCurrentOwedCandidate` (P7) is not fenced by the in-process fence; it stays
+open before the freeze, and its refusals before the seal land in the seal's gate
+or make it ineligible. P7 is fenced by the seal of the generation it would pin:
+under the bare lock it returns `ownership_unknown`, before any candidate,
+context or pin write, when a `final-` file exists at or above the producing
+context's generation or the caller's generation (a failed read of the names
+refuses too, as `preservation_failed`). The fence is checked before the
+already-pinned and remotely-covered short cuts, so after a seal a retain that
+would have written nothing new is also refused (`not_updated`; the settle path
+then preserves the clone, the retirement path preserves it when the claim is
+inventory-guarded): an accepted, fail-closed over-refusal. Once `final-`
+exists the seal blocks recording on every path, including `retainCurrentOwedCandidate`.
+On these paths a second terminal pass for the same generation re-proves the
+released head instead of re-importing (this only stops the hook from
+re-importing); that no later fetch adds a refused head rests on the fence.
+Ordinary below-cap runs with gate `none` take the unchanged path.
+
+**Invariants.**
+
+- I-refusal: a custody release on the cap path happens only when every head the
+  worker refused for that run, up to the releasing generation, is provably
+  covered by the release source, as shown by the sealed gate evidence.
+- Provenance: only a flight of the current worker process that was
+  authenticated as the generation's claim holder can have written the
+  admission; an admission from another process is not trusted.
+- Exclusion: no producer records a refused head after the seal exists (every
+  path) or after the fence closes (P1-P6; P7 is fenced by the seal of the generation it would pin, not by the in-process fence, see above), so the evidence the seal covers cannot grow.
+
+**Failure model.** Process crash, SIGKILL and injected faults. Files rely on
+fsync, rename, directory fsync and read-back. No storage or power-loss claim is
+made for refs.
+
+**Restart rule versus eventual cleanup.** A cap-stopped run whose history
+spans a worker-process restart (or any other process) keeps its hold while
+durable refusal evidence exists or its pins stay at the cap; the
+release ordering does not rely on container teardown. Eventual cleanup of a
+leaked producer is separate: tini as PID 1 exiting kills the container's PID
+namespace, which a real-container test in `e2e/worker-uid/` exercises.
+
+**Cleanup.** With no refusal evidence `cleanupRecoveryGeneration` behaves as
+before. With refusal evidence it validates before any deletion (seal bound, source equal
+to the acknowledged FINAL source, digest equal, ancestry, stages a subset of
+the ledger), then writes `cleanup-`, deletes the excluded import stages, the
+stage and refused refs, rewrites the ledger, performs the existing anchor
+deletions, and finally deletes `final-` and `cleanup-` and then the owed-path
+markers at or below the generation. Admissions are kept: cleanup never deletes
+them (they are the seal's process-binding evidence); only the bare's removal
+removes them, and owner discard does not. A crashed pass
+resumes through an exact-pair subset check, and resume validates the intent
+itself: the digest recomputed from the intent's own lists must equal the
+seal's, every listed stage must be a ref in this run's namespace whose
+generation matches its ref path, is at most the releasing generation and
+whose tip a listed ledger entry covers, and no listed ledger entry may be at a
+later generation. Cleanup matches exact (generation, sha) pairs, so a later
+generation's row for the same head survives. Any change in the evidence retains
+everything locally; this never undoes an already acknowledged release.
+
+**Census.** `info/uzi-refusals` entries named `refusals-`, `final-`, `cleanup-`,
+`incomplete-`, `owedpath-` or `.tmp-` mark a bare protected (`refusal_records`); an admission alone stays
+disposable. Nested `refs/uzi-incoming/<run>/` refs count as `recovery_refs`;
+a flat `refs/uzi-incoming/<uuid>` fetch stage remains unprotected.
+
+**Limitations.** These keep today's behaviour (the owner uses `uzi run
+recovery` or `uzi run discard`):
+
+- A run claimed before this change, a run that crossed an old or another
+  worker, a run whose history spans a worker-process restart (while durable refusal
+  evidence exists or its pins stay at the cap), and a generation whose
+  admission write failed.
+- A run whose refusal writes all failed keeps its hold across a worker restart
+  even when its pins later drop below the cap: the owed-path marker (or the
+  `incomplete-<run>.json` marker) keeps the gate from answering `none`. A
+  generation an older worker filled to the cap has no owed-path marker unless a
+  refusal later happens on the new worker. Unguarded runs: a cap-filling pin
+  is refused on a bare lacking `info/` (default bares have it), and the
+  owed-path marker keeps the bare a refusal-records bare for the census until
+  generation cleanup removes it; for a run that never reaches recovery
+  generation cleanup (for example an unguarded run) it stays until the bare is
+  removed.
+- A refusal under a legacy or no-generation context keeps that run's hold and
+  its cleanup closed permanently.
+- Older workers in a mixed fleet may treat a bare holding the new records as
+  disposable and leak the nested refs and records.
+- Owner discard does not remove refusal artifacts (refusal refs, records,
+  incomplete markers and admissions); they stay reachable. No worker-side
+  discard removes them; only the bare's removal deletes them.
+- A stranded temp file in `info/uzi-refusals` keeps the gate ineligible
+  (see Rework below for whose temp file).
+- An import refused at an already-sealed generation leaves an unanchored
+  import stage, which then blocks later gates for the owner (accepted).
+- A worker killed mid refusal-ref delete leaves an unresolved bare record that
+  fences later writers on that bare. No in-product path resolves a dead owner's
+  running bare record (the same contract as `recovery-cleanup-delete-ref`);
+  operator intervention is needed (accepted).
+
+**Owner-decided residual (2026-11-19).** Provenance gates only the automatic
+cap release (the gate itself is consulted on every inventory-guarded release but
+is a no-op without refusal evidence below the cap and without an owed-path marker). An old worker's refused head
+that old code deleted leaves no trace; the ordinary release proceeds as today.
+This is pre-existing and accepted. Releases with no refusal evidence below the
+cap and no owed-path marker at or below the releasing generation are not gated on admission records. The restart
+residual that earlier text left open is closed by the owed-path marker above.
+
+**Rework (2026-11-20, #4481 review).** The code now also does the following.
+
+- **Ledger key.** Ledger rows are keyed by (generation, sha). An older
+  generation's cleanup removes only its exact pairs, so a later generation's
+  refusal of the same head keeps its own row. The sha-only listed-head retain
+  was removed.
+- **Temp files.** Temp files in `info/uzi-refusals` are named
+  `.tmp-<runId>-<uuid>`. A run's own temp keeps it ineligible and its cleanup
+  retained; another run's temp is ignored; an unattributed temp fails closed for
+  all runs.
+- **Verified stage inventory.** The stage listing is verified. Listing stderr, a
+  non-files ref backend (a reftable directory, or `extensions.refstorage` other
+  than exactly `files`), or a loose ref under `refs/uzi-incoming/<run>/` that
+  is a symlink, non-regular, malformed (including a symbolic `ref:`) or that
+  disagrees with the listing makes the gate ineligible and cleanup retain.
+- **Authority for deletes.** Sealed-cleanup deletes of refused refs and import
+  stages go through the registered bare-mutation authority, op
+  `refusal-cleanup-delete-ref`, with read-back settlement
+  (`agent/src/git-authority-hooks.ts`, `agent/src/bare-refusal-diagnostic.ts`).
+  Failed-acquisition and promotion-time stage deletes remain plain CAS
+  `update-ref -d`, as before.
+- **Import stages.** Import stages are named
+  `refs/uzi-incoming/<run>/<gen>/import-<processNonce>-<uuid>`; evidence refs
+  stay `refused-<sha>`. An import stage whose tip has a refused ref at the same
+  generation plus a ledger (generation, sha) row is excluded from the refusal
+  evidence and the seal digest. A live in-process import makes the gate
+  ineligible, and an unanchored import stage keeps the gate ineligible and
+  cleanup retained (fail-closed). Sealed cleanup lists excluded import stages in
+  its intent (`importStages`, not in the digest) and deletes them first (intent,
+  import stages, refused refs, ledger, pins, files, markers); a resumed cleanup
+  rediscovers them from the intent. A failed acquisition CAS-deletes its own
+  attributed stage at the fetched SHA, and keeps it if the ref moved, if it is
+  the sole anchor of a ledgered head, or on a boundary stop. A failure in a
+  producing-source import's second phase (changed source proof, refused or
+  timed-out source authority, failed second lock) keeps the stage: the head is
+  unproven and the stage may be its only bare copy, so the run stays held
+  (gate ineligible, cleanup retained) for the owner.
+- **Finished import stages (reconciliation).** An import interrupted after its
+  fetch leaves its attributed stage; a later successful retry of the same head
+  does not remove it, and without a refused ref and ledger row it would hold
+  the gate forever. The cache therefore records, process-locally and bounded at
+  4096 entries (oldest evicted, which only makes a stage unproven), the stages
+  whose producing import returned, success or failure. A stage's producer is
+  proven finished only when its leaf nonce equals this process's nonce, it is
+  in that record and it is not live. Under the bare lock, after the latch,
+  incomplete, temp and ledger checks, the later-generation check and the
+  live-import check, the gate (and so the seal) removes such a stage only when
+  an independent anchor sits at its exact tip and the tip is covered. Anchors:
+  the owed pin `refs/uzi-owed/<run>/<tip>`; a recovery pin
+  `refs/uzi-recovery-pin/<run>/<g'>` with g' at or below the releasing
+  generation; or the tracking ref `refs/uzi-runner/<branch>` at the tip, with
+  the branch hint described below. Covered means pinned, or an ancestor of the
+  gate head. Object existence, ledger rows and the head alone never anchor.
+  The removal is the registered CAS delete (op `refusal-cleanup-delete-ref`);
+  a refused registration, a moved ref or any non-abort failure keeps the stage
+  and the gate holds, and a boundary abort propagates. After removals the gate
+  recomputes: with no ledger rows, stages, owed-path marker or full cap it is
+  `none`. Any attributed import stage left at or below the generation whose
+  producer is not proven (a foreign or crashed process's stage, an evicted
+  record) returns `ineligible("refusal import stage producer unproven")`, even
+  when a refused ref and ledger row anchor it. Cleanup planning is unchanged.
+  The tracking anchor needs the caller's branch (an optional trailing argument
+  of the gate and seal). Under the bare lock the branch must equal the ledger's
+  branch when a ledger exists, the tracking ref must be owned by this run at a
+  positive generation at or below the releasing one, and its producing context
+  must parse; any failure means no tracking anchor and no admission is
+  required. Because the reconciliation deletes through the authority hook, the
+  runner takes the authority transaction (A) around the gate. The waits differ
+  by site. `settleGuardedInventory` waits for the shutdown plus maintenance
+  budget plus the boundary deadline (the terms of `cleanupAuthorityWait`). The
+  transfer sites wait with `heldCapture`'s wait when held, with
+  `owedStopReleaseWait(flight)` after an owed-limit stop, and otherwise with
+  `owedStopReleaseWait(flight)` as a fallback; that fallback still refuses on a
+  recorded cancel or claim fence. If A cannot be acquired the gate counts as
+  ineligible and custody is kept. At the transfer sites an ineligible gate,
+  including one caused by an A-acquisition failure, closes the refusal fence for
+  that generation in this process (the settle site only preserves the clone).
+  This is an accepted, fail-closed residual. The sealed cleanup
+  (`refusalCleanupPlan`, unchanged) still excludes and deletes a refused-ref and
+  ledger anchored import stage whatever its nonce. A stage that was proven when
+  sealed (for example one a successor cleans up after a restart) is harmless; one
+  that was not proven when sealed can exist only if it postdates the FINAL. In
+  either case the commit stays covered by the sealed covering head,
+  and the gate and seal hold such a stage as unproven. This is an accepted
+  boundary. Failure
+  model: process crash only. The ref guarantees make no storage or power-loss
+  claim. A crash between registration and settlement leaves a `running` bare
+  record that fences later same-bare writers (the ADR-1783 residual above).
+- **Soft deadline.** The incoming head's refusal is recorded before the
+  checkpoint soft-deadline return.
+- **Recovery.** When the refusal gate is ineligible, a saved FINAL the api
+  already accepted is acknowledged without sending a release: an archive through an accepted-only
+  reconcile answer with an exact receipt; a settled or held release through an
+  observed released hold whose receipt equals the saved request, with source
+  proof and inactivity. New releases and mismatches stay gated. The residue
+  quarantine is rechecked synchronously after the refusal seal, immediately
+  before the release POST.
+- **Runner wait.** After a mid-turn owed-cap stop, the source-authority wait of
+  the terminal refusal-release fetch no longer inherits the flight signals the
+  stop aborted (`owedStopReleaseWait` in `agent/src/runner.ts`). It aborts on
+  shutdown, the maintenance budget, a recorded cancel or claim fence (re-checked
+  at each acquisition) and the terminal lifecycle signal if still live. A
+  cancel or fence recorded while an acquisition is already queued does not abort
+  that acquisition once the stop has aborted the terminal lifecycle signal (while
+  that signal is still live, a fence aborts it through the terminal signal); the
+  import writes only this worker's bare, and the runner's local claim-fence
+  checks and the server's generation fences still stop any later report or release.
+- **Failure model.** Every ordering above is for a process crash. No storage or
+  power-loss durability claim is made.
+- **Known residual: a dead owner's refusal-cleanup record.** A worker SIGKILLed
+  between the `refusal-cleanup-delete-ref` registration (or its `update-ref -d`)
+  and its settlement leaves a `running` bare record. Under
+  [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md)'s accepted contract
+  (no in-product path resolves a dead owner's running bare record), that record
+  blocks later same-bare writes (`assertBareClear`, `bare_unresolved`): seeds,
+  pins and coverage ref writes. This lasts until a manual operator action
+  outside the product (ADR-1783's guarded operator discard also refuses a
+  `running` pending record) and affects only that bare. The remaining refusal refs, the ledger and the seal are
+  kept, and no head loses coverage. See #4066 and the recovery-design follow-up
+  #4550. This change does not force-clear the record or weaken bare registration.
+
 ## Consequences
 
 - Eligible terminal held work can land on its own forge, where `git fetch

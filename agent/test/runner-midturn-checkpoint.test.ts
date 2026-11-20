@@ -4325,11 +4325,11 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
 /** Replace the GitCache's receipt writer so that ONLY the first `phase:"pending"` receipt write runs
  *  the original and then `hook` (the point where a hard abort would strand the receipt). */
 function afterPendingReceipt(g: GitCache, hook: () => Promise<void>): () => void {
-  const internals = g as unknown as { writeOwedFile(bare: string, name: string, value: unknown): Promise<void> };
+  const internals = g as unknown as { writeOwedFile(bare: string, name: string, value: unknown, directory?: string): Promise<void> };
   const original = internals.writeOwedFile.bind(g);
   let fired = false;
-  internals.writeOwedFile = async (bare, name, value) => {
-    await original(bare, name, value);
+  internals.writeOwedFile = async (bare, name, value, directory) => {
+    await original(bare, name, value, directory);
     if (!fired && name.startsWith("receipt-") && (value as { phase?: string }).phase === "pending") {
       fired = true;
       await hook();

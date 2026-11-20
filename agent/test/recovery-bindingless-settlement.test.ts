@@ -458,9 +458,9 @@ test("real Git discovery skips only settled contexts and retains metadata siblin
   const s = await setup("pinned"), { f } = s;
   const cache = new GitCache(path.join(f.root, "data"), nullLogger());
   // Use the existing writer to create authentic Git metadata; discovery remains public.
-  await cache["pinOwedUnderLock"](f.context, f.head);
+  await cache["pinOwedUnderLock"](f.context, f.head, "P1");
   const sibling = { ...f.context, generation: 8, branch: "agent/sibling" };
-  await cache["pinOwedUnderLock"](sibling, f.attempts[0]!);
+  await cache["pinOwedUnderLock"](sibling, f.attempts[0]!, "P1");
   const meta = path.join(f.context.barePath, "uzi-owed");
   await fs.writeFile(path.join(meta, ".tmp-31050000-0000-4000-8000-000000000098"), "pending");
   let walks = 0;
@@ -479,7 +479,7 @@ test("real Git discovery skips only settled contexts and retains metadata siblin
 test("real Git solely settled discovery avoids source enumeration but still rejects corrupt metadata", async () => {
   const s = await setup("pinned"), { f } = s;
   const cache = new GitCache(path.join(f.root, "data"), nullLogger());
-  await cache["pinOwedUnderLock"](f.context, f.head);
+  await cache["pinOwedUnderLock"](f.context, f.head, "P1");
   let walks = 0;
   cache.enumerateOwedUnderLock = async () => { walks++; throw new Error("settled source walked"); };
   s.producer.discoverOwedCandidates = cache.discoverOwedCandidates.bind(cache);
@@ -501,7 +501,7 @@ for (const corruption of ["target", "blob", "tree", "missing-metadata"] as const
   test(`fully skipped real Git run rejects ${corruption} pin without enumeration`, async () => {
     const s = await setup("pinned"), { f } = s;
     const cache = new GitCache(path.join(f.root, "data"), nullLogger());
-    await cache["pinOwedUnderLock"](f.context, f.head);
+    await cache["pinOwedUnderLock"](f.context, f.head, "P1");
     assert.equal(await s.e.coordinator.heldOperationState(f.record), "settled");
     let walks = 0;
     cache.enumerateOwedUnderLock = async () => { walks++; throw new Error("unexpected enumeration"); };

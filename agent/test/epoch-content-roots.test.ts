@@ -106,7 +106,7 @@ async function pin(sha: string, runId = RUN): Promise<void> {
   await git["pinOwedUnderLock"]({
     runId, barePath: bare, branch: BRANCH, generation: 1, kind: "issue",
     defaultIdentity: { ref: "refs/heads/main", sha: command(bare, "rev-parse", "HEAD") },
-  }, sha);
+  }, sha, "P1");
 }
 function snapshot(): string {
   return fs.readdirSync(path.join(bare, "uzi-owed")).sort().map(name =>

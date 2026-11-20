@@ -358,6 +358,9 @@ for (const sibling of ["none", "unreadable", "uncovered"] as const) {
       return { run_id: runId, generation, released: true, holds_released: 1 };
     };
     git.enumerateOwedCandidates = async () => [];
+    // The fixture's bare is synthetic, so the refusal gate and seal (issue #4481) have nothing to read.
+    git.refusalReleaseGate = async () => ({ kind: "none" });
+    git.sealRefusalRelease = async () => "none";
     git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [], clones: [], foreignOwners: [] });
     const record = await internals.recovery.freezeInventory({
       context: { runId, generation, kind: "issue", branch: "task", barePath: git.barePathFor(fx.originPath),

@@ -555,7 +555,8 @@ it("m2 real candidate acquisition mismatch is advisory without retention and gua
     await worker.execute(gitlabClaim(312309, { code_cross_check_required: true, claim_generation: 1 }));
     assert.equal(returned, true);
     assert.ok(beforeReceipt && beforeHead && movedHead && acquisitionState);
-    assert.deepEqual(acquisitionState, { receipt: beforeReceipt, head: beforeHead, stage: movedHead });
+    // issue #4481: the refused acquisition CAS-deletes its attributed private stage; the moved head stays in the clone.
+    assert.deepEqual(acquisitionState, { receipt: beforeReceipt, head: beforeHead, stage: "" });
     assert.deepEqual(snapshots, [{ reason_class: "snapshot_failed" }]);
     assert.equal(flags.length, 1, "fresh snapshot sees the changed head before a second acquisition");
     assert.ok(flags.every(f => !f.preserveRecoveryClone && !f.preserveSession));
