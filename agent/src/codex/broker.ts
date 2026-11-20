@@ -435,6 +435,8 @@ export interface ScreenPolicy {
 export interface RunGrants {
   readonly semanticPlanning?: import("../semantic-plan.js").SemanticPlanning;
   readonly ownerDecisionRequested?: boolean;
+  /** The run's text redactor, applied by scanSignals before its parse-time clamps. */
+  readonly redactText?: (text: string) => string;
   readonly role: string;
   readonly phase: "plan" | "implement";
   /** Canonical tool names (after alias mapping) this role may invoke. */
@@ -1408,7 +1410,7 @@ export class CodexCallbackBroker {
           },
         ],
       },
-    }, { ownerDecisionRequested: this.grants.ownerDecisionRequested, semanticPlanning: this.grants.semanticPlanning });
+    }, { ownerDecisionRequested: this.grants.ownerDecisionRequested, semanticPlanning: this.grants.semanticPlanning, redactText: this.grants.redactText });
     if (scanned.signalDiagnostic !== undefined) {
       return deny("invalid_signal", scanned.signalDiagnostic);
     }

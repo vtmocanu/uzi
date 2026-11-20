@@ -45,6 +45,8 @@ import type { ClaimProviderBinding, ClaimResponse, TaskReviewFinding, TaskReview
 // the API sweeper reaps it — and a stalled worker posts no fallback. On the cap we abort
 // the SDK query AND hard-reject the race, so runModel always settles within the budget
 // and review() falls back to a `failed` review.
+const REVIEW_MODEL_TIMEOUT_MS = 5 * 60 * 1000;
+
 /** An error-derived review summary, capped at 500 chars. The claim's provider key is redacted from
  *  the error text BEFORE the cap, so a key straddling the cut cannot leave a readable prefix. */
 function boundedClaimError(claim: ClaimResponse, prefix: string, err: unknown): string {
@@ -52,8 +54,6 @@ function boundedClaimError(claim: ClaimResponse, prefix: string, err: unknown): 
   const message = credential ? makeTextRedactor(providerKeyForms(credential))(errMessage(err)) : errMessage(err);
   return `${prefix}${message}`.slice(0, 500);
 }
-
-const REVIEW_MODEL_TIMEOUT_MS =5 * 60 * 1000;
 
 // The prompt char budget for the diff. The git layer already caps the diff at 512 KiB
 // (REVIEW_DIFF_MAX_BYTES); this is a second, char-domain clamp so a diff of mostly

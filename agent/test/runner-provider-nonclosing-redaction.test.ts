@@ -107,6 +107,32 @@ describe("provider-bound run: the pre-push refusal hold attempt redacts and boun
   });
 });
 
+describe("provider-bound run: the executor-facing recordCompletionAttempt closure redacts and bounds the reason", () => {
+  it("long reason ending in the key", async () => {
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+    await client.register("provider-closure");
+    const forge = fakeGitlab();
+    const claim = gitlabClaim(45057, {
+      claim_generation: 7, secrets: bound() as never,
+      milestones: [{ id: "m1", title: "Build" }],
+      config: { completion_contract_version: 1, contract_revision: 1 },
+    });
+    api.setPublicationState(claim.run_id, [], 1);
+    const exec: Executor = { run: async (ctx) => {
+      await ctx.recordCompletionAttempt!({
+        declared: [], head: null, worktreeFingerprint: null, nonClosing: { reason: lines(495) + KEY },
+      });
+      return { branch: ctx.branch };
+    } };
+    await runner(exec, forge.gitlab).execute(claim);
+    assert.ok(api.completionAttemptRequests.length >= 1, "the attempt was recorded");
+    const reason = String((api.completionAttemptRequests[0]!.non_closing as { reason: string }).reason);
+    assert.ok(reason.startsWith("yyyy"), reason);
+    assertNoKey("closure non_closing.reason", reason);
+    assert.ok(Array.from(reason).length >= 1 && Array.from(reason).length <= 500, `length ${Array.from(reason).length}`);
+  });
+});
+
 describe("provider-bound run: the gatePlan semantic proposal is redacted before the compile", () => {
   it("submitSemanticCandidate receives a redacted proposal", async () => {
     git.capturePlanningDiff = async () => Buffer.from("");

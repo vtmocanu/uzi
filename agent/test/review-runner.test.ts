@@ -394,10 +394,12 @@ describe("ReviewRunner", () => {
 
   // The 500-char cap on an error-derived summary must not cut through the key: the key is redacted
   // BEFORE the cap, so no readable prefix (8+ chars) of it survives in the posted review.
-  for (const site of ["prep failure", "model call failure"] as const) {
+  // The "model call failure" site is covered by the model pass sanitizing the error first (so this
+  // case does not isolate boundedClaimError there); the "prep failure" site isolates it.
+  for (const site of ["prep failure", "model call failure (model pass sanitizes first)"] as const) {
     it(`a provider key straddling the 500-char cap leaks no prefix (${site})`, async () => {
       const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
-      const prefix = site === "prep failure" ? "Review could not be produced: " : "The reviewer model call did not complete: ";
+      const prefix = site === "prep failure" ?"Review could not be produced: " : "The reviewer model call did not complete: ";
       const message = "x".repeat(490 - prefix.length) + key;
       assert.ok(`${prefix}${message}`.slice(0, 500).includes(key.slice(0, 10)) && !`${prefix}${message}`.slice(0, 500).includes(key), "fixture straddles the cut");
       const { client, calls } = fakeClient();

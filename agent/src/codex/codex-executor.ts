@@ -7227,6 +7227,7 @@ export class CodexExecutor implements Executor {
       childTurnBudgetMs: this.childTurnDeadlineMs(),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
+      redactText: ctx.redactText,
       parkRunSupported: ctx.parkRunSupported,
       // Phase-independent: the root vocabulary is registered once at thread/start and survives
       // the approval thread/resume; the broker gates the phase.

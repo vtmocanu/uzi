@@ -5350,6 +5350,7 @@ export class SdkExecutor implements Executor {
       const request: RunTurnRequest = {
         semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
+        redactText: ctx.redactText,
         prompt,
         // The neutral fields below are carried as-is; the placeholders
         // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which
