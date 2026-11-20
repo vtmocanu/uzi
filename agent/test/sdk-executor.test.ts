@@ -3458,7 +3458,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 24, "all Claude request cases loaded");
+    assert.equal(cases.length, 25, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3504,7 +3504,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 24);
+    assert.equal(visited.length, 25);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
@@ -10520,14 +10520,26 @@ describe("SdkExecutor Claude planning phase model/effort (PRD #3252 M3)", () => 
     assert.equal(turns.length, 0, "no turn ran");
   });
 
-  it("the unsupported configuration is refused regardless of approval", async () => {
+  it("the unsupported configuration is refused when a pre-approved start resumes an existing session", async () => {
+    const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
+    const config: ClaimConfig = { plan_phase: { model: "opus" } };
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [noModelLead, coder], config, planApproved: true, seeded: true, sessionId: "sess-1", approvedPlan: "# Approved",
+    });
+    await assert.rejects(() => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /clear the Claude planning model/);
+    assert.equal(turns.length, 0);
+  });
+
+  it("a fresh seeded start with no session runs no plan turn and proceeds on the implement request without a model key", async () => {
     const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
     const config: ClaimConfig = { plan_phase: { model: "opus" } };
     const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
     const { ctx } = makeCtx({
       agents: [noModelLead, coder], config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
     });
-    await assert.rejects(() => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /clear the Claude planning model/);
-    assert.equal(turns.length, 0);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(turns.length, 1);
+    assert.ok(!("model" in turns[0]!.options), "no model key: the planning model never reaches the implement turn");
   });
 });

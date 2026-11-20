@@ -65,7 +65,9 @@ export function resolveLeadRequest(input: LeadRequestInput): LeadRequest {
   const planPhase = input.phase === "plan" && input.harness === "claude" ? config?.plan_phase : undefined;
   if (planPhase?.model) {
     model = planPhase.model;
-    modelSource = planPhase.model_source ?? "builtin";
+    // A claim that omits the source falls back to the implement source (what the claim declared
+    // for its default model), never a silent "builtin" that would misattribute a user choice.
+    modelSource = planPhase.model_source ?? claimSource;
   }
   if (planPhase?.effort) {
     effort = planPhase.effort as HarnessEffort;

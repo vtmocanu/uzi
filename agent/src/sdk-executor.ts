@@ -1815,7 +1815,7 @@ export class SdkExecutor implements Executor {
     // ONLY when a model is resolved — `model: undefined` must stay omitted (never
     // an explicit key), so an unset model falls back to the SDK/account default.
     // Computed HERE (before the plan-turn copy at planTurnSubagents) so the PRD #305
-    // own-roster override below can run against the same value the lead uses.
+    // override of the plan-turn roster copy below runs against the plan lead model.
     //
     // PRD #3244 / #3252: one LeadRequest per lead phase. Without a claim `plan_phase` the two are
     // equal. The model/effort sent below and the lead-config row reported at each phase entry come
@@ -1837,12 +1837,11 @@ export class SdkExecutor implements Executor {
     const leadModel = implementRequest.model;
     const planLeadModel = planRequest.model;
     // PRD #3252: a planning model with no implementation model to fall back to is an unsupported
-    // phase configuration, refused visibly before any turn. On a provider run the provider map's
-    // default (the sonnet alias) counts as the implementation model only if the map yields a name;
-    // resolveProviderModel below throws otherwise.
-    if (ctx.config?.plan_phase?.model && leadModel === undefined && !ctx.provider) {
-      throw new Error(REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL);
-    }
+    // phase configuration. It is refused (before any turn) only where the planning model could
+    // reach the implement turn: when a plan turn will run, or when the implement turn resumes an
+    // existing session. That check sits below, once `preApproved` is known. On a provider run the
+    // provider map's default (the sonnet alias) counts as the implementation model only if the map
+    // yields a name; resolveProviderModel below throws otherwise.
     // PRD #4320 module 7: a provider run resolves the lead through the bound map BEFORE any content is
     // sent. An unmapped alias or vendor model ID is a typed refusal (provider_model_unmapped) that
     // fails the run; an unset model is the sonnet alias. Never rewritten.
@@ -2088,9 +2087,10 @@ export class SdkExecutor implements Executor {
     //   `baseConfig` drives both planning turns (first plan in Phase 1, re-plan in the
     //   revise loop) while `implementConfig` spreads `baseConfig` and OVERRIDES this
     //   from `selectSubagents(...)`, which reads `assembled.subagents` directly and is
-    //   therefore untouched. `agents` is one of THREE keys `implementConfig` overrides,
-    //   all plan-turn-scoped by that same spread mechanism: `agents`, `systemPrompt`
-    //   and `preToolUse`. Worth knowing which, because `preToolUse` is where the
+    //   therefore untouched. `agents` is one of the plan-turn-scoped keys `implementConfig`
+    //   overrides after the spread: `agents`, `systemPrompt` and `preToolUse` (plus the
+    //   model/effort pair, which is set or deleted per phase, see below). Worth knowing
+    //   which, because `preToolUse` is where the
     //   recorded upgrade path goes — a plan-turn-only `PreToolUse` deny on the
     //   write-tool family, the one mechanism that would also reach the LEAD's own
     //   writes. DO NOT move that denial down to the adapter's top-level
@@ -2117,14 +2117,15 @@ export class SdkExecutor implements Executor {
     //   synchronous by the Agent guard hook. Native AskUserQuestion is denied because
     //   clarification goes through uzi's MCP ask_user (PRD #88).
     //
-    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
-    // override can use it; here it only drives the top-level lead model. PRD #617 effort
+    // `planLeadModel` / `leadModel` are computed above so the PRD #305 plan-roster override
+    // can use them; `spawnModel` drives the plan-block lead model. PRD #617 effort
     // and issue #916 attribution are set ONLY when present in the config (never an explicit
     // undefined); when a key is absent the adapter omits it and the SDK applies its own
     // fallback. The runtime adds no default of its own — the API is the policy source and
     // now populates effort with the owner's choice or the uzi default `medium` for an
-    // inheriting owner (issue #1157). Both reach the implement turn too, via the
-    // `baseConfig` spread.
+    // inheriting owner (issue #1157). Attribution reaches the implement turn via the
+    // `baseConfig` spread; model and effort do NOT: phaseRunLoop replaces them with the
+    // implement pair (or deletes the key).
     // PRD #3252: baseConfig carries the PLAN pair (every plan-block turn reads it); implementConfig
     // replaces model/effort with the implement pair in phaseRunLoop.
     const effort = planRequest.effort;
@@ -2401,6 +2402,18 @@ export class SdkExecutor implements Executor {
         !preApproved &&
         ctx.resumePhase === "awaiting_approval" &&
         !!ctx.approvedPlan?.trim();
+
+      // PRD #3252: the unsupported-phase-configuration refusal (see leadModel above). A fresh
+      // seeded/pre-approved start with no session runs no plan turn and has no session to
+      // inherit the planning model from, so it proceeds on the implement request.
+      if (
+        ctx.config?.plan_phase?.model &&
+        state.implementRequest.model === undefined &&
+        !ctx.provider &&
+        (!(preApproved || resumeAtGate) || !!ctx.sessionId)
+      ) {
+        throw new Error(REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL);
+      }
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
       // planning label) reads the same values on both paths.

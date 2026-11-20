@@ -115,6 +115,21 @@ describe("SdkExecutor in provider mode (issue run lead and subagents)", () => {
     assert.equal(turns[1]!.options.model, "sonnet");
   });
 
+  it("PRD #3252: a planning pair resolves through the map per phase, the plan turn on the planning model and the implement turn on the implement model", async () => {
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), sessionResult()], [signalDone(), sessionResult()]]);
+    const { ctx } = makeCtx({
+      config: {
+        default_model: "corp-sonnet", default_model_source: "user_default",
+        plan_phase: { model: "opus", model_source: "user_planning_default" },
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assertProviderEnv(turns[0]!.options.env, "plan turn");
+    assertProviderEnv(turns[1]!.options.env, "implement turn");
+    assert.equal(turns[0]!.options.model, "opus", "plan turn: the planning alias, mapped by the provider");
+    assert.equal(turns[1]!.options.model, "corp-sonnet", "implement turn: the implement model, not the planning one");
+  });
+
   it("a vendor run is unchanged: OAuth token, no base URL, no explicit model", async () => {
     const { queryFn, turns } = fakeTurns([[submitPlan("plan"), sessionResult()], [signalDone(), sessionResult()]]);
     const { ctx } = makeCtx({ oauthToken: OAUTH });

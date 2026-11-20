@@ -1226,6 +1226,36 @@
         "template_claude": "opus",
         "template_codex": null
       }
+    },
+    {
+      "id": "claude-planning-model-no-template-model-unsupported-implement-phase",
+      "note": "Unsupported phase configuration (PRD #3252 section 5): a planning model with no implementation model (no default_model, no templateModel). The resolver does not fail; it pins the implement request (no model key, source builtin). The Claude executor refuses the run where a plan turn runs or a session is resumed, since the planning model would otherwise leak into the implement turn.",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin",
+        "plan_phase": {
+          "model": "fable",
+          "effort": "medium",
+          "model_source": "user_planning_default",
+          "effort_source": "builtin"
+        }
+      },
+      "expect": {
+        "modelSource": "builtin",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "planning_model": "fable",
+        "template_claude": null,
+        "template_codex": null
+      }
     }
   ],
   "display_cases": [
