@@ -1293,17 +1293,64 @@ are kept by cleanup.
 - a run for which recording a refusal failed (seal-directory read, refused-head
   ref write or ledger write): a durable, never-cleaned
   `incomplete-<run>.json` marker keeps the gate ineligible across restarts, and
-  the census counts it as `refusal_records`. Only if the marker write also
-  fails, on a path without a fetch stage, followed by a worker restart and pins
-  that later reconcile below the cap, does nothing durable record that head, so
-  the ordinary release proceeds without proving it covered (a known residual,
-  not yet accepted by the owner);
+  the census counts it as `refusal_records`;
+- a run that filled the owed cap even if every refusal write failed: a
+  write-once `owedpath-<run>-<generation>.json` marker in `info/uzi-refusals` is
+  written before the pin that fills a positive-generation context's cap (a
+  marker failure refuses that pin as `preservation_failed`) and on the refusal
+  branch if absent. While a marker at or below the releasing generation exists,
+  the gate never answers none: it requires admissions from the current worker
+  process, so after a worker-process change, or with an absent admission, the
+  hold stays with the owner even if the pins later drop below the cap. Runs that
+  never filled the cap are unchanged. Generation cleanup removes the markers
+  last, and the census counts them as `refusal_records`. A generation an older
+  worker filled to the cap gets a marker only if a refusal happens later on the
+  new worker;
 - a refusal under a legacy or no-generation context, whose hold and cleanup stay
   closed permanently;
-- a bare with a stranded temp file in `info/uzi-refusals`, which keeps the gate
-  ineligible.
+- a bare with a stranded temp file (`.tmp-<run-id>-<uuid>`) in
+  `info/uzi-refusals`: the run's own temp keeps it ineligible and its cleanup
+  retained, another run's temp is ignored, and an unattributed temp fails closed
+  for every run;
+- a bare whose refusal stage inventory cannot be verified: listing stderr, a
+  non-files ref backend (a reftable directory or `extensions.refstorage` other
+  than exactly `files`), or a loose ref under `refs/uzi-incoming/<run-id>/` that
+  is a symlink, non-regular, malformed (including a symbolic `ref:`) or
+  disagrees with the listing keeps the gate ineligible and cleanup retained;
+- a run with an unanchored import stage
+  (`refs/uzi-incoming/<run-id>/<generation>/import-<nonce>-<uuid>`, one without
+  both a refused ref at the same generation and a ledger row for that head), or
+  a live import in this process. An import refused at an already-sealed
+  generation leaves such a stage, which then blocks later gates until the owner
+  acts (accepted). An import stage that is anchored is excluded from the
+  evidence and the seal digest, and cleanup deletes it first;
+- a bare left with an unresolved bare-mutation record by a worker killed while
+  deleting a refusal ref (op `refusal-cleanup-delete-ref`, read-back settled).
+  That record fences later writers on the bare, and no in-product path resolves a
+  dead owner's running record (the same contract as `recovery-cleanup-delete-ref`),
+  so it needs operator intervention (accepted).
 
-`uzi run discard` does not remove refusal refs, records, incomplete markers or
+Ledger rows are keyed by generation and head, so cleaning an older generation
+removes only its exact pairs and a later generation's refusal of the same head
+keeps its own row. A failed fetch acquisition deletes its own attributed stage
+(compare-and-delete at the fetched SHA), keeping it if it moved, if it is the
+sole anchor of a ledgered head, or on a boundary stop. The incoming head's
+refusal is recorded before the checkpoint soft-deadline return. After a mid-turn
+owed-cap stop, the terminal fetch that releases the refused head waits for
+source authority on shutdown, the maintenance budget, a recorded cancel or claim
+fence (re-checked at each acquisition) and the terminal lifecycle if still live,
+not on the flight signals the stop aborted; a cancel or fence that arrives only
+after the transfer began is not observed by that wait, and later steps still
+catch it. On recovery, a saved final the API already accepted is acknowledged
+before the refusal gate and sends nothing (an archive through an accepted-only
+reconcile answer with an exact receipt; a settled or held release through an
+observed released hold whose receipt equals the saved request, with source proof
+and inactivity); new releases and mismatches stay gated, and the residue
+quarantine is rechecked right after the refusal seal, immediately before the
+release request. All of these orderings are for a process crash; no storage or
+power-loss durability is claimed.
+
+`uzi run discard` does not remove refusal refs, records, incomplete or owed-path markers or
 admissions; they stay reachable in the worker's bare (no worker-side discard
 removes them). In a mixed fleet an older worker may treat a bare holding
 these records as disposable and leak the nested refs and records. The gate
@@ -1311,9 +1358,10 @@ is consulted on every inventory-guarded release, but it is a no-op when the
 run has no refusal evidence and is below the cap, so releases with no refusal evidence below the cap
 are not held up by these records. A run with earlier recorded
 refusals, or exactly at the cap, needs complete admissions even if its
-terminal fetch succeeded. An old worker's refused head that old code deleted,
-followed by pins reconciling below the cap, leaves no trace, and the ordinary
-release proceeds as before. Design:
+terminal fetch succeeded. An old worker's refused head that old code deleted
+leaves no trace, and the ordinary release proceeds as before. Unguarded runs: a
+cap-filling pin is refused on a bare lacking `info/` (default bares have it) and
+hibernation is blocked from cap-fill until cleanup. Design:
 [ADR-2545](../adr/2545-failed-run-held-publication.md), amendment 2026-11-19.
 
 ### When a run is stopped by a stale or fenced claim
