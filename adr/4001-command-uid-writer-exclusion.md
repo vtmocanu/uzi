@@ -1,6 +1,6 @@
 # ADR-4001: command-uid writer exclusion for the retained predecessor FINAL — an opt-in, kube-rendered Docker-free, restricted-posture compound proof for Claude predecessors
 
-**Status**: Proposed contract, incomplete. Nine owner decisions (D1 to D9) are approved and recorded here. Three items (P-1, P-2, P-3) are recommendations or open problems pending owner decision, and are NOT approved. The retained predecessor FINAL pass stays disabled in production (`command_uid_unproven`) until P-1, P-2 and P-3 are resolved and a separate implementation issue lands and is verified.
+**Status**: Proposed contract, incomplete. Nine owner decisions (D1 to D9) are approved and recorded here. Five items (P-1 to P-5) are recommendations or open problems pending owner decision or a missing mechanism, and are NOT approved. The retained predecessor FINAL pass stays disabled in production (`command_uid_unproven`) until P-1 to P-5 are resolved and a separate implementation issue lands and is verified.
 **Date**: 2026-11-20
 **Issue**: [vtmocanu/uzi#4001](https://github.com/vtmocanu/uzi/issues/4001)
 **Refs**: #2969, #3992, #3851, #3831, #3431, #1862, #4007, #4162, #4494, #1934
@@ -60,10 +60,10 @@ pass may be enabled. One uzi run yields one PR, so the contract lands first.
 |---|---|---|
 | (a) This run's lower generations | No Claude process runs as `runner-cmd` (`agent/src/run-procs.ts` header). Worker-launched uid-10003 helpers of those generations are in scope, including teardown passes that outlive their generation. | P2 helper tracking and the P6 veto. Codex predecessors are deferred (D3). |
 | (b) Other runs' uid-10003 processes | Confined commands, the Codex app-server, checker fileop | Must be excluded (owner decision 2026-11-20). |
-| (c) Worker-launched uid-10003 helpers | Every enumerated launch site | Confinement, or the runtime T-overlap veto, plus pinned resolution (H-A). |
+| (c) Worker-launched uid-10003 helpers | Every enumerated launch site | Confinement, or the runtime T-overlap veto, plus pinned resolution (H-A, defined in the mechanism section). |
 | (w) Worker-uid processes | Hold group `runner` and ambient setuid (`agent/templates/entrypoint.sh` `--ambient-caps -all,+setuid,+setgid`) | Part of the named TCB. Their writes to T are audited: only the pass's own effects and the ordinary paths. |
 | (d) Docker daemon and container writers | | Excluded by ineligibility (D4, D5). The ADR-1783/1786 residual is unchanged elsewhere. |
-| (e) Runner-uid escaped writers | A runner-uid process with cwd outside every target path and no attempt marker or clone key | The 2026-11-06 owner-accepted residual, unchanged. It never exempts a command-uid writer. The alias route is pending (P-1). |
+| (e) Runner-uid writers outside T | A runner-uid process with cwd outside every target path: the 2026-11-06 escaped writer with no attempt marker or clone key, and also other runs' live Claude agents, which carry their own markers and are ignored by the quiescence scan when their cwd is outside T | The 2026-11-06 owner-accepted residual, unchanged. It never exempts a command-uid writer. Routes by which such a process enables a command-uid write (hardlink alias, rename in and out) are pending under P-1. |
 
 No residual's disclosure, and no behaviour of the ordinary terminal FINAL,
 substitutes for the command-uid proof. The ordinary terminal FINAL keeps
@@ -90,10 +90,12 @@ posture is needed.
 
 ## Owner decisions (2026-11-20, owner decision via lead and buddy)
 
+D1 to D9 were each answered by the owner through this run's ask_user gates on 2026-11-20, with the answer recorded as "owner decision via lead and buddy". The later checker-raised questions (P-1 to P-5) reached no human and are not decided.
+
 **D1. Opt-in posture approved.**
 - The compound proof below is the enablement contract.
 - It is valid only on workers running Codex command confinement in `required`
-  mode with the tightened policy.
+  mode with the tightened policy ("policy v2", defined in the mechanism section).
 - Chart and compose defaults stay unchanged. This ADR does not recommend
   changing them.
 - Implementation depends on #1934: a fresh packaged proof before confinement
@@ -102,7 +104,7 @@ posture is needed.
 **D2. Descriptor transfer is closed by seccomp, not accepted as a residual.**
 - The mechanism is an unprivileged cmdsandbox seccomp filter that denies
   `socket(AF_UNIX)` and allows `socketpair`, for the restricted posture only.
-- Landlock ABI 6 alone is insufficient. It scopes abstract sockets, but
+- Landlock ABI 6 alone is insufficient (a design assumption about Landlock ABIs, recorded with the owner's decision, that the implementation must confirm on the probed kernel). It scopes abstract sockets, but
   withholding socket-file creation does not stop a `connect` to an existing
   pathname socket. Pathname-connect control needs Landlock ABI 9.
 - Required, stated here:
@@ -172,8 +174,16 @@ predecessors only.**
   predecessor custody release.
 - Consequences:
   - A restarted container, any later pod, and a pod replaced after force
-    deletion are all ineligible. Force-deletion fencing is therefore handled by
-    ineligibility, not by any teardown claim.
+    deletion are all ineligible to run their own pass. Ineligibility fences
+    only the replacement's own pass, not by any teardown claim. A's in-flight
+    effects while a replacement runs are the D9 and P-2 problem, and stay
+    gated there.
+  - Posture stickiness: a PVC with a genesis record is permanently tied to the
+    posture. The controller refuses any non-posture render on it, or such a
+    render invalidates the genesis row so every later container is refused.
+    The history check reads every incarnation's boundary record, not only
+    attestations; under the posture both are mandatory, so an incarnation
+    without them makes the PVC ineligible.
   - Missing, unreadable or contradictory history refuses pre-entry.
 
 **D8. ReadWriteOncePod.**
@@ -185,7 +195,11 @@ predecessors only.**
   - has access mode ReadWriteOncePod;
   - uses a supported CSI posture, meaning a driver advertising
     SINGLE_NODE_SINGLE_WRITER, from a list the implementation defines.
-- This is controller trust, not new worker authority.
+- This is controller trust, not new worker authority. Reading the bound
+  PersistentVolume is, however, new controller authority: a PV is
+  cluster-scoped, and at base the controller holds only namespaced Roles plus
+  the one owner-authorized `storageclasses` get ClusterRole
+  (`deploy/chart/templates/worker-rbac.yaml`). That is pending item P-4.
 - Existing claims are ReadWriteOnce (`renderPVC`), so a fresh claim is
   required.
 - What RWOP covers:
@@ -223,9 +237,15 @@ Recorded consequences:
   another node.
 - **Node registration happens late.** It exists today only in `worker.run()`,
   after the first uid-10003 launches.
-- **Restart in the same pod.** A container restart inside the same pod means
-  A's worker process exited, because tini is PID 1. So A's pass is not in
-  flight, and D7 makes the new container ineligible.
+- **Restart in the same pod: gated.** A container restart inside the same pod
+  does not establish (2). A's release RPC can still be waiting on the server's
+  row lock, or committing, after A's process died, and that is not a teardown
+  question at all. Init containers do not re-run on a container restart, so
+  the P-2 fence never fires, and the restarted container's entrypoint and
+  startup uid-10003 helpers run before any registration. D7 makes the restarted
+  container ineligible for its own pass, but A's outstanding release is not
+  fenced. This path therefore stays gated under the sentence above (pending
+  item P-5). The candidate mechanism is in P-5.
 
 ## Pending items (NOT approved; the pass stays gated until each is resolved)
 
@@ -233,12 +253,18 @@ Recorded consequences:
 
 **Recommendation:** attribute it to residual (e).
 
-**The route.**
-1. An escaped runner-uid writer (the 2026-11-06 residual) hardlinks a
-   runner-owned T file into a live Codex command's writable clone.
+**The routes.**
+1. A runner-uid process outside T hardlinks a runner-owned T file into a live
+   Codex command's writable clone. The process may be the 2026-11-06 escaped
+   writer, or another run's live Claude agent: those carry their own markers,
+   are ignored by the quiescence scan while their cwd is outside T, and can be
+   steered by repository content.
 2. The command opens the link for writing.
-3. The writer removes the alias, so later `nlink == 1` checks pass while the
-   command keeps a writable descriptor.
+3. The runner-uid process removes the alias, so later `nlink == 1` checks pass
+   while the command keeps a writable descriptor.
+4. A variant renames a T entry into a Codex root and back: T's directories are
+   runner-owned and Codex roots are group-`runner` writable, `nlink` stays 1,
+   and P6 sees no overlap after the move back.
 
 **Why nothing available closes it.**
 - Runner-uid processes are unconfined and own T's files.
@@ -248,9 +274,13 @@ Recorded consequences:
 The issue says the runner-uid residual "never exempts a command-uid writer".
 
 **Recommendation.** Record a command-uid write that is made possible only by
-an escaped runner-uid writer's act on T as part of that residual. That writer
-can already write T directly with the same effect, and the residual's scope
-does not change.
+a runner-uid process's act on T (either route above, by the escaped writer or
+by another run's marked agent) as part of the runner-uid residual. Such a
+process can already write T directly with the same effect. Adopting this
+recommendation explicitly overrides the issue's rule that the runner-uid
+residual "never exempts a command-uid writer" for these routes, and widens the
+residual's described scope to other runs' marked runner-uid agents. It is not
+a restatement of the existing residual.
 
 **Alternative.** Keep the gate until runner-uid processes can be confined.
 
@@ -328,7 +358,8 @@ nothing about what gets bound to it.
   3. Verify the PV was dynamically provisioned for this claim:
      `pv.kubernetes.io/provisioned-by`, a `claimRef` UID equal to the PVC UID,
      and a PV created after the PVC.
-  4. Verify the `volumeHandle` is new and the PV is not a Retain reuse.
+  4. Verify the `volumeHandle` is absent from every genesis record. Whether
+     the PV is a Retain reuse cannot be verified (see below).
   5. Commit a genesis row under the authority-row protocol, with a unique
      `volumeHandle`.
   6. Only then render the posture.
@@ -337,16 +368,54 @@ nothing about what gets bound to it.
   `volumeHandle` is refused permanently.
 
 **Residual trust.** This trusts CSI provisioning freshness: that a newly
-provisioned `volumeHandle` is backed by fresh storage. Neither the worker nor
-the controller can verify that, so it is an owner decision, and the posture
-stays gated until it is made.
+provisioned `volumeHandle` is backed by fresh storage. It also trusts every
+principal able to create a PV, because the provenance annotation, `claimRef`
+UID and creation time can all be set by whoever creates a static PV, and a
+pre-posture volume reused under a new PV object passes the uniqueness check.
+Neither the worker nor the controller can verify that, so it is an owner
+decision, and the posture stays gated until it is made. An empty-volume check
+at first boot is not specified: the entrypoint and runner-init create entries
+on every boot, so this ADR defines no such step.
+
+### P-4. Controller read authority over PersistentVolumes
+
+D8 and P-3 make the controller read the bound PersistentVolume: access mode,
+CSI driver, `volumeHandle`, the provisioned-by annotation, the `claimRef` UID
+and the creation time. A PV is cluster-scoped. At base the controller holds
+only namespaced Roles plus one owner-authorized ClusterRole, `storageclasses`
+get (`deploy/chart/templates/worker-rbac.yaml`). A `persistentvolumes` get
+ClusterRole is therefore new read authority under requirement 4.
+
+**Recommendation:** approve a get-only ClusterRole on `persistentvolumes`,
+scoped by name where the API allows, for opted-in workers only. It is
+justified against the smaller options: the worker has no kube access, and no
+namespaced object carries the PV fields. **Alternative:** keep the gate. This
+is an owner decision under requirement 10.
+
+### P-5. Same-pod container restart
+
+A container restart keeps the pod UID and runs no init container, so the P-2
+fence never fires, and the restarted container's startup writes and uid-10003
+helpers run before node registration. A's release RPC can still be waiting or
+committing at the server after A's process died. D9.2 is therefore not
+established for this path, and it stays gated under D9's fallback.
+
+**Candidate mechanism (not yet sufficient).**
+- Every PROCESS_INCARNATION makes a durable, superseding server registration,
+  carried by its attestation, before its first uid-10003 launch.
+- A keeps T active in its registry until a replay settles an unknown release
+  outcome, so a client-side RPC timeout never drops T's protection.
+- This does not cover the root entrypoint's writes, which run before any node
+  code. Those are TCB writes (root, fixed code), but they are B activity under
+  D9.2. Closing them needs either a proof that they never touch T's content,
+  mode or namespace, or an owner decision classifying them.
 
 ## Mechanism: the compound proof (requirement 1)
 
 **Invariant.** On an eligible worker, from pre-entry through the release ACK,
 no uid-10003 process can change the content, the tracked mode or the
 namespace (create, rename, unlink) of any entry of a Claude T. This is subject
-to P-1, P-2 and P-3. It rests on four facts:
+to P-1 to P-5. It rests on four facts:
 - **(i)** Confined uid-10003 domains have rule inodes that do not overlap T.
   This covers commands, fileop, checker fileop, and the app-server once it is
   confined.
@@ -357,7 +426,16 @@ to P-1, P-2 and P-3. It rests on four facts:
   symlink's resolved path.
 - **(iv)** Unconfined uid-10003 helpers run only on targets whose dev:ino does
   not overlap T, and they resolve paths fd-relative, beneath-root and without
-  symlinks (H-A).
+  symlinks. This rule is called H-A: a path-walking uid-10003 helper (today
+  `purgeChildrenAsAgents` in `agent/src/rmtree.ts` and the provisioning wraps
+  in `agent/src/codex/launcher.ts`) makes the posture ineligible until it
+  moves to the pinned walk that `rmtree.ts` already uses.
+
+**Policy v2** names the tightened confinement policy (D1) as one unit:
+`required` mode; Landlock ABI ≥3 with the existing deny probe; the D2 seccomp
+filter with its bypass audit and in-sandbox check; the narrowed `/dev` grant;
+and the inherited-descriptor audit. Base cmdsandbox has no policy versioning,
+so the version is new and is recorded in every attestation.
 
 xattrs and timestamps on runner-owned entries are outside the git-visible
 inventory the archive preserves. The implementation pins that the capture
@@ -445,6 +523,27 @@ which is availability, never an integrity loss.
   - the `--hold-cache` mode (closed today: fd-pinned, with a 10003-owned 0700
     root);
   - the kill, `cat` and `accessSync` probes.
+
+  Known uid-10003 launch sites at base 401cb4561. This list is a STARTING
+  POINT, not exhaustive: the search skipped oversized files, and value uses of
+  `commandRootCommand` escape a call-syntax grep. The implementation's static
+  inventory test is the exhaustive pin.
+
+  | Site (under `agent/src/`) | What runs as uid 10003 | Obligation |
+  |---|---|---|
+  | `codex/launcher.ts` app-server root | Codex app-server, unconfined except for cross-check | Confine (P3) |
+  | `codex/launcher.ts` effect roots | commands and fileop under cmdsandbox | Policy v2 |
+  | `codex/launcher.ts` reaper roots; `run-quiescence.ts` reaper spawn | reaper modes | Show disjoint and pinned |
+  | `codex/launcher.ts` provisioning wraps | stat, `mkdir`, `rm -rf` of command roots | H-A, or ineligible |
+  | `codex/launcher.ts` `defaultKillAsCommandUid` | `kill -KILL` | No write |
+  | `codex/launcher.ts` `spawnStandaloneMode` | `--hold-cache`, `--remove-cache`, `--measure-cache`, `--reap-orphans` | Hold-cache closed; others show disjoint |
+  | `provision.ts` `probePath` | `node -e` `accessSync` probe | Read-only |
+  | `runner-group-trust.ts` | `/bin/cat` status probe | No write |
+  | `rmtree.ts` `purgeChildrenAsAgents`, `agentWrappers`, removal wrappers | recursive delete, measure, teardown passes | H-A plus the P6 veto |
+  | `runner-uid.ts` `killCommandRootPid` | direct setpriv kill | No write |
+  | `git.ts` retained-readiness helper | `node -e`, unconfined | Codex-only today; show disjoint |
+  | `codex/broker.ts`, `codex/fileop-client.ts`, `codex/cross-check.ts`, `harness.ts` | module-level uses | Classify per spawner |
+  | Transitive: `home-reclaim.ts`, `job-workspace.ts`, `run-caches.ts`, `disk-reclaim.ts`, `cross-check-runner.ts`, `code-cross-check-replay.ts` (Claude-run checker fileop), `codex/codex-executor.ts` | callers of the above | Inherit the callee's obligation |
 
 **P4. Ownership and alias walk.**
 - A new fixed runner-uid helper does a complete lstat walk of T, including
@@ -578,15 +677,27 @@ lock.
   transition's `t_auth`.
 
 **Replay precedence.**
-- The release-idempotency lookup runs first, under the lock.
+- The release-idempotency lookup runs first, under the lock. The key binds a
+  digest of the hold, generation, inventory, incarnation and lease epoch; a
+  stored entry with the same key but a different digest is an integrity
+  refusal.
+- For a PVC bound to an authority row, a predecessor FINAL or release that
+  arrives without a valid fencing token is refused. Today the server accepts
+  any older-generation FINAL (ADR-1296 #2969 amendment), so a missing token
+  must refuse rather than fall through.
 - A committed release returns its original ACK.
 
 **Conflict handling.**
-- A lock wait bounded by the existing statement or lock timeout is a refusal.
+- Each authority-row transaction sets its own `SET LOCAL lock_timeout` and
+  `statement_timeout`, as existing recovery paths do; the pool sets none
+  globally. A wait that hits either is a refusal.
   A STOPs, and B's fence-init retries.
 - A serialization or deadlock error is a refusal. A predecessor effect is
   never silently retried.
-- There is a single row per PVC, so no lock-order inversion is possible.
+- Lock order: fenced predecessor paths already lock the `workers` and `runs`
+  rows (`api/internal/recovery`). Every path that takes the authority row
+  follows one global order: authority row, then worker, then run, then hold.
+  A deadlock is still a refusal, so a violation costs availability only.
 
 **Verification** uses synchronized LiveDB tests, with a hook holding the row
 lock.
@@ -606,6 +717,15 @@ lock.
 
 **Failure model.**
 - **API process crash.** Committed transactions survive.
+- **Database failover.** The chart supports more than one Postgres instance
+  (`deploy/values/ci-render.yaml` sets three), and replication is
+  asynchronous unless synchronous replicas are configured. With asynchronous
+  replication a failover can lose a committed supersession, release or
+  genesis row after its ACK was sent. The posture therefore requires a single
+  instance or synchronous replication with at least one synchronous standby.
+  It also re-checks the effective settings with `SHOW` inside each fence
+  transaction, not only at startup, because `ALTER SYSTEM`, per-role or
+  per-database settings can change them later.
 - **Storage or power loss.**
   - This relies on Postgres `fsync=on` and `synchronous_commit=on`.
   - These are defaults: no override was found in the chart values, the compose
@@ -641,7 +761,8 @@ check.
 - A leftover tmp, a MAC failure or an unreadable entry counts as an earlier,
   possibly launching container, so the PVC becomes ineligible.
 
-**Ordering:** the record is durable (read back) before any uid-10003 launch.
+**Ordering:** the record is durable before any uid-10003 launch. Durability
+comes from the fsync steps; the read-back only confirms the published bytes.
 
 **Verification:** fault injection at each step, through the existing ops
 seam.
@@ -691,15 +812,19 @@ Absence is never inferred.
 
 ## Authority (requirement 4)
 
-- **No new kill, read or identity-switch authority.** Landlock and seccomp are
-  unprivileged self-restrictions.
+- **No new worker kill, read or identity-switch authority.** Landlock and
+  seccomp are unprivileged self-restrictions.
+- **New controller read authority (pending P-4).** Reading the bound
+  PersistentVolume (D8, P-3) needs a cluster-scoped `persistentvolumes` get
+  that the controller does not hold today. It is named here, justified in
+  P-4, and not approved.
 - **Rendered fields.** New rendered fields travel the existing pod-spec and
   downward-API channel. The worker trusts the controller, and that trust is
   named.
 - **Server mechanisms.** The server fence, lease and genesis only add
   refusals and waits.
 - **Owner-approved:** D1, D2, D5, D7, D8 and D9.
-- **Pending:** P-1, P-2 and P-3.
+- **Pending:** P-1 to P-5.
 
 ## Authority interface (requirement 9)
 
@@ -805,8 +930,9 @@ under today's contracts. #4494 Direction 1 motivates it but supplies nothing.
   `clock_timestamp()`.
 - **Chosen:** the opt-in restricted posture with seccomp descriptor closure.
 
-D1 to D9 are owner-approved. P-1, P-2 and P-3 are recommendations or open
-problems, pending owner decision. The production gate stays.
+D1 to D9 are owner-approved. P-1 to P-5 are recommendations or open
+problems, pending owner decision or a missing mechanism. The production gate
+stays.
 
 ## Independence (requirement 11)
 
@@ -863,6 +989,13 @@ may already hold on base.
 - A paused after its final check, past expiry:
   - server effects are refused;
   - the local effect is documented per P-2's outcome.
+- The synchronized rename-in, rename-out race (P-1), documented per its
+  outcome.
+- A same-pod container restart while A's release is outstanding (P-5).
+- A posture-off render on a genesis PVC refused, or invalidating genesis.
+- A non-tokened predecessor FINAL refused; a replay key with a different
+  digest refused.
+- A fence transaction under changed `synchronous_commit` refused.
 - The synchronized open-then-unlink alias race (P-1), documented per its
   outcome.
 - The synchronized row-lock races above, including a lock held across
@@ -899,12 +1032,20 @@ literal leaves, `run.sh` invocations, and `lint:shell`.
 
 ## Dependencies, approvals and implementation obligations (ready to copy into the implementation issue)
 
-**Prerequisite.** The owner resolves P-1, P-2 and P-3 favourably, recorded as
-an amendment to this ADR.
+**Prerequisite.** Each pending item is closed and recorded as an amendment to
+this ADR:
+- P-1, P-3 and P-4 by owner decision;
+- P-2 by a proof that every local predecessor effect is non-authoritative and
+  harmless with B running, plus an owner decision accepting that deviation, or
+  by a local-write fence (none exists today);
+- P-5 by the per-incarnation superseding registration, plus a proof or an
+  owner decision for the root entrypoint's writes.
+Approval alone does not close P-2 or P-5.
 
 **Dependencies:**
 - **External and records.**
   - #1934;
+  - P-4's `persistentvolumes` get ClusterRole, if the owner approves it;
   - the #3831 boundary records.
 - **Worker side.**
   - the enrollment registry;
@@ -915,7 +1056,9 @@ an amendment to this ADR.
   - pinned fd-relative resolution for every unconfined uid-10003 helper;
   - Codex app-server confinement;
   - spawn-wrapper gating keyed on the resolved uid;
-  - the fence init container.
+  - the fence init container;
+  - a durable, superseding server registration by every PROCESS_INCARNATION
+    before its first uid-10003 launch (P-5).
 - **Controller side.**
   - the controller genesis record at claim creation, with provenance checks
     and `volumeHandle` uniqueness;
@@ -949,7 +1092,8 @@ an amendment to this ADR.
 - real-cluster RWOP and CSI behaviour;
 - force-detach ordering;
 - CSI provisioning freshness;
-- storage honouring fsync.
+- storage honouring fsync;
+- database failover under synchronous replication.
 
 **Deferred:**
 - Codex predecessor enablement (D3) and its positive M4 leaf;
