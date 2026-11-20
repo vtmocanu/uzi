@@ -1,4 +1,4 @@
-// Owner accepted 2026-11-20: patch needs no execution environment; MCP helpers require
+// Owner accepted 2026-11-20: native patch is inert without an execution environment; MCP helpers require
 // no native MCP servers are configured. New server configuration requires fresh authority review.
 // PRD #1287 C4 — the exact executed-test TITLE constants shared by the three places that must
 // never drift: the `it(...)` name, the `recordEvidence(...)` call, and the clause row's `tests`
