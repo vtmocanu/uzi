@@ -4411,10 +4411,11 @@ export class RunRunner {
    *  is built refuses; fetchTracking builds it at each source-authority acquisition, so the check is
    *  re-evaluated there (no polling). The terminal lifecycle signal joins only while the stop has not
    *  aborted it. While owedLimitStop is latched but the flight was not stopped, a credential switch or
-   *  PauseNow no longer aborts this acquisition (matching {@link credentialSwitchCaptureWait}). A late
-   *  cancel or claim fence is not observed, because the steering poller stops after the terminal
-   *  lifecycle abort; later steps (settleGuardedInventory guards, freezeInventory cancel observation, the
-   *  reportState claim fence, the server's generation fences) still catch it. */
+   *  PauseNow no longer aborts this acquisition (matching {@link credentialSwitchCaptureWait}). A cancel
+   *  or claim fence recorded while an acquisition is already queued (steering's receipt lanes can still
+   *  fence after the terminal abort) does not abort that acquisition: every steering signal it could
+   *  fire is already aborted. The import writes only this worker's bare; the runner's local claim-fence
+   *  checks (reportState) and the server's generation fences still stop any later report or release. */
   private owedStopReleaseWait(flight: RunFlight): AuthorityWait {
     // Same shutdown, budget and boundary-deadline terms as cleanupAuthorityWait, spelled out here so that
     // wait keeps exactly its pinned callers (runner-cleanup-authority-wait.test.ts).

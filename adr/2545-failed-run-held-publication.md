@@ -584,8 +584,10 @@ residual that earlier text left open is closed by the owed-path marker above.
   stop aborted (`owedStopReleaseWait` in `agent/src/runner.ts`). It aborts on
   shutdown, the maintenance budget, a recorded cancel or claim fence (re-checked
   at each acquisition) and the terminal lifecycle signal if still live. A
-  cancel or fence that arrives only after the transfer began is not observed by
-  that wait, because the steering poller has stopped; later steps still catch it.
+  cancel or fence recorded while an acquisition is already queued does not abort
+  that acquisition (every steering signal is already aborted by the stop); the
+  import writes only this worker's bare, and the runner's local claim-fence
+  checks and the server's generation fences still stop any later report or release.
 - **Failure model.** Every ordering above is for a process crash. No storage or
   power-loss durability claim is made.
 
