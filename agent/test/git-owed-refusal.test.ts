@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
-import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RefusalReleaseGate,
+import { formatAttemptId } from "../src/attempt-path.js";
+import { GitCache, CheckpointSoftDeadlineError, type BoundaryProcessSpawner, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RefusalReleaseGate,
   type TrackingUpdateResult } from "../src/git.js";
 
 // issue #4481: refused heads at the owed cap are recorded, kept alive, gated, sealed and cleaned up.
@@ -55,6 +56,13 @@ const writeRaw = (name: string, v: unknown): void => {
 };
 const ledgerName = `refusals-${RUN}.json`;
 const incomingRefs = (): string[] => gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-incoming/"]).split("\n").filter(Boolean).sort();
+/** The run's import stages (an in-progress import's private ref), by name. */
+const importStageRefs = (): string[] => incomingRefs().map((l) => l.split(" ")[0]!).filter((r) => /\/import-/.test(r));
+const foreignImportStage = (tip: string, nonce = OTHER_NONCE, g = 1): string => {
+  const ref = `refs/uzi-incoming/${RUN}/${g}/import-${nonce}-${randomUUID()}`;
+  gitIn(bare, ["update-ref", ref, tip]);
+  return ref;
+};
 const pinRefs = (): string[] => gitIn(bare, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${RUN}/`]).split("\n").filter(Boolean).sort();
 const gate = (head: string, g = 1, c: GitCache = cache): Promise<RefusalReleaseGate> => c.refusalReleaseGate(bare, RUN, g, head);
 const evidence = (): string => JSON.stringify({ files: refusalFiles().map((n) => [n, fs.readFileSync(path.join(refDir(), n), "utf8")]), refs: incomingRefs() });
@@ -118,7 +126,7 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     const first = incomingRefs();
     assert.equal(first.length, 2, "an attributed stage plus the refused ref");
     assert.ok(first.includes(`refs/uzi-incoming/${RUN}/1/refused-${refused} ${refused}`));
-    assert.ok(first.some((r) => new RegExp(`^refs/uzi-incoming/${RUN}/1/[0-9a-f-]{36} ${refused}$`).test(r)));
+    assert.ok(first.some((r) => new RegExp(`^refs/uzi-incoming/${RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36} ${refused}$`).test(r)));
     // The same head refused again: still one ledger entry, and the duplicate stage is deleted.
     assert.deepEqual(await fetchHead(), { kind: "not_updated", reason: "owed_limit", refusedSha: refused });
     assert.deepEqual(readJson(ledgerName).entries, ledger.entries);
@@ -166,6 +174,37 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     gitIn(bare, ["update-ref", `refs/uzi-incoming/${RUN}/1/stray`, stray]);
     const verdict = await gate(coverOf([...kept, stray, cover]));
     assert.deepEqual(verdict, { kind: "ineligible", reason: "refusal stage is not in the ledger" });
+  });
+
+  it("an unanchored import stage (its refused ref gone) makes the gate ineligible, and re-anchoring restores eligibility", async () => {
+    const { cover, refused } = await eligibleState();
+    assert.equal((await gate(cover)).kind, "eligible");
+    const refusedRef = `refs/uzi-incoming/${RUN}/1/refused-${refused}`;
+    gitIn(bare, ["update-ref", "-d", refusedRef]);
+    assert.deepEqual(await gate(cover), { kind: "ineligible", reason: "refusal import stage is unanchored" });
+    gitIn(bare, ["update-ref", refusedRef, refused]);
+    assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  it("a live in-process import stage makes the gate ineligible while it is in flight", async () => {
+    const { cover } = await eligibleState();
+    const [stage] = importStageRefs() as [string];
+    const live = (cache as unknown as { liveImportStages: Set<string> }).liveImportStages;
+    live.add(stage);
+    assert.deepEqual(await gate(cover), { kind: "ineligible", reason: "refusal import in progress" });
+    live.delete(stage);
+    assert.equal((await gate(cover)).kind, "eligible");
+  });
+
+  it("a stage that is neither an import nor a refused ref stays evidence; a refused-looking import name is not an import", async () => {
+    const { cover, refused } = await eligibleState();
+    gitIn(bare, ["update-ref", `refs/uzi-incoming/${RUN}/1/import-short-${randomUUID()}`, refused]);
+    // The nonce is shorter than the 8 characters an import stage carries: it is plain evidence, here ledgered, so it is
+    // covered and eligible, and it enters the digest (the digest differs from the one without it).
+    const withExtra = await gate(cover);
+    assert.equal(withExtra.kind, "eligible");
+    gitIn(bare, ["update-ref", "-d", incomingRefs().map((l) => l.split(" ")[0]!).find((r) => r.includes("/import-short-"))!]);
+    assert.notDeepEqual(await gate(cover), withExtra);
   });
 
   it("a stage of a later generation, malformed, unbound or over-long ledgers and tmp residue are ineligible", async () => {
@@ -766,6 +805,113 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     assert.equal(await cleanup(cover), "retained");
     assert.equal(incomingRefs().length, 2);
   });
+
+  it("an anchored stopped import stage is no evidence: deleting it after the seal still matches", async () => {
+    const { cover } = await sealed();
+    const [stage] = importStageRefs() as [string];
+    gitIn(bare, ["update-ref", "-d", stage]);
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "matches");
+  });
+
+  it("a foreign-process anchored import stage is excluded from the seal and deleted by the sealed cleanup", async () => {
+    const { cover, refused } = await sealed();
+    const foreign = foreignImportStage(refused);
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "matches", "the foreign stage is not evidence");
+    assert.equal(await cleanup(cover), "removed");
+    assert.deepEqual(incomingRefs(), []);
+    assert.equal(gitIn(bare, ["for-each-ref", foreign]), "");
+    assert.deepEqual(refusalFiles(), [`admission-${RUN}-1.json`]);
+  });
+
+  it("the intent lists the anchored import stage apart from the evidence stages and the sealed digest", async () => {
+    const { refused } = await intentWritten();
+    const intent = readJson(`cleanup-${RUN}-1.json`);
+    assert.deepEqual(intent.stages.map((x: any) => x.ref), [`refs/uzi-incoming/${RUN}/1/refused-${refused}`]);
+    assert.equal(intent.importStages.length, 1);
+    assert.match(intent.importStages[0].ref, new RegExp(`^refs/uzi-incoming/${RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36}$`));
+    assert.equal(intent.importStages[0].tip, refused);
+    assert.equal(intent.finalDigest, readJson(`final-${RUN}-1.json`).evidenceDigest);
+  });
+
+  it("interrupted between the intent and the import deletion, the cleanup resumes and completes", async () => {
+    const { cover } = await intentWritten();
+    assert.equal(incomingRefs().length, 2, "nothing was deleted yet");
+    assert.equal(await cleanup(cover), "removed");
+    assert.deepEqual(incomingRefs(), []);
+    assert.deepEqual(refusalFiles(), [`admission-${RUN}-1.json`]);
+  });
+
+  it("interrupted after the import and refused-ref deletions (ledger not yet rewritten), the cleanup resumes and completes", async () => {
+    const { cover } = await intentWritten();
+    for (const line of incomingRefs()) gitIn(bare, ["update-ref", "-d", line.split(" ")[0]!]);
+    assert.ok(readJson(ledgerName).entries.length > 0, "the ledger still lists the head");
+    assert.equal(await cleanup(cover), "removed");
+    assert.deepEqual(refusalFiles(), [`admission-${RUN}-1.json`]);
+  });
+
+  it("interrupted after only the import deletion, the cleanup resumes and completes", async () => {
+    const { cover } = await intentWritten();
+    for (const ref of importStageRefs()) gitIn(bare, ["update-ref", "-d", ref]);
+    assert.equal(incomingRefs().length, 1);
+    assert.equal(await cleanup(cover), "removed");
+    assert.deepEqual(incomingRefs(), []);
+  });
+
+  it("an import stage the intent does not list, appearing after the intent was written, is retained", async () => {
+    const { cover, refused } = await intentWritten();
+    const late = foreignImportStage(refused);
+    const before = evidence() + JSON.stringify(pinRefs());
+    assert.equal(await cleanup(cover), "retained");
+    assert.equal(evidence() + JSON.stringify(pinRefs()), before, "nothing was deleted");
+    gitIn(bare, ["update-ref", "-d", late]);
+    assert.equal(await cleanup(cover), "removed");
+  });
+
+  it("an import stage whose tip moved since the intent is retained", async () => {
+    const { cover } = await intentWritten();
+    const [stage] = importStageRefs() as [string];
+    const moved = commitTree("moved import", false);
+    toBare(moved);
+    gitIn(bare, ["update-ref", stage, moved]);
+    assert.equal(await cleanup(cover), "retained");
+    assert.equal(gitIn(bare, ["rev-parse", stage]), moved);
+  });
+
+  it("a live in-process import retains the sealed cleanup", async () => {
+    const { cover } = await sealed();
+    const [stage] = importStageRefs() as [string];
+    const live = (cache as unknown as { liveImportStages: Set<string> }).liveImportStages;
+    live.add(stage);
+    const before = evidence() + JSON.stringify(pinRefs());
+    assert.equal(await cleanup(cover), "retained");
+    assert.equal(evidence() + JSON.stringify(pinRefs()), before);
+    live.delete(stage);
+    assert.equal(await cleanup(cover), "removed");
+  });
+
+  it("an unanchored import stage retains the sealed cleanup plan", async () => {
+    const { cover, refused } = await eligibleState();
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "sealed");
+    foreignImportStage(refused, OTHER_NONCE, 2);
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-incoming/${RUN}/1/refused-${refused}`]);
+    assert.equal(await cleanup(cover), "retained");
+  });
+
+  it("the ledger half of the exact-pair subset check: a ledger row added after the intent, with no stage, is retained", async () => {
+    const { cover } = await intentWritten();
+    const ledger = readJson(ledgerName);
+    writeRaw(ledgerName, { ...ledger, entries: [...ledger.entries, { generation: 1, sha: base, path: "P2" }] });
+    const before = evidence() + JSON.stringify(pinRefs());
+    assert.equal(await cleanup(cover), "retained");
+    assert.equal(evidence() + JSON.stringify(pinRefs()), before, "nothing was deleted");
+  });
+
+  it("refusal-directory writes need a valid run id", async () => {
+    const write = cache["writeOwedFile"].bind(cache) as (b: string, n: string, v: unknown, d?: string, r?: string) => Promise<void>;
+    await assert.rejects(write(bare, "x.json", {}, "info/uzi-refusals"), /valid run id/);
+    await assert.rejects(write(bare, "x.json", {}, "info/uzi-refusals", "not a run id!"), /valid run id/);
+    assert.equal(refusalFiles().includes("x.json"), false);
+  });
 });
 
 describe("issue4481 durable incomplete marker and seal comparison", { timeout: 300_000 }, () => {
@@ -1095,13 +1241,15 @@ describe("issue4481 refusal stage listing is cross-checked against loose refs", 
       const { cover } = await eligibleState();
       assert.equal((await gate(cover)).kind, "eligible");
       const original = fs.readFileSync(configPath());
-      // Git only honours a v1 extension in a version 1 repository, so the guard cases keep version 0 and git itself stays quiet.
+      // Git only honours a v1 extension in a version 1 repository, so these config-file cases are git-level fail-closed
+      // (git exits 128 on a reftable or valueless refstorage and the gate reads that as ineligible); they do not isolate the guard.
       fs.writeFileSync(configPath(), (formatVersion1 ? original.toString().replace("repositoryformatversion = 0", "repositoryformatversion = 1") : original.toString()) + extra);
       try { assert.equal((await gate(cover)).kind, expected); } finally { fs.writeFileSync(configPath(), original); }
       assert.equal((await gate(cover)).kind, "eligible");
     };
 
     // Real git rejects most refstorage configs itself, so the guard is isolated by reporting the value to it alone.
+    // A reported empty value must be refused too: only an exact `files` is accepted.
     const reportingConfig = async (value: string, expected: "eligible" | "ineligible"): Promise<void> => {
       const { cover } = await eligibleState();
       const internals = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
@@ -1114,6 +1262,8 @@ describe("issue4481 refusal stage listing is cross-checked against loose refs", 
     };
     it("a reported non-files refstorage value is ineligible", () => reportingConfig("reftable", "ineligible"));
     it("a reported refstorage value of files is accepted", () => reportingConfig("files", "eligible"));
+    it("a reported empty refstorage value is ineligible", () => reportingConfig("", "ineligible"));
+    it("a reported refstorage value that only differs in case is ineligible", () => reportingConfig("FILES", "ineligible"));
 
     it("a reftable directory in the bare is ineligible", async () => {
       const { cover } = await eligibleState();
@@ -1122,8 +1272,8 @@ describe("issue4481 refusal stage listing is cross-checked against loose refs", 
       fs.rmdirSync(path.join(bare, "reftable"));
       assert.equal((await gate(cover)).kind, "eligible");
     });
-    it("extensions.refstorage=reftable in the config file is ineligible", () => withConfig("[extensions]\n\trefstorage = reftable\n", "ineligible"));
-    it("an unset-looking extensions.refstorage value is ineligible", () => withConfig("[extensions]\n\trefstorage\n", "ineligible"));
+    it("git-level fail-closed: extensions.refstorage=reftable in the config file is ineligible", () => withConfig("[extensions]\n\trefstorage = reftable\n", "ineligible"));
+    it("git-level fail-closed: a valueless extensions.refstorage is ineligible", () => withConfig("[extensions]\n\trefstorage\n", "ineligible"));
     it("an explicit extensions.refstorage=files is accepted (git itself rejects other spellings of the value)", () => withConfig("[extensions]\n\trefStorage = files\n", "eligible", true));
   });
 
@@ -1178,5 +1328,167 @@ describe("issue4481 sealed cleanup registers its stage deletions with the author
       testGitCacheOptions({ maxOwedCandidates: CAP, authority: hooks([], true) as never }));
     await assert.rejects(hooked.cleanupRecoveryGeneration(bare, ctx, await roots(), [], [], cover, undefined, "archive"), /authority refused/);
     assert.deepEqual(incomingRefs(), before);
+  });
+});
+
+describe("issue4481 a failed import deletes its own attributed stage", { timeout: 300_000 }, () => {
+  type Internals = {
+    requireOwedCommit: (barePath: string, sha: string) => Promise<void>;
+    runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string>;
+  };
+  const runIncoming = (): string[] => incomingRefs();
+
+  it("an expected-candidate mismatch at a positive generation leaves no attributed stage, and the gate keeps its normal decision", async () => {
+    const first = commitTree("first", true);
+    assert.equal((await fetchHead()).kind, "updated");
+    commitTree("newer", true);
+    await assert.rejects(fetchHead({ ...opts, expectedCandidateSha: first }), /checkpoint candidate changed during acquisition/);
+    assert.deepEqual(runIncoming(), [], "the stage of the failed import is gone");
+    assert.deepEqual(await gate(first), { kind: "none" });
+  });
+
+  it("a flat (null generation) import keeps its unattributed stage after the same failure", async () => {
+    const legacy: FetchAgentBranchOptions = { context: { ...ctx, generation: null, legacy: true } as FetchAgentBranchOptions["context"] };
+    const first = commitTree("legacy first", true);
+    assert.equal((await fetchHead(legacy)).kind, "updated");
+    const newer = commitTree("legacy newer", true);
+    await assert.rejects(fetchHead({ ...legacy, expectedCandidateSha: first }), /checkpoint candidate changed/);
+    assert.equal(gitIn(bare, ["for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"]), newer);
+  });
+
+  it("an owed-commit check that fails after the fetch leaves no attributed stage", async () => {
+    commitTree("first", true);
+    assert.equal((await fetchHead()).kind, "updated");
+    const head = commitTree("poisoned", true);
+    const internals = cache as unknown as Internals;
+    const original = internals.requireOwedCommit.bind(cache);
+    internals.requireOwedCommit = async (b, sha) => { if (sha === head) throw new Error("injected owed-commit failure"); return original(b, sha); };
+    try { await assert.rejects(fetchHead(), /injected owed-commit failure/); }
+    finally { internals.requireOwedCommit = original; }
+    assert.deepEqual(runIncoming(), []);
+  });
+
+  it("a stage that is the ledgered head's sole anchor survives the failure", async () => {
+    const first = commitTree("first", true);
+    assert.equal((await fetchHead()).kind, "updated");
+    const newer = commitTree("newer", true);
+    fs.mkdirSync(refDir(), { recursive: true, mode: 0o700 });
+    writeRaw(ledgerName, { version: 1, runId: RUN, branch: BRANCH, barePath: bare, entries: [{ generation: 1, sha: newer, path: "P2" }] });
+    await assert.rejects(fetchHead({ ...opts, expectedCandidateSha: first }), /checkpoint candidate changed/);
+    assert.equal(runIncoming().length, 1, "no refused ref and no pin anchor the head, so the stage stays");
+    assert.ok(runIncoming()[0]!.endsWith(` ${newer}`));
+  });
+
+  it("a ledgered head that a refused ref anchors does not need its stage", async () => {
+    const first = commitTree("first", true);
+    assert.equal((await fetchHead()).kind, "updated");
+    const newer = commitTree("newer", true);
+    fs.mkdirSync(refDir(), { recursive: true, mode: 0o700 });
+    writeRaw(ledgerName, { version: 1, runId: RUN, branch: BRANCH, barePath: bare, entries: [{ generation: 1, sha: newer, path: "P2" }] });
+    gitIn(bare, ["fetch", "-q", "--no-tags", "--no-write-fetch-head", `file://${clone}`, `+refs/heads/${BRANCH}:refs/uzi-incoming/${RUN}/1/refused-${newer}`]);
+    await assert.rejects(fetchHead({ ...opts, expectedCandidateSha: first }), /checkpoint candidate changed/);
+    assert.deepEqual(runIncoming(), [`refs/uzi-incoming/${RUN}/1/refused-${newer} ${newer}`]);
+  });
+
+  describe("a producing-source import", () => {
+    const SBRANCH = "agent/issue-3747", SRUN = "run-3747";
+    const ATTEMPT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+    let sbare: string, sclone: string, sbase: string, sopts: FetchAgentBranchOptions;
+    const sincoming = (): string[] => gitIn(sbare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-incoming/"]).split("\n").filter(Boolean);
+    const scommit = (label: string): string => {
+      const sha = gitIn(sclone, [...IDENT, "commit-tree", `${sbase}^{tree}`, "-p", sbase, "-m", label]);
+      gitIn(sclone, ["update-ref", `refs/heads/${SBRANCH}`, sha]);
+      return sha;
+    };
+    beforeEach(async () => {
+      sbare = bare;
+      sclone = (await cache.runnerCloneForBranch(sbare, SBRANCH, "issue-3747", noProofReseed, SRUN, false, undefined,
+        { attemptId: ATTEMPT, isLive: () => false, beforeSeed: async () => {} })).path;
+      await cache.markRecoveryCapture(sbare, sclone, SBRANCH, SRUN, ATTEMPT);
+      sbase = base;
+      const sctx: PositiveOwedCandidateContext = { runId: SRUN, generation: 1, kind: "issue", branch: SBRANCH, barePath: sbare,
+        defaultIdentity: { ref: "refs/remotes/origin/main", sha: sbase } };
+      sopts = { context: sctx, producingSource: { runId: SRUN, clonePath: sclone, attemptId: ATTEMPT } };
+      scommit("first");
+      assert.equal((await cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, sopts)).kind, "updated");
+    });
+    const racing = (phase2: () => void): FetchAgentBranchOptions => {
+      let phases = 0;
+      return { ...sopts, withSourceAuthority: async <T>(action: () => Promise<T>) => { if (++phases === 2) phase2(); return action(); } };
+    };
+
+    it("a stage moved between acquisition and promotion is retained at its new tip", async () => {
+      scommit("next head");
+      const moved = racing(() => {
+        const [line] = sincoming() as [string];
+        gitIn(sbare, ["update-ref", line.split(" ")[0]!, sbase, line.split(" ")[1]!]);
+      });
+      await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, moved), /private stage changed/);
+      const left = sincoming();
+      assert.equal(left.length, 1, "the CAS to the acquired tip failed, so the moved stage stays");
+      assert.ok(left[0]!.endsWith(` ${sbase}`));
+    });
+
+    it("a failed owed-commit check in the second lock section deletes the stage", async () => {
+      const head = scommit("next head");
+      const internals = cache as unknown as Internals;
+      const original = internals.requireOwedCommit.bind(cache);
+      let armed = false;
+      internals.requireOwedCommit = async (b, sha) => { if (armed && sha === head) throw new Error("injected owed-commit failure"); return original(b, sha); };
+      try {
+        await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, racing(() => { armed = true; })), /injected owed-commit failure/);
+      } finally { internals.requireOwedCommit = original; }
+      assert.deepEqual(sincoming(), []);
+    });
+  });
+});
+
+describe("issue4481 the incoming head's refusal is recorded before a soft-deadline return", { timeout: 300_000 }, () => {
+  const realSpawner: BoundaryProcessSpawner = async (request) => {
+    const child = (await import("node:child_process")).spawn(request.argv[0]!, request.argv.slice(1), { cwd: request.cwd, env: request.env });
+    const completed = new Promise<{ code: number }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => resolve({ code: code ?? -1 }));
+    });
+    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+      cancel: async () => { child.kill("SIGTERM"); await completed; } };
+  };
+
+  it("a displaced-head refusal with an expired soft deadline still ledgers the incoming head at its generation", async () => {
+    const big = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: CAP + 1 }));
+    const kept: string[] = [];
+    for (let i = 0; i < CAP + 1; i++) {
+      kept.push(commitTree("rig", true));
+      assert.equal((await big.fetchAgentBranch(bare, clone, BRANCH, RUN, opts)).kind, "updated");
+    }
+    const tracking = kept[kept.length - 1]!;
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${tracking}`]);
+    assert.equal(await cache.admitRefusalProvenance({ ...ctx, generation: 2 }), "written");
+    const next = commitTree("displacer", true);
+    // The soft deadline expires once the displaced head's refused ref is written, inside the masked chokepoint.
+    let clock = 0;
+    const internals = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const original = internals.runGit.bind(cache);
+    internals.runGit = async (cwd, args, ...rest) => {
+      const out = await original(cwd, args, ...rest);
+      if (args[0] === "update-ref" && String(args[1]).includes(`/refused-${tracking}`)) clock = 100;
+      return out;
+    };
+    let result: TrackingUpdateResult;
+    try {
+      result = await cache.withBoundaryProcessSpawner(realSpawner, new AbortController().signal,
+        () => cache.fetchAgentBranch(bare, clone, BRANCH, RUN, withContext(2)),
+        { softSignal: new AbortController().signal, softDeadlineAt: 100, now: () => clock });
+    } catch (cause) {
+      assert.ok(!(cause instanceof CheckpointSoftDeadlineError) || clock === 100, String(cause));
+      throw cause;
+    } finally { internals.runGit = original; }
+    assert.equal(clock, 100, "the deadline did expire during the import");
+    assert.deepEqual(result, { kind: "not_updated", reason: "owed_limit", refusedSha: next });
+    const entries = readJson(ledgerName).entries;
+    assert.deepEqual(entries.filter((e: any) => e.sha === tracking).map((e: any) => e.generation), [1]);
+    assert.deepEqual(entries.filter((e: any) => e.sha === next).map((e: any) => [e.generation, e.path]), [[2, "P2"]],
+      "the incoming head is ledgered at its own generation before the soft-deadline return");
+    assert.ok(incomingRefs().includes(`refs/uzi-incoming/${RUN}/2/refused-${next} ${next}`));
   });
 });

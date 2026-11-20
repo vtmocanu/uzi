@@ -53,17 +53,18 @@ async function fixture() {
   return { fx, cache, bare, clone, base, options, commit, fetch, receipt };
 }
 
-it("m1 expected candidate mismatch preserves ownership and one stage without substituting the newer head", async () => {
+it("m1 expected candidate mismatch preserves ownership, drops its attributed stage and does not substitute the newer head", async () => {
   const f = await fixture();
   try {
     const first = f.commit("first"); await f.fetch();
-    const newer = f.commit("newer");
+    f.commit("newer");
     const before = fs.readFileSync(f.receipt, "utf8");
     const options = { ...f.options, expectedCandidateSha: first };
     await assert.rejects(f.fetch(options), { name: "Error", message: "checkpoint candidate changed during acquisition" });
     assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
     assert.equal(fs.readFileSync(f.receipt, "utf8"), before);
-    assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), newer);
+    // issue #4481: the attributed private stage of a refused acquisition is CAS-deleted (the clone keeps the head).
+    assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), "");
     assert.deepEqual((await f.cache.enumerateOwedCandidates(f.bare, run)).map(c => c.sha), [first]);
   } finally { f.fx.cleanup(); }
 });

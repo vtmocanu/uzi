@@ -1044,7 +1044,7 @@ async function resume(w: RefusalWorld, s: { rt: AuthorityRuntime; git: GitCache 
 }
 
 const refusedRefHold = (sha: string): string => `update-ref refs/uzi-incoming/${RF_RUN}/1/refused-${sha}`;
-const stageDeleteHold = (sha: string): string => `update-ref -d refs/uzi-incoming/${RF_RUN}/1/[0-9a-f-]{36} ${sha}`;
+const stageDeleteHold = (sha: string): string => `update-ref -d refs/uzi-incoming/${RF_RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36} ${sha}`;
 const refuse = (head: string): RefusalOp => ({ op: "fetch", head });
 
 test("refusal proof 1a: SIGKILL before the admission rename leaves only temp residue; the successor gate is ineligible and a fresh admission does not clear it", { timeout: 120_000 }, async (t) => {
@@ -1229,7 +1229,7 @@ test("refusal proof 8: SIGKILL with the cleanup intent written never deletes und
 });
 
 for (const nth of [1, 2, 3, 4]) {
-  test(`refusal proof 9: SIGKILL after refusal-stage delete ${nth} of 4 keeps the ledger and every head covered; resuming finishes`, { timeout: 180_000 }, async (t) => {
+  test(`refusal proof 9: SIGKILL after refusal-stage delete ${nth} of 4 keeps the ledger and every head covered; the resumed cleanup is fenced by the unresolved bare record`, { timeout: 180_000 }, async (t) => {
     const w = await refusalWorld(t, 2);
     const [h0, h1] = w.heads as [string, string];
     await crashRefusal(t, w, [{ op: "admit" }, refuse(h0), refuse(h1), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
@@ -1242,14 +1242,15 @@ for (const nth of [1, 2, 3, 4]) {
     // The refusal-stage delete is a registered bare mutation (git-authority-hooks.ts "refusal-cleanup-delete-ref"). Its
     // owner died before settling it, and no production path resolves a dead owner's running bare record by read-back
     // (the same contract as proofs 2 and the recovery-cleanup-delete-ref records above): it stays running and fences every
-    // later writer on the bare until an operator discard. So the resumed cleanup is REFUSED, never completed on top of the
-    // unconfirmed delete, and it deletes no head's coverage.
+    // later writer on the bare (no in-product path resolves it; operator intervention is needed). So the resumed cleanup
+    // is REFUSED, never completed on top of the unconfirmed delete, and it deletes no head's coverage.
+    const refsBeforeResume = incomingRefs(w);
     const s = await refusalSuccessor(w);
     assert.equal((await slotOf(s.rt, w.bare))?.pending?.status, "running", "the dead owner's delete is durable and unresolved");
     await assert.rejects(resume(w, s, w.cover), /unresolved pending footprint/);
     assert.equal((await slotOf(s.rt, w.bare))?.pending?.status, "running", "the refused resume settled nothing");
     assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`) && rfFiles(w).includes(`final-${RF_RUN}-1.json`), "the sealed intent is kept");
-    assert.ok(incomingRefs(w).length <= 4 - nth, "the refused resume deleted no further stage");
+    assert.deepEqual(incomingRefs(w), refsBeforeResume, "the refused resume deleted no further stage");
     assertNoLoss(w, "refused resume", true);
   });
 }

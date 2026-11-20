@@ -73,7 +73,7 @@ describe("issue1924 owed candidate cap", { timeout: 300_000 }, () => {
     const refs = stageRefs();
     assert.equal(refs.length, 2, "the refused head keeps its attributed stage and refused ref");
     assert.ok(refs.includes(`refs/uzi-incoming/${RUN}/1/refused-${over}`));
-    assert.ok(refs.some((r) => new RegExp(`^refs/uzi-incoming/${RUN}/1/[0-9a-f-]{36}$`).test(r)));
+    assert.ok(refs.some((r) => new RegExp(`^refs/uzi-incoming/${RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36}$`).test(r)));
     assert.equal(gitIn(bare, ["for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"]).split("\n").every((o) => o === over), true);
     assert.deepEqual(await pinned(), [...kept].sort(), "every retained head is still recoverable after the cap is hit");
     for (const sha of kept) assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${RUN}/${sha}`]), sha);
