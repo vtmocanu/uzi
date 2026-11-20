@@ -559,7 +559,7 @@ export class ClaudeHarness implements RunHarness {
     if (type === "result") {
       return {
         kind: "turn_finished",
-        terminal: buildTerminal(rec, latest),
+        terminal: buildTerminal(rec, latest, redactText),
         ...(leg ? { usageStamp: { legId: leg.legId, usageThrough: leg.maxOrdinal } } : {}),
         sessionId,
         orphanInstanceFrameKind,
@@ -659,6 +659,7 @@ function markSignals(items: HarnessItem[]): void {
 function buildTerminal(
   msg: Record<string, unknown>,
   latest: RateLimitObservation | undefined,
+  redactText?: RunTurnRequest["redactText"],
 ): HarnessTerminal {
   const decoded = decodeResult(msg);
   // Mirror the pre-extraction driveTurn's raw errorSubtype EXACTLY: the cast is
@@ -729,7 +730,7 @@ function buildTerminal(
         //  4. else a non-empty fallback (never bare "unknown", never "success").
         const isApiError = terminalReason === "api_error" || apiErrorStatus != null;
         const message = isApiError
-          ? providerErrorMessage(apiErrorStatus, resultText)
+          ? providerErrorMessage(apiErrorStatus, resultText, redactText)
           : rawSubtype && rawSubtype !== "success" && rawSubtype !== "unknown"
             ? `agent run failed: ${rawSubtype}`
             : errors.length > 0

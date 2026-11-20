@@ -5483,14 +5483,14 @@ export class SdkExecutor implements Executor {
         const spend = classifySpendLimitTerminal(terminal);
         if (spend) {
           throw new SpendLimitHoldError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText, ctx.redactText),
             spend.detail,
             resumableSessionId(),
           );
         }
         if (!limitFacts && isProviderTransient(terminal)) {
           throw new ProviderTransientError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText, ctx.redactText),
             terminal.apiErrorStatus,
             resumableSessionId(),
           );

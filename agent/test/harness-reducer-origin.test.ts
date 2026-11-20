@@ -81,6 +81,29 @@ test("Claude decode applies RunTurnRequest.redactText to a signal_done summary b
   for (let n = 8; n <= KEY.length; n++) assert.ok(!text.includes(KEY.slice(0, n)), `key prefix of length ${n} leaked`);
 });
 
+test("Claude decode redacts the provider-error failure message before its 200-char cut", async () => {
+  const KEY = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+  const frame = { type: "result", subtype: "success", is_error: true, api_error_status: 401, terminal_reason: "api_error", result: "API Error: " + "x".repeat(188) + KEY };
+  const queryFn = (() => (async function* () { yield frame; })()) as unknown as SdkQueryFn;
+  const harness = new ClaudeHarness({
+    queryFn, spawn: () => ({ pid: undefined }), kill: () => true, log: nullLogger(),
+    contextUsageTimeoutMs: 2000, spawnedPids: new Set<number>(),
+    homeDir: path.join(os.tmpdir(), "uzi-origin-home-does-not-exist"),
+  });
+  harness.prepareTurn(config, { pid: undefined });
+  const redactText = makeTextRedactor(providerKeyForms(KEY));
+  const messageFor = async (extra: Partial<RunTurnRequest>) => {
+    for await (const event of harness.startTurn({ ...request, ...extra }).events) {
+      if (event.kind === "turn_finished") return event.terminal.failure!.materialize().failure.message;
+    }
+    throw new Error("no turn_finished event");
+  };
+  assert.ok((await messageFor({})).includes(KEY.slice(0, 10)), "without redactText the fixture straddles the cut");
+  harness.prepareTurn(config, { pid: undefined });
+  const redacted = await messageFor({ redactText });
+  for (let n = 8; n <= KEY.length; n++) assert.ok(!redacted.includes(KEY.slice(0, n)), `prefix ${n} leaked`);
+});
+
 test("m1 non-closing reducer keeps latest valid reason through omission and rejection", async () => {
   const done = (input: unknown) => ({ type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__uzi__signal_done", input }] } });
   const out = await reduceRaw([done({ non_closing: { reason: " first " } }), done({ non_closing: { reason: " latest " } }), done({}), done({ non_closing: null })]);
