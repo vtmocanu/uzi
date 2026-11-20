@@ -378,11 +378,26 @@ Owner accepted on 2026-11-20: `apply_patch` is inert with no execution
 environment; `list_mcp_resources`, `list_mcp_resource_templates` and
 `read_mcp_resource` are inert under the exact invariant **no native MCP servers are configured**.
 Any later native MCP server configuration requires fresh authority review.
-`[features].goals = false` remains mandatory. Existing layers retain this boundary:
-empty thread/turn execution environments, `CODEX_EXEC_SERVER_URL=none`,
-isolated configuration and environment, native feature suppression and untrusted
-project configuration, and the worker broker for permitted effects. This acceptance
-makes no global inertness or packaged OS isolation claim.
+The controls apply per native surface:
+
+- Native `apply_patch`: empty thread/turn execution environments (`environments: []`)
+  and the launcher guard `CODEX_EXEC_SERVER_URL=none` deny execution; see the
+  [real-binary matrix](../e2e/codex-m4/native-patch-inert.test.ts).
+- Native MCP resource helpers: no servers in builder output or outgoing thread
+  config is the invariant. Semantic regressions cover
+  [config](../agent/test/codex-config.test.ts),
+  [harness](../agent/test/codex-harness.test.ts),
+  [executor](../agent/test/codex-executor.test.ts),
+  [advice](../agent/test/codex-advice-harness.test.ts) and
+  [cross-check](../agent/test/codex-cross-check.test.ts).
+  Isolated configuration and environment prevent inherited server settings.
+- Goals: `[features].goals = false` remains mandatory; the real-binary matrix
+  checks their absence and forced-call rejection.
+
+False obsolete feature keys are construction checks, not runtime evidence.
+The worker broker gates permitted worker effects; it does not establish native
+helper inertness. This acceptance makes no global inertness or packaged OS
+isolation claim.
 
 ### Accepted native exceptions (#1566)
 

@@ -3,6 +3,12 @@ import { parse } from "smol-toml";
 
 /** Inspect semantic keys, including dotted/quoted outgoing override spellings. */
 export function assertNoNativeServers(value: unknown): void {
+  assert.ok(value !== null && typeof value === "object" && !Array.isArray(value),
+    "outgoing thread config must be a non-null object, not an array");
+  visit(value);
+}
+
+function visit(value: unknown): void {
   if (!value || typeof value !== "object") return;
   for (const [key, child] of Object.entries(value)) {
     let decoded: unknown;
@@ -16,6 +22,6 @@ export function assertNoNativeServers(value: unknown): void {
       }
     };
     inspect(decoded);
-    assertNoNativeServers(child);
+    visit(child);
   }
 }

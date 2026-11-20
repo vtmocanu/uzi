@@ -259,6 +259,12 @@ describe("no native MCP servers are configured", () => {
     assertNoNativeServers(config);
     assert.equal((config.features as Record<string, unknown>).goals, false);
   });
+  it("rejects missing, null, scalar and array config roots", () => {
+    for (const config of [undefined, null, false, 0, "config", [], [{}]]) {
+      assert.throws(() => assertNoNativeServers(config), /outgoing thread config/);
+    }
+    assertNoNativeServers({ enabled: false, count: 0, optional: null, nested: ["value", {}] });
+  });
   it("rejects nested, dotted and quoted outgoing server keys without inspecting values", () => {
     for (const config of [
       { mcp_servers: {} }, { "mcp_servers.fixture.command": "unused" },

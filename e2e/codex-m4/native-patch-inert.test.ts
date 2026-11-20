@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import path from "node:path";
 import { CODEX_ROLE_MODELS } from "../../agent/src/codex/render.js";
 import { runtimeInventory } from "./native-exceptions.js";
-import { codeModeExecStep, dummyCredential, nativeApplyPatchStep, nestedWorkerCallScript, scriptedStepsResponder, toolCallbackTexts } from "./fake-provider.js";
+import { codeModeExecStep, dummyCredential, nativeApplyPatchStep, nestedWorkerCallScript, scriptedStepsResponder, toolCallbackTexts, type ResponsesBody } from "./fake-provider.js";
 import { loadProtocolModules, runProtocolTurn, type ProtocolModules } from "./harness-p.js";
 import { P_LAYER_SKIP } from "./p-platform.js";
 import { recordEvidence } from "./evidence.js";
@@ -16,17 +16,46 @@ const models = (JSON.parse(readFileSync(path.resolve(__dirname, "../../fixtures/
 const structured = ["functions", "functions.exec", "functions.wait", "functions.request_user_input", "functions.request_user_input_async"];
 const nested = ["apply_patch", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "uzi_bash", "uzi_apply_patch", "clock__curr_time"];
 
-// Accepted inventory is exact: existing plumbing/worker callbacks plus patch and
-// the three no-server MCP helpers. Model-specific omissions below remain required.
-function assertAcceptedInventory(actual: readonly string[], expected: readonly string[]): void {
-  assert.deepEqual([...actual].sort(), [...expected].sort());
+// The real pinned gpt-5.6-sol catalog omits the DirectModelOnly async helper and nested UTC helper.
+function expectedInventory(model: string) {
+  return {
+    structured: model === "gpt-5.6-sol" ? structured.filter(name => name !== "functions.request_user_input_async") : structured,
+    nested: model === "gpt-5.6-sol" ? nested.filter(name => name !== "clock__curr_time") : nested,
+  };
 }
 
-test("accepted native inventory rejects an unknown native", () => {
-  assertAcceptedInventory(nested, nested);
-  assert.throws(() => assertAcceptedInventory([...nested, "unknown_native"], nested));
-  assert.throws(() => assertAcceptedInventory([...structured, "functions.unknown_native"], structured));
-});
+// Accepted inventory is exact, including missing observations and parser failures.
+function assertAcceptedInventory(request: ResponsesBody, model: string): void {
+  const inventory = runtimeInventory([request]);
+  const expected = expectedInventory(model);
+  assert.equal(inventory.observed, true);
+  assert.deepEqual(inventory.unparsed, []);
+  assert.deepEqual(inventory.structuredNames.sort(), [...expected.structured].sort());
+  assert.deepEqual(inventory.nestedNames.sort(), [...expected.nested].sort());
+}
+
+for (const model of models) {
+  test(`accepted native inventory rejects unknown provider tools: ${model}`, () => {
+    const expected = expectedInventory(model);
+    const fixture = (unknownStructured = false, unknownNested = false): ResponsesBody => ({
+      model,
+      tools: [{ type: "namespace", name: "functions", tools: [
+        ...expected.structured.filter(name => name !== "functions").map(name => ({
+          type: "function", name: name.slice("functions.".length),
+          ...(name === "functions.exec" ? { description: `declare const tools: {
+${[
+            ...expected.nested, ...(unknownNested ? ["unknown_native"] : []),
+          ].map(name => `${name}: () => Promise<unknown>;`).join("\n")}
+};` } : {}),
+        })),
+        ...(unknownStructured ? [{ type: "function", name: "unknown_native" }] : []),
+      ] }],
+    });
+    assertAcceptedInventory(fixture(), model);
+    assert.throws(() => assertAcceptedInventory(fixture(true), model), /unknown_native/);
+    assert.throws(() => assertAcceptedInventory(fixture(false, true), model), /unknown_native/);
+  });
+}
 
 // Each call-linked outcome is checked before worker controls, with no native MCP servers.
 const goals = ["create_goal", "get_goal", "update_goal"] as const;
@@ -116,16 +145,7 @@ for (const model of models) {
       assert.ok(obs.providerRequests.length > 0);
       for (const request of obs.providerRequests) {
         assert.equal(request.model, model);
-        const inventory = runtimeInventory([request]);
-        assert.equal(inventory.observed, true);
-        assert.deepEqual(inventory.unparsed, []);
-        // The real pinned gpt-5.6-sol catalog omits the DirectModelOnly async helper and nested UTC helper.
-        const expectedStructured = model === "gpt-5.6-sol"
-          ? ["functions", "functions.exec", "functions.wait", "functions.request_user_input"] : structured;
-        assertAcceptedInventory(inventory.structuredNames, expectedStructured);
-        const expectedNested = model === "gpt-5.6-sol"
-          ? ["apply_patch", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "uzi_bash", "uzi_apply_patch"] : nested;
-        assertAcceptedInventory(inventory.nestedNames, expectedNested);
+        assertAcceptedInventory(request, model);
       }
       assert.equal(obs.spawnEnv.CODEX_EXEC_SERVER_URL, scenario === "fresh-no-launcher-guard" ? undefined : "none");
       const requests = [obs.threadParams, obs.turnParams];
