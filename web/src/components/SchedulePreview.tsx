@@ -4,7 +4,6 @@
 // button, so a loading or failed preview can never gate or break Save.
 
 import { useId } from "react";
-import { Link } from "react-router-dom";
 import type { ScheduleSettingsPreviewRequest } from "../lib/apiTypes";
 import type {
   IgnoredPinView,
@@ -34,7 +33,7 @@ function Row({ label, value, children }: { label: string; value: React.ReactNode
     <>
       <dt className="text-muted">{label}</dt>
       <dd className="min-w-0 break-words font-mono text-fg">{value}</dd>
-      <dd className="min-w-0 break-words text-muted">{children}</dd>
+      <dd className="col-start-2 min-w-0 break-words text-muted sm:col-start-auto">{children}</dd>
     </>
   );
 }
@@ -49,16 +48,19 @@ function ValueRows({ label, row, children }: { label: string; row: ValueRow | nu
   );
 }
 
-// The link is its own >= 24px target; a bare 12px text line is too small to hit.
+// The link is its own >= 24px target; a bare 12px text line is too small to hit. It opens in a
+// new tab: a same-tab navigation would close the modal and lose the draft.
 function RunDefaultsLink() {
   return (
-    <Link
-      to={RUN_DEFAULTS_PATH}
+    <a
+      href={RUN_DEFAULTS_PATH}
+      target="_blank"
+      rel="noopener noreferrer"
       draggable={false}
       className="inline-flex min-h-6 items-center text-brand hover:text-brand-hover"
     >
-      Run defaults
-    </Link>
+      Run defaults (opens in new tab)
+    </a>
   );
 }
 
@@ -83,10 +85,10 @@ function subagentsDetail(s: SubagentsView): string {
   return parts.join(" · ");
 }
 
-function SubagentsRow({ s }: { s: SubagentsView | null }) {
+function SubagentsRow({ s, prefix }: { s: SubagentsView | null; prefix?: string }) {
   if (!s) return null;
   return (
-    <Row label="Subagents" value={s.mode}>
+    <Row label={prefix ? `${prefix} subagents` : "Subagents"} value={s.mode}>
       {subagentsDetail(s)}
     </Row>
   );
@@ -105,7 +107,7 @@ function BranchRows({ b, link }: { b: ScheduleBranchView; link: boolean }) {
       <ValueRows label={`${b.harness} model`} row={b.model} />
       <EffortRow label={`${b.harness} effort`} row={b.effort} link={link} />
       <ValueRows label={`${b.harness} credential`} row={b.credential} />
-      <SubagentsRow s={b.subagents} />
+      <SubagentsRow s={b.subagents} prefix={b.harness} />
     </>
   );
 }
@@ -117,12 +119,10 @@ function otherHarness(h: string | null): string | null {
 }
 
 function ignoredPinMessage(p: IgnoredPinView, bothUsable: boolean): string {
-  const harness = p.harness ? p.harness.charAt(0).toUpperCase() + p.harness.slice(1) : "the chosen harness";
-  const runs = p.harness ? `${harness} runs` : "these runs";
   const fallback = p.fallbackSource ? `${p.fallback} (${p.fallbackSource})` : p.fallback;
-  const other = otherHarness(p.harness ? harness : null);
-  const advice = bothUsable && other ? `Pin the harness to ${other}.` : `Pick a ${harness} model.`;
-  return `The ${p.pin} pin does not apply to ${runs}; this schedule would use ${fallback}. ${advice}`;
+  const other = otherHarness(p.harness);
+  const advice = bothUsable && other ? `Pin the harness to ${other}.` : `Pick a ${p.harness} model.`;
+  return `The ${p.pin} pin does not apply to ${p.harness} runs; this schedule would use ${fallback}. ${advice}`;
 }
 
 function Rows({ view }: { view: SchedulePreviewView }) {
@@ -168,7 +168,7 @@ export function SchedulePreview({
   const headingId = useId();
   if (result.status === "idle") return null;
   const view = result.status === "ready" ? result.view : null;
-  const ignored = view && !view.refusal ? view.ignoredPin : null;
+  const ignored = view && !view.refusal ? view.ignoredPins : [];
 
   return (
     <section
@@ -186,10 +186,12 @@ export function SchedulePreview({
       {result.status === "error" && <p>{ERROR_TEXT}</p>}
       {view && (
         <>
-          <dl className="grid grid-cols-[auto_minmax(0,auto)_minmax(0,1fr)] gap-x-3 gap-y-0.5">
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 sm:grid-cols-[auto_minmax(0,auto)_minmax(0,1fr)]">
             <Rows view={view} />
           </dl>
-          {ignored && <Alert tone="warning" message={ignoredPinMessage(ignored, bothUsable)} />}
+          {ignored.map((p) => (
+            <Alert key={`${p.harness}:${p.pin}`} tone="warning" message={ignoredPinMessage(p, bothUsable)} />
+          ))}
           <div className="space-y-0.5 text-muted">
             {FOOTER.map((line) => (
               <p key={line}>{line}</p>

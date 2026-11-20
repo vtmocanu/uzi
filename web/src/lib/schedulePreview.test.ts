@@ -69,10 +69,11 @@ describe("schedulePreviewView specifics", () => {
     const v = schedulePreviewView(p);
     expect(v.harness?.value).toBe("Codex");
     expect(v.harness?.timing).toBe("pinned · fixed when it fires");
-    expect(v.ignoredPin?.pin).toBe("sonnet");
-    expect(v.ignoredPin?.harness).toBe("codex");
-    expect(v.ignoredPin?.fallback).toBe(p.worker_model!.resolved_model);
-    expect(v.ignoredPin?.fallbackSource).toBe(modelSettingSourceLabel("model", p.worker_model!.source));
+    expect(v.ignoredPins).toHaveLength(1);
+    expect(v.ignoredPins[0].pin).toBe("sonnet");
+    expect(v.ignoredPins[0].harness).toBe("Codex");
+    expect(v.ignoredPins[0].fallback).toBe(p.worker_model!.resolved_model);
+    expect(v.ignoredPins[0].fallbackSource).toBe(modelSettingSourceLabel("model", p.worker_model!.source));
     expect(v.model?.source).toBe(modelSettingSourceLabel("model", p.worker_model!.source));
     expect(v.model?.timing).toBe("predicted · read when a worker picks the run up");
   });
@@ -82,16 +83,30 @@ describe("schedulePreviewView specifics", () => {
     expect(v.harness?.timing).toBe("predicted · fixed when it fires");
     expect(v.model?.value).toBe("sonnet");
     expect(v.model?.timing).toBe("pinned · fixed when it fires");
-    expect(v.ignoredPin).toBeNull();
+    expect(v.ignoredPins).toEqual([]);
+  });
+
+  it("an ignored pin inside a chosen-at-create alternative gets that branch's harness and fallback", () => {
+    const p = fixture("default", "unpinned sweep");
+    p.alternatives![1].worker_model!.ignored = { value: "sonnet", source: "schedule_pin" };
+    const v = schedulePreviewView(p);
+    expect(v.ignoredPins).toEqual([
+      {
+        pin: "sonnet",
+        harness: "Codex",
+        fallback: p.alternatives![1].worker_model!.resolved_model,
+        fallbackSource: modelSettingSourceLabel("model", p.alternatives![1].worker_model!.source),
+      },
+    ]);
   });
 
   it("codexOnly: single usable harness and ignored pin", () => {
     const v = schedulePreviewView(fixture("codexOnly", "sweep with a claude model pin"));
     expect(v.harness?.value).toBe("Codex");
-    expect(v.ignoredPin?.pin).toBe("sonnet");
+    expect(v.ignoredPins.map((x) => x.pin)).toEqual(["sonnet"]);
     expect(v.subagents?.mode).toBe("follow the lead");
     const plain = schedulePreviewView(fixture("codexOnly", "unpinned sweep"));
-    expect(plain.ignoredPin).toBeNull();
+    expect(plain.ignoredPins).toEqual([]);
     expect(plain.effort?.value).toBe("medium");
   });
 
@@ -124,8 +139,8 @@ describe("schedulePreviewView specifics", () => {
     expect(v.harness?.value).toBe("Claude");
     const ignored = fixture("default", "sweep pinned to codex with a claude model pin");
     ignored.harness = { ...ignored.harness!, value: `co${bidi}dex` } as typeof ignored.harness;
-    expect(schedulePreviewView(ignored).ignoredPin?.harness).toBe("codex");
-    expect(defaultModelChipSuffix(p)).toContain(" on Claude ");
+    expect(schedulePreviewView(ignored).ignoredPins[0].harness).toBe("Codex");
+    expect(defaultModelChipSuffix(p)).toContain("(Claude, predicted)");
   });
 
   it("subagents: follow the lead and own pins", () => {
@@ -173,19 +188,17 @@ describe("schedulePreviewView specifics", () => {
 describe("defaultModelChipSuffix", () => {
   it("decided harness", () => {
     const p = fixture("default", "sweep pinned to claude with subagents following the lead");
-    expect(defaultModelChipSuffix(p)).toBe("now opus on Claude (predicted)");
+    expect(defaultModelChipSuffix(p)).toBe("now opus (Claude, predicted)");
   });
 
   it("chosen at create joins the surviving branches", () => {
     const p = fixture("default", "unpinned sweep");
     const [a, b] = p.alternatives!;
     expect(defaultModelChipSuffix(p)).toBe(
-      `now ${a.worker_model!.resolved_model} on Claude or ${b.worker_model!.resolved_model} on Codex (predicted, harness chosen when it fires)`,
+      `now ${a.worker_model!.resolved_model} (Claude) or ${b.worker_model!.resolved_model} (Codex), predicted`,
     );
     p.alternatives![1] = { ...b, worker_model: null, refusal: "codex_pool_unavailable" };
-    expect(defaultModelChipSuffix(p)).toBe(
-      `now ${a.worker_model!.resolved_model} on Claude (predicted, harness chosen when it fires)`,
-    );
+    expect(defaultModelChipSuffix(p)).toBe(`now ${a.worker_model!.resolved_model} (Claude, predicted)`);
     p.alternatives![0] = { ...a, worker_model: null, refusal: "no_usable_credential" };
     expect(defaultModelChipSuffix(p)).toBeNull();
   });

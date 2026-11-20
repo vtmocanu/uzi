@@ -108,7 +108,7 @@ describe("unpinned model chip prediction", () => {
     previewMock.mockResolvedValue(fixture("default", "prompt with an explicit inherit"));
     const s = await unpinned();
     row(s);
-    expect(await screen.findByText("model: default · now opus on Claude (predicted)")).toBeTruthy();
+    expect(await screen.findByText("model: default · now opus (Claude, predicted)")).toBeTruthy();
     expect(previewMock).toHaveBeenCalledTimes(1);
     expect(previewMock.mock.calls[0]?.[0]).toEqual({ schedule_id: s.id, target: s.target });
   });
@@ -120,7 +120,7 @@ describe("unpinned model chip prediction", () => {
     const [a, b] = p.alternatives!;
     expect(
       await screen.findByText(
-        `model: default · now ${a.worker_model!.resolved_model} on Claude or ${b.worker_model!.resolved_model} on Codex (predicted, harness chosen when it fires)`,
+        `model: default · now ${a.worker_model!.resolved_model} (Claude) or ${b.worker_model!.resolved_model} (Codex), predicted`,
       ),
     ).toBeTruthy();
   });

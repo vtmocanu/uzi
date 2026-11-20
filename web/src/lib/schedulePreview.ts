@@ -109,7 +109,8 @@ export interface SubagentsView {
 
 export interface IgnoredPinView {
   pin: string;
-  harness: string | null;
+  /** Display name of the harness the pin does not apply to. */
+  harness: string;
   fallback: string;
   fallbackSource: string | null;
 }
@@ -131,7 +132,7 @@ export interface SchedulePreviewView {
   subagents: SubagentsView | null;
   notes: string[];
   refusal: string | null;
-  ignoredPin: IgnoredPinView | null;
+  ignoredPins: IgnoredPinView[];
   alternatives: ScheduleBranchView[];
 }
 
@@ -235,16 +236,29 @@ export function schedulePreviewView(preview: ScheduleSettingsPreview): ScheduleP
       }
     : null;
   const model = modelRow(preview.worker_model);
-  const ignored = preview.worker_model?.ignored ?? null;
-  const ignoredPin: IgnoredPinView | null =
-    ignored && preview.worker_model
-      ? {
-          pin: stripUnsafeChars(ignored.value),
-          harness: hv?.value == null ? null : stripUnsafeChars(hv.value),
-          fallback: model?.value ?? "",
-          fallbackSource: model?.source ?? null,
-        }
-      : null;
+  // The server sets `ignored` per branch: on the top-level cell for a decided harness, and on
+  // an alternative's own cell when the harness is chosen at create.
+  const ignoredPins: IgnoredPinView[] = [];
+  const topIgnored = preview.worker_model?.ignored;
+  if (topIgnored && hv?.value != null) {
+    ignoredPins.push({
+      pin: stripUnsafeChars(topIgnored.value),
+      harness: harnessName(hv.value),
+      fallback: model?.value ?? "",
+      fallbackSource: model?.source ?? null,
+    });
+  }
+  for (const a of preview.alternatives ?? []) {
+    const ig = a.worker_model?.ignored;
+    if (!ig || a.refusal) continue;
+    const row = modelRow(a.worker_model);
+    ignoredPins.push({
+      pin: stripUnsafeChars(ig.value),
+      harness: harnessName(a.harness),
+      fallback: row?.value ?? "",
+      fallbackSource: row?.source ?? null,
+    });
+  }
   return {
     harness,
     model,
@@ -253,7 +267,7 @@ export function schedulePreviewView(preview: ScheduleSettingsPreview): ScheduleP
     subagents: subagentsView(preview.subagents),
     notes: noteWords([...(hv?.notes ?? []), ...preview.notes]),
     refusal: preview.refusal ? scheduleRefusalLabel(preview.refusal) : null,
-    ignoredPin,
+    ignoredPins,
     alternatives: (preview.alternatives ?? []).map(branchView),
   };
 }
@@ -267,7 +281,7 @@ export function defaultModelChipSuffix(preview: ScheduleSettingsPreview): string
     if (preview.worker_model?.source === "schedule_pin") return null;
     const model = modelRow(preview.worker_model);
     if (!model) return null;
-    return `now ${model.value} on ${harnessName(preview.harness.value)} (predicted)`;
+    return `now ${model.value} (${harnessName(preview.harness.value)}, predicted)`;
   }
   const alternatives = preview.alternatives ?? [];
   if (alternatives.some((a) => a.worker_model?.source === "schedule_pin")) return null;
@@ -275,8 +289,10 @@ export function defaultModelChipSuffix(preview: ScheduleSettingsPreview): string
   for (const a of alternatives) {
     if (a.refusal) continue;
     const model = modelRow(a.worker_model);
-    if (model) parts.push(`${model.value} on ${harnessName(a.harness)}`);
+    if (model) parts.push(`${model.value} (${harnessName(a.harness)})`);
   }
   if (parts.length === 0) return null;
-  return `now ${parts.join(" or ")} (predicted, harness chosen when it fires)`;
+  // One surviving branch keeps the decided form; two are joined and the whole is the prediction.
+  if (parts.length === 1) return `now ${parts[0].replace(/\)$/, ", predicted)")}`;
+  return `now ${parts.join(" or ")}, predicted`;
 }

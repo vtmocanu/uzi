@@ -122,8 +122,9 @@ describe("schedule modal preview", () => {
     expect(within(r).getByText("updates as you change the picks above")).toBeTruthy();
     await waitFor(() => expect(within(r).getByText("Harness")).toBeTruthy(), WAIT);
 
-    const harnessRow = within(r).getByText("Claude").parentElement!;
-    expect(harnessRow.textContent).toContain("schedule pin · pinned · fixed when it fires");
+    const harnessValue = within(r).getByText("Harness").nextElementSibling!;
+    expect(harnessValue.textContent).toBe("Claude");
+    expect(harnessValue.nextElementSibling?.textContent).toContain("schedule pin · pinned · fixed when it fires");
     const modelValue = within(r).getByText(p.worker_model!.resolved_model);
     expect(modelValue.nextElementSibling?.textContent).toBe(
       "lead template · predicted · read when a worker picks the run up",
@@ -162,7 +163,7 @@ describe("schedule modal preview", () => {
     expect(within(r).getByText("Claude model")).toBeTruthy();
     expect(within(r).getByText("Codex model")).toBeTruthy();
     expect(within(r).getByText(p.alternatives![1].worker_model!.resolved_model)).toBeTruthy();
-    expect(within(r).getAllByRole("link", { name: "Run defaults" })).toHaveLength(1);
+    expect(within(r).getAllByRole("link", { name: "Run defaults (opens in new tab)" })).toHaveLength(1);
   });
 
   it("a refusal shows one Refused row and no duplicate per-alternative refusals", async () => {
@@ -181,8 +182,10 @@ describe("schedule modal preview", () => {
     );
     renderModal();
     const r = await readyRegion();
-    const link = within(r).getByRole("link", { name: "Run defaults" });
+    const link = within(r).getByRole("link", { name: "Run defaults (opens in new tab)" });
     expect(link.getAttribute("href")).toBe("/settings/run-defaults");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     expect(link.closest("dd")?.textContent).toContain("schedules can't change it");
   });
 
@@ -221,6 +224,31 @@ describe("schedule modal preview", () => {
     expect(text).not.toContain("Pin the harness");
   });
 
+  it("an ignored pin inside a chosen-at-create alternative warns with that branch's fallback", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: bothHarnesses() });
+    const p = fixture("default", "unpinned sweep");
+    p.alternatives![1].worker_model!.ignored = { value: "sonnet", source: "schedule_pin" };
+    mockApi.previewScheduleSettings.mockResolvedValue(p);
+    renderModal();
+    await screen.findByLabelText("Harness for this schedule", {}, WAIT);
+    const r = await readyRegion();
+    const fallback = p.alternatives![1].worker_model!.resolved_model;
+    const alerts = within(r).getAllByRole("status");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].textContent).toContain(`The sonnet pin does not apply to Codex runs; this schedule would use ${fallback}`);
+    expect(alerts[0].textContent).toContain("Pin the harness to Claude.");
+  });
+
+  it("while the preview is still loading, Save is enabled and sends", async () => {
+    mockApi.previewScheduleSettings.mockReturnValue(new Promise<ScheduleSettingsPreview>(() => {}));
+    mockApi.createSchedule.mockResolvedValue({} as Awaited<ReturnType<typeof api.createSchedule>>);
+    renderModal();
+    const r = await region();
+    expect(within(r).getByText("Resolving…")).toBeTruthy();
+    await save();
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledTimes(1));
+  });
+
   it("shows Resolving… and then the unavailable state when the preview rejects", async () => {
     mockApi.previewScheduleSettings.mockRejectedValue(new Error("boom"));
     renderModal();
@@ -234,6 +262,8 @@ describe("schedule modal preview", () => {
     mockApi.previewScheduleSettings.mockRejectedValue(new Error("boom"));
     mockApi.createSchedule.mockRejectedValue(new ApiError(422, "model sonnet is not available for this harness"));
     renderModal();
+    const r = await region();
+    expect(await within(r).findByText("Preview unavailable; Save will validate your choices.", {}, WAIT)).toBeTruthy();
     await save();
     await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledTimes(1));
     expect(await screen.findByText("model sonnet is not available for this harness", {}, WAIT)).toBeTruthy();
