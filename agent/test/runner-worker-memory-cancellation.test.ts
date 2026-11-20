@@ -43,6 +43,7 @@ for (const generation of [7, undefined, 8]) {
       client: { memoryIncarnation: incarnation, getRunOwnership: async () => ({ status: "cancelled", claim_generation: generation }) },
       git,
       freeCaptureFlights: new WeakMap(),
+      claimWithCodexAuthority: RunRunner.prototype["claimWithCodexAuthority"],
       runFreeCapture: RunRunner.prototype["runFreeCapture"],
       requiresFreeCaptureScope: RunRunner.prototype["requiresFreeCaptureScope"],
       runGatedSink: RunRunner.prototype["runGatedSink"],
