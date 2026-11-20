@@ -969,6 +969,27 @@ function receiptMatches(observed: RecoveryExactHold, request: NonNullable<Recove
     (request.evidence === undefined || request.evidence === observed.release_evidence);
 }
 
+/** The accepted reconcile answer carries exactly the receipt the saved FINAL request would have produced
+ *  (shared by reconcileInventory's accepted branch and the pre-gate accepted-only recovery). */
+function acceptedReceiptMatchesSaved(response: RecoveryReconcileResponse, saved: NonNullable<RecoveryRecord["finalRequest"]>): boolean {
+  const receipt = response.final_receipt;
+  if (!receipt || response.reason !== undefined ||
+      typeof receipt.coverage_digest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.coverage_digest) ||
+      (receipt.kind === "archive" && (typeof receipt.capture_id !== "string" ||
+        typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
+      (receipt.kind === "settled" && (receipt.capture_id !== undefined || receipt.source_sha !== undefined ||
+        !["publication", "forge_no_output"].includes(response.release_evidence ?? ""))) ||
+      // Issue #2545: the api echoes a held receipt with its publication id; it is accepted only
+      // when it equals the saved request exactly (the equality below), never on its own.
+      (receipt.kind === "held_publication" && (receipt.capture_id !== undefined ||
+        typeof receipt.publication_id !== "string" || !HELD_PUBLICATION_ID_RE.test(receipt.publication_id) ||
+        typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
+      canonicalJson(receipt) !== canonicalJson(saved.disposition) ||
+      response.release_evidence !== saved.evidence ||
+      (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return false;
+  return true;
+}
+
 export interface RecoveryCoordinatorOptions {
   /** TEST-ONLY, constructor-only (#4007 slice B): turns the production-dark terminal-preservation gate on for this
    *  instance. Never passed by main.ts or worker.ts; see terminal-preservation.ts. */
@@ -3131,10 +3152,10 @@ export class RecoveryCoordinator {
     return false;
   }
 
-  private async frozenCoverageProven(record: RecoveryRecord): Promise<boolean> {
+  private async frozenCoverageProven(record: RecoveryRecord, gateChecked = false): Promise<boolean> {
     // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
     if (!record.coverageContext || !this.git.enumerateOwedCandidates) return false;
-    if (!await this.refusalGateAllows(record)) return false;
+    if (!gateChecked && !await this.refusalGateAllows(record)) return false;
     const unresolved = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(record.coverageContext!.barePath, record.runId));
     const frozenRoots = record.originalRoots ?? [];
     const ancestry = await this.frozenSourceAncestry(record, unresolved);
@@ -3239,7 +3260,19 @@ export class RecoveryCoordinator {
         thinArchive = true;
       } else return this.unmet("bundle_header");
     }
-    if (!await this.frozenCoverageProven(record)) return this.unmet("frozen_coverage");
+    // issue #4481: an ineligible refusal gate keeps custody, but a saved FINAL the api already accepted is
+    // recovered first (accepted-only, nothing is POSTed); anything else stays gated.
+    let gateChecked = false;
+    if (record.finalRequest && !this.operatorReplay.getStore()) {
+      if (!await this.refusalGateAllows(record)) {
+        const recovered = await this.recoverAcceptedFinalBeforeGate(record, prove);
+        if (recovered === "acked") return;
+        if (recovered) return recovered;
+        return this.unmet("frozen_coverage");
+      }
+      gateChecked = true;
+    }
+    if (!await this.frozenCoverageProven(record, gateChecked)) return this.unmet("frozen_coverage");
     // A new mint requires healthy capture status. For a saved thin archive FINAL,
     // status is diagnostic: send before looking it up, and reconcile first on failure.
     // Local header, source/coverage and inactivity proofs above still apply.
@@ -3292,6 +3325,8 @@ export class RecoveryCoordinator {
       if (residueQuarantine() !== undefined) { this.operatorRefuse("worker_quarantined"); return quarantinedOutcome(record.captureId); }
       if (!await this.restrictionsAllowCapturedC(record)) return this.unmet("restrictions");
       if (!await this.refusalSealAllows(record)) return this.unmet("refusal_seal");
+      // issue #4481: the seal awaits git I/O, so a latch that landed meanwhile is re-checked synchronously here.
+      if (residueQuarantine() !== undefined) { this.operatorRefuse("worker_quarantined"); return quarantinedOutcome(record.captureId); }
       // The operator's last client checkpoint and point of no return; nothing is awaited before the POST.
       if (replay) this.operatorBeforePost(replay);
       // The release POST goes through recoveryRPC, which refuses a scope that is no longer live at dispatch,
@@ -3540,6 +3575,8 @@ export class RecoveryCoordinator {
       }
       if (!await this.restrictionsAllowCapturedC(record)) return this.unmet("restrictions", kept());
       if (!await this.refusalSealAllows(record)) return this.unmet("refusal_seal", kept());
+      // issue #4481: the seal awaits git I/O, so a latch that landed meanwhile is re-checked synchronously here.
+      if (residueQuarantine() !== undefined) { this.operatorRefuse("worker_quarantined"); return { ...quarantinedOutcome(record.captureId), held: "kept" }; }
       // The operator's last client checkpoint and point of no return; nothing is awaited before the POST.
       if (replay) this.operatorBeforePost(replay);
       const ack = await this.recoveryRPC(() => replayProof
@@ -3657,6 +3694,70 @@ export class RecoveryCoordinator {
     return latest.record.finalRequest?.disposition.kind === "held_publication" ? "kept" as const : "fallback" as const;
   }
 
+  /** Persist `finalAcknowledged` for an accepted reconcile answer already proven equal to the saved FINAL.
+   *  Shared by reconcileInventory's accepted branch and the pre-gate recovery. Returns whether it acknowledged. */
+  private async acknowledgeAcceptedArchive(record: RecoveryRecord, saved: NonNullable<RecoveryRecord["finalRequest"]>,
+    prove: () => Promise<boolean>): Promise<boolean> {
+    if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return false;
+    const current = await this.writeRestrictionCheckedRecord(record, cur =>
+      residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
+      cur.generation === record.generation && cur.serverCaptureId === record.serverCaptureId && !cur.finalAcknowledged
+        ? { ...cur, finalAcknowledged: true } : undefined);
+    MaintenanceBudget.current()?.check();
+    if (!current.finalAcknowledged) return false;
+    this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
+    return true;
+  }
+
+  /**
+   * issue #4481: a saved FINAL the api may already have accepted must still be recoverable when the refusal
+   * gate is ineligible, because its release is committed and only the local ACK is missing. Acts ONLY on
+   * proof that the exact saved request was accepted; never POSTs a release, never writes a retained reason,
+   * reopens a hold or rewrites the record otherwise. The operator replay (which never writes) is not served.
+   *  - archive: the accepted-only half of reconcileInventory (same request, same validation).
+   *  - settled / held_publication: the observed closed hold must carry the exact saved receipt.
+   */
+  private async recoverAcceptedFinalBeforeGate(record: RecoveryRecord, prove: () => Promise<boolean>): Promise<RecoveryOutcome | "acked" | undefined> {
+    const saved = record.finalRequest;
+    if (!saved || this.operatorReplay.getStore()) return undefined;
+    try {
+      if (saved.disposition.kind === "archive") {
+        if (!record.serverCaptureId || !record.coverageDigest || !record.generation ||
+            !hasJournaledBundle(record) || !this.client.hasFeature?.("recovery_inventory_v1") ||
+            !this.client.reconcileRecoveryCapture) return undefined;
+        if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return undefined;
+        const response = await this.recoveryRPC(() => this.client.reconcileRecoveryCapture!(record.runId, record.serverCaptureId!, {
+          generation: record.generation!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest!,
+          checksum: record.checksum!, byte_size: record.byteSize!,
+        }, ...this.passSignalArgs()));
+        if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
+        if (!await this.restrictionsAllowCapturedC(record)) return undefined;
+        if (!response || typeof response !== "object" || Array.isArray(response) ||
+            response.run_id !== record.runId || response.generation !== record.generation ||
+            response.capture_id !== record.serverCaptureId! || response.outcome !== "accepted" ||
+            !acceptedReceiptMatchesSaved(response, saved)) return undefined;
+        return await this.acknowledgeAcceptedArchive(record, saved, prove) ? "acked" : undefined;
+      }
+      // settled and held_publication: observe the hold (this records a closed hold's settlement) and ACK only
+      // on the exact saved receipt.
+      if (await this.heldOperationState(record) !== "settled") return undefined;
+      if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return undefined;
+      const acknowledged = await this.writeRestrictionCheckedRecord(record, cur =>
+        residueQuarantine() === undefined && !cur.finalAcknowledged &&
+        canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
+        cur.holdSettlement !== undefined && receiptMatches(cur.holdSettlement, saved)
+          ? { ...cur, finalAcknowledged: true } : undefined);
+      MaintenanceBudget.current()?.check();
+      if (!acknowledged.finalAcknowledged) return undefined;
+      this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
+      return "acked";
+    } catch (err) {
+      MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
+      return undefined;
+    }
+  }
+
   /** One atomic reconciliation attempt; failures keep custody and every saved identity. */
   private async reconcileInventory(record: RecoveryRecord, prove: () => Promise<boolean>, status?: RecoveryCaptureStatusResponse): Promise<RecoveryOutcome | void> {
     if (!record.serverCaptureId || !record.coverageDigest || !record.generation ||
@@ -3676,29 +3777,9 @@ export class RecoveryCoordinator {
           response.run_id !== record.runId || response.generation !== record.generation ||
           response.capture_id !== record.serverCaptureId!) return unknown();
       if (response.outcome === "accepted") {
-        const receipt = response.final_receipt;
         const saved = record.finalRequest;
-        if (!saved || !receipt || response.reason !== undefined ||
-            typeof receipt.coverage_digest !== "string" || !/^[0-9a-f]{64}$/.test(receipt.coverage_digest) ||
-            (receipt.kind === "archive" && (typeof receipt.capture_id !== "string" ||
-              typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
-            (receipt.kind === "settled" && (receipt.capture_id !== undefined || receipt.source_sha !== undefined ||
-              !["publication", "forge_no_output"].includes(response.release_evidence ?? ""))) ||
-            // Issue #2545: the api echoes a held receipt with its publication id; it is accepted only
-            // when it equals the saved request exactly (the equality below), never on its own.
-            (receipt.kind === "held_publication" && (receipt.capture_id !== undefined ||
-              typeof receipt.publication_id !== "string" || !HELD_PUBLICATION_ID_RE.test(receipt.publication_id) ||
-              typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
-            canonicalJson(receipt) !== canonicalJson(saved.disposition) ||
-            response.release_evidence !== saved.evidence ||
-            (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return unknown();
-        if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
-        const current = await this.writeRestrictionCheckedRecord(record, cur =>
-          residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
-          cur.generation === record.generation && cur.serverCaptureId === record.serverCaptureId && !cur.finalAcknowledged
-            ? { ...cur, finalAcknowledged: true } : undefined);
-        MaintenanceBudget.current()?.check();
-        if (current.finalAcknowledged) this.onAuthoritativeGenerationReleased?.(record.runId, record.generation);
+        if (!saved || !acceptedReceiptMatchesSaved(response, saved)) return unknown();
+        await this.acknowledgeAcceptedArchive(record, saved, prove);
         return;
       }
       if (response.outcome === "retained") {

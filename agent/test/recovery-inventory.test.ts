@@ -8179,3 +8179,148 @@ it("#4140 C5 a validated 200 create_refused read back by the probe clears uncert
   assert.equal(f.finals.length, 1);
   assert.equal(heldKind(f.finals[0]), "archive");
 });
+
+// issue #4481 review: the seal awaits git I/O, so a residue latch that lands during it must stop the POST.
+for (const lane of ["archive", "held_publication"] as const) {
+  it(`#4481 a residue latch landing during the refusal seal sends no ${lane} FINAL`, async () => {
+    const { latchResidueQuarantine, resetResidueQuarantineForTests } = await import("../src/residue-quarantine.js");
+    try {
+      if (lane === "archive") {
+        const { f, before } = await pendingReceiptFixture();
+        try {
+          Object.assign(f.git, {
+            refusalReleaseGate: async () => ({ kind: "none" }),
+            sealRefusalRelease: async () => {
+              latchResidueQuarantine({ cause: "fixture", site: "cleanup" }, nullLogger());
+              return "sealed";
+            },
+          });
+          const finals = f.finals.length;
+          await f.make().resumePending(undefined, [before]);
+          assert.equal(f.finals.length, finals, "no release POST once the worker is latched");
+          resetResidueQuarantineForTests();
+          const after = (await f.coordinator.inspect("run-1"))[0]!;
+          assert.equal(after.finalAcknowledged, undefined);
+          assert.deepEqual(after.finalRequest, before.finalRequest);
+        } finally { await f.close(); }
+      } else {
+        const { f, record, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+        try {
+          closureRestrictions(f, record.sourceSha);
+          const publication = "00000000-0000-4000-8000-000000000009";
+          f.state.finalError = new Error("save held request");
+          await f.coordinator.releaseHeldPublication(record, publication);
+          f.state.finalError = undefined;
+          assert.equal((await saved()).finalRequest?.disposition.kind, "held_publication");
+          Object.assign(f.git, {
+            refusalReleaseGate: async () => ({ kind: "none" }),
+            sealRefusalRelease: async () => {
+              latchResidueQuarantine({ cause: "fixture", site: "cleanup" }, nullLogger());
+              return "sealed";
+            },
+          });
+          const finals = f.finals.length;
+          assert.equal(await f.coordinator.releaseHeldPublication(record, publication), "kept");
+          assert.equal(f.finals.length, finals, "no held release POST once the worker is latched");
+          assert.equal((await saved()).finalAcknowledged, undefined);
+        } finally { await f.close(); }
+      }
+    } finally { resetResidueQuarantineForTests(); }
+  });
+}
+
+// issue #4481 review: an exact already-accepted saved FINAL is recovered before the (ineligible) refusal gate.
+const INELIGIBLE_GATE = { refusalReleaseGate: async () => ({ kind: "ineligible", reason: "refusal history incomplete" }) };
+const HOLD_ID = "00000000-0000-4000-8000-000000000007";
+const REPO_ID = "00000000-0000-4000-8000-000000000008";
+
+it("#4481 an accepted saved archive FINAL is acknowledged without a POST while the refusal gate is ineligible", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    Object.assign(f.git, INELIGIBLE_GATE);
+    f.committedReceipts.set(before.generation!, Object.freeze(structuredClone(before.finalRequest!.disposition)));
+    const reconcile = f.client.reconcileRecoveryCapture!;
+    let reconciles = 0;
+    f.client.reconcileRecoveryCapture = async (...args) => { reconciles++; return reconcile(...args); };
+    const finals = f.finals.length;
+    await f.make().resumePending(undefined, [before]);
+    assert.equal(reconciles, 1);
+    assert.equal(f.finals.length, finals, "nothing is POSTed");
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const answer of ["different receipt", "retained", "replaceable"] as const) {
+  it(`#4481 a ${answer} reconcile answer under an ineligible gate keeps the record untouched and POSTs nothing`, async () => {
+    const { f, before } = await pendingReceiptFixture();
+    try {
+      Object.assign(f.git, INELIGIBLE_GATE);
+      let reconciles = 0;
+      f.client.reconcileRecoveryCapture = async (run, id, request) => {
+        reconciles++;
+        const base = { run_id: run, capture_id: id, generation: request.generation };
+        if (answer === "retained") return { ...base, outcome: "retained", reason: "capture_failure_requires_attention" };
+        if (answer === "replaceable") return { ...base, outcome: "replaceable" };
+        return { ...base, outcome: "accepted", final_receipt: { ...before.finalRequest!.disposition, source_sha: H2 } } as never;
+      };
+      const finals = f.finals.length;
+      await f.make().resumePending(undefined, [before]);
+      assert.equal(reconciles, 1, "the accepted-only recovery asked once");
+      assert.equal(f.finals.length, finals);
+      assert.deepEqual((await f.coordinator.inspect("run-1"))[0], before, "no reason, hold reopen or rewrite");
+    } finally { await f.close(); }
+  });
+}
+
+it("#4481 without a saved FINAL an ineligible gate stays gated and asks nothing", async () => {
+  const { f, before } = await pendingReceiptFixture(false);
+  try {
+    assert.equal(before.finalRequest, undefined);
+    Object.assign(f.git, INELIGIBLE_GATE);
+    let reconciles = 0;
+    const reconcile = f.client.reconcileRecoveryCapture!;
+    f.client.reconcileRecoveryCapture = async (...args) => { reconciles++; return reconcile(...args); };
+    const finals = f.finals.length;
+    await f.make().resumePending(undefined, [before]);
+    assert.equal(reconciles, 0);
+    assert.equal(f.finals.length, finals);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalAcknowledged, undefined);
+  } finally { await f.close(); }
+});
+
+for (const kind of ["held_publication", "settled"] as const) {
+  for (const observed of ["exact receipt", "different receipt", "open"] as const) {
+    it(`#4481 a saved ${kind} FINAL with ${observed} observed hold under an ineligible gate`, async () => {
+      const { f, before } = await pendingReceiptFixture();
+      try {
+        const disposition = kind === "held_publication"
+          ? { kind, publication_id: "00000000-0000-4000-8000-000000000009", source_sha: before.sourceSha, coverage_digest: before.coverageDigest! }
+          : { kind, coverage_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+        const evidence = kind === "settled" ? "publication" : undefined;
+        await patchAuthenticated(f, before, { finalRequest: { disposition, ...(evidence ? { evidence } : {}) } as never,
+          exactHoldBinding: { holdId: HOLD_ID, repoId: REPO_ID },
+          ...(kind === "settled" ? { originalRoots: [], coverageDigest: disposition.coverage_digest } : {}) });
+        const record = (await f.coordinator.inspect("run-1"))[0]!;
+        Object.assign(f.git, INELIGIBLE_GATE);
+        Object.assign(f.client, {
+          getExactRecoveryHold: async () => ({
+            run_id: "run-1", hold_id: HOLD_ID, repo_id: REPO_ID, generation: 7,
+            state: observed === "open" ? "open" : "released",
+            original_worker_id: "original", original_worker_identity: "original", inventory_guarded: true,
+            run_status: "failed", current_claim_generation: 7, claim_released: true,
+            ...(observed === "open" ? { live_worker_id: "original", live_run_id: "run-1" } : {
+              release_evidence: evidence ?? "archive",
+              final_receipt: observed === "exact receipt" ? structuredClone(disposition) : { ...disposition, coverage_digest: "e".repeat(64) },
+            }),
+          }),
+        });
+        const finals = f.finals.length;
+        await f.make().resumePending(undefined, [record]);
+        assert.equal(f.finals.length, finals, "nothing is POSTed");
+        const after = (await f.coordinator.inspect("run-1"))[0]!;
+        assert.equal(after.finalAcknowledged, observed === "exact receipt" ? true : undefined);
+        assert.deepEqual(after.finalRequest, record.finalRequest);
+      } finally { await f.close(); }
+    });
+  }
+}
