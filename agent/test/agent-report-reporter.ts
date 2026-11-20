@@ -21,7 +21,9 @@
 // The marker carries the guarantee, not the event order. The launcher renames it into place
 // before it sends any signal, so it is visible before any death that signal causes. Node can
 // hand over the death before `test:interrupted`: the signal and the child exit reach libuv's
-// signal pipe from whichever thread takes them.
+// signal pipe from whichever thread takes them. With no marker, the guard falls back to that event
+// order and a death handed over first is recorded as done. That happens if the marker write failed,
+// or a stop signal reached the group without going through the launcher.
 //
 // Self-contained at runtime on purpose: node loads a reporter module without the `.js` -> `.ts`
 // mapping a relative import needs, so this file imports only node builtins and TYPES (erased).

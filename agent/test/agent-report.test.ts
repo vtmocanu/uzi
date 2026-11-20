@@ -219,12 +219,34 @@ const leaking = [
   '});',
 ].join("\n");
 
+// Imported by the fixture launcher alone. It records whether the stop marker exists when the
+// launcher sends its first group signal: the marker must precede every signal (#4547).
+function markerPreload(root: string): string {
+  const preload = path.join(root, "marker-probe.mjs");
+  writeFileSync(preload, `
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const root = ${JSON.stringify(root)};
+const out = path.join(root, "marker-at-signal.json");
+const kill = process.kill.bind(process);
+process.kill = (pid, signal) => {
+  if (pid < 0 && signal !== 0 && signal !== undefined && !existsSync(out)) {
+    const { dir } = JSON.parse(readFileSync(path.join(root, ".test-report/latest.json"), "utf8"));
+    writeFileSync(out, JSON.stringify({ signal, present: existsSync(path.join(dir, ${JSON.stringify(STOP_MARKER)})) }));
+  }
+  return kill(pid, signal);
+};
+`);
+  return preload;
+}
+
 test("the watchdog stops a hung file only after every other file finished, and reaps its process group", { timeout: 60_000 }, async () => {
   const root = fixture({
     "a-leak.test.ts": leaking,
     "b-ok.test.ts": 'import test from "node:test";\ntest("ok", async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });\n',
   });
-  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "1500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "2" });
+  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "1500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "2" },
+    markerPreload(root));
   try {
     const result = await run.closed;
     const text = run.output.join("");
@@ -237,6 +259,11 @@ test("the watchdog stops a hung file only after every other file finished, and r
     assert.equal(summary.termination, "watchdog");
     assert.deepEqual(summary.hung_files, ["test/a-leak.test.ts"]);
     assert.equal(summary.cleanup, "verified");
+    assert.deepEqual(readJson(path.join(root, "marker-at-signal.json")), { signal: "SIGTERM", present: true },
+      "the stop marker exists before the watchdog's first signal");
+    // The stop killed the hung file's process: it stays in flight, never a file failure.
+    assert.deepEqual(summary.in_flight_files, ["test/a-leak.test.ts"]);
+    assert.equal(summary.progress!.counts.file_failures, 0);
     assert.ok(summary.progress!.files["test/b-ok.test.ts"]!.done_at, "the other file completed first");
     assert.equal(summary.progress!.counts.pass, 2, "the leaking file's test itself passed");
     assert.equal(alive(Number(readFileSync(path.join(root, "leak.pid"), "utf8"))), false, "the hung file process is gone");
@@ -311,7 +338,8 @@ test("the watchdog does not fire while another file is still queued; SIGTERM the
     "b-queued.test.ts": 'import test from "node:test";\ntest("queued", () => {});\n',
   });
   // Concurrency 1: the queued file cannot start while the hung one holds the only slot.
-  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "1" });
+  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "1" },
+    markerPreload(root));
   try {
     await until(() => existsSync(path.join(root, "grandchild.pid")), 20_000, "the leaking test");
     // The pid file is the test body's own write. Wait for the reporter to list the file before the stall windows.
@@ -330,6 +358,8 @@ test("the watchdog does not fire while another file is still queued; SIGTERM the
     assert.deepEqual(summary.in_flight_files, ["test/a-leak.test.ts"]);
     assert.equal(summary.cleanup, "verified");
     assert.equal(alive(Number(readFileSync(path.join(root, "grandchild.pid"), "utf8"))), false);
+    assert.deepEqual(readJson(path.join(root, "marker-at-signal.json")), { signal: "SIGTERM", present: true },
+      "the stop marker exists before the forwarded signal");
   } finally {
     for (const name of ["leak.pid", "grandchild.pid"]) {
       const pid = Number(readJson<number>(path.join(root, name)));
@@ -359,7 +389,7 @@ function signalGroupIfAlive(pid: number, signal: NodeJS.Signals): void {
 }
 
 const LINUX_ONLY = process.platform !== "linux"
-  ? "relies on Linux delivering node's SIGTERM before the dead file process's exit; the ordering itself is pinned by the event-source tests"
+  ? "holds the runner with SIGSTOP and spots the dead file process as a zombie via ps, a sequence only verified on Linux; the reporter's guard is pinned on every platform by the event-source tests"
   : false;
 
 /**
@@ -389,7 +419,7 @@ async function stopWhileRunnerHeld(): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 300));
     process.kill(runnerPid, "SIGCONT");
     const held = Date.now() - stoppedAt;
-    assert.ok(held < 1_000, `the runner was held ${held}ms; it must resume inside the launcher's 2s escalation`);
+    assert.ok(held < 1_500, `the runner was held ${held}ms; it must resume well inside the launcher's 2s escalation`);
     const result = await run.closed;
     assert.equal(result.signal, "SIGTERM", run.output.join(""));
     const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
@@ -426,6 +456,9 @@ test("a file killed by the interrupting signal stays in flight even when the run
   // Whether node hands the death over before it exits depends on which of its threads takes which
   // signal. With the 300ms hold that happened on every local run, but an attempt that did not get
   // the race proves nothing, so up to three attempts are made. Any attempt failing an assertion fails.
+  // "Got the race" means the completion was handled after the stop, in either order relative to
+  // test:interrupted. The marker arm itself is proven deterministically by the event-source tests,
+  // and the launcher's marker-before-signal order by the marker probe in the SIGTERM and watchdog tests.
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (await stopWhileRunnerHeld()) return;
   }

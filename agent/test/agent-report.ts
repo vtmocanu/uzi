@@ -115,7 +115,8 @@ export interface Summary {
 
 /**
  * Files in flight (started, not done), oldest activity first. A file whose process the run's own
- * stop killed is still in flight: the reporter never marks it done (agent-report-reporter.ts).
+ * stop killed stays in flight whenever the reporter can tell the stop caused it: the launcher's
+ * stop marker or test:interrupted came first (agent-report-reporter.ts).
  */
 export function inFlight(progress: Progress): string[] {
   return Object.entries(progress.files)
