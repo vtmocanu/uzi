@@ -1355,7 +1355,7 @@ admissions; they stay reachable in the worker's bare (no worker-side discard
 removes them). In a mixed fleet an older worker may treat a bare holding
 these records as disposable and leak the nested refs and records. The gate
 is consulted on every inventory-guarded release, but it is a no-op when the
-run has no refusal evidence, is below the cap and has no owed-path marker, so releases with no refusal evidence below the cap and no marker
+run has no refusal evidence, is below the cap and has no owed-path marker at or below that generation, so releases with no refusal evidence below the cap and no marker
 are not held up by these records. A run with earlier recorded
 refusals, or exactly at the cap, needs complete admissions even if its
 terminal fetch succeeded. An old worker's refused head that old code deleted

@@ -372,7 +372,7 @@ fails, or the ledger is invalid, unbound or full, or the owed-path marker write
 fails, the run is latched in-process
 (`refusalRecordingFailed`) and its gate and seal are ineligible ("refusal
 recording failed in this process") for the worker process lifetime. The same
-failure (seal-directory read, refused-ref write or ledger write) also writes a
+failure (seal-directory read, refused-ref write, ledger write or owed-path marker write) also writes a
 durable `info/uzi-refusals/incomplete-<run>.json` marker
 (`markRefusalIncomplete`, best effort, never throws, independent of the other
 recording steps). While the marker is present the gate, and so the seal, is
@@ -425,7 +425,7 @@ an ancestor of, or equal to, the release source (or pinned under
 refusal evidence, the pin count below the cap and no owed-path marker at or
 below G: the ordinary path, unchanged.
 The gate is consulted on every inventory-guarded release but is a no-op
-(`none`) for a run with no refusal evidence below the cap and no owed-path marker; a run with earlier
+(`none`) for a run with no refusal evidence below the cap and no owed-path marker at or below that generation; a run with earlier
 recorded refusals, or exactly at the cap, needs complete admissions even if its
 terminal fetch succeeded. The gate runs before the freeze, before archive capture or upload, before the
 held publish, and inside the coverage proof before every guarded FINAL.
@@ -534,7 +534,7 @@ cap release (the gate itself is consulted on every inventory-guarded release but
 is a no-op without refusal evidence below the cap and without an owed-path marker). An old worker's refused head
 that old code deleted leaves no trace; the ordinary release proceeds as today.
 This is pre-existing and accepted. Releases with no refusal evidence below the
-cap and no owed-path marker are not gated on admission records. The restart
+cap and no owed-path marker at or below the releasing generation are not gated on admission records. The restart
 residual that earlier text left open is closed by the owed-path marker above.
 
 **Rework (2026-11-20, #4481 review).** The code now also does the following.
