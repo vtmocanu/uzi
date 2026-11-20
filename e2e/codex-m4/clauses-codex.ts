@@ -49,7 +49,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     seam: "harness-p production launcher/config/auth/transport/broker with offline loopback provider",
     positiveControl: "nested uzi_apply_patch reaches broker fileop and nested uzi_bash reaches command seam; outputs return to provider",
     negativeOracle: "each nested/direct patch refusal, unsupported goal dispatch and exact empty/unknown-server resource outcome precedes controls with zero callbacks, spawns, fileops and markers; exact inventories and model IDs",
-    intendedOutcome: "native patch execution is denied and goal tools are disabled across curated fresh/cold roots; three registered MCP helpers have fixed no-server outcomes, with exact-clause owner acceptance unresolved",
+    intendedOutcome: "owner accepted 2026-11-20: native patch is inert without an execution environment and three MCP helpers are inert under no native MCP servers are configured; goals remain disabled; new server configuration requires fresh authority review",
     tests: Object.values(NATIVE_PATCH_INERT_TITLES),
   },
   {

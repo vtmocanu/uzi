@@ -1,3 +1,4 @@
+import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { rangeScanBytes } from "../src/codex/broker.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "../src/protocol.js";
 import { it } from "node:test";
@@ -232,7 +233,7 @@ function rig(options: {
 }
 
 it("production turn/start sends the unchanged Plan schema and omits Code schema without a capture adapter", async () => {
- for (const stage of ["plan", "code"] as const) {
+ for (const stage of ["plan", "code"] as const) for (let invocation = 0; invocation < 2; invocation++) {
   const r = rig({ claim: stage === "plan" ? claim() : codeClaim(),
    notes: emit => r.terminal(emit, stage === "plan" ? verdict : '{"findings":[]}') });
   await r.run();
@@ -240,6 +241,9 @@ it("production turn/start sends the unchanged Plan schema and omits Code schema 
   assert.equal(turns.length, 1);
   const threads = r.requests.filter(frame => frame.method === "thread/start");
   assert.equal(threads.length, 1);
+  assertNoNativeServers(threads[0]!.params!.config);
+  assert.equal(threads[0]!.params!.ephemeral, true);
+  assert.equal(r.requests.some(f => f.method === "thread/resume"), false);
   assert.deepEqual(threads[0]!.params!.environments, [], stage + " thread disables native environments");
   assert.deepEqual(turns[0]!.params!.environments, [], stage + " turn disables native environments");
   if (stage === "plan") {

@@ -1,3 +1,4 @@
+import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { rangeScanBytes } from "../src/codex/broker.js";
 import { m3ReduceAndPersist } from "./m3-projection-fixture.js";
 import { describe, it } from "node:test";
@@ -2068,6 +2069,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     const params = rec(start.params);
     assert.equal(params.ephemeral, false, "run roots persist the rollout required by new-root resume");
     const config = rec(params.config);
+    assertNoNativeServers(config);
     assert.deepEqual(params.environments, [], "an empty environment list disables native shell and patch tools");
     const dynamicTools = params.dynamicTools as Array<Record<string, unknown>>;
     assert.ok(dynamicTools.some((tool) => tool.name === "signal_done"), "the root callback vocabulary is registered");
@@ -2111,6 +2113,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined);
     const config = rec(params.config);
+    assertNoNativeServers(config);
     assert.equal(config.project_doc_max_bytes, 0);
     assert.deepEqual(rec(config.projects)[WORKSPACE], { trust_level: "untrusted" });
     assert.doesNotMatch(JSON.stringify(params), /bypass_hook_trust/);

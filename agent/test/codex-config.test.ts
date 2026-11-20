@@ -1,3 +1,5 @@
+import { parse } from "smol-toml";
+import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -235,5 +237,34 @@ describe("buildCodexLoopbackTestConfigToml: authenticated packaged fake", () => 
         value,
       );
     }
+  });
+});
+
+describe("no native MCP servers are configured", () => {
+  for (const authMode of ["api_key", "subscription"] as const) {
+    for (const codeModeHost of [false, true]) {
+      for (const builder of ["production", "loopback"] as const) {
+        it(`${builder}/${authMode}/host=${codeModeHost} semantic no-server config`, () => {
+          const opts = { model: "gpt-6-astra", projectPath: "/work/repo", authMode, codeModeHost };
+          const config = parse(builder === "production" ? buildCodexProductionConfigToml(opts)
+            : buildCodexLoopbackTestConfigToml(opts, "http://127.0.0.1:43123/v1"));
+          assertNoNativeServers(config);
+          assert.equal((config.features as Record<string, unknown>).goals, false);
+        });
+      }
+    }
+  }
+  it("custom provider semantic no-server config", () => {
+    const config = parse(buildCodexConfigToml(OPTS));
+    assertNoNativeServers(config);
+    assert.equal((config.features as Record<string, unknown>).goals, false);
+  });
+  it("rejects nested, dotted and quoted outgoing server keys without inspecting values", () => {
+    for (const config of [
+      { mcp_servers: {} }, { "mcp_servers.fixture.command": "unused" },
+      { '"mcp_servers".fixture': {} }, { features: { mcp_servers: {} } },
+      { "'mcp_servers'.fixture": {} },
+    ]) assert.throws(() => assertNoNativeServers(config), /no native MCP servers/);
+    assertNoNativeServers({ model: "mcp_servers", projects: { "/work/repo": { trust_level: "untrusted" } } });
   });
 });

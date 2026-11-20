@@ -16,6 +16,18 @@ const models = (JSON.parse(readFileSync(path.resolve(__dirname, "../../fixtures/
 const structured = ["functions", "functions.exec", "functions.wait", "functions.request_user_input", "functions.request_user_input_async"];
 const nested = ["apply_patch", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "uzi_bash", "uzi_apply_patch", "clock__curr_time"];
 
+// Accepted inventory is exact: existing plumbing/worker callbacks plus patch and
+// the three no-server MCP helpers. Model-specific omissions below remain required.
+function assertAcceptedInventory(actual: readonly string[], expected: readonly string[]): void {
+  assert.deepEqual([...actual].sort(), [...expected].sort());
+}
+
+test("accepted native inventory rejects an unknown native", () => {
+  assertAcceptedInventory(nested, nested);
+  assert.throws(() => assertAcceptedInventory([...nested, "unknown_native"], nested));
+  assert.throws(() => assertAcceptedInventory([...structured, "functions.unknown_native"], structured));
+});
+
 // Each call-linked outcome is checked before worker controls, with no native MCP servers.
 const goals = ["create_goal", "get_goal", "update_goal"] as const;
 const utilities = [
@@ -110,10 +122,10 @@ for (const model of models) {
         // The real pinned gpt-5.6-sol catalog omits the DirectModelOnly async helper and nested UTC helper.
         const expectedStructured = model === "gpt-5.6-sol"
           ? ["functions", "functions.exec", "functions.wait", "functions.request_user_input"] : structured;
-        assert.deepEqual(inventory.structuredNames.sort(), [...expectedStructured].sort());
+        assertAcceptedInventory(inventory.structuredNames, expectedStructured);
         const expectedNested = model === "gpt-5.6-sol"
           ? ["apply_patch", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "uzi_bash", "uzi_apply_patch"] : nested;
-        assert.deepEqual(inventory.nestedNames.sort(), [...expectedNested].sort());
+        assertAcceptedInventory(inventory.nestedNames, expectedNested);
       }
       assert.equal(obs.spawnEnv.CODEX_EXEC_SERVER_URL, scenario === "fresh-no-launcher-guard" ? undefined : "none");
       const requests = [obs.threadParams, obs.turnParams];

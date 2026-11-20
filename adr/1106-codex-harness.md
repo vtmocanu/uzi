@@ -374,6 +374,16 @@ callback must resolve only after its owned child turn finishes; root completion
 alone cannot establish that condition. Role TOML and healthy hook behavior are
 not substitutes for these checks.
 
+Owner accepted on 2026-11-20: `apply_patch` is inert with no execution
+environment; `list_mcp_resources`, `list_mcp_resource_templates` and
+`read_mcp_resource` are inert under the exact invariant **no native MCP servers are configured**.
+Any later native MCP server configuration requires fresh authority review.
+`[features].goals = false` remains mandatory. Existing layers retain this boundary:
+empty thread/turn execution environments, `CODEX_EXEC_SERVER_URL=none`,
+isolated configuration and environment, native feature suppression and untrusted
+project configuration, and the worker broker for permitted effects. This acceptance
+makes no global inertness or packaged OS isolation claim.
+
 ### Accepted native exceptions (#1566)
 
 **Current characterization (0.159.3).** Option 1 explicitly accepts the two
@@ -1508,8 +1518,9 @@ MCP server, list_mcp_resources and list_mcp_resource_templates return exact empt
 resources/resourceTemplates JSON; read_mcp_resource for offline-fixture returns an
 unknown MCP server error. Each observed outcome precedes controls with zero callbacks,
 spawns, fileops or markers. These finite no-server observations do not prove global
-inertness. Acceptance of the remaining three helpers against the exact single-inert-native
-clause is an unresolved owner decision, not approved; INV_EXTRA_NATIVES is not closed.
+inertness. Owner accepted these helpers on 2026-11-20 under **no native MCP servers are configured**;
+INV_EXTRA_NATIVES is closed under that invariant. Adding any native MCP server
+requires fresh authority review. Native patch is accepted only without an execution environment.
 `gpt-5.6-sol` omits the async and UTC helpers shown by the other curated
 models. The legacy [native-bypass probes](../e2e/codex-m4/native-bypass.test.ts)
 retain their representative top-level inventory assertion; they do not prove
