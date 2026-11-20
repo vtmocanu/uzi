@@ -286,6 +286,114 @@ describe("AdminWorkers recreated cases", () => {
   });
 });
 
+describe("sibling-card save responses (#4544)", () => {
+  // Loose builder for keys the AppSettings fixture type does not enumerate.
+  const resp = (over: Record<string, string>, sources: Record<string, Src> = {}) =>
+    response(over as Partial<import("../lib/api").AppSettings>, sources);
+  const HIB_SAVE = "Save worker hibernation settings";
+  const hibBox = () => screen.getByRole("checkbox", { name: "Allow hibernating persistent hosted workers" }) as HTMLInputElement;
+  const hibSave = () => screen.getByRole("button", { name: HIB_SAVE }) as HTMLButtonElement;
+  const hibKeys = { worker_hibernation_auto: "false", worker_hibernation_idle_after: "336h", worker_hibernation_surplus: "false", worker_hibernation_surplus_idle_after: "2h" };
+
+  it("keeps a sibling card's confirmed value when a slower, older response lands", async () => {
+    mockApi.getSettings.mockResolvedValue(resp({ docker_repo_allowlist: "repo-uzi", worker_hibernation_enabled: "false", ...hibKeys }));
+    let release!: (r: ReturnType<typeof response>) => void;
+    const held = new Promise<ReturnType<typeof response>>((res) => {
+      release = res;
+    });
+    mockApi.updateSettings.mockReturnValueOnce(held as never);
+    mockApi.updateSettings.mockResolvedValueOnce(resp({ docker_repo_allowlist: "repo-uzi", worker_hibernation_enabled: "true", ...hibKeys }) as never);
+    renderPage();
+    fireEvent.click(await screen.findByLabelText(/vtmocanu\/two/));
+    fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(hibBox());
+    fireEvent.click(hibSave());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText("Worker hibernation settings saved.")).toBeTruthy());
+    expect(hibSave().disabled).toBe(true);
+
+    // The older allowlist response still carries the pre-save hibernation value.
+    release(resp({ docker_repo_allowlist: "repo-two,repo-uzi", worker_hibernation_enabled: "false", ...hibKeys }));
+    await screen.findByText(/repo allowlist saved/i);
+
+    expect(hibBox().checked).toBe(true);
+    // Save stays disabled only if the page still holds "true" (the card's checkbox is local state).
+    expect(hibSave().disabled).toBe(true);
+    fireEvent.click(hibBox());
+    expect(hibSave().disabled).toBe(false);
+  });
+
+  it("seeds every key on load and keeps another card's source state when a card saves", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      resp(
+        { docker_repo_allowlist: "repo-uzi", capability_aware_scheduling: "true", ephemeral_lease: "30m", hosted_default_size: "s" },
+        { capability_aware_scheduling: "env", ephemeral_lease: "env", hosted_default_size: "db" },
+      ),
+    );
+    mockApi.updateSettings.mockResolvedValue(
+      resp({ docker_repo_allowlist: "repo-two,repo-uzi" }, { capability_aware_scheduling: "db", docker_repo_allowlist: "db" }) as never,
+    );
+    renderPage();
+    const toggle = () => screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement;
+    await screen.findByText("Capability-aware scheduling");
+    expect(toggle().disabled).toBe(true);
+    const lease = screen.getByLabelText("Idle lease") as HTMLInputElement;
+    expect(lease.value).toBe("30m");
+    expect(lease.disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
+
+    fireEvent.click(await screen.findByLabelText(/vtmocanu\/two/));
+    fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
+    await screen.findByText(/repo allowlist saved/i);
+
+    expect(toggle().disabled).toBe(true);
+    expect((screen.getByLabelText("Idle lease") as HTMLInputElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
+  });
+
+  it("merges the response values for the sent keys only, and sends exactly the payload", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      resp({ docker_repo_allowlist: "repo-uzi", capability_aware_scheduling: "true", ephemeral_lease: "30m", hosted_default_size: "s", hosted_worker_quota: "2" }),
+    );
+    renderPage();
+    const quota = () => screen.getByRole("spinbutton", { name: "Hosted workers per user" }) as HTMLInputElement;
+    await screen.findByText("Capability-aware scheduling");
+
+    // Allowlist: the response also carries unsent keys with other values; they must not land.
+    mockApi.updateSettings.mockResolvedValueOnce(
+      resp({ docker_repo_allowlist: "repo-uzi", capability_aware_scheduling: "false", hosted_worker_quota: "9" }) as never,
+    );
+    fireEvent.click(await screen.findByLabelText(/vtmocanu\/two/));
+    fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ docker_repo_allowlist: "repo-two,repo-uzi" }));
+    await screen.findByText(/repo allowlist saved/i);
+    // The sent key took the response's value (the server kept only repo-uzi).
+    expect((screen.getByLabelText(/vtmocanu\/two/) as HTMLInputElement).checked).toBe(false);
+    expect(quota().value).toBe("2");
+    expect((screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement).checked).toBe(true);
+
+    // Capability: its own key lands, the unsent quota does not.
+    mockApi.updateSettings.mockResolvedValueOnce(resp({ capability_aware_scheduling: "false", hosted_worker_quota: "7" }) as never);
+    fireEvent.click(screen.getByLabelText(/enable capability-aware scheduling/i));
+    fireEvent.click(screen.getByRole("button", { name: /save capability scheduling/i }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ capability_aware_scheduling: "false" }));
+    await screen.findByText("Capability-aware scheduling setting saved.");
+    expect(quota().value).toBe("2");
+
+    // A SettingControl-based control: the default-size selector.
+    mockApi.updateSettings.mockResolvedValueOnce(
+      resp({ hosted_default_size: "m", ephemeral_lease: "99m" }, { hosted_default_size: "db" }) as never,
+    );
+    fireEvent.change(screen.getByLabelText("Default size for new workers"), { target: { value: "m" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Default size for new workers" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ hosted_default_size: "m" }));
+    await waitFor(() => expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("m"));
+    expect((screen.getByLabelText("Idle lease") as HTMLInputElement).value).toBe("30m");
+  });
+});
+
 describe("AdminWorkers worker sizes (PRD #4213)", () => {
   const optionTexts = (label: string) =>
     [...(screen.getByLabelText(label) as HTMLSelectElement).options].filter((o) => !o.disabled).map((o) => o.textContent);

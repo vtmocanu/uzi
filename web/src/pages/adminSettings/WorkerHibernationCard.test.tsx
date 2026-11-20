@@ -107,7 +107,9 @@ describe("WorkerHibernationCard", () => {
     );
     expect(mockApi.updateSettings).toHaveBeenCalledTimes(1);
     expect(await screen.findByText("Worker hibernation settings saved.")).toBeTruthy();
-    expect(onSaved).toHaveBeenCalledWith(resp);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(onSaved.mock.calls[0][0]).toBe(resp);
+    expect(onSaved.mock.calls[0][1]).toBe(mockApi.updateSettings.mock.calls[0][0]);
     expect(threshold().value).toBe("720h");
   });
 

@@ -1,5 +1,12 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, type AppSettings, type AdminDockerAllowlistRepo, type SettingSource, type SettingsResponse } from "../../lib/api";
+import {
+  api,
+  type AppSettings,
+  type AdminDockerAllowlistRepo,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
+} from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
@@ -38,7 +45,7 @@ export function DockerAllowlistCard({
 }: {
   settings: AppSettings;
   sources: Record<string, SettingSource>;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const demo = useDemoMode();
   const [repos, setRepos] = useState<AdminDockerAllowlistRepo[]>([]);
@@ -91,8 +98,9 @@ export function DockerAllowlistCard({
     const value = chosenSpellings(selected).join(",");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ docker_repo_allowlist: value });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { docker_repo_allowlist: value };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setSelected(new Set(parseAllowlist(resp.settings.docker_repo_allowlist)));
       setNotice("Docker worker repo allowlist saved.");
     } catch (err) {
