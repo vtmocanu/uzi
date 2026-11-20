@@ -1252,6 +1252,7 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
     lastCheckpointRefTip: string | undefined;
     lastAttemptedCheckpointRefTip: string | undefined;
     reportedPublishOutcomes: Set<string>;
+    providerKeyForms: readonly string[];
     runLog: Logger;
     batcher: { emit: (m: unknown) => void };
   }
@@ -1285,7 +1286,7 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
       owedContext: Promise.resolve(context),
       lastCheckpointRefTip: undefined,
       lastAttemptedCheckpointRefTip: undefined,
-      reportedPublishOutcomes: new Set<string>(),
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(),
       runLog: log,
       batcher: { emit() {} },
       ...over,

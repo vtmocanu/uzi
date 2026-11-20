@@ -523,7 +523,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
       lastAttemptedCheckpointRefTip: "ATTEMPTED",
-      reportedPublishOutcomes: new Set<string>(),
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(),
       runLog: logger,
       redactText: makeTextRedactor([PAT]),
       batcher: { emit(message: { payload?: { text?: string } }) {
@@ -575,7 +575,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
       lastAttemptedCheckpointRefTip: "ATTEMPTED",
-      reportedPublishOutcomes: new Set<string>(),
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(),
       runLog: logger,
       batcher: { emit(message: { payload?: { text?: string } }) {
         if (message.payload?.text) feed.push(message.payload.text);
@@ -994,7 +994,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
       checkpointFloor: P,
       lastCheckpointRefTip: "CONFIRMED",
       lastAttemptedCheckpointRefTip: "ATTEMPTED",
-      reportedPublishOutcomes: new Set<string>(),
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(),
       runLog: nullLogger(),
       batcher: { emit(message: { payload?: { text?: string } }) {
         if (message.payload?.text) lines.push(message.payload.text);

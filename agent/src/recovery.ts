@@ -1944,7 +1944,7 @@ export class RecoveryCoordinator {
         try {
           return await prepareFrozenHeldPinned({
             git: pinned, barePath, branch: record.branch, sourceSha: record.sourceSha, policy, deadlineMs: 30_000,
-            perCommitCi: true, ciTarget: coverageContext.defaultIdentity.sha, expectDigests,
+            literals: [], perCommitCi: true, ciTarget: coverageContext.defaultIdentity.sha, expectDigests,
             remediationHold: async () => !await this.restrictionsAllowCapturedC(record),
           }, range);
         } catch { MaintenanceBudget.current()?.check(); return { reason: "preparation_failed" }; }
@@ -3987,6 +3987,8 @@ export class RecoveryCoordinator {
         git.rangeTouchesWorkflows && git.changedFilesNoRenames && git.checkpointPack
           ? await prepareFrozenHeld({ git: git as HeldGit, barePath: input.barePath,
             branch: record.branch, sourceSha: record.sourceSha, policy: record.heldPolicy!, deadlineMs: 30_000,
+            // No claim here, so no key forms: a provider-bound policy (providerKeyScan) fails closed.
+            literals: [],
             remediationHold: async () => !await this.restrictionsAllowCapturedC(record) })
           : { reason: "preparation_unavailable" };
       const prepared = await prepare().catch(() => ({ reason: "preparation_failed" }));

@@ -136,7 +136,7 @@ function start(opts: {
   } };
   const flight = { cancel: abort, steering: { lifecycleSignal: () => abort.signal }, runId: "retry", runKind: "issue", barePath: "bare", branch: "branch", lastCheckpointRefTip: "OLD",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
-    reportedPublishOutcomes: new Set<string>(), runLog,
+    providerKeyForms: [], reportedPublishOutcomes: new Set<string>(), runLog,
     batcher: { emit: (value: unknown) => feed.push(value) } };
   let settled = false;
   const done = seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, abort.signal)
