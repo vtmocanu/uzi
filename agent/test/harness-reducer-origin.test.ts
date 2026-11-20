@@ -8,6 +8,8 @@ import { RunTurnReducerImpl } from "../src/harness-reducer.js";
 import type { RunTurnRequest } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+import { makeTextRedactor, providerKeyForms } from "../src/redact.js";
+import { REPORT_MD_MAX_LEN } from "../src/signals.js";
 
 const config: ClaudeTurnConfig = {
   cwd: "/tmp/uzi-origin-test", env: {}, skillsPluginPath: "/tmp/uzi-origin-plugin",
@@ -27,7 +29,7 @@ function assistant(text: string, markers: Record<string, unknown> = {}): Record<
   };
 }
 
-async function reduceRaw(frames: Record<string, unknown>[], ownerDecisionRequested = false) {
+async function reduceRaw(frames: Record<string, unknown>[], ownerDecisionRequested = false, extra: Partial<RunTurnRequest> = {}) {
   const queryFn = (() => (async function* () { for (const frame of frames) yield frame; })()) as unknown as SdkQueryFn;
   const harness = new ClaudeHarness({
     queryFn, spawn: () => ({ pid: undefined }), kill: () => true, log: nullLogger(),
@@ -41,7 +43,7 @@ async function reduceRaw(frames: Record<string, unknown>[], ownerDecisionRequest
   let contextRequests = 0;
   reducer.beginTurn();
   const messages = [];
-  for await (const event of harness.startTurn({ ...request, ownerDecisionRequested }).events) {
+  for await (const event of harness.startTurn({ ...request, ownerDecisionRequested, ...extra }).events) {
     messages.push(...(await reducer.accept(event)).messages);
   }
   return { result: reducer.finish({ kind: "exhausted" }).result, messages, contextRequests };
@@ -64,6 +66,19 @@ test("issue3089 stream admission and accepted-done request fold", async () => {
   assert.equal((await reduceRaw([done({ owner_decision_requested: { reason: "child" } },
     { parent_tool_use_id: "child" })], true)).result.done, false);
   assert.equal((await reduceRaw([done({})], true)).result.ownerDecisionRequested, undefined, "new turn starts empty");
+});
+
+test("Claude decode applies RunTurnRequest.redactText to a signal_done summary before its cut", async () => {
+  const KEY = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+  const summary = "x".repeat(REPORT_MD_MAX_LEN - 10) + KEY;
+  const frame = { type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__uzi__signal_done", input: { summary } }] } };
+  const bare = await reduceRaw([frame]);
+  assert.ok(String(bare.result.summary).includes(KEY.slice(0, 10)), "without redactText the fixture straddles the cut");
+  const redactText = makeTextRedactor(providerKeyForms(KEY));
+  const out = await reduceRaw([frame], false, { redactText });
+  assert.equal(out.result.done, true);
+  const text = String(out.result.summary);
+  for (let n = 8; n <= KEY.length; n++) assert.ok(!text.includes(KEY.slice(0, n)), `key prefix of length ${n} leaked`);
 });
 
 test("m1 non-closing reducer keeps latest valid reason through omission and rejection", async () => {

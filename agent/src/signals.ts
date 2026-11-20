@@ -809,10 +809,10 @@ function rejectedMilestonesOf(raw: unknown, redact = identityRedact): Milestone[
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw)) return [{ id: "", title: "" }];
   const capped = raw.slice(0, MAX_MILESTONES);
-  if (parseMilestones(capped).length === capped.length) return undefined;
+  if (parseMilestones(capped, redact).length === capped.length) return undefined;
   return capped.map((item) => {
     const m = asRecord(item);
-    const id = typeof m?.["id"] === "string" ? m["id"].trim() : "";
+    const id = typeof m?.["id"] === "string" ? redact(m["id"]).trim() : "";
     const title = typeof m?.["title"] === "string" ? redact(m["title"]).trim() : "";
     return { id: clamp(id, MAX_MILESTONE_ID_RUNES), title: clamp(title, MAX_MILESTONE_TITLE_RUNES) };
   });
@@ -832,7 +832,7 @@ function parseMilestones(raw: unknown, redact = identityRedact): Milestone[] {
   for (const item of raw.slice(0, MAX_MILESTONES)) {
     const m = asRecord(item);
     if (!m) continue;
-    const id = typeof m["id"] === "string" ? m["id"].trim() : "";
+    const id = typeof m["id"] === "string" ? redact(m["id"]).trim() : "";
     if (id === "") continue;
     const title = typeof m["title"] === "string" ? redact(m["title"]).trim() : "";
     if (title === "") continue;
@@ -850,8 +850,8 @@ function parseMilestones(raw: unknown, redact = identityRedact): Milestone[] {
  * before parseProgressIds clamps it; any other non-array still yields []. Used only by
  * the report_progress scan: signal_done's `milestones_completed` stays array-only.
  */
-function parseProgressSide(raw: unknown): string[] {
-  return parseProgressIds(typeof raw === "string" ? [raw] : raw);
+function parseProgressSide(raw: unknown, redact = identityRedact): string[] {
+  return parseProgressIds(typeof raw === "string" ? [raw] : raw, redact);
 }
 
 /**
@@ -861,7 +861,7 @@ function parseProgressSide(raw: unknown): string[] {
  * 64 runes and deduped, and the list is capped at MAX_PROGRESS_IDS. Never throws. The cap
  * here is HYGIENE — the api validates membership against the frozen list (Decision 12).
  */
-function parseProgressIds(raw: unknown): string[] {
+function parseProgressIds(raw: unknown, redact = identityRedact): string[] {
   if (!Array.isArray(raw)) return [];
   const out: string[] = [];
   const seen = new Set<string>();
@@ -871,7 +871,7 @@ function parseProgressIds(raw: unknown): string[] {
     // stringifiable id, so it is dropped rather than turned into "[object Object]".
     const id =
       typeof item === "string"
-        ? item.trim()
+        ? redact(item).trim()
         : typeof item === "number" || typeof item === "boolean"
           ? String(item).trim()
           : "";
@@ -901,7 +901,7 @@ function parseProgressIds(raw: unknown): string[] {
  * membership (id must be a frozen, in-progress member) + the identifier shape and is the
  * authoritative control (D4/D5).
  */
-function parseMilestoneAgents(raw: unknown): MilestoneAgent[] {
+function parseMilestoneAgents(raw: unknown, redact = identityRedact): MilestoneAgent[] {
   if (!Array.isArray(raw)) return [];
   const out: MilestoneAgent[] = [];
   // NO client-side dedup by id: the server's milestoneAgentsParam is first-VALID-wins — an
@@ -913,13 +913,13 @@ function parseMilestoneAgents(raw: unknown): MilestoneAgent[] {
   for (const item of raw.slice(0, MAX_PROGRESS_IDS)) {
     const entry = asRecord(item);
     if (!entry) continue;
-    const id = typeof entry["id"] === "string" ? entry["id"].trim() : "";
+    const id = typeof entry["id"] === "string" ? redact(entry["id"]).trim() : "";
     if (id === "") continue;
     const agent = typeof entry["agent"] === "string" ? entry["agent"].trim() : "";
     if (agent === "") continue;
     const parsed: MilestoneAgent = { id: clamp(id, MAX_PROGRESS_ID_RUNES), agent };
     if (typeof entry["agent_label"] === "string") {
-      const label = entry["agent_label"].trim();
+      const label = redact(entry["agent_label"]).trim();
       if (label !== "") parsed.agent_label = clamp(label, MAX_MILESTONE_TITLE_RUNES);
     }
     out.push(parsed);
@@ -1139,7 +1139,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // frozen list is re-checked server-side. Only set when at least one id parsed, so a
       // signal_done with no/garbage milestones_completed stays additive-absent and must
       // never affect `done` — a malformed declaration still means the run finished.
-      const completed = parseProgressIds(input?.["milestones_completed"]);
+      const completed = parseProgressIds(input?.["milestones_completed"], redact);
       if (completed.length > 0) out.milestonesCompleted = completed;
       // issue #279. Extracted HERE, in the same signal_done branch and therefore behind the
       // same main-thread guard as prd_done_path above: `summary` is persisted as report_md and
@@ -1218,11 +1218,11 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // out.progress ONLY when the progress object is being set AND the parsed list is
       // non-empty; it never manufactures a progress signal.
       const input = asRecord(block["input"]);
-      const completed = parseProgressSide(input?.["completed"]);
-      const in_progress = parseProgressSide(input?.["in_progress"]);
+      const completed = parseProgressSide(input?.["completed"], redact);
+      const in_progress = parseProgressSide(input?.["in_progress"], redact);
       if (completed.length > 0 || in_progress.length > 0) {
         out.progress = { completed, in_progress };
-        const milestones_agents = parseMilestoneAgents(input?.["milestones_agents"]);
+        const milestones_agents = parseMilestoneAgents(input?.["milestones_agents"], redact);
         if (milestones_agents.length > 0)
           out.progress.milestones_agents = milestones_agents;
       }
