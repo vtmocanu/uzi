@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// PRD #3881 M2: the per-user rows and factory total shared by both Overview usage cards.
+// PRD #3881 M2: the per-user rows and factory total shared by the Overview usage cards.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { harnessShare, perUserRows } from "./usageByUser";
 import { mockApi } from "../mocks/mockApi";

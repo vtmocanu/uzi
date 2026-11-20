@@ -284,8 +284,52 @@ describe("OverviewNext for an admin", () => {
   });
 });
 
+describe("account cooldown through the 10s poll", () => {
+  const retained = { agent: "coder", agent_label: "Coder", tool: "Bash", detail: "retained cooldown activity", at: "2026-10-28T12:00:00Z", seq: 1 };
+  const waiting = { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" } as never;
+  const row = () => within(screen.getByRole("list", { name: "Your runs" })).getByText("Live run row").closest("li")!;
+  const visibleWaits = () =>
+    [...row().querySelectorAll("*")].filter((el) => !el.childElementCount && !el.closest(".sr-only") && el.textContent?.includes("waiting for account cooldown"));
+
+  it("refreshes an extended cooldown, then drops the wait once a poll clears it", async () => {
+    vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+    const r = aRun({ health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-10-28T12:01:37Z", progress: waiting });
+    mockApi.listRuns.mockResolvedValue({ runs: [r] });
+    await mount();
+    expect(visibleWaits()).toHaveLength(1);
+    expect(row().textContent).not.toMatch(/waits on you|⚠|%/);
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...r, account_cooldown_class: "overload", account_cooldown_eligible_at: "2026-10-28T12:05:37Z" }] });
+    await settle(10_000);
+    expect(visibleWaits()[0].textContent).toBe("waiting for account cooldown \u00b7 overload \u00b7 earliest eligibility 2026-10-28T12:05:37Z");
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...r, account_cooldown_class: undefined, account_cooldown_eligible_at: undefined }] });
+    await settle(10_000);
+    expect(visibleWaits()).toHaveLength(0);
+    expect(row().textContent).not.toMatch(/waits on you|⚠|provider reported/);
+  });
+
+  it.each(["running", "awaiting_approval"] as const)(
+    "keeps a %s row quiet when polls drop or expire the cooldown metadata, until a healthy poll",
+    async (status) => {
+      vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+      const run = aRun({ status, health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-10-28T11:59:59Z", current_activity: retained });
+      mockApi.listRuns.mockResolvedValue({ runs: [run] });
+      await mount();
+      for (const metadata of [{}, { account_cooldown_class: undefined }, { account_cooldown_eligible_at: undefined }]) {
+        mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, ...metadata }] });
+        await settle(10_000);
+        expect(row().textContent).toContain("waiting");
+        expect(row().textContent).not.toMatch(/waiting for account cooldown|Coder/);
+        expect(row().querySelector(".animate-pulse")).toBeNull();
+      }
+      mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, health: "ok" }] });
+      await settle(10_000);
+      expect(within(row()).getByText("Coder")).toBeTruthy();
+    },
+  );
+});
+
 describe("Capacity rail", () => {
-  it("lists every owner worker on the rail, including one with no stats, and has no Worker load card", async () => {
+  it("lists every owner worker on the rail, including offline and stat-less ones", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [
         aWorker({ id: "w1", name: "statless-worker", active_runs: 1, max_concurrent_runs: 2 }),
@@ -306,7 +350,6 @@ describe("Capacity rail", () => {
     expect(within(rail).getByText("statless-worker")).toBeTruthy();
     expect(within(rail).getByText("gone-worker")).toBeTruthy();
     expect(within(rail).getByText("loaded-worker")).toBeTruthy();
-    expect(screen.queryByText("Worker load")).toBeNull();
     expect(within(rail).getAllByText("No stats reported")).toHaveLength(2);
   });
 

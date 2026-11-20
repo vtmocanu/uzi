@@ -71,8 +71,8 @@ export function mergeOverviewRows(
 }
 
 // PRD #1349 M6 (D8/D10): the count of the viewer's runs currently self-healing in the
-// recovery_wait park, derived client-side from runs the page already polls. Both Overview
-// pages feed it the viewer's OWN runs only.
+// recovery_wait park, derived client-side from runs the page already polls. The Overview
+// feeds it the viewer's OWN runs only.
 export function ownRecoveryWaitCount(runs: ReadonlyArray<Pick<RunSummaryItem, "status">>): number {
   return runs.filter((r) => r.status === "recovery_wait").length;
 }

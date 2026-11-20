@@ -50,7 +50,7 @@ describe("OverviewRunRow owner", () => {
 });
 
 // The row anatomy below was pinned on the retired old Overview page and now lives with the
-// component that renders it, which both Overview surfaces share.
+// component that renders it, which the Overview renders.
 const NOW = Date.parse("2026-07-05T12:05:00Z");
 
 function renderRun(run: ReturnType<typeof aRun>, now = NOW) {
@@ -206,6 +206,17 @@ describe("OverviewRunRow account cooldown", () => {
 
   it.each(["running", "awaiting_approval"] as const)("keeps a %s row quiet with expired cooldown metadata", (status) => {
     renderRun(aRun({ status, health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-10-28T11:59:59Z", current_activity: retained }), T);
+    const row = screen.getByText("Live run row").closest("li")!;
+    expect(row.textContent).toContain("waiting");
+    expect(row.textContent).not.toMatch(/waiting for account cooldown|Coder/);
+    expect(row.querySelector(".animate-pulse")).toBeNull();
+  });
+
+  it.each([
+    ["class missing", { account_cooldown_class: undefined }],
+    ["eligibility missing", { account_cooldown_eligible_at: undefined }],
+  ] as const)("keeps a running row quiet when the cooldown %s", (_label, missing) => {
+    renderRun(aRun({ status: "running", health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-10-28T12:01:37Z", current_activity: retained, ...missing }), T);
     const row = screen.getByText("Live run row").closest("li")!;
     expect(row.textContent).toContain("waiting");
     expect(row.textContent).not.toMatch(/waiting for account cooldown|Coder/);
