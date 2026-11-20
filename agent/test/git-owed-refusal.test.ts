@@ -186,6 +186,14 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     assert.equal((await gate(cover)).kind, "eligible");
   });
 
+  it("an import stage anchored only at an earlier generation is unanchored at its own generation, not excluded", async () => {
+    const { cover, refused } = await eligibleState();
+    assert.equal(await cache.admitRefusalProvenance({ ...ctx, generation: 2 }), "written");
+    // The refused ref and ledger row for this sha exist at generation 1 only; this stage sits at generation 2.
+    foreignImportStage(refused, OTHER_NONCE, 2);
+    assert.deepEqual(await gate(cover, 2), { kind: "ineligible", reason: "refusal import stage is unanchored" });
+  });
+
   it("a live in-process import stage makes the gate ineligible while it is in flight", async () => {
     const { cover } = await eligibleState();
     const [stage] = importStageRefs() as [string];
@@ -196,7 +204,7 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     assert.equal((await gate(cover)).kind, "eligible");
   });
 
-  it("a stage that is neither an import nor a refused ref stays evidence; a refused-looking import name is not an import", async () => {
+  it("a stage that is neither an import nor a refused ref stays evidence; a short-nonce import-looking name is not an import", async () => {
     const { cover, refused } = await eligibleState();
     gitIn(bare, ["update-ref", `refs/uzi-incoming/${RUN}/1/import-short-${randomUUID()}`, refused]);
     // The nonce is shorter than the 8 characters an import stage carries: it is plain evidence, here ledgered, so it is
@@ -1439,6 +1447,33 @@ describe("issue4481 a failed import deletes its own attributed stage", { timeout
         await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, racing(() => { armed = true; })), /injected owed-commit failure/);
       } finally { internals.requireOwedCommit = original; }
       assert.deepEqual(sincoming(), []);
+    });
+
+    it("the real import is a live import between its two lock sections and not after it completes", async () => {
+      scommit("next head");
+      const gateAt = (): Promise<RefusalReleaseGate> => cache.refusalReleaseGate(sbare, SRUN, 1, sbase);
+      let between: RefusalReleaseGate | undefined;
+      let phases = 0;
+      const observing: FetchAgentBranchOptions = { ...sopts, withSourceAuthority: async <T>(action: () => Promise<T>) => {
+        if (++phases === 2) between = await gateAt();
+        return action();
+      } };
+      assert.equal((await cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, observing)).kind, "updated");
+      assert.deepEqual(between, { kind: "ineligible", reason: "refusal import in progress" });
+      const live = (cache as unknown as { liveImportStages: Set<string> }).liveImportStages;
+      assert.equal(live.size, 0, "the entry is removed when the import completes");
+      assert.notDeepEqual(await gateAt(), { kind: "ineligible", reason: "refusal import in progress" });
+    });
+
+    it("a boundary stop after the fetch leaves the attributed stage in place, unlike an ordinary failure", async () => {
+      const head = scommit("next head");
+      const internals = cache as unknown as Internals;
+      const original = internals.requireOwedCommit.bind(cache);
+      try {
+        internals.requireOwedCommit = async (b, sha) => { if (sha === head) throw new CheckpointSoftDeadlineError(); return original(b, sha); };
+        await assert.rejects(cache.fetchAgentBranch(sbare, sclone, SBRANCH, SRUN, sopts), (e: unknown) => e instanceof CheckpointSoftDeadlineError);
+      } finally { internals.requireOwedCommit = original; }
+      assert.deepEqual(sincoming().map((l) => l.split(" ")[1]), [head], "the soft stop keeps the stage");
     });
   });
 });
