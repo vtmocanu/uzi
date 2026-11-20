@@ -56,6 +56,7 @@ export const STRICT_P_SUITE: readonly string[] = [
   "native-bypass.test.ts",
   "native-exceptions.test.ts",
   "token-resume.test.ts",
+  "phase-model-switch.test.ts",
   "large-resume.test.ts",
 ];
 
