@@ -209,6 +209,9 @@ const REASON_CREDENTIAL_SWITCH = "run released for a credential switch";
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
 /** PRD #4320 D8: a credential switch on a provider-bound run is refused (the run fails; no OAuth token is injected). */
 const REASON_PROVIDER_SWITCH_REFUSED = "provider_credential_switch_refused: a provider-bound run cannot switch credentials";
+/** PRD #3252: a Claude planning model is set but nothing resolves the implementation model. */
+const REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL =
+  "unsupported phase configuration: a Claude planning model is set but no implementation model resolves; set an implementation (worker) model, or clear the Claude planning model";
 const REASON_NO_PLAN =
   "the agent ended the planning turn without submitting a plan";
 /** PRD #88 M4: the lead kept asking instead of planning. Distinct from
@@ -825,9 +828,11 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
  *  The first-truthy-session-id latch moved into the per-run reducer (harness-
  *  reducer.ts); the owner delivers ctx.onSessionId from its `firstSessionId`. */
 interface RunDrive {
-  /** PRD #3244: the lead's requested model/effort, the same value the SDK options were built from;
-   *  reported through ctx.leadConfig at each lead phase entry. */
-  leadRequest: LeadRequest;
+  /** PRD #3244 / #3252: the lead's requested model/effort per phase, the same values the SDK options
+   *  were built from; reported through ctx.leadConfig at each lead phase entry. Equal unless the
+   *  claim carries `plan_phase`. */
+  planRequest: LeadRequest;
+  implementRequest: LeadRequest;
   /** PRD #3244 M2: the phase entries whose first turn already carried the runtime-config callback
    *  ("phase:entry"); a later turn of the same entry (revise round, re-drive) does not get one. */
   observedEntries?: Set<string>;
@@ -918,7 +923,10 @@ interface DriveState {
   repoInstructionsBlock: string | undefined;
   survivorNames: Set<string>;
   assembled: ReturnType<typeof assembleAgents>;
+  /** The IMPLEMENT lead model (state.implementRequest.model): applied to the implement roster. */
   leadModel: string | undefined;
+  /** The implement turns' model after provider mapping (PRD #3252); undefined leaves the key off. */
+  implementSpawnModel: string | undefined;
   planSubagentNames: string[];
   planSource: AgentSource;
   subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
@@ -1809,26 +1817,41 @@ export class SdkExecutor implements Executor {
     // Computed HERE (before the plan-turn copy at planTurnSubagents) so the PRD #305
     // own-roster override below can run against the same value the lead uses.
     //
-    // PRD #3244: one LeadRequest per run (equal for both phases in this unit). The model/effort
-    // sent below and the lead-config row reported at each phase entry come from this one value.
-    const leadRequest = resolveLeadRequest({
+    // PRD #3244 / #3252: one LeadRequest per lead phase. Without a claim `plan_phase` the two are
+    // equal. The model/effort sent below and the lead-config row reported at each phase entry come
+    // from these values: `planRequest` drives every plan-block turn, `implementRequest` every
+    // implement turn.
+    const templateModelInput = assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {};
+    const implementRequest = resolveLeadRequest({
       harness: "claude",
       phase: "implement",
       config: ctx.config,
-      ...(assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {}),
+      ...templateModelInput,
     });
-    const leadModel = leadRequest.model;
+    const planRequest = resolveLeadRequest({
+      harness: "claude",
+      phase: "plan",
+      config: ctx.config,
+      ...templateModelInput,
+    });
+    const leadModel = implementRequest.model;
+    const planLeadModel = planRequest.model;
+    // PRD #3252: a planning model with no implementation model to fall back to is an unsupported
+    // phase configuration, refused visibly before any turn. On a provider run the provider map's
+    // default (the sonnet alias) counts as the implementation model only if the map yields a name;
+    // resolveProviderModel below throws otherwise.
+    if (ctx.config?.plan_phase?.model && leadModel === undefined && !ctx.provider) {
+      throw new Error(REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL);
+    }
     // PRD #4320 module 7: a provider run resolves the lead through the bound map BEFORE any content is
     // sent. An unmapped alias or vendor model ID is a typed refusal (provider_model_unmapped) that
     // fails the run; an unset model is the sonnet alias. Never rewritten.
-    const spawnModel = ctx.provider ? resolveProviderModel(leadModel, ctx.provider.model_map) : leadModel;
-    // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
-    // copies them and before the own-source implement path reuses them, so both the plan
-    // turn and an own-source implement follow the lead model. The repo roster is built
-    // later and overridden where it is built. Off/no-model = pins win (byte-identical).
-    if (ctx.config?.override_subagent_model && leadModel) {
-      applySubagentModelOverride(assembled.subagents, leadModel);
-    }
+    const spawnModel = ctx.provider ? resolveProviderModel(planLeadModel, ctx.provider.model_map) : planLeadModel;
+    const implementSpawnModel = ctx.provider ? resolveProviderModel(leadModel, ctx.provider.model_map) : leadModel;
+    // PRD #305: the run's model is applied to every subagent of a roster. The plan-turn copy gets
+    // the PLAN lead model (applied to `planAgents` below, after it is copied) and the implement
+    // roster gets the IMPLEMENT lead model where it is selected (phaseRunLoop), so a planning
+    // model never reaches an implement subagent. Off/no-model = pins win (byte-identical).
     // The names come from the RESULT, never from `assembled.subagents`. They feed
     // the plan turn's Agent-guard allowSet AND the "Available subagents to
     // delegate to:" line of every plan prompt, so a name surviving here while its
@@ -1853,8 +1876,10 @@ export class SdkExecutor implements Executor {
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
     const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
-    if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
-      applySubagentModelOverride(planAgents, leadModel);
+    // `planAgents` holds copies (planTurnSubagents spreads each def), so this never reaches the
+    // own roster the implement phase selects from.
+    if (ctx.config?.override_subagent_model && planLeadModel) {
+      applySubagentModelOverride(planAgents, planLeadModel);
     }
     // PRD #4320 module 7: every subagent the plan turn can run resolves through the bound map (own and
     // repo-sourced rosters alike); an excluded template is never in this map and is not checked.
@@ -2100,7 +2125,9 @@ export class SdkExecutor implements Executor {
     // now populates effort with the owner's choice or the uzi default `medium` for an
     // inheriting owner (issue #1157). Both reach the implement turn too, via the
     // `baseConfig` spread.
-    const effort = leadRequest.effort;
+    // PRD #3252: baseConfig carries the PLAN pair (every plan-block turn reads it); implementConfig
+    // replaces model/effort with the implement pair in phaseRunLoop.
+    const effort = planRequest.effort;
     const baseConfig: ClaudeTurnConfig = {
       cwd: ctx.worktreePath,
       env: env as unknown as Record<string, string | undefined>,
@@ -2140,7 +2167,8 @@ export class SdkExecutor implements Executor {
     // it. This replaced the applied-once `wallScaled` latch, which swallowed a second bump.
     let maxServedWallMs = initialWallMs;
     const state: RunDrive = {
-      leadRequest,
+      planRequest,
+      implementRequest,
       currentChild: {},
       wallRemainingMs: initialWallMs,
       ...(ctx.codeCrossCheckGate && ctx.codeCrossCheckRepairActive && ctx.codeCrossCheckRepair && ctx.reportCrossCheckDispositions && ctx.claimGeneration ? {
@@ -2262,6 +2290,7 @@ export class SdkExecutor implements Executor {
       survivorNames,
       assembled,
       leadModel,
+      implementSpawnModel,
       planSubagentNames,
       planSource,
       subagentCanWrite,
@@ -2987,6 +3016,7 @@ export class SdkExecutor implements Executor {
     const {
       depsInstall,
       leadModel,
+      implementSpawnModel,
       assembled,
       survivorNames,
       prepared,
@@ -3073,8 +3103,8 @@ export class SdkExecutor implements Executor {
       // PRD #305: repo-source defs are freshly built from repo files here and were NOT
       // touched by the own-roster override above; apply it so the flag covers the repo
       // roster (the primary case: an auto-approved scheduled run resolves to the repo
-      // roster). Own-source defs were copied by reference from the already-overridden
-      // assembled.subagents, so this repeat is idempotent for them.
+      // roster). Own-source defs alias assembled.subagents, which setup left untouched
+      // (the plan turn got its own copies), so this is where they take the IMPLEMENT lead model.
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
@@ -3121,6 +3151,12 @@ export class SdkExecutor implements Executor {
         preToolUse: preToolUse(selectedNames, true, implementUnavailable),
         mcpServers: baseConfig.mcpServers,
       };
+      // PRD #3252: baseConfig carries the PLAN pair; the implement turns take the implement pair.
+      // An unresolved value deletes the key (never `model: undefined`), so the SDK default applies.
+      if (implementSpawnModel) implementConfig.model = implementSpawnModel;
+      else delete implementConfig.model;
+      if (state.implementRequest.effort) implementConfig.effort = state.implementRequest.effort;
+      else delete implementConfig.effort;
       ctx.emit({
         kind: "status",
         agent: "worker",
@@ -5281,7 +5317,7 @@ export class SdkExecutor implements Executor {
     let markObserved: (() => void) | undefined;
     if (ctx.leadConfig?.enabled) {
       const reporter = ctx.leadConfig;
-      const entry: PhaseEntry = await reporter.enterPhase(phase, state.leadRequest);
+      const entry: PhaseEntry = await reporter.enterPhase(phase, phase === "plan" ? state.planRequest : state.implementRequest);
       // PRD #3244 M2: only the first turn of a phase entry asks the runtime for its config, so the
       // single settings probe runs at most once per entry. The callback never throws into the turn.
       const key = `${entry.phase}:${entry.entry}`;

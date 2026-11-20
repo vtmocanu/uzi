@@ -975,6 +975,257 @@
         "template_claude": null,
         "template_codex": null
       }
+    },
+    {
+      "id": "claude-planning-model-effort-plan-phase",
+      "harness": "claude",
+      "phase": "plan",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "medium",
+        "default_effort_source": "user_default",
+        "plan_phase": {
+          "model": "opus",
+          "effort": "high",
+          "model_source": "user_planning_default",
+          "effort_source": "user_planning_default"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "opus",
+        "modelSource": "user_planning_default",
+        "effort": "high",
+        "effortMode": "explicit",
+        "effortSource": "user_planning_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "user_effort": "medium",
+        "planning_model": "opus",
+        "planning_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-planning-model-effort-implement-phase",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "medium",
+        "default_effort_source": "user_default",
+        "plan_phase": {
+          "model": "opus",
+          "effort": "high",
+          "model_source": "user_planning_default",
+          "effort_source": "user_planning_default"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "sonnet",
+        "modelSource": "user_default",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "user_effort": "medium",
+        "planning_model": "opus",
+        "planning_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-planning-schedule-pin-plan-phase",
+      "harness": "claude",
+      "phase": "plan",
+      "config": {
+        "default_model": "fable",
+        "default_model_source": "schedule_pin",
+        "default_effort": "medium",
+        "default_effort_source": "user_default",
+        "plan_phase": {
+          "model": "fable",
+          "effort": "high",
+          "model_source": "schedule_pin",
+          "effort_source": "user_planning_default"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "fable",
+        "modelSource": "schedule_pin",
+        "effort": "high",
+        "effortMode": "explicit",
+        "effortSource": "user_planning_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": "fable",
+        "user_effort": "medium",
+        "planning_model": "opus",
+        "planning_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-planning-schedule-pin-implement-phase",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "fable",
+        "default_model_source": "schedule_pin",
+        "default_effort": "medium",
+        "default_effort_source": "user_default",
+        "plan_phase": {
+          "model": "fable",
+          "effort": "high",
+          "model_source": "schedule_pin",
+          "effort_source": "user_planning_default"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "fable",
+        "modelSource": "schedule_pin",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": "fable",
+        "user_effort": "medium",
+        "planning_model": "opus",
+        "planning_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-planning-model-empty-lane-template-plan-phase",
+      "harness": "claude",
+      "phase": "plan",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin",
+        "plan_phase": {
+          "model": "fable",
+          "effort": "medium",
+          "model_source": "user_planning_default",
+          "effort_source": "builtin"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "fable",
+        "modelSource": "user_planning_default",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "planning_model": "fable",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-planning-model-empty-lane-template-implement-phase",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin",
+        "plan_phase": {
+          "model": "fable",
+          "effort": "medium",
+          "model_source": "user_planning_default",
+          "effort_source": "builtin"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "opus",
+        "modelSource": "template",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "planning_model": "fable",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-planning-effort-only-empty-lane-template-plan-phase",
+      "harness": "claude",
+      "phase": "plan",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin",
+        "plan_phase": {
+          "effort": "high",
+          "effort_source": "user_planning_default"
+        }
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "opus",
+        "modelSource": "template",
+        "effort": "high",
+        "effortMode": "explicit",
+        "effortSource": "user_planning_default"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "planning_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-template-fallback-plan-phase-without-plan-phase",
+      "harness": "claude",
+      "phase": "plan",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "opus",
+        "modelSource": "template",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": "opus",
+        "template_codex": null
+      }
     }
   ],
   "display_cases": [

@@ -1315,6 +1315,15 @@ export interface ClaimConfig {
   /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
    *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
   default_effort_source?: LeadEffortSource;
+  /** PRD #3252: the Claude lead's planning-phase model/effort, present only on a Claude lead-lane
+   *  claim whose owner/schedule configured a planning value. Each key resolves independently:
+   *  an absent key means the planning phase uses the implement value. Sources are omitted when empty. */
+  plan_phase?: {
+    model?: string;
+    effort?: EffortLevel;
+    model_source?: LeadModelSource;
+    effort_source?: LeadEffortSource;
+  };
   /** Issue #3251: the opaque catalog context (64 lowercase hex) of a Codex lead-lane claim with a
    *  complete credential binding; echoed verbatim when reporting the catalog default effort. */
   codex_catalog_context?: string;

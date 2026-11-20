@@ -16,11 +16,15 @@ export type { LeadEffortSource, LeadModelSource } from "./protocol.js";
 
 export type LeadPhase = "plan" | "implement";
 
+/** PRD #3252: advertised by every worker that resolves a claim's `plan_phase` for the Claude lead. */
+export const CLAUDE_PHASE_MODELS_CAPABILITY = "claude_phase_models_v1";
+
 // ── Resolver ─────────────────────────────────────────────────────────────────
 
 export interface LeadRequestInput {
   harness: "claude" | "codex";
-  /** Ignored in H; a later planning-phase child selects planning values by it. */
+  /** Claude: phase "plan" with a claim `plan_phase` takes its model/effort key by key (a key the
+   *  claim omits keeps the implement result); otherwise, and for Codex, the phase is ignored. */
   phase: LeadPhase;
   config: ClaimConfig | null | undefined;
   /** The selected owner lead template's delivered model (assembleAgents' leadModel for Claude). */
@@ -54,13 +58,25 @@ export function resolveLeadRequest(input: LeadRequestInput): LeadRequest {
     model = config?.default_model ?? templateModel ?? input.providerDefaultModel;
     modelSource = config?.default_model != null ? claimSource : templateModel !== undefined ? "template" : "builtin";
   }
-  const effort = config?.default_effort as HarnessEffort | undefined;
+  let effort = config?.default_effort as HarnessEffort | undefined;
+  let effortSource: LeadEffortSource = config?.default_effort_source ?? "builtin";
+  // Planning phase (Claude only): each key is replaced by the claim's `plan_phase` value only when
+  // that key is present; an absent key keeps exactly the implement result above.
+  const planPhase = input.phase === "plan" && input.harness === "claude" ? config?.plan_phase : undefined;
+  if (planPhase?.model) {
+    model = planPhase.model;
+    modelSource = planPhase.model_source ?? "builtin";
+  }
+  if (planPhase?.effort) {
+    effort = planPhase.effort as HarnessEffort;
+    effortSource = planPhase.effort_source ?? "builtin";
+  }
   return {
     ...(model !== undefined ? { model } : {}),
     modelSource,
     ...(effort ? { effort } : {}),
     effortMode: effort ? "explicit" : "runtime_default",
-    effortSource: config?.default_effort_source ?? "builtin",
+    effortSource,
   };
 }
 

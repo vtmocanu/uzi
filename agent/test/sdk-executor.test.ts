@@ -3458,7 +3458,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 16, "all Claude request cases loaded");
+    assert.equal(cases.length, 24, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3504,7 +3504,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 16);
+    assert.equal(visited.length, 24);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
@@ -10348,5 +10348,186 @@ describe("SdkExecutor spend-limit terminal (issue #3767)", () => {
     const probe = makeCtx();
     const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(probe.ctx);
     assert.ok(result, "the run completed without throwing");
+  });
+});
+
+describe("SdkExecutor Claude planning phase model/effort (PRD #3252 M3)", () => {
+  const PHASE_CONFIG: ClaimConfig = {
+    default_model: "sonnet", default_model_source: "user_default",
+    default_effort: "medium", default_effort_source: "user_default",
+    plan_phase: {
+      model: "opus", effort: "high",
+      model_source: "user_planning_default", effort_source: "user_planning_default",
+    },
+  };
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const revise: PlanVerdict = { kind: "revise", feedback: "tighten it" };
+  const fast = { emptyTurnBackoffBaseMs: 0 };
+  const sent = (t: { options: SdkOptions }) => [t.options.model, t.options.effort];
+  const PLAN_PAIR = ["opus", "high"];
+  const IMPL_PAIR = ["sonnet", "medium"];
+
+  function reporterRig() {
+    const posts: LeadConfigReportBody[] = [];
+    const client: LeadConfigClient = { async recordLeadConfig(_r, body) { posts.push(body); return { kind: "ok" }; } };
+    const make = (config: ClaimConfig | null) => new LeadConfigReporter({
+      client, runId: "r1", claimGeneration: 4, active: leadConfigActive(config), logger: nullLogger(),
+    });
+    return { posts, make };
+  }
+
+  it("example 1: plan row opus/high user_planning_default, implement row sonnet/medium user_default, and the SDK is sent the same", async () => {
+    const { posts, make } = reporterRig();
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: PHASE_CONFIG, leadConfig: make(PHASE_CONFIG) }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    const row = (phase: string) => posts.filter((p) => p.phase === phase).map((p) =>
+      [p.requested_model, p.requested_model_source, p.requested_effort, p.requested_effort_mode, p.requested_effort_source]);
+    assert.deepEqual(row("plan"), [["opus", "user_planning_default", "high", "explicit", "user_planning_default"]]);
+    assert.deepEqual(row("implement"), [["sonnet", "user_default", "medium", "explicit", "user_default"]]);
+    assert.deepEqual(turns.map(sent), [PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("a revise round and the implement turn after it: plan pair on every plan-block turn, implement pair after approval", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("v1"), resultSuccess()], [submitPlan("v2"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: PHASE_CONFIG }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(turns.map(sent), [PLAN_PAIR, PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("a clarification round (ask_user) stays on the plan pair", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [askUserTurn("which config?"), resultSuccess()], [submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: PHASE_CONFIG,
+      askUser: async () => ({ kind: "answer", answers: ["the default"] }),
+    }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(turns.map(sent), [PLAN_PAIR, PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("a missing-plan nudge turn stays on the plan pair", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("thinking"), resultSuccess()], [submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: PHASE_CONFIG }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, ...fast }).run(ctx);
+    assert.equal(turns.length, 3);
+    assert.deepEqual(turns.map(sent), [PLAN_PAIR, PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("a plan-turn in-place restart (credential-switch give-up) stays on the plan pair", async () => {
+    const abortTurn: Script = () => (async function* () { yield* []; throw new CredentialSwitchSignal(); })();
+    const { queryFn, turns } = fakeTurns([abortTurn, [submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: PHASE_CONFIG, attemptCredentialSwitch: async () => "gave_up" as const,
+    }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, ...fast }).run(ctx);
+    assert.deepEqual(turns.map(sent), [PLAN_PAIR, PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("a reclaimed unapproved run re-plans on the plan pair", async () => {
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: PHASE_CONFIG, sessionId: "sess-1" }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(turns.map(sent), [PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("pre-approved (reclaimed after approval) runs only the implement pair, and an implement in-place restart keeps it", async () => {
+    const pauseTurn: Script = () => (async function* () { yield* []; throw new PauseNowSignal(); })();
+    const { queryFn, turns } = fakeTurns([pauseTurn, [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: { ...PHASE_CONFIG }, planApproved: true, seeded: true, sessionId: null,
+      approvedPlan: "# Approved", parkForPause: async () => false,
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, ...fast }).run(ctx);
+    assert.equal(turns.length, 2);
+    assert.deepEqual(turns.map(sent), [IMPL_PAIR, IMPL_PAIR]);
+  });
+
+  it("without plan_phase the plan and implement turns carry identical model/effort options", async () => {
+    const config: ClaimConfig = { ...PHASE_CONFIG };
+    delete config.plan_phase;
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(turns.map(sent), [IMPL_PAIR, IMPL_PAIR]);
+  });
+
+  it("an implement side with no effort omits the effort key on the implement turn while the plan turn carries its planning effort", async () => {
+    const config: ClaimConfig = {
+      default_effort_source: "builtin",
+      plan_phase: { model: "opus", effort: "high", model_source: "user_planning_default", effort_source: "user_planning_default" },
+    };
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const withTemplate: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT", model: "sonnet" };
+    const { ctx } = makeCtx({ agents: [withTemplate, coder], config }, approve);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(sent(turns[0]!), PLAN_PAIR);
+    assert.equal(turns[1]!.options.model, "sonnet");
+    assert.ok(!("effort" in turns[1]!.options), "an unresolved implement effort deletes the key");
+  });
+
+  describe("subagent model override per phase", () => {
+    const pinnedReviewer: AgentTemplate = { ...reviewer, model: "haiku" };
+    const OVERRIDE: ClaimConfig = { ...PHASE_CONFIG, override_subagent_model: true };
+
+    it("own roster: the plan turn's subagents take the plan model, the implement turn's the implement model", async () => {
+      const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+      const { ctx } = makeCtx({ agents: [lead, coder, pinnedReviewer], config: OVERRIDE }, approveWith("own"));
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.equal(turns[0]!.options.agents!.reviewer!.model, "opus", "plan subagent: plan model");
+      assert.equal(turns[1]!.options.agents!.reviewer!.model, "sonnet", "implement subagent: no plan model leaked");
+    });
+
+    it("repo roster: the plan copy takes the plan model, the implement roster the implement model", async () => {
+      const pinnedRepoAuditor: AgentTemplate = { ...repoAuditor, model: "haiku" };
+      const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+      const { ctx } = makeCtx({
+        agents: [lead, coder, pinnedReviewer], repoAgents: [repoCoder, pinnedRepoAuditor], config: OVERRIDE, requestedAgentSource: "repo",
+      }, approveWith("repo"));
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.equal(turns[0]!.options.agents!.auditor!.model, "opus");
+      assert.equal(turns[1]!.options.agents!.auditor!.model, "sonnet");
+    });
+
+    it("without plan_phase the rosters equal the single-model behavior on both turns", async () => {
+      const config: ClaimConfig = { ...OVERRIDE };
+      delete config.plan_phase;
+      const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+      const { ctx } = makeCtx({ agents: [lead, coder, pinnedReviewer], config }, approveWith("own"));
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.equal(turns[0]!.options.agents!.reviewer!.model, "sonnet");
+      assert.equal(turns[1]!.options.agents!.reviewer!.model, "sonnet");
+    });
+  });
+
+  it("a planning model with no implementation model fails visibly before any turn, naming both remedies", async () => {
+    const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
+    const config: ClaimConfig = {
+      default_effort_source: "builtin",
+      plan_phase: { model: "opus", model_source: "user_planning_default" },
+    };
+    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), resultSuccess()]]);
+    const { ctx } = makeCtx({ agents: [noModelLead, coder], config }, approve);
+    await assert.rejects(
+      () => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
+      (err: Error) => /set an implementation \(worker\) model, or clear the Claude planning model/.test(err.message),
+    );
+    assert.equal(turns.length, 0, "no turn ran");
+  });
+
+  it("the unsupported configuration is refused regardless of approval", async () => {
+    const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
+    const config: ClaimConfig = { plan_phase: { model: "opus" } };
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [noModelLead, coder], config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await assert.rejects(() => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /clear the Claude planning model/);
+    assert.equal(turns.length, 0);
   });
 });
