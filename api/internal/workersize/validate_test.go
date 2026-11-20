@@ -1,6 +1,7 @@
 package workersize
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -177,6 +178,66 @@ func TestQuotaAdvisoryUnavailableIsNeverFits(t *testing.T) {
 	c.Enabled[builtin.TierIsolated] = false
 	if got := advisoryKinds(Validate("m", okSpec, nil, c, builtin.Quota{})); got["isolated/"+KindQuotaUnavailable] != 0 {
 		t.Errorf("disabled tier advised: %v", got)
+	}
+}
+
+// A docker tier whose worker requests alone fit exactly (1000m x 10 = 10000), so any
+// sidecar request on top would exceed, must say the estimate is incomplete, never stay
+// silent (#4517). The api holds no sidecar requests, so the test pins only the note.
+func TestQuotaAdvisoryDockerSidecarExcludedIsIncomplete(t *testing.T) {
+	q := fullQuota(1e9, 1e9, 10)
+	q.Tier[builtin.TierDocker] = builtin.TierQuota{
+		RequestsCPUMillicores: builtin.Present(10000), RequestsMemoryMiB: builtin.Present(1e9), Deployments: builtin.Present(10)}
+	r := Validate("m", okSpec, nil, chartCeilings(), q)
+	if !r.OK() {
+		t.Fatalf("an advisory never refuses: %v", r.Fields)
+	}
+	var incomplete int
+	for _, a := range r.Advisories {
+		if a.Tier == "docker" && a.Kind == KindQuotaUnavailable {
+			incomplete++
+			if !strings.Contains(a.Message, "incomplete") || !strings.Contains(a.Message, "sidecar") || a.Field != "" {
+				t.Errorf("docker advisory = %+v, want an incomplete/sidecar message with no field", a)
+			}
+		}
+	}
+	got := advisoryKinds(r)
+	for _, a := range r.Advisories {
+		if a.Kind == KindQuotaUnavailable && a.Tier != "docker" {
+			t.Errorf("complete %s tier must not read unavailable: %+v", a.Tier, a)
+		}
+	}
+	if incomplete != 1 || got["docker/"+KindQuotaExceeded] != 0 || got["docker/"+KindQuotaZero] != 0 {
+		t.Fatalf("docker advisories = %v, want exactly one incomplete and no exceeded/zero", got)
+	}
+	// The restricted tier's complete estimate is unchanged: identical to docker disabled.
+	c := chartCeilings()
+	c.Enabled[builtin.TierDocker] = false
+	var withDocker, without []Advisory
+	for _, a := range r.Advisories {
+		if a.Tier != "docker" {
+			withDocker = append(withDocker, a)
+		}
+	}
+	for _, a := range Validate("m", okSpec, nil, c, q).Advisories {
+		if a.Tier == "docker" {
+			t.Errorf("disabled docker tier advised: %+v", a)
+		}
+		without = append(without, a)
+	}
+	if fmt.Sprint(withDocker) != fmt.Sprint(without) || got["restricted/"+KindQuotaUnavailable] != 0 {
+		t.Errorf("non-docker advisories changed: %+v vs %+v", withDocker, without)
+	}
+	// Definite warnings are preserved alongside the incomplete note.
+	zero := fullQuota(1e9, 1e9, 10)
+	zero.Tier[builtin.TierDocker].RequestsCPUMillicores = builtin.Present(0)
+	if got := advisoryKinds(Validate("m", okSpec, nil, chartCeilings(), zero)); got["docker/"+KindQuotaZero] != 1 || got["docker/"+KindQuotaUnavailable] != 1 {
+		t.Errorf("zero docker quota: %v", got)
+	}
+	over := fullQuota(1e9, 1e9, 10)
+	over.Tier[builtin.TierDocker].RequestsCPUMillicores = builtin.Present(9999)
+	if got := advisoryKinds(Validate("m", okSpec, nil, chartCeilings(), over)); got["docker/"+KindQuotaExceeded] != 1 || got["docker/"+KindQuotaUnavailable] != 1 {
+		t.Errorf("worker-only exceeded docker quota: %v", got)
 	}
 }
 

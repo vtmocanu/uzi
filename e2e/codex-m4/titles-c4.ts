@@ -1,3 +1,5 @@
+// Owner accepted 2026-11-20: native patch is inert without an execution environment; MCP helpers require
+// no native MCP servers are configured. New server configuration requires fresh authority review.
 // PRD #1287 C4 — the exact executed-test TITLE constants shared by the three places that must
 // never drift: the `it(...)` name, the `recordEvidence(...)` call, and the clause row's `tests`
 // list (clauses-codex.ts). A single source of truth keeps the completeness checker's
@@ -32,6 +34,6 @@ export const CODEX_U_ADVICE_APIKEY_NO_FALLBACK_TITLE =
 
 // ── Failure closure — real config builders + real broker/handler ──
 export const CODEX_U_FAILURE_HOOKS_DISABLED_TITLE =
-  "codex U failure closure: the production + loopback config builders disable hooks and every native execution feature (no hooks=true, no bypass-hook-trust), so an upstream hook failure can never become production permission";
+  "codex U failure closure: the production + loopback config builders disable hooks and pin fixed feature settings (no hooks=true, no bypass-hook-trust), so an upstream hook failure can never become production permission";
 export const CODEX_U_FAILURE_BROKER_CLOSURE_TITLE =
   "codex U failure closure: a throwing/unwired worker tool handler and a rejecting command spawn fail closed (handler_error/denied_tool/broker_error) with no fabricated success, while a well-behaved handler still succeeds";

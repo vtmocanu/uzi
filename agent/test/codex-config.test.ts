@@ -1,3 +1,5 @@
+import { parse } from "smol-toml";
+import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -45,15 +47,17 @@ describe("buildCodexConfigToml: stock native-disabled config", () => {
   });
 
   it("pins every [features] native knob to its disabled value", () => {
+    assert.doesNotMatch(toml, /\bmcp_servers\b/, "no native MCP server is configured");
     assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, "the removed compatibility key is omitted");
     for (const key of [
-      "apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform",
+      "goals", "apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform",
       "shell_snapshot", "shell_snapshot_v2",
       "code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm",
       "unified_exec", "hooks", "multi_agent", "multi_agent_v2",
       "enable_request_compression",
     ]) {
-      assert.match(toml, new RegExp(`^${key} = false$`, "m"), `${key} must be false`);
+      const features = toml.split("[features]\n")[1]!.split("\n[")[0]!;
+      assert.match(features, new RegExp(`^${key} = false$`, "m"), `[features].${key} must be false`);
     }
   });
 
@@ -233,5 +237,40 @@ describe("buildCodexLoopbackTestConfigToml: authenticated packaged fake", () => 
         value,
       );
     }
+  });
+});
+
+describe("no native MCP servers are configured", () => {
+  for (const authMode of ["api_key", "subscription"] as const) {
+    for (const codeModeHost of [false, true]) {
+      for (const builder of ["production", "loopback"] as const) {
+        it(`${builder}/${authMode}/host=${codeModeHost} semantic no-server config`, () => {
+          const opts = { model: "gpt-6-astra", projectPath: "/work/repo", authMode, codeModeHost };
+          const config = parse(builder === "production" ? buildCodexProductionConfigToml(opts)
+            : buildCodexLoopbackTestConfigToml(opts, "http://127.0.0.1:43123/v1"));
+          assertNoNativeServers(config);
+          assert.equal((config.features as Record<string, unknown>).goals, false);
+        });
+      }
+    }
+  }
+  it("custom provider semantic no-server config", () => {
+    const config = parse(buildCodexConfigToml(OPTS));
+    assertNoNativeServers(config);
+    assert.equal((config.features as Record<string, unknown>).goals, false);
+  });
+  it("rejects missing, null, scalar and array config roots", () => {
+    for (const config of [undefined, null, false, 0, "config", [], [{}]]) {
+      assert.throws(() => assertNoNativeServers(config), /outgoing thread config/);
+    }
+    assertNoNativeServers({ enabled: false, count: 0, optional: null, nested: ["value", {}] });
+  });
+  it("rejects nested, dotted and quoted outgoing server keys without inspecting values", () => {
+    for (const config of [
+      { mcp_servers: {} }, { "mcp_servers.fixture.command": "unused" },
+      { '"mcp_servers".fixture': {} }, { features: { mcp_servers: {} } },
+      { "'mcp_servers'.fixture": {} },
+    ]) assert.throws(() => assertNoNativeServers(config), /no native MCP servers/);
+    assertNoNativeServers({ model: "mcp_servers", projects: { "/work/repo": { trust_level: "untrusted" } } });
   });
 });

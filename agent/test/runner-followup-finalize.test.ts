@@ -6,11 +6,12 @@
 // publication intent the way the api does. Every test ends at an assertion deadline, never a hang:
 // a run that does not finish is cancelled and the test fails with the observed states.
 import { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { Executor, FollowUpOutcome, RunContext } from "../src/executor.js";
@@ -19,12 +20,12 @@ import { ReportPreconditionError } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import { REASON_FOLLOWUP_NOT_PARKED, RunRunner, StaleClaimError } from "../src/runner.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
-import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
-import type { ClaimResponse, StateRequest } from "../src/protocol.js";
+import { CredentialSwitchSignal, PauseNowSignal, SteeringChannel } from "../src/steering.js";
+import type { ClaimResponse, StateAck, StateRequest } from "../src/protocol.js";
 import { api, client, fakeGitlab, fx, git, installHarness } from "./runner-harness.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 
-installHarness();
+installHarness({}, cleanupTest);
 
 const GEN = 4;
 const REPO_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
@@ -37,6 +38,129 @@ const ATTEMPTS = 3;
 const roots: string[] = [];
 afterEach(async () => {
   for (const r of roots.splice(0)) await fsp.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+// Issue #4536: no outcome here depends on real timer ordering. The run's SteeringChannel reads a
+// frozen FakeClock (RunnerOptions.steeringNow), the follow-up idle window is crossed by advancing
+// that clock at arm time, and the admission loop's recovery backoff waits are fake waits the test
+// advances. Real-time waits below (until/finish/sleep) are only readiness polling and failure caps.
+interface FakeWait { deadline: number; check(): void; wake(): void }
+
+class FakeClock {
+  private t = Date.now();
+  private readonly waits = new Set<FakeWait>();
+  private fake = false;
+  private released = false;
+  readonly now = (): number => this.t;
+  get engaged(): boolean { return this.fake && !this.released; }
+  engage(): void { this.fake = true; }
+  get pending(): number { return this.waits.size; }
+  nextDeadline(): number | undefined {
+    let min: number | undefined;
+    for (const w of this.waits) min = min === undefined ? w.deadline : Math.min(min, w.deadline);
+    return min;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+    for (const w of this.waits) w.check();
+  }
+  /** Resolves at the fake deadline, or early when `signal` aborts or `shouldWake()` holds on an advance. */
+  wait(ms: number, signal: AbortSignal | undefined, shouldWake: () => boolean): Promise<void> {
+    return new Promise<void>(resolve => {
+      const w: FakeWait = {
+        deadline: this.t + ms,
+        check: () => { if (this.t >= w.deadline || shouldWake()) w.wake(); },
+        wake: () => {
+          if (!this.waits.delete(w)) return;
+          signal?.removeEventListener("abort", w.wake);
+          resolve();
+        },
+      };
+      this.waits.add(w);
+      signal?.addEventListener("abort", w.wake, { once: true });
+      w.check();
+    });
+  }
+  /** Resolves every pending wait; later waits delegate to the real implementation. */
+  release(): void {
+    this.released = true;
+    for (const w of this.waits) w.wake();
+  }
+}
+
+const RECOVERY_RETRY_MS = 5;
+/** The follow-up idle bound the parks arm; only the FakeClock crosses it. */
+const IDLE_MS = 40;
+const realAwaitFollowUp = SteeringChannel.prototype.awaitFollowUp;
+let clock = new FakeClock();
+let armPolicy: (armIndex: number) => boolean = () => true;
+let armCount = 0;
+let currentSteering: SteeringChannel | undefined;
+const executions: Array<{ runner: RunRunner; promise: Promise<void> }> = [];
+
+/** Join before installHarness removes the API and clone paths, including after a thrown assertion. */
+async function cleanupTest(): Promise<void> {
+  try {
+    clock.release();
+    for (const { runner } of executions) runner.shutdown();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(executions.map(e => e.promise)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("followup-finalize execution did not settle during fixture cleanup")), 5_000);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    assert.equal(clock.pending, 0, "fixture cleanup left fake waits pending");
+  } finally {
+    SteeringChannel.prototype.awaitFollowUp = realAwaitFollowUp;
+    executions.length = 0;
+  }
+}
+
+function startExecution(runner: RunRunner, claim: ClaimResponse): Promise<void> {
+  const promise = runner.execute(claim);
+  executions.push({ runner, promise });
+  // Teardown observes failures without replacing the original promise's rejection for its caller.
+  void promise.catch(() => undefined);
+  return promise;
+}
+
+beforeEach(() => {
+  const c = clock = new FakeClock();
+  armPolicy = () => true;
+  armCount = 0;
+  currentSteering = undefined;
+  SteeringChannel.prototype.awaitFollowUp = function (this: SteeringChannel, idleMs: number) {
+    const parked = realAwaitFollowUp.call(this, idleMs); // throws synchronously on a double arm
+    // eslint-disable-next-line typescript/no-this-alias
+    currentSteering = this;
+    const armIndex = ++armCount;
+    if (armPolicy(armIndex)) c.advance(idleMs);
+    return parked;
+  };
+});
+
+/** Stop and cancel cases: the park must end by that input, never by the idle window. */
+const neverIdle = (): void => { armPolicy = () => false; };
+
+it("fixture cleanup releases a fake wait abandoned by a failing operation", async t => {
+  const c = clock;
+  c.engage();
+  const pending = c.wait(5, undefined, () => false);
+  const original = new Error("injected failure before the explicit clock release");
+  await assert.rejects(async () => { throw original; }, error => error === original);
+  // t.after runs after the harness's afterEach, so this observes the shared teardown.
+  t.after(async () => {
+    const remaining = c.pending;
+    c.release(); // The regression must also clean up when run against the unfixed hooks.
+    await pending;
+    assert.equal(remaining, 0, "fixture cleanup left a fake wait pending");
+    assert.equal(SteeringChannel.prototype.awaitFollowUp, realAwaitFollowUp, "fixture cleanup did not restore the prototype");
+  });
 });
 
 async function mkOutbox(): Promise<Outbox> {
@@ -165,7 +289,7 @@ function commitWork(ctx: RunContext, note: string): void {
 
 /** Parks until the park ENDS (idle, stop or cancel), reporting a turn after each follow-up as the
  *  SDK executor does, then commits and returns. A cancelled park raises the cancel signal as it does. */
-function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = 40): Executor {
+function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = IDLE_MS): Executor {
   return {
     async run(ctx: RunContext): Promise<{ branch: string }> {
       await ctx.checkpoint?.({ reap: true });
@@ -186,18 +310,47 @@ function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = 40): Exe
 
 function build(executor: Executor, outbox: Outbox | undefined, gitlab = fakeGitlab().gitlab, extra: Record<string, unknown> = {}, homeDir?: string): RunRunner {
   const r = new RunRunner(client, git, () => ({ executor, homeDir }), nullLogger(), 20, undefined, {
-    pollMs: 5, planApprovalTimeoutMs: 0, prDescriptionHeadLagMs: 0, recoveryRetryMs: 5,
-    checkpointTestHooks: { retryBackoffMs: [0, 0] }, gitlab,
+    pollMs: 5, planApprovalTimeoutMs: 0, prDescriptionHeadLagMs: 0, recoveryRetryMs: RECOVERY_RETRY_MS,
+    checkpointTestHooks: { retryBackoffMs: [0, 0] }, gitlab, steeringNow: clock.now,
     ...(outbox ? { outbox } : {}), ...extra,
   });
   const seams = r as unknown as { forgeRetrySleep: (ms: number) => Promise<void>; publicationRetry: unknown };
   seams.forgeRetrySleep = async () => {};
   seams.publicationRetry = { retryDelaysMs: [0, 0, 0], sleep: async () => {} };
+  installBackoffSeams(r);
   return r;
 }
 
+interface WaitFlight { cancel: { signal: AbortSignal }; active?: { shuttingDown?: boolean }; steering: { isCancelled(): boolean } }
+
+/** Routes the admission loop's own recovery backoff (not the send closure's) to the FakeClock while
+ *  fake mode is engaged; every other caller, and every call once the clock is released, stays real. */
+function installBackoffSeams(r: RunRunner): void {
+  const c = clock;
+  const where = new AsyncLocalStorage<"admit" | "send">();
+  const seams = r as unknown as {
+    admitFollowUpFinalize(flight: WaitFlight, first: unknown, idleMs: number, parkSeq: number, send: (b: StateRequest) => Promise<StateAck>): Promise<unknown>;
+    waitRecoveryRetry(flight: WaitFlight, cancelStopsWait?: boolean, waitMs?: number, signal?: AbortSignal): Promise<void>;
+    shuttingDownGlobal: boolean;
+  };
+  const realAdmit = seams.admitFollowUpFinalize.bind(r);
+  const realWait = seams.waitRecoveryRetry.bind(r);
+  seams.admitFollowUpFinalize = (flight, first, idleMs, parkSeq, send) =>
+    where.run("admit", () => realAdmit(flight, first, idleMs, parkSeq, b => where.run("send", () => send(b))));
+  seams.waitRecoveryRetry = async (flight, cancelStopsWait = true, waitMs, signal) => {
+    if (!c.engaged || where.getStore() !== "admit") return realWait(flight, cancelStopsWait, waitMs, signal);
+    signal?.throwIfAborted();
+    const cancelSignal = flight.cancel.signal.aborted ? undefined : flight.cancel.signal;
+    const signals = [signal, cancelSignal].filter((s): s is AbortSignal => s !== undefined);
+    await c.wait(waitMs ?? RECOVERY_RETRY_MS, signals.length ? AbortSignal.any(signals) : undefined,
+      () => flight.active?.shuttingDown === true || seams.shuttingDownGlobal === true
+        || (cancelStopsWait && flight.steering.isCancelled()));
+    signal?.throwIfAborted();
+  };
+}
+
 /** The flight the runner hands the admission loop, so a test can reach its steering and flags. */
-interface Captured { flight?: { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void; markCancelled(): void; approveRefusedBySwitchPending(): boolean }; preserveRecoveryClone?: boolean; preserveSession?: boolean; stoppedSourceKept?: boolean; followUpPendingRearms?: number } }
+interface Captured { flight?: { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void; markCancelled(): void; isCancelled(): boolean; approveRefusedBySwitchPending(): boolean }; preserveRecoveryClone?: boolean; preserveSession?: boolean; stoppedSourceKept?: boolean; followUpPendingRearms?: number } }
 function captureFlight(r: RunRunner, onEnter?: (flight: NonNullable<Captured["flight"]>) => void): Captured {
   const cap: Captured = {};
   const seam = r as unknown as { admitFollowUpFinalize: (flight: NonNullable<Captured["flight"]>, ...rest: unknown[]) => Promise<unknown> };
@@ -241,7 +394,7 @@ async function until(predicate: () => boolean, ms: number): Promise<boolean> {
 
 /** Run to its end or fail at the deadline: a hung run is cancelled so the harness can tear down. */
 async function finish(r: RunRunner, claim: ClaimResponse, ms = 10_000): Promise<void> {
-  const execution = r.execute(claim).then(() => "done" as const);
+  const execution = startExecution(r, claim).then(() => "done" as const);
   const winner = await Promise.race([execution, sleep(ms).then(() => "deadline" as const)]);
   if (winner === "deadline") {
     api.setInputs(claim.run_id, [{ id: 9_000, kind: "cancel", body: null }]);
@@ -251,16 +404,39 @@ async function finish(r: RunRunner, claim: ClaimResponse, ms = 10_000): Promise<
 }
 
 /** For the cases whose correct outcome is to NOT proceed: observe for a window, then cancel. */
-async function observeThenCancel(r: RunRunner, claim: ClaimResponse, windowMs: number, ms = 10_000): Promise<void> {
-  const execution = r.execute(claim).then(() => "done" as const);
-  // The window starts at the park (the clone and checkpoint before it take a while), not at the start.
-  assert.ok(await until(() => statuses(claim.run_id).includes("awaiting_followup"), 8_000), "the run parked");
-  await sleep(windowMs);
-  const during = { statuses: statuses(claim.run_id), intents: api.publicationIntentRequests.length, finished: false };
-  const early = await Promise.race([execution, sleep(0).then(() => "running" as const)]);
-  during.finished = early === "done";
-  observed.push(during);
-  api.setInputs(claim.run_id, [{ id: 9_001, kind: "cancel", body: null }]);
+async function observeThenCancel(r: RunRunner, claim: ClaimResponse, log: { outcomes: FollowUpOutcome[] }, windowMs: number, ms = 10_000): Promise<void> {
+  clock.engage();
+  let settled = false;
+  const execution = startExecution(r, claim).then(() => { settled = true; return "done" as const; });
+  void execution.catch(() => { settled = true; });
+  // The window is FAKE time measured from the first backoff wait: every pending admission backoff is
+  // advanced to its deadline until the window has elapsed, so the resend count never depends on the host.
+  // A real-time cap that expires is a failure, never a completed window; on any failure the run is
+  // still cancelled and the clock released, so the file never hangs.
+  let cancelSent = false;
+  try {
+    assert.ok(await until(() => statuses(claim.run_id).includes("awaiting_followup"), 8_000), "the run parked");
+    let firstBackoffAt: number | undefined;
+    for (;;) {
+      assert.ok(await until(() => clock.pending > 0 || log.outcomes.length > 0 || settled, 8_000),
+        "the admission reached a backoff, an outcome or the end of the run");
+      const deadline = clock.nextDeadline();
+      if (deadline === undefined) break;
+      firstBackoffAt ??= clock.now();
+      if (clock.now() - firstBackoffAt >= windowMs) break;
+      clock.advance(Math.max(0, deadline - clock.now()));
+    }
+    // An outcome that reached the executor proceeds to publication (or completes); let that settle.
+    if (log.outcomes.length > 0)
+      assert.ok(await until(() => api.publicationIntentRequests.length >= 1 || settled, 8_000), "the outcome reached publication");
+    observed.push({ statuses: statuses(claim.run_id), intents: api.publicationIntentRequests.length, finished: settled });
+    api.setInputs(claim.run_id, [{ id: 9_001, kind: "cancel", body: null }]);
+    cancelSent = true;
+    assert.ok(await until(() => currentSteering?.isCancelled() === true || settled, 8_000), "the cancel was observed");
+  } finally {
+    if (!cancelSent) api.setInputs(claim.run_id, [{ id: 9_001, kind: "cancel", body: null }]);
+    clock.release();
+  }
   const winner = await Promise.race([execution, sleep(ms).then(() => "deadline" as const)]);
   assert.equal(winner, "done", "the cancel ends the run");
 }
@@ -291,7 +467,8 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
 
   it("stopped: a graceful stop is admitted the same way and completes", async () => {
     const { claim, m, outbox, log } = await idleSetup({ onPark: () => api.setInputs(claim.run_id, [{ id: 7, kind: "stop", body: null }]) });
-    await finish(build(parkingExecutor(log, 60_000), outbox), claim);
+    neverIdle();
+    await finish(build(parkingExecutor(log), outbox), claim);
 
     assert.deepEqual(log.outcomes, [{ kind: "ended", reason: "stopped" }]);
     assert.equal(finalizeBodies(claim.run_id).length, 1);
@@ -345,7 +522,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     const { claim, m, outbox, log } = await idleSetup({
       script: [{ kind: "raw", status: 200, body: {}, apply: false }], forceOwnershipRunning: true,
     });
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 300);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 300);
 
     assert.equal(observed[0]!.finished, false, "still waiting inside the window");
     assert.equal(observed[0]!.intents, 0, "no publication intent while the admission is unconfirmed");
@@ -406,8 +583,10 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       script: [{ kind: "refuse", reason: "followup_pending", apply: false }, { kind: "admitted" }],
       onFinalize: index => { if (index === 0) api.setInputs(claim.run_id, [{ id: 11, kind: "follow_up", body: "one more thing" }]); },
     });
-    // A wide idle window: the re-armed wait must not idle out before the poll loop delivers the follow-up.
-    const r = build(parkingExecutor(log, 600), outbox);
+    // Only arms 1 and 3 cross the idle window. The re-arm after the refusal (arm 2) must not idle out:
+    // the poll loop delivers the follow-up to it.
+    armPolicy = armIndex => armIndex === 1 || armIndex === 3;
+    const r = build(parkingExecutor(log), outbox);
     const cap = captureFlight(r);
     await finish(r, claim, 20_000);
 
@@ -423,7 +602,8 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       script: [{ kind: "refuse", reason: "followup_pending", apply: false }],
       onPark: () => api.setInputs(claim.run_id, [{ id: 7, kind: "stop", body: null }]),
     });
-    await finish(build(parkingExecutor(log, 60_000), outbox), claim);
+    neverIdle();
+    await finish(build(parkingExecutor(log), outbox), claim);
 
     assert.equal(m.finalizeRequests, 1, "bounded: one refusal, no resend");
     assert.match(String(states(claim.run_id).find(b => b.status === "failed")?.failure_reason), new RegExp(REASON_FOLLOWUP_NOT_PARKED));
@@ -436,8 +616,15 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       onPark: () => api.setInputs(claim.run_id, [{ id: 7, kind: "stop", body: null }]),
       onFinalize: index => { if (index === 0) api.setInputs(claim.run_id, [{ id: 8, kind: "cancel", body: null }]); },
     });
-    await finish(build(parkingExecutor(log, 60_000), outbox), claim);
+    neverIdle();
+    // The clock never advances: the queued cancel ends the park (or wakes the fake backoff if one is pending).
+    clock.engage();
+    const r = build(parkingExecutor(log), outbox);
+    const cap = captureFlight(r);
+    await finish(r, claim);
+    const cancelSeen = cap.flight?.steering.isCancelled() === true;
 
+    assert.equal(cancelSeen, true);
     assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
     assert.ok(m.finalizeRequests <= 20, `bounded resends: ${m.finalizeRequests}`);
     assert.match(String(states(claim.run_id).find(b => b.status === "failed")?.failure_reason), /run cancelled/);
@@ -534,7 +721,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     const { claim, m, outbox, log } = await idleSetup();
     client.protocolFeatures = BASE_FEATURES;
     const sends = spyFinalizeSends();
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 250);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 250);
 
     assert.equal(sends.count, 0, "the runner never even hands the client a followup_finalize report");
     assert.equal(m.finalizeRequests, 0);
@@ -557,7 +744,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     it(`a ${name} park sequence behaves as today: no admission is sent`, async () => {
       observed.length = 0;
       const { claim, m, outbox, log } = await idleSetup({ parkAck });
-      await observeThenCancel(build(parkingExecutor(log), outbox), claim, 250);
+      await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 250);
 
       assert.equal(m.finalizeRequests, 0);
       assert.ok(statuses(claim.run_id).includes("awaiting_followup"), "it did park");
@@ -569,7 +756,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     const { claim, m, outbox, log } = await idleSetup({
       script: [{ kind: "lost" }], onFinalize: () => { client.protocolFeatures = BASE_FEATURES; },
     });
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 300);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 300);
 
     assert.equal(m.finalizeRequests, ATTEMPTS, "only the first round reached the wire");
     assert.equal(api.publicationIntentRequests.length, 0);
@@ -580,7 +767,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     it(`a rolled-back api (${name}) on the first send keeps today's behaviour: no transition, no resend`, async () => {
       observed.length = 0;
       const { claim, m, outbox, log } = await idleSetup({ script: [{ kind: "raw", status: 400, body }] });
-      await observeThenCancel(build(parkingExecutor(log), outbox), claim, 250);
+      await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 250);
 
       assert.equal(m.finalizeRequests, 1, "a 400 is neither retried nor resent");
       assert.ok(m.intentStatuses.every(status => status === "awaiting_followup"), "no transition: every intent met the parked row");
@@ -593,7 +780,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     const { claim, m, outbox, log } = await idleSetup({
       script: [{ kind: "lost" }, { kind: "lost" }, { kind: "lost" }, { kind: "raw", status: 400, body: { error: GENERIC_400 } }],
     });
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 300);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 300);
 
     assert.ok(m.finalizeRequests > ATTEMPTS + 1, "it keeps resending");
     assert.equal(api.publicationIntentRequests.length, 0);
@@ -633,7 +820,8 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     const wire = api.stateAckWire!;
     api.stateAckWire = (body, run) => body.status === "recovery_wait"
       ? { status: 200, body: { run: { ...run, status: "cancelled" } } } : wire(body, run);
-    await finish(build(parkingExecutor(log, 60_000), outbox), claim);
+    neverIdle();
+    await finish(build(parkingExecutor(log), outbox), claim);
 
     assert.equal(m.finalizeRequests, 1);
     assert.equal(states(claim.run_id).filter(b => b.status === "recovery_wait").length, 1);
@@ -647,7 +835,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       onFinalize: () => { client.protocolFeatures = BASE_FEATURES; },
     });
     const sends = spyFinalizeSends();
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 400);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 400);
 
     assert.equal(sends.count, 1, "no further report is handed to the client once the feature is gone");
     assert.equal(m.finalizeRequests, 1);
@@ -708,18 +896,21 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
   });
 
   it("a cancel seen when the admitted ACK returns yields the cancelled outcome and publishes nothing", async () => {
-    let release!: () => void;
-    const hold = new Promise<void>(resolve => { release = resolve; });
+    let releaseAck!: () => void;
+    const hold = new Promise<void>(resolve => { releaseAck = resolve; });
+    let cancelSeen = false;
     const { claim, outbox, log } = await idleSetup({
       onFinalize: index => {
         if (index !== 0) return;
         api.setInputs(claim.run_id, [{ id: 8, kind: "cancel", body: null }]);
-        setTimeout(release, 200);
+        // Hold the ACK until the steering channel has actually seen the cancel (failure cap 8 s).
+        void until(() => currentSteering?.isCancelled() === true, 8_000).then(ok => { cancelSeen = ok; releaseAck(); });
       },
     });
     api.afterPersistState(claim.run_id, b => b.status === "followup_finalize", hold);
     await finish(build(parkingExecutor(log), outbox), claim);
 
+    assert.equal(cancelSeen, true, "the cancel was seen before the ACK was released");
     assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
     assert.equal(api.publicationIntentRequests.length, 0);
     assert.ok(!statuses(claim.run_id).includes("completed"));
@@ -731,7 +922,8 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       script: [{ kind: "refuse", reason: "cancel_pending", apply: false }],
       onPark: () => api.setInputs(claim.run_id, [{ id: 7, kind: "stop", body: null }]),
     });
-    await observeThenCancel(build(parkingExecutor(log, 60_000), outbox), claim, 400);
+    neverIdle();
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 400);
 
     assert.ok(m.finalizeRequests >= 3, `it keeps resending: ${m.finalizeRequests}`);
     assert.ok(m.finalizeRequests <= 90, `bounded by the 5 ms backoff within a 400 ms window: ${m.finalizeRequests}`);
@@ -749,7 +941,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       });
       const r = build(parkingExecutor(log), outbox);
       cap = captureFlight(r);
-      await observeThenCancel(r, claim, 400);
+      await observeThenCancel(r, claim, log, 400);
 
       assert.equal(m.parkSeq, 1, "the park was not re-run");
       assert.ok(m.finalizeRequests > ATTEMPTS, "it keeps resending");
@@ -853,7 +1045,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       onFinalize: index => { if (index === ATTEMPTS) client.protocolFeatures = BASE_FEATURES; },
     });
     const sends = spyFinalizeSends();
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 400);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 400);
 
     assert.equal(sends.count, 2, "one unknown round, one refused round, then it stops sending");
     assert.equal(m.finalizeRequests, ATTEMPTS + 1);
@@ -881,7 +1073,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       attempts++;
       throw new ReportPreconditionError("local guard");
     }) as typeof client.reportState;
-    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 400);
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, log, 400);
 
     assert.equal(attempts, 1, "never resent");
     assert.equal(m.finalizeRequests, 0);

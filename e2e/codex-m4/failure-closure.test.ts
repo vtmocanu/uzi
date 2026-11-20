@@ -2,7 +2,7 @@
 //
 // (a) Upstream hook characterization is DISTINCT from production policy and is test-only:
 //     production Codex hooks are DISABLED. This drives the REAL production + loopback config
-//     builders (config.ts) and asserts hooks + every native execution feature are off — so an
+//     builders (config.ts) and asserts hooks are off and exact feature keys are false — so an
 //     upstream hook serialization/spawn/timeout/malformed-output failure can NEVER become
 //     production permission. The upstream *characterization* itself lives in the M0 opt-in suite
 //     (e2e/codex-m0/hooks-stdin.test.mjs, harness-errors.test.mjs); it is REFERENCED here (its
@@ -35,12 +35,15 @@ before(async () => {
   umods = await loadUModules();
 });
 
-/** The native EXECUTION surfaces that must be pinned off in every production/loopback config, in
+/** Exact false feature entries in each production/loopback config, in
  *  BOTH the default/advice and the run-lane posture. `code_mode_host` is deliberately NOT in this
  *  list: it is the authority-free callback-routing execution HOST (off on the advice/stock lane,
  *  enabled on the run lane), asserted posture-by-posture below — not an always-off native-execution
- *  grant. */
+ *  grant. Removed apply_patch_freeform and catalog-overridden code_mode/code_mode_only keys
+ *  are construction checks, not runtime suppression proof (pin 0.167.0). Native patch remains
+ *  advertised; environments: [] and launcher CODEX_EXEC_SERVER_URL=none deny execution. */
 const NATIVE_FEATURES = [
+  "goals",
   "shell_tool",
   "unified_exec",
   "code_mode",
@@ -80,7 +83,7 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
     const prodSub = config.buildCodexProductionConfigToml({ ...opts, authMode: "subscription" });
     const loopback = config.buildCodexLoopbackTestConfigToml({ ...opts, authMode: "subscription" }, "http://127.0.0.1:5599/v1");
 
-    // NEGATIVE oracle: hooks are OFF and every native EXECUTION feature is OFF in EVERY builder, with
+    // NEGATIVE construction oracle: hooks are OFF and listed feature entries are false, with
     // code_mode_host the single posture-dependent exception — the authority-free callback-routing host
     // is OFF on the DEFAULT/advice lane here (asserted per-builder below) and enabled ONLY on the run
     // lane (the second pass further down). An upstream hook failure therefore has nothing to become —
@@ -99,7 +102,7 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
       assert.ok(!toml.includes("dangerously-bypass-hook-trust"), `${label}: no CLI hook-trust bypass`);
 
       // EFFECTIVE-TABLE oracle (a key moved to an ineffective table now fails):
-      // hooks + every native execution feature are disabled UNDER [features].
+      // hooks and listed false entries are emitted UNDER [features]; runtime support is separate.
       assert.ok(features.includes("hooks = false"), `${label}: [features].hooks = false`);
       for (const feature of NATIVE_FEATURES) {
         assert.ok(features.includes(`${feature} = false`), `${label}: [features].${feature} = false (effective table)`);
@@ -115,12 +118,13 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
 
     // RUN-LANE posture: the SAME production + loopback builders, driven with the trusted
     // launcher-fixed codeModeHost:true, enable ONLY the authority-free code-mode execution host
-    // (code_mode_host = true). hooks stay off and EVERY OTHER native execution feature stays off, so
+    // (code_mode_host = true). Hooks stay off and the other tested keys remain false;
     // the run-lane host is a callback-routing surface, never a native-execution grant.
     const prodApiRun = config.buildCodexProductionConfigToml({ ...opts, authMode: "api_key", codeModeHost: true });
     const prodSubRun = config.buildCodexProductionConfigToml({ ...opts, authMode: "subscription", codeModeHost: true });
     const loopbackRun = config.buildCodexLoopbackTestConfigToml({ ...opts, authMode: "subscription", codeModeHost: true }, "http://127.0.0.1:5599/v1");
     for (const [label, toml] of [["prod api_key (run lane)", prodApiRun], ["prod subscription (run lane)", prodSubRun], ["loopback (run lane)", loopbackRun]] as const) {
+      assert.doesNotMatch(toml, /\bmcp_servers\b/, `${label}: no native MCP server configured`);
       const features = tomlSections(toml).get("features") ?? [];
       assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, `${label}: the removed compatibility key is omitted`);
       // The run lane flips ONLY code_mode_host on (line-anchored) …
@@ -129,7 +133,7 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
       assert.ok(features.includes("hooks = false"), `${label}: hooks stay off on the run lane`);
       assert.doesNotMatch(toml, /hooks = true/, `${label}: hooks are NEVER enabled on the run lane`);
       assert.ok(!toml.includes("bypass_hook_trust") && !toml.includes("dangerously-bypass-hook-trust"), `${label}: no hook-trust bypass on the run lane`);
-      // … and EVERY OTHER native execution feature stays off (code_mode/code_mode_only/prewarm too).
+      // … and the other tested config entries remain false (not a runtime suppression oracle).
       for (const feature of NATIVE_FEATURES) {
         assert.ok(features.includes(`${feature} = false`), `${label}: [features].${feature} = false stays off on the run lane`);
       }

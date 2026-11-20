@@ -238,6 +238,16 @@ func quotaAdvisories(name string, s Spec, cpuReqOK, memReqOK bool, c builtin.Cei
 					s.MemoryRequestMiB, tq.Deployments.N, tier, tq.RequestsMemoryMiB.N, quotaPathPrefix[t]),
 			})
 		}
+		if t == builtin.TierDocker {
+			// A docker pod is also charged for its DinD sidecars, whose requests only the
+			// controller holds (workers.docker.dindResources); the api deliberately carries no
+			// copy. The comparison above is therefore worker-only: say it is incomplete, so the
+			// absence of an exceeded warning never reads as "fits" (#4517).
+			out = append(out, Advisory{
+				Size: name, Tier: tier, Kind: KindQuotaUnavailable,
+				Message: fmt.Sprintf("quota advisory incomplete for the %s tier: only the worker container's requests x deployments are compared against %s.*; the DinD sidecars' requests (dind, dind-meter, and dind-init when rootless) are not counted, so the absence of an exceeded warning does not mean the pod fits", tier, quotaPathPrefix[t]),
+			})
+		}
 	}
 	return out
 }

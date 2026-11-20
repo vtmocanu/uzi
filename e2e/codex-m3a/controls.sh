@@ -433,7 +433,9 @@ control_5() {
   # observe EXACTLY the allowlist + the provider credential and NOTHING from the host/worker.
   # This drove `launch-cli` above with the fixed production Codex app-server target. Read the
   # real app-server process environment as the same runner uid and assert its full key set.
-  _expect_keys="HOME CODEX_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME TMPDIR PATH SHELL LANG TERM FAKE_PROVIDER_API_KEY"
+  # #4509: a provider root's allowlist includes the fixed CODEX_EXEC_SERVER_URL=none, the
+  # launcher-side guard denying a default native execution environment (asserted in (d2)).
+  _expect_keys="HOME CODEX_HOME CODEX_EXEC_SERVER_URL XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME TMPDIR PATH SHELL LANG TERM FAKE_PROVIDER_API_KEY"
   _child="$($NODE "$EVQ" "$CLI_ERR" ready started.childPid 2>/dev/null)"
   _envtxt="$(as_runner sh -c 'tr "\000" "\n" < "/proc/$1/environ"' sh "$_child" 2>/dev/null || true)"
   _cnt="$(printf '%s\n' "$_envtxt" | grep -c '=' || true)"
@@ -482,6 +484,14 @@ control_5() {
       ok "provider credential FAKE_PROVIDER_API_KEY delivered to child (== the dummy value)"
     else
       bad "provider credential mismatch: child got '$_credval' want '$_cred'"
+    fi
+
+    # (d2) #4509: the launcher's exec-server guard reached the child verbatim (== none).
+    _execsrv="$(printf '%s\n' "$_envtxt" | grep '^CODEX_EXEC_SERVER_URL=' | head -1 | cut -d= -f2-)"
+    if [ "$_execsrv" = "none" ]; then
+      ok "exec-server guard CODEX_EXEC_SERVER_URL=none delivered to child"
+    else
+      bad "exec-server guard mismatch: child got CODEX_EXEC_SERVER_URL='$_execsrv' want 'none'"
     fi
 
     # (e) NO host/worker leak: named-forbidden keys + wildcard families must ALL be absent.

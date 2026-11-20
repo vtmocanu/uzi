@@ -52,7 +52,7 @@ export function SlackSettingsCard({
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
   status: string;
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.slack_enabled === "true");
   const [publicBaseUrl, setPublicBaseUrl] = useState(settings.public_base_url);
@@ -88,7 +88,7 @@ export function SlackSettingsCard({
     setBusy(true);
     try {
       const resp = await api.updateSettings(payload);
-      onSaved(resp);
+      onSaved(resp, payload);
       setEnabled(resp.settings.slack_enabled === "true");
       setPublicBaseUrl(resp.settings.public_base_url);
       setBotToken("");

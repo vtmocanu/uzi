@@ -84,8 +84,9 @@ untrusted uid.
    setgid bit inherited from `/data/runner`. It then asserts, **fail-closed**, that the
    real app-server's `/proc` environment is the
    env-delivery allowlist and nothing else: non-empty; EXACTLY `HOME`, `CODEX_HOME`, the four
-   `XDG_*_HOME`, `TMPDIR`, `PATH`, `SHELL`, `LANG`, `TERM`, and the provider credential var
-   (== the dummy value); `HOME`/`CODEX_HOME` pointing into the fresh 0700 trees; and NO
+   `XDG_*_HOME`, `TMPDIR`, `PATH`, `SHELL`, `LANG`, `TERM`, the fixed
+   `CODEX_EXEC_SERVER_URL` (== `none`, #4509's launcher guard against a default native
+   execution environment), and the provider credential var (== the dummy value); `HOME`/`CODEX_HOME` pointing into the fresh 0700 trees; and NO
    host/worker leak (`UZI_WORKER_TOKEN{,_FILE}`, any `ANTHROPIC*`, any `*_PAT`/forge token,
    `NODE_OPTIONS`, and an exported test canary are all absent). This is the regression guard
    for the supervisor's `launchChild` env forwarding.
@@ -136,7 +137,8 @@ required for a dynamic-tool-only cell.
   appears — the shipped stock config correctly does not launch one.
 - **C. Isolation controls** (`isolation.test.ts`). The m3-specific additions on top of the
   shell controls: C1 reads the REAL Codex child's `/proc/<pid>/environ` and asserts exactly
-  the replacement-env allowlist + credential with no host/worker leak; C2 asserts no
+  the replacement-env allowlist (including `CODEX_EXEC_SERVER_URL=none`) + credential with
+  no host/worker leak; C2 asserts no
   auth/session/credential material is baked into the shipped image; C3 is a MUTATION control
   proving the C1 assertion rejects a leaked/mutated env (non-vacuous, fails after
   typecheck); C4 proves malicious repo config cannot enter the production launch
@@ -240,11 +242,11 @@ The supervisor's `launchChild` (`agent/codex/supervisor/main.go`) builds the chi
 `ProcAttr` with `Env: os.Environ()`, so the child INHERITS the supervisor's own environment.
 Under the isolated launcher that environment IS the replaced-env allowlist: the launcher
 spawns the supervisor with an explicit, fully-replaced env (HOME/CODEX_HOME/XDG/TMPDIR/PATH,
-SHELL/LANG/TERM, and the provider credential for a `kind:"provider"` root) and `setpriv`
+SHELL/LANG/TERM, `CODEX_EXEC_SERVER_URL=none`, and the provider credential for a `kind:"provider"` root) and `setpriv`
 passes it through unchanged (no `--reset-env`), so forwarding it verbatim delivers exactly
 that allowlist to the child — and nothing from the host/worker. Control 5 asserts this
 fail-closed (see the five checks above): the child env is non-empty, is exactly the
-allowlist keys with the credential present, HOME/CODEX_HOME point into the fresh 0700 trees,
+allowlist keys with the credential present and `CODEX_EXEC_SERVER_URL=none`, HOME/CODEX_HOME point into the fresh 0700 trees,
 and no host/worker vars leak. An earlier revision of `launchChild` set `Env` nil (an EMPTY
 child env, so the allowlist never reached the child); that one-line bug is now fixed and this
 control is its permanent regression guard.

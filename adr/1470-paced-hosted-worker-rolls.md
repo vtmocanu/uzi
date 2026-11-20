@@ -180,6 +180,60 @@ participants without a canary. A desired worker that cannot be rendered in the
 same or an unknown namespace also keeps this history: its cohort membership
 cannot be ruled out from the incomplete observation.
 
+#### Absent duplicate-canary cancellation (#4475)
+
+When a pool holds exactly two incomplete canary reservations and the
+old-incarnation duplicate proof fails, the controller cancels one (D) instead of
+holding the pool, only if every condition below holds. D's Deployment is live, at
+replicas 0, and no pod, PVC or claim is attributable to it by any identity
+signal: worker-id label, Deployment-name prefix, direct or ReplicaSet ownership
+(terminating ReplicaSets included), canonical claim names or mounts. Every
+attributable ReplicaSet must have a known zero desired replica count; a pending
+pod producer denies absence even when no pod has been observed. D's
+reservation hash differs from its deployed template and D has drifted from the
+target, and D is not custody-held, under maintenance, busy or hibernating. The
+other canary (S) is current: a live one-replica Deployment that is not physically
+absent and not stuck, its reservation equals the rendered target hash, image and
+exact version, its deployed template equals the reservation, it has the same
+owner and lane, is not custody-held, and carries no claim mirror or malformed
+reservation. The whole pool and namespace
+observation is clean: no hibernating or waking member, no unavailable, mutated,
+blocked, snapshot-incomplete or undecodable-reservation member, no uncertainty,
+migration or layout fence, no unplanned worker in the namespace or an unknown
+one, no ambiguous identity or stray reservation, and no out-of-pool canary of the
+same owner and lane or unattributed reservation.
+
+The only write is one metadata-only reservation cancellation conditioned on D's
+UID and resourceVersion. The pool is then held ("duplicate canary cancelled for
+absent worker; re-observation required") and the next tick re-observes and
+resumes through normal promotion, coverage and concurrency rules. The
+cancellation grants S no promotion proof. A conflict or unconfirmed write keeps
+the existing hold and is reported as an error; an uncertain write that committed
+is not repeated, because the next tick sees one canary.
+
+The pool stays in the existing hold (`duplicate canary reservations unresolved;
+explicit recovery required`) when any absence proof is not met; when the absent
+duplicate is already on the target template (not drifted), because cancelling it
+can leave a markerless worker held as "target template has no reservation
+proof"; when the pool has a waking hibernation member; when the survivor is
+physically absent, terminating, stuck or otherwise not current; and with three or
+more canaries. Two live canaries cannot use this fallback, but the existing
+old-incarnation duplicate proof may still cancel their reservations. When the
+absent worker has drifted, manual recovery is to pause controller reconciliation,
+clear the stale `uzi.dev/image-roll` annotation from its data claim first (if
+present), and then clear it from the Deployment. Re-observe both annotations as
+absent before resuming reconciliation, so rollSnapshot cannot restore the stale
+mirror. The worker then re-enters as a fresh drifted participant. Other held
+shapes need case-specific recovery.
+
+How the second canary arises is not established. Characterization tests found
+that the mapping-correction retarget rewrites only an entry's own marker (keeping
+its canary bit, resetting `completed`) and observed no second canary holder,
+including when completed canary history kept on a claim mirror is reopened as an
+incomplete canary at the new version. The producing path of the incident is
+therefore unknown; this rule settles the one provably safe shape and does not
+prevent the duplicate.
+
 ### D4 — Promotion proves the current incarnation
 
 The promotion boundary in `controller/internal/kube/roll_pacing.go` requires:

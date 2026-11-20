@@ -69,6 +69,8 @@ test(EXCEPTIONS_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
       assert.equal(effects, isAdvice ? 0 : 1, "only the later control callback may reach a worker effect; no answer was supplied");
       assert.deepEqual(obs.callbacks.map(c => c.tool), isAdvice ? [] : ["uzi_bash"]);
       const inventory = runtimeInventory(obs.providerRequests);
+      assert.equal(inventory.observed, true);
+      assert.deepEqual(inventory.unparsed, []);
       assert.ok(inventory.names.includes("request_user_input_async"), "direct async advertisement is visible");
       assert.match(inventory.descriptions, /clock__curr_time/, "UTC appears in the nested exec declarations");
       if (isAdvice) assert.doesNotMatch(inventory.descriptions, /uzi_bash/, "advice advertises no worker callback");

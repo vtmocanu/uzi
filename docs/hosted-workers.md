@@ -132,6 +132,9 @@ can be edited and reset but never removed.
   overrides it. ResourceQuota is advisory only: an edit that does not fit shows a
   warning but saves, a quota of zero is accepted, and quota values the api cannot
   read show as "quota check unavailable", never as unlimited or as fitting.
+  The docker tier's check counts only the worker container's requests, not the
+  DinD sidecars', so it always also shows "quota check unavailable"
+  (incomplete): no exceeded warning there does not mean the pod fits.
 - **Read-only until supported.** The editor stays read-only, and saves are refused
   with `409`, until the controller advertises support on a fresh status report. On
   a rolling upgrade the api rolls first, so the card unlocks once the new controller
@@ -875,6 +878,38 @@ While no canary exists the pool can stay held:
   participant regains proof or its Deployment is rescaled, retemplated or loses its
   marker. Deleting that Deployment replaces this hold, usually with the
   missing-deployment guard above.
+
+A pool with exactly two incomplete canary reservations is normally held with
+`duplicate canary reservations unresolved; explicit recovery required`. The
+controller cancels one of them on its own only when it is provably stale: its
+Deployment is at zero replicas with no pod, PVC or claim attributable to that
+worker, every attributable ReplicaSet (including terminating ones) has a known
+zero replica count, its reservation no longer matches its deployed template and it has
+drifted from the target, and it is not custody-held, under maintenance, busy or
+hibernating. The other canary must be current: one replica, not stuck, with the
+reservation, deployed template and rendered target all matching, and no claim
+mirror or malformed reservation, and it must not be custody-held. The rest of the pool and namespace must also be clean (no hibernating,
+waking, unavailable or blocked worker, no uncertainty, migration or layout fence,
+no unplanned worker, no stray or ambiguous reservation, no same-owner canary
+outside the pool). The controller then makes one metadata-only cancellation of the
+stale reservation, holds the pool with `duplicate canary cancelled for absent
+worker; re-observation required` for that tick, and resumes normal roll planning
+on the next. This grants the surviving canary no promotion proof. A conflicting
+or unconfirmed write keeps the hold and is reported as an error.
+
+The pool stays held with the unresolved-duplicate reason when any of those
+conditions fails: the absent worker is already on the target template, a worker is
+waking from hibernation, the surviving canary is absent, terminating, stuck or
+otherwise not current, or there are three or more canaries. Two live canaries
+cannot use this absent-worker recovery; the existing old-incarnation proof may
+still cancel their reservations when both satisfy that proof.
+When the absent worker has drifted, an operator can pause controller
+reconciliation, remove the stale `uzi.dev/image-roll` annotation from its data
+claim first (if present), and then remove it from the Deployment. Re-observe both
+objects and verify the annotations are absent before resuming reconciliation;
+otherwise the retained mirror can restore the stale reservation. The worker then
+re-enters the roll as a fresh drifted participant. Other held shapes need
+case-specific recovery.
 
 Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
