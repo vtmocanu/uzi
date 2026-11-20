@@ -761,8 +761,7 @@ export class JobRunner {
       // (a job fails terminally), this is the worker's second layer.
       if (claim.secrets?.provider) {
         for (const k of providerKeys) this.log.addSecret(k);
-        try { await this.fail(runId, generation, PROVIDER_LANE_UNSUPPORTED); }
-        finally { for (const k of providerKeys) this.log.removeSecret(k); }
+        await this.fail(runId, generation, PROVIDER_LANE_UNSUPPORTED);
         return;
       }
       const job = claim.job;

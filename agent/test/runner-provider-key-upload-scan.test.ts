@@ -359,4 +359,3 @@ describe("provider key scan: held publication", () => {
     assert.equal(server.heldCalls.length, 1);
   });
 });
-

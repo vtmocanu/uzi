@@ -181,6 +181,7 @@ import {
   resendPublicationRecord,
   samePublicationGuardAndMr,
   boundedPrSummaryJson,
+  redactStrings,
   sliceWellFormed,
   attachServerSequence,
   chooseResumeRecord,
@@ -11980,7 +11981,8 @@ export class RunRunner {
           checkpoint_key: flight.runKind === "task" ? (flight.checkpointCoordinates?.checkpoint_key ?? null) : null,
         },
         mr: {
-          // Redacted exactly like the MR path (buildDeliveryContext / redactText) before it enters the durable intent.
+          // Redacted with the flight's redactText before it enters the durable intent; the MR path redacts the
+          // lead's claim the same way (redactStrings at the description publisher's `lead`).
           title: sliceWellFormed(redactText(mrTitle(claim, result.scopeCapped, completionScope)), 1024),
           // The structured claim as redacted, well-formed JSON (never a cut one): the publisher's lead_only and
           // deterministic_only modes (leadFields in pr-description-publisher.ts) are built from exactly this
@@ -13409,7 +13411,8 @@ export class RunRunner {
         // only destroy human text.
         blindFallback: !interlocked,
         prior: claim.pr_description,
-        lead: result.prSummary,
+        // Every string of the lead's claim is redacted here: the publisher stages these fields into the PR body.
+        lead: result.prSummary ? redactStrings(result.prSummary, redactText) : result.prSummary,
         facts: async (s) => {
           const size = await computeSize(this.git, barePath, s.targetBranch, s.headSha || null, runLog);
           let baseSha: string | null = null;

@@ -257,6 +257,18 @@ describe("secretScanCheckpointRange with provider key literals", () => {
     assertNoKeyBytes(res);
   });
 
+  it("a zero range (tip === excludeSha) scans the objects the pack carries: the tip against its pinned parents", async () => {
+    const parent = commitFile(work, "p.txt", "p\n");
+    const tip = commitFile(work, "a.txt", `leaked: ${RAW}\n`);
+    syncFeature();
+    const res = await cache.secretScanCheckpointRange(
+      bare, { tipSha: tip, excludeSha: tip, packExcludeShas: [parent] }, { literals: FORMS });
+    assert.equal(res.trusted, true);
+    assert.equal(res.findings.length, 1, "the declared commit's own blob is scanned, not the empty tip..^tip");
+    assert.equal(res.findings[0]!.ruleId, "uzi-provider-key");
+    assertNoKeyBytes(res);
+  });
+
   it("the same range without literals is clean (a vendor run: no extra work)", async (t) => {
     git(work, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", `note ${RAW}`);
     const tip = git(work, "rev-parse", "HEAD");

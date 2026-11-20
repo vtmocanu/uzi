@@ -178,6 +178,14 @@ function assertStorableStrings(value: unknown, where: string): void {
   }
 }
 
+/** A copy of `v` with `redact` applied to every string in it (members of arrays and objects included). */
+export function redactStrings<T>(v: T, redact: (text: string) => string): T {
+  const scrub = (x: unknown): unknown => typeof x === "string" ? redact(x)
+    : Array.isArray(x) ? x.map(scrub)
+      : typeof x === "object" && x !== null ? Object.fromEntries(Object.entries(x).map(([k, y]) => [k, scrub(y)])) : x;
+  return scrub(v) as T;
+}
+
 /**
  * The lead's structured PR summary as the intent records it: every string redacted with `redact`, then
  * serialized as WELL-FORMED JSON that fits `maxChars`. It is never cut mid-text (a cut leaves unparseable
@@ -188,10 +196,7 @@ function assertStorableStrings(value: unknown, where: string): void {
  */
 export function boundedPrSummaryJson(summary: unknown, redact: (text: string) => string, maxChars: number = MAX_SUMMARY_CHARS): string {
   if (typeof summary !== "object" || summary === null || Array.isArray(summary)) return "";
-  const scrub = (v: unknown): unknown => typeof v === "string" ? redact(v)
-    : Array.isArray(v) ? v.map(scrub)
-      : typeof v === "object" && v !== null ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrub(x)])) : v;
-  const work = scrub(summary) as Record<string, unknown>;
+  const work = redactStrings(summary, redact) as Record<string, unknown>;
   const fits = (): string | undefined => {
     const json = JSON.stringify(work);
     return json.length <= maxChars ? json : undefined;
@@ -285,7 +290,7 @@ function secretRemediation(value: unknown, where: string): PublicationSecretReme
   };
 }
 
-const FROZEN_HELD_KEYS = ["version", "blocked", "everKnown", "cleanTip", "flaggedCommits", "ciGlobs", "confirmedTip", "checkpointKey", "extraFloors"];
+const FROZEN_HELD_KEYS = ["version", "blocked", "everKnown", "cleanTip", "flaggedCommits", "ciGlobs", "confirmedTip", "checkpointKey", "extraFloors", "providerKeyScan"];
 
 function frozenHeld(value: unknown, where: string, owner: { kind: string; runId: string }): FrozenHeldPolicy {
   const o = object(value, where, FROZEN_HELD_KEYS, ["version", "blocked", "everKnown", "flaggedCommits", "ciGlobs", "extraFloors"]);
@@ -302,6 +307,7 @@ function frozenHeld(value: unknown, where: string, owner: { kind: string; runId:
     ...(o.confirmedTip !== undefined ? { confirmedTip: o.confirmedTip } : {}),
     ...(o.checkpointKey !== undefined ? { checkpointKey: o.checkpointKey } : {}),
     extraFloors: [...o.extraFloors],
+    ...(o.providerKeyScan === true ? { providerKeyScan: true as const } : {}),
   };
 }
 

@@ -19796,11 +19796,12 @@ export class GitCache {
     // 0. The exact-key scan, over the same revisions and BEFORE the size pre-check and the
     // zero-textual-commit early return below: an empty commit's message, a filename, a binary
     // blob or a merge result carries the key without a gitleaks-countable hunk. The scan excludes
-    // only `excludeSha`, not the scan floors: a pinned pack (checkpointPack) excludes only that
-    // commit too, so the scanned objects stay a superset of what the pack carries.
+    // only the pack's own exclusions, not the scan floors: `packExcludeShas` for a zero range (the
+    // tip's parents, see zeroRangePackExcludes), else `excludeSha`, so the scanned objects stay a
+    // superset of what the pinned pack (checkpointPack) carries.
     if (opts.literals.length > 0) {
       const key = await this.scanObjectsForLiterals(
-        barePath, { tip: range.tipSha, excludes: [range.excludeSha] }, opts.literals, { deadlineMs: remaining() },
+        barePath, { tip: range.tipSha, excludes: range.packExcludeShas ?? [range.excludeSha] }, opts.literals, { deadlineMs: remaining() },
       );
       if (!key.trusted) return untrusted("provider_key_scan_untrusted", { why: key.reason });
       if (key.findings.length > 0) return { trusted: true, findings: key.findings };
@@ -20001,11 +20002,12 @@ export class GitCache {
       const findings: SecretFinding[] = [];
       for (const hit of hits) {
         let commit = hit.type === "commit" ? hit.oid : range.tip;
-        if (hit.type !== "commit") {
+        // Attribution is best effort and bounded by the scan deadline: once it is spent the finding names the tip.
+        if (hit.type !== "commit" && remaining() > 0) {
           try {
             const log = await this.execScoped("git", withDir(barePath, [
               "--no-replace-objects", "log", "-m", "--reverse", "--format=%H", `--find-object=${hit.oid}`, ...revs,
-            ]), { env: gitEnv(), timeout: Math.max(1_000, remaining()), maxBuffer: 1024 * 1024 });
+            ]), { env: gitEnv(), timeout: remaining(), maxBuffer: 1024 * 1024 });
             const first = log.stdout.split("\n").find((l) => SHA40_RE.test(l.trim()));
             if (first) commit = first.trim();
           } catch (err) {
