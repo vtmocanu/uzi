@@ -249,6 +249,25 @@ describe("provider pass key encodings", () => {
   });
 });
 
+it("provider usage preserves metadata when redacted model ids collide", async () => {
+  const calls: AdviceUsageSnapshot[] = [];
+  await runReadOnlyModelPass(passOpts({
+    provider: binding(ID_KEY), onUsage: usage => { calls.push(usage); },
+    queryFn: frames(
+      assistant("first", { id: "metadata-first", model: ID_KEY }, { input_tokens: 10, output_tokens: 2, service_tier: "first-tier" }),
+      assistant("second", { id: "metadata-second", model: REDACTED }, { input_tokens: 5, output_tokens: 3, service_tier: "second-tier" }),
+      OK,
+    ),
+  }));
+  assert.equal(calls.length, 1);
+  assert.equal(carries(calls[0], ID_KEY), false);
+  const merged = calls[0]![REDACTED] as unknown as Record<string, unknown>;
+  assert.equal(merged.inputTokens, 15);
+  assert.equal(merged.outputTokens, 5);
+  assert.equal(merged.service_tier, "first-tier");
+  assert.equal(merged["service_tier#2"], "second-tier");
+});
+
 describe("redactingLogger", () => {
   it("scrubs the message and nested fields, including through child()", () => {
     const key = ID_KEY;

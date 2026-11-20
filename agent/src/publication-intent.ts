@@ -25,7 +25,10 @@
  * that very enrollment_seq.
  */
 import { validFrozenHeldPolicy, type FrozenHeldPolicy } from "./frozen-held.js";
+import { redactStrings } from "./redact.js";
 import type { PrSummaryClaim, PrSummaryScopeNote, PrSummaryVerification } from "./signals.js";
+
+export { redactStrings };
 
 /** The intent document version. A reader of any other version refuses it (mismatch). */
 const PUBLICATION_INTENT_VERSION = 1;
@@ -176,14 +179,6 @@ function assertStorableStrings(value: unknown, where: string): void {
       assertStorableStrings(v, `${where}.${k}`);
     }
   }
-}
-
-/** A copy of `v` with `redact` applied to every string in it (members of arrays and objects included). */
-export function redactStrings<T>(v: T, redact: (text: string) => string): T {
-  const scrub = (x: unknown): unknown => typeof x === "string" ? redact(x)
-    : Array.isArray(x) ? x.map(scrub)
-      : typeof x === "object" && x !== null ? Object.fromEntries(Object.entries(x).map(([k, y]) => [k, scrub(y)])) : x;
-  return scrub(v) as T;
 }
 
 /**

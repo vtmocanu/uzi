@@ -33,7 +33,7 @@ import { uidSplitActive } from "./runner-uid.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
-import { makeTextRedactor, providerKeyForms, type TextRedactor } from "./redact.js";
+import { makeTextRedactor, providerKeyForms, redactStrings, type TextRedactor } from "./redact.js";
 import type { Logger } from "./log.js";
 import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
@@ -231,7 +231,7 @@ function usageLatch(opts: ReadOnlyModelPassOpts, scope?: ProviderScope): {
       closed = true;
       if (latest === undefined) return;
       try {
-        onUsage(scope ? redactUsageSnapshot(latest, scope.text) : latest);
+        onUsage(scope ? redactStrings(latest, scope.text) : latest);
       } catch (e) {
         log.warn(`${opts.label} usage callback failed`, { error: errMessage(e) });
       }
@@ -247,7 +247,7 @@ function usageLatch(opts: ReadOnlyModelPassOpts, scope?: ProviderScope): {
 
 interface ProviderScope {
   readonly text: TextRedactor;
-  /** The pass's logger: redacts the message and the string fields of plain objects and arrays (up to depth 6)
+  /** The pass's logger: redacts the message, member names and string fields of plain objects and arrays (up to depth 6)
    *  before delegating. */
   readonly log: Logger;
   /** The value to throw in place of `err`: `err` itself when it carries no key form. */
@@ -261,16 +261,15 @@ function providerScope(key: string, base: Logger, label: string): ProviderScope 
 
 const MAX_LOG_FIELD_DEPTH = 6;
 
-function redactLogValue(v: unknown, text: TextRedactor, depth = 0): unknown {
-  if (typeof v === "string") return text(v);
-  if (v === null || typeof v !== "object" || depth >= MAX_LOG_FIELD_DEPTH) return v;
-  if (Array.isArray(v)) return v.map((x) => redactLogValue(x, text, depth + 1));
-  const proto = Object.getPrototypeOf(v);
-  if (proto !== Object.prototype && proto !== null) return v;
-  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactLogValue(x, text, depth + 1)]));
+function redactLogValue(v: unknown, text: TextRedactor): unknown {
+  return redactStrings(v, text, (container, depth) => {
+    if (depth >= MAX_LOG_FIELD_DEPTH) return false;
+    const proto = Object.getPrototypeOf(container);
+    return Array.isArray(container) || proto === Object.prototype || proto === null;
+  });
 }
 
-/** A Logger over `base` that scrubs the message and the string fields of plain objects and arrays
+/** A Logger over `base` that scrubs the message, member names and string fields of plain objects and arrays
  *  (to a depth of MAX_LOG_FIELD_DEPTH); class instances and deeper values pass through. It never
  *  touches `base`'s secret registry: addSecret/removeSecret only delegate what a caller explicitly asks. */
 export function redactingLogger(base: Logger, text: TextRedactor): Logger {
@@ -289,27 +288,6 @@ export function redactingLogger(base: Logger, text: TextRedactor): Logger {
   };
   if (base.redactDiagnostic) out.redactDiagnostic = (t) => text(base.redactDiagnostic!(t));
   return out;
-}
-
-/** The snapshot with every model id and string field redacted. Ids that collide once redacted are
- *  merged: numeric fields are summed (an optional one when either side has it). */
-function redactUsageSnapshot(snapshot: AdviceUsageSnapshot, text: TextRedactor): AdviceUsageSnapshot {
-  const merged = new Map<string, Record<string, unknown>>();
-  for (const [model, usage] of Object.entries(snapshot)) {
-    const clean: Record<string, unknown> = {};
-    for (const [field, value] of Object.entries(usage)) clean[field] = typeof value === "string" ? text(value) : value;
-    const id = text(model);
-    const prior = merged.get(id);
-    if (prior === undefined) {
-      merged.set(id, clean);
-      continue;
-    }
-    for (const [field, value] of Object.entries(clean)) {
-      const have = prior[field];
-      prior[field] = typeof have === "number" && typeof value === "number" ? have + value : (have ?? value);
-    }
-  }
-  return Object.fromEntries(merged) as unknown as AdviceUsageSnapshot;
 }
 
 function sanitizeThrown(value: unknown, text: TextRedactor, label: string): unknown {
