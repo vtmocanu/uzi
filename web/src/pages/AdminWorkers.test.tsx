@@ -326,31 +326,92 @@ describe("sibling-card save responses (#4544)", () => {
   });
 
   it("seeds every key on load and keeps another card's source state when a card saves", async () => {
-    mockApi.getSettings.mockResolvedValue(
-      resp(
-        { docker_repo_allowlist: "repo-uzi", capability_aware_scheduling: "true", ephemeral_lease: "30m", hosted_default_size: "s" },
+    // Every key carries a distinct, non-default value so a key dropped from the initial
+    // seeding shows up as a changed or missing rendered value.
+    mockApi.getSettings.mockResolvedValue({
+      ...resp(
+        {
+          docker_repo_allowlist: "repo-two",
+          hosted_worker_quota: "5",
+          hosted_default_size: "m",
+          custody_hold_limit: "13",
+          ephemeral_workers_enabled: "true",
+          ephemeral_max_per_user: "6",
+          ephemeral_default_size: "l",
+          ephemeral_lease: "30m",
+          worker_hibernation_enabled: "true",
+          worker_hibernation_auto: "true",
+          worker_hibernation_idle_after: "72h",
+          worker_hibernation_surplus: "true",
+          worker_hibernation_surplus_idle_after: "30m",
+          capability_aware_scheduling: "false",
+        },
         { capability_aware_scheduling: "env", ephemeral_lease: "env", hosted_default_size: "db" },
       ),
-    );
+      defaults: { hosted_default_size: "s", ephemeral_max_per_user: "3", ephemeral_default_size: "s", ephemeral_lease: "2h" },
+    });
     mockApi.updateSettings.mockResolvedValue(
       resp({ docker_repo_allowlist: "repo-two,repo-uzi" }, { capability_aware_scheduling: "db", docker_repo_allowlist: "db" }) as never,
     );
     renderPage();
     const toggle = () => screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement;
+    const quota = () => screen.getByRole("spinbutton", { name: "Hosted workers per user" }) as HTMLInputElement;
+    const quotaSave = () => screen.getByRole("button", { name: "Save hosted worker quota" }) as HTMLButtonElement;
+    const custody = () => screen.getByRole("spinbutton", { name: "Recovery holds per owner" }) as HTMLInputElement;
+    const custodySave = () => screen.getByRole("button", { name: "Save custody hold limit" }) as HTMLButtonElement;
     await screen.findByText("Capability-aware scheduling");
-    expect(toggle().disabled).toBe(true);
+
+    // Docker allowlist: only the seeded id is ticked.
+    expect((await screen.findByLabelText(/vtmocanu\/two/) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText(/vtmocanu\/uzi/) as HTMLInputElement).checked).toBe(false);
+    // Hosted quota, default size (value, source, defaults-driven hint).
+    expect(quota().value).toBe("5");
+    expect(quotaSave().disabled).toBe(true);
+    expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("m");
+    expect(screen.getByText("Saved · built-in default s")).toBeTruthy();
+    // Custody hold limit.
+    expect(custody().value).toBe("13");
+    expect(custodySave().disabled).toBe(true);
+    // Ephemeral workers: switch, cap, default size, lease.
+    expect((screen.getByLabelText(/Auto-provision workers on demand for this instance/i) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Per-user cap") as HTMLInputElement).value).toBe("6");
+    expect(screen.getByText("Default · built-in default 3")).toBeTruthy();
+    expect((screen.getByLabelText("Ephemeral default size") as HTMLSelectElement).value).toBe("l");
+    expect(screen.getByText("Default · built-in default s")).toBeTruthy();
     const lease = screen.getByLabelText("Idle lease") as HTMLInputElement;
     expect(lease.value).toBe("30m");
     expect(lease.disabled).toBe(true);
+    expect(screen.getByText("Set by environment · built-in default 2h")).toBeTruthy();
+    // Worker hibernation: five keys, plus the readout derived from the idle threshold.
+    expect(hibBox().checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Automatically hibernate idle workers" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Idle threshold") as HTMLInputElement).value).toBe("72h");
+    expect(screen.getByText("3 days without run activity")).toBeTruthy();
+    const surplus = screen.getByRole("checkbox", { name: "Keep one warm worker per pool, hibernate the surplus" }) as HTMLInputElement;
+    expect(surplus.checked).toBe(true);
+    expect(surplus.disabled).toBe(false);
+    expect((screen.getByLabelText("Surplus idle threshold") as HTMLInputElement).value).toBe("30m");
+    expect(hibSave().disabled).toBe(true);
+    // Capability scheduling: off and locked by the environment.
+    expect(toggle().checked).toBe(false);
+    expect(toggle().disabled).toBe(true);
     expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
 
-    fireEvent.click(await screen.findByLabelText(/vtmocanu\/two/));
+    fireEvent.click(screen.getByLabelText(/vtmocanu\/uzi/));
     fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
     await screen.findByText(/repo allowlist saved/i);
 
+    // Unsent keys keep their seeded values and sources (the response carries fixture defaults).
     expect(toggle().disabled).toBe(true);
+    expect(toggle().checked).toBe(false);
     expect((screen.getByLabelText("Idle lease") as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
+    // Save stays disabled only while the page still holds the seeded quota, custody and hibernation values.
+    expect(quota().value).toBe("5");
+    expect(quotaSave().disabled).toBe(true);
+    expect(custody().value).toBe("13");
+    expect(custodySave().disabled).toBe(true);
+    expect(hibSave().disabled).toBe(true);
   });
 
   it("merges the response values for the sent keys only, and sends exactly the payload", async () => {
@@ -400,6 +461,38 @@ describe("sibling-card save responses (#4544)", () => {
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ hosted_default_size: "m" }));
     await waitFor(() => expect(resetBtn()).toBeNull());
     expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("l");
+    expect((screen.getByLabelText("Idle lease") as HTMLInputElement).value).toBe("30m");
+
+    // Hosted quota: the response confirms a value that differs from the one sent. Save going
+    // disabled needs the page's own copy to equal the response value (the card's input alone
+    // would also show it), and the unsent custody limit in the response must not land.
+    const quotaSave = () => screen.getByRole("button", { name: "Save hosted worker quota" }) as HTMLButtonElement;
+    const custody = () => screen.getByRole("spinbutton", { name: "Recovery holds per owner" }) as HTMLInputElement;
+    const custodySave = () => screen.getByRole("button", { name: "Save custody hold limit" }) as HTMLButtonElement;
+    expect(quotaSave().disabled).toBe(true);
+    mockApi.updateSettings.mockResolvedValueOnce(resp({ hosted_worker_quota: "8", custody_hold_limit: "99" }) as never);
+    fireEvent.change(quota(), { target: { value: "6" } });
+    expect(quotaSave().disabled).toBe(false);
+    fireEvent.click(quotaSave());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ hosted_worker_quota: "6" }));
+    await screen.findByText("Hosted worker quota saved.");
+    expect(quota().value).toBe("8");
+    expect(quotaSave().disabled).toBe(true);
+    // Custody was not sent: still the fixture's 8, so its Save is disabled against the page's 8, not 99.
+    expect(custody().value).toBe("8");
+    expect(custodySave().disabled).toBe(true);
+
+    // Custody hold limit: same shape, with the unsent quota differing in the response.
+    mockApi.updateSettings.mockResolvedValueOnce(resp({ custody_hold_limit: "15", hosted_worker_quota: "19" }) as never);
+    fireEvent.change(custody(), { target: { value: "12" } });
+    expect(custodySave().disabled).toBe(false);
+    fireEvent.click(custodySave());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ custody_hold_limit: "12" }));
+    await screen.findByText("Custody hold limit saved.");
+    expect(custody().value).toBe("15");
+    expect(custodySave().disabled).toBe(true);
+    expect(quota().value).toBe("8");
+    expect(quotaSave().disabled).toBe(true);
     expect((screen.getByLabelText("Idle lease") as HTMLInputElement).value).toBe("30m");
   });
 });
