@@ -9,7 +9,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { DEFAULT_STALL_MS, hungFiles, type Progress, type Summary } from "./agent-report.js";
+import { DEFAULT_STALL_MS, STOP_MARKER, hungFiles, type Progress, type Summary } from "./agent-report.js";
+import agentReport from "./agent-report-reporter.js";
 
 const agentRoot = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -218,12 +219,34 @@ const leaking = [
   '});',
 ].join("\n");
 
+// Imported by the fixture launcher alone. It records whether the stop marker exists when the
+// launcher sends its first group signal: the marker must precede every signal (#4547).
+function markerPreload(root: string): string {
+  const preload = path.join(root, "marker-probe.mjs");
+  writeFileSync(preload, `
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const root = ${JSON.stringify(root)};
+const out = path.join(root, "marker-at-signal.json");
+const kill = process.kill.bind(process);
+process.kill = (pid, signal) => {
+  if (pid < 0 && signal !== 0 && signal !== undefined && !existsSync(out)) {
+    const { dir } = JSON.parse(readFileSync(path.join(root, ".test-report/latest.json"), "utf8"));
+    writeFileSync(out, JSON.stringify({ signal, present: existsSync(path.join(dir, ${JSON.stringify(STOP_MARKER)})) }));
+  }
+  return kill(pid, signal);
+};
+`);
+  return preload;
+}
+
 test("the watchdog stops a hung file only after every other file finished, and reaps its process group", { timeout: 60_000 }, async () => {
   const root = fixture({
     "a-leak.test.ts": leaking,
     "b-ok.test.ts": 'import test from "node:test";\ntest("ok", async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });\n',
   });
-  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "1500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "2" });
+  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "1500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "2" },
+    markerPreload(root));
   try {
     const result = await run.closed;
     const text = run.output.join("");
@@ -236,6 +259,11 @@ test("the watchdog stops a hung file only after every other file finished, and r
     assert.equal(summary.termination, "watchdog");
     assert.deepEqual(summary.hung_files, ["test/a-leak.test.ts"]);
     assert.equal(summary.cleanup, "verified");
+    assert.deepEqual(readJson(path.join(root, "marker-at-signal.json")), { signal: "SIGTERM", present: true },
+      "the stop marker exists before the watchdog's first signal");
+    // The stop killed the hung file's process: it stays in flight, never a file failure.
+    assert.deepEqual(summary.in_flight_files, ["test/a-leak.test.ts"]);
+    assert.equal(summary.progress!.counts.file_failures, 0);
     assert.ok(summary.progress!.files["test/b-ok.test.ts"]!.done_at, "the other file completed first");
     assert.equal(summary.progress!.counts.pass, 2, "the leaking file's test itself passed");
     assert.equal(alive(Number(readFileSync(path.join(root, "leak.pid"), "utf8"))), false, "the hung file process is gone");
@@ -310,9 +338,13 @@ test("the watchdog does not fire while another file is still queued; SIGTERM the
     "b-queued.test.ts": 'import test from "node:test";\ntest("queued", () => {});\n',
   });
   // Concurrency 1: the queued file cannot start while the hung one holds the only slot.
-  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "1" });
+  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "1" },
+    markerPreload(root));
   try {
     await until(() => existsSync(path.join(root, "grandchild.pid")), 20_000, "the leaking test");
+    // The pid file is the test body's own write. Wait for the reporter to list the file before the stall windows.
+    await until(() => readJson<Progress>(path.join(latestDir(root), "progress.json"))?.files["test/a-leak.test.ts"] !== undefined,
+      20_000, "the leaking file in progress.json");
     await new Promise((resolve) => setTimeout(resolve, 2_500)); // five stall windows
     assert.equal(run.child.exitCode, null, "still running: a queued file blocks the watchdog\n" + run.output.join(""));
     assert.doesNotMatch(run.output.join(""), /HUNG/);
@@ -326,6 +358,8 @@ test("the watchdog does not fire while another file is still queued; SIGTERM the
     assert.deepEqual(summary.in_flight_files, ["test/a-leak.test.ts"]);
     assert.equal(summary.cleanup, "verified");
     assert.equal(alive(Number(readFileSync(path.join(root, "grandchild.pid"), "utf8"))), false);
+    assert.deepEqual(readJson(path.join(root, "marker-at-signal.json")), { signal: "SIGTERM", present: true },
+      "the stop marker exists before the forwarded signal");
   } finally {
     for (const name of ["leak.pid", "grandchild.pid"]) {
       const pid = Number(readJson<number>(path.join(root, name)));
@@ -336,6 +370,187 @@ test("the watchdog does not fire while another file is still queued; SIGTERM the
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/** The process state letters `ps` reports ("Z" = zombie), "" once the pid is gone. Fails loudly if `ps` cannot answer. */
+function processState(pid: number): string {
+  const result = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0 && result.stderr.trim() !== "") assert.fail(`ps -o stat= -p ${pid} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+/** Signals a process group, tolerating one that is already gone. */
+function signalGroupIfAlive(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+}
+
+const LINUX_ONLY = process.platform !== "linux"
+  ? "holds the runner with SIGSTOP and spots the dead file process as a zombie via ps, a sequence only verified on Linux; the reporter's guard is pinned on every platform by the event-source tests"
+  : false;
+
+/**
+ * #4547, the shard-load race. The runner is held stopped across the stop, so the file process dies
+ * of the group SIGTERM before node handles its own. Every summary assertion holds whether or not node
+ * then hands the death to the reporter before it exits. Returns whether it did: an a-leak event
+ * processed after the stop.
+ */
+async function stopWhileRunnerHeld(): Promise<boolean> {
+  const root = fixture({
+    "a-leak.test.ts": leaking,
+    "b-queued.test.ts": 'import test from "node:test";\ntest("queued", () => {});\n',
+  });
+  const run = launch(root, { UZI_AGENT_TEST_CONCURRENCY: "1" });
+  let runnerPid: number | undefined;
+  try {
+    await until(() => existsSync(path.join(root, "grandchild.pid")), 20_000, "the leaking test");
+    const progressFile = path.join(latestDir(root), "progress.json");
+    // The inner test's own completion is processed first, so no inner event can arrive after the stop.
+    await until(() => readJson<Progress>(progressFile)?.counts.pass === 1, 20_000, "the leaking test's pass in progress.json");
+    runnerPid = Number(readFileSync(path.join(root, "runner.pid"), "utf8"));
+    const leakPid = Number(readFileSync(path.join(root, "leak.pid"), "utf8"));
+    process.kill(runnerPid, "SIGSTOP");
+    const stoppedAt = Date.now();
+    run.child.kill("SIGTERM");
+    await until(() => processState(leakPid).startsWith("Z"), 600, "the file process to die while the runner is stopped");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    process.kill(runnerPid, "SIGCONT");
+    const held = Date.now() - stoppedAt;
+    assert.ok(held < 1_500, `the runner was held ${held}ms; it must resume well inside the launcher's 2s escalation`);
+    const result = await run.closed;
+    assert.equal(result.signal, "SIGTERM", run.output.join(""));
+    const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
+    assert.equal(summary.state, "incomplete");
+    assert.equal(summary.termination, "signal");
+    assert.deepEqual(summary.hung_files, []);
+    assert.deepEqual(summary.in_flight_files, ["test/a-leak.test.ts"],
+      JSON.stringify({ state: summary.progress?.state, files: summary.progress?.files, failures: summary.progress?.failures }));
+    assert.equal(summary.cleanup, "verified");
+    assert.equal(alive(Number(readFileSync(path.join(root, "grandchild.pid"), "utf8"))), false);
+    const progress = summary.progress!;
+    const leak = progress.files["test/a-leak.test.ts"]!;
+    assert.equal(leak.done_at, undefined, "the killed file is not recorded as done");
+    assert.equal(progress.counts.file_failures, 0);
+    assert.deepEqual(progress.failures, []);
+    assert.equal(progress.state, "interrupted");
+    return Date.parse(leak.last_event_at) > stoppedAt;
+  } finally {
+    if (runnerPid !== undefined && alive(runnerPid)) {
+      signalGroupIfAlive(runnerPid, "SIGCONT");
+      signalGroupIfAlive(runnerPid, "SIGKILL");
+    }
+    for (const name of ["leak.pid", "grandchild.pid"]) {
+      const pid = Number(readJson<number>(path.join(root, name)));
+      if (pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+    if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill("SIGKILL");
+    await run.closed.catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("a file killed by the interrupting signal stays in flight even when the runner sees it die before exiting", { timeout: 90_000, skip: LINUX_ONLY }, async (t) => {
+  // Whether node hands the death over before it exits depends on which of its threads takes which
+  // signal. With the 300ms hold that happened on every local run, but an attempt that did not get
+  // the race proves nothing, so up to three attempts are made. Any attempt failing an assertion fails.
+  // An attempt that does not get the race is still correct behaviour: every assertion passed. So
+  // three such attempts skip, with a reported reason, rather than fail.
+  // "Got the race" means the completion was handled after the stop, in either order relative to
+  // test:interrupted. The marker arm itself is proven deterministically by the event-source tests,
+  // and the launcher's marker-before-signal order by the marker probe in the SIGTERM and watchdog tests.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (await stopWhileRunnerHeld()) return;
+  }
+  t.skip("node exited before handing the killed file's completion to the reporter in all three attempts; "
+    + "every assertion passed, but the race was not exercised");
+});
+
+/**
+ * Drives the reporter in-process over a scripted event order: the inner test starts, then the
+ * file's completion fails with `error`. In "interrupt-first", test:interrupted comes before that
+ * completion; in "complete-first", after it; in "no-interrupt", never. With `marker`, the
+ * launcher's stop marker exists before the completion. Returns the progress the completion
+ * flushed to disk.
+ */
+async function reportFileCompletion(order: "interrupt-first" | "complete-first" | "no-interrupt",
+  error: { signal?: string; exitCode?: number }, marker = false): Promise<Progress> {
+  const key = "UZI_AGENT_TEST_REPORT_RUN_DIR";
+  const prior = process.env[key];
+  const dir = mkdtempSync(path.join(tmpdir(), "uzi-agent-report-events-"));
+  const progressFile = path.join(dir, "progress.json");
+  writeFileSync(path.join(dir, "selected.json"), JSON.stringify(["test/x.test.ts"]));
+  const file = path.resolve(process.cwd(), "test/x.test.ts");
+  let flushed: Progress | null = null;
+  async function* events() {
+    yield { type: "test:start", data: { name: "t", nesting: 0, file } };
+    if (order === "interrupt-first") yield { type: "test:interrupted", data: {} };
+    if (marker) writeFileSync(path.join(dir, STOP_MARKER), "{}\n");
+    rmSync(progressFile, { force: true });
+    yield {
+      type: "test:complete",
+      data: { name: "test/x.test.ts", nesting: 0, file, details: { passed: false, duration_ms: 1,
+        error: Object.assign(new Error("test failed"), { failureType: "testCodeFailure", signal: null, exitCode: null }, error) } },
+    };
+    // The reporter asked for the next event, so it has processed the completion.
+    flushed = readJson<Progress>(progressFile);
+    assert.ok(flushed, "the completion is flushed at once, never left to the throttle");
+    if (order === "complete-first") yield { type: "test:interrupted", data: {} };
+  }
+  // The suite's own launcher sets this for the live report: point it away, then restore it.
+  process.env[key] = dir;
+  try {
+    for await (const _line of agentReport(events())) { /* drain */ }
+  } finally {
+    if (prior === undefined) delete process.env[key];
+    else process.env[key] = prior;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  return flushed!;
+}
+
+type Order = "interrupt-first" | "complete-first" | "no-interrupt";
+type FileError = { signal?: string; exitCode?: number };
+
+const stoppedCases: { order: Order; error: FileError; marker: boolean }[] = [
+  ...[{ signal: "SIGTERM" }, { signal: "SIGINT" }, { signal: "SIGKILL" }, { exitCode: 143 }, { exitCode: 130 }]
+    .map((error) => ({ order: "interrupt-first" as const, error, marker: false })),
+  // The launcher's marker covers a death node hands over before test:interrupted, or without it.
+  { order: "complete-first", error: { signal: "SIGTERM" }, marker: true },
+  { order: "no-interrupt", error: { signal: "SIGKILL" }, marker: true },
+  { order: "no-interrupt", error: { exitCode: 143 }, marker: true },
+];
+for (const { order, error, marker } of stoppedCases) {
+  test(`while stopping, a file ended by the stop (${order}${marker ? ", marker" : ""}, ${JSON.stringify(error)}) stays in flight`, async () => {
+    const progress = await reportFileCompletion(order, error, marker);
+    assert.equal(progress.files["test/x.test.ts"]!.done_at, undefined);
+    assert.equal(progress.counts.file_failures, 0);
+    assert.deepEqual(progress.failures, []);
+  });
+}
+
+const recordedCases: { order: Order; error: FileError; marker: boolean }[] = [
+  { order: "interrupt-first", error: { signal: "SIGHUP" }, marker: false },
+  { order: "interrupt-first", error: { signal: "SIGSEGV" }, marker: false },
+  { order: "interrupt-first", error: { exitCode: 255 }, marker: false },
+  { order: "interrupt-first", error: { exitCode: 1 }, marker: false },
+  { order: "no-interrupt", error: { signal: "SIGHUP" }, marker: true },
+  { order: "no-interrupt", error: { exitCode: 255 }, marker: true },
+  // Without the marker, a completion before test:interrupted, or with no stop at all, is a file failure.
+  { order: "complete-first", error: { signal: "SIGTERM" }, marker: false },
+  { order: "no-interrupt", error: { signal: "SIGTERM" }, marker: false },
+];
+for (const { order, error, marker } of recordedCases) {
+  test(`a file failure not caused by the stop (${order}${marker ? ", marker" : ""}, ${JSON.stringify(error)}) is recorded as done`, async () => {
+    const progress = await reportFileCompletion(order, error, marker);
+    assert.ok(progress.files["test/x.test.ts"]!.done_at, "recorded as done");
+    assert.equal(progress.counts.file_failures, 1);
+    assert.deepEqual(progress.failures.map((failure) => ({ kind: failure.kind, file: failure.file })),
+      [{ kind: "file", file: "test/x.test.ts" }]);
+  });
+}
 
 test("a test registered by a helper module never counts as a file, so a queued file still blocks the watchdog", { timeout: 60_000 }, async () => {
   const root = fixture({

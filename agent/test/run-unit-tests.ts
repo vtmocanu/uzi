@@ -8,6 +8,7 @@ import { selectAgentTests } from "./agent-test-shards.js";
 import {
   DEFAULT_STALL_MS,
   REPORT_SCHEMA,
+  STOP_MARKER,
   hungFiles,
   inFlight,
   renderSummaryText,
@@ -184,6 +185,15 @@ function main(): void {
   let finished = false;
   const stop = (signal: NodeJS.Signals): void => {
     if (child.pid === undefined) return;
+    // Before any signal: the reporter must know a file death is this stop's doing, in whatever
+    // order node hands it the stop and the death (agent-report-reporter.ts).
+    if (!escalation) {
+      try {
+        writeJsonAtomic(path.join(dir, STOP_MARKER), { at: new Date().toISOString(), signal });
+      } catch (error) {
+        reportError(error);
+      }
+    }
     signalGroup(child.pid, signal);
     escalation ??= setTimeout(() => signalGroup(child.pid!, "SIGKILL"), 2_000);
   };

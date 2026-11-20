@@ -8,15 +8,16 @@
 //   summary.txt    node --test process group has exited; absent means the invocation never finished
 //
 // plus invocation.json and selected.json (the launcher's file inventory, the only paths the reporter
-// counts as files) in <id>/, and latest.json beside the directories, naming the newest invocation.
+// counts as files) and stopping.json (written by the launcher before it signals a stop) in <id>/,
+// and latest.json beside the directories, naming the newest invocation.
 //
 // Fail-closed contract: this covers the UNIT stage only (task's exit code is the gate verdict:
 // real-procfs-skip-check.sh, tmpdir-leak-guard.sh and test:codex-m4 run after it). A missing
 // summary, a progress file still `running`, or `state: incomplete` is never green, however fresh
 // its heartbeat.
-import { REPORT_SCHEMA, writeJsonAtomic, writeTextAtomic } from "./agent-report-reporter.js";
+import { REPORT_SCHEMA, STOP_MARKER, writeJsonAtomic, writeTextAtomic } from "./agent-report-reporter.js";
 
-export { REPORT_SCHEMA, writeJsonAtomic, writeTextAtomic };
+export { REPORT_SCHEMA, STOP_MARKER, writeJsonAtomic, writeTextAtomic };
 /** A file with no event for this long, once every other file finished, is treated as hung. */
 export const DEFAULT_STALL_MS = 600_000;
 export type FailureKind = "fail" | "cancelled" | "file" | "suite";
@@ -112,7 +113,11 @@ export interface Summary {
 }
 
 
-/** Files in flight (started, not done), oldest activity first. */
+/**
+ * Files in flight (started, not done), oldest activity first. A file whose process the run's own
+ * stop killed stays in flight whenever the reporter can tell the stop caused it: the launcher's
+ * stop marker or test:interrupted came first (agent-report-reporter.ts).
+ */
 export function inFlight(progress: Progress): string[] {
   return Object.entries(progress.files)
     .filter(([, state]) => state.done_at === undefined)
