@@ -560,7 +560,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// cooled-down run is not rewritten every tick. Issue #4507: an owner hold the detector observed
 		// and committed (health_owner_hold_active, the episode-keyed marker) keeps the ceiling deadline
 		// even when the stale grace expired earlier; a hold that began and cleared between two ticks,
-		// or whose marker write failed, falls back to the stale-grace timing (quietWindowEnded).
+		// or whose marker write failed, falls back to the pre-#4507 timing (quietWindowEnded): the
+		// stale-grace end when the stale pin covered the episode, otherwise the affinity ceiling.
 		quietHoldEnded := r.Health == target && textEq(r.HealthReason, reason) &&
 			isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText &&
 			!s.quietCodexHold(now, r, reason) && s.quietWindowCoveredEpisode(r) && s.quietWindowEnded(now, r) &&
@@ -570,7 +571,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			(target != healthPublicationWithheld || r.HealthSince.Valid && r.PublicationWithheldSince.Valid && r.HealthSince.Time.Equal(r.PublicationWithheldSince.Time)) {
 			// The owner hold may begin mid-episode: stamp the marker alone (no other health column, no
 			// broadcast, not counted). Guarded by the episode just read, so a changed episode matches
-			// zero rows; a failed write falls back to the stale-grace timing.
+			// zero rows; a failed write falls back to the pre-#4507 timing (stale-grace end if the stale pin
+			// covered the episode, else the affinity ceiling).
 			if ownerQuiet && !r.HealthOwnerHoldActive && r.HealthSince.Valid && r.HealthReason.Valid {
 				if _, err := s.q.MarkRunHealthOwnerHold(ctx, store.MarkRunHealthOwnerHoldParams{
 					ID:           r.ID,
@@ -2456,7 +2458,8 @@ func (s *Service) quietWindowCoveredEpisode(r store.ListActiveRunsForHealthRow) 
 // (the ceiling end), so it is over. Issue #4507: when the detector observed and committed an owner
 // hold in this episode (HealthOwnerHoldActive), the window runs to the ceiling end even if the
 // stale grace expired earlier; only holds so recorded are remembered, so one that began and cleared
-// between two ticks, or whose marker write failed, falls back to the stale-grace timing below. A
+// between two ticks, or whose marker write failed, falls back to the pre-#4507 timing below: the
+// stale-grace end when the stale pin covered the episode, otherwise the affinity ceiling. A
 // stale-only episode still ends at grace expiry. A stale-requeue flag proves nothing alone (it
 // outlives the grace): the pin end (min of status_since + grace and the ceiling end) must be after
 // health_since and passed. Otherwise the run waits for the affinity ceiling end (updated_at +

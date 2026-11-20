@@ -101,6 +101,31 @@ func TestHealthOwnerHoldMarkerLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("a later write for the same episode without the mark keeps it active", func(t *testing.T) {
+		id := e.seedQueuedRun(t, nil, nil)
+		setHealth(t, id, base, true)
+		setHealth(t, id, base, false)
+		if !active(t, id) {
+			t.Fatal("marker lost by a same-episode SetRunHealth without MarkOwnerHold")
+		}
+	})
+
+	t.Run("a mark for another health or a NULL reason affects no row", func(t *testing.T) {
+		id := e.seedQueuedRun(t, nil, nil)
+		setHealth(t, id, base, false)
+		for name, p := range map[string]store.MarkRunHealthOwnerHoldParams{
+			"different health": {ID: id, Status: "queued", Health: healthStalled, HealthReason: text(reasonA), HealthSince: ts(base)},
+			"null reason":      {ID: id, Status: "queued", Health: healthWaitingWorker, HealthSince: ts(base)},
+		} {
+			if n, err := e.q.MarkRunHealthOwnerHold(e.ctx, p); err != nil || n != 0 {
+				t.Fatalf("%s: n=%d err=%v, want 0", name, n, err)
+			}
+		}
+		if active(t, id) {
+			t.Fatal("active after only rejected marks")
+		}
+	})
+
 	t.Run("a nanosecond health_since round-trips to active", func(t *testing.T) {
 		id := e.seedQueuedRun(t, nil, nil)
 		setHealth(t, id, base.Add(123*time.Nanosecond), true)

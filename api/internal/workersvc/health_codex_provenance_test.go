@@ -551,6 +551,28 @@ func TestCodexProvenanceMarkedHoldCeilingNudgeRespectsCooldown(t *testing.T) {
 	}
 }
 
+// The pinnable flag alone is not an owner hold: past updated_at + WorkerAffinityCeiling ownerHold is
+// false, so no tick may stamp the marker, whether it writes a new episode or skips an unchanged one.
+func TestCodexProvenancePinnableFlagPastCeilingNeverMarks(t *testing.T) {
+	r := heldCodexRun("A")
+	r.OwnerHoldPinnable = true
+	r.UpdatedAt = ago(3 * time.Hour) // ceiling (2h) ended an hour ago
+
+	fs, _, _ := ownerHoldTick(t, r, t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.MarkOwnerHold || len(fs.marks) != 0 {
+		t.Fatalf("new episode: MarkOwnerHold=%v marks=%d, want none past the ceiling", w.MarkOwnerHold, len(fs.marks))
+	}
+
+	// Unchanged episode that was already nudged, so the tick takes the skip branch.
+	r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
+	r.HealthNotifiedAt = pgconv.Time(t0)
+	fs, _, n := ownerHoldTick(t, r, t0.Add(time.Minute))
+	if n != 0 || len(fs.writes) != 0 || len(fs.marks) != 0 {
+		t.Fatalf("unchanged episode: changed=%d writes=%d marks=%d, want none past the ceiling", n, len(fs.writes), len(fs.marks))
+	}
+}
+
 // Without the marker (the hold began and cleared between ticks, or its write failed) the stale
 // shortcut still applies: the nudge fires at grace expiry.
 func TestCodexProvenanceUnmarkedStaleExpiredNudgesAtGraceEnd(t *testing.T) {
