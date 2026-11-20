@@ -654,6 +654,13 @@ which is availability, never an integrity loss.
   expected errno, mirroring the existing Landlock deny probe.
 - **Stdio.** The worker endpoint of the stdio socketpairs never sends
   SCM_RIGHTS and never receives cmsg.
+- **Control fd 3 and evidence fd 4, after launch.** The filter blocks only new
+  `socket(AF_UNIX)` calls, so an inherited AF_UNIX descriptor could still
+  receive an `SCM_RIGHTS` message after launch. Before the confined process
+  runs, each of fd 3 and fd 4 must be closed, shown to be a non-socket type,
+  or shown to have a peer that never sends descriptors (the same rule as the
+  stdio endpoint). Until that holds, D2 closes only new socket creation, and
+  the pass is not enableable.
 - **ptrace and dumpability.** Landlock's cross-domain ptrace restriction
   applies. The supervisor and `--hold-cache` are nondumpable.
 - **`/dev`.** The `/dev` grant is narrowed, or P0 asserts that no device node
