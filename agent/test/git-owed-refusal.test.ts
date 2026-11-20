@@ -222,7 +222,9 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     const withExtra = await gate(cover);
     assert.equal(withExtra.kind, "eligible");
     gitIn(bare, ["update-ref", "-d", incomingRefs().map((l) => l.split(" ")[0]!).find((r) => r.includes("/import-short-"))!]);
-    assert.notDeepEqual(await gate(cover), withExtra);
+    const without = await gate(cover);
+    assert.equal(without.kind, "eligible");
+    assert.notEqual((without as { evidenceDigest: string }).evidenceDigest, (withExtra as { evidenceDigest: string }).evidenceDigest);
   });
 
   it("a stage of a later generation, malformed, unbound or over-long ledgers and tmp residue are ineligible", async () => {
@@ -1040,7 +1042,16 @@ describe("issue4481 owed-path marker (restart residual)", { timeout: 300_000 }, 
     assert.deepEqual(readJson(markerName), { version: 1, runId: RUN, generation: 1, branch: BRANCH, barePath: bare });
     const before = fs.readFileSync(path.join(refDir(), markerName), "utf8");
     await rewriteTimes(0);
-    await cache["pinOwedUnderLock"](ctx, base, "P4").catch(() => undefined);
+    const internals = cache as unknown as Internals;
+    const write = internals.writeOwedFile.bind(cache);
+    const markerWrites: string[] = [];
+    internals.writeOwedFile = async (b, name, value, dir, runId) => {
+      if (name === markerName) markerWrites.push(name);
+      return write(b, name, value, dir, runId);
+    };
+    try { await assert.rejects(cache["pinOwedUnderLock"](ctx, base, "P4"), /owed candidate limit/); }
+    finally { internals.writeOwedFile = write; }
+    assert.deepEqual(markerWrites, [], "an existing marker is never rewritten");
     assert.equal(fs.readFileSync(path.join(refDir(), markerName), "utf8"), before, "write-once");
   });
 
@@ -1247,7 +1258,15 @@ describe("issue4481 refusal stage listing is cross-checked against loose refs", 
     const cover = coverOf([...kept, h0, h1]);
     assert.equal((await gate(cover)).kind, "eligible");
     // Both heads stay ledgered and covered; only the listed oids are swapped against the files on disk.
-    const swap = (line: string): string => line.replace(h0, "@").replace(h1, h0).replace("@", h1);
+    // Only import-stage lines get their oid field swapped; the refused-ref lines stay untouched.
+    assert.ok(incomingRefs().some((l) => l.includes("/import-") && l.endsWith(` ${h0}`)), "an import stage at h0");
+    assert.ok(incomingRefs().some((l) => l.includes("/import-") && l.endsWith(` ${h1}`)), "an import stage at h1");
+    const swap = (line: string): string => {
+      const i = line.lastIndexOf(" ");
+      if (i < 0 || !line.slice(0, i).includes("/import-")) return line;
+      const oid = line.slice(i + 1);
+      return `${line.slice(0, i)} ${oid === h0 ? h1 : oid === h1 ? h0 : oid}`;
+    };
     const restore = stubListing((out) => ({ stdout: out.stdout.split("\n").map(swap).join("\n"), stderr: out.stderr }));
     try { assert.equal((await gate(cover)).kind, "ineligible"); } finally { restore(); }
     assert.equal((await gate(cover)).kind, "eligible");
@@ -1472,7 +1491,9 @@ describe("issue4481 a failed import deletes its own attributed stage", { timeout
       assert.deepEqual(between, { kind: "ineligible", reason: "refusal import in progress" });
       const live = (cache as unknown as { liveImportStages: Set<string> }).liveImportStages;
       assert.equal(live.size, 0, "the entry is removed when the import completes");
-      assert.notDeepEqual(await gateAt(), { kind: "ineligible", reason: "refusal import in progress" });
+      // Asserted before the gate runs: the gate itself reconciles a finished import stage, so after it a surviving stage would be gone.
+      assert.deepEqual(sincoming(), [], "the completed import's stage is deleted by the import, not by the gate");
+      assert.deepEqual(await gateAt(), { kind: "none" });
     });
 
     it("a boundary stop after the fetch leaves the attributed stage in place, unlike an ordinary failure", async () => {
