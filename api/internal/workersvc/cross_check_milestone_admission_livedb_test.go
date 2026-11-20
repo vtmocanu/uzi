@@ -12,9 +12,9 @@ import (
 
 // Issue #4554 live-DB coverage: a checked plan whose post-scrub milestone list is not
 // exactly [{id,title}] objects passing validateMilestones is refused at cross-check
-// admission, before any cross_checks row or checker child exists. A pre-fix attempt that
-// already stores such a list cannot be resubmitted, and an approved one cannot be written as
-// a running plan even with its own stored digest.
+// admission, before any cross_checks row or checker child exists, and a pre-fix attempt that
+// already stores such a list cannot be resubmitted. The running-write proofs below are
+// pre-existing fail-closed invariants kept for rollout, not proofs of the admission check.
 
 var invalidMilestoneLists = []struct{ name, raw string }{
 	{"blank id and title", `[{"id":"","title":""}]`},
@@ -187,7 +187,12 @@ func TestCrossCheckMilestoneAdmissionPreFixAttemptLiveDB(t *testing.T) {
 
 // An APPROVED pre-fix attempt storing an invalid list, with the worker presenting that
 // attempt's own stored digest, still cannot be written as a running plan: the write fails
-// closed with ErrInvalidState and persists nothing.
+// closed with ErrInvalidState and persists nothing. Like the running-write block above, this
+// is a pre-existing invariant kept for rollout (it also holds on the pre-fix service), not a
+// proof of the admission check. The digest matches by construction; the refusing check is
+// the Go milestone validation for "blank id and title" (and "missing title"), and only the
+// SetRunAutopilotPlan cc.milestones equality in SQL for "extra key", whose typed decode drops
+// the key.
 func TestCrossCheckMilestoneAdmissionApprovedPreFixAttemptLiveDB(t *testing.T) {
 	for _, tc := range invalidMilestoneLists {
 		t.Run(tc.name, func(t *testing.T) {
