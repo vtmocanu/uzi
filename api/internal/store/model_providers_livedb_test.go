@@ -251,8 +251,14 @@ func TestProviderKeyCompositeForeignKeyLiveDB(t *testing.T) {
 	pa := newProvider(ctx, t, q, a, "a-provider")
 	if _, err := insertProviderKey(ctx, q, b, pa.ID); err == nil {
 		t.Fatal("user B stored a key pointing at user A's provider")
-	} else if code, c := pgCodeC(err); code != "23503" || c != "user_secrets_provider_fkey" {
-		t.Fatalf("cross-owner key error = %v (%s %s), want user_secrets_provider_fkey", err, code, c)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-owner key error = %v, want no owned provider row", err)
+	}
+	// Direct writes remain protected by the owner-bound FK too.
+	_, err := pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id)
+        VALUES ($1, 'anthropic_compatible_key', 'foreign', 'ct', 'master', $2)`, b, pa.ID)
+	if code, c := pgCodeC(err); code != "23503" || c != "user_secrets_provider_fkey" {
+		t.Fatalf("cross-owner direct key error = %v (%s %s)", err, code, c)
 	}
 	// B cannot select A's provider as a source either.
 	if _, err := pool.Exec(ctx, `UPDATE users SET claude_provider_id = $2 WHERE id = $1`, b, pa.ID); err == nil {

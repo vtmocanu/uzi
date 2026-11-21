@@ -757,6 +757,7 @@ type ModelProviderRevision struct {
 	AuthStyle  string             `json:"auth_style"`
 	ModelMap   []byte             `json:"model_map"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	Engine     string             `json:"engine"`
 }
 
 type MrReviewAuthorQueue struct {
@@ -2032,6 +2033,7 @@ type User struct {
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
 	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
+	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
 }
 
 type UserCrossCheckPin struct {
