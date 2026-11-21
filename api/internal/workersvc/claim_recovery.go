@@ -541,7 +541,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	//
 	// The lock is FOR KEY SHARE NOWAIT (order worker -> run -> users), taken as late as possible
 	// so nothing else locks after it, and held to commit: every run_env_vars writer, the account
-	// reset and the user delete lock the users row FOR UPDATE, which conflicts with it, so the
+	// reset and the user delete lock the users row FOR UPDATE (except the retired-version sweeper,
+	// which never deletes a version a non-terminal run holds, and the repo-delete cascade, which
+	// removes the runs with the rows; see LockUserVaultStateForKeyShareNowait), which conflicts with it, so the
 	// recompute sees every committed variable write and the next one waits for the receipts. A
 	// plain update of a non-key users column does not conflict. 55P03 rolls the transaction back
 	// into finishRunClaim's bounded retry: the claim never waits, parks or fails on the lock.

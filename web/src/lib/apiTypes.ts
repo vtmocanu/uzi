@@ -3886,7 +3886,16 @@ export interface HarnessDecision {
   other_weekly_reset_at: string | null;
 }
 
+/** PRD #4416 M2: one variable delivered to a run's current claim; never a value. */
+export interface RunInjectedEnvVar {
+  name: string;
+  scope: string;
+  secret: boolean;
+}
+
 export interface Run {
+  /** PRD #4416 M2: the variables the current claim delivered (names only, owner-only). */
+  injected_env?: RunInjectedEnvVar[];
   policy_hold?: {
     preserve_required: boolean;
     pending_fresh: boolean;
@@ -5048,7 +5057,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch" | "injected_env"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"

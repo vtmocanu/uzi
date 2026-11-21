@@ -357,6 +357,11 @@ type LockUserVaultStateForKeyShareNowaitRow struct {
 // (LockVaultAuthState), the account reset (DeleteAllRunEnvVarsForOwner, inside the vault
 // lifecycle lock) and a user delete. A future run_env_vars writer must lock the users row
 // FOR UPDATE, never FOR NO KEY UPDATE, or the claim finisher's recompute would not see it.
+// Two deliberate exceptions: the retired-version sweeper deletes under FOR SHARE NOWAIT, which
+// does not conflict with this lock, and is safe only because it never deletes a version a
+// non-terminal run holds a receipt for (fn_run_env_run_held), and a run being claimed is
+// non-terminal; a repo delete cascades the repo's rows with no users lock, and the repo's runs
+// and receipts cascade in the same statement.
 func (q *Queries) LockUserVaultStateForKeyShareNowait(ctx context.Context, userID uuid.UUID) (LockUserVaultStateForKeyShareNowaitRow, error) {
 	row := q.db.QueryRow(ctx, lockUserVaultStateForKeyShareNowait, userID)
 	var i LockUserVaultStateForKeyShareNowaitRow

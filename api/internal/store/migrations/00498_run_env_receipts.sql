@@ -1,6 +1,9 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
 -- The backfill and the identity trigger below read a table whose writers must not interleave.
+-- runs and users are locked first (the two foreign keys below take these modes anyway), so the
+-- migration keeps the application's runs/users -> run_env_vars order and cannot deadlock with it.
+LOCK TABLE runs, users IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE run_env_vars IN ACCESS EXCLUSIVE MODE;
 
 -- PRD #4416 M2: delivery receipts, the never-reused variable identity, the version-2 AAD
@@ -28,6 +31,9 @@ CREATE TABLE run_env_receipts (
 );
 CREATE INDEX run_env_receipts_secret_version_idx
     ON run_env_receipts (var_id, rev, run_id) WHERE secret;
+-- The sweeper's orphan-identity checks look receipts up by var_id, plain and secret alike; the
+-- primary key leads with run_id and the index above is partial, so neither serves them.
+CREATE INDEX run_env_receipts_var_idx ON run_env_receipts (var_id);
 
 -- run_env_var_ids: the identity of every variable ever created, kept after its rows and
 -- its repo are gone. A var_id is bound to one (user, repo, scope, name) for good, so a
