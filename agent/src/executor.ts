@@ -329,8 +329,10 @@ export interface RunContext {
   /** PRD #4320 module 5/6: the decoded provider binding of a provider-bound run (exclusive with
    *  `oauthToken`). Every Claude spawn of the run builds its env from it, never from an OAuth token. */
   provider?: ClaimProviderBinding;
-  /** PRD #4416 M2: the run's user environment variables (decoded claim `run_env`). Read by the lead
-   *  lane's env builders only; chat, cross-check, advice, job, judge and review lanes never see it. */
+  /** PRD #4416 M2: the run's user environment variables (decoded claim `run_env`). The runner sets it
+   *  only for a lead-lane run (run-env-lane.ts, the mirror of the api's LeadLane: kinds issue, ci_fix,
+   *  prompt, self_improve, mr_rework, task, no review target, not egress-bound) and only the lead
+   *  lane's env builders read it. */
   runEnv?: ClaimRunEnvVar[];
   /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
    *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */

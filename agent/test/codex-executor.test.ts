@@ -36611,3 +36611,38 @@ describe("Codex repeated actualRunner switching", () => {
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
 });
+
+// PRD 4416 M2 (W2b): the Codex lead prompts carry the run-variables block (names, descriptions, plain
+// values; never a secret value). Dummy values only.
+describe("CodexExecutor prompts: run variables", () => {
+  const SECRET = "dummy-secret-run-value-000000";
+  const ESC = String.fromCharCode(0x1b);
+  const runEnv = [
+    { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: 1, name: "REGION", value: "eu west", secret: false, description: `zone${ESC}[31m\r\nx‮y⁦z​w` },
+    { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: 1, name: "DB_PASSWORD", value: SECRET, secret: true, description: "login" },
+  ];
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+  const norm = (p: string) => p.replace(/_[0-9a-f]{16}>/g, "_N>").replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE");
+
+  for (const phase of ["planPrompt", "implementPrompt"] as const) {
+    it(`${phase} lists the variables and never a secret value`, () => {
+      const prompt = builders[phase](makeCtx({ runEnv }).ctx);
+      assert.match(prompt, /<run_env_[0-9a-f]+>/);
+      assert.ok(prompt.includes("DB_PASSWORD") && prompt.includes("login"));
+      assert.ok(!prompt.includes(SECRET));
+      assert.ok(prompt.includes('"eu west"'));
+      const block = prompt.slice(prompt.indexOf("<run_env_"), prompt.indexOf("</run_env_"));
+      for (const bad of [ESC, "\r", "‮", "⁦", "​", "[31m"]) assert.ok(!block.includes(bad), JSON.stringify(bad));
+    });
+
+    it(`${phase} is unchanged without variables`, () => {
+      const fresh = makeCtx().ctx;
+      assert.ok(!builders[phase](fresh).includes("run_env_"));
+      assert.equal(norm(builders[phase]({ ...fresh, runEnv: [] })), norm(builders[phase](fresh)));
+    });
+  }
+});

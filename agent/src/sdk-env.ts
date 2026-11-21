@@ -252,6 +252,9 @@ export function buildSdkEnv(
   }
   // PRD #4416 M2: user variables, after the tool profile and before every worker-set key below.
   foldRunEnv(env, runEnv, (k) => PROTECTED_ENV_KEYS.has(k));
+  // PRD #4416 M2: every worker-set key assigned from here on overwrites a user variable of the same
+  // name silently (no drop event), which is safe only because each such key is also denied by name
+  // (RUN_ENV_DENIED_NAMES / prefixes), so a user variable never reaches this point under it.
   // Issue #3382: the worker's optional Go build concurrency defaults (GOFLAGS=-p=N,
   // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
   // override them; absent settings add no key at all. Not protected keys.

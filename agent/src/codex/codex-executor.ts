@@ -72,6 +72,7 @@ import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
 import { foldRunEnv, runEnvDropText, type RunEnvInjection } from "../run-env-inject.js";
+import { buildRunEnvBlock } from "../run-env-prompt.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
@@ -141,7 +142,7 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
+import { redactPlanSummary, SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
 import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
@@ -3384,10 +3385,13 @@ export class CodexExecutor implements Executor {
               return;
             }
             if (!allowed()) return;
+            // PRD #4416 M2: the generated summary and the plan text leave the worker redacted, like every
+            // other agent-derived payload; the redacted value is also what the terminal report carries.
+            const safe = redactPlanSummary(result, ctx.redactText);
             await this.opts.client.postPlanSummary(ctx.runId, {
-              ...result, plan_md: planMd.replaceAll("\u0000", ""),
+              ...safe, plan_md: (ctx.redactText?.(planMd) ?? planMd).replaceAll("\u0000", ""),
             });
-            if (allowed()) latestPlanSummary = result;
+            if (allowed()) latestPlanSummary = safe;
           } catch (error) {
             this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
           } finally { this.planFlights.delete(owned); }
@@ -7223,12 +7227,14 @@ export class CodexExecutor implements Executor {
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
+    const runEnvAppend = buildRunEnvBlock(ctx.runEnv);
     const request: RunTurnRequest = {
       semanticPlanning: ctx.semanticPlanning,
       ciEvidencePrepared: !!ctx.ciEvidence,
       prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
       childTurnBudgetMs: this.childTurnDeadlineMs(),
+      ...(runEnvAppend ? { runEnvAppend } : {}),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       redactText: ctx.redactText,
@@ -7281,7 +7287,9 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${head}\n\n${review}` : head;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
+    // PRD #4416 M2: the run's user variables (lead lane; absent otherwise), after the facts block.
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}${runEnvBlock ? `\n\n${runEnvBlock}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -7373,7 +7381,10 @@ export class CodexExecutor implements Executor {
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
     const block = buildEnvironmentFactsBlock(facts);
-    const withFacts = block ? `${prompt}\n\n${block}` : prompt;
+    const withFactsOnly = block ? `${prompt}\n\n${block}` : prompt;
+    // PRD #4416 M2: the run's user variables ride every implement prompt this builder returns, like the facts.
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const withFacts = runEnvBlock ? `${withFactsOnly}\n\n${runEnvBlock}` : withFactsOnly;
     const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
     return dockerResume ? `${withFacts}\n\n${dockerResume}` : withFacts;
   }
@@ -8272,6 +8283,9 @@ export function buildCommandEnv(
   // PRD #4416 M2: the run's user variables, lowest precedence: after the tool profile, before every
   // worker-set key below, and never a protected key or git config carrier.
   foldRunEnv(env, runEnv, (k) => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k));
+  // PRD #4416 M2: the worker-set keys below overwrite a user variable of the same name silently (no
+  // drop event); every such key is also denied by name (RUN_ENV_DENIED_NAMES / prefixes), so a user
+  // variable never reaches this point under it.
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
