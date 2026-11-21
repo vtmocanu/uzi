@@ -3873,10 +3873,14 @@ export class CodexExecutor implements Executor {
         if (!await installState.settle(deadlineAt)) {
           throw new TrustedExecutionRefusal("installer cleanup proof unavailable");
         }
-        // A healthy final epoch cannot certify a prior epoch whose cleanup was
-        // unproven. Clean intentional-capture epochs leave this set at teardown.
+        // Only the exact deferred final pair whose non-registry cleanup succeeded may
+        // remain here. Facade identity alone cannot excuse a failed helper cleanup on a
+        // predecessor that still owns this.safety. The safety wrapper separately verifies
+        // the registry disposal witness after this hook returns.
         for (const registry of this.unverifiedEpochRegistries) {
-          if (this.epochSafeties.get(registry) !== this.safety) {
+          const final = this.deferredFinal;
+          if (final?.registry !== registry || final.safety !== this.safety ||
+              this.epochSafeties.get(registry) !== final.safety) {
             throw new TrustedExecutionRefusal("prior Codex epoch cleanup unproven");
           }
         }
@@ -4818,8 +4822,11 @@ export class CodexExecutor implements Executor {
       }
       const selection = resolvedSelection.selection;
       shared.selection.current = selection;
-      // Verify before the first iteration report, independently of the accounting cut.
-      if (lastSessionId) {
+      // Verify before the first normal iteration report, independently of the accounting cut.
+      // A seeded stop owns the existing loop boundary first; it must not launch a provider
+      // merely to park it. If that stop is declined, driveCodexTurn still verifies before dispatch.
+      if (lastSessionId && this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
+          !pauseNow.vaultLock.latched && ctx.pauseModeRequested?.() == null) {
         const request = this.buildRunRequest(ctx, "implement", "", lastSessionId, lifecycleSignal,
           selection, shared.repoInstructions);
         try {

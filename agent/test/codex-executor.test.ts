@@ -474,6 +474,9 @@ function defaultResponder(c: ResponderCtx): unknown {
 function threadStarted(threadId = "th-1"): CodexNotification {
   return { kind: "thread_started", method: "thread/started", threadId, params: { thread: { id: threadId } } };
 }
+function turnStarted(threadId = "th-1", turnId = "tn-1"): CodexNotification {
+  return { kind: "turn_started", method: "turn/started", threadId, turnId, params: { threadId, turn: { id: turnId } } };
+}
 function turnCompleted(status = "completed", threadId = "th-1", turnId = "tn-1"): CodexNotification {
   return { kind: "turn_completed", method: "turn/completed", threadId, turnId, status, params: { threadId, turn: { id: turnId, status } } };
 }
@@ -11943,10 +11946,14 @@ describe("CodexExecutor clarification turns (#1584)", () => {
   const ask = (id: number, th: string, tn: string) =>
     toolCall(id, "ask_user", { questions: [question] }, th, tn, `c-ask-${id}`);
   const scripted = (steps: Array<Array<"ask" | "plan" | "done" | "checkpoint">>, th = "th-1"): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       const stepsNow = steps[c.turnStartCount - 1] ?? [];
       stepsNow.forEach((step, i) => {
         const id = c.turnStartCount * 10 + i;
@@ -14866,10 +14873,14 @@ describe("Codex completion interlock", () => {
 describe("CodexExecutor milestone progress (issue #1674)", () => {
   type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
   const script = (th: string, turns: TurnScript[]): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
       return { turn: { id: tn } };
@@ -16223,10 +16234,12 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.deepEqual(resumedStore.sources.map((s) => s.launched), [true]);
   });
 
-  it("plan approval recreation stopped at reportIteration leaves the plan generation intact", async () => {
+  it("plan approval preparation stopped at reportIteration preserves the saved plan without implementation", async () => {
     const rig = makeMultiEpochRig([epochResponder("th-plan", "tn-plan", (t, th, tn) => {
       t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan"))
         .push(turnCompleted("completed", th, tn));
+    }), resumedEpochResponder("th-plan", "tn-implement", () => {
+      assert.fail("reportIteration must stop before an implementation turn");
     })]);
     const store = sessionGenerationSpy(rig);
     const { ctx } = makeCtx({
@@ -16235,9 +16248,12 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
       reportIteration: async () => { throw new Error("stop at running report"); },
     });
     await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "approval report stop"), /stop at running report/);
-    assert.equal(rig.providerLaunches(), 1);
-    assert.deepEqual(store.sources.map((s) => s.launched), [true]);
-    assert.equal(store.generation(), 1);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "preparation never executes implementation");
+    assert.deepEqual(rig.epochs[1]!.transport.requests.filter(r => r.method === "thread/resume").map(r => rec(r.params).threadId), ["th-plan"]);
+    assert.deepEqual(store.sources.map((s) => s.launched), [true, true]);
+    // Explicit preparation launched and adopted the plan session before reportIteration failed.
+    assert.equal(store.generation(), 2);
     assert.equal(store.files(), 1);
   });
 
@@ -19131,10 +19147,14 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
 describe("CodexExecutor owner follow-up (issue #1800)", () => {
   type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
   const script = (th: string, turns: TurnScript[], onTurnStart: (n: number) => void = () => {}): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       onTurnStart(c.turnStartCount);
       for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
@@ -20006,10 +20026,11 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) {
           if (!resumed) c.transport.push(threadStarted(rootTh));
+          c.transport.push(turnStarted(rootTh, "tn-root"));
           return { turn: { id: "tn-root" } };
         }
         const th = String(rec(c.params).threadId);
-        c.transport.push(turnCompleted("completed", th, `tn-${th}`));
+        c.transport.push(turnStarted(th, `tn-${th}`)).push(turnCompleted("completed", th, `tn-${th}`));
         return { turn: { id: `tn-${th}` } };
       }
       return {};
@@ -21039,9 +21060,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
   for (const productive of [false, true]) for (const retry of productive ? [false] : [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive} retry=${retry}`, async t => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
-      epochResponder("th-2", "tn-2", transport => {
-        if (productive) transport.push(agentMessage("partial model output", "th-2"));
-        else if (retry) transport.push(retryNote("rateLimitExceeded", true, "th-2", "tn-2"));
+      epochResponder("th-2", "tn-2", (transport, th, tn) => {
+        if (productive) transport.push(agentMessage("partial model output", th));
+        else if (retry) transport.push(retryNote("rateLimitExceeded", true, th, tn));
       }),
     ]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
@@ -21102,7 +21123,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
-        c.transport.push(threadStarted());
+        c.transport.push(threadStarted()).push(turnStarted());
         if (retry) c.transport.push(retryNote("rateLimitExceeded"));
         if (productive) c.transport.push(agentMessage("partial model output"));
         c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
@@ -23249,7 +23270,7 @@ describe("Codex M1 review transport", () => {
     return (turns[0]!.params as { input: { text: string }[] }).input[0]!.text;
   }
   const done = (threadId: string) => resumedEpochResponder(threadId, "tn-m1-done", (t, th, tn) => {
-    t.push(toolCall(2393, "signal_done", {}, th, tn, "m1-done")).push(turnCompleted("completed", th, tn));
+    t.push(turnStarted(th, tn)).push(toolCall(2393, "signal_done", {}, th, tn, "m1-done")).push(turnCompleted("completed", th, tn));
   });
   it("plan to gated implementation and ordinary successor on a distinct recreated epoch", async () => {
     const threadId = "th-m1-gated";
@@ -23258,7 +23279,7 @@ describe("Codex M1 review transport", () => {
         t.push(toolCall(2390, "submit_plan", { plan_md: "M1-GATED-PLAN" }, th, tn, "m1-plan")).push(turnCompleted("completed", th, tn));
       }),
       resumedEpochResponder(threadId, "tn-m1-checkpoint", (t, th, tn) => {
-        t.push(toolCall(2391, "checkpoint", {}, th, tn, "m1-checkpoint")).push(turnCompleted("completed", th, tn));
+        t.push(turnStarted(th, tn)).push(toolCall(2391, "checkpoint", {}, th, tn, "m1-checkpoint")).push(turnCompleted("completed", th, tn));
       }),
       done(threadId),
     ]);
@@ -23539,6 +23560,7 @@ describe("Codex dependency provisioning M2", () => {
     const impl: Responder = (c) => {
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
+        c.transport.push(turnStarted());
         if (c.turnStartCount === 2) c.transport.push(signalDone());
         c.transport.push(turnCompleted());
         return { turn: { id: "tn-1" } };
@@ -24484,10 +24506,11 @@ describe("M3 Codex bounded park controls", () => {
         if (c.method === "thread/start") assert.fail("the implementation epoch must resume, not start");
         if (c.method === "thread/resume") {
           resumes.push({ tools: rec(c.params).dynamicTools, threadId: rec(c.params).threadId });
-          return { thread: { id: "th-1" } };
+          return { thread: { id: "th-1" }, model: rec(c.params).model };
         }
         if (c.method === "turn/start") {
           prompts.push(JSON.stringify(c.params));
+          c.transport.push(turnStarted("th-1", "tn-2"));
           c.transport.push(toolCall(603, "park_run", {}, "th-1", "tn-2", "impl-park"));
           c.transport.push(turnCompleted("completed", "th-1", "tn-2"));
           return { turn: { id: "tn-2" } };
@@ -24654,7 +24677,9 @@ describe("Codex overflow scheduling M1", () => {
     const plan = epochResponder("th-1", "tn-1", transport => {
       transport.push(toolCall(1, "submit_plan", { plan_md: "M1" }, "th-1", "tn-1", "plan")).push(turnCompleted());
     });
-    const rig = makeMultiEpochRig([plan]);
+    const rig = makeMultiEpochRig([plan, resumedEpochResponder("th-1", "tn-2", () => {
+      assert.fail("spent wall budget must park before implementation");
+    })]);
     rig.deps = { ...rig.deps, timeoutNow: clock.now, wallMs: REPRO_DELAY, installDeps: (_cwd, _env, opts) => {
       opts?.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
       return install;
@@ -24687,6 +24712,7 @@ describe("Codex overflow scheduling M1", () => {
       finish({ results: [], truncated: false });
       const result = await running;
       assert.ok(result.walled);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "preparation permits no implementation turn after the wall");
       assert.equal(parks, 1);
       assert.equal(clock.pending().some(r => r.delay === 98_999_354), false, "actual installer join cancels pending deadline chunks");
       clock.move(98_999_354); clock.deliver(); await drain();
@@ -25373,6 +25399,7 @@ describe("2833 Codex inline summaries", () => {
           const implementResponder: Responder = c => {
             if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
             if (c.method !== "turn/start") return {};
+            c.transport.push(turnStarted("th-plan", "tn-impl"));
             implementation.resolve();
             void finish.promise.then(() => c.transport
               .push(toolCall(99, "signal_done", {}, "th-plan", "tn-impl", "done"))
@@ -25440,6 +25467,7 @@ describe("2833 Codex inline summaries", () => {
     const implementResponder: Responder = c => {
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
+      c.transport.push(turnStarted("th-plan", "tn-impl"));
       implementation.resolve();
       void finish.promise.then(() => c.transport
         .push(toolCall(99, "signal_done", {}, "th-plan", "tn-impl", "done"))
@@ -25627,6 +25655,7 @@ describe("2833 Codex inline summaries", () => {
       const implementResponder: Responder = c => {
         if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
+        c.transport.push(turnStarted("th-plan", "tn-impl"));
         implementation.resolve();
         void finish.promise.then(() => c.transport
           .push(toolCall(99, "signal_done", {}, "th-plan", "tn-impl", "done"))
@@ -27519,10 +27548,18 @@ describe("A capture lifecycle public run", () => {
     const exec = makeExecutor(fx.rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, fx.homeRoot);
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
     try {
-      assert.equal((await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")).branch, ctx.branch);
+      if (unclean) {
+        // Approval cannot replace an epoch whose helper cleanup is unproved: allowing a
+        // successful branch here would publish work across an unverified ownership boundary.
+        await assert.rejects(withTimeout(exec.run(ctx), 5000, "unclean old epoch run"), /prior Codex epoch cleanup unproven/);
+        assert.equal(fx.rig.providerLaunches(), 1, "no replacement launch without cleanup proof");
+        assert.equal(fx.rig.epochs[1]!.transport.turnStartCount, 0, "no implementation turn admitted");
+      } else {
+        assert.equal((await withTimeout(exec.run(ctx), 5000, "clean old epoch run")).branch, ctx.branch);
+        assert.equal(fx.rig.providerLaunches(), 2);
+        await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
+      }
       assert.ok(oldDisposals > 0, "the real abandoned epoch attempted helper teardown");
-      assert.equal(fx.rig.providerLaunches(), 2);
-      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
       const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
       assert.equal(disposed.kind, unclean ? "incomplete" : "disposed");
       if (disposed.kind === "incomplete") assert.match(JSON.stringify(disposed.errors), /terminal cleanup hook failed/);
@@ -28219,9 +28256,12 @@ describe("M3 Codex interrupted recovery delivery", () => {
         t.push(toolCall(3131, "submit_plan", { plan_md: "plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn));
       }),
       resumedEpochResponder("th-m3", "tn-check", (t, th, tn) => {
-        t.push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
+        t.push(turnStarted(th, tn)).push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
       }),
-      resumedEpochResponder("th-m3", "tn-done", done),
+      resumedEpochResponder("th-m3", "tn-done", (t, th, tn) => {
+        t.push(turnStarted(th, tn));
+        done(t, th, tn);
+      }),
     ]);
     rig.deps = { ...rig.deps, installDeps: async () => { installed = true; return { results: [], truncated: false }; } };
     const { ctx } = makeCtx({
@@ -29127,10 +29167,14 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
   type Script = (th: string, tn: string) => CodexNotification[];
   const done: Script = (th, tn) => [signalDone(th, tn)];
   const script = (th: string, turns: Script[]): Responder => c => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       const next = turns[c.turnStartCount - 1];
       assert.ok(next, "no unexpected extra model turn");
       for (const frame of next(th, tn)) c.transport.push(frame);
@@ -29282,13 +29326,16 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
         rig.transport.requestOverride = c => c.method === "thread/resume"
           ? rejected
             ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
-            : Promise.resolve({ thread: { id: "claimed-3472" } })
+            : Promise.resolve({ thread: { id: "claimed-3472" }, model: rec(c.params).model })
           : undefined;
         await observe(async requests => {
           const { ctx } = makeCtx({ worktreePath: root, repoClaudemdEnabled: true, sessionId: "claimed-3472" });
           await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "3472 claimed resume");
           assert.deepEqual(routes(rig.transport).map(r => r.method), rejected ? ["thread/resume", "thread/start"] : ["thread/resume"]);
-          assert.equal(requests.length, rejected ? 2 : 1);
+          // No-turn resume preparation is not a startTurn attempt; only the fresh fallback
+          // (or the accepted resume) reaches model dispatch. Both routes retain the snapshot.
+          assert.equal(requests.length, 1);
+          assert.equal(rig.transport.turnStartCount, 1);
           const snapshot = block(requests[0]!.systemPrompt!);
           assert.ok(snapshot.includes(payload));
           for (const r of requests) assert.equal(block(r.systemPrompt!), snapshot);
@@ -35659,10 +35706,14 @@ describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { sk
   };
   // A multi-turn scripted provider: turn N pushes turns[N-1]'s frames, then completes.
   const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
       return { turn: { id: tn } };
@@ -35870,10 +35921,14 @@ describe("issue #4313 real CodexExecutor + RunRunner over the done gate and resu
     }
   };
   const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
       return { turn: { id: tn } };
