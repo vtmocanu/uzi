@@ -2,7 +2,7 @@
 
 **Status**: Accepted (issue #4591). The api pool now caps pgx's per-connection statement cache at 128 unless `DATABASE_URL` sets `statement_cache_capacity`. Connection recycling (jitter, shorter lifetimes) was measured and **not adopted**.
 **Date**: 2026-11-21
-**Deciders**: lead (plan), coder (measurement and implementation), reviewer; the DBA-facing caveats were reviewed by the owner.
+**Deciders**: lead (plan), coder (measurement and implementation), reviewer, dba, fact-checker.
 **Related**: [ADR-1620](1620-custom-plan-cache-mode.md) keeps `plan_cache_mode = auto` on the same pool and supplies the latency method reused here; this ADR does not change it.
 **PRD**: none. The spec lived in the issue body; this ADR records the measurement behind the decision.
 
@@ -15,8 +15,10 @@ defaults, and so does `plan_cache_mode` ([ADR-1620](1620-custom-plan-cache-mode.
 
 - **What it bounds.** Each cached statement keeps its plan state in the PostgreSQL backend.
   Measured: about 154 KiB of backend memory contexts, and about 62 KiB of resident anonymous
-  memory, per cached statement. A cap of 128 bounds the plan-cache portion of a backend's
-  memory contexts at about 128 x 154 KiB.
+  memory, per cached statement (this fixture's average marginal cost; the wide-read sample
+  showed about 115-192 KiB per statement). The cap bounds the statement count, not bytes: it
+  caps the cached statements at 128 per connection, which in the harness was about
+  128 x 154 KiB of memory contexts.
 - **What it saved, in this harness.** Steady backend heap (Anonymous) fell 16.7% with JIT off
   (68.6 to 57.1 MiB) and 3.8% with the server's default JIT on (70.0 to 67.4 MiB). The
   production saving is **unmeasured** and expected to fall between those two.
@@ -28,7 +30,7 @@ defaults, and so does `plan_cache_mode` ([ADR-1620](1620-custom-plan-cache-mode.
   No jitter was added.
 - **It is a reversible default.** `statement_cache_capacity=512` in `DATABASE_URL` restores
   pgx's default. Never set it to `0`: with pgx's default exec mode it makes every
-  parameterised query fail (see [the description-cache finding](#the-description-cache-does-not-apply-here)).
+  query fail except an argument-less `Exec` (see [the description-cache finding](#the-description-cache-does-not-apply-here)).
 
 The incident-scale figure that motivated the issue, 110-160Mi per backend, was **not
 reproduced or attributed** here (see [Limits](#limits)).
@@ -62,13 +64,14 @@ reproducible.
 Four runs were made. The first three were superseded; they are recorded because the
 differences explain why the numbers below are trustworthy and why the earlier ones are not.
 
-1. **Run 1.** Savepoints taken per execution were never `RELEASE`d, so subtransactions nested
-   about 1520 deep and inflated absolute memory (steady Anonymous for A was 93.4 MiB). All
+1. **Run 1.** Savepoints taken per execution were never `RELEASE`d, so each `SAVEPOINT` nested inside
+   the previous one, so subtransaction depth grew by one per call within each transaction (one
+   level per breadth call and per latency-loop execution), and that inflated absolute memory (steady Anonymous for A was 93.4 MiB). All
    candidates shared one database.
 2. **Run 2.** `RELEASE` was added and autovacuum turned off, but all candidates still shared
    one database. Rolled-back writes bloated that database across the sequential candidates,
    an order confound: the capped candidates read worse than A (B128's Anonymous rose from
-   66.7 to 86.8 MiB between runs 1 and 2 while contexts stayed flat). Its per-candidate
+   66.7 to 86.8 MiB between runs 1 and 2 while its contexts fell from 31.1 to 25.1 MiB). Its per-candidate
    `Private_Clean` also jumped to about 50 MiB, which was not understood yet.
 3. **Run 3.** Each candidate and rep ran on its own `CREATE DATABASE ... TEMPLATE pm_template`
    clone (schema and fixture seeded once, `ANALYZE`d), two reps, Anonymous as the primary heap
@@ -76,8 +79,10 @@ differences explain why the numbers below are trustworthy and why the earlier on
    `Private_Clean` jump of about 51 MiB still appeared on every candidate that evicts or
    recycles, and was first read as shared-buffer pages.
 4. **Run 4 (the primary results).** Showed that jump is **LLVM JIT**: `llvmjit.so` and
-   `libLLVM.so.19.1` are mapped into a backend from round 8, because re-planned statements on
-   the bloating clone cross `jit_above_cost` (100000). It added a `jit = off` control
+   `libLLVM.so.19.1` are mapped into a backend from round 8. The leading hypothesis,
+   consistent with the evidence (LLVM is mapped only on backends that re-plan, and `jit = off`
+   removes it), is that re-planned statements on the bloating clone cross `jit_above_cost`
+   (100000); the specific statement was not identified. It added a `jit = off` control
    (`ALTER DATABASE <clone> SET jit = off`, measurement only, read back per backend with
    `SHOW jit`), a memory-map probe for LLVM, and an `EXPLAIN` split of `ClaimRun`. Run 4's
    JIT-off runs (a and c) are primary; run 4's jit-default run (b) shows the JIT effect.
@@ -217,7 +222,7 @@ rotated, the median round's per-execution mean. The columns are that mean in mic
   about 0.24 ms. A cap smaller than the number of distinct statements between two uses evicts
   the hot statement each pass: a thrash.
 - **Cold reconnect.** Connecting takes about 5 ms. The first `ClaimRun` on an empty cache
-  takes about 100-106 ms and the second about 64-68 ms, for every candidate alike.
+  takes about 98.5-103.9 ms and the second about 64-68 ms, for every candidate alike.
 
 `EXPLAIN (ANALYZE, SUMMARY)` of `ClaimRun` on one connection, four runs (jit default and off,
 two reps each), per execution: planning about 69-75 ms on the first, about 50-58 ms on
@@ -304,8 +309,10 @@ pool and was not a candidate.**
 The same excerpts give the `0` hazard. With `statement_cache_capacity=0` the statement cache
 is nil (`if c.config.StatementCacheCapacity > 0 { c.statementCache = ... }`), and the
 `QueryExecModeCacheStatement` branch returns `errDisabledStatementCache` ("cannot use
-QueryExecModeCacheStatement with disabled statement cache"). A statement with no arguments
-uses the simple protocol and is unaffected, so a pool at `0` fails every parameterised query.
+QueryExecModeCacheStatement with disabled statement cache"). In pgx v5.12.0 only an argument-less `Exec` uses the simple protocol. An argument-less
+`Query` or `QueryRow` still goes through the statement description path and fails with
+`errDisabledStatementCache`, so a pool at `0` fails every query except an argument-less
+`Exec` under the default mode.
 `0` is only valid together with a different `default_query_exec_mode`.
 
 The statement cache is an LRU that evicts on `Put` at capacity, and the evicted statement is
@@ -335,10 +342,10 @@ destroyed on release.
 
 The default was to land only if a cap bounded backend memory without moving the hot paths.
 
-- **128 clears that bar.** It cuts the plan-cache portion of a backend by about 154 KiB per
-  statement it no longer holds, leaves headline latency flat, and in the harness cut steady
+- **128 clears that bar.** It cuts about 154 KiB of memory contexts per
+  statement it no longer holds (this fixture's average), leaves headline latency flat, and in the harness cut steady
   heap by 16.7% with JIT off. With JIT on the measured saving is only 3.8%, because
-  evicting and re-planning on the bloated clone triggered JIT, which maps about 51 MiB of
+  evicting and re-planning on the bloated clone is the leading hypothesis for what triggered JIT, which maps about 51 MiB of
   shared library text and about 8.5-14 MiB of Anonymous. The production saving is
   unmeasured. It depends on how many distinct statements a connection runs, which the
   harness fixes at 317, and on whether any re-planned statement crosses `jit_above_cost`.
@@ -370,8 +377,10 @@ The default was to land only if a cap bounded backend memory without moving the 
   - `ALTER ROLE <app-role> SET jit = off;` takes effect for **new sessions only**, so
     existing pool connections keep JIT until they recycle (up to 1h) or the api restarts.
   - `jit=off` as a key in the `DATABASE_URL` query: pgx passes unknown keys through as
-    startup parameters. The chart ships no PgBouncer. A transaction-mode PgBouncer would
-    drop it (see [ADR-1620](1620-custom-plan-cache-mode.md)).
+    startup parameters. The chart ships no PgBouncer. A transaction-mode PgBouncer rejects a
+    startup parameter it does not track, failing the connection, unless it is listed in
+    `ignore_startup_parameters`, which drops it silently (see
+    [ADR-1620](1620-custom-plan-cache-mode.md)).
   - `ALTER DATABASE ... SET jit = off`, or a server-wide setting, is the infrastructure
     owner's call.
 
@@ -385,7 +394,8 @@ The default was to land only if a cap bounded backend memory without moving the 
   (67.4 steady, 72.7 sampled peak Anonymous, 71.7 Private_Dirty). One replica at 20
   connections is about 1.2 GiB with JIT off and about 1.5 GiB with JIT on. Add what is
   counted once (`shared_buffers`, the shared LLVM library page cache, PostgreSQL background
-  processes), headroom for non-api connections (workers, migrations, CNPG's own), concurrent
+  processes), headroom for non-api connections (one-off `uzi setup` runs, admin `psql` sessions, migrations
+  (`store.Migrate` opens its own connection), CNPG's own connections), concurrent
   query memory (up to `work_mem` per sort or hash plan node) and other PostgreSQL and
   container overhead. It assumes every pool connection has been opened and used; pgxpool
   opens connections lazily and reaps idle ones after 30m. The chart's api Deployment uses
@@ -402,14 +412,14 @@ The default was to land only if a cap bounded backend memory without moving the 
 - **Small synthetic fixture.** 2000 messages, 300 runs per measured user, 313 breadth methods
   and 317 retained statements against about 1691 named queries in the repository. Plan sizes
   and result sizes are not production-shaped; many breadth entries return empty rows.
-- **The incident scale was not reproduced.** A's `VmHWM` reached 121.2-125.6 MiB in run 4
-  and 124.7-128.6 MiB in the wide-read sample, but `VmHWM` includes shared pages, so it is
+- **The incident scale was not reproduced.** A's `VmHWM` reached 121.2-125.6 MiB in run 4,
+  and the wide-read sample's `VmHWM` was 124.7-170.0 MiB across its settings (not candidate A), but `VmHWM` includes shared pages, so it is
   not the per-backend heap, and nothing here attributes the 110-160Mi reported.
 - **One measured PostgreSQL version and host**: 17.12 with `shared_buffers` 128MB.
 - **JIT figures are one rep** (run 4 b) and compare across two runs on the same container;
   the jit-off figures are two reps.
 - **Sampling.** Memory is sampled from `/proc` at a 100 ms target (mean 100.0 ms, p95 100.8 ms
-  in run 3; run 2 recorded a maximum interval of 102.9-105.0 ms). A peak shorter than the
+  in run 3; run 1 recorded maximum intervals of 102.9-105.0 ms; run 2 recorded 102.8-200.8 ms, because candidate D had one roughly 200 ms gap or dropped sample). A peak shorter than the
   interval can fall between samples, so the sampled peak is a lower bound on the true peak;
   `VmHWM` is the kernel's high-water mark but includes shared pages. No sampling errors
   occurred in run 4.
