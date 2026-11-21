@@ -746,7 +746,7 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    the AGENTS.md *Two harnesses* exceptions: `claude` for Claude SDK work or after a Codex
    provider safety-policy refusal (`fail_origin` `provider_policy_refusal`), `codex` for
    Codex SDK work. Leave `--token` off unless the user authorized a specific credential
-   override; never pin an excluded credential. Re-choose the effort per step 2 (a
+   override; never pin an excluded credential. Re-choose the effort per *The loop, per run* step 2 (`effort.md`; a
    successor does not inherit a run-level effort). Verify `harness`, `auto_approve=false` and
    `credential_override` (null when the server chose) from `uzi run get`. At the gate, require the plan to build on the existing
    commits and finish the in-progress milestone, and co-review it with the buddy.

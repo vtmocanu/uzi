@@ -125,6 +125,6 @@ shown). Issue numbers and scopes are placeholders.
   otherwise cancel it and create a new run, applying this table again.
 - **Successors re-choose.** A successor run does not inherit its predecessor's run-level
   effort. Apply the table again and pass the result when creating it.
-- **Not the architecture-review effort.** The opus/xhigh architecture review that
-  `AGENTS.md` and `issue-triage`'s taxonomy require before dispatching a high or urgent
-  issue is a separate reviewer step. It neither sets nor replaces the run's `--effort`.
+- **Not the architecture-review effort.** The independent architecture review (a Claude
+  reviewer plus a Codex one) that `AGENTS.md` and `issue-triage`'s taxonomy require before
+  dispatching a high or urgent issue is a separate reviewer step. It neither sets nor replaces the run's `--effort`.
