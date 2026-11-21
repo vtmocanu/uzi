@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -272,13 +273,24 @@ func (h *Handler) sizeRefusals(ctx context.Context, listed []string) ([]apitypes
 		})
 	}
 
+	return selectSizeRefusals(byRaw, listed, clean)
+}
+
+// selectSizeRefusals picks the response from the fresh refusals grouped by raw hosted_size:
+// listed sizes first (name order), then unlisted raw sizes by name, at most maxRefusalSizes
+// sizes, each with its first maxRefusalsPerSize entries and its full count in totals. An
+// unlisted raw size whose sanitized key equals any listed name or an already retained key is
+// skipped, so one raw value never adds to another size's total. Both results are non-nil.
+func selectSizeRefusals(byRaw map[string][]apitypes.WorkerSizeRefusalDTO, listed []string, clean func(string) string) ([]apitypes.WorkerSizeRefusalDTO, map[string]int) {
+	out := []apitypes.WorkerSizeRefusalDTO{}
+	totals := map[string]int{}
 	listedKeys := map[string]bool{}
 	for _, name := range listed {
 		listedKeys[clean(name)] = true
 	}
 	order := make([]string, 0, len(byRaw))
 	seenListed := map[string]bool{}
-	for _, name := range sortedStrings(listed) {
+	for _, name := range slices.Sorted(slices.Values(listed)) {
 		if _, ok := byRaw[name]; ok && !seenListed[name] {
 			seenListed[name] = true
 			order = append(order, name)
@@ -324,12 +336,6 @@ func (h *Handler) sizeRefusals(ctx context.Context, listed []string) ([]apitypes
 		return out[i].WorkerID < out[j].WorkerID
 	})
 	return out, totals
-}
-
-func sortedStrings(in []string) []string {
-	s := append([]string(nil), in...)
-	sort.Strings(s)
-	return s
 }
 
 // appendRefusalSize records one retained size: its total is every entry, its output the first
