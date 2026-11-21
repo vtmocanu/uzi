@@ -84,9 +84,12 @@ authentication the worker selects. The rules guard the worker, not the build.
 - `assembleClaim` reads the effective injection set (enabled, live versions) and the redact-only
   secret versions as lists of `(var_id, rev)` and opens each value for the run's owner.
   `finishRunClaimTx` then takes the owner's users row `FOR KEY SHARE NOWAIT`, after the run lock,
-  recomputes both lists and compares them (`checkRunEnv`). Every variable writer, the account
-  reset and the user delete lock the same row `FOR UPDATE`, so the recompute sees every committed
-  write and the next one waits for the receipts. A busy lock rolls back into the finisher's bounded
+  recomputes both lists and compares them (`checkRunEnv`). Every user-facing variable writer, the
+  account reset and the user delete lock the same row `FOR UPDATE`, so the recompute sees every
+  committed write and the next one waits for the receipts. Two deliberate exceptions (listed in
+  `queries/run_env_receipts.sql`): the retired-version sweeper takes the row `FOR SHARE NOWAIT` and
+  deletes only versions no held run's receipt references, and a repo delete cascades its variables
+  together with the repo's runs and their receipts. A busy lock rolls back into the finisher's bounded
   retry; the claim never waits on it.
 - A changed list, or a non-empty set on a worker without `run_env_v1`, returns the run to queued
   with nothing delivered. A change committed after the finish reaches the run at its next claim.
@@ -184,8 +187,9 @@ and exclusion set that is then published (`scanCoversCandidate`). Sites:
 - **Held and terminal packs and recovery bundle uploads**, through the recovery coordinator, which
   takes its needles from the live claim or, with no flight, from the redact route; an unresolvable
   answer withholds and the publish is retried later.
-- **Finalize, on every forge**, before the branch push. A hit fails the run with
-  `fail_origin = push_secret_blocked`, no push and no preserved patch.
+- **Finalize, on every forge**, before the branch push. A hit, or a scan that cannot prove the
+  range clean, fails the run with `fail_origin = push_secret_blocked`, no push and no preserved
+  patch.
 - **The preserved patch**: the raw patch is searched first and withheld whole on a hit, then
   redacted and gitleaks-scanned as before.
 
@@ -207,7 +211,7 @@ Recorded so the PRD's plan is not read as the shipped mechanism.
   latch into the remediation state. The recovered work stays reachable through the run's custody and `uzi run export`.
 - The PRD named the lane by kind; the code uses the lane function above.
 - The PRD said receipts record secret versions. They record plain versions too.
-- The PRD's AAD was the M1 context (scope, repo, secret flag, name). Version 2 adds owner, `var_id` and `rev`.
+- The PRD's AAD named the user id, scope, repo, secret flag and name; the M1 code's version-1 context binds scope, repo, secret flag and name, with the owner bound by the vault seam (`OpenSealed` takes the user id). Version 2 adds owner, `var_id` and `rev` to the context itself.
 
 ## Residuals
 
@@ -215,7 +219,8 @@ Accepted, in addition to the PRD's list (agent-readable values, shared uid and d
 exact-match redaction with an 8-character floor, values reaching the model provider):
 
 - **AAD v1 rows.** Rows sealed before M2 keep `aad_version = 1`, whose context lacks `var_id` and
-  `rev`: a database writer can swap two such ciphertexts that share name, scope and secret flag.
+  `rev`: a database writer can swap two such ciphertexts of the same owner that share repo, name, scope and
+  secret flag (in practice, two versions of the same variable).
   A database writer can also downgrade `aad_version` on a row. Both close when the version is
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.

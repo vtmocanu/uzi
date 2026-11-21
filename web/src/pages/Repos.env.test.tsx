@@ -160,7 +160,7 @@ describe("Repos environment variables panel", () => {
     expect(within(panel).getByText("Sandbox base URL")).toBeTruthy();
     expect(within(panel).getByText("Pending deletion")).toBeTruthy();
     expect(panel.textContent).toContain("The agent can read every value, secret or not.");
-    expect(panel.textContent).toContain("Variables are set in the environment of every command a repo’s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge and cross-check runs do not receive them.");
+    expect(panel.textContent).toContain("Variables are set in the environment of every command a repo’s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge, job and cross-check runs do not receive them.");
     expect(panel.textContent).toContain("Secret values are redacted from run output and checked before anything is pushed.");
     expect(panel.textContent).not.toContain("not yet injected");
     expect(panel.textContent).toContain("does not revoke the credential; revoke it at the provider");

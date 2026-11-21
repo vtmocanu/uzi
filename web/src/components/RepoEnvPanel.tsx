@@ -269,7 +269,7 @@ export function RepoEnvPanel({
         <p>
           The agent can read every value, secret or not. uzi only sets these variables in the run&rsquo;s environment; any login
           or tool configuration is done by the agent or the repo&rsquo;s scripts. Variables are set in the environment of every
-          command a repo&rsquo;s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge and cross-check runs do not receive them.
+          command a repo&rsquo;s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge, job and cross-check runs do not receive them.
           Secret values are redacted from run output and checked before anything is pushed.
         </p>
         <p>Disabling or deleting a variable does not revoke the credential; revoke it at the provider.</p>

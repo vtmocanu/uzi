@@ -77,8 +77,9 @@ terminal preservation packs, recovery archives and the preserved patch.
   trigger this; pick a longer value.
 - The scan **fails closed**. If it cannot prove a range clean (a timeout, an
   unreadable range, a scanner error, or the run's secret history cannot be
-  looked up), the publish is withheld and retried later. The work stays on the
-  worker under its recovery hold.
+  looked up), a checkpoint, pack or recovery upload is withheld and retried
+  later, and the work stays on the worker under its recovery hold. At the final
+  push the run fails as `push_secret_blocked` instead.
 - A plain value found in tracked files holds nothing.
 
 ## Rotating and deleting while runs are active

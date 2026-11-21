@@ -1,6 +1,6 @@
 # PRD #4416: Per-repo secrets and variables for runs
 
-**Status**: M1 and M2 shipped; M3 and M4 pending
+**Status**: M1 shipped; M2 implemented (pending landing); M3 and M4 pending
 **Priority**: Normal
 
 ## Problem
@@ -230,7 +230,7 @@ Outside the milestones, not a worker obligation; this delivery is `non_closing` 
 - **The salvage ref is an API copy of the checkpoint.** The PRD listed a worker-side salvage-ref publish to scan. There is none; scanning the checkpoint covers the copy. Park, shutdown, pause and overlay checkpoints were not gitleaks-scanned and recovery bundle uploads were unscanned; both now pass the exact-value scan, at the single `publishCheckpoint` call and the recovery coordinator.
 - **One lead-lane function (O2).** The lane is `leadcfg.LeadLane`, mirrored in SQL by `fn_run_env_lane` and pinned by a LiveDB test, so run kinds, review targets and egress-profile-bound runs cannot drift between claim, gate, placement and health.
 - **A variable identity table (O5).** `run_env_var_ids` binds a `var_id` to one owner, repo, scope and name for good, enforced by a trigger, so a receipt can never be satisfied by another variable's row.
-- **AAD version 2 (O6).** New seals bind owner, `var_id` and `rev` as well as scope, repo, secret flag and name, selected per row by `aad_version`. Residual: version-1 rows sealed before M2 can be swapped with a same-name, same-scope, same-flag ciphertext, and a database writer can downgrade `aad_version`; both close when the row is rewritten.
+- **AAD version 2 (O6).** New seals bind owner, `var_id` and `rev` as well as scope, repo, secret flag and name, selected per row by `aad_version`. Residual: version-1 rows sealed before M2 can be swapped with a ciphertext of the same owner, repo, name, scope and secret flag (in practice another version of the same variable), and a database writer can downgrade `aad_version`; both close when the row is rewritten.
 - **Cross-check children mask the lead's secret versions.** A child never receives `run_env` and writes no receipts, but its checker reads the lead's code and output, so its claim carries the lead's secret versions as `run_env_redact`. Without `run_env_v1` or an openable version it ends `checker_unavailable`, which forces a human gate. Residuals: retention does not consider a child's dependence on its lead's versions (the child fails closed), and placement does not steer a child to a `run_env_v1` worker, so a rolling deploy can force a human gate.
 - **A maintenance redact route without a generation bound.** A worker that last held the run, or took an open custody hold on it, reads the run's whole receipted secret history after its claim, so held, terminal and recovery publishes can still be scanned. Read-only and same-user only, so accepted.
 - **An unreadable receipted version parks the run.** Hold reason `run_env_history_unavailable`: Resume retries once the history is restored, Cancel is terminal.

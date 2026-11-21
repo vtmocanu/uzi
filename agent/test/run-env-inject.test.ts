@@ -160,7 +160,8 @@ describe("only the lead lane receives run variables", () => {
 
   // Scan-needle consumers (PRD 4416 M2 exact-value scan): they search publishes for the registered forms of the
   // secret values and never build an env. Allowed by name; the test below pins that none of them injects.
-  const NEEDLE_CONSUMERS = ["frozen-held.ts", "recovery.ts", "run-env-scan.ts", "terminal-preservation-lane.ts"];
+  // cross-check-runner.ts registers a cross-check child's run_env_redact forms (the lead's secret versions) for redaction only.
+  const NEEDLE_CONSUMERS = ["cross-check-runner.ts", "frozen-held.ts", "recovery.ts", "run-env-scan.ts", "terminal-preservation-lane.ts"];
 
   // runEnvProbe (env-probe.ts) is the unrelated environment probe, so match the variable names only.
   const RUN_ENV_MENTION = /\brunEnv\b|run_env|RunEnv(Claim|Var|Injection|Redact)|ClaimRunEnv|run-env-/;

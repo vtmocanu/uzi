@@ -268,8 +268,11 @@ func TestRunEnvRedactNonLeadLaneRunIsUnprotectedLiveDB(t *testing.T) {
 	fx.put(t, "API_KEY", true, envSecretValue("one"))
 	// A chat run is outside the lead lane, whatever the repo holds.
 	runID := uuid.New()
-	fx.env.exec(`INSERT INTO runs (id, user_id, kind, status, status_since, worker_id, budget_wall_seconds, issue_title)
-	    VALUES ($1, $2, 'chat', 'queued', now(), $3, 3600, '')`, runID, fx.userID, fx.workerID)
+	// The chat column set mirrors credential_switch_chat_exempt_livedb_test.go's chat-run fixture.
+	fx.env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source, harness,
+	             status, status_since, worker_id, claim_generation, budget_paused_seconds, budget_wall_seconds)
+	    VALUES ($1, $2, 'chat', 'chat title', 'chat prompt', 'chat title', 'chat', 'claude',
+	            'queued', now(), $3, 0, 0, 3600)`, runID, fx.userID, fx.workerID)
 	res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
 	if err != nil || res.Protected || len(res.Versions) != 0 {
 		t.Fatalf("%+v, %v; want {protected:false}", res, err)
