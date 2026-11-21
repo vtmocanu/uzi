@@ -145,9 +145,9 @@ func TestOnceFireRetry_I_CapacityBlockedContinuationHoldsQuietly(t *testing.T) {
 	s := capacityOnceSweep(h, 3, 2, 2)
 	h.runs.ledger.seed(s.ID, 7, intPtr(3), 96, "t96")
 	h.st.due = []store.RunSchedule{s}
-	h.st.inFlight = 2
+	h.st.inFlight = 5
 	h.sched.Boot(context.Background())
-	h.st.inFlight = 5 // a different in-flight count; room is still 0
+	h.st.inFlight = 3 // a different in-flight count; room is still 0
 	h.sched.Boot(context.Background())
 	if len(h.runs.autopilot) != 0 || len(h.st.advanceCalls) != 0 || len(h.st.statusCalls) != 0 {
 		t.Fatalf("a held continuation must create, advance and park nothing: created=%d advances=%d", len(h.runs.autopilot), len(h.st.advanceCalls))
@@ -159,8 +159,8 @@ func TestOnceFireRetry_I_CapacityBlockedContinuationHoldsQuietly(t *testing.T) {
 		t.Fatalf("partial writes = %d, want exactly 1 across two held ticks with different in-flight counts", len(h.st.partialCalls))
 	}
 	rec := lastWritten(t, h.st.partialCalls[0].LastFire)
-	if len(rec.Started) != 1 || rec.Started[0].Title != "t96" || rec.Capacity == nil || !rec.Capacity.Blocked || rec.Capacity.Limit != 2 || rec.Capacity.Room != 0 || len(rec.Skips) != 0 {
-		t.Fatalf("held summary = %+v, want the folded start, a blocked capacity and no skip", rec)
+	if len(rec.Started) != 1 || rec.Started[0].Title != "t96" || rec.Capacity == nil || !rec.Capacity.Blocked || rec.Capacity.Limit != 2 || rec.Capacity.InFlight != 5 || rec.Capacity.Room != 0 || len(rec.Skips) != 0 {
+		t.Fatalf("held summary = %+v, want the folded start, the observed in-flight 5, a blocked capacity and no skip", rec)
 	}
 	if len(h.fb.f.getIID) != 0 {
 		t.Fatalf("a held continuation must make no forge call: %v", h.fb.f.getIID)
@@ -257,6 +257,64 @@ func TestOnceFireRetry_J_FailedSummaryWriteStillRetries(t *testing.T) {
 			t.Fatal("an unreadable ledger must neither start nor advance")
 		}
 	})
+}
+
+// cancelledActiveStore fails the active-run check on a cancelled context the way the real
+// database does.
+type cancelledActiveStore struct{ *fakeStore }
+
+func (s cancelledActiveStore) HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return s.fakeStore.HasActiveRunForIssue(ctx, arg)
+}
+
+// cancelAfterRuns cancels the run context right after candidate 96 is admitted.
+type cancelAfterRuns struct {
+	*fakeRuns
+	cancel context.CancelFunc
+}
+
+func (r *cancelAfterRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, description string, wait *bool, rework *bool, model *string, subagent bool, credential *workersvc.CredentialOverride, harness *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error) {
+	run, err := r.fakeRuns.CreateScheduledAutopilotRun(ctx, user, repo, iid, description, wait, rework, model, subagent, credential, harness, progress)
+	if iid == 96 {
+		r.cancel()
+	}
+	return run, err
+}
+
+// Cancellation (shutdown) after one admission must not consume the partial once fire: the cancelled
+// context would turn the remaining candidates into fetch_failed skips and the completing advance
+// would spend the unused slots. The fire is returned as transient instead: the row is not
+// advanced and the ledger keeps 96 for the resume. On the pre-fix code the active-run check of 97
+// fails on the cancelled context, becomes a skip, and the completing advance is written.
+func TestOnceFireRetry_CancelMidSweepDoesNotConsumePartialFire(t *testing.T) {
+	h := newHarness()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.sched.store = cancelledActiveStore{h.st}
+	h.sched.runs = &cancelAfterRuns{fakeRuns: h.runs, cancel: cancel}
+	h.st.sweepRows = sweepRows(96, 97, 98)
+	s := onceSweep(h, 3)
+	h.st.due = []store.RunSchedule{s}
+	h.sched.Boot(ctx)
+	if len(h.st.advanceCalls) != 0 || len(h.st.statusCalls) != 0 {
+		t.Fatalf("a cancelled once fire advanced or parked: advances=%+v", h.st.advanceCalls)
+	}
+	if rows := h.runs.ledger.rows(s.ID, 7); len(rows) != 1 || rows[0].IssueIid != 96 {
+		t.Fatalf("ledger = %+v, want only 96", rows)
+	}
+	out, err := h.sched.fireOne(ctx, s, true)
+	if !errors.Is(err, context.Canceled) || len(out.Started) != 0 {
+		t.Fatalf("fireOne on a cancelled context = %+v, %v, want the context error", out, err)
+	}
+	// The resume on a live context spends only the remaining slots and completes.
+	h.sched.store, h.sched.runs = h.st, h.runs
+	h.sched.Boot(context.Background())
+	if len(h.runs.autopilot) != 3 || len(h.st.advanceCalls) != 1 || h.st.advanceCalls[0].Status != "fired" {
+		t.Fatalf("resume created %d, advances=%+v", len(h.runs.autopilot), h.st.advanceCalls)
+	}
 }
 
 // (l) unit: a lost acknowledgement (committed create, errored call) is in Started exactly once,

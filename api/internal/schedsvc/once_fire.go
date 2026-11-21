@@ -51,14 +51,6 @@ func foldPriorStarts(rows []store.ListOnceFireProgressRow) []Started {
 	return out
 }
 
-// heldCapacity is the capacity block of a continuation held for room. In-flight and room are
-// volatile (they change every tick), so they are not recorded as observed: a hold means room is
-// 0, which fixes both from the stable limit, and an unchanged hold therefore dedupes.
-func heldCapacity(sched store.RunSchedule) CapacityCheck {
-	limit := int(sched.CapacityLimit.Int32)
-	return CapacityCheck{InFlight: int64(limit), Limit: limit, RoomNeeded: int(sched.CapacityRoomNeeded.Int32), Room: 0, Blocked: true}
-}
-
 // composeOnceSummary builds the outcome to persist from the fire's outcome and the ledger rows
 // read under the schedule row lock. Started comes ONLY from the ledger, so a delayed or lost-ack
 // view never shrinks or duplicates it; the caller's skips for a recorded issue are dropped (a
@@ -82,7 +74,9 @@ func composeOnceSummary(out FireOutcome, rows []store.ListOnceFireProgressRow) F
 }
 
 // summaryEquivalent reports whether stored already says exactly what next says (fired_at aside),
-// so a repeated partial or held write is skipped.
+// so a repeated partial or held write is skipped. The capacity block's InFlight and Room are
+// volatile observations (they change every tick), so they are ignored; its stable fields still
+// compare.
 func summaryEquivalent(stored []byte, next []byte) bool {
 	if len(stored) == 0 {
 		return false
@@ -92,6 +86,11 @@ func summaryEquivalent(stored []byte, next []byte) bool {
 		return false
 	}
 	a.FiredAt = b.FiredAt
+	if a.Capacity != nil && b.Capacity != nil {
+		ac, bc := *a.Capacity, *b.Capacity
+		ac.InFlight, ac.Room = bc.InFlight, bc.Room
+		a.Capacity = &ac
+	}
 	return reflect.DeepEqual(a, b)
 }
 

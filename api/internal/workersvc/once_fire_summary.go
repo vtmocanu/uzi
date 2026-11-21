@@ -79,6 +79,11 @@ func (s *Service) WriteOnceFireSummary(ctx context.Context, scheduleID, userID u
 		return OnceFireSummaryResult{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// READ COMMITTED first: the ledger read must see an admission that committed while this
+	// transaction waited on the schedule row lock (a fresh snapshot per statement).
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return OnceFireSummaryResult{}, err
+	}
 	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '5s'"); err != nil {
 		return OnceFireSummaryResult{}, err
 	}

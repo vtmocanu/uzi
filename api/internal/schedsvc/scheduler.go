@@ -797,7 +797,8 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule, sche
 			// bounds the NEW starts, and none at all is a quiet hold.
 			capacity.Blocked = false
 			if room == 0 {
-				held := heldCapacity(sched)
+				held := *capacity
+				held.Blocked = true
 				return FireOutcome{Capacity: &held, Started: started, Matched: len(started)}, errOnceFireHeld
 			}
 			newRoom = int(room)
@@ -916,6 +917,12 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule, sche
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
 		iidCopy := iid
+		if onceProgress && ctx.Err() != nil {
+			// A cancelled run context (shutdown) makes every remaining seam call fail and would be
+			// recorded as fetch_failed skips, then the completing advance would consume the unused
+			// slots. Return it as transient: the row stays due and the ledger resumes the fire.
+			return FireOutcome{}, ctx.Err()
+		}
 		if recorded[iid] {
 			// A slot an earlier attempt of this fire already spent (its run is in Started, folded
 			// from the ledger): never started again and never skipped, even if the run has ended or
@@ -1072,6 +1079,9 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule, sche
 		if newRoom >= 0 && len(out.Started)-len(prior) >= newRoom {
 			break
 		}
+	}
+	if onceProgress && ctx.Err() != nil {
+		return FireOutcome{}, ctx.Err() // see the loop-top check: never advance a cancelled once fire
 	}
 	// Matched = candidates examined this fire (== started + skipped by construction).
 	out.Matched = len(out.Started) + len(out.Skips)
