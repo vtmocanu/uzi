@@ -45,6 +45,7 @@ import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
 import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import { runEnvDropText } from "./run-env-inject.js";
 import { assertAgentModelsMapped, isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
@@ -1670,7 +1671,12 @@ export class SdkExecutor implements Executor {
     // agent starts is positively attributable to this attempt by the quiescence reaper.
     // PRD #4320 module 6: a provider run builds its env from the frozen binding and never carries an OAuth token.
     const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
-    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir);
+    // PRD #4416 M2: the lead lane alone receives the run's user variables (lowest precedence); each
+    // dropped name is reported as a run event naming the rule, never the value.
+    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir,
+      ctx.runEnv && ctx.runEnv.length > 0
+        ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+        : undefined);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK

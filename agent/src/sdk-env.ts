@@ -24,6 +24,7 @@
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { foldRunEnv, type RunEnvInjection } from "./run-env-inject.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
 
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
@@ -191,6 +192,9 @@ function credentialEnv(credential: SdkCredential): Record<string, string | undef
  *                   this parameter (a provisioned GOTMPDIR behaves as before).
  * @param runTmpdir  issue #4420: the run-owned scratch leaf (`RunContext.runTmpdir`). When set it
  *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
+ * @param runEnv     PRD #4416 M2: the run's user variables. Lead-lane spawn sites only. Folded in
+ *                   right after the toolEnv fold with the lowest precedence (see foldRunEnv); every
+ *                   worker-set key below still wins. Undefined ⇒ the env is byte-identical to before.
  */
 export function buildSdkEnv(
   credential: SdkCredential,
@@ -200,6 +204,7 @@ export function buildSdkEnv(
   attempt?: SdkAttemptEnv,
   goWorkDir?: string,
   runTmpdir?: string,
+  runEnv?: RunEnvInjection,
 ): SdkEnv {
   const env = {
     ...credentialEnv(credential),
@@ -245,6 +250,8 @@ export function buildSdkEnv(
     if (PROTECTED_ENV_KEYS.has(k)) continue;
     env[k] = v;
   }
+  // PRD #4416 M2: user variables, after the tool profile and before every worker-set key below.
+  foldRunEnv(env, runEnv, (k) => PROTECTED_ENV_KEYS.has(k));
   // Issue #3382: the worker's optional Go build concurrency defaults (GOFLAGS=-p=N,
   // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
   // override them; absent settings add no key at all. Not protected keys.

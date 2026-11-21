@@ -71,6 +71,7 @@ import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
+import { foldRunEnv, runEnvDropText, type RunEnvInjection } from "../run-env-inject.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
@@ -3756,6 +3757,9 @@ export class CodexExecutor implements Executor {
           // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
+          ctx.runEnv && ctx.runEnv.length > 0
+            ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+            : undefined,
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -8234,11 +8238,20 @@ export function commandSandboxArgv(
  *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
  *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
  *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
+ *   - PRD #4416 M2: `runEnv` (lead lane only) adds the run's user variables after the toolEnv
+ *     fold, lowest precedence (see foldRunEnv): never a protected key, git config carrier, denied
+ *     name or key already set; the worker keys below overwrite it.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
+export function buildCommandEnv(
+  tmpdir: string,
+  toolEnv: Record<string, string>,
+  dockerHost?: string,
+  browserDiscovery = false,
+  runEnv?: RunEnvInjection,
+): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -8256,6 +8269,9 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
+  // PRD #4416 M2: the run's user variables, lowest precedence: after the tool profile, before every
+  // worker-set key below, and never a protected key or git config carrier.
+  foldRunEnv(env, runEnv, (k) => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k));
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
