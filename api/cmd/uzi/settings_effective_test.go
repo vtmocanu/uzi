@@ -272,3 +272,34 @@ func TestSettingsGetEffectiveHostileTextAndBounds(t *testing.T) {
 		t.Fatalf("hostile failure text on stderr: exit %d, %q", code, stderr)
 	}
 }
+
+// TestSettingsGetEffectivePlanningRowsPrintOnce pins PRD #3252 on the effective table path: the
+// view's planning cells (settings planning_model and planning_effort) do not add rows, because the
+// planning rows come from the settings read, so each prints exactly once.
+func TestSettingsGetEffectivePlanningRowsPrintOnce(t *testing.T) {
+	e := effectiveFixture()
+	opus, high := "opus", "high"
+	pm := modelCell("planning_model", "claude", &opus, "opus", "template", "opus", "user_planning_default")
+	pe := effortCell("planning_effort", "claude", &high, &high, "user_planning_default", "explicit")
+	e.Models = append(e.Models, pm)
+	e.Efforts = append(e.Efforts, pe)
+	s := settingsWithLegacyCells()
+	s.PlanningModels = []apitypes.ModelSettingCellDTO{pm.ModelSettingCellDTO}
+	s.PlanningEfforts = []apitypes.EffortSettingCellDTO{pe.EffortSettingCellDTO}
+	out, stderr, code := runCLI(t, fakeEnv(&uzicli.FakeClient{Settings: s, Effective: e}), "settings", "get")
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	counts := map[string]int{}
+	for _, l := range strings.Split(out, "\n") {
+		f := fields(l)
+		for _, p := range []string{"planning model ", "planning effort "} {
+			if strings.HasPrefix(f, p) {
+				counts[p]++
+			}
+		}
+	}
+	if counts["planning model "] != 1 || counts["planning effort "] != 1 {
+		t.Errorf("planning rows printed %v, want once each:\n%s", counts, out)
+	}
+}

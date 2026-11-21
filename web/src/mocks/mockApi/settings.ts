@@ -905,7 +905,7 @@ export function sessionBody() {
 }
 
 function recordedEffectiveScenario(): RecordedEffectiveScenario {
-  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault" } as Record<string, string>)[mockScenario()] ?? "default";
+  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault", "planning-pair": "planning" } as Record<string, string>)[mockScenario()] ?? "default";
   const found = RECORDED_EFFECTIVE_SCENARIOS.find(s => s.name === name);
   if (!found) throw new Error(`no recorded effective-settings scenario ${name}`);
   return found;
@@ -923,6 +923,22 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
       ? { ...c, notes: [...c.notes, "not_used"] }
       : c,
   );
+  return view;
+}
+
+// PRD #3252: the recordings are taken with no planning value, so the mock user's stored planning
+// pair is applied at response time on the Claude planning cells, through the same mock cell
+// builders /me/settings uses. With neither value set the recording is served unchanged.
+function withPlanning(view: EffectiveSettings): EffectiveSettings {
+  const model = userSettings.planning_claude_model, effort = userSettings.planning_claude_effort;
+  if (model == null && effort == null) return view;
+  const [m] = mockPlanningModelCells(model, userSettings.default_claude_model);
+  const [e] = mockPlanningEffortCells(effort, userSettings.default_effort);
+  // The recording's default pair stays; only the stored value and, when it applies, the resolution move.
+  view.models = view.models.map(c => c.setting !== "planning_model" ? c
+    : m.source === "user_planning_default" ? { ...c, model: m.model, resolved_model: m.resolved_model, source: "user_planning_default" } : { ...c, model: m.model });
+  view.efforts = view.efforts.map(c => c.setting !== "planning_effort" ? c
+    : e.source === "user_planning_default" ? { ...c, effort: e.effort, resolved_effort: e.resolved_effort, source: "user_planning_default", mode: "explicit" } : { ...c, effort: e.effort });
   return view;
 }
 
@@ -1658,10 +1674,11 @@ export const settingsApi = {
   },
   // PRD #3254 M2: the recorded server behavior for the active demo scenario, not a second
   // resolver. "codex-only" serves the codexOnly recording and "overflow-codex-default" the
-  // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
+  // overflowCodexDefault one (the recorded refused-alternative case) and "planning-pair" the
+  // planning one (an owner with a Claude planning pair, PRD #3252); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
+    return delay(withPlanning(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on)), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();

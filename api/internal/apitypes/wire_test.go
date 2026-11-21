@@ -1571,3 +1571,35 @@ func TestRunCreatedIssuesWire(t *testing.T) {
 		t.Fatalf("roundtrip=%+v", decoded.CreatedIssues)
 	}
 }
+
+// TestEffectivePlanPhaseIsOmittedUnlessSet pins PRD #3252: plan_phase rides the start and schedule
+// previews (and their alternatives) only when set, so a preview with no planning value applying is
+// byte-identical to one that predates it, and the object carries the claim's own plan_phase keys.
+func TestEffectivePlanPhaseIsOmittedUnlessSet(t *testing.T) {
+	for name, v := range map[string]any{
+		"StartPreviewDTO": StartPreviewDTO{}, "StartPreviewAlternativeDTO": StartPreviewAlternativeDTO{},
+		"ScheduleSettingsPreviewDTO": ScheduleSettingsPreviewDTO{}, "ScheduleAlternativeDTO": ScheduleAlternativeDTO{},
+	} {
+		for _, k := range tagSet(t, v) {
+			if k == "plan_phase" {
+				t.Errorf("%s zero value carries plan_phase", name)
+			}
+		}
+	}
+	m, e := "opus", "high"
+	raw, err := json.Marshal(StartPreviewDTO{PlanPhase: &EffectivePlanPhaseDTO{Model: &m, Effort: &e, ModelSource: "user_planning_default", EffortSource: "user_planning_default"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body["plan_phase"]); got != `{"model":"opus","effort":"high","model_source":"user_planning_default","effort_source":"user_planning_default"}` {
+		t.Fatalf("plan_phase = %s", got)
+	}
+	// Neither side's values: the object is empty, never null members.
+	if raw, _ := json.Marshal(EffectivePlanPhaseDTO{}); string(raw) != `{}` {
+		t.Fatalf("empty plan_phase = %s", raw)
+	}
+}

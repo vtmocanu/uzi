@@ -69,6 +69,43 @@ func TestEffectiveSettingsRunOverrideClaimEquivalenceLiveDB(t *testing.T) {
 			want:   leadWant{harness: HarnessClaude, model: "opus", modelSource: "template", effort: "low", effortSource: "run_override"},
 		},
 		{
+			// PRD #3252: a frozen run model wins in both phases; the planning effort still applies to plan.
+			name: "a run model is the plan model too, the planning effort still splits",
+			setup: func(fx *effFix) {
+				fx.anthropic()
+				fx.lane("planning_claude_model", "haiku")
+				fx.lane("planning_claude_effort", "high")
+			},
+			model: strp("sonnet"),
+			want: leadWant{harness: HarnessClaude, model: "sonnet", modelSource: "run_override", claimModel: "sonnet", claimSource: "run_override",
+				effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Model: strp("sonnet"), Effort: strp("high"),
+					ModelSource: "run_override", EffortSource: "user_planning_default"}},
+		},
+		{
+			name: "a run effort is the plan effort too, the planning model still splits",
+			setup: func(fx *effFix) {
+				fx.anthropic()
+				fx.lane("planning_claude_model", "opus")
+				fx.lane("planning_claude_effort", "max")
+			},
+			effort: strp("low"),
+			want: leadWant{harness: HarnessClaude, model: "", modelSource: "builtin", effort: "low", effortSource: "run_override",
+				plan: &ClaimPhaseSettings{Model: strp("opus"), Effort: strp("low"),
+					ModelSource: "user_planning_default", EffortSource: "run_override"}},
+		},
+		{
+			name: "a run model and effort leave nothing for the planning lane",
+			setup: func(fx *effFix) {
+				fx.anthropic()
+				fx.lane("planning_claude_model", "haiku")
+				fx.lane("planning_claude_effort", "high")
+			},
+			model: strp("sonnet"), effort: strp("xhigh"),
+			want: leadWant{harness: HarnessClaude, model: "sonnet", modelSource: "run_override", claimModel: "sonnet", claimSource: "run_override",
+				effort: "xhigh", effortSource: "run_override"},
+		},
+		{
 			name:     "codex effort only keeps the built-in model",
 			setup:    func(fx *effFix) { fx.codexDefault() },
 			explicit: &codex,

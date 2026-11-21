@@ -298,9 +298,9 @@ export interface CatalogDefault {
  *  source_labels of fixtures/model-settings/contract.json. */
 type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
-  | "cross_check_pin" | "cross_check_worker_default" | "run_override";
+  | "cross_check_pin" | "cross_check_worker_default" | "run_override" | "user_planning_default";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override" | "user_planning_default";
 type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
@@ -311,8 +311,21 @@ type EffectiveRefusal =
   | "provider_lane_unsupported" | "provider_model_unmapped" | "provider_binding_stale"
   | "provider_destination_not_allowed" | "credential_override_provider_source";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
-type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
-type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+type EffectiveModelSetting = "worker_model" | "planning_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
+type EffectiveEffortSetting = "worker_effort" | "planning_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+
+/** PRD #3252: the lead model and effort of every turn before plan approval, exactly the claim's
+ *  `plan_phase`. Present on a preview only for a Claude run whose owner's Claude planning model or
+ *  effort applies; omitted otherwise. `model` / `effort` are omitted when the plan side ships none
+ *  (it then follows the implement side, the preview's own worker cells). The sources are the claim's
+ *  provenance tokens: `user_planning_default` for a planning value, else the implement value's
+ *  source (`run_override` or `schedule_pin` freeze the model in both phases). */
+export interface EffectivePlanPhase {
+  model?: string;
+  effort?: string;
+  model_source?: EffectiveModelSource;
+  effort_source?: EffectiveEffortSource;
+}
 
 /** PRD #3254: a supplied value that does not apply (a schedule's model pin on the other harness). */
 export interface EffectiveIgnored {
@@ -412,6 +425,8 @@ export interface StartPreviewAlternative {
   /** Present only when the request carried an effort (source run_override). There is no worker_model
    *  here: a request with a model never leaves the harness undecided (D22). */
   worker_effort?: EffortSettingCell;
+  /** PRD #3252: the Claude plan-phase pair; present only when the planning lane applies. */
+  plan_phase?: EffectivePlanPhase;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
@@ -430,6 +445,9 @@ export interface StartPreview {
    *  run_override, effort mode explicit); with an undecided harness each alternative carries its own. */
   worker_model?: ModelSettingCell;
   worker_effort?: EffortSettingCell;
+  /** PRD #3252: the Claude plan-phase pair; present only when the harness is decided as Claude and
+   *  the planning lane applies. */
+  plan_phase?: EffectivePlanPhase;
   alternatives?: StartPreviewAlternative[];
 }
 
@@ -484,6 +502,8 @@ export interface ScheduleAlternative {
   subagents: EffectiveSubagents | null;
   refusal: ScheduleRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
+  /** PRD #3252: the Claude plan-phase pair; omitted unless the planning lane applies. */
+  plan_phase?: EffectivePlanPhase;
 }
 
 /** The schedule-preview response: what firing the schedule now and claiming the run would use.
@@ -502,6 +522,9 @@ export interface ScheduleSettingsPreview {
   subagents: EffectiveSubagents | null;
   notes: string[];
   alternatives?: ScheduleAlternative[];
+  /** PRD #3252: the Claude plan-phase pair of a fire on Claude; omitted unless the planning lane
+   *  applies (carried per alternative when the harness is chosen at creation). */
+  plan_phase?: EffectivePlanPhase;
 }
 
 export interface UserSettings {

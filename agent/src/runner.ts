@@ -26774,7 +26774,8 @@ export class RunRunner {
   /** Issue #3252: one ownership read, classified for the phase-switch hold. `held`, `resumed` and
    *  `live` need a fully populated row at this flight's generation with the claim not released;
    *  `nonlive` is a definitive loss of the claim (404, released, another generation, a cancellation
-   *  request or a terminal status); everything else, a failed read included, is `unknown`. */
+   *  request the input read confirmed, or a terminal status); everything else, a failed read
+   *  included, is `unknown`. */
   private async observePhaseSwitchOwnership(
     flight: RunFlight, signal: AbortSignal, runLog: Logger,
   ): Promise<"held" | "resumed" | "live" | "nonlive" | "unknown"> {
