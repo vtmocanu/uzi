@@ -2,23 +2,27 @@
 
 **Status**: Implemented on branch agent/issue-3252 (2026-11-21); exact-head CI pending
 **Date**: 2026-11-21
-**Related**: Issue #3252; [PRD #3252](../prds/done/3252-claude-planning-model.md) (the Decision Log carries D1-D19); Q-spike #3246 (mechanism evidence); epic #1703; Q-codex #3253 (the Codex half)
+**Related**: Issue #3252; [PRD #3252](../prds/done/3252-claude-planning-model.md) (the Decision Log carries D1-D19); Q-spike #3246 (mechanism evidence); epic #1703; [PRD #3253](../prds/3253-codex-planning-model.md) (Codex integration; evidence record maintained separately)
 
 ## Decision (summary)
 
 A user can set an optional Claude **planning model** and **planning effort**. For Claude lead-lane runs, lead turns before plan approval use that pair; after approval the run switches to its own model and effort in the same session and conversation. Left unset, nothing changes.
 
 - **Switch only at plan approval.** The pair is bound to the executor phase, not to a latch: a re-plan on a later claim uses the planning pair again with no special case (PRD D2).
-- **The pair is fixed per claim.** Both pairs resolve when a worker claims the run and nothing is re-read at approval; a new claim re-resolves (D4). A model or effort chosen at run start or pinned by a schedule wins in both phases (D5).
+- **The pair is fixed per claim.** Both pairs resolve when a worker claims the run and nothing is re-read at approval; a new claim re-resolves (D4). A model chosen at run start or pinned by a schedule, and an effort chosen at run start, independently win in both phases (D5).
 - **Same-conversation evidence (D1).** Q-spike showed that resuming the plan session with another model and effort works on the pinned SDK/CLI: switch, reclaim and switch back all completed with the history intact. This is provider and runtime compatibility evidence. It does not establish that a switch took effect.
 - **Never implement on the planning pair.** An unverifiable switch holds the run; it does not continue on the planning model, fall back to a fresh conversation, or substitute a value (D8, D9).
 - **A settings barrier guards the switch (D18).** Before the first turn after approval the worker withholds the prompt and reads the runtime's applied model and effort (`getSettings`). The prompt is released only on a match with an expectation uzi derives itself.
 
-Not shipped: the Codex half (see "Codex: see Q-codex (#3253)" below), a CLI setter for the two settings, a fresh-conversation fallback, and any real-gateway or subscription-auth validation of the alias table.
+The original Claude decisions below remain in force; the Codex integration is
+recorded in the final section. Not shipped: a CLI setter for planning settings,
+a fresh-conversation phase-switch fallback, and real-gateway or
+subscription-auth validation of the Claude alias table. This ADR does not
+claim completion of exact-head CI, hosted acceptance or the PRD evidence update.
 
 ## Context
 
-Today a run resolves one model and one effort at claim and uses them for every lead turn. A maintainer wants a strong pair to plan and a cheaper one to implement. Changing worker defaults between plan approval and implementation does nothing for a running session, because its claim already carried the old pair.
+Before this feature, a run resolved one model and one effort at claim and used them for every lead turn. A maintainer wants a strong pair to plan and a cheaper one to implement. Changing worker defaults between plan approval and implementation does nothing for a running session, because its claim already carried the old pair.
 
 Two facts shaped the design. First, the SDK init frame arrives only after the prompt is consumed, and aborting on init still let one provider request through, so init cannot be a guard. Second, the pinned CLI answers a `get_settings` control request while the prompt is withheld, and its applied model and effort matched the first wire request in every characterized shape.
 
@@ -78,4 +82,81 @@ Deploy the API before relying on the capability. A worker deployed first against
 
 ## Codex
 
-Codex: see Q-codex (#3253).
+### Settings, scope and precedence (#3253)
+
+Codex adds nullable `planning_codex_model` and `planning_codex_effort` beside
+the Claude pair. Null means **Same as the run**; absent PUT fields are unchanged.
+The cookie-only settings API and the existing Planning card expose both harnesses,
+with one shared **Save planning defaults** action for changed fields. Planning
+effort accepts the five explicit levels, not `runtime`. Safe custom model IDs
+are allowed at worker/planning roots; Claude aliases are rejected in the Codex
+lane. This does not widen run-start, schedule, role, review or summary vocabularies,
+or change the dedicated cross-check pin contract.
+
+The phase pair applies to Codex lead kinds issue, ci_fix, self_improve, prompt,
+mr_rework and task. Review, chat, judge, cross_check, job and egress-bound lanes
+retain their prior behavior. `resolvePlanPhase` in
+`api/internal/workersvc/claim_phase.go` resolves each field independently: a
+frozen run or schedule model wins in both phases, as does a frozen run effort;
+otherwise the planning field overrides the implementation field before approval.
+A later claim resolves its pair again, including a claim that re-plans.
+
+API rollout precedes workers. The claim/placement requirement is
+`codex_phase_models_v1`; a custom effective planning root additionally needs
+`codex_custom_model_v1`. Curated planning and effort-only choices do not need
+the extra custom capability. A curated frozen run model suppresses the custom
+planning-root requirement because that frozen model wins in both phases.
+Incapable workers leave the run queued with the existing phase/custom health
+reason rather than silently dropping a setting.
+
+### Cold same-conversation switch and guard
+
+Approval resumes the plan thread in a cold provider epoch with the intended
+implementation pair. Local replacement construction may precede teardown, but
+old-harness disposal and proof of cleanup precede fresh provider preparation
+and publication (`codex-executor.ts`, approval handoff). The closed harness
+rejects late usage callbacks. The implementation model is latched within an
+epoch: a later request changing it is refused before `turn/start`.
+
+`CodexHarness.verifyPreparedPhaseModel` checks the sanitized canonical
+`thread/resume` response model against the intended implementation model before
+an implementation turn. A mismatch, missing field or unsafe value raises
+`PhaseSwitchUnverifiedError`, using the existing `phase_switch_unavailable`
+hold. Resume starts a new claim and verifies again; Cancel ends the run.
+An unconfirmed phase transition cannot fall back to a fresh thread.
+
+Explicit planning effort with Runtime-default implementation effort is accepted
+in either save order. On pinned Codex 0.167.0 the cold resume reports effort
+present as `null`; implementation sends no level and reporting invents no numeric
+effort. This is the cold mechanism's allowance, not permission for a warm switch
+that may retain an override. The model guard does not establish an independently
+measured numeric effective effort.
+
+### Accounting handoff and failure boundary
+
+The integration reuses #4580's accountant and `beginModelSegment`; it does not
+introduce another billing fold. A claim-shared pending transition survives
+provider replacements. Verification binds to the new harness instance, so a
+replacement must verify for itself before it can consume that transition.
+
+In `CodexHarness.recordUsageNote`, buffered historical replay is recorded into
+the planning segment before the single cut at the first matching root
+`turn_started`. Preparing a thread is not a cut. Completion without a matching
+start is not a cut and leaves the boundary unproved. The old harness's closed
+fence prevents its late notes crossing into implementation. Child threads keep
+their own registrations; each adopted response's `usage_record` carries its
+segment model.
+
+The accountant's seven-column monotone admission preserves proved claim deltas;
+quarantine and `unreported` remain sticky and retain proven tokens. An empty
+segment can rebind under #4580's rules. Reconciliation and pricing use each
+segment's own model and response evidence; see
+[ADR-2555](./2555-run-usage-attribution.md).
+
+A process crash loses the accountant, unflushed frames and pending cut. A later
+claim creates a new accountant registered to its current phase and baselines
+proved replay history. It does not reconstruct missing spend. Delivered frames
+remain idempotent and additive per leg through the existing server fold; neither
+this switch nor its accounting claims fsync durability or storage-crash recovery.
+Runtime-pin compatibility, live/hosted acceptance and exact-head checks need their
+own evidence; this documentation update supplies none.

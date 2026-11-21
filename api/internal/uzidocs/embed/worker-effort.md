@@ -49,10 +49,12 @@ edited Codex preferences.
 
 ## Planning effort
 
-A Claude run can plan at a different effort than it implements. In **Settings →
-Run defaults → Planning**, **Claude planning effort** takes `low`, `medium`,
-`high`, `xhigh` or `max`; its empty option, **Same as the run**, plans at the
-run's own effort. There is no Runtime default choice for planning effort, and
+Claude and Codex runs can plan at a different effort than they implement.
+In **Settings → Run defaults → Planning**, each harness's planning effort
+takes `low`, `medium`, `high`, `xhigh` or `max`; its empty option,
+**Same as the run**, plans at the run's own effort. The shared
+**Save planning defaults** button saves changed fields for both harnesses.
+There is no Runtime default choice for planning effort, and
 the setting is written through `PUT /api/me/settings` (cookie-only) or that
 card; no CLI command sets it. Phases, scope and the planning model are in
 [Worker model](./worker-model.md#planning-model-and-effort).
@@ -60,10 +62,13 @@ card; no CLI command sets it. Phases, scope and the planning model are in
 - **Any combination is allowed.** A planning effort can be set while your
   implementation effort is **Runtime default**. When the run switches to
   implementation, uzi sends no effort and the runtime reverts to its own
-  default for the model; this was observed on the pinned Claude runtime, and
-  the worker verifies the applied effort before it sends the first
-  implementation prompt, holding the run if it differs.
-- **Which defaults apply.** After approval the runtime default is the one
+  default for the model. This combination is accepted in either save order.
+  Claude verifies the applied effort before the first implementation prompt,
+  holding if it differs. Codex uses a cold resume of the same conversation;
+  pinned 0.167.0 reports effort present as `null`. uzi sends no level and
+  invents no numeric effective effort. A warm switch retaining the planning
+  override is outside this allowance.
+- **Claude defaults.** After approval the runtime default is the one
   characterized for the implementation model: `medium` for `opus`, `sonnet`
   and `haiku`, and `high` for `fable`. An unlisted model has no independently
   established default, so that switch holds. The model is the one the runtime
