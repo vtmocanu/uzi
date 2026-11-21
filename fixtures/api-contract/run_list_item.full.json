@@ -308,6 +308,13 @@
     "max": 1,
     "remaining": 1
   },
+  "injected_env": [
+    {
+      "name": "x",
+      "scope": "x",
+      "secret": true
+    }
+  ],
   "id": "x",
   "repo_id": "x",
   "forge_type": "x",

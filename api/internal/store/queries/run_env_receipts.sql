@@ -41,6 +41,19 @@ WHERE rc.run_id = @run_id AND rc.secret
         AND e.disabled_at IS NULL AND e.retired_at IS NULL AND e.pending_delete_at IS NULL)
 ORDER BY rc.var_id, rc.rev;
 
+-- name: ListRunEnvSecretReceiptVersionsForRun :many
+-- Every secret version this run was ever delivered, current or not, with the owner's stored
+-- row (NULL row columns when no row of the run's owner holds it): the maintenance endpoint that
+-- hands a worker everything it must mask for the run. One row per secret receipt.
+SELECT rc.var_id, rc.rev, rc.name, rc.scope,
+       v.id AS row_id, v.ciphertext, v.sealed_with, v.aad_version, v.secret AS row_secret,
+       v.repo_id AS row_repo_id, v.user_id AS row_user_id, v.name AS row_name
+FROM run_env_receipts rc
+JOIN runs r ON r.id = rc.run_id
+LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_id = r.user_id
+WHERE rc.run_id = @run_id AND rc.secret
+ORDER BY rc.var_id, rc.rev;
+
 -- name: ListRunEnvRedactKeysForRun :many
 -- ListRunEnvRedactForRun without the ciphertext: the finish transaction's recompute.
 -- present is false when no row of the owner holds the version.
@@ -82,10 +95,16 @@ JOIN runs r ON r.id = rc.run_id
 WHERE rc.run_id = @run_id AND rc.last_claim_generation = r.claim_generation
 ORDER BY rc.name, rc.var_id, rc.rev;
 
--- name: LockUserVaultStateForShareNowait :one
--- The owner's vault mode and epoch under a share lock that fails at once (55P03) when a
--- vault mode change holds the row, so a claim never waits behind one.
-SELECT vault_mode, vault_epoch FROM users WHERE id = @user_id FOR SHARE NOWAIT;
+-- name: LockUserVaultStateForKeyShareNowait :one
+-- The owner's vault mode and epoch under FOR KEY SHARE NOWAIT: it fails at once (55P03) when
+-- a writer holds the row FOR UPDATE, so a claim never waits behind one, and it does NOT
+-- conflict with a plain UPDATE of a non-key users column (FOR NO KEY UPDATE). That is enough
+-- because every run_env_vars writer takes the users row FOR UPDATE: the variable writes
+-- (handler run_env_vars.go via LockUserVaultState), the vault lifecycle and rewrap
+-- (LockVaultAuthState), the account reset (DeleteAllRunEnvVarsForOwner, inside the vault
+-- lifecycle lock) and a user delete. A future run_env_vars writer must lock the users row
+-- FOR UPDATE, never FOR NO KEY UPDATE, or the claim finisher's recompute would not see it.
+SELECT vault_mode, vault_epoch FROM users WHERE id = @user_id FOR KEY SHARE NOWAIT;
 
 -- PRD #4416: the claim finisher's park for a run whose secret run-env history cannot be
 -- masked completely (a receipted secret version is missing or cannot be opened). It is

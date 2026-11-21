@@ -2190,7 +2190,9 @@ type Service struct {
 	heldCleanupHook func(stage string)
 	// terminal holds the terminal-preservation route's broker seams and fault-injection points
 	// (terminal_preservation.go); its zero value uses the pushbroker functions.
-	terminal           terminalHooks
+	terminal terminalHooks
+	// runEnvSweep is the retired-version sweeper's owner cursor (run_env_sweep.go).
+	runEnvSweep        runEnvSweepState
 	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.

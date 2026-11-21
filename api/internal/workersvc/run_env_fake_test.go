@@ -17,7 +17,7 @@ type fakeRunEnv struct {
 
 	receipts []store.UpsertRunEnvReceiptParams
 	parked   *store.ParkRunEnvHistoryUnavailableRunParams
-	// lockErrs are returned in order by LockUserVaultStateForShareNowait; lockCalls counts calls.
+	// lockErrs are returned in order by LockUserVaultStateForKeyShareNowait; lockCalls counts calls.
 	lockErrs  []error
 	lockCalls int
 }
@@ -30,16 +30,16 @@ func (f *fakeStore) ListRunEnvRedactForRun(context.Context, uuid.UUID) ([]store.
 	return f.runEnv.redact, nil
 }
 
-func (t *fakeClaimFinishTx) LockUserVaultStateForShareNowait(context.Context, uuid.UUID) (store.LockUserVaultStateForShareNowaitRow, error) {
+func (t *fakeClaimFinishTx) LockUserVaultStateForKeyShareNowait(context.Context, uuid.UUID) (store.LockUserVaultStateForKeyShareNowaitRow, error) {
 	t.f.runEnv.lockCalls++
 	if len(t.f.runEnv.lockErrs) > 0 {
 		err := t.f.runEnv.lockErrs[0]
 		t.f.runEnv.lockErrs = t.f.runEnv.lockErrs[1:]
 		if err != nil {
-			return store.LockUserVaultStateForShareNowaitRow{}, err
+			return store.LockUserVaultStateForKeyShareNowaitRow{}, err
 		}
 	}
-	return store.LockUserVaultStateForShareNowaitRow{}, nil
+	return store.LockUserVaultStateForKeyShareNowaitRow{}, nil
 }
 
 func (t *fakeClaimFinishTx) ListRunEnvEffectiveKeysForRun(context.Context, uuid.UUID) ([]store.ListRunEnvEffectiveKeysForRunRow, error) {

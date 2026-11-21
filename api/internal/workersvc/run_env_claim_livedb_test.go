@@ -426,7 +426,7 @@ func TestRunEnvAttachSkipsNonDeliveredShapesLiveDB(t *testing.T) {
 	}
 }
 
-// While the finish holds the owner's users row FOR SHARE, a variable writer's FOR UPDATE fence
+// While the finish holds the owner's users row FOR KEY SHARE, a variable writer's FOR UPDATE fence
 // waits; it proceeds once the claim commits, and the next claim sees its rotation.
 func TestRunEnvFinishHoldsShareLockWriterProceedsAfterLiveDB(t *testing.T) {
 	fx := newREFix(t, true)

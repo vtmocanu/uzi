@@ -1,0 +1,189 @@
+package workersvc
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// Skipped unless UZI_TEST_DATABASE_URL is set; run via ./e2e/run-store-it.sh.
+
+// A plain UPDATE of a non-key users column (a settings write) held across the finish does not
+// conflict with the finish's FOR KEY SHARE lock: the claim delivers, with no 55P03.
+func TestRunEnvFinishIgnoresPlainUsersUpdateLiveDB(t *testing.T) {
+	fx := newREFix(t, true)
+	runID := fx.queuedRun(t, "issue")
+	fx.put(t, "API_KEY", true, envSecretValue("one"))
+	var tx pgx.Tx
+	fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(ctx context.Context, _ store.Run, _ *ClaimPayload, _ error) {
+		var err error
+		if tx, err = fx.env.pool.Begin(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE users SET default_effort='low' WHERE id=$1`, fx.userID); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	p, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
+	if tx != nil {
+		defer func() { _ = tx.Rollback(fx.env.ctx) }()
+	}
+	if err != nil || p == nil || runEnvByName(p)["API_KEY"].Value != envSecretValue("one") {
+		t.Fatalf("claim = (%v, %v) while a plain users UPDATE was held; want the variable delivered", p != nil, err)
+	}
+	if r := mustRun(t, fx.env, runID); r.Status != "claimed" || r.FailOrigin.Valid || r.HoldReason.Valid {
+		t.Fatalf("status=%s fail=%v hold=%v", r.Status, r.FailOrigin, r.HoldReason)
+	}
+}
+
+// insertForeignOwnerRow writes a run_env_vars row of another user on the run's own repo
+// directly, the way a bug or a manual write could.
+func (fx *reFix) insertForeignOwnerRow(t *testing.T, foreign uuid.UUID, name, state string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	fx.env.exec(`INSERT INTO run_env_vars (var_id,user_id,repo_id,name,secret,ciphertext,sealed_with,value_bytes,rev,retired_at)
+	    VALUES ($1,$2,$3,$4,true,$5,'master_aad',10,1,CASE WHEN $6 = 'retired' THEN now() END)`,
+		id, foreign, fx.repoID, name, []byte("0123456789abcdef"), state)
+	return id
+}
+
+// A row of another owner on the run's own repo is never delivered.
+func TestRunEnvForeignOwnerLiveRowIsNotDeliveredLiveDB(t *testing.T) {
+	fx := newREFix(t, true)
+	fx.queuedRun(t, "issue")
+	fx.put(t, "MINE", true, envSecretValue("mine"))
+	fx.insertForeignOwnerRow(t, fx.env.seedUser(t), "FOREIGN_LIVE", "live")
+	p := fx.claim(t)
+	if p == nil {
+		t.Fatal("claim idle")
+	}
+	got := runEnvByName(p)
+	if len(got) != 1 || got["MINE"].Value != envSecretValue("mine") || len(p.Secrets.RunEnvRedact) != 0 {
+		t.Fatalf("delivered %+v redact %+v; want only MINE", got, p.Secrets.RunEnvRedact)
+	}
+}
+
+// A receipt that only a foreign owner's row could satisfy is not redacted from that row: the
+// history is unavailable and the run parks.
+func TestRunEnvForeignOwnerRowDoesNotSatisfyReceiptLiveDB(t *testing.T) {
+	fx := newREFix(t, true)
+	runID := fx.queuedRun(t, "issue")
+	foreignVar := fx.insertForeignOwnerRow(t, fx.env.seedUser(t), "FOREIGN_OLD", "retired")
+	fx.env.exec(`INSERT INTO run_env_receipts (run_id,user_id,var_id,rev,scope,name,secret,first_claim_generation,last_claim_generation)
+	    VALUES ($1,$2,$3,1,'repo','FOREIGN_OLD',true,1,1)`, runID, fx.userID, foreignVar)
+	fx.assertParkedHistoryUnavailable(t, runID, fx.claim(t))
+}
+
+// redactFix is a Run that claimed with a secret and a plain variable, so it holds receipts.
+func redactFix(t *testing.T) (*reFix, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	fx := newREFix(t, true)
+	runID := fx.queuedRun(t, "issue")
+	keyVar := fx.put(t, "API_KEY", true, envSecretValue("one"))
+	fx.put(t, "API_BASE", false, "https://sandbox.example.test")
+	if p := fx.claim(t); p == nil {
+		t.Fatal("claim idle")
+	}
+	return fx, runID, keyVar
+}
+
+// The redact route hands the holding worker every secret version the run was delivered, opened
+// for the run's owner; a plain variable is not part of it.
+func TestRunEnvRedactReturnsEverySecretVersionLiveDB(t *testing.T) {
+	fx, runID, keyVar := redactFix(t)
+	// Rotating after the claim makes rev 1 non-effective; both versions stay receipted or held.
+	fx.rotate(t, "API_KEY", envSecretValue("two"))
+	res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Protected || len(res.Versions) != 1 {
+		t.Fatalf("response = %+v; want protected with the one receipted secret version", res)
+	}
+	v := res.Versions[0]
+	if v.VarID != keyVar.String() || v.Rev != 1 || v.Name != "API_KEY" || v.Scope != "repo" || v.Value != envSecretValue("one") {
+		t.Fatalf("version = %+v", v)
+	}
+}
+
+func TestRunEnvRedactUnprotectedWithoutSecretReceiptsLiveDB(t *testing.T) {
+	fx := newREFix(t, true)
+	runID := fx.queuedRun(t, "issue")
+	fx.put(t, "API_BASE", false, "https://sandbox.example.test")
+	if p := fx.claim(t); p == nil {
+		t.Fatal("claim idle")
+	}
+	res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
+	if err != nil || res.Protected || len(res.Versions) != 0 {
+		t.Fatalf("response = %+v, %v; want {protected:false}", res, err)
+	}
+}
+
+// Only the worker that holds or last held the run, of the run's own user, may read it; anything
+// else, an unknown run or a deleted one included, is not found.
+func TestRunEnvRedactOwnershipLiveDB(t *testing.T) {
+	fx, runID, _ := redactFix(t)
+	wkr := fx.worker(t)
+	otherWorkerOfUser := wkr
+	otherWorkerOfUser.ID = uuid.New()
+	fx.env.exec(`INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')`,
+		otherWorkerOfUser.ID, fx.userID, otherWorkerOfUser.ID.String(), otherWorkerOfUser.ID[:])
+	otherUser := fx.env.seedUser(t)
+	otherUsersWorker := wkr
+	otherUsersWorker.ID, otherUsersWorker.UserID = uuid.New(), otherUser
+	fx.env.exec(`INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')`,
+		otherUsersWorker.ID, otherUser, otherUsersWorker.ID.String(), otherUsersWorker.ID[:])
+
+	for name, tc := range map[string]struct {
+		w   store.Worker
+		run uuid.UUID
+	}{
+		"another worker of the same user": {otherWorkerOfUser, runID},
+		"a worker of another user":        {otherUsersWorker, runID},
+		"the owner's worker, unknown run": {wkr, uuid.New()},
+	} {
+		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, tc.w, tc.run); !errors.Is(err, ErrRunNotOwned) {
+			t.Fatalf("%s: err = %v, want ErrRunNotOwned", name, err)
+		}
+	}
+	// A released claim keeps its worker as affinity: the worker that last held the run reads it.
+	fx.env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, runID)
+	if res, err := fx.svc.RunEnvRedact(fx.env.ctx, wkr, runID); err != nil || !res.Protected {
+		t.Fatalf("last holder: %+v, %v", res, err)
+	}
+	fx.env.exec(`DELETE FROM runs WHERE id = $1`, runID)
+	if _, err := fx.svc.RunEnvRedact(fx.env.ctx, wkr, runID); !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("deleted run: err = %v, want ErrRunNotOwned", err)
+	}
+}
+
+func TestRunEnvRedactRefusesWhenHistoryCannotBeOpenedLiveDB(t *testing.T) {
+	t.Run("missing version", func(t *testing.T) {
+		fx, runID, keyVar := redactFix(t)
+		fx.env.exec(`DELETE FROM run_env_vars WHERE var_id = $1`, keyVar)
+		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvHistoryUnavailable) {
+			t.Fatalf("err = %v, want ErrRunEnvHistoryUnavailable", err)
+		}
+	})
+	t.Run("swapped ciphertext", func(t *testing.T) {
+		fx, runID, keyVar := redactFix(t)
+		other := fx.put(t, "OTHER_KEY", true, envSecretValue("other"))
+		fx.env.exec(`UPDATE run_env_vars d SET ciphertext = s.ciphertext, sealed_with = s.sealed_with
+		    FROM run_env_vars s WHERE d.var_id = $1 AND s.var_id = $2`, keyVar, other)
+		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvHistoryUnavailable) {
+			t.Fatalf("err = %v, want ErrRunEnvHistoryUnavailable", err)
+		}
+	})
+	t.Run("locked vault", func(t *testing.T) {
+		fx, runID, keyVar := redactFix(t)
+		fx.env.exec(`UPDATE run_env_vars SET sealed_with = 'dek' WHERE var_id = $1`, keyVar)
+		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvVaultLocked) {
+			t.Fatalf("err = %v, want ErrRunEnvVaultLocked", err)
+		}
+	})
+}

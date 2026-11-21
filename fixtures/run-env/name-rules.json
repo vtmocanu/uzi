@@ -680,6 +680,11 @@
       "note": "hub CLI configuration and credentials"
     },
     {
+      "value": "DEBUG",
+      "invariant": "harness_control",
+      "note": "debug, telemetry or control switch read by the Node runtime or the Claude CLI"
+    },
+    {
       "value": "DEBUG_SDK",
       "invariant": "harness_control",
       "note": "debug, telemetry or control switch read by the Node runtime or the Claude CLI"
@@ -1147,12 +1152,6 @@
       "harness": "claude",
       "decision": "allowed",
       "reason": "python uv package index used by builds; no effect on the CLI"
-    },
-    {
-      "name": "DEBUG",
-      "harness": "claude",
-      "decision": "allowed",
-      "reason": "application debug switch; Claude CLI debug output stays local"
     },
     {
       "name": "TZ",

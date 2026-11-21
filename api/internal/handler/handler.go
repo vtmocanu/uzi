@@ -159,6 +159,7 @@ type Handler struct {
 	wsvc                 *workersvc.Service
 	heldSvc              heldPublisher     // test seam for WorkerRunHeldPublication; nil = wsvc
 	terminalSvc          terminalPublisher // test seam for WorkerRunTerminalPreservation; nil = wsvc
+	runEnvRedactSvc      runEnvRedactor    // test seam for WorkerRunEnvRedact; nil = wsvc
 	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
 	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
 	catalogDefaults codexCatalogReader
@@ -1028,7 +1029,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountAdminRoutes(r, forgeLimiter, authLimiter)
 		h.mountForgeRoutes(r, forgeLimiter)
 		h.mountIssueTrackerRoutes(r, forgeLimiter)
-		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
+		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter, authLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
 		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
 		// only) and a per-user limit; read mountV1Routes before adding anything here.
@@ -1419,6 +1420,11 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// the route refuses unsupported, with no write, for a worker without
 		// recovery_terminal_preservation_v1.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/terminal-preservation", h.WorkerRunTerminalPreservation)
+
+		// Run environment redact maintenance (PRD #4416 M2): the secret versions a run was ever
+		// delivered, opened for its owner, so the worker that holds or last held the run can mask
+		// its output. The answer carries plaintext secrets and is never cacheable.
+		r.With(h.refuseJobRuns).Get("/runs/{id}/run-env-redact", h.WorkerRunEnvRedact)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences
