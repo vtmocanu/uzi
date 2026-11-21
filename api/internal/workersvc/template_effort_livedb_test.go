@@ -259,8 +259,10 @@ func TestTemplateEffortLeadSelectionParityLiveDB(t *testing.T) {
 			if got := derefOr(lead.Effort, ""); got != want || lead.EffortSource != "template" {
 				t.Errorf("predicted effort = %q (%s), want %q (template)", got, lead.EffortSource, want)
 			}
-			if got := agentEfforts(p)["orchestrator"]; got != want {
-				t.Errorf("delivered orchestrator effort = %q, want %q", got, want)
+			// The lead-shaped orchestrator's effort travels only via default_effort (N3), never as an
+			// agent pin that would bypass the owner's preference.
+			if got, ok := agentEfforts(p)["orchestrator"]; ok {
+				t.Errorf("delivered orchestrator carries agent effort %q, want none", got)
 			}
 		})
 	}
