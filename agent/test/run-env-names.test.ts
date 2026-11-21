@@ -88,6 +88,8 @@ describe("runEnvNameViolation", () => {
     "AWS_REGION",
     "NPM_TOKEN",
     "GRADLE_OPTS",
+    "ANT_OPTS",
+    "ANT_HOME",
     "NPM_CONFIG_REGISTRY",
     "PIP_INDEX_URL",
     "MAVEN_OPTS",
@@ -104,9 +106,24 @@ describe("runEnvNameViolation", () => {
     "_LEADING_UNDERSCORE",
     "A",
     "A".repeat(128),
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "ENABLE_FEATURE_X",
   ]) {
     it(`allows ${name.length > 20 ? `${name.length}-char name` : name}`, () => {
       assert.equal(runEnvNameViolation(name), null);
+    });
+  }
+
+  for (const name of [
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    "ANT_OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_LOG_USER_PROMPTS",
+    "LC_ALL",
+    "LC_CTYPE",
+  ]) {
+    it(`denies registry name ${name}`, () => {
+      assert.notEqual(runEnvNameViolation(name), null);
     });
   }
 

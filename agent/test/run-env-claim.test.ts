@@ -5,6 +5,7 @@ import {
   RUN_ENV_CAPABILITY,
   RUN_ENV_MAX_DESCRIPTION_BYTES,
   RUN_ENV_MAX_REDACT_ENTRIES,
+  RUN_ENV_MAX_REV,
   RUN_ENV_MAX_REDACT_TOTAL_BYTES,
   RUN_ENV_MAX_TOTAL_VALUE_BYTES,
   RUN_ENV_MAX_VALUE_BYTES,
@@ -12,6 +13,7 @@ import {
   decodeRunEnvClaim,
   decodeRunEnvRedactResponse,
 } from "../src/run-env-claim.js";
+import { MIN_SECRET_LEN } from "../src/redact.js";
 
 const read = (name: string): unknown =>
   JSON.parse(fs.readFileSync(new URL(`../../fixtures/claims/${name}`, import.meta.url), "utf8"));
@@ -20,12 +22,30 @@ const redactFixture = read("run-env-redact-response.json") as { protected: boole
 
 const UUID = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 const plain = (n: number, value = "v"): Record<string, unknown> => ({
-  var_id: UUID(n), scope: "repo", rev: 1, name: "NAME", value, secret: false, description: "",
+  var_id: UUID(n), scope: "repo", rev: 1, name: `NAME_${n}`, value, secret: false, description: "",
 });
 const redact = (n: number, value: string): Record<string, unknown> => ({
   var_id: UUID(n), scope: "user", rev: 1, name: "NAME", value,
 });
 const decode = (run_env: unknown, run_env_redact?: unknown) => decodeRunEnvClaim({ run_env, run_env_redact });
+
+const limits = JSON.parse(fs.readFileSync(new URL("../../fixtures/run-env/claim-limits.json", import.meta.url), "utf8")) as Record<string, number>;
+
+describe("run-env claim limits equal the shared fixture", () => {
+  it("constants match fixtures/run-env/claim-limits.json (the api side is pinned to it against its store limits)", () => {
+    assert.equal(RUN_ENV_MAX_VARS, limits.max_run_env_entries);
+    assert.equal(RUN_ENV_MAX_VALUE_BYTES, limits.max_value_bytes);
+    assert.equal(RUN_ENV_MAX_TOTAL_VALUE_BYTES, limits.max_run_env_total_bytes);
+    assert.equal(RUN_ENV_MAX_REDACT_ENTRIES, limits.max_redact_entries);
+    assert.equal(RUN_ENV_MAX_REDACT_TOTAL_BYTES, limits.max_redact_total_bytes);
+    assert.equal(MIN_SECRET_LEN, limits.min_secret_len);
+  });
+
+  it("a claim with more redact entries than the retired budget alone still decodes", () => {
+    // 201 legal entries: 200 retired versions plus a disabled secret, as the api can send.
+    assert.doesNotThrow(() => decode([], Array.from({ length: 201 }, (_, i) => redact(i + 1, "longenough"))));
+  });
+});
 
 describe("run-env claim fixtures", () => {
   it("capability name", () => assert.equal(RUN_ENV_CAPABILITY, "run_env_v1"));
@@ -71,12 +91,12 @@ describe("run-env claim limits fail closed", () => {
   it("more than the redact entry cap", () => {
     const mk = (count: number) => Array.from({ length: count }, (_, i) => redact(i + 1, "longenough"));
     assert.doesNotThrow(() => decode([], mk(RUN_ENV_MAX_REDACT_ENTRIES)));
-    assert.throws(() => decode([], mk(RUN_ENV_MAX_REDACT_ENTRIES + 1)), /run_env_redact: at most 200/);
+    assert.throws(() => decode([], mk(RUN_ENV_MAX_REDACT_ENTRIES + 1)), new RegExp(`run_env_redact: at most ${RUN_ENV_MAX_REDACT_ENTRIES}`));
   });
 
   it("total redact value bytes over the cap", () => {
     const per = RUN_ENV_MAX_VALUE_BYTES;
-    const n = RUN_ENV_MAX_REDACT_TOTAL_BYTES / per; // 32 full-size values
+    const n = RUN_ENV_MAX_REDACT_TOTAL_BYTES / per; // 40 full-size values
     const full = Array.from({ length: n }, (_, i) => redact(i + 1, "a".repeat(per)));
     assert.doesNotThrow(() => decode([], full));
     assert.throws(() => decode([], [...full, redact(n + 1, "longenough")]), /values total/);
@@ -105,6 +125,20 @@ describe("run-env claim limits fail closed", () => {
     }
   });
 
+  it("rev above the api's int32 range", () => {
+    assert.doesNotThrow(() => decode([{ ...plain(1), rev: RUN_ENV_MAX_REV }]));
+    assert.throws(() => decode([{ ...plain(1), rev: RUN_ENV_MAX_REV + 1 }]), /rev: must be a positive integer/);
+    assert.throws(() => decode([], [{ ...redact(1, "longenough"), rev: RUN_ENV_MAX_REV + 1 }]), /rev: must be a positive integer/);
+  });
+
+  it("lone surrogates in a value or description", () => {
+    assert.throws(() => decode([plain(1, "a\ud800b")]), /value: must be valid Unicode/);
+    assert.throws(() => decode([plain(1, "a\udc00")]), /value: must be valid Unicode/);
+    assert.throws(() => decode([], [redact(1, "longenough\ud800")]), /value: must be valid Unicode/);
+    assert.throws(() => decode([{ ...plain(1), description: "x\ud800" }]), /description: must be valid Unicode/);
+    assert.doesNotThrow(() => decode([plain(1, "pair \ud83d\ude00")]));
+  });
+
   it("var_id that is not a UUID", () => {
     assert.throws(() => decode([{ ...plain(1), var_id: "not-a-uuid" }]), /var_id: must be a UUID/);
   });
@@ -123,7 +157,21 @@ describe("run-env claim limits fail closed", () => {
   it("duplicate (var_id, rev)", () => {
     assert.throws(() => decode([plain(1), plain(1)]), /duplicate/);
     assert.throws(() => decode([], [redact(1, "longenough"), redact(1, "otherlonger")]), /duplicate/);
-    assert.doesNotThrow(() => decode([plain(1), { ...plain(1), rev: 2 }]));
+    // two versions of one variable may be in run_env_redact, never twice in run_env.
+    assert.doesNotThrow(() => decode([], [redact(1, "longenough"), { ...redact(1, "otherlonger"), rev: 2 }]));
+  });
+
+  it("duplicate variable names in run_env", () => {
+    assert.throws(() => decode([plain(1), { ...plain(2), name: "NAME_1" }]), /run_env\[1\]\.name: duplicate name/);
+    assert.doesNotThrow(() => decode([plain(1), { ...plain(2), name: "OTHER" }]));
+    // redact entries are versions, not variables: a name may repeat there.
+    assert.doesNotThrow(() => decode([], [redact(1, "longenough"), redact(2, "otherlonger")]));
+  });
+
+  it("a (var_id, rev) in both run_env and run_env_redact", () => {
+    const secret = { ...plain(1, "longenough"), secret: true };
+    assert.throws(() => decode([secret], [redact(1, "longenough")].map((r) => ({ ...r, scope: "repo" }))), /run_env_redact\[0\]: .*already in run_env/);
+    assert.doesNotThrow(() => decode([secret], [{ ...redact(1, "olderversion"), scope: "repo", rev: 2 }]));
   });
 
   it("exact field types", () => {

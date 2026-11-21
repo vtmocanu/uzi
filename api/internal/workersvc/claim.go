@@ -562,8 +562,10 @@ type ClaimSecrets struct {
 	// `run_env` key, so its JSON is byte-identical to today's wire. Only a worker advertising
 	// run_env_v1 is sent it. Secret values are plaintext here: never logged, never persisted.
 	RunEnv []ClaimRunEnvVar `json:"run_env,omitempty"`
-	// RunEnvRedact are the secret values (every version still reachable by this run) the worker
-	// registers with its redactor; same omitempty and never-logged, never-persisted rules as RunEnv.
+	// RunEnvRedact are the secret versions this run holds a receipt for that are not in RunEnv
+	// (older versions of a rotated secret, disabled secrets, secrets pending deletion): the worker
+	// registers their values with its redactor. A (var_id, rev) is never in both lists. Same
+	// omitempty and never-logged, never-persisted rules as RunEnv.
 	RunEnvRedact []ClaimRunEnvRedact `json:"run_env_redact,omitempty"`
 }
 

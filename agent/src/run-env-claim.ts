@@ -10,12 +10,25 @@ import { MIN_SECRET_LEN } from "./redact.js";
 /** The protocol capability a worker advertises to be sent run_env and run_env_redact. */
 export const RUN_ENV_CAPABILITY = "run_env_v1";
 
+// Decoder bounds. Each is derived from the store limits in api/internal/runenv/values.go and pinned to
+// them through fixtures/run-env/claim-limits.json (api/internal/runenv/claim_limits_test.go and
+// test/run-env-claim.test.ts), so a legal claim is never rejected.
+//
+// run_env carries one scope in M2 (repo): at most MaxVarsPerScope variables and MaxScopeValueBytes of
+// values. M4 adds the user scope and widens this bound to two scopes.
 export const RUN_ENV_MAX_VARS = 50;
 export const RUN_ENV_MAX_VALUE_BYTES = 65536;
 export const RUN_ENV_MAX_TOTAL_VALUE_BYTES = 262144;
-export const RUN_ENV_MAX_REDACT_ENTRIES = 200;
-export const RUN_ENV_MAX_REDACT_TOTAL_BYTES = 2097152;
+// run_env_redact is every secret version this run may still print: the retired-version budget
+// (MaxRetiredVersions = 200 versions, MaxRetiredValueBytes = 2097152 bytes) plus the disabled and
+// pending-deletion secrets that are not in run_env, which count against the per-scope limits
+// (MaxVarsPerScope = 50 variables, MaxScopeValueBytes = 262144 bytes). The factor 2 covers the repo and
+// the user scope (M4), so 200 + 2 * 50 = 300 entries and 2097152 + 2 * 262144 = 2621440 bytes.
+export const RUN_ENV_MAX_REDACT_ENTRIES = 300;
+export const RUN_ENV_MAX_REDACT_TOTAL_BYTES = 2621440;
 export const RUN_ENV_MAX_DESCRIPTION_BYTES = 1024;
+/** Largest revision the api stores (int32). */
+export const RUN_ENV_MAX_REV = 2147483647;
 
 const NAME_RE = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -36,6 +49,9 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+// A lone surrogate cannot be encoded as UTF-8, so it never round-trips through the environment.
+const LONE_SURROGATE_RE = /\p{Cs}/u;
+
 function bytes(s: string): number {
   return Buffer.byteLength(s, "utf8");
 }
@@ -43,6 +59,7 @@ function bytes(s: string): number {
 function str(rec: Record<string, unknown>, key: string, path: string): string {
   const v = rec[key];
   if (typeof v !== "string") fail(`${path}.${key}`, "must be a string");
+  if (LONE_SURROGATE_RE.test(v)) fail(`${path}.${key}`, "must be valid Unicode (no lone surrogates)");
   return v;
 }
 
@@ -58,7 +75,9 @@ function decodeCommon(
   const scope = str(raw, "scope", path);
   if (scope !== "repo" && scope !== "user") fail(`${path}.scope`, "must be repo or user");
   const rev = raw.rev;
-  if (typeof rev !== "number" || !Number.isSafeInteger(rev) || rev < 1) fail(`${path}.rev`, "must be a positive integer");
+  if (typeof rev !== "number" || !Number.isSafeInteger(rev) || rev < 1 || rev > RUN_ENV_MAX_REV) {
+    fail(`${path}.rev`, `must be a positive integer of at most ${RUN_ENV_MAX_REV}`);
+  }
   const name = str(raw, "name", path);
   if (!NAME_RE.test(name)) fail(`${path}.name`, "must match ^[A-Z_][A-Z0-9_]{0,127}$");
   const value = str(raw, "value", path);
@@ -100,6 +119,7 @@ export function decodeRunEnvClaim(raw: unknown): { runEnv: ClaimRunEnvVar[]; run
   if (!isRecord(raw)) fail("secrets", "must be an object");
   const entries = list(raw.run_env, "run_env", RUN_ENV_MAX_VARS);
   const seen = new Set<string>();
+  const names = new Set<string>();
   let total = 0;
   const runEnv: ClaimRunEnvVar[] = [];
   entries.forEach((e, i) => {
@@ -112,13 +132,20 @@ export function decodeRunEnvClaim(raw: unknown): { runEnv: ClaimRunEnvVar[]; run
     const id = `${var_id}#${rev}`;
     if (seen.has(id)) fail(path, "duplicate (var_id, rev)");
     seen.add(id);
+    if (names.has(name)) fail(`${path}.name`, "duplicate name");
+    names.add(name);
     const b = bytes(value);
     if (b > RUN_ENV_MAX_VALUE_BYTES) fail(`${path}.value`, `at most ${RUN_ENV_MAX_VALUE_BYTES} bytes`);
     total += b;
     if (total > RUN_ENV_MAX_TOTAL_VALUE_BYTES) fail("run_env", `values total at most ${RUN_ENV_MAX_TOTAL_VALUE_BYTES} bytes`);
     runEnv.push({ var_id, scope, rev, name, value, secret: e.secret, description });
   });
-  return { runEnv, runEnvRedact: decodeRedactList(raw.run_env_redact, "run_env_redact") };
+  const runEnvRedact = decodeRedactList(raw.run_env_redact, "run_env_redact");
+  // run_env_redact holds the versions that are not in run_env; a version in both is a contract break.
+  runEnvRedact.forEach((r, i) => {
+    if (seen.has(`${r.var_id}#${r.rev}`)) fail(`run_env_redact[${i}]`, "(var_id, rev) is already in run_env");
+  });
+  return { runEnv, runEnvRedact };
 }
 
 /** Decodes the body of the run-env redact maintenance endpoint. protected:false must carry no
