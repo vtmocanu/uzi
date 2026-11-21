@@ -44,8 +44,9 @@ package store_test
 // measurement. The throwaway role is a superuser.
 //
 // Design (see the ADR this feeds for the interpretation):
-//   - One api-style pool per candidate (MaxConns 1), built from pgxpool.ParseConfig with the
-//     candidate's StatementCacheCapacity / MaxConnLifetime / jitter set directly, plus an
+//   - One api-style pool per candidate (MaxConns 1), built from pgxpool.ParseConfig (not
+//     OpenPool, so candidate A is raw pgx defaults; since #4591 the api's OpenPool default
+//     corresponds to candidate B128) with the candidate's StatementCacheCapacity / MaxConnLifetime / jitter set directly, plus an
 //     AfterConnect hook and pgx QueryTracer that record the backend PID, connect time,
 //     executions served and the distinct statement texts executed successfully per PID.
 //   - Primary workload, default plan_cache_mode=auto, through the real sqlc methods: a hot

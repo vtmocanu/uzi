@@ -29,10 +29,12 @@ func WithMaxConns(n int32) PoolOption {
 
 // defaultStatementCacheCapacity caps pgx's per-connection cache of server-side prepared
 // statements (pgx's own default is 512). Each cached statement holds its plan state in the
-// backend; ADR-4591 measured about 154 KiB of backend memory contexts per cached statement,
-// and with JIT off a 128 cap cut steady backend heap by 16.7% (68.6 to 57.1 MiB) with flat
-// ClaimRun / InsertRunMessage latency. 32 thrashed the hot paths. An explicit
-// statement_cache_capacity in DATABASE_URL overrides it.
+// backend; ADR-4591 measured about 154 KiB of backend memory contexts (about 62 KiB of
+// resident anonymous memory) per cached statement. In that harness, with JIT off, a 128 cap
+// cut steady backend heap by 16.7% (68.6 to 57.1 MiB) with flat ClaimRun / InsertRunMessage
+// latency; with the server's default JIT on, re-planning loaded LLVM and the measured saving
+// was 3.8%. 32 thrashed the hot paths. These are harness figures, not a production promise.
+// An explicit statement_cache_capacity in DATABASE_URL overrides it.
 const defaultStatementCacheCapacity = 128
 
 // poolConfig parses dsn into the pool config OpenPool uses, applies the pool defaults the
