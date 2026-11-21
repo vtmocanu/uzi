@@ -34312,6 +34312,8 @@ describe("M2 actualRunner credential replacement", () => {
         // The I4 follow-on flight is owned here so the outer cleanup joins it (bounded) before mocks are restored and
         // the fixture directory is removed.
         let followingFlight: Promise<unknown> | undefined;
+        // Set when the test body throws: a follow-on join failure must not replace that body error in cleanup.
+        let bodyFailed = false;
         const joinExecution = async () => {
           const settled = await Promise.allSettled([running, ...triggers]);
           // A follow-on join failure never hides the primary join failure, and never skips the bounded join.
@@ -34322,7 +34324,7 @@ describe("M2 actualRunner credential replacement", () => {
           for (const result of settled) {
             if (result.status === "rejected") throw result.reason;
           }
-          if (followJoin) throw followJoin.error;
+          if (followJoin && !bodyFailed) throw followJoin.error;
         };
         try {
           await withTimeout(aEntered.promise, 5000, "M2 A turn");
@@ -36134,7 +36136,7 @@ describe("M2 actualRunner credential replacement", () => {
               if (followStopError !== undefined) throw followStopError;
             }
           }
-        } finally {
+        } catch (error) { bodyFailed = true; throw error; } finally {
           try {
             followOnCancelRequested = true;
             planRelease.resolve(); planGateRelease.resolve(); bPlanSettled.resolve();
