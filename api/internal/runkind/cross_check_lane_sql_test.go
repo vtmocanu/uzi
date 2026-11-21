@@ -9,8 +9,9 @@ import (
 
 // Every non-chat predicate site has a disposition. Load predicates must use the
 // per-claim marker; excluding every child would lose legacy run-slot accounting.
-// The three *RunOutcomes queries left this inventory in #4209: they use fn_usage_primary_kind
-// (see usage_primary_kind_sql_test.go) instead of a hand-written non-chat list.
+// The three *RunOutcomes queries are outside this literal-predicate inventory: their non-chat
+// predicate lives in fn_outcome_kind (#4577) and deliberately includes cross_check lane
+// children (see usage_primary_kind_sql_test.go).
 func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 	type disposition struct {
 		file, name string

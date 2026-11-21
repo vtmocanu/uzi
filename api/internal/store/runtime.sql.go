@@ -78,7 +78,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND fn_usage_primary_kind(kind)
+      AND fn_outcome_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -88,7 +88,7 @@ SELECT
     COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_user_id,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
+       WHERE r3.status = 'completed' AND fn_outcome_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -125,18 +125,18 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
-  AND fn_usage_primary_kind(kind)
+  AND fn_outcome_kind(kind)
 `
 
 type AdminRunOutcomesRow struct {
@@ -202,7 +202,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND fn_usage_primary_kind(kind)
+      AND fn_outcome_kind(kind)
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
 SELECT u.id AS user_id, u.email,
@@ -211,7 +211,7 @@ SELECT u.id AS user_id, u.email,
     COALESCE((SELECT f.origin FROM last_failure f WHERE f.user_id = u.id), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = u.id AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind) AND f.user_id = u.id
+       WHERE r3.user_id = u.id AND r3.status = 'completed' AND fn_outcome_kind(r3.kind) AND f.user_id = u.id
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS finished,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
@@ -251,19 +251,19 @@ SELECT u.id AS user_id, u.email,
               FROM runs r2
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
-  AND fn_usage_primary_kind(r.kind)
+  AND fn_outcome_kind(r.kind)
 GROUP BY u.id, u.email
 ORDER BY u.id
 `
@@ -26288,7 +26288,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE user_id = $1 AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND fn_usage_primary_kind(kind)
+      AND fn_outcome_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -26297,7 +26297,7 @@ SELECT
     COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = $1 AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
+       WHERE r3.user_id = $1 AND r3.status = 'completed' AND fn_outcome_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -26342,20 +26342,20 @@ SELECT
               FROM runs r2
               WHERE r2.user_id = $1
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = $1
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE runs.user_id = $1
   AND status IN ('completed', 'failed', 'cancelled')
-  AND fn_usage_primary_kind(kind)
+  AND fn_outcome_kind(kind)
 `
 
 type SelfRunOutcomesParams struct {
@@ -26390,11 +26390,13 @@ type SelfRunOutcomesRow struct {
 // These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
 // provisioning / credential lookup / guardrail has no usage row, so a rate computed
 // over the usage join would systematically hide the infra failures this number exists
-// to surface. Issue #4209: outcomes count terminal PRIMARY work runs only, the population
-// fn_usage_primary_kind defines (issue, task, prompt, job, self_improve), over terminal
-// runs only (status IN ('completed','failed','cancelled')). Helper runs (chat, judge,
-// cross_check, mr_rework, ci_fix, manual and automatic alike) are not factory run outcomes.
-// This no longer mirrors the Runs page: ListRunsForUser still lists mr_rework and ci_fix.
+// to surface. Issue #4577 (revising #4209 for outcomes): outcomes count every terminal run
+// kind except chat (fn_outcome_kind: issue, task, prompt, job, self_improve, mr_rework,
+// ci_fix, cross_check, judge), over terminal runs only (status IN ('completed','failed',
+// 'cancelled')). Numerator and denominator are the same population; membership is by
+// runs.status only (cross-check metadata never moves a run between buckets); one row per
+// run, no dedup against a parent run. The usage run_count stays primary-only
+// (fn_usage_primary_kind).
 // Windowed on created_at (D3), the same
 // axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 // same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
