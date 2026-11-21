@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,6 +78,9 @@ func TestOnceFireSummaryBlocksAdmissionUntilCommitLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	reached, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHook := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHook)
 	f.svc.onceFireSummaryAfterReadHook = func() { close(reached); <-release }
 	var seen []int64
 	sumErr := make(chan error, 1)
@@ -98,7 +102,7 @@ func TestOnceFireSummaryBlocksAdmissionUntilCommitLiveDB(t *testing.T) {
 	if _, rows := f.ledgerRows(t); rows != 1 {
 		t.Fatalf("ledger rows while the summary holds the lock = %d, want 1 (the admission must wait)", rows)
 	}
-	close(release)
+	releaseHook()
 	if err := <-sumErr; err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +167,9 @@ func testOnceFireSummaryWaitsForCommittingAdmission(t *testing.T, repeatableRead
 		t.Fatal(err)
 	}
 	reached, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHook := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHook)
 	f.svc.createBeforeCommitHook = func(store.Run) { close(reached); <-release }
 	admitErr := make(chan error, 1)
 	go func() {
@@ -185,7 +192,7 @@ func testOnceFireSummaryWaitsForCommittingAdmission(t *testing.T, repeatableRead
 		sumErr <- err
 	}()
 	waitBlocked(t, f.env, summaryLockWait)
-	close(release)
+	releaseHook()
 	if err := <-admitErr; err != nil {
 		t.Fatal(err)
 	}

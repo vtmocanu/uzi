@@ -2,8 +2,10 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -584,6 +586,23 @@ func TestOnceFireQueriesLiveDB(t *testing.T) {
 		t.Fatalf("exists(97) in another epoch = %v %v", ok, err)
 	}
 
+	// Seed history so a partial write must preserve content, not just an empty array.
+	previous := map[string]any{"matched": float64(1), "tag": "previous"}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE run_schedules SET recent_fires=$2::jsonb WHERE id=$1`, l.sched.ID, `[{"matched":1,"tag":"previous"}]`); err != nil {
+		t.Fatal(err)
+	}
+	readHistory := func() (store.RunSchedule, []map[string]any) {
+		t.Helper()
+		got, err := f.q.GetRunSchedule(f.ctx, l.sched.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var history []map[string]any
+		if err := json.Unmarshal(got.RecentFires, &history); err != nil {
+			t.Fatalf("decode recent_fires: %v", err)
+		}
+		return got, history
+	}
 	// Guarded writers write nothing for a stale epoch or a non-active row.
 	stale := store.RecordOnceFirePartialParams{ID: l.sched.ID, FireEpoch: 7, LastFire: []byte(`{"matched":1}`)}
 	if n, err := f.q.RecordOnceFirePartial(f.ctx, stale); err != nil || n != 0 {
@@ -592,8 +611,8 @@ func TestOnceFireQueriesLiveDB(t *testing.T) {
 	if n, err := f.q.RecordOnceFirePartial(f.ctx, store.RecordOnceFirePartialParams{ID: l.sched.ID, FireEpoch: 0, LastFire: []byte(`{"matched":3}`)}); err != nil || n != 1 {
 		t.Fatalf("partial wrote %d rows (%v)", n, err)
 	}
-	if got, _ := f.q.GetRunSchedule(f.ctx, l.sched.ID); len(got.RecentFires) > 2 {
-		t.Fatalf("the partial write must never touch recent_fires, got %s", got.RecentFires)
+	if _, history := readHistory(); !reflect.DeepEqual(history, []map[string]any{previous}) {
+		t.Fatalf("the partial write must preserve recent_fires, got %+v", history)
 	}
 	adv := store.AdvanceOnceScheduleGuardedParams{ID: l.sched.ID, FireEpoch: 7, Status: "fired", LastFire: []byte(`{"matched":3}`), LastFiredAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
 	if n, err := f.q.AdvanceOnceScheduleGuarded(f.ctx, adv); err != nil || n != 0 {
@@ -603,28 +622,28 @@ func TestOnceFireQueriesLiveDB(t *testing.T) {
 	if n, err := f.q.AdvanceOnceScheduleGuarded(f.ctx, adv); err != nil || n != 1 {
 		t.Fatalf("advance wrote %d rows (%v)", n, err)
 	}
-	if got, _ := f.q.GetRunSchedule(f.ctx, l.sched.ID); got.Status != "fired" || len(got.RecentFires) < 3 {
-		t.Fatalf("advance must set status fired and prepend recent_fires (matched>0): %q %s", got.Status, got.RecentFires)
+	if got, history := readHistory(); got.Status != "fired" || !reflect.DeepEqual(history, []map[string]any{{"matched": float64(3)}, previous}) {
+		t.Fatalf("advance must set status fired and prepend exactly once: %q %+v", got.Status, history)
 	}
 	// Once fired, a second advance, a partial and a park all match nothing.
-	if n, _ := f.q.AdvanceOnceScheduleGuarded(f.ctx, adv); n != 0 {
-		t.Fatalf("advance on a fired row wrote %d rows", n)
+	if n, err := f.q.AdvanceOnceScheduleGuarded(f.ctx, adv); err != nil || n != 0 {
+		t.Fatalf("advance on a fired row wrote %d rows (%v)", n, err)
 	}
-	if n, _ := f.q.RecordOnceFirePartial(f.ctx, store.RecordOnceFirePartialParams{ID: l.sched.ID, FireEpoch: 0, LastFire: []byte(`{}`)}); n != 0 {
-		t.Fatalf("partial on a fired row wrote %d rows", n)
+	if n, err := f.q.RecordOnceFirePartial(f.ctx, store.RecordOnceFirePartialParams{ID: l.sched.ID, FireEpoch: 0, LastFire: []byte(`{}`)}); err != nil || n != 0 {
+		t.Fatalf("partial on a fired row wrote %d rows (%v)", n, err)
 	}
-	if n, _ := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: l.sched.ID, FireEpoch: 0}); n != 0 {
-		t.Fatalf("park on a fired row wrote %d rows", n)
+	if n, err := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: l.sched.ID, FireEpoch: 0}); err != nil || n != 0 {
+		t.Fatalf("park on a fired row wrote %d rows (%v)", n, err)
 	}
 
 	// Park: stale epoch writes nothing, the claimed one parks (any timing).
 	for _, mk := range []func(*testing.T, string) store.RunSchedule{f.onceSweep, f.recurringSweep} {
 		s := mk(t, "active")
-		if n, _ := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: s.ID, FireEpoch: 3}); n != 0 {
-			t.Fatalf("park with a stale epoch wrote %d rows", n)
+		if n, err := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: s.ID, FireEpoch: 3}); err != nil || n != 0 {
+			t.Fatalf("park with a stale epoch wrote %d rows (%v)", n, err)
 		}
-		if n, _ := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: s.ID, FireEpoch: 0}); n != 1 {
-			t.Fatalf("park wrote %d rows", n)
+		if n, err := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: s.ID, FireEpoch: 0}); err != nil || n != 1 {
+			t.Fatalf("park wrote %d rows (%v)", n, err)
 		}
 	}
 
@@ -632,21 +651,21 @@ func TestOnceFireQueriesLiveDB(t *testing.T) {
 	rec := f.recurringSweep(t, "active")
 	radv := store.AdvanceScheduleGuardedParams{ID: rec.ID, FireEpoch: 4, Status: "active", LastFire: []byte(`{"matched":0}`),
 		LastFiredAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, NextFireAt: futureTS()}
-	if n, _ := f.q.AdvanceScheduleGuarded(f.ctx, radv); n != 0 {
-		t.Fatalf("recurring advance with a stale epoch wrote %d rows", n)
+	if n, err := f.q.AdvanceScheduleGuarded(f.ctx, radv); err != nil || n != 0 {
+		t.Fatalf("recurring advance with a stale epoch wrote %d rows (%v)", n, err)
 	}
 	radv.FireEpoch = 0
-	if n, _ := f.q.AdvanceScheduleGuarded(f.ctx, radv); n != 1 {
-		t.Fatalf("recurring advance wrote %d rows", n)
+	if n, err := f.q.AdvanceScheduleGuarded(f.ctx, radv); err != nil || n != 1 {
+		t.Fatalf("recurring advance wrote %d rows (%v)", n, err)
 	}
 
 	// RecordScheduleHeldFire now carries the epoch guard.
 	hold := f.onceSweep(t, "active")
-	if n, _ := f.q.RecordScheduleHeldFire(f.ctx, store.RecordScheduleHeldFireParams{ID: hold.ID, LastFire: []byte(`{"matched":0}`), FireEpoch: 2}); n != 0 {
-		t.Fatalf("held write with a stale epoch wrote %d rows", n)
+	if n, err := f.q.RecordScheduleHeldFire(f.ctx, store.RecordScheduleHeldFireParams{ID: hold.ID, LastFire: []byte(`{"matched":0}`), FireEpoch: 2}); err != nil || n != 0 {
+		t.Fatalf("held write with a stale epoch wrote %d rows (%v)", n, err)
 	}
-	if n, _ := f.q.RecordScheduleHeldFire(f.ctx, store.RecordScheduleHeldFireParams{ID: hold.ID, LastFire: []byte(`{"matched":0}`), FireEpoch: 0}); n != 1 {
-		t.Fatalf("held write wrote %d rows", n)
+	if n, err := f.q.RecordScheduleHeldFire(f.ctx, store.RecordScheduleHeldFireParams{ID: hold.ID, LastFire: []byte(`{"matched":0}`), FireEpoch: 0}); err != nil || n != 1 {
+		t.Fatalf("held write wrote %d rows (%v)", n, err)
 	}
 }
 

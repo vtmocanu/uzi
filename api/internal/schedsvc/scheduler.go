@@ -121,8 +121,9 @@ type Store interface {
 	// #1093), RAW: expiry is computed in Go against e.now() at fire time, not by SQL.
 	// ErrNoRows resolves to not paused (fail-open).
 	GetUserSchedulePause(ctx context.Context, userID uuid.UUID) (store.GetUserSchedulePauseRow, error)
-	// RecordScheduleHeldFire writes only last_fire on a still-active one-time row (PRD #1732
-	// D2): the credential_disabled hold records why the row waits without advancing it.
+	// RecordScheduleHeldFire writes last_fire and, when matched > 0, prepends recent_fires
+	// on a still-active one-time row (PRD #1732 D2). The credential_disabled hold has
+	// matched = 1 and records why the row waits without advancing it.
 	RecordScheduleHeldFire(ctx context.Context, arg store.RecordScheduleHeldFireParams) (int64, error)
 	// GetCIWatchEpisode is the ci_watch fire's UNLOCKED read of one workflow's episode (PRD
 	// #2865). Every write is rechecked under locks by the RunCreator seam below.

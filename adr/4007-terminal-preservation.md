@@ -423,8 +423,10 @@ admission ends the wait with a 55P03 or, as the helper's detached context is als
 `LockRunScheduleForUser FOR UPDATE` row lock as step 7, rechecks the epoch and
 `status = 'active'`, re-reads the ledger under that lock, composes Started from
 the ledger rows plus the caller's skips and capacity fields, and writes either
-`last_fire` only (`RecordOnceFirePartial`, or the epoch-guarded
-`RecordScheduleHeldFire` when there is no progress yet) or the guarded advance
+`last_fire` only for `RecordOnceFirePartial`, the epoch-guarded
+`RecordScheduleHeldFire` when there is no progress yet (which also prepends to
+`recent_fires` when `matched > 0`, including the credential-disabled hold with
+`matched = 1`, preserving PRD #1732), or the guarded advance
 `AdvanceOnceScheduleGuarded` (`AND fire_epoch = @fire_epoch AND
 status = 'active'`). An admission either committed before the summary's read
 and is included, or waits for the summary to commit; a delayed writer cannot
@@ -583,7 +585,9 @@ second migration's Down destroys the ledger and every recorded `run_uuid`; a
 later Up recreates empty tables.
 
 **Retention.** Header and ledger rows of earlier epochs persist until the
-schedule is deleted: at most one header and min(cap, matching open issues)
+schedule is deleted. Deleting the repository also cascades its ledger rows
+through `repo_id`; this is an exception to retention until schedule deletion.
+Otherwise there is at most one header and min(cap, matching open issues)
 ledger rows per admitted epoch (with no cap, the matching open issues), and one
 epoch per owner re-arm. No sweeper is added.
 
