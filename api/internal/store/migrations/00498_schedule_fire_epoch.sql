@@ -30,6 +30,7 @@ WHEN ((OLD.timing = 'once' OR NEW.timing = 'once') AND (
 EXECUTE FUNCTION run_schedules_bump_fire_epoch();
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TRIGGER run_schedules_fire_epoch ON run_schedules;
 DROP FUNCTION run_schedules_bump_fire_epoch();
 ALTER TABLE run_schedules DROP COLUMN fire_epoch;

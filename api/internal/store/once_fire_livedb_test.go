@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -424,17 +426,25 @@ func TestOnceFireLedgerSchemaLiveDB(t *testing.T) {
 		if err := l.insertRun(t, 1, uuid.New()); err != nil {
 			t.Fatal(err)
 		}
-		for _, set := range []string{`issue_iid = 2`, `run_uuid = gen_random_uuid()`, `repo_id = '` + f.otherRepo.String() + `'`, `fire_epoch = 7`} {
-			if _, err := f.pool.Exec(f.ctx, `UPDATE schedule_once_fire_runs SET `+set+` WHERE schedule_id=$1`, l.sched.ID); err == nil {
-				t.Errorf("UPDATE SET %s must be refused", set)
+		// A header at the target epoch exists, so the composite FK cannot be what refuses the
+		// fire_epoch change: only the immutability trigger can.
+		f.exec(t, `INSERT INTO schedule_once_fires (schedule_id, fire_epoch, effective_cap) VALUES ($1, 7, 2)`, l.sched.ID)
+		other := f.ledger(t) // a second schedule with an epoch-0 header, the target of the schedule_id change
+		refused := func(set string, args ...any) {
+			t.Helper()
+			_, err := f.pool.Exec(f.ctx, `UPDATE schedule_once_fire_runs SET `+set+` WHERE schedule_id=$1 AND issue_iid=1`, append([]any{l.sched.ID}, args...)...)
+			var pe *pgconn.PgError
+			// The trigger's own RAISE EXCEPTION: SQLSTATE P0001 and its message, not an FK or CHECK error.
+			if !errors.As(err, &pe) || pe.Code != "P0001" || !strings.Contains(pe.Message, "identity columns are immutable") {
+				t.Errorf("UPDATE SET %s: want the immutability trigger's P0001, got %v", set, err)
 			}
 		}
+		refused(`issue_iid = 2`)
+		refused(`run_uuid = gen_random_uuid()`)
+		refused(`repo_id = $2`, f.otherRepo)
+		refused(`fire_epoch = 7`)
+		refused(`schedule_id = $2`, other.sched.ID)
 		f.exec(t, `UPDATE schedule_once_fire_runs SET issue_title = 'renamed' WHERE schedule_id=$1`, l.sched.ID)
-		// The schedule_id column too (a second schedule with the same epoch header).
-		other := f.ledger(t)
-		if _, err := f.pool.Exec(f.ctx, `UPDATE schedule_once_fire_runs SET schedule_id=$2 WHERE schedule_id=$1`, l.sched.ID, other.sched.ID); err == nil {
-			t.Error("UPDATE SET schedule_id must be refused")
-		}
 	})
 
 	t.Run("the nil run uuid and a duplicate issue are refused", func(t *testing.T) {

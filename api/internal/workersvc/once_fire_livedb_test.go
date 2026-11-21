@@ -114,20 +114,40 @@ func (f *onceFx) assertNothing(t *testing.T, why string) {
 // waitBlocked waits until a backend whose query matches like is blocked on a lock.
 func waitBlocked(t *testing.T, env codexTestEnv, like string) {
 	t.Helper()
+	waitBlockedPID(t, env, like)
+}
+
+// waitBlockedPID is waitBlocked returning the blocked backend's pid.
+func waitBlockedPID(t *testing.T, env codexTestEnv, like string) int32 {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		var n int
-		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE $1 AND pid <> pg_backend_pid()`, like).Scan(&n); err != nil {
-			t.Fatal(err)
+		var pid int32
+		err := env.pool.QueryRow(env.ctx, `SELECT pid FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE $1 AND pid <> pg_backend_pid() LIMIT 1`, like).Scan(&pid)
+		if err == nil {
+			return pid
 		}
-		if n > 0 {
-			return
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no backend blocked on a lock with a query like %q", like)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// awaitReached waits for a commit hook's reached signal, failing instead of hanging when the admission
+// ends first (its error says why) or never gets there.
+func awaitReached(t *testing.T, reached <-chan struct{}, admitErr <-chan error) {
+	t.Helper()
+	select {
+	case <-reached:
+	case err := <-admitErr:
+		t.Fatalf("the admission ended before reaching its commit hook: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the admission never reached its commit hook")
 	}
 }
 
@@ -354,41 +374,34 @@ func TestOnceFireLostAckLiveDB(t *testing.T) {
 	}
 }
 
-// TestOnceFireConcurrentAdmissionsAtCapOneLiveDB: concurrent admissions of distinct issues at cap 1 start
-// exactly one run.
+// TestOnceFireConcurrentAdmissionsAtCapOneLiveDB: a second admission at cap 1, blocked on the schedule row
+// lock while the first holds it (ledger row written, not yet committed), is refused ErrOnceFireCapSpent once
+// the first commits, so exactly one run starts. The ordering is forced, not raced.
 func TestOnceFireConcurrentAdmissionsAtCapOneLiveDB(t *testing.T) {
 	f := newOnceFx(t)
-	const workers = 4
-	iids := make([]int64, workers)
-	for i := range iids {
-		iids[i] = f.issue(t)
+	iid1, iid2 := f.issue(t), f.issue(t)
+	reached, proceed := make(chan struct{}), make(chan struct{})
+	var once, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(proceed) }) }
+	defer release()
+	f.svc.createBeforeCommitHook = func(store.Run) {
+		once.Do(func() { close(reached) })
+		<-proceed
 	}
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	errs := make([]error, workers)
-	for i := range iids {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			_, errs[i] = f.admit(iids[i], f.progress(iids[i], onceCap(1)))
-		}()
+	admitErr1 := make(chan error, 1)
+	go func() { _, err := f.admit(iid1, f.progress(iid1, onceCap(1))); admitErr1 <- err }()
+	awaitReached(t, reached, admitErr1) // admission 1 holds the repo share and schedule row locks, ledger row written
+
+	admitErr2 := make(chan error, 1)
+	go func() { _, err := f.admit(iid2, f.progress(iid2, onceCap(1))); admitErr2 <- err }()
+	waitBlocked(t, f.env, "%FROM run_schedules WHERE id = $1 AND user_id = $2 FOR UPDATE%")
+
+	release()
+	if err := <-admitErr1; err != nil {
+		t.Fatalf("admission 1: %v", err)
 	}
-	close(start)
-	wg.Wait()
-	ok, spent := 0, 0
-	for _, err := range errs {
-		switch {
-		case err == nil:
-			ok++
-		case errors.Is(err, ErrOnceFireCapSpent):
-			spent++
-		default:
-			t.Fatalf("unexpected admission error: %v", err)
-		}
-	}
-	if ok != 1 || spent != workers-1 {
-		t.Fatalf("started %d, cap-spent %d, want 1 and %d", ok, spent, workers-1)
+	if err := <-admitErr2; !errors.Is(err, ErrOnceFireCapSpent) {
+		t.Fatalf("admission 2 = %v, want ErrOnceFireCapSpent", err)
 	}
 	if n := f.runs(t); n != 1 {
 		t.Fatalf("runs = %d, want exactly 1", n)
@@ -562,26 +575,59 @@ func TestOnceFireIdentityLiveDB(t *testing.T) {
 // TestOnceFireRepoDeleteDuringAdmissionLiveDB: a repo delete overlapping an admission, in either order,
 // never deadlocks: the repo share lock is taken before the schedule row lock.
 func TestOnceFireRepoDeleteDuringAdmissionLiveDB(t *testing.T) {
-	t.Run("admission holds its locks, delete waits at the repo row", func(t *testing.T) {
+	t.Run("admission holds the repo share lock while waiting for the schedule row, delete queues behind it", func(t *testing.T) {
 		f := newOnceFx(t)
-		f.env.exec(`UPDATE repos SET enabled=false WHERE id=$1`, f.repo)
+		f.env.exec(`UPDATE repos SET enabled=false WHERE id=$1`, f.repo) // DeleteRepoForUser only deletes a disabled repo
 		iid := f.issue(t)
-		reached, proceed := make(chan struct{}), make(chan struct{})
-		f.svc.createBeforeCommitHook = func(store.Run) { close(reached); <-proceed }
+
+		// Session 1 holds the schedule row.
+		hold, err := f.env.pool.Begin(f.env.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = hold.Rollback(context.Background()) }()
+		if _, err := hold.Exec(f.env.ctx, `SELECT id FROM run_schedules WHERE id=$1 FOR UPDATE`, f.sched.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		// The admission takes the repo FOR SHARE and then blocks on the schedule row.
 		admitErr := make(chan error, 1)
 		go func() { _, err := f.admit(iid, f.progress(iid, onceCap(2))); admitErr <- err }()
-		<-reached // run, header and ledger row written; repo FOR SHARE and schedule FOR UPDATE held
+		admitPID := waitBlockedPID(t, f.env, "%FROM run_schedules WHERE id = $1 AND user_id = $2 FOR UPDATE%")
 
+		// The repo delete blocks on the repo row the admission share-locked.
 		delErr := make(chan error, 1)
 		go func() {
-			var owner uuid.UUID = f.user
-			_, err := f.env.q.DeleteRepoForUser(f.env.ctx, store.DeleteRepoForUserParams{ID: f.repo, UserID: owner})
+			_, err := f.env.q.DeleteRepoForUser(f.env.ctx, store.DeleteRepoForUserParams{ID: f.repo, UserID: f.user})
 			delErr <- err
 		}()
-		waitBlocked(t, f.env, "%repos%")
-		close(proceed)
+		delPID := waitBlockedPID(t, f.env, "%WITH deletion_scope AS%")
+		var blockedByAdmission bool
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT $2 = ANY(pg_blocking_pids($1))`, delPID, admitPID).Scan(&blockedByAdmission); err != nil {
+			t.Fatal(err)
+		}
+		if !blockedByAdmission {
+			t.Fatalf("the repo delete (pid %d) is not blocked by the admission (pid %d): the admission did not take the repo lock before the schedule row", delPID, admitPID)
+		}
+		// pg_blocking_pids also lists backends queued ahead on the same lock, so pin the direct cause: the
+		// delete waits on the admission's own transaction (the repo row share lock), not on session 1's.
+		var waitsOnAdmissionTx bool
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks w JOIN pg_locks h
+				ON h.locktype = 'transactionid' AND h.transactionid = w.transactionid AND h.granted
+			WHERE w.pid = $1 AND w.locktype = 'transactionid' AND NOT w.granted AND h.pid = $2)`, delPID, admitPID).Scan(&waitsOnAdmissionTx); err != nil {
+			t.Fatal(err)
+		}
+		if !waitsOnAdmissionTx {
+			t.Fatalf("the repo delete (pid %d) does not wait on the admission's transaction (pid %d)", delPID, admitPID)
+		}
+
+		if err := hold.Rollback(f.env.ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Shipped order: the admission already holds the repo share lock, so it proceeds and commits, and
+		// the delete (queued behind it) then removes the repo with its schedule and ledger.
 		if err := <-admitErr; err != nil {
-			t.Fatalf("admission: %v", err)
+			t.Fatalf("admission (deadlock=%v): %v", isDeadlock(err), err)
 		}
 		if err := <-delErr; err != nil {
 			t.Fatalf("repo delete (deadlock=%v): %v", isDeadlock(err), err)
@@ -610,12 +656,8 @@ func TestOnceFireRepoDeleteDuringAdmissionLiveDB(t *testing.T) {
 		if err := tx.Commit(f.env.ctx); err != nil {
 			t.Fatalf("commit delete: %v", err)
 		}
-		err = <-admitErr
-		if isDeadlock(err) {
-			t.Fatalf("admission deadlocked: %v", err)
-		}
-		if err == nil {
-			t.Fatal("admission succeeded on a deleted repo")
+		if err := <-admitErr; !errors.Is(err, ErrOnceFireStale) {
+			t.Fatalf("admission = %v (deadlock=%v), want ErrOnceFireStale", err, isDeadlock(err))
 		}
 		var n int
 		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM runs WHERE repo_id=$1`, f.repo).Scan(&n); err != nil || n != 0 {

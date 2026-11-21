@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"math"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -58,7 +59,21 @@ func checkOnceFireArgs(p *OnceFireProgress, userID, repoID uuid.UUID, issueIID i
 	if p.UserID != userID || p.RepoID != repoID || p.IssueIID != issueIID {
 		return ErrOnceFireIdentity
 	}
-	return nil
+	_, err := onceFireCapArg(p.EffectiveCap)
+	return err
+}
+
+// onceFireCapArg converts the fire's cap to the header's int4. nil is unlimited (a NULL cap); a
+// value outside 0..MaxInt32 is never narrowed and fails closed as ErrOnceFireIdentity.
+func onceFireCapArg(c *int) (pgtype.Int4, error) {
+	if c == nil {
+		return pgtype.Int4{}, nil
+	}
+	v := *c
+	if v < 0 || v > math.MaxInt32 {
+		return pgtype.Int4{}, ErrOnceFireIdentity
+	}
+	return pgtype.Int4{Int32: int32(v), Valid: true}, nil
 }
 
 // isOnceFireLedgerConflict reports a 23505 on the ledger's primary key.
@@ -92,9 +107,9 @@ func admitOnceFire(ctx context.Context, q *store.Queries, p *OnceFireProgress, u
 	if sched.RepoID != repoID {
 		return ErrOnceFireIdentity
 	}
-	var capArg pgtype.Int4
-	if p.EffectiveCap != nil {
-		capArg = pgtype.Int4{Int32: int32(*p.EffectiveCap), Valid: true}
+	capArg, err := onceFireCapArg(p.EffectiveCap) // already vetted pre-lock by checkOnceFireArgs
+	if err != nil {
+		return err
 	}
 	if err := q.InsertOnceFireHeader(ctx, store.InsertOnceFireHeaderParams{ScheduleID: p.ScheduleID, FireEpoch: p.FireEpoch, EffectiveCap: capArg}); err != nil {
 		return err
