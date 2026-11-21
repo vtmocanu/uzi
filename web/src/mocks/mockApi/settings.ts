@@ -856,16 +856,17 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
 }
 
 // Issue #3258 N3: the recordings carry no lead-template effort, so the delivered mock lead
-// template's effort is applied at response time, exactly as leadEffortSettingCell derives it: when
+// template's effort is applied at response time, mirroring how leadEffortSettingCell derives it: when
 // the owner's preference for the harness is NULL or blank, the worker_effort cell resolves to the
-// template's level with source template, and its default names the template. Without a template
-// effort (the shipped mock lead has none) the recording is served unchanged.
+// template's level with source template, and its default names the template. The demo ships no
+// lead row, so without a delivered lead template effort the recording is served unchanged. The
+// extra `c.effort === null` check only keeps a recorded stored preference authoritative.
 function withLeadTemplateEffort(view: EffectiveSettings, efforts: { claude: string | null; codex: string | null }, prefs: { claude: unknown; codex: unknown }): EffectiveSettings {
   view.efforts = view.efforts.map(c => {
     if (c.setting !== "worker_effort") return c;
     const h = c.harness as "claude" | "codex";
     const level = efforts[h];
-    if (level === null) return c;
+    if (!level) return c;
     const next = { ...c, default_effort: level, default_source: "template" };
     const pref = prefs[h];
     if (c.effort === null && (pref === null || pref === undefined || (typeof pref === "string" && pref.trim() === ""))) {

@@ -257,7 +257,7 @@ describe("AgentDetail effort pins (#3258)", () => {
     const codex = screen.getByRole("combobox", { name: "Codex effort" }) as HTMLSelectElement;
     expect(claude.value).toBe("high");
     expect(codex.value).toBe("low");
-    expect(within(claude).queryByRole("option", { name: "runtime" })).toBeNull();
+    expect([...claude.options].map((o) => o.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
     fireEvent.change(claude, { target: { value: "max" } });
     fireEvent.change(codex, { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));

@@ -135,6 +135,28 @@ describe("getEffectiveSettings", () => {
     expect(await mockApi.getEffectiveSettings()).toEqual(behavior.scenarios[0].get);
   });
 
+  it("keeps the recorded resolution when a preference is set, naming the template only as the default", async () => {
+    const template = {
+      ...templates[0]!, id: "b-lead-3258b", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: null, codex_effort: "high",
+    };
+    templates.push(template);
+    const recorded = behavior.scenarios[0].get.efforts.find((c) => c.setting === "worker_effort" && c.harness === "codex")!;
+    try {
+      await mockApi.setTemplateAllocations({ my_overrides: [{ template_id: template.id, enabled: true }] });
+      for (const pref of ["low", "runtime"]) {
+        await mockApi.putMySettings({ default_codex_effort: pref });
+        const got = await mockApi.getEffectiveSettings();
+        const codex = got.efforts.find((c) => c.setting === "worker_effort" && c.harness === "codex");
+        expect(codex).toEqual({ ...recorded, default_effort: "high", default_source: "template" });
+      }
+    } finally {
+      await mockApi.putMySettings({ default_codex_effort: null });
+      await mockApi.setTemplateAllocations({ my_overrides: [] });
+      templates.splice(templates.indexOf(template), 1);
+    }
+  });
+
   it("returns a copy, so a caller cannot change the recording", async () => {
     const first = await mockApi.getEffectiveSettings();
     first.harnesses.length = 0;
