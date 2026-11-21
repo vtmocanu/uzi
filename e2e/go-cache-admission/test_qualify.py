@@ -499,6 +499,16 @@ class ChargeMapTests(Base):
                 self.assertEqual(q.daemon_capability({k: v for k, v in base.items() if k != key}),
                                  ["daemon-info-missing"])
                 self.assertEqual(q.daemon_capability(dict(base, **{key: False})), ["daemon-capability-unsupported"])
+        # Rootless with an unreported cgroup driver is missing evidence, not a negative.
+        for driver in (None, "absent"):
+            with self.subTest(driver=driver):
+                rootless = dict(base, rootless=True, CgroupDriver=driver)
+                if driver == "absent":
+                    del rootless["CgroupDriver"]
+                self.assertEqual(q.daemon_capability(rootless), ["daemon-info-missing"])
+        self.assertEqual(q.daemon_capability(dict(base, rootless=True, CgroupDriver="cgroupfs")),
+                         ["daemon-capability-unsupported"])
+        self.assertEqual(q.daemon_capability(dict(base, rootless=True, CgroupDriver="systemd")), [])
         # An explicit False wins over a missing sibling.
         self.assertEqual(q.daemon_capability(dict(base, MemoryLimit=None, SwapLimit=False)),
                          ["daemon-capability-unsupported"])

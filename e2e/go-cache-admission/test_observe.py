@@ -248,6 +248,23 @@ class SanitizationTests(Base):
         self.assertEqual(recs[iid("1")]["architecture"], "amd64")
         self.assertEqual(recs[iid("1")]["os"], "linux")
 
+    def test_image_architecture_and_os_use_the_exact_allowlists_and_are_counted(self):
+        meta = dict(image("1"), Architecture="host9.example.com", Os="box.example.org")
+        counts = dict(refs=0, ids=0, daemon=0)
+        rec = o.LiveObserver("tcp://127.0.0.1:1", salt=b"s"*16)._record(iid("1"), meta, counts, "config")
+        self.assertEqual((rec["architecture"], rec["os"], counts["daemon"]), (None, None, 2))
+        counts = dict(refs=0, ids=0, daemon=0)
+        rec = o.LiveObserver("tcp://127.0.0.1:1", salt=b"s"*16)._record(iid("1"), image("1"), counts, "config")
+        self.assertEqual((rec["architecture"], rec["os"], counts["daemon"]), ("amd64", "linux", 0))
+        daemon, r = self.go([dict(image("1"), Architecture="host9.example.com")])
+        self.assertEqual(r.returncode, 2, r)
+        binding = self.docs()[0]["binding"]
+        self.assertIsNone(binding["images"][0]["architecture"])
+        # One for the fixture's reduced KernelVersion ("6.1.0-test"), one for the image Architecture.
+        self.assertEqual(binding["dropped_daemon_strings"], 2)
+        for text in self.texts().values():
+            self.assertNotIn("host9", text)
+
     def test_malformed_refs_are_dropped_and_counted(self):
         bad = [image("1", tags=["bad\x00name:1", "UPPER/case:1", "x"*300+":1", "ok.example/x:bad tag"],
                      digests=["good@sha256:short", "good@"+iid("5")+"x"])]
@@ -883,6 +900,29 @@ class LifecycleTests(Base):
 
 
 class EvidenceTests(Base):
+    def test_every_committed_daemon_string_is_reproduced_by_daemon_section(self):
+        d = json.loads((EVIDENCE/"artifact.json").read_text())["daemon"]
+        version = dict(Version=d["ServerVersion"], Os=d["Os"], Arch=d["Arch"], KernelVersion=d["KernelVersion"])
+        features = json.dumps({"annotations": {"org.opencontainers.runc.version": d["RuncVersion"]}})
+        options = ["name=seccomp,profile=builtin"] if d["seccomp"] else []
+        if d["rootless"]:
+            options.append("name=rootless")
+        daemon_info = dict(
+            ServerVersion=d["ServerVersion"], KernelVersion=d["KernelVersion"], Driver=d["Driver"],
+            DriverStatus=[["driver-type", d["DriverType"]]], CgroupVersion=d["CgroupVersion"],
+            CgroupDriver=d["CgroupDriver"], LoggingDriver=d["LoggingDriver"], DefaultRuntime=d["DefaultRuntime"],
+            MemoryLimit=d["MemoryLimit"], SwapLimit=d["SwapLimit"], PidsLimit=d["PidsLimit"],
+            Runtimes={"runc": {"status": {"org.opencontainers.runtime-spec.features": features}}},
+            SecurityOptions=options)
+        counts = dict(daemon=0)
+        self.assertEqual(o.daemon_section(version, daemon_info, counts), d)
+        self.assertEqual(counts["daemon"], 0)
+        free = {"ServerVersion", "KernelVersion", "RuncVersion"}
+        for key, value in d.items():
+            if type(value) is str and key not in free:
+                with self.subTest(key=key):
+                    self.assertIn(value, o.ENUMS[key])
+
     def test_a_fresh_run_satisfies_the_evidence_invariants(self):
         daemon, r = self.go([image("1", tags=["postgres:16"])])
         self.assertEqual(r.returncode, 2, r)

@@ -240,7 +240,8 @@ CLI or `evaluate()` path.
   backend-support evidence is present), `new-mount-possible` (needs CapBnd 0, NoNewPrivs 1
   and seccomp mode 2 default profile or max_user_namespaces 0),
   `daemon-capability-unsupported` (MemoryLimit, SwapLimit or PidsLimit false, or
-  rootless with the cgroupfs driver; judged from the daemon section alone, so it also
+  rootless with the cgroupfs driver; rootless with a null CgroupDriver is
+  `daemon-info-missing`, not unsupported; judged from the daemon section alone, so it also
   turns the enforcement leg NEGATIVE when no container mount facts exist),
   `limits-not-applied-observed`,
   `claim-evidence-not-collector`, and per-sink coverage codes `sink-bytes-uncovered`,
@@ -339,8 +340,10 @@ python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
   `io.containerd.snapshotter.v1`), so a hostname-shaped value never survives. ServerVersion and RuncVersion must be exactly `N.N.N`
   (else null); KernelVersion keeps its numeric prefix `N.N.N[-N]` plus an optional `.elN` and
   `.x86_64`/`.aarch64` suffix and nothing after it; any daemon string containing `uzi-` or
-  `.internal` is null. Every reduced or dropped daemon string, version or not, is counted in
-  `dropped_daemon_strings`. MemoryLimit, SwapLimit and PidsLimit are true or false as reported
+  `.internal` is null. Each allowlisted daemon field (3 version fields plus 8 enum fields) whose
+  value is reduced or dropped is counted in `dropped_daemon_strings`; Name, ID,
+  DockerRootDir and SecurityOptions overflow are dropped uncounted. A per-image Architecture or Os
+  is held to the same Arch and Os allowlists (null and counted in `dropped_daemon_strings` otherwise). MemoryLimit, SwapLimit and PidsLimit are true or false as reported
   and null when the daemon did not report a boolean; null is missing evidence
   (`daemon-info-missing`, UNVERIFIED), never a negative `daemon-capability-unsupported`. Name, ID, DockerRootDir, hostnames, labels, proxy settings and
   paths are never copied. The daemon ID feeds only the salted hash in `collector.daemon_id_hash`

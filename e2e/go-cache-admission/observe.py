@@ -375,7 +375,9 @@ def tri(value):
 
 def daemon_section(version, info, counts=None):
     """Allowlisted daemon fields only; Name, ID, DockerRootDir, labels and paths are never copied.
-    Any string field that is reduced or dropped is counted in counts["daemon"] when given."""
+    counts["daemon"], when given, counts each allowlisted daemon field (ServerVersion, KernelVersion,
+    RuncVersion plus the eight enum fields) whose reported value is reduced or dropped. Name, ID,
+    DockerRootDir and SecurityOptions overflow are dropped uncounted."""
     v = version if isinstance(version, dict) else {}
     i = info if isinstance(info, dict) else {}
     options = i.get("SecurityOptions")
@@ -514,8 +516,14 @@ class LiveObserver:
             if got[1]:
                 digests.add(got[1])
         config = meta.get("Config")
-        return dict(id=image_id, id_kind=id_kind, architecture=safe(meta.get("Architecture"), TOKEN_RE),
-                    os=safe(meta.get("Os"), TOKEN_RE), digests=sorted(digests)[:8], repos=sorted(repos)[:8],
+        # Same exact Arch/Os allowlists as the daemon section; a miss is null and counted with the daemon strings.
+        fields = {}
+        for key, raw in (("Arch", meta.get("Architecture")), ("Os", meta.get("Os"))):
+            fields[key] = dchoice(raw, ENUMS[key])
+            if raw is not None and raw != fields[key]:
+                counts["daemon"] += 1
+        return dict(id=image_id, id_kind=id_kind, architecture=fields["Arch"],
+                    os=fields["Os"], digests=sorted(digests)[:8], repos=sorted(repos)[:8],
                     go_declared=go_declared(config))
 
     def observe(self):

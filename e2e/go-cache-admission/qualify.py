@@ -472,7 +472,9 @@ def daemon_capability(daemon):
             or (daemon.get("rootless") is True and daemon.get("CgroupDriver") == "cgroupfs")
             or daemon.get("rootless") not in (True, False)):
         return ["daemon-capability-unsupported"]
-    return ["daemon-info-missing"] if any(v is not True for v in limits) else []
+    # Rootless with an unreported cgroup driver cannot be judged either way: missing, not supported.
+    rootless_unknown = daemon.get("rootless") is True and type(daemon.get("CgroupDriver")) is not str
+    return ["daemon-info-missing"] if rootless_unknown or any(v is not True for v in limits) else []
 
 
 def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):

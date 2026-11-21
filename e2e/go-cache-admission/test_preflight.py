@@ -279,8 +279,8 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(p.docker_get(endpoint, "/version"), {})
 
     def test_terminated_header_block_just_over_the_cap_is_refused(self):
-        # The terminator arrives in the same send as the overflow: only the terminator-chunk check sees it.
-        block = self.header_of(p.LIMITS["header"]+16)
+        # One byte over the cap, terminator in the same send: only the terminator-chunk check sees it.
+        block = self.header_of(p.LIMITS["header"]+1)
         endpoint = self.hostile_header_server(lambda conn, stop, end: conn.sendall(block + b"{}"))
         with self.assertRaises(ValueError):
             p.docker_get(endpoint, "/version")
@@ -296,6 +296,69 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.docker_get(endpoint, "/version")
         self.assertLess(time.monotonic()-started, 2.5)
+
+    @staticmethod
+    def open_fds():
+        count = 0
+        for fd in range(256):
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            count += 1
+        return count
+
+    def test_refused_response_closes_its_descriptors_even_with_exceptions_kept_alive(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        server.settimeout(0.2)
+        stop = threading.Event()
+        served = []
+
+        def serve():
+            end = time.monotonic()+20
+            while not stop.is_set() and time.monotonic() < end:
+                try:
+                    conn = server.accept()[0]
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        data = b""
+                        while b"\r\n\r\n" not in data and len(data) < 8192:
+                            data += conn.recv(1024)
+                        conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n"
+                                     b"Connection: close\r\n\r\nbody")
+                    except OSError:
+                        pass
+                served.append(1)
+        thread = threading.Thread(target=serve)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join(5)
+        self.addCleanup(finish)
+        endpoint = "tcp://127.0.0.1:%d" % server.getsockname()[1]
+        kept = []
+        before = self.open_fds()
+        for _ in range(5):
+            try:
+                p.docker_get(endpoint, "/version")
+            except ValueError as error:
+                kept.append(error)
+        self.assertEqual(len(kept), 5)
+        # The stub shares this process: wait until it has closed its side of every connection.
+        settle = time.monotonic()+5
+        while len(served) < 5 and time.monotonic() < settle:
+            time.sleep(0.01)
+        self.assertEqual(len(served), 5)
+        self.assertEqual(self.open_fds(), before)
 
     def test_unix_socket_setup_failure_closes_resources(self):
         # A bind failure (here: missing parent) must still close the socket that was opened.
