@@ -2,7 +2,7 @@
 
 **Issue:** #4580 (number assigned after draft review).
 **Parent:** #1703; split from #3253.
-**Status:** Draft, 2026-11-21; baseline origin/main `10876dee680859e4e468ae5f004475f44b31a80a`.
+**Status:** Implemented, 2026-11-21 (M1 complete on branch `agent/issue-4580`; the landing obligations below remain exact-head PR CI checks at merge). Draft baseline origin/main `10876dee680859e4e468ae5f004475f44b31a80a`.
 **Labels:** `enhancement`, `PRD`, `area::runtime`, `priority::normal`.
 **Blocked by:** none. The accountant and its tests already exist on this base. #3253 is a downstream consumer, not a prerequisite.
 **Delivery:** one implementation run, one PR. Accounting is a billing-integrity seam: include reviewer, tester and auditor. No implementation or validation writes under `.github/workflows/`.
@@ -86,7 +86,7 @@ The caller must apply any historical replay to the previous segment before cutti
 
 ### ADR-2555 and release note
 
-Amend [ADR-2555](../adr/2555-run-usage-attribution.md): root response attribution uses the root thread's current segment model, and cuts occur only after the caller has recorded the historical replay boundary. State that this child has no production cut caller yet and #3253 supplies that integration. Preserve child lane/identity rules and the distinction between attribution evidence and billing. Add a lowercase UUID-v4 changelog fragment for the malformed-sequence correction and segment-capable accountant.
+Amend [ADR-2555](../../adr/2555-run-usage-attribution.md): root response attribution uses the root thread's current segment model, and cuts occur only after the caller has recorded the historical replay boundary. State that this child has no production cut caller yet and #3253 supplies that integration. Preserve child lane/identity rules and the distinction between attribution evidence and billing. Add a lowercase UUID-v4 changelog fragment for the malformed-sequence correction and segment-capable accountant.
 
 ## Testing decisions
 

@@ -165,4 +165,4 @@ changes; malformed reasoning or total-token dips are now refused (see Admission)
   `record()` call.
 
 Rationale and rejected alternatives are in the PRD Decision Log
-([PRD #4580](../prds/4580-codex-usage-model-segments.md)).
+([PRD #4580](../prds/done/4580-codex-usage-model-segments.md)).
