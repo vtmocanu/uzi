@@ -24,6 +24,8 @@ func TestSameContentDetectsEachMutableColumn(t *testing.T) {
 		{"model", func(d *Definition) { d.Model = "sonnet" }},
 		{"tools", func(d *Definition) { d.Tools = []string{"Bash", "Read"} }},
 		{"prompt_body", func(d *Definition) { d.PromptBody = "You are the coder. Be terse.\n" }},
+		{"effort", func(d *Definition) { d.Effort = "high" }},
+		{"codex_effort", func(d *Definition) { d.CodexEffort = "low" }},
 	}
 	for _, c := range cases {
 		t.Run(c.column, func(t *testing.T) {
