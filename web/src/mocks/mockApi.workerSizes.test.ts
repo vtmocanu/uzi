@@ -30,6 +30,7 @@ describe("mock admin worker sizes", () => {
     const api = await fresh();
     const got = await api.getAdminWorkerSizes();
     expect(got.refusals?.map((r) => [r.size, r.kind, r.worker_name])).toEqual([["m", "size_refused", "base.m-9f3c"]]);
+    expect(got.refusal_totals).toEqual({ m: 1 });
     const { workers } = await api.listWorkers();
     const w = workers.find((x) => x.id === got.refusals![0].worker_id);
     expect(w).toMatchObject({ name: "base.m-9f3c", hosted_size: "m" });

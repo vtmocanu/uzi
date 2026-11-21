@@ -88,8 +88,23 @@ const REFUSALS: WorkerSizeRefusal[] = [{
   reported_at: "2026-11-18T14:20:00Z",
 }];
 
-function refusals(): WorkerSizeRefusal[] {
-  return REFUSALS.filter((r) => rows.some((row) => row.name === r.size));
+// The api's per-size cap on refusal details; the totals count every refusal before it.
+const MAX_REFUSALS_PER_SIZE = 3;
+
+// As the api serves them: only listed sizes, sorted by size then worker name, at most three
+// details per size, and per size the count before that cap.
+function refusals(): { refusals: WorkerSizeRefusal[]; refusal_totals: Record<string, number> } {
+  const listed = REFUSALS.filter((r) => rows.some((row) => row.name === r.size)).sort(
+    (a, b) => a.size.localeCompare(b.size) || a.worker_name.localeCompare(b.worker_name),
+  );
+  const refusal_totals: Record<string, number> = {};
+  const kept: WorkerSizeRefusal[] = [];
+  for (const r of listed) {
+    const n = refusal_totals[r.size] ?? 0;
+    refusal_totals[r.size] = n + 1;
+    if (n < MAX_REFUSALS_PER_SIZE) kept.push(r);
+  }
+  return { refusals: kept, refusal_totals };
 }
 
 // Each field's unit, and the api's absolute cap per unit (api/internal/workersize/builtin),
@@ -237,7 +252,7 @@ export const workerSizesApi = {
       read_only_code: readOnly() ? READ_ONLY_CODE : null,
       advisories: advisories(),
       max_sizes: MAX_WORKER_SIZES,
-      refusals: refusals(),
+      ...refusals(),
     });
   },
   // Both verbs are the api's one PUT: an existing name is edited, an absent one created.
