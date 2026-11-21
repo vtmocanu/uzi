@@ -223,7 +223,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// PRD #4322, so such a row (data that creation cannot produce; defence in depth) is refused
 	// terminally before anything is opened: a provider run never reaches a vendor credential ladder.
 	if providerBoundRun(run) && (run.Kind == runkind.Judge || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
-		isolated || run.Harness != harnessClaude) {
+		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
+		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
 		return nil, errProviderLaneClaimRefused
 	}
 	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A
@@ -1049,7 +1050,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// indicated by either M1 sentinel fails closed the same way. An ordinary Claude run
 	// (harness='claude', no codex fields) skips this entirely and its claim JSON stays
 	// byte-identical to today's (ClaimSecrets.Codex stays nil ⇒ no `codex` key).
-	if run.Harness == harnessCodex {
+	// A validated provider binding supplies exclusive authority; vendor runs, including
+	// deleted aliases with a null FK, still enter the harness-authoritative path.
+	if run.Harness == harnessCodex && providerBinding == nil {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
 			// finishRunClaim (claim_recovery.go) settles every outcome in one exact-claim

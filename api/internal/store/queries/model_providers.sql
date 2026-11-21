@@ -200,7 +200,7 @@ FOR SHARE NOWAIT;
 -- which the finishers do not retry). NOWAIT turns that contention into 55P03, which finishRunClaim /
 -- finishChatClaim already retry as a bounded whole-transaction retry. A missing row is
 -- pgx.ErrNoRows (stale).
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -213,7 +213,7 @@ FOR KEY SHARE OF r NOWAIT;
 -- the transaction and does not by itself keep the revision. What keeps PruneModelProviderRevisions off
 -- a revision is the source run row's own reference (model_provider_revision), which stays true while
 -- run rows are never deleted.
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3

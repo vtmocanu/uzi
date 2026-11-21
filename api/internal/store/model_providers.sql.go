@@ -187,7 +187,7 @@ func (q *Queries) GetModelProviderRevision(ctx context.Context, arg GetModelProv
 }
 
 const getModelProviderRevisionForOwner = `-- name: GetModelProviderRevisionForOwner :one
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -207,6 +207,7 @@ type GetModelProviderRevisionForOwnerRow struct {
 	BaseUrl    string    `json:"base_url"`
 	AuthStyle  string    `json:"auth_style"`
 	ModelMap   []byte    `json:"model_map"`
+	Engine     string    `json:"engine"`
 }
 
 // A frozen revision of an owner's provider (inherited creation re-checks the URL against the
@@ -225,6 +226,7 @@ func (q *Queries) GetModelProviderRevisionForOwner(ctx context.Context, arg GetM
 		&i.BaseUrl,
 		&i.AuthStyle,
 		&i.ModelMap,
+		&i.Engine,
 	)
 	return i, err
 }
@@ -729,7 +731,7 @@ func (q *Queries) LockProviderBindingKeyForShareNowait(ctx context.Context, arg 
 }
 
 const lockProviderBindingRevisionForKeyShareNowait = `-- name: LockProviderBindingRevisionForKeyShareNowait :one
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -749,6 +751,7 @@ type LockProviderBindingRevisionForKeyShareNowaitRow struct {
 	BaseUrl    string    `json:"base_url"`
 	AuthStyle  string    `json:"auth_style"`
 	ModelMap   []byte    `json:"model_map"`
+	Engine     string    `json:"engine"`
 }
 
 // The claim finisher's revision read (PRD #4320 module 5, D9): the same SELECT as
@@ -768,6 +771,7 @@ func (q *Queries) LockProviderBindingRevisionForKeyShareNowait(ctx context.Conte
 		&i.BaseUrl,
 		&i.AuthStyle,
 		&i.ModelMap,
+		&i.Engine,
 	)
 	return i, err
 }
