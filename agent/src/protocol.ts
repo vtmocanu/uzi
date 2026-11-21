@@ -2543,6 +2543,15 @@ export type BaseAttestationHoldOutcome =
   | { outcome: "stale"; status: string }
   | { outcome: "unknown"; detail: string };
 
+/** Issue #3252: what one phase-switch hold request established. `held` is the server's positive ACK
+ *  (paused + phase_switch_unavailable); `refused` is a 409 carrying the row's current status and hold
+ *  reason (and `reason` such as plan_not_approved); `unknown` proves neither (transport, 5xx, a 404, a
+ *  400 or an unreadable body). */
+export type PhaseSwitchHoldOutcome =
+  | { outcome: "held"; status: string }
+  | { outcome: "refused"; status: string; holdReason: string | null; reason?: string }
+  | { outcome: "unknown"; detail: string };
+
 /** Dedicated iteration park evidence. Counters/allowances are positive int32 values;
  * claim_generation is a positive safe integer. iteration_count is max_iterations or
  * max_iterations + 1; head is at most 128 UTF8 bytes. */

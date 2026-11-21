@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { PhaseSwitchUnverifiedError } from "./phase-switch-unverified.js";
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "./park-run.js";
 import { chunkedTimeout } from "./chunked-timeout.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
@@ -890,6 +891,24 @@ interface RunDrive {
    *  whether it showed model evidence. Read by driveTurnWithEmptyRecovery's refusal arm. */
   lastTurnPostSwitch?: boolean;
   lastTurnModelEvidence?: boolean;
+  /** PRD #3252 D8: phases whose settings barrier returned a passing verdict this claim. Set only by that
+   *  verdict, so an in-place restart or an event-free retry before a verdict verifies again. */
+  phaseVerified?: Set<"plan" | "implement">;
+}
+
+/** PRD #3252 D8: on a provider run the CLI resolves an alias through the gateway map, so the runtime
+ *  applies the mapped id; that id is what the settings barrier must see. Undefined = no mapping. */
+const PROVIDER_ALIAS_ENV: Readonly<Record<string, string>> = {
+  opus: "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+};
+function providerMappedModel(ctx: RunContext, turnConfig: ClaudeTurnConfig): string | undefined {
+  const key = ctx.provider && turnConfig.model !== undefined && Object.hasOwn(PROVIDER_ALIAS_ENV, turnConfig.model)
+    ? PROVIDER_ALIAS_ENV[turnConfig.model] : undefined;
+  const mapped = key !== undefined ? turnConfig.env[key] : undefined;
+  return mapped !== undefined && mapped !== "" ? mapped : undefined;
 }
 
 /**
@@ -3323,6 +3342,8 @@ export class SdkExecutor implements Executor {
       // the runner reads it in phasePublish to SKIP finalize (the wall seam already parked the run or
       // left it non-terminal, and the finally preserves clone + HOME).
       let walled: { reason: string } | undefined;
+      // PRD #3252 D8: latched when the implement turn's settings barrier refused to admit the prompt.
+      let phaseSwitchHeld: NonNullable<ExecutorResult["phaseSwitchHeld"]> | undefined;
       const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
         if (!ctx.completionInterlock || !(completionAttempted || history.priorAttempt)) return false;
         if (await this.routeSummaryHold(ctx, reason, true, { allowDegradedCapture: true }))
@@ -4029,6 +4050,13 @@ export class SdkExecutor implements Executor {
           }
 
         } catch (err) {
+          // PRD #3252 D8: checked FIRST so no credential-switch, pause-now, wall or idle arm below can
+          // swallow it. The turn never reached the provider; the runner holds the run for the owner.
+          if (err instanceof PhaseSwitchUnverifiedError) {
+            state.phaseVerified?.delete("implement");
+            phaseSwitchHeld = { cause: err.cause, requested: err.requested, observed: err.observed, phase: "implement" };
+            break;
+          }
           // PRD #1247 M5b (data-integrity fix): a held-state credential switch tripped this
           // implement turn (the SDK abort / re-armable interrupt → driveTurn throws
           // CredentialSwitchSignal). Handle it IN PLACE via ctx.attemptCredentialSwitch INSTEAD of
@@ -4846,6 +4874,7 @@ export class SdkExecutor implements Executor {
       // pausedAt/completionHeld. NOT gated on isIssueRun (all six timed kinds park). OMITTED (not
       // undefined) on every normal completion so existing deepStrictEqual assertions hold.
       if (walled) result.walled = walled;
+      if (phaseSwitchHeld) result.phaseSwitchHeld = phaseSwitchHeld;
       if (iterationParked) result.iterationParked = iterationParked;
       // PRD #1247 M5b (data-integrity fix): forward the released-in-place disposition. Set only when a
       // held-state credential switch RELEASED the claim (ctx.attemptCredentialSwitch → "released")
@@ -5393,6 +5422,10 @@ export class SdkExecutor implements Executor {
         if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
       }
       if (beforeDispatch) prompt = beforeDispatch(prompt);
+      // PRD #3252 D8: with a claim `plan_phase`, the first implement turn and the first plan turn that
+      // resumes an existing session withhold the prompt until the runtime's applied settings match.
+      const verifyPhase = ctx.config?.plan_phase !== undefined && !state.phaseVerified?.has(phase) &&
+        (phase === "implement" || resumeId !== undefined);
       const request: RunTurnRequest = {
         semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
@@ -5409,6 +5442,15 @@ export class SdkExecutor implements Executor {
         agents: {},
         leadSkills: [],
         ...(onRuntimeConfig ? { onRuntimeConfig } : {}),
+        ...(verifyPhase
+          ? {
+              verifyApplied: {
+                ...(turnConfig.model !== undefined ? { model: providerMappedModel(ctx, turnConfig) ?? turnConfig.model } : {}),
+                ...(turnConfig.effort !== undefined ? { effort: turnConfig.effort } : {}),
+              },
+              onPhaseVerified: () => (state.phaseVerified ??= new Set()).add(phase),
+            }
+          : {}),
       };
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
@@ -5554,6 +5596,8 @@ export class SdkExecutor implements Executor {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
       if (state.tripReason) throw this.tripError(state);
+      // PRD #3252 D8: an unverified phase switch is final for this claim: no resume, no retry.
+      if (err instanceof PhaseSwitchUnverifiedError) throw err;
       // issue #1656: only with no trip pending — every uzi kill sets tripReason first — is a
       // SIGTERM/SIGKILL death of the CLI foreign, and resumable by the recovery wrapper.
       const death = err instanceof Error ? foreignCliTermination(err) : undefined;
@@ -5710,6 +5754,8 @@ export class SdkExecutor implements Executor {
         } catch (err) {
           // A real cancel/idle/wall trip WINS and keeps its existing outcome.
           if (state.tripReason) throw this.tripError(state);
+          // PRD #3252 D8: ahead of every retry arm below (event-free, signal death, resume refusal).
+          if (err instanceof PhaseSwitchUnverifiedError) throw err;
           // A usage-limit death routes to the usage-limit wait path, unchanged.
           if (err instanceof LimitReachedError) throw err;
           if (err instanceof EventFreeStreamError) {

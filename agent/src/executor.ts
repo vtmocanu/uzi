@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
+import type { PhaseSettings, PhaseSwitchCause } from "./phase-switch-unverified.js";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
@@ -1059,6 +1060,11 @@ export interface ExecutorResult {
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
   walled?: { reason: string };
+  /** PRD #3252 D8 (m4): the settings barrier could not prove the runtime applied the requested phase
+   *  model/effort, so the turn never reached the provider. The runner reads it in phasePublish to SKIP
+   *  finalization and enter the phase-switch worker hold (no push, no PR, no terminal report). Claude
+   *  lead lanes only; absent on every other result. */
+  phaseSwitchHeld?: { cause: PhaseSwitchCause; requested: PhaseSettings; observed: PhaseSettings; phase: "plan" | "implement" };
   /** Disposition for every iteration sink outcome. The runner must skip finalization for either. */
   iterationParked?: { outcome: IterationParkOutcome };
   /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim

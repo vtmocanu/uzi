@@ -22,6 +22,7 @@ import type { AdviceUsageSnapshot } from "../src/harness.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
 import { secretRecordingLogger } from "./runner-harness.js";
+import { withAppliedSettings } from "./phase-settings-fake.js";
 
 // PRD #4320 module 6/7 (agent half): every converted spawn builder's env and model in provider mode,
 // the gateway-limit and switch refusals, and the second-layer lane refusals. The gateway key is
@@ -116,11 +117,15 @@ describe("SdkExecutor in provider mode (issue run lead and subagents)", () => {
   });
 
   it("PRD #3252: a planning pair resolves through the map per phase, the plan turn on the planning model and the implement turn on the implement model", async () => {
-    const { queryFn, turns } = fakeTurns([[submitPlan("plan"), sessionResult()], [signalDone(), sessionResult()]]);
+    const fake = fakeTurns([[submitPlan("plan"), sessionResult()], [signalDone(), sessionResult()]]);
+    const { turns } = fake;
+    // The gateway map resolves the alias the CLI is given; the runtime reports the mapped ids.
+    const queryFn = withAppliedSettings(fake.queryFn, (o) => ({ model: o.model === "opus" ? "corp-opus" : o.model, effort: "medium" }));
     const { ctx } = makeCtx({
       config: {
         default_model: "corp-sonnet", default_model_source: "user_default",
-        plan_phase: { model: "opus", model_source: "user_planning_default" },
+        default_effort: "medium", default_effort_source: "user_default",
+        plan_phase: { model: "opus", model_source: "user_planning_default", effort: "medium", effort_source: "user_planning_default" },
       },
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
