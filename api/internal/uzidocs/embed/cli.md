@@ -291,8 +291,9 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, rejected plans and `base_diverged` required-base
-  rejections do not count as failures. Required-base rejections remain in the
+  as Overview: chat, rejected plans and `base_diverged` required-base
+  rejections do not count as failures; failed helper runs (judge,
+  cross_check, mr_rework, ci_fix) do. Required-base rejections remain in the
   finished-run denominator and have a separate numeric `base_diverged` count
   in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
   for the partition identity and the web bar's combined **rejected** segment.

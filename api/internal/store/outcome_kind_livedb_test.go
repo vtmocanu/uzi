@@ -325,6 +325,12 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 		run, l7run, claude, codex, l7claude, l7codex int64
 		in, l7in, cost, l7cost                       int64
 	}
+	// seed writes cache_read = 2x, cache_creation = 3x and output = 4x the input tokens, so the
+	// expected lifetime then last7 cache-read/cache-creation/output sums follow from the Go-side
+	// input sums.
+	otherTokens := func(a *uf) [6]int64 {
+		return [6]int64{2 * a.in, 3 * a.in, 4 * a.in, 2 * a.l7in, 3 * a.l7in, 4 * a.l7in}
+	}
 	uwant := map[int]*uf{0: {}, 1: {}, 2: {}}
 	var fac uf
 	for _, r := range recs {
@@ -375,6 +381,10 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 		if s.RunCount != w.run || s.LifetimeInputTokens != w.in || s.Last7InputTokens != w.l7in || microsOf(t, s.LifetimeCostUsd) != w.cost || microsOf(t, s.Last7CostUsd) != w.l7cost {
 			t.Errorf("SelfUsage user %d: run %d in %d/%d cost %d/%d, want %+v", u, s.RunCount, s.LifetimeInputTokens, s.Last7InputTokens, microsOf(t, s.LifetimeCostUsd), microsOf(t, s.Last7CostUsd), *w)
 		}
+		got := [6]int64{s.LifetimeCacheReadTokens, s.LifetimeCacheCreationTokens, s.LifetimeOutputTokens, s.Last7CacheReadTokens, s.Last7CacheCreationTokens, s.Last7OutputTokens}
+		if exp := otherTokens(w); got != exp {
+			t.Errorf("SelfUsage user %d cache-read/cache-creation/output tokens: got %v want %v", u, got, exp)
+		}
 	}
 	tot, err := q.AdminUsageTotals(ctx)
 	if err != nil {
@@ -382,6 +392,9 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 	}
 	if tot.RunCount != fac.run || tot.LifetimeInputTokens != fac.in || tot.Last7InputTokens != fac.l7in || microsOf(t, tot.LifetimeCostUsd) != fac.cost || microsOf(t, tot.Last7CostUsd) != fac.l7cost {
 		t.Errorf("AdminUsageTotals: run %d in %d/%d, want %+v", tot.RunCount, tot.LifetimeInputTokens, tot.Last7InputTokens, fac)
+	}
+	if got, exp := [6]int64{tot.LifetimeCacheReadTokens, tot.LifetimeCacheCreationTokens, tot.LifetimeOutputTokens, tot.Last7CacheReadTokens, tot.Last7CacheCreationTokens, tot.Last7OutputTokens}, otherTokens(&fac); got != exp {
+		t.Errorf("AdminUsageTotals cache-read/cache-creation/output tokens: got %v want %v", got, exp)
 	}
 	pu, err := q.AdminUsagePerUser(ctx)
 	if err != nil {
@@ -399,6 +412,9 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 			exp := [10]int64{w.run, w.l7run, w.claude, w.codex, w.l7claude, w.l7codex, w.in, w.l7in, w.cost, w.l7cost}
 			if got != exp {
 				t.Errorf("AdminUsagePerUser user %d: got %v want %v", u, got, exp)
+			}
+			if got, exp := [6]int64{r.CacheReadTokens, r.CacheCreationTokens, r.OutputTokens, r.Last7CacheReadTokens, r.Last7CacheCreationTokens, r.Last7OutputTokens}, otherTokens(w); got != exp {
+				t.Errorf("AdminUsagePerUser user %d cache-read/cache-creation/output tokens: got %v want %v", u, got, exp)
 			}
 		}
 	}
