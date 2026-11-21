@@ -36055,23 +36055,28 @@ describe("M2 actualRunner credential replacement", () => {
               followOnActive = true;
               const following = runner.execute(followClaim);
               try {
-                await withTimeout(Promise.race([followOnIntentPosted.promise, following.then(() => {
-                  throw new Error("follow-on execute ended before its intent summary posted");
-                })]), 5000, "follow-on intent summary posted");
+                // Record whether the event happened within its bound instead of throwing, so the named assertions below report the defect.
+                let followOnTimer: ReturnType<typeof setTimeout> | undefined;
+                try {
+                  await Promise.race([followOnIntentPosted.promise, following.then(() => undefined),
+                    new Promise<void>(resolve => { followOnTimer = setTimeout(resolve, 5000); })]);
+                } finally { clearTimeout(followOnTimer); }
                 // The batcher delivers frames on its own interval: hold the flight open (bounded) until the usage frame lands.
                 const deliveryDeadline = Date.now() + 4000;
                 while (Date.now() < deliveryDeadline && !api.messages(claim.run_id).slice(switchedFeedLength)
                   .some(message => message.kind === "summary_usage" && rec(message.payload).pass === "intent"))
                   await new Promise<void>(resolve => setTimeout(resolve, 10));
               } finally { followOnCancelRequested = true; }
-              await withTimeout(following, 5000, "follow-on flight stops after its intent summary");
+              // Record the stop instead of throwing, so a defective follow-on flight reports the named assertions first.
+              const followStopError = await withTimeout(following, 5000, "follow-on flight stops after its intent summary")
+                .then(() => undefined, (error: unknown) => error);
               assert.equal(factories, 2, "the follow-on execute built a leg on the same executor");
               const followInputs = intentInputs.slice(inputsBefore), followBuilds = summaryBuilds.slice(buildsBefore);
               assert.equal(followInputs.length, 1, "B intent summary uses B's credential");
               assert.deepEqual(followInputs[0], { capability: next.capability, authMode: next.auth_mode }, "B intent summary uses B's credential");
+              assert.deepEqual(intentPosts, [`Intent summary built with ${next.capability}`], "exactly one B intent summary post");
               assert.equal(followBuilds.length, 1, "exactly one B intent build");
               assert.deepEqual([followBuilds[0]?.capability, followBuilds[0]?.authMode], [next.capability, next.auth_mode], "exactly one B intent build");
-              assert.deepEqual(intentPosts, [`Intent summary built with ${next.capability}`], "exactly one B intent summary post");
               const followFeed = api.messages(claim.run_id).slice(switchedFeedLength);
               assert.equal(followFeed.some(message => rec(message.payload).event === "summary_skipped" && rec(message.payload).pass === "intent"), false,
                 "follow-on intent summary is not suppressed");
@@ -36079,6 +36084,7 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(followUsage.length, 1, "follow-on intent summary usage is delivered once");
               for (const row of followUsage)
                 assert.equal("credential_epoch_ordinal" in row, false, "follow-on intent summary usage carries the follow-on flight's baseline (no ordinal)");
+              if (followStopError !== undefined) throw followStopError;
             }
           }
         } finally {
