@@ -149,9 +149,11 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: GetProviderKeyForUpdate :one
 -- The provider key's identity and enablement, locked inside a mutation transaction.
-SELECT id, disabled_at, enablement_rev FROM user_secrets
-WHERE user_id = $1 AND provider_id = $2 AND kind IN ('anthropic_compatible_key', 'openai_compatible_key')
-FOR UPDATE;
+SELECT k.id, k.disabled_at, k.enablement_rev FROM user_secrets k
+JOIN model_providers p ON p.id = k.provider_id AND p.owner_user_id = k.user_id
+WHERE k.user_id = $1 AND k.provider_id = $2
+  AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+FOR UPDATE OF k;
 
 -- name: DeleteProviderKeySecret :execrows
 DELETE FROM user_secrets

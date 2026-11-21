@@ -10,6 +10,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -23,8 +24,8 @@ const (
 	reasonProviderBindingStale          = "provider_binding_stale"
 	reasonProviderDestinationNotAllowed = "provider_destination_not_allowed"
 
-	claudeSourceUnusableMessagePrefix    = "the provider cannot be the Claude source: "
-	claudeSourceUnusableRunMessagePrefix = "your Claude source is a model provider that cannot serve a run: "
+	claudeSourceUnusableMessagePrefix    = "the provider cannot be the source: "
+	claudeSourceUnusableRunMessagePrefix = "your source is a model provider that cannot serve a run: "
 )
 
 // providerSourceReasonText names a ProviderSourceUnusableError reason for the user.
@@ -85,9 +86,17 @@ func quoteModel(m string) string { return "\"" + m + "\"" }
 // is the caller's, not retired, its current base URL is on the operator allowlist and it has an
 // enabled key (409 provider_source_unusable); a foreign or unknown provider is a 404. It runs under
 // the per-user secret-mutation lock and applies the SAME usability rules run creation does
-// (workersvc.ResolveClaudeProviderSource), by writing the selection and reading it back in the one
+// (workersvc.ResolveProviderSource), by writing the selection and reading it back in the one
 // transaction, so a refusal rolls the write back.
 func (h *Handler) SetMyClaudeProviderSource(w http.ResponseWriter, r *http.Request) {
+	h.setMyProviderSource(w, r, providers.EngineClaude)
+}
+
+// SetMyCodexProviderSource selects or clears only the owner's Codex source.
+func (h *Handler) SetMyCodexProviderSource(w http.ResponseWriter, r *http.Request) {
+	h.setMyProviderSource(w, r, providers.EngineCodex)
+}
+func (h *Handler) setMyProviderSource(w http.ResponseWriter, r *http.Request, engine string) {
 	user, ok := userForProviderRoute(w, r)
 	if !ok {
 		return
@@ -119,22 +128,24 @@ func (h *Handler) SetMyClaudeProviderSource(w http.ResponseWriter, r *http.Reque
 	}
 	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
 		if want == nil {
-			_, err := q.SetUserClaudeProviderSource(r.Context(), store.SetUserClaudeProviderSourceParams{SetSource: true, ID: user.ID})
+			_, err := q.SetUserProviderSource(r.Context(), store.SetUserProviderSourceParams{Engine: engine, ID: user.ID})
 			return err
 		}
 		// An unknown or foreign provider violates the composite (owner, provider) foreign key.
-		if _, err := q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: *want, OwnerUserID: user.ID}); err != nil {
+		if profile, err := q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: *want, OwnerUserID: user.ID}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return errProviderNotFound
 			}
 			return err
+		} else if profile.Engine != engine {
+			return errProviderNotFound
 		}
-		if _, err := q.SetUserClaudeProviderSource(r.Context(), store.SetUserClaudeProviderSourceParams{
-			SetSource: true, ProviderID: pgconv.UUID(*want), ID: user.ID,
+		if _, err := q.SetUserProviderSource(r.Context(), store.SetUserProviderSourceParams{
+			Engine: engine, ProviderID: pgconv.UUID(*want), ID: user.ID,
 		}); err != nil {
 			return err
 		}
-		res, err := workersvc.ResolveClaudeProviderSource(r.Context(), q, user.ID, h.cfg.ProviderBaseURLAllowed)
+		res, err := workersvc.ResolveProviderSource(r.Context(), q, user.ID, engine, h.cfg.ProviderBaseURLAllowed)
 		if err != nil {
 			return err
 		}
@@ -152,9 +163,10 @@ func (h *Handler) SetMyClaudeProviderSource(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	out := map[string]any{"claude_provider_id": nil}
+	field := engine + "_provider_id"
+	out := map[string]any{field: nil}
 	if want != nil {
-		out["claude_provider_id"] = want.String()
+		out[field] = want.String()
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }

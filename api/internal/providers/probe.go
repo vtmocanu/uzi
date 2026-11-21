@@ -131,9 +131,10 @@ func NewProber(cfg ProbeConfig) *Prober {
 
 // ProbeTarget is what one probe needs. Key is the provider key; the caller drops it afterwards.
 type ProbeTarget struct {
+	Protocol  string
 	BaseURL   string
 	AuthStyle string
-	Model     string // the provider's mapped haiku model
+	Model     string // the provider's mapped probe model (Claude haiku or Codex default)
 	Key       []byte
 }
 
@@ -154,7 +155,22 @@ func (p *Prober) Probe(ctx context.Context, t ProbeTarget) (ProbeResult, error) 
 	if !ok {
 		return ProbeResult{}, ErrBaseURLNotAllowed
 	}
+	res := ProbeResult{Auth: AuthInconclusive, Tool: ToolNotRun}
+	protocol := t.Protocol
+	if protocol == "" {
+		protocol = ProtocolAnth
+	}
+	if protocol != ProtocolAnth && protocol != ProtocolResponses || ValidateAuthStyle(t.AuthStyle) != nil || protocol == ProtocolResponses && t.AuthStyle != AuthBearer {
+		return res, nil
+	}
 	target := entry + "/v1/messages"
+	authPayload, toolPayload := authBody(t.Model), toolBody(t.Model)
+	valid, verdict := isMessage, toolVerdict
+	if protocol == ProtocolResponses {
+		target = entry + "/responses"
+		authPayload, toolPayload = responsesBody(t.Model, false), responsesBody(t.Model, true)
+		valid, verdict = isResponse, responseToolVerdict
+	}
 	host, err := hostOf(target)
 	if err != nil {
 		return ProbeResult{}, ErrBaseURLNotAllowed
@@ -166,8 +182,7 @@ func (p *Prober) Probe(ctx context.Context, t ProbeTarget) (ProbeResult, error) 
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
-	res := ProbeResult{Auth: AuthInconclusive, Tool: ToolNotRun}
-	status, body, ok := p.step(ctx, client, target, t, authBody(t.Model))
+	status, body, ok := p.step(ctx, client, target, t, authPayload)
 	if !ok {
 		return res, nil
 	}
@@ -175,17 +190,17 @@ func (p *Prober) Probe(ctx context.Context, t ProbeTarget) (ProbeResult, error) 
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		res.Auth = AuthRejected
 		return res, nil
-	case status < 200 || status > 299 || !isMessage(body):
+	case status < 200 || status > 299 || !valid(body):
 		return res, nil
 	}
 	res.Auth = AuthOK
 
 	res.Tool = ToolInconclusive
-	status, body, ok = p.step(ctx, client, target, t, toolBody(t.Model))
-	if !ok || status < 200 || status > 299 || !isMessage(body) {
+	status, body, ok = p.step(ctx, client, target, t, toolPayload)
+	if !ok || status < 200 || status > 299 || !valid(body) {
 		return res, nil
 	}
-	res.Tool = toolVerdict(body)
+	res.Tool = verdict(body)
 	return res, nil
 }
 
@@ -237,7 +252,9 @@ func (p *Prober) step(ctx context.Context, client *http.Client, target string, t
 	if err != nil {
 		return 0, nil, false
 	}
-	req.Header.Set("anthropic-version", "2023-06-01")
+	if t.Protocol == "" || t.Protocol == ProtocolAnth {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 	req.Header.Set("content-type", "application/json")
 	if t.AuthStyle == AuthXAPIKey {
 		req.Header.Set("x-api-key", string(t.Key))
@@ -439,4 +456,74 @@ func (p *Prober) dialPinned(ctx context.Context, ap netip.AddrPort) (net.Conn, e
 		},
 	}
 	return d.DialContext(ctx, "tcp", ap.String())
+}
+
+// responsesBody keeps the Responses probe non-streaming and forces the same diagnostic tool.
+func responsesBody(model string, tool bool) []byte {
+	m := map[string]any{"model": model, "input": "ping", "max_output_tokens": 16, "stream": false}
+	if tool {
+		m["input"] = "Call the uzi_probe tool with ok set to true."
+		m["max_output_tokens"] = 64
+		m["tools"] = []any{map[string]any{"type": "function", "name": probeToolName, "description": "Connectivity probe.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"ok": map[string]string{"type": "boolean"}}, "required": []string{"ok"}, "additionalProperties": false}, "strict": true}}
+		m["tool_choice"] = map[string]string{"type": "function", "name": probeToolName}
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
+func responseOutput(body []byte) ([]json.RawMessage, bool) {
+	var m struct {
+		Object string
+		Output json.RawMessage
+	}
+	if json.Unmarshal(body, &m) != nil || m.Object != "response" {
+		return nil, false
+	}
+	if b := bytes.TrimSpace(m.Output); len(b) == 0 || b[0] != '[' {
+		return nil, false
+	}
+	var output []json.RawMessage
+	if json.Unmarshal(m.Output, &output) != nil {
+		return nil, false
+	}
+	return output, true
+}
+func isResponse(body []byte) bool { _, ok := responseOutput(body); return ok }
+
+func responseToolVerdict(body []byte) string {
+	output, ok := responseOutput(body)
+	if !ok {
+		return ToolInconclusive
+	}
+	passed := false
+	// The response byte limit bounds this scan; malformed siblings invalidate the reply.
+	for _, raw := range output {
+		var item struct {
+			Type      string
+			Name      string
+			Arguments *string
+		}
+		if json.Unmarshal(raw, &item) != nil || item.Type == "" {
+			return ToolInconclusive
+		}
+		if item.Type != "function_call" {
+			continue
+		}
+		if item.Name == "" || item.Arguments == nil {
+			return ToolInconclusive
+		}
+		var args struct {
+			OK *bool `json:"ok"`
+		}
+		if json.Unmarshal([]byte(*item.Arguments), &args) != nil {
+			return ToolInconclusive
+		}
+		if item.Name == probeToolName && args.OK != nil && *args.OK {
+			passed = true
+		}
+	}
+	if passed {
+		return ToolPassed
+	}
+	return ToolNotSupported
 }

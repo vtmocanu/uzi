@@ -59,8 +59,8 @@ func (h *Handler) providerProbe() (*providers.Prober, *providers.ProbeLimiter) {
 	return h.providerProber, h.providerProbeLimiter
 }
 
-// TestMyProvider probes one of the caller's providers (POST /api/me/providers/{id}/test): a one-token
-// Messages request and, if it succeeds, a forced single-tool request, both at the provider's base URL
+// TestMyProvider probes one of the caller's providers (POST /api/me/providers/{id}/test): a bounded
+// request in the profile's protocol and, if it succeeds, a forced single-tool request at its base URL
 // with its key. The key is opened for the call and dropped after it; the response carries the two
 // outcomes and nothing from the gateway's bodies. The result is stored for the current revision.
 func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
@@ -96,9 +96,19 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 		writeBaseURLRefusal(w)
 		return
 	}
+	var models providers.ModelMap
+	if json.Unmarshal(row.ModelMap, &models) != nil || providers.ValidateProfile(row.Engine, row.Protocol, row.AuthStyle, models) != nil {
+		httpx.Error(w, http.StatusConflict, "the provider profile is invalid")
+		return
+	}
 	model := providerHaikuModel(row.ModelMap)
+	expectedKind := store.KindAnthropicCompatibleKey
+	if row.Engine == providers.EngineCodex {
+		model = models["default"].Model
+		expectedKind = store.KindOpenAICompatibleKey
+	}
 	if model == "" {
-		httpx.Error(w, http.StatusConflict, "the provider has no haiku model")
+		httpx.Error(w, http.StatusConflict, "the provider has no probe model")
 		return
 	}
 
@@ -112,7 +122,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	key, err := secretopen.OpenByIDOfKind(r.Context(), h.q, h.vault, h.box, user.ID, row.KeySecretID.Bytes, store.KindAnthropicCompatibleKey)
+	key, err := secretopen.OpenByIDOfKind(r.Context(), h.q, h.vault, h.box, user.ID, row.KeySecretID.Bytes, expectedKind)
 	if err != nil {
 		switch {
 		case errors.Is(err, secretopen.ErrVaultLocked) || errors.Is(err, vault.ErrLocked):
@@ -149,7 +159,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	// The listener's 15 s WriteTimeout would cut a probe (two steps of up to 20 s) short.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2*providers.DefaultProbeStepTimeout + providerProbeResponseGrace))
 
-	res, err := prober.Probe(r.Context(), providers.ProbeTarget{BaseURL: entry, AuthStyle: row.AuthStyle, Model: model, Key: key})
+	res, err := prober.Probe(r.Context(), providers.ProbeTarget{Protocol: row.Protocol, BaseURL: entry, AuthStyle: row.AuthStyle, Model: model, Key: key})
 	if errors.Is(err, providers.ErrBaseURLNotAllowed) {
 		writeBaseURLRefusal(w)
 		return

@@ -108,6 +108,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			// refused unless the provider is the caller's, usable and allowlisted. A static path,
 			// matched ahead of /{id}.
 			r.Put("/claude-source", h.SetMyClaudeProviderSource)
+			r.Put("/codex-source", h.SetMyCodexProviderSource)
 			// The Test probe sends the stored key to the stored (allowlisted) destination and
 			// returns only two outcome words, so a Bearer caller can run it but cannot read the
 			// key or move the destination. Rate-limited by its own in-memory admission limiter.
