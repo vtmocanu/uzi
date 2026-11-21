@@ -1047,9 +1047,9 @@ export interface RecoveryCoordinatorOptions {
   isExecuting?: (runId: string) => boolean;
   /** PRD 4416 M2: where the exact-value scan needles of a run's secret variables come from when this coordinator
    *  publishes (a bundle upload, a held or terminal pack): the live claim's set, else the api's maintenance
-   *  answer; a withhold stops the publish and keeps custody. Absent: every publish is withheld (fail
-   *  closed). The runner always wires it. */
-  scanNeedlesFor?: (runId: string, signal?: AbortSignal) => Promise<NeedleResolution>;
+   *  answer; a withhold stops the publish and keeps custody. Required so a new construction site cannot
+   *  forget it; a coordinator whose value is absent at runtime still withholds every publish (fail closed). */
+  scanNeedlesFor: (runId: string, signal?: AbortSignal) => Promise<NeedleResolution>;
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
   /** Exact reports still need their authenticated generation evidence after FINAL.
    * Read synchronously so cleanup rechecks it at every destructive boundary. */

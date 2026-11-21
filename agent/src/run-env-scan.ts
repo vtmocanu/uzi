@@ -84,11 +84,12 @@ export type NeedleResolution =
 /**
  * Where the needles of a publish come from.
  *  - A live flight uses the set its own claim carried (`live`), including an empty set: a run whose claim
- *    carried no secret variables has nothing to mask, and that is established locally, so a non-lead-lane run
- *    (which the maintenance route answers 404 for) is never withheld while its flight is live.
+ *    carried no secret variables has nothing to mask, and that is established locally, so a run that never
+ *    receives variables is never withheld while its flight is live.
  *  - With no flight (the run is terminal, the worker restarted, or a held or terminal publication lane runs
- *    after the flight is gone) the api is asked. `{protected:false}` means no needles. A 404 (the run is
- *    deleted, is not this worker's, or is not a lead-lane run), a 409 (vault locked or a receipted version
+ *    after the flight is gone) the api is asked. `{protected:false}` means no needles, and is also the answer
+ *    for a run with no governing run (neither a lead-lane run nor a cross-check child). A 404 (the run is
+ *    deleted or is not this worker's), a 409 (vault locked or a receipted version
  *    unavailable), a network or decode error all withhold: nothing local can prove the run holds no secret
  *    versions, so the publish is refused now and retried later.
  */

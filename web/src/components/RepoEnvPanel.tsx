@@ -269,7 +269,8 @@ export function RepoEnvPanel({
         <p>
           The agent can read every value, secret or not. uzi only sets these variables in the run&rsquo;s environment; any login
           or tool configuration is done by the agent or the repo&rsquo;s scripts. Variables are set in the environment of every
-          command the repo&rsquo;s agent runs execute (not review or isolated runs). Secret values are redacted from run output and checked before anything is pushed.
+          command a repo&rsquo;s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge and cross-check runs do not receive them.
+          Secret values are redacted from run output and checked before anything is pushed.
         </p>
         <p>Disabling or deleting a variable does not revoke the credential; revoke it at the provider.</p>
       </div>
@@ -283,8 +284,8 @@ export function RepoEnvPanel({
       {heldByRuns && (
         <div className="space-y-1 text-xs text-muted">
           <p>
-            Retired secret versions are kept until the runs holding them end and their retained work is released (up to 24 hours after
-            a run ends). Until then you can still Disable or Delete a variable.
+            Retired secret versions are kept while the runs holding them are active, for at least 24 hours after they end, and longer
+            while their retained work is kept. You can still Disable or Delete a variable.
           </p>
           {heldByRuns.length > 0 ? (
             <ul className="flex flex-wrap gap-x-3 gap-y-1">

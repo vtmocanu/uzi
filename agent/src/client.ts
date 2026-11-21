@@ -4799,8 +4799,8 @@ export class WorkerClient {
 
   /** PRD 4416 M2: the secret variable versions a run was delivered, for a publish scan that has no live
    *  claim (after a restart or once the run is terminal). GET /worker/runs/{id}/run-env-redact. Resolves to
-   *  `{protected:false}` when the run holds no secret receipt. Throws a RequestError on 404 (not this
-   *  worker's run, deleted, or a run kind that never receives variables) and 409 (`vault_locked`,
+   *  `{protected:false}` when the run holds no secret receipt or has no governing run (not lead-lane, not
+   *  a cross-check child). Throws a RequestError on 404 (not this worker's run, or deleted) and 409 (`vault_locked`,
    *  `run_env_history_unavailable`), and a decoder error on a malformed body: the caller treats every
    *  throw as "cannot prove the publish clean". The body carries plaintext secrets and is never logged. */
   async getRunEnvRedact(runId: string, signal?: AbortSignal): Promise<RunEnvRedactResponse> {

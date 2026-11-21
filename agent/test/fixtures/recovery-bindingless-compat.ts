@@ -7,6 +7,7 @@ import { GitCache, type PositiveOwedCandidateContext } from "../../src/git.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryBundleProducer, type RecoveryRecord } from "../../src/recovery.js";
 import type { RecoveryExactHold } from "../../src/protocol.js";
 import { nullLogger } from "../helpers.js";
+import { NO_SCAN_NEEDLES } from "../run-env-test-support.js";
 
 const workerToken = "bindingless-compat-fixture-worker";
 const id = (n: number) => `31050000-0000-4000-8000-${String(n).padStart(12, "0")}`;
@@ -88,7 +89,7 @@ export function environment(f: Fixture, ReaderClass: Reader = RecoveryCoordinato
   };
   const make = () => new ReaderClass({
     recoveryRoot: path.join(f.root, "data", "recovery"), workerToken: token,
-    client, git: producer, log, now: () => 1000,
+    client, git: producer, log, now: () => 1000, ...NO_SCAN_NEEDLES,
     withCompletionSourceBoundary: async (source, action) => {
       assert.equal(git(source.clonePath, "rev-parse", "HEAD"), source.expectedHead);
       assert.equal(await fs.readFile(path.join(source.clonePath, "retained.txt"), "utf8"), "retained source before rollback\n");

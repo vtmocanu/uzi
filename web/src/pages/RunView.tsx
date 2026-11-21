@@ -1720,7 +1720,7 @@ function RunEnvHistoryHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
   if (run.status !== "paused" || run.hold_reason !== "run_env_history_unavailable") return null;
   return <Card className="p-4">
     <h2 className="text-sm font-semibold text-warn">Variable history unavailable: waiting for owner</h2>
-    <p className="mt-1 text-xs text-muted">The run is paused because a secret variable version it was given can no longer be read, so its output cannot be masked. The agent was not restarted.</p>
+    <p className="mt-1 text-xs text-muted">The run is paused because a secret variable version it was given can no longer be read, so its output cannot be masked. The agent was not started for this attempt.</p>
     <p className="mt-1 text-xs text-muted">Resume retries once the variable history is restored; it pauses again while the version is still missing. Otherwise, Cancel the run. This run does not resume automatically.</p>
     {ownerProof ? <div className="mt-3 flex gap-2">
       <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
