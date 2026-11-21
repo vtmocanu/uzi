@@ -3479,6 +3479,14 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
           : { agents, config: c.config, leadConfig: reporter, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
         approveWith("own"),
       );
+      if (c.id.includes("unsupported")) {
+        // PRD #3252: the contract case records the request the claim resolves to, which no turn may
+        // send: the executor refuses the unsupported phase configuration regardless of approval state.
+        await assert.rejects(() => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /unsupported phase configuration/);
+        assert.equal(turns.length, 0, `${c.id}: the refusal precedes every turn`);
+        visited.push(c.id);
+        continue;
+      }
       await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
       assert.ok(turns.length >= 1, `${c.id}: a turn ran`);
       // Only the turns of the case's own phase: the first turn is the plan turn, the rest implement.
@@ -10551,16 +10559,18 @@ describe("SdkExecutor Claude planning phase model/effort (PRD #3252 M3)", () => 
     assert.equal(turns.length, 0);
   });
 
-  it("a fresh seeded start with no session runs no plan turn and proceeds on the implement request without a model key", async () => {
+  it("the unsupported configuration is refused even for a fresh pre-approved seeded start with no session", async () => {
     const noModelLead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT" };
     const config: ClaimConfig = { plan_phase: { model: "opus" } };
     const { queryFn, turns } = phaseTurns([[signalDone(), resultSuccess()]]);
     const { ctx } = makeCtx({
       agents: [noModelLead, coder], config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
     });
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
-    assert.equal(turns.length, 1);
-    assert.ok(!("model" in turns[0]!.options), "no model key: the planning model never reaches the implement turn");
+    await assert.rejects(
+      () => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
+      (err: Error) => /set an implementation \(worker\) model, or clear the Claude planning model/.test(err.message),
+    );
+    assert.equal(turns.length, 0, "no turn ran");
   });
 });
 
@@ -10641,6 +10651,33 @@ describe("SdkExecutor settings barrier on a phase switch (PRD #3252 m4)", () => 
     assert.equal(err.cause, "model_mismatch");
     assert.deepEqual(err.requested, { model: "opus", effort: "high" });
     assert.equal(turns.length, 1, "no retry and no fresh-session restart");
+  });
+
+  it("a resumed-gate revise whose plan-phase barrier fails stays unsettled: the revise input is acknowledged only by a gate call after a verified turn", async () => {
+    const resumedGate = (settledWith: Array<number | undefined>) => ({
+      agents: [lead, coder], config: PHASE_CONFIG, sessionId: "sess-1", planApproved: false, resumePhase: "awaiting_approval" as const,
+      approvedPlan: "# Submitted",
+      takeResumedGateEvent: async () => ({ kind: "revise" as const, feedback: "split it", inputId: 7 }),
+      gatePlan: async (_plan: string, _milestones: unknown, _persisted: unknown, settles?: number) => {
+        settledWith.push(settles);
+        return approve;
+      },
+    });
+    // Control: a verified revise turn reaches the gate, which settles input 7.
+    const okSettled: Array<number | undefined> = [];
+    const ok = barrierTurns([[submitPlan("revised"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn: ok.queryFn, ...fast }).run(makeCtx(resumedGate(okSettled)).ctx);
+    assert.deepEqual(okSettled, [7], "the verified revise settles its input at the re-gate");
+    assert.equal(ok.turns[0]!.options.model, "opus", "the revise turn resumed the session with the planning pair");
+    // A barrier that cannot prove the planning pair holds the run before the turn and before any settle.
+    const heldSettled: Array<number | undefined> = [];
+    const bad = barrierTurns([[submitPlan("revised"), resultSuccess()]], () => ({ model: "claude-sonnet-5-5", effort: "medium" }));
+    const err = await new SdkExecutor(nullLogger(), homeDir, { queryFn: bad.queryFn, ...fast })
+      .run(makeCtx(resumedGate(heldSettled)).ctx).then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof PhaseSwitchUnverifiedError, `got ${String(err)}`);
+    assert.deepEqual(heldSettled, [], "no gate call, hence no settle or acknowledgement of the revise input");
+    assert.equal(bad.turns.length, 1, "no retry");
+    assert.equal(bad.turns[0]!.promptText, undefined, "the revise prompt was never delivered");
   });
 
   it("the first plan turn of a claim (no session to resume) is not gated", async () => {

@@ -2422,16 +2422,15 @@ export class SdkExecutor implements Executor {
         ctx.resumePhase === "awaiting_approval" &&
         !!ctx.approvedPlan?.trim();
 
-      // PRD #3252: the unsupported-phase-configuration refusal (see leadModel above). Only a
-      // fresh pre-approved start with no session is exempt: it runs no plan turn and has no
-      // session to inherit the planning model from, so it proceeds on the implement request. A
-      // resume at the gate is NOT exempt: a revise there opens a planning session that the
-      // implement turn would resume with no model key, keeping the planning model.
+      // PRD #3252: the unsupported-phase-configuration refusal (see leadModel above), regardless
+      // of approval state: a planning model with no implement model has no model key to switch
+      // back with, so every start or resume (pre-approved, resumed at the gate, or fresh) is
+      // refused rather than left to run or resume under the planning model. A provider run is
+      // skipped: resolveProviderModel always yields an explicit model or throws.
       if (
         ctx.config?.plan_phase?.model &&
         state.implementRequest.model === undefined &&
-        !ctx.provider &&
-        (!preApproved || !!ctx.sessionId)
+        !ctx.provider
       ) {
         throw new Error(REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL);
       }

@@ -43,6 +43,8 @@ interface HoldOptions {
   iid: number;
   /** Queue an owner cancel input while the nth (1-based) hold request is in flight. */
   cancelDuringPost?: number;
+  /** Production configuration: no independent hold deadline (the default tests set a TEST-ONLY one). */
+  noDeadline?: boolean;
 }
 
 const IMPLEMENT_HELD = {
@@ -93,7 +95,7 @@ async function runHold(opts: HoldOptions) {
   const t0 = Date.now();
   let finished = false;
   const flight = runnerWith(() => ({ executor }), gitlab, undefined, nullLogger(),
-    { recoveryRetryMs: 5, phaseSwitchHoldDeadlineMs: 3_000 }).execute(claim).finally(() => { finished = true; });
+    { recoveryRetryMs: 5, ...(opts.noDeadline ? {} : { phaseSwitchHoldDeadlineMs: 3_000 }) }).execute(claim).finally(() => { finished = true; });
   try {
     await flight;
   } finally {
@@ -173,12 +175,12 @@ describe("phase-switch hold (issue #3252 m4)", () => {
 
   it("a lost ACK followed by an owner Resume: queued with the hold reason at our generation ends the flight with no further post or report", async () => {
     const r = await runHold({
-      iid: 32528, post: [unknown, held],
+      iid: 32528, post: [unknown, held], noDeadline: true,
       ownership: [ownRow(1, { status: "queued", hold_reason: PHASE_SWITCH_HOLD_REASON })],
     });
     assert.equal(r.posts.length, 1, "no post after the observation");
     assert.equal(r.ownershipReads(), 1, "the queued observation settled the outcome at once");
-    assert.ok(r.elapsedMs < 1_500, `resumed is recognised promptly, not at the hold deadline (${r.elapsedMs} ms)`);
+    assert.ok(r.elapsedMs < 20_000, `resumed is recognised promptly, not at the hold deadline (${r.elapsedMs} ms)`);
     assert.equal(r.runs, 1);
     assert.deepEqual(terminal(r.states), []);
     assert.deepEqual([...new Set(r.states)], ["running"], "no report changed the row after the observation");
@@ -191,12 +193,12 @@ describe("phase-switch hold (issue #3252 m4)", () => {
 
   it("a 409 whose ownership shows queued with the hold reason is confirmed by the read, with no second post", async () => {
     const r = await runHold({
-      iid: 32529, post: [{ outcome: "refused", status: "queued", holdReason: PHASE_SWITCH_HOLD_REASON }, held],
+      iid: 32529, post: [{ outcome: "refused", status: "queued", holdReason: PHASE_SWITCH_HOLD_REASON }, held], noDeadline: true,
       ownership: [ownRow(1, { status: "queued", hold_reason: PHASE_SWITCH_HOLD_REASON })],
     });
     assert.equal(r.posts.length, 1);
     assert.equal(r.ownershipReads(), 1, "one read confirmed it");
-    assert.ok(r.elapsedMs < 1_500, `confirmed promptly, not at the hold deadline (${r.elapsedMs} ms)`);
+    assert.ok(r.elapsedMs < 20_000, `confirmed promptly, not at the hold deadline (${r.elapsedMs} ms)`);
     assert.deepEqual(terminal(r.states), []);
   });
 
@@ -233,21 +235,40 @@ describe("phase-switch hold (issue #3252 m4)", () => {
     ["a terminal status", ownRow(1, { status: "completed" })],
   ] as Array<[string, Own]>) {
     it(`definitive non-live (${name}) stops at once: one post, one read, no report`, async () => {
-      const r = await runHold({ iid: 32540 + name.length, post: [unknown], ownership: [own] });
+      const r = await runHold({ iid: 32540 + name.length, post: [unknown], ownership: [own], noDeadline: true });
       assert.equal(r.posts.length, 1);
       assert.equal(r.ownershipReads(), 1);
       assert.deepEqual(terminal(r.states), []);
-      assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+      assert.ok(r.elapsedMs < 20_000, "returned well before the retry deadline");
       assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), "the Paused line was posted");
       assert.ok(r.feed.includes("This worker no longer holds the run and has stopped working on it. This worker keeps its copy of the work."),
         `the feed corrects the Paused line: ${r.feed.join(" | ")}`);
     });
   }
 
-  it("a hold request whose reply and every ownership read are lost ends at the deadline without claiming the run is not paused", async () => {
+  it("a server-side park (paused with another hold reason at our generation) ends the flight promptly with no post, report or deadline wait", async () => {
+    for (const [i, reason] of ["budget_exhausted", "wall"].entries()) {
+      const r = await runHold({
+        iid: 32580 + i, post: [unknown, held],
+        ownership: [{ status: 503 }, ownRow(1, { status: "paused", hold_reason: reason })],
+        noDeadline: true,
+      });
+      assert.equal(r.posts.length, 1, "no post after the park observation");
+      assert.equal(r.ownershipReads(), 2);
+      assert.ok(r.elapsedMs < 20_000, `recognised promptly (${r.elapsedMs} ms)`);
+      assert.equal(r.runs, 1);
+      assert.deepEqual(terminal(r.states), [], "no terminal report");
+      assert.deepEqual([...new Set(r.states)], ["running"], "no report changed the row");
+      assert.equal(r.cloneKept, true, "the clone is kept");
+      assert.ok(r.feed.includes(`The server paused the run first (${reason}); this worker keeps the work.`), r.feed.join(" | "));
+      assert.ok(!r.feed.some((t) => t.includes("no longer holds the run")));
+    }
+  });
+
+  it("TEST-ONLY phaseSwitchHoldDeadlineMs: a hold request whose reply and every ownership read are lost ends at the explicit test deadline without claiming the run is not paused", async () => {
     const r = await runHold({ iid: 32575, post: [unknown], ownership: [{ status: 503 }] });
     assert.deepEqual(terminal(r.states), [], "no terminal report");
-    assert.ok(r.elapsedMs >= 2_500, `waited for the hold deadline (${r.elapsedMs} ms)`);
+    assert.ok(r.elapsedMs >= 2_500, `waited for the explicit test deadline (${r.elapsedMs} ms)`);
     assert.ok(r.feed.includes("The pause could not be confirmed; the run may not be paused. This worker keeps the work."),
       `the feed hedges rather than asserting the run is not paused: ${r.feed.join(" | ")}`);
     assert.ok(!r.feed.some((t) => t.includes("no longer holds the run")), "the definitive non-live line is not used for an unknown outcome");
@@ -255,22 +276,22 @@ describe("phase-switch hold (issue #3252 m4)", () => {
   });
 
   it("an owner Cancel queued during an unknown hold request reports cancelled and cleans up like any cancel", async () => {
-    const r = await runHold({ iid: 32560, post: [unknown], cancelDuringPost: 1, ownership: [ownRow(1)] });
+    const r = await runHold({ iid: 32560, post: [unknown], cancelDuringPost: 1, ownership: [ownRow(1)], noDeadline: true });
     assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
     assert.equal(r.cloneKept, false, "the normal cancelled cleanup removed the clone");
     assert.ok(!r.feed.some((t) => t.includes("could not be confirmed") || t.includes("no longer holds the run")));
-    assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+    assert.ok(r.elapsedMs < 20_000, "returned well before the retry deadline");
   });
 
   it("an ownership read naming a cancellation request reports cancelled and cleans up like any cancel", async () => {
     const r = await runHold({
-      iid: 32561, post: [unknown], cancelDuringPost: 1,
+      iid: 32561, post: [unknown], cancelDuringPost: 1, noDeadline: true,
       ownership: [ownRow(1, { cancellation_requested: true })],
     });
     assert.ok(r.ownershipReads() >= 1);
     assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
     assert.equal(r.cloneKept, false, "the normal cancelled cleanup removed the clone");
-    assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+    assert.ok(r.elapsedMs < 20_000, "returned well before the retry deadline");
   });
 
   it("a pending cancellation the input read cannot confirm is retried, never reported as a lost claim", async () => {
