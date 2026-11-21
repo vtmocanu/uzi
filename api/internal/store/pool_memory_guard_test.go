@@ -61,31 +61,33 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	ctx := context.Background()
 	pmRequireThrowawayDB(ctx, t, adminDSN)
 
-	dbExists := func(name string) bool {
-		t.Helper()
+	// Both helpers report on the *testing.T they are given, so a subtest never fails its parent.
+	dbExists := func(tt *testing.T, name string) bool {
+		tt.Helper()
 		c, err := pgx.Connect(ctx, adminDSN)
 		if err != nil {
-			t.Fatalf("dbExists connect: %v", err)
+			tt.Fatalf("dbExists connect: %v", err)
 		}
 		defer func() { _ = c.Close(ctx) }()
 		if err := pmCheckMarker(ctx, c); err != nil {
-			t.Fatalf("dbExists marker: %v", err)
+			tt.Fatalf("dbExists marker: %v", err)
 		}
 		var ok bool
 		if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&ok); err != nil {
-			t.Fatalf("dbExists query: %v", err)
+			tt.Fatalf("dbExists query: %v", err)
 		}
 		return ok
 	}
-	// makeDB creates a fixture database directly from template0 and registers its exact-name drop.
-	makeDB := func(name string) {
-		t.Helper()
+	// makeDB creates a fixture database directly from template0 and registers its exact-name drop
+	// on tt.
+	makeDB := func(tt *testing.T, name string) {
+		tt.Helper()
 		if err := pmAdminExec(ctx, adminDSN, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE template0"); err != nil {
-			t.Fatalf("create fixture %s: %v", name, err)
+			tt.Fatalf("create fixture %s: %v", name, err)
 		}
-		t.Cleanup(func() {
+		tt.Cleanup(func() {
 			if err := pmDropDB(adminDSN, name); err != nil {
-				t.Errorf("drop fixture %s: %v", name, err)
+				tt.Errorf("drop fixture %s: %v", name, err)
 			}
 		})
 	}
@@ -101,7 +103,7 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("template name: %v", err)
 	}
-	makeDB(tplName)
+	makeDB(t, tplName)
 	lab := &pmLab{t: t, out: &pmOut{f: outFile}, adminDSN: adminDSN, rawDir: t.TempDir(), jit: "default",
 		prefix: labPrefix, templateName: tplName, exec: pmAdminExec}
 
@@ -109,8 +111,16 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 		p := pmGuardPrefix()
 		unmarked := p + "_unmarked"
 		probe := p + "_probe"
-		makeDB(unmarked)
-		t.Cleanup(func() { _ = pmDropDB(adminDSN, probe) }) // safety net if the guard ever fails
+		makeDB(t, unmarked)
+		t.Cleanup(func() { // safety net if the guard ever fails: drop the probe and fail the test
+			if !dbExists(t, probe) {
+				return
+			}
+			t.Errorf("probe database %s exists; dropping it", probe)
+			if err := pmDropDB(adminDSN, probe); err != nil {
+				t.Errorf("drop probe %s: %v", probe, err)
+			}
+		})
 		udsn := pmDSNForDB(t, adminDSN, unmarked)
 		uc, err := pgx.Connect(ctx, udsn)
 		if err != nil {
@@ -126,7 +136,7 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 		if !errors.As(err, &ae) || ae.Stage != pmStageMarker {
 			t.Fatalf("pmAdminExec on unmarked db = %v, want marker-stage pmAdminErr", err)
 		}
-		if dbExists(probe) {
+		if dbExists(t, probe) {
 			t.Fatalf("probe database %s was created despite the missing marker", probe)
 		}
 	})
@@ -150,32 +160,51 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	})
 
 	victim := labPrefix + "_victim"
-	makeDB(victim)
+	makeDB(t, victim)
 	t.Run("collision", func(t *testing.T) {
+		l := *lab
+		l.t = t
 		ran := false
-		err := lab.clone(ctx, "victim", func(string, string, *pmObserver) { ran = true })
+		err := l.clone(ctx, "victim", func(string, string, *pmObserver) { ran = true })
 		if err == nil {
 			t.Fatal("clone over a pre-existing database returned nil")
+		}
+		if strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("a definite server ERROR was classified ambiguous: %v", err)
+		}
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "42P04" {
+			t.Fatalf("clone error = %v, want a *pgconn.PgError with code 42P04 (duplicate_database)", err)
 		}
 		if ran {
 			t.Fatal("fn ran although the CREATE failed")
 		}
 	})
-	if !dbExists(victim) {
+	if !dbExists(t, victim) {
 		t.Fatalf("pre-existing database %s was dropped", victim)
 	}
 
 	foreign := "pm_" + strings.ReplaceAll(uuid.New().String(), "-", "") + "_foreign"
-	makeDB(foreign)
+	makeDB(t, foreign)
 	okName := labPrefix + "_ok"
+	t.Cleanup(func() { // safety net: drop okName only if the clone's own cleanup left it behind
+		if !dbExists(t, okName) {
+			return
+		}
+		if err := pmDropDB(adminDSN, okName); err != nil {
+			t.Errorf("drop %s: %v", okName, err)
+		}
+	})
 	t.Run("owned-only cleanup", func(t *testing.T) {
+		l := *lab
+		l.t = t
 		ran := false
-		err := lab.clone(ctx, "ok", func(name, _ string, _ *pmObserver) {
+		err := l.clone(ctx, "ok", func(name, _ string, _ *pmObserver) {
 			ran = true
 			if name != okName {
 				t.Errorf("clone name %q, want %q", name, okName)
 			}
-			if !dbExists(name) {
+			if !dbExists(t, name) {
 				t.Errorf("clone %s does not exist inside fn", name)
 			}
 		})
@@ -186,17 +215,21 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 			t.Fatal("fn did not run")
 		}
 	})
-	if dbExists(okName) {
+	if dbExists(t, okName) {
 		t.Errorf("owned clone %s was not dropped", okName)
 	}
 	for _, keep := range []string{foreign, victim} {
-		if !dbExists(keep) {
+		if !dbExists(t, keep) {
 			t.Errorf("database %s that this lab did not create was dropped", keep)
 		}
 	}
 
 	ambName := labPrefix + "_amb"
-	t.Cleanup(func() { _ = pmDropDB(adminDSN, ambName) })
+	t.Cleanup(func() {
+		if err := pmDropDB(adminDSN, ambName); err != nil {
+			t.Errorf("drop %s: %v", ambName, err)
+		}
+	})
 	var recorded []string
 	lab2 := *lab
 	lab2.exec = func(ctx context.Context, dsn, sql string) error {
@@ -208,6 +241,8 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 		return err
 	}
 	t.Run("ambiguous creation", func(t *testing.T) {
+		lab2 := lab2
+		lab2.t = t
 		ran := false
 		err := lab2.clone(ctx, "amb", func(string, string, *pmObserver) { ran = true })
 		if err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "preserved") {
@@ -222,7 +257,7 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 			t.Errorf("a DROP was issued after an ambiguous CREATE: %s", s)
 		}
 	}
-	if !dbExists(ambName) {
+	if !dbExists(t, ambName) {
 		t.Errorf("database %s was not preserved after the ambiguous CREATE", ambName)
 	}
 }

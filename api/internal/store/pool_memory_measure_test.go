@@ -3289,16 +3289,13 @@ type pmLab struct {
 	// template database name.
 	prefix       string
 	templateName string
-	// exec runs one admin statement; nil means pmAdminExec. It is a plain func value so a copy
-	// of the lab (el := *lab) stays safe.
+	// exec runs one admin statement; every construction sets it (pmAdminExec, or a test seam).
+	// It is a plain func value so a copy of the lab (el := *lab) stays safe.
 	exec func(ctx context.Context, adminDSN, sql string) error
 }
 
 func (l *pmLab) run(ctx context.Context, sql string) error {
-	if l.exec != nil {
-		return l.exec(ctx, l.adminDSN, sql)
-	}
-	return pmAdminExec(ctx, l.adminDSN, sql)
+	return l.exec(ctx, l.adminDSN, sql)
 }
 
 // drop issues DROP DATABASE IF EXISTS ... WITH (FORCE) through the lab's exec seam.
@@ -3306,21 +3303,26 @@ func (l *pmLab) drop(name string) error {
 	return pmDropDBWith(l.run, name)
 }
 
-// create runs a CREATE DATABASE statement for name and reports whether this call owns the
+// create runs a CREATE DATABASE statement for name. A nil return means this call owns the
 // database. An ambiguous outcome (the statement may have been applied) preserves the database
 // and returns an error naming the manual drop; a definite failure drops nothing.
-func (l *pmLab) create(ctx context.Context, name, sql string) (bool, error) {
+func (l *pmLab) create(ctx context.Context, name, sql string) error {
 	err := l.run(ctx, sql)
 	created, ambiguous := pmCreateOutcome(err)
 	switch {
 	case created:
-		return true, nil
+		return nil
 	case ambiguous:
-		return false, fmt.Errorf("creation outcome ambiguous; %s preserved, not dropped; if it exists and is unwanted run: DROP DATABASE %s WITH (FORCE): %w",
+		return fmt.Errorf("creation outcome ambiguous; %s preserved, not dropped; if it exists and is unwanted run: DROP DATABASE %s WITH (FORCE): %w",
 			name, pgx.Identifier{name}.Sanitize(), err)
 	default:
-		return false, fmt.Errorf("create database %s: %w", name, err)
+		return fmt.Errorf("create database %s: %w", name, err)
 	}
+}
+
+// pmIdentRune reports whether r is allowed in a database name suffix ([a-z0-9_]).
+func pmIdentRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_'
 }
 
 // pmDBName joins prefix and suffix, lowercasing the suffix. It rejects characters outside
@@ -3328,7 +3330,7 @@ func (l *pmLab) create(ctx context.Context, name, sql string) (bool, error) {
 func pmDBName(prefix, suffix string) (string, error) {
 	suffix = strings.ToLower(suffix)
 	for _, r := range suffix {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+		if !pmIdentRune(r) {
 			return "", fmt.Errorf("database name suffix %q has invalid character %q (allowed [a-z0-9_])", suffix, r)
 		}
 	}
@@ -3377,8 +3379,7 @@ func pmDSNForDB(t *testing.T, dsn, db string) string {
 	return u.String()
 }
 
-// pmAdminExec runs one statement (simple protocol, so CREATE/DROP DATABASE are legal) on a
-// short-lived superuser connection to the maintenance database.
+// Stages of pmAdminExec at which an error can arise.
 const (
 	pmStageConnect = "connect"
 	pmStageMarker  = "marker"
@@ -3439,17 +3440,14 @@ func (l *pmLab) clone(ctx context.Context, label string, fn func(name, dsn strin
 	if err != nil {
 		return fmt.Errorf("clone name: %w", err)
 	}
-	created, err := l.create(ctx, name, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{l.templateName}.Sanitize())
-	if err != nil {
+	if err := l.create(ctx, name, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{l.templateName}.Sanitize()); err != nil {
 		return err
 	}
-	if created {
-		defer func() {
-			if err := l.drop(name); err != nil {
-				l.t.Errorf("drop clone %s: %v", name, err)
-			}
-		}()
-	}
+	defer func() {
+		if err := l.drop(name); err != nil {
+			l.t.Errorf("drop clone %s: %v", name, err)
+		}
+	}()
 	if l.jit == "off" {
 		if err := l.run(ctx, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" SET jit = off"); err != nil {
 			return fmt.Errorf("disable jit on clone %s: %w", name, err)
@@ -3548,17 +3546,16 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	lab.templateName = tplName
 	// The template and every clone are named from this invocation's own prefix, so no existing
 	// database can collide with them and nothing is dropped unless this run created it.
-	created, err := lab.create(ctx, tplName, "CREATE DATABASE "+pgx.Identifier{tplName}.Sanitize())
-	if err != nil {
+	// TEMPLATE template0: a bare CREATE DATABASE copies template1, which fails (55006) while any
+	// other session is connected to template1.
+	if err := lab.create(ctx, tplName, "CREATE DATABASE "+pgx.Identifier{tplName}.Sanitize()+" TEMPLATE template0"); err != nil {
 		t.Fatalf("create template: %v", err)
 	}
-	if created {
-		t.Cleanup(func() {
-			if err := lab.drop(tplName); err != nil {
-				t.Errorf("drop template: %v", err)
-			}
-		})
-	}
+	t.Cleanup(func() {
+		if err := lab.drop(tplName); err != nil {
+			t.Errorf("drop template: %v", err)
+		}
+	})
 	tdsn := pmDSNForDB(t, adminDSN, tplName)
 	if err := store.Migrate(ctx, tdsn); err != nil {
 		t.Fatalf("migrate: %v", err)
