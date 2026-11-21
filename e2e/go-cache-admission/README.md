@@ -416,3 +416,6 @@ PROVEN leg.
 `test_observe.py` runs the collector in subprocesses (it redirects fds 1 and 2) against owned
 loopback TCP and AF_UNIX stub daemons; no real Docker endpoint, container, image pull or Go run.
 Its stubs prove sanitization, routes, lifecycle and caps, not any environment.
+
+The requirement-by-requirement record of the one candidate evaluated with this collector, its
+verdict and the owner decision requests are in [environment.md](environment.md).

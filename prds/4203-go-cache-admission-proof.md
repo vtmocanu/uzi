@@ -145,3 +145,18 @@ resource/scope decision for the heavy representative matrix. This is a prerequis
 proposal, not production enablement, a new privilege policy or a D13 exception.
 
 Formal partial delivery (2026-11-12) retains M4 and defers incomplete M1 and unstarted M2-M3. This nonclosing PR delivers the nonproducing scaffold and evidence only. No producing leg or A/B viability is established, no criterion is waived as met, and #4203/#2013 remain open. Owner production decision and the deferred prerequisites remain pending. Hosted proof and production acceptance are not established by this report.
+
+## Follow-up 2026-11-21: #4575 environment verification
+
+Issue #4575 evaluated one candidate environment read-only: this run's own DinD daemon, through GET requests only. No container, pull, mount, privilege or configuration change occurred. The verdict is **NO-QUALIFIED-ENVIRONMENT**. The full record, with each assertion labelled observed, cited, inferred or UNVERIFIED and bound to a revision, is [environment.md](../e2e/go-cache-admission/environment.md).
+
+The daemon facts were observed. The prerequisites remain UNVERIFIED, each with its missing mechanism named there:
+
+- image and Go-toolchain binding: no Go-bearing image is verified, and only host Go coordinates exist;
+- live soft threshold: no owner input, so no effective value bound to an incarnation;
+- all-sink, all-mount charge map and enforcement: no container mount, fd, capability or seccomp facts;
+- backing capacity and the canary: not collected and not run.
+
+Owner requests, none granted: (a) threshold inputs; (b) a digest-pinned Go-toolchain image already on the run's daemon with trusted output provenance (acquisition needs separate approval); (c) the inode ceiling 65,536 with its split; (d) a later bounded canary on that image.
+
+Producer admission stays closed. #4203 and #2013 remain open. The historical proof above is not rewritten, and M1-M3 of #4203 remain deferred. Closing the prerequisite issue does not authorize producers.
