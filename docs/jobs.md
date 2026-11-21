@@ -169,6 +169,7 @@ A store failure while checking the token answers 503 `auth_unavailable` with no 
 | 403 | `job_type_not_allowed` | The product does not allow this job type |
 | 404 | `not_found` | No such job for this caller |
 | 409 | `job_terminal` | Cancel of a finished job |
+| 409 | `provider_lane_unsupported` | Your Claude source is a model provider; jobs do not support one yet (until PRD #4322) |
 | 413 | `payload_too_large` | The create body is over 4 MiB |
 | 403 | `egress_profile_not_allowed` | A product token named a site list its product is not allowed to use |
 | 404 | `unknown_egress_profile` | `egress_profile` names no existing site list |
