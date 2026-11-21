@@ -3386,10 +3386,10 @@ function phaseSwitchHoldText(
 
 /** Issue #3252: follow-up feed lines when a phase-switch hold ended without the server confirming it,
  *  so the earlier "Paused:" line is not left standing. "nonlive" is a definitive ownership answer (this
- *  claim is gone); "stopped" (deadline, shutdown) is not, since an applied hold whose ACK was lost
+ *  claim is released, terminal or superseded); "stopped" (deadline, shutdown) is not, since an applied hold whose ACK was lost
  *  followed by failed reads is indistinguishable from an unapplied one, so it states only what is known. */
 const PHASE_SWITCH_NONLIVE_TEXT =
-  "This worker no longer holds the run, so it stopped working on it. This worker keeps its copy of the work.";
+  "This worker no longer holds the run and has stopped working on it. This worker keeps its copy of the work.";
 const PHASE_SWITCH_UNCONFIRMED_TEXT =
   "The pause could not be confirmed; the run may not be paused. This worker keeps the work.";
 
@@ -26787,13 +26787,17 @@ export class RunRunner {
       return "unknown";
     }
     const generation = Number.isSafeInteger(own.claim_generation) ? own.claim_generation : undefined;
-    if (own.claim_released === true || own.cancellation_requested === true ||
+    if (own.claim_released === true ||
         (typeof own.status === "string" && TERMINAL_RUN_STATUSES.has(own.status)) ||
         (generation !== undefined && generation !== flight.claimGeneration)) {
-      if (own.cancellation_requested === true) {
-        await flight.steering.observePendingCancellation(signal).catch(() => undefined);
-      }
       return "nonlive";
+    }
+    if (own.cancellation_requested === true) {
+      // The claim is still ours: an owner Cancel is pending. Mark it through the input read so the
+      // caller takes the ordinary cancel path; if that read fails or names no cancel yet, this is not
+      // a definitive answer, so retry rather than end the flight as if the claim were gone.
+      await flight.steering.observePendingCancellation(signal).catch(() => undefined);
+      return flight.steering.isCancelled() ? "nonlive" : "unknown";
     }
     if (generation !== flight.claimGeneration || own.claim_released !== false || typeof own.status !== "string" ||
         own.hold_reason === undefined) return "unknown";

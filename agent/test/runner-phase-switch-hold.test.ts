@@ -239,7 +239,7 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       assert.deepEqual(terminal(r.states), []);
       assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
       assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), "the Paused line was posted");
-      assert.ok(r.feed.includes("This worker no longer holds the run, so it stopped working on it. This worker keeps its copy of the work."),
+      assert.ok(r.feed.includes("This worker no longer holds the run and has stopped working on it. This worker keeps its copy of the work."),
         `the feed corrects the Paused line: ${r.feed.join(" | ")}`);
     });
   }
@@ -271,6 +271,13 @@ describe("phase-switch hold (issue #3252 m4)", () => {
     assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
     assert.equal(r.cloneKept, false, "the normal cancelled cleanup removed the clone");
     assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+  });
+
+  it("a pending cancellation the input read cannot confirm is retried, never reported as a lost claim", async () => {
+    const r = await runHold({ iid: 32563, post: [unknown], ownership: [ownRow(1, { cancellation_requested: true })] });
+    assert.ok(r.ownershipReads() > 1, "the unconfirmed cancellation is re-read, not taken as definitive");
+    assert.ok(!r.feed.some((t) => t.includes("no longer holds the run")), `the claim is still ours: ${r.feed.join(" | ")}`);
+    assert.ok(r.feed.includes("The pause could not be confirmed; the run may not be paused. This worker keeps the work."));
   });
 
   it("a plan-phase hold interrupted by an owner Cancel also reports cancelled", async () => {
