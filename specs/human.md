@@ -14,6 +14,12 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 - Fresh compatible task claims freeze validated root work-branch and own-run checkpoint-key coordinates with `task_checkpoint_coordinates_v1`; issue/self-improvement keys stay exact, active legacy tasks are not converted, invalid lineage stays unsupported and old workers receive no descriptor. Authorization markers do not prove durability: known no-write may continue on the inherited branch; unavailable/mismatched confirmed anchors or unresolved writes without verified evidence retain custody and fail closed. Ordinary checkpoints are committed-only; WIP requires verified capture overlay. Read-only review, task MR behavior, custody/generation/CAS and issue-only milestone policy remain unchanged. Old API rollback can stall queue-head claims or reject whole mixed readoption batches; roll forward compatible API. Schema Down refuses enrolled rows; capability overrides cannot bypass compatibility. See [ADR-3343](../adr/3343-task-checkpoint-coordinates.md). (AI-synced 2026-10-24)
 
+## Feature #4416 — Run environment variables
+
+PRD at `prds/4416-repo-env-vars.md` (M1 and M2 shipped; M3 and M4 pending).
+
+- A repo's variables reach lead-lane runs only (`issue`, `ci_fix`, `prompt`, `self_improve`, `mr_rework`, `task`, no review target, no egress profile), at the lowest precedence in the agent command environment on both harnesses; chat, judge, job, task-review and cross-check runs get none. Secret values are redacted from run output and every publish (checkpoint, final push on every forge, held and terminal packs, recovery uploads, preserved patch) is exact-value scanned and fails closed. A run is claimed only by a worker reporting `run_env_v1`. (AI-synced 2026-11-21)
+
 ## Project
 
 - Name: "Uzinele Întunecate" (uzi) — an AI dark factory.

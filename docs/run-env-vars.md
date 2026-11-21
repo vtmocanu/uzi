@@ -6,9 +6,6 @@ audience: user
 
 # Run environment variables
 
-> **Temporary note (milestone 1).** Variables are stored and managed, but
-> **not yet injected into runs**. Saving one has no effect on any run today.
-
 Give a repo's runs named settings and credentials, such as a database URL or a
 package index token. Each variable belongs to one repo and is either **secret**
 or **plain**. Values are sealed through your per-user vault.
@@ -17,14 +14,91 @@ Set them under **Repos → Environment variables**. Writes are web-only. The CLI
 can list a repo's variables read-only: `uzi repo env list <id>`
 ([CLI reference](./cli.md)).
 
+## Which runs get them
+
+A run receives its repo's enabled variables as environment variables in every
+command its agent runs, on both the Claude and the Codex harness, the way a CI
+job receives CI variables. Tools that read the environment work unchanged.
+
+- **Run kinds**: runs that have a lead agent working on the repo (issue, prompt,
+  CI-fix, MR-rework, self-improve and task runs). Review runs, chat, judge, job
+  and cross-check runs, and runs bound to an egress profile, get none.
+- **Claim time**: a run gets the set that is current when it is claimed. A
+  variable you edit, disable or delete afterwards reaches the run at its next
+  claim (a resume re-claims); a run keeps the set it was given until then. A
+  description-only edit does not interrupt a claim in progress, so a run can
+  carry the previous description.
+- **Precedence**: user variables have the lowest precedence. A name the worker
+  sets itself is never replaced or removed by a variable, and the worker drops
+  a variable whose name breaks the rules below, with a run event naming it.
+- **Worker support**: delivery needs a worker that reports `run_env_v1`. A run
+  whose repo has variables is never claimed by an older worker, and run health
+  says "no online worker supports repo variables (run_env_v1); upgrade a worker"
+  while none is online. Cross-check children get no variables, but one claimed
+  by a worker without `run_env_v1` ends as checker unavailable, which asks for a
+  human decision; upgrade the worker to avoid it.
+
 ## Secret or plain
 
 - **Secret**: the value is never shown again, in the web UI, the CLI or the
-  API. Once injection ships, secret values are redacted from run output and a
-  publish that contains one is blocked.
+  API. It is redacted from run output, and every publish of the run's work is
+  searched for it (see below).
 - **Plain**: the value stays readable, including in `uzi repo env list`, and is
-  **not** redacted. Use it only for non-sensitive settings such as URLs and
-  regions.
+  **not** redacted or scanned. Use it only for non-sensitive settings such as
+  URLs and regions.
+
+## What the agent is told
+
+The lead's prompt lists each injected variable's name, scope and description,
+and the value of each plain variable. A secret's value is never in a prompt. The
+block states that the variables are already set in every command, so the agent
+does not have to guess or ask. Descriptions and plain values are treated as
+untrusted text: control and invisible characters are stripped or escaped.
+Describe a variable so the agent knows what to do with it, for example which
+login command uses it.
+
+## Redaction and the publish scan
+
+For each secret, uzi redacts the value from run messages, the worker log, the
+plan and its summary, and the other output the run produces. It also redacts the
+value's JSON-escaped form and the forms it takes inside base64 text (such as
+the entry a registry login stores, or an HTTP Basic header). Redaction is
+exact-match with an 8-character floor, so it is a net, not a boundary: another
+encoding of the value is not caught.
+
+Before work leaves the worker, every commit in the outgoing range is searched
+for those forms, not only the final tree. That covers checkpoint pushes
+(including parked, paused and shutdown checkpoints), the final push, held and
+terminal preservation packs, recovery archives and the preserved patch.
+
+- A hit blocks the publish and names the **variable**, never the value. At the
+  final push the run fails as `push_secret_blocked`; a checkpoint hit is held by
+  the existing secret-remediation hold. A secret that is a common word can
+  trigger this; pick a longer value.
+- The scan **fails closed**. If it cannot prove a range clean (a timeout, an
+  unreadable range, a scanner error, or the run's secret history cannot be
+  looked up), the publish is withheld and retried later. The work stays on the
+  worker under its recovery hold.
+- A plain value found in tracked files holds nothing.
+
+## Rotating and deleting while runs are active
+
+Rotating a secret keeps its older value sealed so runs that were given it can
+still mask it. The old value is kept until every such run has ended, its
+retained work has been released, and 24 hours have passed. Until then:
+
+- a write that would exceed the retired-value limit is refused with
+  `env_history_full`, and the panel lists the runs holding versions;
+- **Disable** and **Delete** always work. A deleted secret that runs still need
+  shows **Pending deletion**.
+
+If a secret version a run was given is missing or cannot be read, the run is
+held with the reason **variable history unavailable** (`run_env_history_unavailable`)
+and does not resume or publish. **Resume** retries once the history is restored;
+otherwise **Cancel** the run.
+
+The run page lists **Variables injected** for the run's current attempt: each
+name, its scope and a secret badge, never a value.
 
 ## Warning: the agent can read every value
 
@@ -76,8 +150,7 @@ across browsers.
 
 ## Worked examples
 
-These describe how the variables will be used once injection ships. Today they
-are only stored. All hosts are placeholders.
+These show how a repo's variables are used. All hosts are placeholders.
 
 ### An API
 
@@ -153,8 +226,8 @@ printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_U
   docker pull "$REGISTRY_HOST/team/image:tag"
 ```
 
-Login persistence across commands is not yet available, so log in in the same
-command that uses the registry.
+A login does not yet persist across commands, so log in in the same command
+that uses the registry.
 
 ## Edit, disable, delete
 

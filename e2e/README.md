@@ -389,6 +389,7 @@ headers, not the rows.
 | 74 | codex-activation | gitlab | no | PRD #1429 M6: the joined Codex public activation, proved offline (stub harness-neutral seam) |
 | 75 | codex-rate-limit-meters | gitlab | no | PRD #1209: per-account Codex rate-limit meters (seeded snapshot row -> /me) |
 | 76 | compose-web-dns | any | no | Compose web re-resolves API DNS for REST and WebSocket |
+| 77 | run-env-vars | gitlab | no | PRD #4416 M2: repo run variables reach a run on both harnesses; the secret value never leaves the vault path (stub) |
 
 <!-- registry:end -->
 
