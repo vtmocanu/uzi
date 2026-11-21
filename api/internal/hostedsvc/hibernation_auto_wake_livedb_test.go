@@ -33,7 +33,8 @@ func (autoSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Dur
 // controller's transitions take it to hibernated; a queued schedule-triggered run of the owner
 // is woken by the real HibernationWaker; the replacement pod's registration settles the wake;
 // the run is claimed and finished on the worker; the next pass does not admit it (the clock
-// restarted at the run's finished_at) and a pass at finished_at+14d+1m does.
+// restarted at the run's finished_at), not at finished_at+14d-1m either, and passes from
+// finished_at+14d+1m on do (within the bounded retry below).
 //
 // A pass admits a bounded, oldest-first batch and passes are paced once per minute, so both
 // positive admissions (the initial one and the one at finished_at+14d+1m) retry with
@@ -132,7 +133,7 @@ func TestHibernationAutoThenScheduleWakeLiveDB(t *testing.T) {
 	}
 
 	// Example 1: only the worker past the threshold is admitted.
-	admitWithin(idle15, "initial admission")
+	admitWithin(idle15, "initial admission of the 15d worker")
 	if got := e.state(idle15); got != "preparing" {
 		t.Fatalf("15d worker state = %q, want preparing", got)
 	}
@@ -221,8 +222,15 @@ func TestHibernationAutoThenScheduleWakeLiveDB(t *testing.T) {
 	requireResiduesIdle("at finished_at+14d-1m")
 	// Only now age the owned residues to just before finished_at: they outrank the target
 	// (anchor finished_at) and fill the batch, so the admission below needs further passes.
-	e.exec(`UPDATE workers SET created_at = $2 WHERE user_id = $1`, residue, finished.Add(-30*time.Second))
-	// finished_at + 14d + 1m: admitted.
+	tag, err := e.pool.Exec(e.ctx, `UPDATE workers SET created_at = $2 WHERE user_id = $1`, residue, finished.Add(-30*time.Second))
+	if err != nil {
+		t.Fatalf("age residues: %v", err)
+	}
+	if got := tag.RowsAffected(); got != int64(len(residueIDs)) {
+		t.Fatalf("aged %d residue workers, want %d", got, len(residueIDs))
+	}
+	// From finished_at + 14d + 1m on: admitted once the residue batch ahead of it has been taken
+	// (a bounded retry, so the edge is pinned to the retry window, not to the single +1m pass).
 	clock = finished.Add(14*24*time.Hour + time.Minute)
 	advertise()
 	admitWithin(idle15, "at finished_at+14d+1m")
