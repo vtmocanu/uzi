@@ -33457,6 +33457,7 @@ describe("M2 actualRunner credential replacement", () => {
               input.onUsage?.(planUsageSnapshot as never);
               lateResult = { summary: "Late A plan summary", deltas: [{ kind: "added", text: "late A delta" }] };
               lateResolvedAfterAbort = planAbortObserved;
+              lateInput.aborted = input.signal?.aborted === true;
               planSummaryEvents.push("A-plan-late-result");
               return lateResult;
             }
@@ -34557,6 +34558,14 @@ describe("M2 actualRunner credential replacement", () => {
               : injectedStage === "before-executor-publication" ? 1
               : injectedStage === "before-Now-publication" || injectedStage === "after-Now-publication" ? 2
               : injectedStage === "before-B-preparation" ? 3 : 5;
+            if (planSummary && !planSummaryUnacked && !planSummaryLate) {
+              // Race publication against the switch settling, so a suspension that refuses while A's plan work is
+              // still held fails at the named ordering assertion instead of timing out at the before-publish barrier.
+              await withTimeout(Promise.race([publicationBarriers[0]!.entered.promise, switchSettled.promise]), 5000,
+                "before-publish or switch settlement");
+              const order = ["A-plan-flight-settled", "suspension-returned", "before-publish"].map(event => planSummaryEvents.indexOf(event));
+              assert.ok(order[0]! >= 0 && order[0]! < order[1]! && order[1]! < order[2]!, "A plan summary joins before suspension completes");
+            }
             for (const barrier of publicationBarriers.slice(0, failureBoundaryCount)) {
               await withTimeout(barrier.entered.promise, 5000, barrier.stage);
               const builds = nowBuilds.length;
@@ -35558,14 +35567,15 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(planSuspensionPendingAtRelease, true, "the suspension is still pending when A plan work is released");
               assert.equal(planAbortObserved, true, "A plan work observed its signal aborted by the switch");
               assert.ok(at("A-plan-aborted") >= 0 && at("A-plan-aborted") < at("A-plan-released"));
-              assert.equal(aInputs.length, 1, "exactly one A plan summary input");
-              assert.equal(planSummaryEvents.filter(event => event === "A-plan-flight-settled").length, 1);
               if (planSummaryLate) {
+                assert.equal(aInputs.length, 1, "exactly one A plan summary input");
+                assert.equal(planSummaryEvents.filter(event => event === "A-plan-flight-settled").length, 1);
                 assert.ok(lateInput, "the late wrapper captured A's real generatePlanSummary input");
                 assert.equal(lateInput.capability, oldClaim.capability, "late A plan result never posts as B");
                 assert.equal(lateInput.authMode, oldClaim.auth_mode, "late A plan result never posts as B");
                 assert.ok(lateResult !== null && lateResult !== undefined, "late A plan result never posts as B");
                 assert.equal(lateResolvedAfterAbort, true, "late A plan result never posts as B");
+                assert.equal(lateInput.aborted, true, "late A plan result resolves only after the switch aborted it");
                 assert.equal(planPosts.length, 0, "late A plan result never posts as B");
                 assert.equal(bInputsAtFinish, 0, "late A plan result never posts as B");
                 assert.ok(at("A-plan-late-result") >= 0 && at("A-plan-late-result") < at("A-plan-flight-settled") &&
@@ -35587,6 +35597,8 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.equal(planPosts.length, 1, "B plan summary build is admitted with B's credential");
                 assert.equal(planUsage.length, 1, "B plan summary usage is delivered with B's credential_epoch_ordinal");
                 assert.equal(planUsage[0]?.credential_epoch_ordinal, 1, "B plan summary usage is delivered with B's credential_epoch_ordinal");
+                assert.equal(aInputs.length, 1, "exactly one A plan summary input");
+                assert.equal(planSummaryEvents.filter(event => event === "A-plan-flight-settled").length, 1);
               }
             }
             assert.equal(summaryOwners.length, summaryBuilds.length, "every summary build retained its ownership record");
