@@ -163,6 +163,36 @@ func TestTemplateEffortClaimProjectionLiveDB(t *testing.T) {
 	}
 }
 
+// TestTemplateEffortOmittedNoteStaleGenerationLiveDB: a re-assembly holding a stale run row (the claim
+// generation has since moved) persists no notice and returns the seq it was handed, so the claim
+// payload never adopts a seq that no row carries.
+//
+// MUTATION: delete the `if !res.Inserted { return startLastSeq }` guard in
+// recordTemplateEffortOmittedNote; the stale call then returns startLastSeq+1 and this test fails.
+func TestTemplateEffortOmittedNoteStaleGenerationLiveDB(t *testing.T) {
+	fx := newEffFix(t)
+	fx.anthropic()
+	fx.templateEffort("eff-coder", "high", "low")
+	h := HarnessClaude
+	run := fx.mustCreate(&h)
+	fx.claimWith(run, 1, newWorkerCaps) // capable worker: no notice written
+	stale := mustRun(t, fx.env, run.ID)
+	fx.env.exec(`UPDATE runs SET claim_generation = 2 WHERE id = $1`, run.ID)
+	lastSeq := mustRun(t, fx.env, run.ID).LastSeq
+
+	got := fx.svc.recordTemplateEffortOmittedNote(fx.env.ctx, stale, lastSeq)
+
+	if got != lastSeq {
+		t.Errorf("stale call returned seq %d, want the passed %d", got, lastSeq)
+	}
+	if n := fx.effortNotes(run.ID); len(n) != 0 {
+		t.Errorf("stale call persisted notices: %+v", n)
+	}
+	if after := mustRun(t, fx.env, run.ID).LastSeq; after != lastSeq {
+		t.Errorf("runs.last_seq = %d, want unchanged %d", after, lastSeq)
+	}
+}
+
 func containsKey(raw []byte, key string) bool {
 	var list []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &list); err != nil {
