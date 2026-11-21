@@ -395,11 +395,19 @@ it by default. Nothing resumes this hold on a timer.
 If the worker cannot reach the server while parking, it retries for up to 30
 minutes. After that the worker's flight ends and it keeps its copy of the work.
 If the worker is still alive, its next heartbeat no longer lists the run, and
-the server treats it as missing from the snapshot: once the run has been silent
-past the stale window plus one heartbeat interval, it is requeued while it is
-under its requeue budget (`RUN_MAX_REQUEUES`), otherwise it fails with "worker
-lost the execution; exceeded re-queue budget". The stale-worker sweep applies
-only when the worker itself is gone.
+the server treats it as missing from the snapshot. That handling applies only
+when the hold was not applied, so the run is still `running` or `awaiting_*`.
+It fires on the first heartbeat that omits the run once the run's last status
+change is older than the stale window plus one heartbeat interval. The run is
+requeued while it is under its requeue budget (`RUN_MAX_REQUEUES`). Over the cap
+it parks in `recovery_wait` with cause `worker_requeue_exhausted` when recovery
+evidence exists (a checkpoint tip, an available capture, a publication
+enrollment, or uncertain or unknown evidence), which is the usual case for a
+held run because it keeps its clone and custody. Only without evidence does it
+fail with "worker lost the execution; exceeded re-queue budget". If the hold was
+applied but never confirmed to the worker, the run is already `paused` on
+`phase_switch_unavailable` and stays held for you (Resume or Cancel). The
+stale-worker sweep applies only when the worker itself is gone.
 
 ## Not the same as a completion hold
 

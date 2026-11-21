@@ -1030,7 +1030,8 @@ status line from the worker, then the run parks (see [the hold](./run-pause.md#h
 - `Paused: this worker cannot verify a switch to <target>. Choose a supported
   model (opus, sonnet, haiku, fable) or a full model id, or clear the Claude
   planning setting, then Resume; Cancel ends the run.` The target is not in the
-  characterized set the worker can check. The runtime not offering a
+  characterized set the worker can check. The same line also covers an omitted
+  effort on an uncharacterized reported model. The runtime not offering a
   `getSettings` method gives this same line, since the worker cannot verify a
   switch without it.
 

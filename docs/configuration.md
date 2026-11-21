@@ -430,7 +430,7 @@ The body holds, for a manual start of an issue run with no model and no Anthropi
 |---|---|
 | `harnesses` | Claude then Codex, each taken as an explicit choice: `usable`, a `refusal` (and optional `refusal_detail`) when not, and the `credential` it would use. |
 | `start` | The three start choices (`default`, `claude`, `codex`): the predicted `harness` (`value`, `source`, `fixed_at`, `notes`) or a refusal, plus `anthropic_override_allowed`. |
-| `models` | Nine cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex, then the Claude-only `planning_model` appended last. |
+| `models` | Up to nine cells: the two worker model cells (Claude then Codex), then the Claude-only `planning_model`, then the judge, run-summary and task-review cells (each Claude then Codex). The judge and summary cells are present only when instance settings are wired, hence "up to". |
 | `efforts` | Five cells: worker effort and task-review effort, each for Claude then Codex, then the Claude-only `planning_effort` appended last. |
 | `cross_check` | Eight cells: plan then code, Claude then Codex, as `models` and `efforts`. |
 | `judge_harness` | One cell, always present: the harness a [judge](./judge.md#judge-runs-on) run would use (`value`, `source`, `fixed_at`, `notes`). An explicit **Judge runs on** choice is `value` `claude` or `codex` with `source` `user_default`; unset is `value` null with `source` `same_as_run`, because the judge follows the harness of the run it reviews, known only once that run exists. `fixed_at` is `create` in both cases. |
