@@ -1108,7 +1108,7 @@ advice alike. Four things can hold a worker back:
 The [operator knobs](./configuration.md#controller) that control the first two
 are `UZI_WORKER_UID_SPLIT` and `UZI_CODEX_COMMAND_SANDBOX`.
 
-A related knob does not hold a worker back: the controller also forwards `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` (chart value `workers.codex.commandCacheRunBytes`) to the worker container, only when it is set. It is the per-run budget past which a running Codex run's command cache is rotated to a fresh generation (default 4 GiB, `0` disables; best-effort, no hard size bound). Setting or changing it changes the pod spec and rolls the fleet once. See [Configuration](./configuration.md#controller).
+A related knob does not hold a worker back: the controller also forwards `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` (chart value `workers.codex.commandCacheRunBytes`) to the worker container, only when it is set. It is the per-run budget past which a running Codex run's command cache is rotated to a fresh generation (default 4 GiB, `0` disables; best-effort, no hard size bound). Setting or changing it changes the pod spec and rolls the fleet once. The controller likewise forwards `UZI_RUN_CACHE_CAP_MAX_BYTES` / `UZI_RUN_CACHE_CAP_FRACTION` (chart values `workers.runCacheCapMaxBytes` / `workers.runCacheCapFraction`) only when set, and setting or changing either rolls the fleet once. See [Configuration](./configuration.md#controller).
 
 ## My Codex run says "no worker supporting custom Codex models is online"
 

@@ -3,7 +3,8 @@
 // Two layers, because one long build inside a single turn can fill the data volume before any
 // turn boundary comes:
 //
-//  - the SOFT layer, the per-run cache cap. At every implement turn boundary the executor asks
+//  - the SOFT layer, the per-run cache cap (the min of the fraction-derived cap and the absolute
+//    UZI_RUN_CACHE_CAP_MAX_BYTES ceiling). At every implement turn boundary the executor asks
 //    {@link DiskGovernor.boundary}; a run whose caches exceed its cap is TRIMMED (least recently
 //    used entries first, run-caches.ts trimRunCaches) only at a proven quiet point: between turns
 //    AND with no process of the run alive, never judged from file mtimes. "Alive" is the executor's
@@ -93,6 +94,8 @@ export interface CacheCapConfig {
   capEnabled: boolean;
   /** UZI_RUN_CACHE_CAP_FRACTION: the share of the data volume all runs' caches may use. */
   capFraction: number;
+  /** UZI_RUN_CACHE_CAP_MAX_BYTES: an absolute per-run ceiling on the cap; absent/undefined = no ceiling. */
+  capMaxBytes?: number;
   /** UZI_RUN_CACHE_LOW_WATER: where a trim stops, as a fraction of the cap. */
   lowWater: number;
   /** WORKER_MAX_CONCURRENT_RUNS: the cap is divided among this many runs. */
@@ -106,11 +109,18 @@ export interface CacheCapConfig {
 /**
  * One run's cache cap in bytes: `fraction` of the data volume's size divided by the worker's
  * maximum concurrent runs (0.5 of 25 GiB over 2 runs = 6.25 GiB). Undefined when the volume's
- * size is unknown or zero: no cap is then enforced.
+ * size is unknown or zero: no cap is then enforced. An optional absolute `maxBytes` ceiling
+ * bounds it: the cap is min(fraction-derived, maxBytes); undefined means no ceiling.
  */
-export function runCacheCapBytes(volumeTotalBytes: number | undefined, fraction: number, maxConcurrentRuns: number): number | undefined {
+export function runCacheCapBytes(
+  volumeTotalBytes: number | undefined,
+  fraction: number,
+  maxConcurrentRuns: number,
+  maxBytes?: number,
+): number | undefined {
   if (volumeTotalBytes === undefined || !(volumeTotalBytes > 0)) return undefined;
-  return Math.floor((volumeTotalBytes * fraction) / Math.max(1, maxConcurrentRuns));
+  const f = Math.floor((volumeTotalBytes * fraction) / Math.max(1, maxConcurrentRuns));
+  return maxBytes === undefined ? f : Math.min(f, maxBytes);
 }
 
 /**
@@ -349,7 +359,7 @@ export class DiskGovernor {
   /** The cap in bytes, from the volume's current size. */
   capBytes(): number | undefined {
     const c = this.opts.config;
-    return runCacheCapBytes(this.opts.volumeTotalBytes(), c.capFraction, c.maxConcurrentRuns);
+    return runCacheCapBytes(this.opts.volumeTotalBytes(), c.capFraction, c.maxConcurrentRuns, c.capMaxBytes);
   }
 
   /**

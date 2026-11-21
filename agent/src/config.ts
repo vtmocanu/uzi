@@ -126,9 +126,17 @@ export interface Config {
   /**
    * PRD #1809 D4: the share of the data volume all running runs' caches may use together
    * (UZI_RUN_CACHE_CAP_FRACTION, default 0.5). One run's cap is this fraction of the volume's
-   * size divided by WORKER_MAX_CONCURRENT_RUNS. A fraction in (0, 1]; anything else falls back.
+   * size divided by WORKER_MAX_CONCURRENT_RUNS, then bounded by runCacheCapMaxBytes (the cap is
+   * the min of the two). A fraction in (0, 1]; anything else falls back.
    */
   runCacheCapFraction: number;
+  /**
+   * An absolute ceiling on one run's cache cap in bytes (UZI_RUN_CACHE_CAP_MAX_BYTES, default
+   * 16106127360 = 15 GiB): the cap is min(fraction-derived cap, this). A trimmed, case-insensitive
+   * `off` disables only the ceiling (undefined); any other invalid value falls back to the
+   * default. Parsing never throws.
+   */
+  runCacheCapMaxBytes: number | undefined;
   /**
    * PRD #1809 D4: where a trim stops, as a fraction of the cap (UZI_RUN_CACHE_LOW_WATER, default
    * 0.6): a trim evicts until the run's caches are at or under this share of its cap. A fraction
@@ -479,6 +487,21 @@ function openFraction(
   return Number.isFinite(n) && n > 0 && (opts.includeOne ? n <= 1 : n < 1) ? n : fallback;
 }
 
+const DEFAULT_RUN_CACHE_CAP_MAX_BYTES = 16106127360;
+
+/** UZI_RUN_CACHE_CAP_MAX_BYTES: a positive safe integer of bytes (leading zeros honoured); a
+ *  trimmed, case-insensitive `off` disables the ceiling (undefined); anything else, unset
+ *  included, is the default. Never throws. */
+function parseRunCacheCapMaxBytes(v: string | undefined): number | undefined {
+  const s = (v ?? "").trim();
+  if (s.toLowerCase() === "off") return undefined;
+  if (/^[0-9]+$/.test(s)) {
+    const n = Number(s);
+    if (n > 0 && Number.isSafeInteger(n)) return n;
+  }
+  return DEFAULT_RUN_CACHE_CAP_MAX_BYTES;
+}
+
 function isLogLevel(v: string): v is LogLevel {
   return v === "debug" || v === "info" || v === "warn" || v === "error";
 }
@@ -660,6 +683,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),
     runCacheCapEnabled: parseBoolDefaultTrue(env.UZI_RUN_CACHE_CAP_ENABLED),
     runCacheCapFraction: openFraction(env, "UZI_RUN_CACHE_CAP_FRACTION", 0.5, { includeOne: true }),
+    runCacheCapMaxBytes: parseRunCacheCapMaxBytes(env.UZI_RUN_CACHE_CAP_MAX_BYTES),
     runCacheLowWater: openFraction(env, "UZI_RUN_CACHE_LOW_WATER", 0.6, { includeOne: false }),
     diskHardStopEnabled: parseBoolDefaultTrue(env.UZI_DISK_HARD_STOP_ENABLED),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
