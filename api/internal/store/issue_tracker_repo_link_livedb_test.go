@@ -161,6 +161,11 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 			{"recommendation_filed_issues", `INSERT INTO recommendation_filed_issues (review_id,category,filed_repo_id,filed_issue_iid) VALUES ($1,'c',$2,5)`, func(r uuid.UUID) []any { return []any{reviewID, r} }},
 			{"finding_dispositions", `INSERT INTO finding_dispositions (user_id,repo_id,location,filed_issue_iid) VALUES ($1,$2,'loc',5)`, func(r uuid.UUID) []any { return []any{f.user, r} }},
 			{"finding_group_operations", `INSERT INTO finding_group_operations (user_id,repo_id,deadline_at,issue_iid,issue_url) VALUES ($1,$2,now(),5,'u')`, func(r uuid.UUID) []any { return []any{f.user, r} }},
+			// Issue #4512: the one-time fire ledger. Each execution makes its own schedule and header,
+			// so the list can run twice (before and after the repo is enabled).
+			{"schedule_once_fire_runs", `WITH s AS (INSERT INTO run_schedules (user_id,repo_id,target,prompt,timing,run_at) VALUES ($1,$2,'prompt','p','once',now()) RETURNING id),
+				h AS (INSERT INTO schedule_once_fires (schedule_id,fire_epoch) SELECT id,0 FROM s RETURNING schedule_id)
+				INSERT INTO schedule_once_fire_runs (schedule_id,fire_epoch,repo_id,issue_iid,issue_title,web_url,run_uuid) SELECT schedule_id,0,$2,5,'t','u',gen_random_uuid() FROM h`, func(r uuid.UUID) []any { return []any{f.user, r} }},
 		}
 		for _, in := range inserts {
 			if _, err := pool.Exec(ctx, in.sql, in.args(aw.ID)...); sqlState(err) != issueNumberGuardSQLState {

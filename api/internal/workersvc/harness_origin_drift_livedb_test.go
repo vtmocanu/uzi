@@ -129,7 +129,7 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 	t.Run("scheduled issue (Service.CreateScheduledRun)", func(t *testing.T) {
 		iid := iidBase + 3
 		seedEligibleIssue(t, env, repoID, iid)
-		run, err := svc.CreateScheduledRun(env.ctx, userID, repoID, iid, "desc", nil, nil, nil, false, nil, nil, nil)
+		run, err := svc.CreateScheduledRun(env.ctx, userID, repoID, iid, "desc", nil, nil, nil, false, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateScheduledRun: %v", err)
 		}
@@ -140,7 +140,7 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 		iid := iidBase + 4
 		seedEligibleIssue(t, env, repoID, iid)
 		waitOnLimit := false
-		run, err := svc.CreateScheduledAutopilotRun(env.ctx, userID, repoID, iid, "desc", &waitOnLimit, nil, nil, false, nil, nil)
+		run, err := svc.CreateScheduledAutopilotRun(env.ctx, userID, repoID, iid, "desc", &waitOnLimit, nil, nil, false, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateScheduledAutopilotRun: %v", err)
 		}

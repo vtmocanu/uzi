@@ -58,7 +58,7 @@ func runAllPaths(t *testing.T, wire func(*Service), labels []byte, hasPRDLink bo
 		return err
 	})
 	invoke("CreateScheduledRun", func(svc *Service) error {
-		_, err := svc.CreateScheduledRun(context.Background(), user, repo, 4, "desc", nil, nil, nil, false, nil, nil, nil)
+		_, err := svc.CreateScheduledRun(context.Background(), user, repo, 4, "desc", nil, nil, nil, false, nil, nil, nil, nil)
 		return err
 	})
 	invoke("CreateAutopilotRun", func(svc *Service) error {
@@ -66,7 +66,7 @@ func runAllPaths(t *testing.T, wire func(*Service), labels []byte, hasPRDLink bo
 		return err
 	})
 	invoke("CreateScheduledAutopilotRun", func(svc *Service) error {
-		_, err := svc.CreateScheduledAutopilotRun(context.Background(), user, repo, 4, "desc", nil, nil, nil, false, nil, nil)
+		_, err := svc.CreateScheduledAutopilotRun(context.Background(), user, repo, 4, "desc", nil, nil, nil, false, nil, nil, nil)
 		return err
 	})
 	return out

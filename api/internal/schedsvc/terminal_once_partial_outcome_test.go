@@ -18,12 +18,12 @@ type partialGateCancelRuns struct {
 	cancel context.CancelFunc
 }
 
-func (r *partialGateCancelRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, description string, wait *bool, rework *bool, model *string, subagent bool, credential *workersvc.CredentialOverride, harness *workersvc.Harness) (store.Run, error) {
+func (r *partialGateCancelRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, description string, wait *bool, rework *bool, model *string, subagent bool, credential *workersvc.CredentialOverride, harness *workersvc.Harness, _ *workersvc.OnceFireProgress) (store.Run, error) {
 	if iid == 97 {
 		r.cancel()
 		return store.Run{}, workersvc.ErrTerminalConsumerGateBusy
 	}
-	return r.fakeRuns.CreateScheduledAutopilotRun(ctx, user, repo, iid, description, wait, rework, model, subagent, credential, harness)
+	return r.fakeRuns.CreateScheduledAutopilotRun(ctx, user, repo, iid, description, wait, rework, model, subagent, credential, harness, nil)
 }
 
 type partialGateAdvanceStore struct {
