@@ -786,14 +786,16 @@ function makeExecutor(
   log: Logger = noopLog,
   dockerWiring?: DockerWiring,
   providerConfig: CodexProviderConfig = provider,
-  homeOrSummaryOptions: string | Pick<import("../src/codex/codex-executor.js").CodexExecutorOptions, "summaryRunner" | "summarySettleMs" | "codexAdviceHarnessFactory" | "summaryClaimCodex"> = {},
+  homeOrSummaryOptions: string | (Pick<import("../src/codex/codex-executor.js").CodexExecutorOptions, "summaryRunner" | "summarySettleMs" | "codexAdviceHarnessFactory" | "summaryClaimCodex"> & { home?: string }) = {},
 ): CodexExecutor {
   const seam = rig.deps.spawnCommand;
+  const { home, ...summaryOptions } = typeof homeOrSummaryOptions === "string"
+    ? { home: homeOrSummaryOptions } : homeOrSummaryOptions;
   return new CodexExecutor(
     log,
-    typeof homeOrSummaryOptions === "string" ? homeOrSummaryOptions : "/data/agent-home/run-1",
+    home ?? "/data/agent-home/run-1",
     { binding, client: rig.client as never, provider: providerConfig, dockerWiring,
-      ...(typeof homeOrSummaryOptions === "string" ? {} : homeOrSummaryOptions) },
+      ...summaryOptions },
     { installDeps: async () => ({ results: [], truncated: false }), ...rig.deps,
       ...(seam ? { spawnCommand: answerEnvProbe(seam, rig.probeCalls) } : {}) },
   );
@@ -32468,7 +32470,7 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "tool-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "tool-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "gated-plan-summary", "gated-plan-summary-late", "gated-plan-summary-unacked", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
@@ -32524,6 +32526,10 @@ describe("M2 actualRunner credential replacement", () => {
           ? oldClaim !== SUBSCRIPTION || target !== API_KEY
           : oldClaim !== API_KEY || target !== SUBSCRIPTION))) continue;
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
+        // Plan-summary variants: the executor's own real SummaryRunner over a plan-gated claim.
+        const planSummaryLate = publication === "gated-plan-summary-late";
+        const planSummaryUnacked = publication === "gated-plan-summary-unacked";
+        const planSummary = publication === "gated-plan-summary" || planSummaryLate || planSummaryUnacked;
         const probeEpochConsumers = publication === "baseline" && oldClaim === API_KEY && phase === "factory";
         const probeBInitialCredential = publication === "baseline" && phase === "factory";
         const probeScopeIdentity = publication === "baseline" && phase === "factory" &&
@@ -32569,6 +32575,8 @@ describe("M2 actualRunner credential replacement", () => {
         : publication === "preflight-foreign-op" ? "Codex real rollout preflight foreign ready op retains A without reopening"
         : persistFailure ? `Codex real rollout ${inspectFailure ? "inspection unavailable" : "persist failure"} before teardown (${publication})`
         : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work${positiveBChild ? "; finished B preparation broker dispatches an actual child" : ""}`
+        : planSummary ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} plan summary ${planSummaryLate ? "late A result settles before B publication and never posts as B"
+          : planSummaryUnacked ? "uninvoked A plan callback admits no work through B publication" : "joins before suspension and B build is admitted with B's credential"}`
         : crashRecovery ? publication === "crash-after-a-teardown-recovery"
           ? "Codex switch crash after A teardown before apply recovers committed A without switching"
           : publication === "crash-apply-reply-lost-recovery"
@@ -32586,7 +32594,9 @@ describe("M2 actualRunner credential replacement", () => {
         const next = { ...target, access_token: "M2-B-access", capability: "M2-B-capability" } as import("../src/protocol.js").ClaimCodexSecrets;
         if ("chatgpt_account_id" in oldClaim && next.auth_mode === "subscription")
           assert.notEqual(oldClaim.chatgpt_account_id, next.chatgpt_account_id);
-        const claim: ClaimResponse = { ...m2Runner.gitlabClaim(4202, {
+        const claim: ClaimResponse = { ...m2Runner.gitlabClaim(4202, planSummary ? {
+          auto_approve: false, plan_approved: false,
+        } : {
           plan_md: "Approved integration proof", plan_approved: true, plan_source: "seeded",
         }), claim_generation: 7 };
         claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
@@ -32613,6 +32623,59 @@ describe("M2 actualRunner credential replacement", () => {
         const owners: import("../src/codex/summary-ownership.js").SummaryOwnership[] = [];
         let retiredADenied = false, liveBAdmitted = false;
         let retiredADenial: { refusal: boolean; message: string } | undefined;
+        // Plan-summary variants only. Production callbacks below only RECORD into these; every assertion over
+        // them runs at the top level of the test.
+        const planPass = new AsyncLocalStorage<true>();
+        const summaryBuilds: { capability: string; authMode: string; plan: boolean }[] = [];
+        const summaryOwners: import("../src/codex/summary-ownership.js").SummaryOwnership[] = [];
+        const planInputs: { capability: string | undefined; authMode: string | undefined }[] = [];
+        const planPosts: string[] = [];
+        const planSummaryEvents: string[] = [];
+        const planWorkEntered = installerBarrier(), planAborted = installerBarrier(), planRelease = installerBarrier();
+        const refreshDrained = installerBarrier(), depsSettled = installerBarrier();
+        const planGateReached = installerBarrier(), planGateRelease = installerBarrier(), bPlanSettled = installerBarrier();
+        const bGatePresented = installerBarrier();
+        let planGateHeld = false, planSuspensionInFlight = false, planAbortObserved = false, planWorkStarted = false;
+        let planSuspensionPendingAtRelease: boolean | undefined;
+        let planAtSuspend: { flights: number; workEntered: boolean; released: boolean } | undefined;
+        let lateInput: { capability: string | undefined; authMode: string | undefined; aborted: boolean } | undefined;
+        let lateResult: import("../src/summary-runner.js").PlanSummaryResult | null | undefined;
+        let lateResolvedAfterAbort: boolean | undefined;
+        let bInputsAtFinish: number | undefined;
+        const retainedPlanCallbacks: ((planMd: string) => Promise<void>)[] = [];
+        const unackedAttempts: { stage: string; inputs: number; builds: number; releases: number; refreshes: number; posts: number }[] = [];
+        let retiredCallbackAfterB: { before: { inputs: number; builds: number; posts: number };
+          after: { inputs: number; builds: number; posts: number }; returned: boolean } | undefined;
+        const planUsageSnapshot = { "gpt-6-luna": { inputTokens: 11, outputTokens: 3, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.00002 } };
+        // The designated A plan work holds until the switch aborts it, then waits for a release that the test
+        // grants only after the suspension's sibling drain operands settled (plus one macrotask).
+        const awaitPlanAbortThenRelease = async (signal: AbortSignal | undefined): Promise<void> => {
+          if (signal && !signal.aborted)
+            await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+          planAbortObserved = signal === undefined || signal.aborted;
+          planSummaryEvents.push("A-plan-aborted");
+          planAborted.resolve();
+          await planRelease.promise;
+          planSummaryEvents.push("A-plan-released");
+        };
+        const planSummaryFactory = (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
+          const plan = planPass.getStore() === true;
+          summaryBuilds.push({ capability: params.binding.capability, authMode: params.binding.authMode, plan });
+          summaryOwners.push(summaryOwnership.get(params)!);
+          // Intent and any other pass settles at once: no mutant can hang on a summary timeout.
+          if (!plan) throw new Error("plan-summary fixture serves only the plan pass");
+          if (params.binding.capability === oldClaim.capability) {
+            planWorkStarted = true;
+            planWorkEntered.resolve();
+            await awaitPlanAbortThenRelease(params.signal);
+            throw new DOMException("A plan summary aborted by the switch", "AbortError");
+          }
+          return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
+            request.usageObserver?.(planUsageSnapshot as never);
+            return { text: JSON.stringify({ summary: `Plan summary built with ${params.binding.capability}`, deltas: [] }),
+              end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
+          } };
+        }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
         const triggerNow = async (id: string) => {
           await context.reportProgress!({ completed: [], in_progress: [id] }, [{ id, title: `Inspect ${id}` }] as never);
           context.emit({ kind: "tool_use", agent: "lead", payload: { id, name: "Bash", input: { command: "true", description: `Inspect ${id}` } } });
@@ -32662,6 +32725,15 @@ describe("M2 actualRunner credential replacement", () => {
         client.reportState = async (id, body, ...args) => {
           reports.push(body.status);
           dispositions.push({ status: body.status, failure_reason: body.failure_reason });
+          if (planSummaryUnacked && body.status === "awaiting_approval" && !planGateHeld) {
+            // The switch is pending at A's first gate report: the server refuses the presentation and stamps the
+            // switch on the ACK, so the Runner never confirms the gate and never invokes onPlanPersisted.
+            planGateHeld = true;
+            planGateReached.resolve();
+            await planGateRelease.promise;
+            pending = true;
+            return { applied: false, credentialSwitch: { generation: 7, op_id: pendingOp, target_secret_id: "M2-target" } };
+          }
           if (probeScopeIdentity && body.status === "credential_switch_uncertain") {
             scopeIdentityUncertain.resolve();
             // ACK only the failure path so the driver can diagnose a scope collision and join cleanup.
@@ -32845,6 +32917,16 @@ describe("M2 actualRunner credential replacement", () => {
         const followupId = 4202001;
         const followupApplied = installerBarrier();
         let followupDeliveredBefore: number | undefined;
+        if (planSummary) {
+          // The first gate the api sees is the plan A presents (the unacked variant never lets that report through,
+          // so its first api-visible gate is B's retried one). The run is stopped at B's retried gate, so no
+          // implementation epoch is recreated.
+          let apiGates = 0;
+          api.onState(claim.run_id, body => {
+            if (body.status === "awaiting_approval" && ++apiGates === (planSummaryUnacked ? 1 : 2)) bGatePresented.resolve();
+          });
+          if (planSummaryUnacked) planRelease.resolve();
+        }
         if (preserveCleanupFollowup) {
           api.setInputClaimGeneration(claim.run_id, 7);
           const applyInputs = client.applyInputs.bind(client);
@@ -33353,7 +33435,43 @@ describe("M2 actualRunner credential replacement", () => {
           if (resumeRefusal && method === "thread/start") await publicationBoundary("fresh");
           return request(method, params, opts);
         };
-        const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
+        const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, planSummary
+          ? { home: m2Runner.homeDir, codexAdviceHarnessFactory: planSummaryFactory } : m2Runner.homeDir);
+        if (planSummary) {
+          // Spies on the executor's OWN real SummaryRunner (its generatePlanSummary) and its OWN client; each
+          // callback only records. The factory above is the one the executor wraps in ownSummaryFactory.
+          const summaryRunner = (executor as unknown as { summaryRunner: { generatePlanSummary(input: PlanSummaryInput): Promise<import("../src/summary-runner.js").PlanSummaryResult | null> } }).summaryRunner;
+          const realPlan = summaryRunner.generatePlanSummary.bind(summaryRunner);
+          summaryRunner.generatePlanSummary = async input => {
+            const codex = input.claim?.secrets.codex as { capability?: string; auth_mode?: string } | undefined;
+            const entry = { capability: codex?.capability, authMode: codex?.auth_mode };
+            planInputs.push(entry);
+            const isA = entry.capability === oldClaim.capability;
+            if (planSummaryLate) {
+              if (!isA) { bPlanSettled.resolve(); return null; }
+              // The real call is not delegated: this stands in for a late A result that outlives its abort.
+              lateInput = { ...entry, aborted: input.signal?.aborted === true };
+              planWorkStarted = true;
+              planWorkEntered.resolve();
+              await awaitPlanAbortThenRelease(input.signal);
+              input.onUsage?.(planUsageSnapshot as never);
+              lateResult = { summary: "Late A plan summary", deltas: [{ kind: "added", text: "late A delta" }] };
+              lateResolvedAfterAbort = planAbortObserved;
+              planSummaryEvents.push("A-plan-late-result");
+              return lateResult;
+            }
+            return planPass.run(true, () => realPlan(input));
+          };
+          (rig.client as unknown as { postPlanSummary: (id: string, plan: { summary: string }) => Promise<void> }).postPlanSummary =
+            async (_id, plan) => { planPosts.push(plan.summary); bPlanSettled.resolve(); };
+          const settleDeps = (executor as unknown as { settleDepsInstall(...args: unknown[]): Promise<boolean> }).settleDepsInstall.bind(executor);
+          Reflect.set(executor, "settleDepsInstall", async (...args: unknown[]) => {
+            try { return await settleDeps(...args); } finally { if (planSuspensionInFlight) depsSettled.resolve(); }
+          });
+          if (!planSummaryUnacked) void Promise.all([planAborted.promise, refreshDrained.promise, depsSettled.promise])
+            .then(() => new Promise<void>(resolve => setImmediate(resolve)))
+            .then(() => { planSuspensionPendingAtRelease = !aSuspendReturned; planRelease.resolve(); });
+        }
         if (probeEpochConsumers) {
           // Retain the production-created A credential boundary, not its retired safety facade.
           const original = Reflect.get(executor, "startProviderEpoch") as (...args: unknown[]) => unknown;
@@ -33395,6 +33513,14 @@ describe("M2 actualRunner credential replacement", () => {
               requestId: 191, params: { reason: "unauthorized", previousAccountId: null } });
             await withTimeout(aRefreshEntered.promise, 5000, "armed A worker refresh entry");
           }
+          if (planSummary) {
+            const flights = [...(executor as unknown as { planFlights: Set<{ done: Promise<void> }> }).planFlights];
+            // The held work cannot settle before its release, so "not yet released" is the unsettled precondition.
+            planAtSuspend = { flights: flights.length, workEntered: planWorkStarted,
+              released: planSummaryEvents.includes("A-plan-released") };
+            for (const flight of flights) void flight.done.then(() => { planSummaryEvents.push("A-plan-flight-settled"); });
+            planSuspensionInFlight = true;
+          }
           const suspension = suspend(bounds);
           aSuspendOwned = suspension;
           // Keep assertions outside Runner's switch catch paths.
@@ -33410,6 +33536,7 @@ describe("M2 actualRunner credential replacement", () => {
             } finally { aRefreshRelease.resolve(); }
           }
           const lease = await suspension;
+          if (planSummary) planSummaryEvents.push("suspension-returned");
           if (probeARefreshDrain) {
             aRefreshReturnSnapshot = aRefreshSnapshot();
             aRefreshWindow = false; aRefreshArmed = false;
@@ -33473,6 +33600,7 @@ describe("M2 actualRunner credential replacement", () => {
             reopenA: async nextBounds => { reopenAttempts++; return lease.reopenA(nextBounds); },
             publishB: async (...args) => {
               publishAttempts++;
+              if (planSummary) planSummaryEvents.push("before-publish");
               await publicationBoundary("before-publish");
               await lease.publishB(...args);
               await publicationBoundary("after-publish");
@@ -33491,6 +33619,7 @@ describe("M2 actualRunner credential replacement", () => {
             },
             finishB: async (...args) => {
               ordinaryBRefreshesBeforeFinish = ordinaryBRefreshes;
+              if (planSummary) bInputsAtFinish = planInputs.filter(input => input.capability === next.capability).length;
               if (publication === "subscription-refresh") {
                 await withTimeout(refreshDelivered.promise, 5000, "B startup refresh delivered to auth owner");
                 assert.equal(refreshDeliveries, 1);
@@ -33541,10 +33670,30 @@ describe("M2 actualRunner credential replacement", () => {
           retainedPrepareRootDispatch = ctx.prepareCodexRootDispatch;
           worktree = ctx.worktreePath;
           await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
+          if (planSummaryUnacked) {
+            // Retain A's FIRST onPlanPersisted callback (3rd gatePlan argument): the Runner never invokes it because
+            // the switch refused A's presentation. It is forwarded unchanged.
+            const gate = ctx.gatePlan!;
+            ctx.gatePlan = async (...gateArgs) => {
+              if (gateArgs[2] && retainedPlanCallbacks.length === 0) retainedPlanCallbacks.push(gateArgs[2]);
+              return gate(...gateArgs);
+            };
+          }
           const attempt = ctx.attemptCodexCredentialSwitch!;
           ctx.attemptCodexCredentialSwitch = async (...args) => {
             hooks++;
-            try { switchResult = await attempt(...args); return switchResult; }
+            try {
+              switchResult = await attempt(...args);
+              if (planSummaryUnacked && (switchResult === "resumed_B" || switchResult === "fresh_B")) {
+                // B is live and finishB reopened admission, but the retried gate has not begun a fresh plan summary:
+                // the retained A callback is invoked now and its returned promise is awaited before returning.
+                const count = () => ({ inputs: planInputs.length, builds: summaryBuilds.length, posts: planPosts.length });
+                const before = count();
+                await retainedPlanCallbacks[0]?.("# Plan A\n- do it");
+                retiredCallbackAfterB = { before, after: count(), returned: true };
+              }
+              return switchResult;
+            }
             catch (error) { switchError = error; throw error; }
             finally { switchSettled.resolve(); }
           };
@@ -33768,6 +33917,21 @@ describe("M2 actualRunner credential replacement", () => {
         const epochProbe = mock.method(epochBuilder, "startProviderEpoch", async (...args: unknown[]) => {
           const epoch = await startProviderEpoch(...args);
           const epochIndex = epochBuilds++;
+          if (planSummary && epochIndex === 0) {
+            // Observe the suspension's sibling drain operands of A's auth (the live refresh drain, or the reaped-auth
+            // settlement). They are recorded only; the executor still owns and joins them.
+            const harness = epoch.harness as unknown as {
+              suspendRefreshAdmission(): import("../src/codex/appserver-auth.js").CodexAuthSuspensionLease;
+              settleReapedAuth(): Promise<void>;
+            };
+            const suspendRefresh = harness.suspendRefreshAdmission.bind(harness);
+            harness.suspendRefreshAdmission = () => {
+              const lease = suspendRefresh();
+              return { ...lease, drain: () => lease.drain().finally(() => { if (planSuspensionInFlight) refreshDrained.resolve(); }) };
+            };
+            const settleReaped = harness.settleReapedAuth.bind(harness);
+            harness.settleReapedAuth = () => settleReaped().finally(() => { if (planSuspensionInFlight) refreshDrained.resolve(); });
+          }
           if (publication === "gated" || injectedStage || preserveCleanup) {
             // Read the actual auth owner retained by the returned harness. Its config
             // retains the same bridge object that the read-path auth interceptor calls.
@@ -33789,7 +33953,8 @@ describe("M2 actualRunner credential replacement", () => {
             };
             // Use the returned epoch's real builder before login, without publishing
             // a root dispatcher or changing the harness's seeded PLAN broker.
-            epoch.buildPhaseBroker("implement");
+            // A plan-gated claim has no resolved agent selection yet, so its preparation builder is the plan phase.
+            epoch.buildPhaseBroker(planSummary ? "plan" : "implement");
           }
           return epoch;
         });
@@ -33992,6 +34157,15 @@ describe("M2 actualRunner credential replacement", () => {
           }
           await triggerNow("A");
           await withTimeout(nowEntered.promise, 5000, "M2 active A Now factory");
+          if (planSummary) {
+            // A's plan turn submits only after its Now call is in flight (the plan gate holds Now afterwards), then
+            // the Runner gates the plan: the unacked variant's report is held, the others get the applied ACK.
+            a.transport.push(toolCall(800, "submit_plan", { plan_md: "# Plan A\n- do it",
+              milestones: [{ id: "m1", title: "Milestone 1" }] }, savedId, "M2-A-turn", "plan-1"))
+              .push(turnCompleted("completed", savedId, "M2-A-turn"));
+            await withTimeout(planSummaryUnacked ? planGateReached.promise : planWorkEntered.promise, 5000,
+              planSummaryUnacked ? "A plan gate report held" : "A plan summary work entered after the applied gate ACK");
+          }
           if (publication === "baseline") {
             assert.ok(actualFlight);
             assert.equal(actualFlight.worktreePath, worktree);
@@ -34008,6 +34182,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(admission.calls.seedRunnerClone > 0, "real admission reached the production seed observer");
           }
           pending = true;
+          planGateRelease.resolve();
           const firstSuspension = await withTimeout(Promise.race([
             nowSuspensionEntered.promise.then(() => "Now suspension"),
             executorSuspensionEntered.promise.then(() => "executor suspension"),
@@ -34430,6 +34605,17 @@ describe("M2 actualRunner credential replacement", () => {
                   assert.equal(credentialRefreshes, refreshes);
                 }
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                if (planSummaryUnacked) {
+                  // The Runner never invoked A's retained plan callback; invoke it here and await its result.
+                  const callback = retainedPlanCallbacks[0];
+                  assert.ok(callback, "A's uninvoked plan callback was retained");
+                  const before = { inputs: planInputs.length, builds: summaryBuilds.length, releases: credentialReleases,
+                    refreshes: credentialRefreshes, posts: planPosts.length };
+                  await callback("# Plan A\n- do it");
+                  unackedAttempts.push({ stage: barrier.stage, inputs: planInputs.length - before.inputs,
+                    builds: summaryBuilds.length - before.builds, releases: credentialReleases - before.releases,
+                    refreshes: credentialRefreshes - before.refreshes, posts: planPosts.length - before.posts });
+                }
                 await triggerNow(`held-${barrier.stage}`);
                 assert.ok(retainedRootDispatch);
                 await assert.rejects(retainedRootDispatch.prepare(), "retired A root dispatch is refused");
@@ -34877,7 +35063,7 @@ describe("M2 actualRunner credential replacement", () => {
               await assertRetainedPolicy(held);
               return;
             }
-            if (publication !== "gated" && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
+            if (publication !== "gated" && !planSummary && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
               if (resumeUncertain) {
                 await withTimeout(Promise.race([running, forbiddenUncertainFresh.promise]), 5000, "uncertain resume retains execution or attempts forbidden fresh");
                 assert.equal(b.transport.threadStartCount, 0, "unclassified resume failure cannot send thread/start");
@@ -35327,6 +35513,85 @@ describe("M2 actualRunner credential replacement", () => {
               return;
             }
           }
+          if (planSummary) {
+            // B presents the retried plan gate and its own plan work (if any) settles; the run is then stopped at
+            // that gate, so no implementation epoch is recreated and B's ordinary work never starts.
+            await withTimeout(bGatePresented.promise, 5000, "B presents the retried plan gate");
+            await Promise.race([bPlanSettled.promise, new Promise<void>(resolve => setTimeout(resolve, 1500))]);
+            cancelled = true;
+            cleanupContinue.resolve();
+            await withTimeout(running, 5000, "plan-gated run stops at B's retried gate");
+            assert.equal(applies, 1);
+            assert.equal(loginObservations.length, 1);
+            assert.equal(bFinished, true, "B was finished before its retried plan gate");
+            assert.equal(b.transport.turnStartCount, 0, "no B work turn before the plan is approved");
+            const feed = api.messages(claim.run_id);
+            const aInputs = planInputs.filter(input => input.capability === oldClaim.capability);
+            const bInputs = planInputs.filter(input => input.capability === next.capability);
+            const aPlanBuilds = summaryBuilds.filter(build => build.plan && build.capability === oldClaim.capability);
+            const bPlanBuilds = summaryBuilds.filter(build => build.plan && build.capability === next.capability);
+            const planUsage = feed.filter(message => message.kind === "summary_usage" && rec(message.payload).pass === "plan");
+            const at = (event: string) => planSummaryEvents.indexOf(event);
+            if (planSummaryUnacked) {
+              assert.equal(retainedPlanCallbacks.length, 1, "A's first onPlanPersisted callback was retained uninvoked");
+              assert.deepEqual(unackedAttempts.map(attempt => attempt.stage), [...publicationStages],
+                "uninvoked A plan callback admits no summary work during partial publication");
+              for (const attempt of unackedAttempts) {
+                assert.deepEqual(attempt, { stage: attempt.stage, inputs: 0, builds: 0, releases: 0, refreshes: 0, posts: 0 },
+                  "uninvoked A plan callback admits no summary work during partial publication");
+              }
+              for (const attempt of unackedAttempts.filter(entry => entry.stage !== "before-publish"))
+                assert.equal(attempt.inputs + attempt.builds + attempt.posts, 0, "retired A plan callback never builds or posts with B");
+              assert.equal(aInputs.length, 0, "uninvoked A plan callback admits no summary work during partial publication");
+              assert.equal(aPlanBuilds.length, 0, "uninvoked A plan callback admits no summary work during partial publication");
+              assert.ok(retiredCallbackAfterB, "the retained A callback was invoked after B resumed");
+              assert.equal(retiredCallbackAfterB.returned, true);
+              assert.deepEqual(retiredCallbackAfterB.after, retiredCallbackAfterB.before,
+                "retired A plan callback never builds or posts with B");
+              assert.equal(bInputsAtFinish, 0, "retired A plan callback never builds or posts with B");
+              assert.equal(planInputs.filter(input => input.capability === next.capability).length, 1,
+                "only B's own retried gate summarises, with B's credential");
+            } else {
+              // Preconditions, recorded when the executor suspension was entered and when the barrier was released.
+              assert.deepEqual(planAtSuspend, { flights: 1, workEntered: true, released: false },
+                "A plan work is entered and unsettled when the suspension begins");
+              assert.equal(planSuspensionPendingAtRelease, true, "the suspension is still pending when A plan work is released");
+              assert.equal(planAbortObserved, true, "A plan work observed its signal aborted by the switch");
+              assert.ok(at("A-plan-aborted") >= 0 && at("A-plan-aborted") < at("A-plan-released"));
+              assert.equal(aInputs.length, 1, "exactly one A plan summary input");
+              assert.equal(planSummaryEvents.filter(event => event === "A-plan-flight-settled").length, 1);
+              if (planSummaryLate) {
+                assert.ok(lateInput, "the late wrapper captured A's real generatePlanSummary input");
+                assert.equal(lateInput.capability, oldClaim.capability, "late A plan result never posts as B");
+                assert.equal(lateInput.authMode, oldClaim.auth_mode, "late A plan result never posts as B");
+                assert.ok(lateResult !== null && lateResult !== undefined, "late A plan result never posts as B");
+                assert.equal(lateResolvedAfterAbort, true, "late A plan result never posts as B");
+                assert.equal(planPosts.length, 0, "late A plan result never posts as B");
+                assert.equal(bInputsAtFinish, 0, "late A plan result never posts as B");
+                assert.ok(at("A-plan-late-result") >= 0 && at("A-plan-late-result") < at("A-plan-flight-settled") &&
+                  at("A-plan-flight-settled") < at("suspension-returned") && at("suspension-returned") < at("before-publish"),
+                "late A plan result settles before B publication");
+                assert.equal(aPlanBuilds.length, 0);
+                assert.ok(planUsage.length >= 1, "the late A usage frame was delivered");
+                for (const row of planUsage) assert.equal("credential_epoch_ordinal" in row, false, "late A usage carries no epoch ordinal");
+              } else {
+                assert.equal(aPlanBuilds.length, 1, "exactly one A plan summary build");
+                assert.ok(at("A-plan-flight-settled") >= 0 && at("A-plan-flight-settled") < at("suspension-returned") &&
+                  at("suspension-returned") < at("before-publish"), "A plan summary joins before suspension completes");
+                assert.equal(bInputsAtFinish, 0, "A plan summary joins before suspension completes");
+                assert.equal(bInputs.length, 1, "B plan summary build is admitted with B's credential");
+                assert.deepEqual(bInputs[0], { capability: next.capability, authMode: next.auth_mode },
+                  "B plan summary build is admitted with B's credential");
+                assert.equal(bPlanBuilds.length, 1, "B plan summary build is admitted with B's credential");
+                assert.equal(bPlanBuilds[0]?.authMode, next.auth_mode, "B plan summary build is admitted with B's credential");
+                assert.equal(planPosts.length, 1, "B plan summary build is admitted with B's credential");
+                assert.equal(planUsage.length, 1, "B plan summary usage is delivered with B's credential_epoch_ordinal");
+                assert.equal(planUsage[0]?.credential_epoch_ordinal, 1, "B plan summary usage is delivered with B's credential_epoch_ordinal");
+              }
+            }
+            assert.equal(summaryOwners.length, summaryBuilds.length, "every summary build retained its ownership record");
+            return;
+          }
           if (probeScopeIdentity) {
             const wake = await withTimeout(Promise.race([
               switchSettled.promise.then(() => "settled" as const),
@@ -35528,6 +35793,7 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
           try {
+            planRelease.resolve(); planGateRelease.resolve(); bPlanSettled.resolve();
             scopeProbesArmed = false;
             aRefreshRelease.resolve(); aRefreshContinue.resolve();
             releaseRetry?.();
