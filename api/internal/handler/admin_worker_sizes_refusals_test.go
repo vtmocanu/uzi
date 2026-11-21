@@ -5,12 +5,10 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
-func refusalClean(s string) string {
-	return termsafe.SanitizeBounded(termsafe.CellText(s), maxRefusalTextByte)
-}
+// refusalClean is the production sanitizer, so the tests follow any change to it.
+var refusalClean = cleanRefusalText
 
 // refusalsFor builds n refusal entries for one raw size, named so their order is known.
 func refusalsFor(raw string, n int) []apitypes.WorkerSizeRefusalDTO {
@@ -95,6 +93,27 @@ func TestSelectSizeRefusalsUnlistedCollisionsSkipped(t *testing.T) {
 	}
 	if len(out) != 1+3 {
 		t.Fatalf("len(out) = %d, want %d: %+v", len(out), 1+3, out)
+	}
+}
+
+// Unlisted sizes fill the slots left after the listed ones strictly by name: with 15 listed
+// refused sizes, only the first unlisted name by sort order gets the one free slot.
+func TestSelectSizeRefusalsUnlistedByName(t *testing.T) {
+	byRaw := map[string][]apitypes.WorkerSizeRefusalDTO{}
+	var listed []string
+	for i := 0; i < 15; i++ {
+		name := fmt.Sprintf("z-%02d", i)
+		listed = append(listed, name)
+		byRaw[name] = refusalsFor(name, 1)
+	}
+	for _, name := range []string{"u-c", "u-a", "u-d", "u-b"} {
+		byRaw[name] = refusalsFor(name, 2)
+	}
+	for run := 0; run < 20; run++ { // map order varies per run; the result must not
+		_, totals := selectSizeRefusals(byRaw, listed, refusalClean)
+		if len(totals) != 16 || totals["u-a"] != 2 || totals["u-b"] != 0 || totals["u-c"] != 0 || totals["u-d"] != 0 {
+			t.Fatalf("run %d: totals = %v, want the 15 listed sizes plus u-a only", run, totals)
+		}
 	}
 }
 

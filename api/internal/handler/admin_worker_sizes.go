@@ -250,7 +250,7 @@ func (h *Handler) sizeRefusals(ctx context.Context, listed []string) ([]apitypes
 		return out, totals
 	}
 	now := h.clock()
-	clean := func(s string) string { return termsafe.SanitizeBounded(termsafe.CellText(s), maxRefusalTextByte) }
+	clean := cleanRefusalText
 	byRaw := map[string][]apitypes.WorkerSizeRefusalDTO{}
 	for _, row := range rows {
 		if row.Worker.Kind != "hosted" || !row.Worker.HostedSize.Valid ||
@@ -274,6 +274,11 @@ func (h *Handler) sizeRefusals(ctx context.Context, listed []string) ([]apitypes
 	}
 
 	return selectSizeRefusals(byRaw, listed, clean)
+}
+
+// cleanRefusalText sanitizes and bounds one controller- or admin-supplied refusal field.
+func cleanRefusalText(s string) string {
+	return termsafe.SanitizeBounded(termsafe.CellText(s), maxRefusalTextByte)
 }
 
 // selectSizeRefusals picks the response from the fresh refusals grouped by raw hosted_size:

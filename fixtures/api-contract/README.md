@@ -389,8 +389,8 @@ and `WorkerSizeAdvisoryDTO` ride inside element 0 of the full fixture, and `ceil
 |---|---|---|
 | `AdminWorkerSizes` | `sizes` | `make([]apitypes.AdminWorkerSizeDTO, 0, len(rows))` in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:201`) → `[]` |
 | `AdminWorkerSizes` | `advisories` | `[]apitypes.WorkerSizeAdvisoryDTO{}` literal in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:204`) → `[]` |
-| `AdminWorkerSizes` | `refusals` | `sizeRefusals` returns a non-nil slice on every path, `out := []apitypes.WorkerSizeRefusalDTO{}` (`handler/admin_worker_sizes.go:241` early returns, `:284` in `selectSizeRefusals`) |
-| `AdminWorkerSizes` | `refusal_totals` | `sizeRefusals` returns a non-nil map on every path, `totals := map[string]int{}` (`handler/admin_worker_sizes.go:242` early returns, `:285` in `selectSizeRefusals`) → `{}` |
+| `AdminWorkerSizes` | `refusals` | `sizeRefusals` returns a non-nil slice on every path, `out := []apitypes.WorkerSizeRefusalDTO{}` (`handler/admin_worker_sizes.go:241` early returns, `:289` in `selectSizeRefusals`) |
+| `AdminWorkerSizes` | `refusal_totals` | `sizeRefusals` returns a non-nil map on every path, `totals := map[string]int{}` (`handler/admin_worker_sizes.go:242` early returns, `:290` in `selectSizeRefusals`) → `{}` |
 
 No exemption: `ceilings.cpu_limit_millicores`, `memory_limit_mib`, `data_gib`,
 `dind_data_gib` (null when no ceiling applies) and `ceilings.enabled_tiers` (null when the api
