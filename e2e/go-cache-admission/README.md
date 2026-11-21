@@ -20,14 +20,19 @@ leg's status. Neither exit authorizes production. JSON schema 2 is fixture-only,
 ASCII escaped, at most 64 KiB, with PROVEN/FIXTURE-PROVEN/NEGATIVE/UNVERIFIED per leg. Raw probe
 responses, errors, environment values, and supplied input strings are not echoed.
 ANSI, controls and bidi characters are escaped by the JSON encoder. No inherited
-environment or proxy/config is passed to probes: Docker uses direct Unix-socket
-GETs, not a CLI. No environment enumeration occurs.
+environment or proxy/config is passed to probes: Docker uses direct GETs (Unix
+socket or literal loopback TCP, see below), not a CLI. No environment enumeration occurs.
 
 ## Explicit inputs
 
 All inputs are optional so unavailable prerequisites can be inspected:
 - `--endpoint`: existing absolute Unix Docker socket (default
-  /var/run/docker.sock); only GET /version and GET /images/sha256:…/json.
+  /var/run/docker.sock), or a loopback TCP endpoint written exactly
+  `tcp://127.0.0.1:<port>` or `tcp://[::1]:<port>` (port 1-65535). The address is a
+  literal: no hostname resolution, no `DOCKER_HOST` or other environment read, and
+  `tcp://localhost:...` or any other address is refused. Only GET /version,
+  GET /info, GET /images/json and GET /images/sha256:<64 hex>/json; any non-200
+  status, redirects included, is refused.
 - `--docker-version`: exact expected daemon version.
 - `--image`: installed immutable sha256 image ID; `--repo-digest`: exact
   repository@sha256 digest in that local image's RepoDigests.
@@ -136,3 +141,127 @@ and a bounded join on a non-daemon thread, with socket/directory closure. Fixtur
 setup creates root scratch before temporary directories, including in a fresh
 checkout. Tests never execute the fake go/cc files. All allocation/quota authority,
 actual child confinement and hard inode enforcement remain UNVERIFIED.
+
+## qualify.py: prerequisite verifier (issue 4575, M1)
+
+`qualify.py` is a pure, nonproducing verifier. It starts no Docker, Go, container or
+subprocess, and it qualifies no environment: the canary leg has no collector, so
+`qualified` is always false and the verdict is NO-QUALIFIED-ENVIRONMENT. No live proof
+is claimed; every test fixture is synthetic and labelled fixture-only.
+
+```sh
+python3 -B e2e/go-cache-admission/qualify.py --artifact <abs path under .uzi/scratch> [--experimental]
+```
+
+Exit 2 unless qualified (never, in this issue); `--experimental` exits 0 and never sets
+`qualified`. The artifact is read by `preflight.read_json` (64 KiB, duplicate keys
+rejected, scratch-only path, schema `uzi-go-cache-env/1`); an unreadable or wrong-schema
+artifact reports every leg UNVERIFIED `schema-unsupported`. Output is the `encode()`d
+JSON: `qualified`, `verdict`, `producer_launched=false`, `production_authorized=false`
+and eight legs (binding, threshold, charge_map, enforcement, aliasing, envelope,
+backing, canary), each with `status`, `reason` and the full `reasons` list.
+
+Statuses: PROVEN, NEGATIVE (a contradiction), UNVERIFIED (missing or unproven evidence),
+FIXTURE-CONSISTENT (consistent, but only file-sourced evidence).
+
+### Evidence tiers
+
+Whatever a file claims about its own provenance is ignored: file values reach at most
+FIXTURE-CONSISTENT. PROVEN needs a `CollectorEvidence`, which only `collect(observer)`
+can construct (a module-private token; it also stores the daemon identity as a hash
+salted per invocation). The CLI never builds one. A later collector calls
+`evaluate(artifact, collector=collect(observer), now=...)`, where
+`observer.observe()` returns the sections binding, threshold, mountinfo, runtime,
+daemon and backing and `observer.daemon_id()` a string; collector sections replace the
+file's. The envelope leg is declared-only and cannot exceed FIXTURE-CONSISTENT.
+Defects are reported whatever the tier.
+
+### Legs and reason codes
+
+- binding: `binding-source-unbound`, `binding-image-mismatch`, `go-host-only`,
+  `go-not-declared` (distinct from `go-absent-verified`), `provenance-coordinate-only`
+  (tag, label, profile path, devbox lock, narhash), `toolchain-mount-writable`,
+  `no-go-bearing-image-verified`. Go must be observed with `observed_in: "image-fs"`
+  and a provenance kind in `signed-output-metadata` or `reproducible-build-attestation`.
+- threshold: `owner-input-not-supplied`, `effective-value-unestablished` (an API value
+  alone), `threshold-stale` (over 300 s old or in the future), `threshold-contradictory`,
+  `margin-js-parse-unsupported`. The effective value must be a `soft-threshold-log` or
+  `owner-authorized` observation bound to the same incarnation, equal to the API
+  threshold minus `config_margin` (or the threshold itself when that is not positive).
+  `config_margin` emulates agent/src/config.ts `marginFraction` (JS trim and Number);
+  input outside the emulated grammar raises instead of guessing.
+- charge_map: `sink-missing` (CHARGE_SINKS is the preflight SINKS plus the container,
+  daemon and export sinks), `no-container-mount-facts`, `unaccounted-writable-mount`,
+  `unaccounted-writable-fd`. Read-only mounts need no storage coverage. Writable proc
+  and devpts are listed with a reason as non-storage. Writable mqueue, sysfs, cgroup,
+  cgroup2, network binds (/etc/hosts, /etc/hostname, /etc/resolv.conf), bind or volume
+  mounts and any other fstype are unaccounted. Writable tmpfs needs `size` and
+  `nr_inodes` coverage. A writable fd must map to an accounted mount.
+- Kernel memory: every enumerated mount, read-only and non-storage ones included, stays
+  in the leg's `kernel_memory` list charged to the memory domain (tmpfs pages, dentry
+  and inode slab). It is never dropped because a mount is not a storage sink.
+- enforcement: claims are triples `{kind, resource, sinks}`.
+
+| kind | resource | scope and evidence |
+| --- | --- | --- |
+| tmpfs-size | bytes | sinks on that tmpfs superblock; `size` in its options |
+| tmpfs-nr_inodes | inodes | same; `nr_inodes` in its options |
+| exclusive-finite-fs | bytes and inodes (two triples, both needed) | collector capacity, inode count, `exclusive: true` |
+| readonly-rootfs | write-deny | sink realpath resolves by longest prefix to the read-only root mount |
+| pids-max | pids | process tree only; limit observed applied |
+| log-driver-none | logs | container_logs only; driver observed `none` |
+| memcg-max-eq-swap | memory-swap | outer memory domain only; memory max equals swap max |
+
+  Codes: `boundary-resource-missing`, `-unknown`, `-mismatch`, `boundary-sink-out-of-scope`,
+  `boundary-removable` (privileged, CAP_SYS_ADMIN for mount claims, writable cgroupfs or
+  no cgroupns for pids/memory claims), `boundary-not-allocation-enforcement` (emptyDir
+  sizeLimit, ephemeral-storage limit, quota monitoring, PVC request, fs capacity,
+  watchdog, sampled du/statfs, broker counters, eviction, cooperative writer caps,
+  json-file max-size, rlimit fsize, cacheprog object count, and storage-opt size unless
+  backend-support evidence is present), `new-mount-possible` (needs CapBnd 0, NoNewPrivs 1
+  and seccomp mode 2 default profile or max_user_namespaces 0),
+  `daemon-capability-unsupported` (MemoryLimit, SwapLimit or PidsLimit false, or
+  rootless with the cgroupfs driver), `limits-not-applied-observed`,
+  `claim-evidence-not-collector`, and per-sink coverage codes `sink-bytes-uncovered`,
+  `sink-inodes-uncovered`, `sink-pids-uncovered`, `sink-logs-uncovered`,
+  `sink-memory-swap-uncovered`. Every incremental-allocation sink and writable storage
+  mount needs bytes and inodes coverage; daemon-side sinks are outside container
+  enforcement and are only charged through the aliasing and backing legs.
+- DAC rule: a `dac-deny-nonroot` kind (or any claim using fields like `non_root_user`,
+  `owner`, `mode`, `acl`) is UNVERIFIED `dac-ownership-mode-unverified` and covers
+  nothing: ownership checks cannot establish zero allocation (CHOWN/SETUID-class
+  capabilities may remain and pre-existing writable fds are unaccounted).
+- aliasing: the domain key is the superblock; `mount_id` only maps paths. `domain-overcommitted`
+  when sink ceilings on one superblock exceed its limit, `domain-alias-split` when sinks
+  on one superblock claim different backing domains; a child charged inside its parent
+  counts once.
+- envelope: `envelope-drift` unless limits equal preflight.LIMITS exactly;
+  `inode-ceiling-unapproved` unless `owner_approved` is true.
+- backing: `backing_check` reuses `preflight.project_domains`. Codes
+  `backing-link-cited-only`, `backing-capacity-unknown`, `backing-sample-stale` (over
+  60 s), `backing-concurrency-unknown`, `backing-mapping-unknown`,
+  `backing-aggregate-exceeds-soft` (projected use must stay strictly below soft times
+  capacity for bytes and inodes), `backing-soft-unknown`.
+- canary: evaluated only when the other legs are PROVEN and a canary-collector result
+  exists; none does, so `canary-collector-not-implemented`. `classify_canary` is tested
+  with fixtures: readonly-rootfs needs EROFS and the read-only flag
+  (`write-deny-not-erofs`), tmpfs needs ENOSPC, EDQUOT only for an accepted quota kind
+  (`canary-errno-unexpected`), a kill without an errno is `canary-kill-only`.
+- Other codes: `schema-unsupported`, `malformed-section`, `container-facts-missing`,
+  `daemon-info-missing`, `sink-mapping-mismatch`.
+
+### Margin golden table
+
+`margin-golden.json` records the output of the real `loadConfig(...).diskSoftMargin` from
+agent/src/config.ts at revision f99e8a84d9111dea0f0431485295d2411ec5e971, with the
+sha256 of that file. Tests check every row and that the file still hashes to the recorded
+value, so a config.ts change turns them (and the threshold leg) red until the table is
+regenerated. Regenerate the rows with this command (it passes only the required
+variables plus `UZI_DISK_SOFT_MARGIN`), then update `config_ts_sha256` and `revision`:
+
+```sh
+cd agent && node --import tsx -e 'import("./src/config.ts").then(({ loadConfig }) => { const rows = [null, "", "   ", " ", "\u3000 0.2 ", "0.1", "0.25", "1e-1", ".5", "5.", "0x0", "0b0", "-0.1", "1", "1.5", "abc", "NaN", "Infinity", "1_0", "0.5abc", "+0.3", " 0.3\n"]; console.log(JSON.stringify(rows.map((input) => { const explicit = { UZI_API_URL: "http://x", UZI_WORKER_TOKEN: "t" }; if (input !== null) explicit.UZI_DISK_SOFT_MARGIN = input; return { input, expected: loadConfig(explicit).diskSoftMargin }; }))); })'
+```
+
+The new tests are `test_qualify.py`: synthetic fixtures only, including an owned
+loopback TCP stub for `docker_get`. They validate code paths, not an environment.

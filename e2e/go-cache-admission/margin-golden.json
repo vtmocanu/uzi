@@ -1,0 +1,94 @@
+{
+ "config_ts_sha256": "efd588c2f259b8d4f7e6c01dee8d949c265338cf3622e0884af8c8fb9c571588",
+ "revision": "f99e8a84d9111dea0f0431485295d2411ec5e971",
+ "rows": [
+  {
+   "input": null,
+   "expected": 0.1
+  },
+  {
+   "input": "",
+   "expected": 0.1
+  },
+  {
+   "input": "   ",
+   "expected": 0.1
+  },
+  {
+   "input": " ",
+   "expected": 0.1
+  },
+  {
+   "input": "\u3000 0.2 ",
+   "expected": 0.2
+  },
+  {
+   "input": "0.1",
+   "expected": 0.1
+  },
+  {
+   "input": "0.25",
+   "expected": 0.25
+  },
+  {
+   "input": "1e-1",
+   "expected": 0.1
+  },
+  {
+   "input": ".5",
+   "expected": 0.5
+  },
+  {
+   "input": "5.",
+   "expected": 0.1
+  },
+  {
+   "input": "0x0",
+   "expected": 0
+  },
+  {
+   "input": "0b0",
+   "expected": 0
+  },
+  {
+   "input": "-0.1",
+   "expected": 0.1
+  },
+  {
+   "input": "1",
+   "expected": 0.1
+  },
+  {
+   "input": "1.5",
+   "expected": 0.1
+  },
+  {
+   "input": "abc",
+   "expected": 0.1
+  },
+  {
+   "input": "NaN",
+   "expected": 0.1
+  },
+  {
+   "input": "Infinity",
+   "expected": 0.1
+  },
+  {
+   "input": "1_0",
+   "expected": 0.1
+  },
+  {
+   "input": "0.5abc",
+   "expected": 0.1
+  },
+  {
+   "input": "+0.3",
+   "expected": 0.3
+  },
+  {
+   "input": " 0.3\n",
+   "expected": 0.3
+  }
+ ]
+}
