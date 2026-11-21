@@ -232,8 +232,10 @@ An effective custom Codex planning model also requires `codex_custom_model_v1`;
 a curated planning model or effort-only setting does not add that requirement.
 A curated frozen run model wins in both phases, so a saved custom planning
 model does not add a custom-model requirement in that case.
-Older workers leave the run queued. When phase support is missing, health
-reads **no worker supporting separate planning settings is online**;
+Older workers leave the run queued. For otherwise eligible runs with curated
+roots, missing phase support reads **no worker supporting separate planning
+settings is online**. A custom effective root can show the custom-model health
+reason when no worker supports both requirements;
 see [Hosted workers](./hosted-workers.md#my-run-says-no-worker-supporting-separate-planning-settings-is-online).
 A run that was queued on an incapable worker may stay with it for about two
 minutes before another capable worker can take it.

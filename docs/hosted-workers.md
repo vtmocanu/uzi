@@ -1149,8 +1149,10 @@ respectively. An effective custom Codex planning model requires both
 and effort-only settings do not add the custom-model requirement. A curated
 frozen run model wins in both phases and suppresses a saved custom planning model.
 Deploy the API before the workers. An incapable worker leaves the run queued.
-Missing phase support reads **no worker supporting separate planning settings is online**;
-missing custom-model support uses the custom-model reason above.
+For an otherwise eligible run with curated roots, missing phase support reads
+**no worker supporting separate planning settings is online**. A custom effective
+root can instead show the custom-model reason above when no worker supports both
+custom models and the required separate-planning capability.
 
 - Ask your admin to upgrade or roll the hosted worker fleet to an image that
   advertises the phase capability for the run's harness (and the custom-model
