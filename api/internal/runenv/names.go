@@ -272,11 +272,21 @@ func deniedBy(name string) string {
 	return ""
 }
 
+// ValidateNameShape applies the name shape only. It is the check for a name that already exists
+// (disable, enable, delete): a stored variable whose name a later denylist entry denies stays
+// manageable.
+func ValidateNameShape(name string) error {
+	if !NameRegexp.MatchString(name) {
+		return &RuleError{Field: "name", Rule: "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)"}
+	}
+	return nil
+}
+
 // ValidateName applies the name shape and the denylist. A non-nil result is a
 // *RuleError whose message names the broken rule.
 func ValidateName(name string) error {
-	if !NameRegexp.MatchString(name) {
-		return &RuleError{Field: "name", Rule: "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)"}
+	if err := ValidateNameShape(name); err != nil {
+		return err
 	}
 	if rule := deniedBy(name); rule != "" {
 		return &RuleError{Field: "name", Rule: rule}

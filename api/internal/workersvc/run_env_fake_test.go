@@ -38,6 +38,10 @@ func (f *fakeStore) WorkerHoldsOpenCustodyForRun(context.Context, store.WorkerHo
 	return false, nil
 }
 
+func (f *fakeStore) RunEnvRedactOpen(context.Context, uuid.UUID) (bool, error) {
+	return true, nil
+}
+
 func (t *fakeClaimFinishTx) LockUserVaultStateForKeyShareNowait(context.Context, uuid.UUID) (store.LockUserVaultStateForKeyShareNowaitRow, error) {
 	t.f.runEnv.lockCalls++
 	if len(t.f.runEnv.lockErrs) > 0 {

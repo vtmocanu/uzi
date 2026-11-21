@@ -651,7 +651,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	name := chi.URLParam(r, "name")
-	if err := runenv.ValidateName(name); err != nil {
+	if err := runenv.ValidateNameShape(name); err != nil {
 		writeRunEnvRule(w, err)
 		return
 	}
@@ -695,7 +695,7 @@ func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := chi.URLParam(r, "name")
-	if err := runenv.ValidateName(name); err != nil {
+	if err := runenv.ValidateNameShape(name); err != nil {
 		writeRunEnvRule(w, err)
 		return
 	}

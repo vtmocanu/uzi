@@ -1115,3 +1115,24 @@ func TestRunEnvPutSurrogateEscapesLiveDB(t *testing.T) {
 		}
 	}
 }
+
+// A stored variable whose name a denylist now denies can still be disabled, enabled and deleted;
+// only creating or updating one applies the denylist.
+func TestRunEnvDeniedStoredNameCanBeDisabledAndDeletedLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO run_env_vars (var_id,user_id,repo_id,name,secret,ciphertext,sealed_with,value_bytes,rev)
+ VALUES ($1,$2,$3,'PATH',false,'\x01','master_aad',1,1)`, uuid.New(), f.owner, f.repo); err != nil {
+		t.Fatal(err)
+	}
+	f.must(f.do(http.MethodPut, "/PATH", jsonBody(map[string]any{"value": "/usr/bin", "secret": false})), http.StatusUnprocessableEntity)
+	f.must(f.do(http.MethodPost, "/PATH/disable", ""), http.StatusOK)
+	if k := f.find(f.list(), "PATH"); k == nil || k.State != apitypes.RunEnvStateDisabled {
+		t.Fatalf("after disable = %+v", k)
+	}
+	f.must(f.do(http.MethodPost, "/PATH/enable", ""), http.StatusOK)
+	f.must(f.do(http.MethodDelete, "/PATH", ""), http.StatusOK)
+	if n := f.rowCount("name='PATH'"); n != 0 {
+		t.Fatalf("rows after delete = %d", n)
+	}
+	f.must(f.do(http.MethodDelete, "/lower_case", ""), http.StatusUnprocessableEntity)
+}

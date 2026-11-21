@@ -626,6 +626,7 @@ type Store interface {
 	// The redact maintenance route and a cross-check child's claim (PRD #4416 M2).
 	ListRunEnvSecretReceiptVersionsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvSecretReceiptVersionsForRunRow, error)
 	WorkerHoldsOpenCustodyForRun(ctx context.Context, arg store.WorkerHoldsOpenCustodyForRunParams) (bool, error)
+	RunEnvRedactOpen(ctx context.Context, runID uuid.UUID) (bool, error)
 
 	// Durable run recovery (PRD #1296 M1): the custody/archive store contract M2
 	// (upload/owner API), M3 (worker capture/retry) and M5 (owner UX) consume. Frozen

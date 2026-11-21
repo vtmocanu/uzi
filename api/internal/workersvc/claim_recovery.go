@@ -801,7 +801,7 @@ const codexResetFailureReason = "the bound Codex login is unavailable after your
 // claimCredentialsReset reports whether the run's owner redeemed an account reset link after the
 // run was created (PRD #3989). It is a plain read that takes no users row lock of its own, so it adds no
 // edge to the run-then-users lock order (a lead-lane claim's finisher takes the users row FOR
-// SHARE NOWAIT separately, after the run lock; PRD #4416). A missing marker or user is "no".
+// KEY SHARE NOWAIT separately, after the run lock; PRD #4416). A missing marker or user is "no".
 func claimCredentialsReset(ctx context.Context, q claimFinishQueries, locked store.Run) (bool, error) {
 	marker, err := q.GetUserCredentialsResetAt(ctx, locked.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {

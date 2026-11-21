@@ -420,6 +420,39 @@ func (q *Queries) ParkRunEnvHistoryUnavailableRun(ctx context.Context, arg ParkR
 	return result.RowsAffected(), nil
 }
 
+const runEnvRedactOpen = `-- name: RunEnvRedactOpen :one
+SELECT (
+    r.status NOT IN ('completed', 'failed', 'cancelled')
+    OR fn_run_env_publication_pending(r.id)
+)::boolean AS open
+FROM runs r
+WHERE r.id = $1 AND r.kind <> 'cross_check'
+UNION ALL
+SELECT (
+    fn_run_env_publication_pending(r.id)
+    OR (r.status NOT IN ('completed', 'failed', 'cancelled')
+        AND EXISTS (
+            SELECT 1 FROM cross_checks x
+            WHERE x.checker_run_id = r.id AND x.deadline_at > now()
+              AND ((x.stage = 'plan' AND x.verdict = 'pending')
+                   OR (x.stage = 'code' AND x.outcome = 'pending'))))
+)::boolean AS open
+FROM runs r
+WHERE r.id = $1 AND r.kind = 'cross_check'
+`
+
+// Whether the redact route still answers for the requested run, which is not the governing run.
+// A run that is not terminal is served. A terminal run is served while it has recovery custody or
+// a publication in flight (fn_run_env_publication_pending). A cross-check child that is not
+// terminal is also served while its cross_checks row is open: a pending plan verdict or a pending
+// code outcome, before its deadline.
+func (q *Queries) RunEnvRedactOpen(ctx context.Context, runID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, runEnvRedactOpen, runID)
+	var open bool
+	err := row.Scan(&open)
+	return open, err
+}
+
 const runEnvSecretVersionReceiptExists = `-- name: RunEnvSecretVersionReceiptExists :one
 SELECT EXISTS (SELECT 1 FROM run_env_receipts WHERE var_id = $1 AND rev = $2 AND secret) AS held
 `

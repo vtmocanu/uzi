@@ -67,7 +67,8 @@ func TestWorkerRunEnvRedactMapsTheServiceAnswer(t *testing.T) {
 	}{
 		{"unprotected", workersvc.RunEnvRedactResponse{}, nil, http.StatusOK, "", `{"protected":false}`},
 		{"protected", protected, nil, http.StatusOK, "", string(raw)},
-		{"notOwned", workersvc.RunEnvRedactResponse{}, workersvc.ErrRunNotOwned, http.StatusNotFound, "", ""},
+		{"notOwned", workersvc.RunEnvRedactResponse{}, workersvc.ErrRunNotOwned, http.StatusNotFound, "run_env_run_not_found", ""},
+		{"redactClosed", workersvc.RunEnvRedactResponse{}, workersvc.ErrRunEnvRedactClosed, http.StatusConflict, "run_env_redact_closed", ""},
 		{"vaultLocked", workersvc.RunEnvRedactResponse{}, workersvc.ErrRunEnvVaultLocked, http.StatusConflict, "vault_locked", ""},
 		{"historyUnavailable", workersvc.RunEnvRedactResponse{}, workersvc.ErrRunEnvHistoryUnavailable, http.StatusConflict, "run_env_history_unavailable", ""},
 		{"internal", workersvc.RunEnvRedactResponse{}, errors.New("database exploded"), http.StatusInternalServerError, "", ""},
@@ -89,7 +90,7 @@ func TestWorkerRunEnvRedactMapsTheServiceAnswer(t *testing.T) {
 			var body map[string]any
 			_ = json.Unmarshal(rec.Body.Bytes(), &body)
 			if tc.wantReason != "" && (body["reason"] != tc.wantReason || body["code"] != tc.wantReason) {
-				t.Fatalf("409 body = %s, want reason and code %q", rec.Body.String(), tc.wantReason)
+				t.Fatalf("error body = %s, want reason and code %q", rec.Body.String(), tc.wantReason)
 			}
 			if tc.wantBody != "" {
 				var want any

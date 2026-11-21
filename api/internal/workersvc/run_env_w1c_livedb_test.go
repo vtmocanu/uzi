@@ -187,3 +187,51 @@ func TestRunEnvRedactRefusesWhenHistoryCannotBeOpenedLiveDB(t *testing.T) {
 		}
 	})
 }
+
+// A terminal run is served only while it has recovery custody or a publication in flight; a
+// non-terminal run is always served.
+func TestRunEnvRedactBoundedByRunStateLiveDB(t *testing.T) {
+	terminal := func(fx *reFix, runID uuid.UUID) {
+		fx.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, runID)
+	}
+	t.Run("non-terminal run is served", func(t *testing.T) {
+		fx, runID, _ := redactFix(t)
+		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); err != nil || !res.Protected {
+			t.Fatalf("%+v, %v; want protected", res, err)
+		}
+	})
+	t.Run("terminal run with nothing pending is closed", func(t *testing.T) {
+		fx, runID, _ := redactFix(t)
+		terminal(fx, runID)
+		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvRedactClosed) {
+			t.Fatalf("err = %v, want ErrRunEnvRedactClosed", err)
+		}
+	})
+	t.Run("terminal run without secret receipts answers unprotected", func(t *testing.T) {
+		fx := newREFix(t, true)
+		runID := fx.queuedRun(t, "issue")
+		fx.put(t, "API_BASE", false, "https://sandbox.example.test")
+		if p := fx.claim(t); p == nil {
+			t.Fatal("claim idle")
+		}
+		terminal(fx, runID)
+		res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
+		if err != nil || res.Protected {
+			t.Fatalf("%+v, %v; want {protected:false}", res, err)
+		}
+	})
+	t.Run("terminal run with an open custody hold of this worker is served", func(t *testing.T) {
+		fx, runID, _ := redactFix(t)
+		terminal(fx, runID)
+		hold := uuid.New()
+		fx.env.exec(`INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
+		    VALUES($1,$2,$3,$4,1,'open',$5,'redact-fixture')`, hold, fx.userID, fx.repoID, runID, fx.workerID)
+		t.Cleanup(func() {
+			fx.env.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
+				released_at=now(),updated_at=now() WHERE id=$1`, hold)
+		})
+		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); err != nil || !res.Protected {
+			t.Fatalf("%+v, %v; want protected", res, err)
+		}
+	})
+}

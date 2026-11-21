@@ -239,12 +239,15 @@ func (s *Service) openRunEnvRedact(owner uuid.UUID, row runEnvRedactRow) (string
 	return string(plain), nil
 }
 
-// ErrRunEnvVaultLocked and ErrRunEnvHistoryUnavailable are the redact maintenance route's two
-// typed refusals: the owner's vault is locked, or a receipted version is missing or cannot be
-// opened. Neither carries a value.
+// ErrRunEnvVaultLocked, ErrRunEnvHistoryUnavailable and ErrRunEnvRedactClosed are the redact
+// maintenance route's typed refusals: the owner's vault is locked, a receipted version is missing
+// or cannot be opened, or the requested run is past the point the route answers for it (a
+// terminal run with no recovery custody or publication in flight, or a cross-check child whose
+// check is no longer open). None carries a value.
 var (
 	ErrRunEnvVaultLocked        = errors.New("run environment redact: vault locked")
 	ErrRunEnvHistoryUnavailable = errors.New("run environment redact: history unavailable")
+	ErrRunEnvRedactClosed       = errors.New("run environment redact: closed for this run")
 )
 
 // RunEnvRedact answers the redact maintenance route (PRD #4416 M2): every secret version the
@@ -254,7 +257,8 @@ var (
 // governing run or the governing run has no secret receipt. The run must be the worker's user's
 // and one this worker holds or last held (runs.worker_id), or one whose open recovery custody
 // hold this worker took (the worker recovering a run another claim has since moved); anything
-// else is ErrRunNotOwned. The route is read-only, so there is no generation or repo check. The
+// else is ErrRunNotOwned. When versions would be returned, the requested run must still be open
+// (RunEnvRedactOpen), else ErrRunEnvRedactClosed. The route is read-only, so there is no generation or repo check. The
 // result carries plaintext secrets: the caller must never log or cache it.
 func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid.UUID) (RunEnvRedactResponse, error) {
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
@@ -287,6 +291,13 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	}
 	if len(rows) == 0 {
 		return RunEnvRedactResponse{Protected: false}, nil
+	}
+	open, err := s.q.RunEnvRedactOpen(ctx, runID)
+	if err != nil {
+		return RunEnvRedactResponse{}, fmt.Errorf("run env redact open: %w", err)
+	}
+	if !open {
+		return RunEnvRedactResponse{}, ErrRunEnvRedactClosed
 	}
 	out := RunEnvRedactResponse{Protected: true, Versions: make([]ClaimRunEnvRedact, 0, len(rows))}
 	for _, row := range rows {

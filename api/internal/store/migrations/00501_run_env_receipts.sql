@@ -162,6 +162,19 @@ CREATE FUNCTION fn_run_env_run_held(p_run_id uuid) RETURNS boolean LANGUAGE sql 
 $$;
 -- +goose StatementEnd
 
+-- fn_run_env_publication_pending: whether a run still has recovery custody or a publication in
+-- flight: an open custody hold, a capture not yet expired or discarded, a held-work publication
+-- that is prepared, invoked or of unknown outcome, or a terminal preservation that is bound,
+-- publishing or live. The run-env redact route stays open for a terminal run while this holds.
+-- +goose StatementBegin
+CREATE FUNCTION fn_run_env_publication_pending(p_run_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = p_run_id AND h.state = 'open')
+        OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = p_run_id AND c.state NOT IN ('expired', 'discarded'))
+        OR EXISTS (SELECT 1 FROM run_held_publications p WHERE p.run_id = p_run_id AND p.state IN ('prepared', 'invoked', 'create_unknown'))
+        OR EXISTS (SELECT 1 FROM run_terminal_preservations t WHERE t.run_id = p_run_id AND t.state IN ('bound', 'publishing', 'live'))
+$$;
+-- +goose StatementEnd
+
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 -- Version-2 rows and receipts have no version-1 representation: dropping aad_version would leave
@@ -176,6 +189,7 @@ BEGIN
 END
 $$;
 -- +goose StatementEnd
+DROP FUNCTION fn_run_env_publication_pending(uuid);
 DROP FUNCTION fn_run_env_run_held(uuid);
 DROP FUNCTION fn_run_env_lane(text, uuid, uuid);
 DROP INDEX run_env_vars_sweep_idx;

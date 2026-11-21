@@ -278,3 +278,62 @@ func TestRunEnvRedactNonLeadLaneRunIsUnprotectedLiveDB(t *testing.T) {
 		t.Fatalf("%+v, %v; want {protected:false}", res, err)
 	}
 }
+
+// A cross-check child is served while its check is open; once it is terminal, or its check has
+// passed its deadline, the route is closed unless the child itself holds recovery state.
+func TestRunEnvRedactCrossCheckChildBoundedLiveDB(t *testing.T) {
+	setup := func(t *testing.T, stage string) crossCheckContentionFixture {
+		t.Helper()
+		f, w := admissionCheckerBase(t, stage)
+		f, _ = admissionCheckerSubmit(t, f, w, stage, 0, nil)
+		crossCheckEnvCapable(f, true)
+		seedLeadSecret(t, f, "API_KEY", envSecretValue("lead"))
+		if p := laneClaim(t, f, "cross_check", nil); p == nil {
+			t.Fatal("checker not claimed")
+		}
+		return f
+	}
+	redact := func(f crossCheckContentionFixture) (RunEnvRedactResponse, error) {
+		return f.svc.RunEnvRedact(f.env.ctx, wkrRow(t, f.env, f.workerID), f.runID)
+	}
+	for _, stage := range []string{"plan", "code"} {
+		t.Run(stage+"/open check is served", func(t *testing.T) {
+			f := setup(t, stage)
+			if res, err := redact(f); err != nil || !res.Protected || len(res.Versions) != 1 {
+				t.Fatalf("%+v, %v; want the lead's version", res, err)
+			}
+		})
+		t.Run(stage+"/terminal child is closed", func(t *testing.T) {
+			f := setup(t, stage)
+			f.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, f.runID)
+			if _, err := redact(f); !errors.Is(err, ErrRunEnvRedactClosed) {
+				t.Fatalf("err = %v, want ErrRunEnvRedactClosed", err)
+			}
+		})
+		t.Run(stage+"/terminal child with its own live capture is served", func(t *testing.T) {
+			f := setup(t, stage)
+			f.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, f.runID)
+			hold, capture := uuid.New(), uuid.New()
+			f.env.exec(`INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
+			    VALUES($1,$2,(SELECT repo_id FROM runs WHERE id=$3),$3,1,'open',$4,'redact-fixture')`, hold, f.userID, f.runID, f.workerID)
+			f.env.exec(`INSERT INTO recovery_captures(id,hold_id,run_id,user_id,original_worker_id,original_worker_identity,source_sha,idempotency_key,state)
+			    VALUES($1,$2,$3,$4,$5,'redact-fixture','sha','redact-capture','available')`, capture, hold, f.runID, f.userID, f.workerID)
+			t.Cleanup(func() {
+				f.env.exec(`UPDATE recovery_captures SET state='discarded' WHERE id=$1`, capture)
+				f.env.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
+					released_at=now(),updated_at=now() WHERE id=$1`, hold)
+			})
+			if res, err := redact(f); err != nil || !res.Protected {
+				t.Fatalf("%+v, %v; want protected", res, err)
+			}
+		})
+	}
+	// A code cross-check snapshot, deadline included, is immutable, so only a plan check is aged.
+	t.Run("plan/child past its check deadline is closed", func(t *testing.T) {
+		f := setup(t, "plan")
+		f.env.exec(`UPDATE cross_checks SET deadline_at = now() - interval '1 minute' WHERE checker_run_id = $1`, f.runID)
+		if _, err := redact(f); !errors.Is(err, ErrRunEnvRedactClosed) {
+			t.Fatalf("err = %v, want ErrRunEnvRedactClosed", err)
+		}
+	})
+}

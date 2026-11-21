@@ -65,6 +65,31 @@ SELECT EXISTS (
       AND (NOT h.inventory_guarded OR (h.live_worker_id = @worker_id AND h.live_run_id = @run_id))
 )::boolean AS held;
 
+-- name: RunEnvRedactOpen :one
+-- Whether the redact route still answers for the requested run, which is not the governing run.
+-- A run that is not terminal is served. A terminal run is served while it has recovery custody or
+-- a publication in flight (fn_run_env_publication_pending). A cross-check child that is not
+-- terminal is also served while its cross_checks row is open: a pending plan verdict or a pending
+-- code outcome, before its deadline.
+SELECT (
+    r.status NOT IN ('completed', 'failed', 'cancelled')
+    OR fn_run_env_publication_pending(r.id)
+)::boolean AS open
+FROM runs r
+WHERE r.id = @run_id AND r.kind <> 'cross_check'
+UNION ALL
+SELECT (
+    fn_run_env_publication_pending(r.id)
+    OR (r.status NOT IN ('completed', 'failed', 'cancelled')
+        AND EXISTS (
+            SELECT 1 FROM cross_checks x
+            WHERE x.checker_run_id = r.id AND x.deadline_at > now()
+              AND ((x.stage = 'plan' AND x.verdict = 'pending')
+                   OR (x.stage = 'code' AND x.outcome = 'pending'))))
+)::boolean AS open
+FROM runs r
+WHERE r.id = @run_id AND r.kind = 'cross_check';
+
 -- name: ListRunEnvRedactKeysForRun :many
 -- ListRunEnvRedactForRun without the ciphertext: the finish transaction's recompute.
 -- present is false when no row of the owner holds the version.
