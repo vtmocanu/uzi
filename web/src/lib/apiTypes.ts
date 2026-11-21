@@ -267,7 +267,7 @@ export interface ModelSettingCell {
 /** One harness's cell of the ordinary reasoning-effort setting (PRD #3247), parallel to
  *  ModelSettingCell. `effort` is the stored token (null = Default, a level, or
  *  "runtime"); `resolved_effort` is the level a claim sends, null exactly when `mode`
- *  is "runtime_default". `source` is user_default | builtin; labelled by
+ *  is "runtime_default". `source` and `default_source` are user_default | template | builtin; labelled by
  *  fixtures/model-settings/contract.json. */
 export interface EffortSettingCell {
   harness: Harness;

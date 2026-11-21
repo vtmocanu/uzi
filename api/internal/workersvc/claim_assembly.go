@@ -492,12 +492,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 
 	// Issue #3258 N6: stored subagent effort pins ride the claim only to a worker advertising
-	// template_effort_v1. For one that does not, the withheld pins get exactly one run-feed line per
-	// claim generation. Recorded here, before the payload literal reads recordedLastSeq.
+	// template_effort_v1. The withheld-pins feed line is recorded at the end of assembly, once no
+	// later refusal or isolation strip can make it misleading.
 	templateEffortSupported := slices.Contains(wkr.ProtocolCapabilities, capability.TemplateEffortV1)
-	if !templateEffortSupported && hasWithheldTemplateEffort(templates, run.Harness) {
-		recordedLastSeq = s.recordTemplateEffortOmittedNote(ctx, run, recordedLastSeq)
-	}
 
 	// PRD #1551 M4 (D6): post-claim custom-Codex capability re-check. ClaimRun commits BEFORE
 	// assembleClaim runs (service.go), so the owner's Codex lane could have flipped to a CUSTOM
@@ -1159,6 +1156,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	payload.PublicationResume = resume
 	if err := assertClaimSecretsExclusive(payload.Secrets); err != nil {
 		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
+	// Issue #3258 N6: last, so no refusal above and no isolation strip (payload.Agents empty)
+	// leaves a feed line naming pins the claim never carried.
+	if !templateEffortSupported && !isolated && len(payload.Agents) > 0 && hasWithheldTemplateEffort(templates, run.Harness) {
+		payload.LastSeq = s.recordTemplateEffortOmittedNote(ctx, run, payload.LastSeq)
 	}
 	return payload, nil
 }

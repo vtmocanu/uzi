@@ -129,7 +129,7 @@ family inherit again. Only a template you own (scope `user`) is editable: a
 builtin or global template is edited in the web UI by an admin, even when the
 CLI token is an admin's, and another user's template is not found. The command
 changes only the pins; description, tools and prompt are untouched. See
-[Agent-template model pins](./cli.md#agent-template-model-pins) for the commands,
+[Agent-template model pins](./cli.md#agent-template-model-and-effort-pins) for the commands,
 name and id resolution and exit codes.
 
 The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it

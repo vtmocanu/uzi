@@ -60,8 +60,10 @@ func TestEffectiveSettingsTemplateEffortSourceLiveDB(t *testing.T) {
 				if (e.ResolvedEffort == nil) != (want.resolved == "") {
 					t.Errorf("%s resolved_effort nil-ness wrong: %+v", harness, e)
 				}
-				if e.DefaultEffort != "medium" || e.DefaultSource != "builtin" {
-					t.Errorf("%s default = %q (%s), want the builtin medium", harness, e.DefaultEffort, e.DefaultSource)
+				// Choosing Default (a NULL preference) resolves to the lead template's effort.
+				wantDefault := map[string]string{"claude": "high", "codex": "low"}[harness]
+				if e.DefaultEffort != wantDefault || e.DefaultSource != "template" {
+					t.Errorf("%s default = %q (%s), want the lead template's %s", harness, e.DefaultEffort, e.DefaultSource, wantDefault)
 				}
 			}
 		})

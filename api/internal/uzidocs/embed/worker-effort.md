@@ -78,7 +78,7 @@ The lead's effort for a harness resolves in this order:
 The template tier applies only when your preference is unset or blank, so
 choosing **Runtime default** keeps sending no level even when the lead template
 pins one. It reaches the worker as the claimed default effort. `uzi settings get` and
-`GET /api/me/effective-settings` show it with the source `lead template`. The
+`GET /api/me/effective-settings` show it with the source `template`. The
 Codex catalog advisory below still applies to the lead only.
 
 ## Set an override

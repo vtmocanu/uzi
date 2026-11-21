@@ -6476,6 +6476,7 @@ func TestAgentsFromTemplatesEffortProjection(t *testing.T) {
 		{Name: "dual", Effort: pgconv.TextOrNull("max"), CodexEffort: pgconv.TextOrNull("xhigh")},
 		{Name: "hostile", Effort: pgconv.TextOrNull("High"), CodexEffort: pgconv.TextOrNull("runtime")},
 		{Name: "unpinned"},
+		{Name: "lead", Effort: pgconv.TextOrNull("max"), CodexEffort: pgconv.TextOrNull("xhigh")},
 	}
 	for _, tc := range []struct {
 		name    string
@@ -6483,10 +6484,10 @@ func TestAgentsFromTemplatesEffortProjection(t *testing.T) {
 		flag    bool
 		want    []string
 	}{
-		{"claude with capability", "claude", true, []string{"high", "", "max", "", ""}},
-		{"codex with capability", "codex", true, []string{"", "low", "xhigh", "", ""}},
-		{"claude without capability", "claude", false, []string{"", "", "", "", ""}},
-		{"codex without capability", "codex", false, []string{"", "", "", "", ""}},
+		{"claude with capability", "claude", true, []string{"high", "", "max", "", "", ""}},
+		{"codex with capability", "codex", true, []string{"", "low", "xhigh", "", "", ""}},
+		{"claude without capability", "claude", false, []string{"", "", "", "", "", ""}},
+		{"codex without capability", "codex", false, []string{"", "", "", "", "", ""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agents := agentsFromTemplates(rows, nil, tc.harness, tc.flag)
