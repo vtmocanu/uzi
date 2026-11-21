@@ -594,3 +594,37 @@ func TestRunEnvReceiptsMigrationDownRefusesWithDataLiveDB(t *testing.T) {
 		t.Fatalf("down with nothing to lose: %v", err)
 	}
 }
+
+// TestRunEnvReceiptsVarIndexServesIdentityScanLiveDB pins the plain var_id index the sweeper's
+// orphan-identity checks need: the primary key leads with run_id and the other var_id index is
+// partial (WHERE secret), so without it every sweep pass scans the whole receipts table. With
+// sequential scans disabled the planner must still find an index path for the plain lookup;
+// this proves the path exists, not that the planner picks it at default settings.
+func TestRunEnvReceiptsVarIndexServesIdentityScanLiveDB(t *testing.T) {
+	pool, _ := envRunDB(t)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	var plan string
+	rows, err := tx.Query(ctx, `EXPLAIN SELECT 1 FROM run_env_receipts WHERE var_id = '00000000-0000-0000-0000-000000000001'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan += line + "\n"
+	}
+	rows.Close()
+	if !strings.Contains(plan, "run_env_receipts_var_idx") {
+		t.Fatalf("plain var_id lookup does not use run_env_receipts_var_idx:\n%s", plan)
+	}
+}
