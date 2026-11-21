@@ -694,7 +694,7 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings }));
+      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings, planning_efforts: settings.planning_efforts }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);

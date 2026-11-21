@@ -113,6 +113,26 @@ it("blocks invalid custom models and associates a server model error with the Co
   expect(document.getElementById("planning-model-error")).toBeNull();
 });
 
+for (const effort of ["max", "runtime"] as const) it(`refreshes the inherited Codex planning label after saving worker effort ${effort}`, async () => {
+  settings = { ...settings, planning_efforts: [cell("codex")] };
+  mockApi.putMySettings.mockImplementationOnce(async patch => {
+    settings = { ...settings, ...patch, planning_efforts: [cell("codex", {
+      default_effort: effort, default_source: "user_default",
+      resolved_effort: effort === "runtime" ? null : effort, source: "user_default",
+      mode: effort === "runtime" ? "runtime_default" : "explicit",
+    })] } as UserSettings;
+    return { settings };
+  });
+  mount();
+  const planning = await screen.findByLabelText("Codex planning effort") as HTMLSelectElement;
+  expect(planning.options[0].text).toContain("medium");
+  fireEvent.change(screen.getByLabelText("Codex effort"), { target: { value: effort } });
+  fireEvent.click(screen.getByText("Save Codex effort"));
+  await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledExactlyOnceWith({ default_codex_effort: effort }));
+  await waitFor(() => expect(planning.options[0].text).toContain(effort === "runtime" ? "runtime default" : effort));
+  expect(planning.options[0].text).not.toContain("medium");
+});
+
 it("saves edits to both harnesses in one request", async () => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey, { ...codexKey, id: "claude", kind: "anthropic_token" }] } as never);
   mount();
