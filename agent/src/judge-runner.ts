@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 // The JudgeRunner (PRD #46 M3, Decision 1): a slim runner for a `judge` claim. It
 // fetches the reviewed run's trace through the Bearer trace endpoint, compacts it to a
 // budget, makes ONE structured-output model call on the run owner's credential for its harness,
@@ -18,6 +18,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Logger } from "./log.js";
+import { providerKeyForms } from "./redact.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
@@ -238,7 +239,7 @@ export class JudgeRunner {
    *  failed and returns, so the worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     scope?.own();
     try { await this.executeClaim(claim, signal); }
     finally { scope?.close(); }
@@ -270,7 +271,7 @@ export class JudgeRunner {
         if (registration === undefined || operation.kind !== "advice") return undefined;
         const token = this.activeRuns?.setAccountCooldown(judgeRunId, claim.claim_generation ?? 0, operation, registration);
         return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(judgeRunId, claim.claim_generation ?? 0, token);
-      }, ["advice"], this.log) : undefined;
+      }, ["advice"], this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     // Build the review. Any failure BEFORE the post still lands the deterministic
     // command-not-found findings the claim carries (Decision 4): a trace-fetch throw
     // must not lose them, so it falls back rather than failing the run with no review.
@@ -327,11 +328,12 @@ export class JudgeRunner {
         // PRD #4320: the judge lane cannot serve a provider until PRD #4322 (the server refuses it first;
         // this is the worker's second layer). The judge is reported failed with the typed reason and no
         // model call, no fallback review, is made.
-        this.log.addSecret(claim.secrets.provider.credential);
+        const providerKeys = providerKeyForms(claim.secrets.provider.credential);
+        for (const k of providerKeys) this.log.addSecret(k);
         this.log.warn("judge claim carried a provider binding; refusing the lane", { run_id: judgeRunId, reason: PROVIDER_LANE_UNSUPPORTED });
         await safeReportFailed(this.client, this.log, "judge", judgeRunId, PROVIDER_LANE_UNSUPPORTED, undefined,
           claim.claim_generation, this.terminalDeps);
-        this.log.removeSecret(claim.secrets.provider.credential);
+        for (const k of providerKeys) this.log.removeSecret(k);
         required?.close();
         this.activeRuns?.remove(judgeRunId);
         return;

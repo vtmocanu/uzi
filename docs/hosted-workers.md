@@ -1165,8 +1165,7 @@ it if the health reason does not clear after you roll the fleet.
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
-on the **Workers** page, the new Overview's Capacity rail, and the classic
-Overview's "Worker load" card gain a Disk bar per volume (`/nix`, `/data`); see [Resource stats and
+on the **Workers** page and the Overview's Capacity rail gain a Disk bar per volume (`/nix`, `/data`); see [Resource stats and
 sizing](./worker-setup.md#resource-stats-and-sizing).
 
 Automatic recycle handles these cases:

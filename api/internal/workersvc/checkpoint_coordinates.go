@@ -64,6 +64,9 @@ func (s *Service) claimCheckpointRun(ctx context.Context, tx pgx.Tx, params stor
 			return store.Run{}, err
 		}
 		run, err := q.ClaimRun(ctx, params)
+		if err == nil {
+			run, err = expireCodexSwitchOnFreshClaim(ctx, q, run)
+		}
 		if err == nil && run.Kind == "task" {
 			run.CheckpointCoordinates, err = q.EnrollCheckpointCoordinates(ctx, store.EnrollCheckpointCoordinatesParams{
 				RunID: run.ID, WorkerID: uuid.UUID(params.WorkerID.Bytes), Generation: run.ClaimGeneration,

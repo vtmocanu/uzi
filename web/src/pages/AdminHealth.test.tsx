@@ -2,7 +2,7 @@
 //
 // Health tab component tests (PRD #1484 M4, triage-first layout PRD #1648 M3/M4). They mount
 // the real AdminHealth page (which wraps itself in AdminShell) and feed it fixtures through
-// the mocked api client — the same pattern CustodyBoardAlert.test.tsx uses. Covered: the
+// the mocked api client — the same pattern as the other page tests. Covered: the
 // header line (Copy diagnostics), the attention card in its danger / warn / unknown forms or
 // the all-clear line, the All checks inventory (disclosure, chips, counts, poll survival,
 // in-page jumps with reduced motion), na on a no-hosted-workers fixture, and the Fleet card

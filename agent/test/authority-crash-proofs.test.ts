@@ -9,9 +9,9 @@ import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
 import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext } from "../src/git.js";
 import { agentRoot, fifoDir, makeTmp, readFifoBounded, testLockOptions, writeFifoBounded } from "./authority-test-support.js";
-import type { Barrier, ChildConfig } from "./fixtures/authority-crash-child.js";
+import type { Barrier, ChildConfig, RefusalHold, RefusalOp } from "./fixtures/authority-crash-child.js";
 import { makeFixture } from "./fixture-repo.js";
-import { nullLogger, noProofReseed } from "./helpers.js";
+import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 
 // issue #3404 M4 - the named mandatory production-dispatch crash proofs. Each proof runs the PRODUCTION
 // operation (GitCache over the real AuthorityRuntime and the real durable authority store) inside a
@@ -909,4 +909,446 @@ test("issue #4066 SIGTERM, then SIGKILL before the settlement: the record stays 
   const { rt, git } = await persistedSuccessor(dataDir);
   assert.equal((await slotOf(rt, a))?.pending?.status, "running");
   await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
+});
+
+// ---- issue #4481: the refusal store under SIGKILL ----------------------------------------------------------------------
+//
+// The owning worker (scenario "refusal" of fixtures/authority-crash-child.ts) runs the real refusal operations and parks
+// itself in-process before or after one real effect (an fs rename of the write-once record, an fs unlink, or a git child);
+// the test SIGKILLs it there. Two successors then read the same bare:
+//  - the real successor: another process nonce, so every admission or seal the dead worker wrote is foreign to it;
+//  - a forensic reader with the dead worker's nonce, which isolates what the on-disk state alone says (the verdict the
+//    dead worker itself would reach), so each ordering point is asserted for its own reason and not only for the nonce.
+// No refused head may be lost: after every kill each one is still reachable through a uzi ref, or (only once a FINAL
+// covering it was sealed) is an ancestor of that covering commit.
+
+const RF_RUN = "44814481-aaaa-bbbb-cccc-444444444444";
+const RF_BR = "agent/issue-4481";
+const RF_CAP = 6;
+const RF_NONCE = "crash-proof-dead-worker-nonce-0001";
+const RF_LEDGER = `refusals-${RF_RUN}.json`;
+
+interface RefusalWorld {
+  dataDir: string;
+  bare: string;
+  clone: string;
+  base: string;
+  ctx: PositiveOwedCandidateContext;
+  kept: string[];
+  /** Refused-to-be heads: commits in the clone only, never on a ref in the bare until the dead worker imports them. */
+  heads: string[];
+  /** A commit in the bare whose parents are every kept and refused head: the confirmed FINAL a seal would cover. */
+  cover: string;
+  /** A child of `cover`: a different source that still covers every head. */
+  cover2: string;
+  later: string;
+  /** The frozen roots the cleanup caller holds: enumerated once, before any crash (production passes its journaled list, never a re-read of refs the dead worker may already have deleted). */
+  frozen: Array<{ sha: string; contexts: PositiveOwedCandidateContext[] }>;
+}
+
+/** The bare at the owed cap (six kept pins), `headCount` refusable heads, a covering commit, and an optional later-generation ledger entry. */
+async function refusalWorld(t: TestContext, headCount: number, laterEntry = false): Promise<RefusalWorld> {
+  const fx = makeFixture();
+  t.after(() => fx.cleanup());
+  const dataDir = fs.realpathSync(fx.dataDir);
+  const plain = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: RF_CAP }));
+  const bare = await plain.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const base = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const clone = (await plain.runnerCloneForBranch(bare, RF_BR, "issue-4481", noProofReseed, RF_RUN)).path;
+  const ctx: PositiveOwedCandidateContext = { runId: RF_RUN, generation: 1, branch: RF_BR, kind: "issue", barePath: bare,
+    defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } };
+  let n = 0;
+  const tree = gitIn(clone, ["rev-parse", `${base}^{tree}`]);
+  const commit = (label: string, parents: string[], moveBranch: boolean): string => {
+    const sha = gitIn(clone, [...IDENT, "commit-tree", tree, ...parents.flatMap((p) => ["-p", p]), "-m", `${label} ${n++}`]);
+    if (moveBranch) gitIn(clone, ["update-ref", `refs/heads/${RF_BR}`, sha]);
+    return sha;
+  };
+  const kept: string[] = [];
+  for (let i = 0; i < RF_CAP; i++) {
+    kept.push(commit("kept", [base], true));
+    assert.equal((await plain.fetchAgentBranch(bare, clone, RF_BR, RF_RUN, { context: ctx })).kind, "updated");
+  }
+  const heads = Array.from({ length: headCount }, () => commit("refused", [base], false));
+  const later = commit("later-generation", [base], false);
+  const cover = commit("cover", [...kept, ...heads], false);
+  gitIn(clone, ["update-ref", "refs/heads/cover", cover]);
+  gitIn(bare, ["fetch", "-q", "--no-tags", "--no-write-fetch-head", `file://${clone}`, "+refs/heads/cover:refs/uzi-test/cover"]);
+  const cover2 = commit("cover2", [cover], false);
+  gitIn(clone, ["update-ref", "refs/heads/cover2", cover2]);
+  gitIn(bare, ["fetch", "-q", "--no-tags", "--no-write-fetch-head", `file://${clone}`, "+refs/heads/cover2:refs/uzi-test/cover2"]);
+  if (laterEntry) {
+    const dir = path.join(bare, "info", "uzi-refusals");
+    fs.mkdirSync(dir, { mode: 0o700, recursive: true });
+    fs.writeFileSync(path.join(dir, RF_LEDGER), JSON.stringify({ version: 1, runId: RF_RUN, branch: RF_BR, barePath: bare,
+      entries: [{ generation: 2, sha: later, path: "P2" }] }) + "\n", { mode: 0o600 });
+  }
+  const frozen = (await plain.enumerateOwedCandidates(bare, RF_RUN)).map((c) => ({ sha: c.sha, contexts: c.contexts as PositiveOwedCandidateContext[] }));
+  return { dataDir, bare, clone, base, ctx, kept, heads, cover, cover2, later, frozen };
+}
+
+const rfDir = (w: RefusalWorld): string => path.join(w.bare, "info", "uzi-refusals");
+const rfFiles = (w: RefusalWorld): string[] => fs.existsSync(rfDir(w)) ? fs.readdirSync(rfDir(w)).sort() : [];
+const rfJson = (w: RefusalWorld, name: string): any => JSON.parse(fs.readFileSync(path.join(rfDir(w), name), "utf8"));
+const rfRaw = (w: RefusalWorld, name: string): string => fs.readFileSync(path.join(rfDir(w), name), "utf8");
+const rfLedgerShas = (w: RefusalWorld): string[] => rfFiles(w).includes(RF_LEDGER) ? rfJson(w, RF_LEDGER).entries.map((e: { sha: string }) => e.sha) : [];
+const incomingRefs = (w: RefusalWorld): string[] =>
+  gitIn(w.bare, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-incoming/${RF_RUN}/`]).split("\n").filter(Boolean).sort();
+const stagesAt = (w: RefusalWorld, sha: string): string[] => incomingRefs(w).filter((l) => l.endsWith(` ${sha}`) && !l.includes("/refused-"));
+const refusedRefAt = (w: RefusalWorld, sha: string): string[] => incomingRefs(w).filter((l) => l.includes(`/refused-${sha} `));
+const ownedPins = (w: RefusalWorld): string[] =>
+  gitIn(w.bare, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${RF_RUN}/`]).split("\n").filter(Boolean);
+/** Every uzi ref (outside the test's own covering ref) whose tip contains `sha`. */
+const protectedBy = (w: RefusalWorld, sha: string): string[] =>
+  gitIn(w.bare, ["for-each-ref", "--contains", sha, "--format=%(refname)",
+    "refs/uzi-incoming", "refs/uzi-owed", "refs/uzi-runner", "refs/uzi-coverage"]).split("\n").filter(Boolean);
+const isAncestor = (w: RefusalWorld, sha: string, of: string): boolean =>
+  spawnSync("git", ["-C", w.bare, "merge-base", "--is-ancestor", sha, of], { env: ENV }).status === 0;
+
+/** No refused head is lost: each is reachable through a uzi ref, or (covered = a sealed FINAL exists) an ancestor of it. */
+function assertNoLoss(w: RefusalWorld, label: string, covered = false): void {
+  for (const head of w.heads) {
+    if (protectedBy(w, head).length > 0) continue;
+    assert.ok(covered && isAncestor(w, head, w.cover), `${label}: refused head ${head} lost (no uzi ref reaches it and no sealed cover holds it)`);
+  }
+}
+
+async function crashRefusal(t: TestContext, w: RefusalWorld, ops: RefusalOp[], hold: RefusalHold): Promise<void> {
+  const rig = makeBarrier(t);
+  const worker = spawnChild(t, { scenario: "refusal", dataDir: w.dataDir, token: TOKEN, bare: w.bare, barrier: rig, context: w.ctx,
+    refusal: { cap: RF_CAP, nonce: RF_NONCE, clone: w.clone, ops, hold } });
+  assert.equal(await worker.line(), "W");
+  const finishedFirst = watch(worker, (line) => line.startsWith("DONE") || line.startsWith("FAILED")).then((line): never => {
+    throw new assert.AssertionError({ message: `the worker finished before its hold was reached: ${line}` });
+  });
+  await armed(rig, worker, finishedFirst);
+  await worker.kill();
+}
+
+async function refusalSuccessor(w: RefusalWorld): Promise<{ rt: AuthorityRuntime; git: GitCache }> {
+  const lifetime = await acquireWorkerLifetime(w.dataDir, testLockOptions());
+  const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 20_000 });
+  return { rt, git: new GitCache(w.dataDir, nullLogger(), undefined, { authority: rt.hooks, authorityRequired: true, maxOwedCandidates: RF_CAP }) };
+}
+
+/** A reader carrying the dead worker's process nonce: what the on-disk evidence alone says. */
+const deadWorkerReader = (w: RefusalWorld): GitCache =>
+  new GitCache(w.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: RF_CAP, processNonce: RF_NONCE }));
+
+/** The dead worker's reader that also treats the import stages now on disk as finished imports of its process: a
+ *  crashed worker's imports are over, and the process-local finished record is what proves it. */
+const provenReader = (w: RefusalWorld): GitCache => {
+  const reader = deadWorkerReader(w);
+  const finished = (reader as unknown as { finishedImportStages: Set<string> }).finishedImportStages;
+  for (const line of incomingRefs(w)) if (/\/import-/.test(line.split(" ")[0]!)) finished.add(line.split(" ")[0]!);
+  return reader;
+};
+
+const gateOf = (w: RefusalWorld, git: GitCache, head: string) => git.refusalReleaseGate(w.bare, RF_RUN, 1, head);
+
+async function resume(w: RefusalWorld, s: { rt: AuthorityRuntime; git: GitCache }, covering: string): Promise<string> {
+  return s.rt.withTransaction(() => s.git.cleanupRecoveryGeneration(w.bare, w.ctx, w.frozen, [], [], covering, undefined, "archive"));
+}
+
+const refusedRefHold = (sha: string): string => `update-ref refs/uzi-incoming/${RF_RUN}/1/refused-${sha}`;
+const stageDeleteHold = (sha: string): string => `update-ref -d refs/uzi-incoming/${RF_RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36} ${sha}`;
+const refuse = (head: string): RefusalOp => ({ op: "fetch", head });
+
+test("refusal proof 1a: SIGKILL before the admission rename leaves only temp residue; the successor gate is ineligible and a fresh admission does not clear it", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  await crashRefusal(t, w, [{ op: "admit" }], { op: 0, kind: "rename-before", match: "^admission-" });
+  const files = rfFiles(w);
+  assert.ok(files.some((f) => f.startsWith(".tmp-")), "the interrupted write left its temp file");
+  assert.ok(!files.some((f) => f.startsWith("admission-")), "no admission, partial or whole, was published");
+
+  const s = await refusalSuccessor(w);
+  for (const [who, git] of [["successor", s.git], ["dead-worker nonce", deadWorkerReader(w)]] as const) {
+    const verdict = await gateOf(w, git, w.cover);
+    assert.equal(verdict.kind, "ineligible", who);
+    assert.match((verdict as { reason: string }).reason, /temporary refusal metadata present/, who);
+  }
+  assert.equal(await s.git.admitRefusalProvenance(w.ctx), "written", "the successor may write its own admission");
+  const after = await gateOf(w, s.git, w.cover);
+  assert.equal(after.kind, "ineligible", "a complete admission does not make the leftover temp file harmless");
+  assert.match((after as { reason: string }).reason, /temporary refusal metadata present/);
+});
+
+test("refusal proof 1b: SIGKILL after the admission rename leaves a complete record; it is foreign to the successor and never overwritten", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  await crashRefusal(t, w, [{ op: "admit" }], { op: 0, kind: "rename-after", match: "^admission-" });
+  const name = `admission-${RF_RUN}-1.json`;
+  assert.deepEqual(rfJson(w, name), { version: 1, runId: RF_RUN, generation: 1, branch: RF_BR, barePath: w.bare, protocol: 1, process: RF_NONCE });
+  assert.ok(!rfFiles(w).some((f) => f.startsWith(".tmp-")), "the rename consumed the temp file");
+  const before = rfRaw(w, name);
+
+  const s = await refusalSuccessor(w);
+  const verdict = await gateOf(w, s.git, w.cover);
+  assert.equal(verdict.kind, "ineligible");
+  assert.match((verdict as { reason: string }).reason, /admission for generation 1 is from another process/);
+  assert.equal((await gateOf(w, deadWorkerReader(w), w.cover)).kind, "eligible", "the complete record is a valid admission for its own process");
+  assert.equal(await s.git.admitRefusalProvenance(w.ctx), "existing");
+  assert.equal(rfRaw(w, name), before, "the admission is write-once: the successor's nonce never replaced the dead worker's");
+});
+
+test("refusal proof 2: SIGKILL with the stage present and no ledger keeps the stage; the gate is ineligible", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h)], { op: 1, kind: "git-before", match: refusedRefHold(h) });
+  assert.equal(stagesAt(w, h).length, 1, "the attributed stage is kept as the refused head's evidence");
+  assert.deepEqual(refusedRefAt(w, h), []);
+  assert.ok(!rfFiles(w).includes(RF_LEDGER), "the ledger was not written yet");
+  assertNoLoss(w, "stage only");
+
+  const s = await refusalSuccessor(w);
+  assert.equal((await gateOf(w, s.git, w.cover)).kind, "ineligible");
+  // Without a finished record of its own, a dead worker's leftover import stage is unproven (fail closed).
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  assert.deepEqual(await gateOf(w, provenReader(w), w.cover), { kind: "ineligible", reason: "refusal stage is not in the ledger" });
+  assert.equal(stagesAt(w, h).length, 1, "reading the gate deleted nothing");
+});
+
+test("refusal proof 3: SIGKILL with the refused ref written and no ledger keeps the object reachable; the gate is ineligible and a retry completes the ledger", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h)], { op: 1, kind: "git-after", match: refusedRefHold(h) });
+  assert.equal(refusedRefAt(w, h).length, 1, "the refused ref exists");
+  assert.equal(stagesAt(w, h).length, 1);
+  assert.ok(!rfFiles(w).includes(RF_LEDGER));
+  assertNoLoss(w, "refused ref, no ledger");
+
+  const s = await refusalSuccessor(w);
+  assert.equal((await gateOf(w, s.git, w.cover)).kind, "ineligible");
+  // Without a finished record of its own, a dead worker's leftover import stage is unproven (fail closed).
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  assert.deepEqual(await gateOf(w, provenReader(w), w.cover), { kind: "ineligible", reason: "refusal stage is not in the ledger" });
+
+  // The successor's retry of the same refusal records the head (the refused ref write is idempotent).
+  gitIn(w.clone, ["update-ref", `refs/heads/${RF_BR}`, h]);
+  const retry = new GitCache(w.dataDir, nullLogger(), undefined, testGitCacheOptions({ maxOwedCandidates: RF_CAP }));
+  assert.deepEqual(await retry.fetchAgentBranch(w.bare, w.clone, RF_BR, RF_RUN, { context: w.ctx }), { kind: "not_updated", reason: "owed_limit", refusedSha: h });
+  assert.deepEqual(rfLedgerShas(w), [h]);
+  assertNoLoss(w, "after retry");
+});
+
+test("refusal proof 4: SIGKILL with the ledger temp file written and not renamed keeps the old ledger; temp residue makes the gate ineligible", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 2);
+  const [h0, h1] = w.heads as [string, string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h0), refuse(h1)], { op: 2, kind: "rename-before", match: "^refusals-" });
+  assert.deepEqual(rfLedgerShas(w), [h0], "the previous ledger is intact");
+  assert.ok(rfFiles(w).some((f) => f.startsWith(".tmp-")), "the interrupted rewrite left its temp file");
+  assert.equal(refusedRefAt(w, h1).length, 1, "the head being recorded already has its refused ref");
+  assert.equal(stagesAt(w, h1).length, 1);
+  assertNoLoss(w, "ledger temp");
+
+  const s = await refusalSuccessor(w);
+  for (const [who, git] of [["successor", s.git], ["dead-worker nonce", deadWorkerReader(w)]] as const) {
+    const verdict = await gateOf(w, git, w.cover);
+    assert.equal(verdict.kind, "ineligible", who);
+    assert.match((verdict as { reason: string }).reason, /temporary refusal metadata present/, who);
+  }
+});
+
+test("refusal proof 5: SIGKILL after the ledger rename leaves the complete ledger, which the successor reads", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 2);
+  const [h0, h1] = w.heads as [string, string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h0), refuse(h1)], { op: 2, kind: "rename-after", match: "^refusals-" });
+  assert.deepEqual(rfLedgerShas(w), [h0, h1], "the renamed ledger is complete");
+  assert.ok(!rfFiles(w).some((f) => f.startsWith(".tmp-")));
+  assertNoLoss(w, "ledger renamed");
+
+  const s = await refusalSuccessor(w);
+  const verdict = await gateOf(w, s.git, w.cover);
+  assert.equal(verdict.kind, "ineligible");
+  // The dead worker's leftover import stage is unproven to the successor and holds the gate before the admission
+  // check (proof 1b covers the foreign admission with no stage on disk).
+  assert.deepEqual(verdict, { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  const own = await gateOf(w, provenReader(w), w.cover);
+  assert.equal(own.kind, "eligible", "the evidence on disk (both heads ledgered, every stage ledgered) is complete");
+  assert.deepEqual(rfLedgerShas(w), [h0, h1], "the successor's reads changed nothing");
+});
+
+test("refusal proof 6a: SIGKILL before the duplicate stage delete keeps both stages and the ledgered head", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), refuse(h)], { op: 2, kind: "git-before", match: stageDeleteHold(h) });
+  assert.equal(stagesAt(w, h).length, 2, "the duplicate has not been deleted yet");
+  assert.equal(refusedRefAt(w, h).length, 1);
+  assert.deepEqual(rfLedgerShas(w), [h]);
+  assertNoLoss(w, "duplicate pending");
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  const own = await gateOf(w, provenReader(w), w.cover);
+  assert.equal(own.kind, "eligible", "a surplus ledgered stage never makes the evidence incomplete");
+  assert.equal((await gateOf(w, (await refusalSuccessor(w)).git, w.cover)).kind, "ineligible");
+});
+
+test("refusal proof 6b: SIGKILL after the duplicate stage delete leaves one stage and the ledgered head", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), refuse(h)], { op: 2, kind: "git-after", match: stageDeleteHold(h) });
+  assert.equal(stagesAt(w, h).length, 1, "exactly the duplicate was deleted");
+  assert.equal(refusedRefAt(w, h).length, 1);
+  assert.deepEqual(rfLedgerShas(w), [h], "the head is ledgered, so the deletion was never an unledgered loss");
+  assertNoLoss(w, "duplicate deleted");
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  assert.equal((await gateOf(w, provenReader(w), w.cover)).kind, "eligible");
+});
+
+test("refusal proof 7: a FINAL written with no POST, then restart: the successor's seal is ineligible and never sends; only the dead worker's own nonce matches", { timeout: 120_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }], { op: 2, kind: "rename-after", match: "^final-" });
+  const name = `final-${RF_RUN}-1.json`;
+  const final = rfJson(w, name);
+  assert.equal(final.sourceSha, w.cover);
+  assert.equal(final.process, RF_NONCE);
+  const before = rfRaw(w, name);
+  assertNoLoss(w, "final written");
+
+  const s = await refusalSuccessor(w);
+  const result = await s.git.sealRefusalRelease(w.bare, RF_RUN, 1, w.cover);
+  assert.equal(result, "ineligible", "another process may never replay or re-seal the release (it would be a send)");
+  assert.equal(rfRaw(w, name), before, "the successor did not rewrite the FINAL");
+  assert.deepEqual(await gateOf(w, deadWorkerReader(w), w.cover2), { kind: "ineligible", reason: "refusal import stage producer unproven" });
+  assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover), "ineligible", "the dead worker's own nonce without a finished record cannot seal either");
+  assert.equal(await provenReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover), "matches");
+  assert.equal((await gateOf(w, provenReader(w), w.cover2)).kind, "eligible", "the other source covers every head, so only the existing FINAL can refuse it");
+  assert.equal(await provenReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover2), "mismatch", "a different source is never sealed over the existing FINAL");
+  assert.equal(rfRaw(w, name), before);
+});
+
+async function allGone(w: RefusalWorld, label: string): Promise<void> {
+  assert.deepEqual(incomingRefs(w), [], `${label}: no refusal stage or refused ref remains`);
+  assert.deepEqual(rfFiles(w).filter((f) => !f.startsWith("refusals-")), [`admission-${RF_RUN}-1.json`], `${label}: only the kept admission remains, no final, cleanup or temp`);
+  assert.deepEqual(ownedPins(w), [], `${label}: the anchors are released`);
+}
+
+test("refusal proof 8: SIGKILL with the cleanup intent written never deletes under an uncovered source, and resuming against the sealed source completes", { timeout: 180_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+    { op: 3, kind: "rename-after", match: "^cleanup-" });
+  const files = rfFiles(w);
+  assert.ok(files.includes(`cleanup-${RF_RUN}-1.json`) && files.includes(`final-${RF_RUN}-1.json`));
+  assert.deepEqual(rfJson(w, `cleanup-${RF_RUN}-1.json`).ledgerEntries, [{ generation: 1, sha: h }]);
+  assert.equal(stagesAt(w, h).length, 1, "the intent precedes every deletion");
+  const evidence = (): string => JSON.stringify([rfFiles(w).map((f) => [f, rfRaw(w, f)]), incomingRefs(w), ownedPins(w)]);
+  const before = evidence();
+
+  const s = await refusalSuccessor(w);
+  assert.equal(await resume(w, s, w.base), "retained", "a source that is not the sealed one deletes nothing");
+  assert.equal(evidence(), before);
+  assertNoLoss(w, "uncovered resume");
+
+  assert.equal(await resume(w, s, w.cover), "removed");
+  await allGone(w, "resumed");
+  assert.deepEqual(rfLedgerShas(w), []);
+  assertNoLoss(w, "resumed", true);
+});
+
+for (const nth of [1, 2, 3, 4]) {
+  test(`refusal proof 9: SIGKILL after refusal-stage delete ${nth} of 4 keeps the ledger and every head covered; the resumed cleanup is fenced by the unresolved bare record`, { timeout: 180_000 }, async (t) => {
+    const w = await refusalWorld(t, 2);
+    const [h0, h1] = w.heads as [string, string];
+    await crashRefusal(t, w, [{ op: "admit" }, refuse(h0), refuse(h1), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+      { op: 4, kind: "git-after", match: `update-ref -d refs/uzi-incoming/${RF_RUN}/1/`, nth });
+    assert.equal(incomingRefs(w).length, 4 - nth, "exactly the deletions up to the hold happened");
+    assert.deepEqual(rfLedgerShas(w), [h0, h1], "the ledger is rewritten only after every stage");
+    assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`));
+    assertNoLoss(w, `after delete ${nth}`, true);
+
+    // KNOWN RESIDUAL of ADR-2545 (#4481 amendment), under ADR-1783's accepted contract (#4066; recovery-design
+    // follow-up #4550): the refusal-stage delete is a registered bare mutation (git-authority-hooks.ts "refusal-cleanup-delete-ref"). Its
+    // owner died before settling it, and no production path resolves a dead owner's running bare record by read-back
+    // (the same contract as proofs 2 and the recovery-cleanup-delete-ref records above): it stays running and fences every
+    // later writer on the bare (no in-product path resolves it; operator intervention is needed). So the resumed cleanup
+    // is REFUSED, never completed on top of the unconfirmed delete, and it deletes no head's coverage.
+    const refsBeforeResume = incomingRefs(w);
+    const s = await refusalSuccessor(w);
+    assert.equal((await slotOf(s.rt, w.bare))?.pending?.status, "running", "the dead owner's delete is durable and unresolved");
+    await assert.rejects(resume(w, s, w.cover), /unresolved pending footprint/);
+    assert.equal((await slotOf(s.rt, w.bare))?.pending?.status, "running", "the refused resume settled nothing");
+    assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`) && rfFiles(w).includes(`final-${RF_RUN}-1.json`), "the sealed intent is kept");
+    assert.deepEqual(incomingRefs(w), refsBeforeResume, "the refused resume deleted no further stage");
+    assertNoLoss(w, "refused resume", true);
+  });
+}
+
+test("refusal proof 10a: SIGKILL after the ledger rewrite keeps the later generation's entry; resuming finishes without re-creating anything", { timeout: 180_000 }, async (t) => {
+  const w = await refusalWorld(t, 1, true);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+    { op: 3, kind: "rename-after", match: "^refusals-" });
+  assert.deepEqual(incomingRefs(w), [], "every listed stage is gone before the ledger is rewritten");
+  assert.deepEqual(rfLedgerShas(w), [w.later], "exactly the listed entry was removed by the rewrite");
+  assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`) && rfFiles(w).includes(`final-${RF_RUN}-1.json`));
+  assertNoLoss(w, "rewritten", true);
+
+  const s = await refusalSuccessor(w);
+  assert.equal(await resume(w, s, w.cover), "removed");
+  assert.deepEqual(rfLedgerShas(w), [w.later], "a later generation's evidence is never cleaned by this generation");
+  await allGone(w, "resumed");
+});
+
+test("refusal proof 10b: SIGKILL after the emptied ledger is removed leaves nothing refused to protect; resuming finishes", { timeout: 180_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+    { op: 3, kind: "unlink-after", match: "^refusals-" });
+  assert.ok(!rfFiles(w).includes(RF_LEDGER));
+  assert.deepEqual(incomingRefs(w), []);
+  assertNoLoss(w, "ledger removed", true);
+  const s = await refusalSuccessor(w);
+  assert.equal(await resume(w, s, w.cover), "removed");
+  await allGone(w, "resumed");
+});
+
+test("refusal proof 11: SIGKILL after the anchor deletes (before the first candidate record is removed) leaves heads covered; resuming does not delete uncovered", { timeout: 180_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+    { op: 3, kind: "unlink-before", match: "^candidate-" });
+  assert.deepEqual(ownedPins(w), [], "every anchor was deleted");
+  assert.deepEqual(incomingRefs(w), []);
+  assert.ok(rfFiles(w).includes(`cleanup-${RF_RUN}-1.json`) && rfFiles(w).includes(`final-${RF_RUN}-1.json`));
+  assertNoLoss(w, "anchors deleted", true);
+
+  const s = await refusalSuccessor(w);
+  assert.equal(await resume(w, s, w.base), "retained", "an uncovered source never completes the cleanup");
+  assert.ok(rfFiles(w).includes(`final-${RF_RUN}-1.json`), "nothing was deleted by the uncovered resume");
+  assertNoLoss(w, "uncovered resume", true);
+  assert.equal(await resume(w, s, w.cover), "removed");
+  await allGone(w, "resumed");
+});
+
+test("refusal proof 12a: SIGKILL after the FINAL is deleted; resuming deletes the intent, keeps the admission and re-creates nothing", { timeout: 180_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+    { op: 3, kind: "unlink-after", match: "^final-" });
+  const files = rfFiles(w);
+  assert.ok(!files.includes(`final-${RF_RUN}-1.json`));
+  assert.ok(files.includes(`cleanup-${RF_RUN}-1.json`) && files.includes(`admission-${RF_RUN}-1.json`));
+  assertNoLoss(w, "final deleted", true);
+
+  const s = await refusalSuccessor(w);
+  assert.equal(await resume(w, s, w.cover), "removed");
+  await allGone(w, "resumed");
+  // Nothing is re-created: with the evidence gone the seal has nothing to seal and writes no FINAL.
+  assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover), "none");
+  await allGone(w, "after a later seal attempt");
+});
+
+test("refusal proof 12b: SIGKILL after the cleanup intent is deleted; resuming keeps the admission", { timeout: 180_000 }, async (t) => {
+  const w = await refusalWorld(t, 1);
+  const [h] = w.heads as [string];
+  await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
+    { op: 3, kind: "unlink-after", match: "^cleanup-" });
+  // The owed-path marker is removed last (after the final and the intent), so it is still present at this crash point.
+  assert.deepEqual(rfFiles(w), [`admission-${RF_RUN}-1.json`, `owedpath-${RF_RUN}-1.json`]);
+  assertNoLoss(w, "intent deleted", true);
+  const s = await refusalSuccessor(w);
+  assert.equal(await resume(w, s, w.cover), "removed");
+  await allGone(w, "resumed");
 });

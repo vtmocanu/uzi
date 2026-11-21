@@ -444,7 +444,7 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 	if err != nil {
 		return CodexRefreshResult{}, err
 	}
-	res, err = s.coordinatedRefresh(operationCtx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration, leaseDeadline, providerDeadline)
+	res, err = s.coordinatedRefresh(operationCtx, authCtx.UserID, authCtx.AccountID, operationID, observedGeneration, leaseDeadline, providerDeadline, codexWorkerRefreshAdmission(wkr, runID, capability, authCtx))
 
 	// (7) Post-exchange release recheck (audit #3b), the recheck-before-release idiom
 	// ReleaseCodexCredential uses. CoordinatedCodexRefresh authorized ScopeStartRefresh
@@ -575,7 +575,7 @@ func codexRefreshOperationBudget(ctx context.Context) time.Duration {
 // coordinatedRefresh is the post-authorization core, keyed on the resolved (user,
 // account). Split out so its failure paths (CAS lost, persistence failure) are testable
 // through a wrapped store without re-deriving the authority every time.
-func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, operationID uuid.UUID, observedGeneration int64, leaseDeadline, providerDeadline time.Time) (CodexRefreshResult, error) {
+func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, operationID uuid.UUID, observedGeneration int64, leaseDeadline, providerDeadline time.Time, admission ...codexRefreshAdmissionCheck) (CodexRefreshResult, error) {
 	q, ok := s.codexRefreshQueries()
 	if !ok {
 		return CodexRefreshResult{}, errCodexStoreUnavailable
@@ -628,15 +628,93 @@ func (s *Service) coordinatedRefresh(ctx context.Context, userID, accountID, ope
 	}
 
 	// observedGeneration == acct.Generation → ADVANCE (steps 3-6).
-	return s.advanceCodexRefresh(ctx, q, userID, accountID, operationID, acct, leaseDeadline, providerDeadline)
+	return s.advanceCodexRefresh(ctx, q, userID, accountID, operationID, acct, leaseDeadline, providerDeadline, admission...)
 }
 
-// advanceCodexRefresh performs the rotation itself (PRD #1147 M2, B6 §3-6): durable intent,
-// lease, one provider exchange, merged reseal, CAS commit. The durable intent is recorded
-// BEFORE the lease so a same-operationID concurrent retry is caught (23505) before any lease
-// is held and can never strand it. `acct` is the account read at generation ==
-// observedGeneration (the generation this rotation advances FROM).
-func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, snapshot codexAccountSnapshot, leaseDeadline, providerDeadline time.Time) (CodexRefreshResult, error) {
+// codexRefreshAdmissionCheck runs only for a new worker ADVANCE, inside admission.
+// Reuse and account-only pollers carry no run authority check.
+type codexRefreshAdmissionCheck func(context.Context, *store.Queries) error
+
+func codexWorkerRefreshAdmission(wkr store.Worker, runID uuid.UUID, capability string, initial CodexAuthContext) codexRefreshAdmissionCheck {
+	return func(ctx context.Context, q *store.Queries) error {
+		if _, err := q.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+			return err
+		}
+		if _, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCodexWorkerMismatch
+			}
+			return err
+		}
+		if _, err := q.LockCodexAliasForShareNowait(ctx, store.LockCodexAliasForShareNowaitParams{UserSecretID: initial.SecretID, UserID: initial.UserID}); err != nil {
+			return err
+		}
+		if _, err := q.LockCodexAccountForUpdateNowait(ctx, store.LockCodexAccountForUpdateNowaitParams{ID: initial.AccountID, UserID: initial.UserID}); err != nil {
+			return err
+		}
+		current, err := authorizeCodexCredentialOpWithQueries(ctx, q, wkr, runID, capability, ScopeStartRefresh, false)
+		if err != nil {
+			return err
+		}
+		a, b := initial.binding, current.binding
+		if current.SecretID != initial.SecretID || current.AccountID != initial.AccountID ||
+			a.CodexAuthMode != b.CodexAuthMode || a.CodexAccountKey != b.CodexAccountKey ||
+			a.CodexMaterialRevision != b.CodexMaterialRevision || a.CodexAccountRevision != b.CodexAccountRevision {
+			return ErrCodexBindingConflict
+		}
+		return nil
+	}
+}
+
+// admitCodexRefreshAdvance commits intent and lease together before provider I/O.
+// Account writers (including switch apply) serialize before the intent is visible.
+// There is one attempt; NOWAIT contention aborts without provider work.
+func (s *Service) admitCodexRefreshAdvance(ctx context.Context, source codexRefreshStore, userID, accountID, operationID uuid.UUID, generation int64, leaseDeadline time.Time, admission ...codexRefreshAdmissionCheck) (bool, error) {
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	var bound codexRefreshStore
+	switch source := source.(type) {
+	case codexRefreshTxBinder:
+		bound = source.bindCodexRefreshTx(q)
+	case *store.Queries:
+		bound = q
+	default:
+		return false, errors.New("codex refresh: store lacks transaction binding")
+	}
+	if bound == nil {
+		return false, errors.New("codex refresh: empty transaction binding")
+	}
+	if len(admission) > 0 && admission[0] != nil {
+		if err := admission[0](ctx, q); err != nil {
+			return false, err
+		}
+	}
+	if _, err := q.LockCodexAccountForUpdateNowait(ctx, store.LockCodexAccountForUpdateNowaitParams{ID: accountID, UserID: userID}); err != nil {
+		return false, err
+	}
+	if _, err := bound.InsertCodexRefreshIntent(ctx, store.InsertCodexRefreshIntentParams{OperationID: operationID, UserID: userID, ProviderAccountID: accountID, FromGeneration: generation}); err != nil {
+		return false, err
+	}
+	n, err := bound.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{Op: operationID, Deadline: pgconv.Time(leaseDeadline), ID: accountID, UserID: userID, FromGeneration: generation})
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("codex refresh: admission commit: %w", err)
+	}
+	return true, nil
+}
+
+// advanceCodexRefresh performs the rotation itself (PRD #1147 M2, B6 §3-6):
+// insert the intent before the lease update, then commit both before provider I/O.
+// A duplicate operation rolls back admission before replay; it never strands a lease.
+// The exchange is followed by merged reseal and CAS commit. `acct` was read at
+// generation == observedGeneration (the generation this rotation advances FROM).
+func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, snapshot codexAccountSnapshot, leaseDeadline, providerDeadline time.Time, admission ...codexRefreshAdmissionCheck) (CodexRefreshResult, error) {
 	acct := snapshot.CodexProviderAccount
 	if s.vlt == nil {
 		return CodexRefreshResult{}, vault.ErrNotConfigured
@@ -661,48 +739,18 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 		return CodexRefreshResult{}, ErrCodexRefreshNoClient
 	}
 
-	// (3) Durable pre-rotation intent, recorded BEFORE the lease is acquired. Ordering the
-	// intent ahead of the lease is what makes a same-operationID concurrent retry safe: a
-	// duplicate op (23505) is detected on THIS insert, before any lease is held, so the
-	// replay path (codexReplayAfterDuplicate) can never strand a freshly-acquired lease and
-	// quarantine the account. Any non-duplicate insert failure (e.g. DB unavailable) means
-	// the intent is not durable, so neither the lease nor the provider is touched — the
-	// current refresh token stays valid and nothing is lost.
-	if _, err := q.InsertCodexRefreshIntent(ctx, store.InsertCodexRefreshIntentParams{
-		OperationID:       operationID,
-		UserID:            userID,
-		ProviderAccountID: accountID,
-		FromGeneration:    acct.Generation,
-	}); err != nil {
+	admitted, err := s.admitCodexRefreshAdvance(ctx, q, userID, accountID, operationID, acct.Generation, leaseDeadline, admission...)
+	if err != nil {
 		if isUniqueViolation(err) {
 			return s.codexReplayAfterDuplicate(ctx, q, userID, accountID, operationID)
 		}
-		return CodexRefreshResult{}, fmt.Errorf("codex refresh: record intent: %w", err)
+		if isLockNotAvailable(err) {
+			// Preserve the existing retryable 409 contract for NOWAIT contention.
+			return CodexRefreshResult{Outcome: CodexRefreshContended}, ErrCodexRefreshContended
+		}
+		return CodexRefreshResult{}, err
 	}
-
-	// (4) Acquire the lease, bounded to the provider callback deadline. It serializes the
-	// single rotation, now AFTER the durable intent exists. The acquire is guarded on
-	// generation = acct.Generation (PRD #1147 M4): a loser op that snapshotted this
-	// generation but was scheduled out while a winner ran a full exchange→commit→reset cycle
-	// can no longer win the freshly-idle lease, because the account's generation has moved
-	// past the from_generation it presents. 0 rows means a live lease or a quarantine holds
-	// the account, OR the generation already advanced — so this op must NOT exchange: if a
-	// rival op has already advanced the account past our generation, reconcile to the
-	// now-committed token with NO provider call; otherwise the outcome is contended and this
-	// op's own 'rotating' intent (from_generation=acct.Generation) is resolved by
-	// ReconcileUnresolvedCodexRefresh once the account advances past it. Either way no lease
-	// is stranded and the stale refresh token is never re-spent.
-	n, err := q.AcquireCodexRefreshLease(ctx, store.AcquireCodexRefreshLeaseParams{
-		Op:             operationID,
-		Deadline:       pgconv.Time(leaseDeadline),
-		ID:             accountID,
-		UserID:         userID,
-		FromGeneration: acct.Generation,
-	})
-	if err != nil {
-		return CodexRefreshResult{}, fmt.Errorf("codex refresh: acquire lease: %w", err)
-	}
-	if n == 0 {
+	if !admitted {
 		if fresh, gerr := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{UserID: userID, ID: accountID}); gerr == nil && fresh.Generation > acct.Generation {
 			return s.codexReturnCommitted(ctx, userID, fresh, CodexRefreshReconciled)
 		}

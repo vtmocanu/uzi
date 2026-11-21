@@ -243,18 +243,18 @@ if (["ExpiredParent", "CancelledParent", "PreparationAbort", "PreparationDeadlin
   stopped = true;
   assert.equal(calls.some(call => call.includes("pack-objects")), false);
 } else if (cfg.mode === "FrozenHeld") {
-  const result = await prepareFrozenHeld({ git: cache, barePath: bare, branch, sourceSha: tip,
+  const result = await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch, sourceSha: tip,
     deadlineMs: 90_000, defaultBranch: defaultName,
     policy: { version: 1, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: [], extraFloors: [] } });
   assert.ok("pack" in result, "reason" in result ? result.reason : "held bytes prepared");
   // Retain the exact production-prepared bytes, without JSON/base64 transport.
   const { Readable } = await import("node:stream");
   await save("held", { pack: Readable.from(result.pack), exited: Promise.resolve(0), cancel: () => {} }, tip);
-  const denied = await prepareFrozenHeld({ git: cache, barePath: bare, branch, sourceSha: tip,
+  const denied = await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch, sourceSha: tip,
     deadlineMs: 90_000, defaultBranch: defaultName,
     policy: { version: 1, blocked: true, everKnown: false, flaggedCommits: [], ciGlobs: [], extraFloors: [] } });
   assert.deepEqual(denied, { reason: "secret_remediation_pending" });
-  const guardedResult = await prepareFrozenHeld({ git: cache, barePath: bare, branch, sourceSha: tip,
+  const guardedResult = await prepareFrozenHeld({ literals: [], git: cache, barePath: bare, branch, sourceSha: tip,
     deadlineMs: 90_000, defaultBranch: defaultName,
     policy: { version: 1, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: ["private"], extraFloors: [] } });
   assert.deepEqual(guardedResult, { reason: "ci_config_guard" });

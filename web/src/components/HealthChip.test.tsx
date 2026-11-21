@@ -6,7 +6,6 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { MemoryRouter } from "react-router-dom";
 
 import { HealthChip } from "./HealthChip";
-import { HealthOverviewCard } from "./HealthOverviewCard";
 import type { HealthDoc } from "../lib/api";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import {
@@ -216,7 +215,7 @@ describe("HealthChip popover", () => {
     expect(within(dialog()).getByText(`System health: all ${applicableCount(passingDoc)} checks passing`)).toBeTruthy();
   });
 
-  it("lists every attention check while the Overview card caps at three", () => {
+  it("lists every attention check, with no cap", () => {
     const doc = healthySilentDoc();
     const ids = ["fleet.roll", "fleet.capacity", "queue.waiting", "forge.ciwatch", "schedules.paused"];
     for (const c of doc.checks) if (ids.includes(c.id)) c.severity = "warn";
@@ -225,19 +224,9 @@ describe("HealthChip popover", () => {
     mount(doc);
     fireEvent.click(chip());
     expect(within(dialog().querySelector<HTMLElement>("[data-health-attention-list]")!).getAllByRole("listitem")).toHaveLength(5);
-    cleanup();
-    current = doc;
-    render(
-      <MemoryRouter>
-        <HealthOverviewCard />
-      </MemoryRouter>,
-    );
-    const card = screen.getByRole("status", { name: "System health" });
-    expect(within(card).getAllByRole("listitem")).toHaveLength(3);
-    expect(within(card).getByText("and 2 more")).toBeTruthy();
   });
 
-  it("lays out panel evidence in two columns, widening values over 40 characters only there", () => {
+  it("lays out panel evidence in two columns, widening values over 40 characters", () => {
     const doc = ownerOnlyDoc();
     const check = doc.checks.find((c) => c.id === "queue.waiting")!;
     check.doc = "worker-capacity";
@@ -256,13 +245,6 @@ describe("HealthChip popover", () => {
     expect(entries[0].className).not.toContain("col-span-2");
     expect(entries[1].className).toContain("col-span-2");
     expect(entries[1].textContent).toContain("y".repeat(41));
-
-    cleanup();
-    current = doc;
-    render(<MemoryRouter><HealthOverviewCard /></MemoryRouter>);
-    const card = screen.getByRole("alert", { name: "System health" });
-    expect(card.querySelector("[data-health-evidence-grid]")).toBeNull();
-    expect(within(card).getByText((_, el) => el?.tagName === "SPAN" && el.textContent === `Long image: ${"y".repeat(41)}`)).toBeTruthy();
   });
 
   it("keeps the chip-attached fallback width and mobile bottom-sheet classes", () => {

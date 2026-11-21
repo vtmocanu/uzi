@@ -9,14 +9,32 @@
 // never completes. State is written synchronously as it changes: on SIGTERM node delivers
 // `test:interrupted` and the stream never ends, so nothing may wait for the end.
 //
+// The launcher signals the whole process group, so the stop kills the running file processes
+// as well as node. If node is descheduled while that happens, it can see a file process die
+// before it exits, and reports that file complete with a failure (#4547). While the run is
+// stopping, such a completion leaves the file in flight: no done_at, no file failure.
+// "Stopping" means the launcher's STOP_MARKER exists or `test:interrupted` has arrived. That
+// applies only to the stop's own outcomes: death by SIGTERM, SIGINT or SIGKILL, or exit 130/143
+// (a trapped SIGINT/SIGTERM). Any other signal or exit code is still recorded as a file failure.
+// Remaining ambiguity: an unrelated OOM SIGKILL, or a test's own handler exiting 130/143, during
+// the stop looks the same.
+// The marker carries the guarantee, not the event order. The launcher renames it into place
+// before it sends any signal, so it is visible before any death that signal causes. Node can
+// hand over the death before `test:interrupted`: the signal and the child exit reach libuv's
+// signal pipe from whichever thread takes them. With no marker, the guard falls back to that event
+// order and a death handed over first is recorded as done. That happens if the marker write failed,
+// or a stop signal reached the group without going through the launcher.
+//
 // Self-contained at runtime on purpose: node loads a reporter module without the `.js` -> `.ts`
 // mapping a relative import needs, so this file imports only node builtins and TYPES (erased).
 // The launcher imports its shared runtime helpers from here, through agent-report.ts.
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Counts, Failure, Progress } from "./agent-report.js";
 
 export const REPORT_SCHEMA = 1;
+/** Written in the run directory by the launcher before it signals a stop (run-unit-tests.ts). */
+export const STOP_MARKER = "stopping.json";
 /** Bounded error text per failure, and failures kept in full. */
 const ERROR_CHARS = 600;
 const FAILURE_LIMIT = 50;
@@ -68,6 +86,19 @@ function failureType(error: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/** Signals the run's own stop sends: the launcher's forwarded SIGINT/SIGTERM (also the watchdog's
+ * SIGTERM), its SIGKILL escalation, and node's SIGTERM abort of its file children. */
+const STOP_SIGNALS = new Set(["SIGTERM", "SIGINT", "SIGKILL"]);
+/** A file process that traps SIGINT or SIGTERM and exits 128 + n. SIGKILL cannot be trapped. */
+const STOP_EXIT_CODES = new Set([130, 143]);
+
+/** Whether a file process's failure is an outcome of the run's own stop. */
+function stoppedByInterruption(error: unknown): boolean {
+  const { signal, exitCode } = (error ?? {}) as { signal?: unknown; exitCode?: unknown };
+  return (typeof signal === "string" && STOP_SIGNALS.has(signal))
+    || (typeof exitCode === "number" && STOP_EXIT_CODES.has(exitCode));
+}
+
 function errorText(error: unknown): string | undefined {
   if (error === undefined || error === null) return undefined;
   const cause = (error as { cause?: unknown }).cause;
@@ -83,6 +114,7 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
     return;
   }
   const file = path.join(dir, "progress.json");
+  const stopMarker = path.join(dir, STOP_MARKER);
   // The launcher's exact selected inventory: only these paths are files; an event located anywhere
   // else (a test registered by a helper module) cannot be attributed and never counts as a file.
   let selected: Set<string> | null = null;
@@ -177,7 +209,12 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
       if (event.type === "test:complete") {
         const details = data.details ?? {};
         const type = failureType(details.error);
-        if (isFileWrapper && state !== undefined) {
+        if (isFileWrapper && state !== undefined && details.passed !== true && stoppedByInterruption(details.error)
+          && (progress.state === "interrupted" || existsSync(stopMarker))) {
+          // Killed by the run's own stop, not finished: the file stays in flight. Flush now, since
+          // node exits right after this window and a throttled write would be lost.
+          important = true;
+        } else if (isFileWrapper && state !== undefined) {
           state.done_at = at;
           state.duration_ms = details.duration_ms;
           state.passed = details.passed === true;

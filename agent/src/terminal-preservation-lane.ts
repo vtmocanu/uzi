@@ -53,6 +53,8 @@ export interface TerminalLaneFlight {
   attemptId: string | undefined;
   runnerClone?: { attemptId?: string | undefined } | undefined;
   secretBlocked?: boolean;
+  /** The encoded forms of the run's provider key (absent or empty for a vendor run). */
+  providerKeyForms?: readonly string[];
   terminalPreservation?: TerminalLaneResult;
 }
 
@@ -249,6 +251,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
         }
         const out = await prepareFrozenHeldPinned({
           git: env.git, barePath, branch, sourceSha: tip, policy: env.policy(), deadlineMs: left(),
+          literals: flight.providerKeyForms ?? [],
           ...(defaultBranch ? { defaultBranch } : {}),
           perCommitCi: true, ...(ciTarget ? { ciTarget } : {}), ...(expectDigests ? { expectDigests } : {}),
           onScan: scan => { if (scan.trusted && scan.findings.length) flagged = scan.findings.map(f => f.commit); },

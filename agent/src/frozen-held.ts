@@ -14,6 +14,9 @@ export interface FrozenHeldPolicy {
   /** Task checkpoint evidence belongs to this exact run key, never merely its branch. */
   checkpointKey?: string;
   extraFloors: string[];
+  /** Frozen from a provider-bound run: the held range MUST be scanned for the run's provider key.
+   *  A caller with no claim (so no key forms) cannot scan and fails closed instead. Absent for a vendor run. */
+  providerKeyScan?: true;
 }
 export type HeldGit = Pick<GitCache, "resolveCheckpointRange" | "secretScanCheckpointRange" |
   "ancestry" | "rangeTouchesWorkflows" | "changedFilesNoRenames" | "checkpointPack">;
@@ -31,6 +34,7 @@ export function validFrozenHeldPolicy(value: unknown, owner?: { kind: string; ru
     (p.checkpointKey === undefined || (typeof p.checkpointKey === "string" &&
       /^uzi\/task\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(p.checkpointKey))) &&
     Array.isArray(p.extraFloors) && p.extraFloors.every(sha) &&
+    (p.providerKeyScan === undefined || p.providerKeyScan === true) &&
     (!owner || ((p.checkpointKey === undefined ||
       (owner.kind === "task" && p.checkpointKey === `uzi/task/${owner.runId}`)) &&
       (owner.kind !== "task" || p.confirmedTip === undefined || p.checkpointKey !== undefined)));
@@ -39,6 +43,8 @@ export function validFrozenHeldPolicy(value: unknown, owner?: { kind: string; ru
 type FrozenHeldInput = {
   git: HeldGit; barePath: string; branch: string; sourceSha: string; policy: FrozenHeldPolicy;
   deadlineMs: number; maxBytes?: number; defaultBranch?: string;
+  /** The encoded forms of the run's provider key; `[]` for a vendor run or a caller with no claim. */
+  literals: readonly string[];
   onScan?: (scan: Awaited<ReturnType<HeldGit["secretScanCheckpointRange"]>>) => void;
   remediationHold?: () => Promise<boolean>;
   ciHold?: () => Promise<"clear" | "blocked" | "unknown">;
@@ -114,7 +120,9 @@ async function prepareOverRange(input: FrozenHeldInput, range: CheckpointRange, 
     check();
     return Math.floor(Math.min(input.deadlineMs, budget?.remainingMs() ?? input.deadlineMs));
   };
-  const scan = await git.secretScanCheckpointRange(barePath, range, { deadlineMs: deadlineMs() });
+  // A provider-bound policy with no key forms to scan for cannot prove the range clean: the work stays local.
+  if (policy.providerKeyScan === true && input.literals.length === 0) return { reason: "scan_untrusted" };
+  const scan = await git.secretScanCheckpointRange(barePath, range, { deadlineMs: deadlineMs(), literals: input.literals });
   check();
   input.onScan?.(scan);
   check();

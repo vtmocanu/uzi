@@ -81,6 +81,9 @@
  *    boundary-process scope the tick spawner reports a joined signal death or its own kill as a numeric
  *    code only after the process group is gone, so it is a known exit. The slot epoch covers clone sources, not refs of the
  *    shared bare that other runs' cleanup and pinning also touch.
+ *  - "refusal-cleanup-delete-ref": GitCache.applyRefusalCleanup's deletion of one sealed refusal stage
+ *    (`update-ref -d` of refs/uzi-incoming/<run>/<generation>/<name>, via GitCache.deleteRefSettled), after the
+ *    expected-tip comparison. Footprint: the ref. Same join and reasoning as "recovery-cleanup-delete-ref".
  *  - "owed-reconcile-delete-ref": GitCache.reconcileOwedCandidates (`update-ref -d` of the owed pin,
  *    via GitCache.deleteRefSettled). Same footprint, join and reasoning.
  *  - "recovery-pin-delete-ref": GitCache.deleteRecoveryPin (`update-ref -d` of refs/uzi-recovery-pin/
@@ -95,7 +98,7 @@
  *    object ever existed) settles as residue; a rejected settlement surfaces as AuthorityRefusedError.
  *  Other `update-ref -d` sites swept in git.ts, none in a namespace assertBareClear guards, so none is
  *  hooked: refs/uzi-checkpoints/<key>, refs/uzi-publication-floor/, refs/uzi-incoming/ (the fetch
- *  stage), the tracking-ancestor `candidate` in the archive step (refs/uzi-runner/..., after its
+ *  stage; the sealed refusal-stage deletion above is the exception), the tracking-ancestor `candidate` in the archive step (refs/uzi-runner/..., after its
  *  refs/uzi-archive/ copy exists), refs/uzi-cross-check/<run>, refs/uzi-settle/, refs/uzi-recovery-
  *  episode/ (the discard path), refs/uzi-workflow-target/, refs/uzi-secret-scan-floor/, the
  *  RECOVERY_BUNDLE_REF, and clone-local refs (runGitAsRunner / the clone `git` helper). The guarded

@@ -25,6 +25,30 @@ type reuseReceiptStore struct {
 	writesAfterReceipt []string
 }
 
+// Bind explicitly: promoting rejFakeStore's binder would discard the receipt
+// wrapper's write interception. Keep its counters on the original wrapper.
+func (f *reuseReceiptStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	return &reuseReceiptBoundStore{
+		reuseReceiptStore: f,
+		bound:             f.rejFakeStore.bindCodexRefreshTx(q),
+	}
+}
+
+type reuseReceiptBoundStore struct {
+	*reuseReceiptStore
+	bound codexRefreshStore
+}
+
+func (f *reuseReceiptBoundStore) InsertCodexRefreshIntent(ctx context.Context, arg store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
+	f.wrote("insert_intent")
+	return f.bound.InsertCodexRefreshIntent(ctx, arg)
+}
+
+func (f *reuseReceiptBoundStore) AcquireCodexRefreshLease(ctx context.Context, arg store.AcquireCodexRefreshLeaseParams) (int64, error) {
+	f.wrote("acquire_lease")
+	return f.bound.AcquireCodexRefreshLease(ctx, arg)
+}
+
 func (f *reuseReceiptStore) RecordCodexRefreshProviderError(ctx context.Context, arg store.RecordCodexRefreshProviderErrorParams) (int64, error) {
 	f.calls++
 	f.arg = arg

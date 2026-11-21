@@ -69,7 +69,7 @@ const EXACT_SITES: Record<string, Site[]> = {
   ],
   "diagram-diagnostic.ts": [
     { label: "claim type", line: "secrets: { anthropic_oauth_token?: string; codex?: unknown; provider?: { credential: string } };", count: 1 },
-    { label: "redaction list", line: "const secrets = [claim.secrets.anthropic_oauth_token, claim.secrets.provider?.credential, ...extraSecrets];", count: 1 },
+    { label: "redaction list", line: "const secrets = [claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), ...extraSecrets];", count: 1 },
   ],
   // The fail-closed provider decoder (PRD #4320): reads the OAuth token only to refuse a binding next to it.
   "provider-binding.ts": [
@@ -124,6 +124,15 @@ function censusOffenders(sources: Map<string, string>): string[] {
   return offenders;
 }
 
+function assertNowCredentialSnapshot(source: string): void {
+  assert.match(source, /const authority = this\.authority;\s*const cred = authority \? undefined : this\.deps\.credential\?\.\(\);/);
+  assert.equal((source.match(/this\.deps\.credential\?\.\(\)/g) ?? []).length, 1,
+    "the holder is read once, only for a non-Codex call");
+  assert.match(source, /epoch: authority\?\.ordinal \?\? cred\?\.ordinal \?\? 0/);
+  assert.match(source, /\.\.\.\(cred \? \{ token: cred\.token \} : \{\}\)/);
+  assert.match(source, /epochStamp\(call\.epoch\)/);
+}
+
 describe("issue #4201 m2d: no consumer reads the run token outside the credential holder", () => {
   const sources = readSources(SRC);
 
@@ -164,14 +173,23 @@ describe("issue #4201 m2d: no consumer reads the run token outside the credentia
 
   it("the flight consumers snapshot the holder at call start and stamp the epoch", () => {
     const nowSummary = sources.get("now-summary.ts")!;
-    assert.match(nowSummary, /const cred = this\.deps\.credential\?\.\(\)/);
-    assert.match(nowSummary, /\.\.\.\(cred \? \{ token: cred\.token \} : \{\}\)/);
-    assert.match(nowSummary, /epochStamp\(call\.epoch\)/);
+    assertNowCredentialSnapshot(nowSummary);
     const sdk = sources.get("sdk-executor.ts")!;
     assert.equal((sdk.match(/credentialEpochOrdinal: cred\.ordinal/g) ?? []).length, 2, "intent and plan summary frames");
     const runner = sources.get("runner.ts")!;
     assert.match(runner, /credential: \(\) => flight\.credential!\.current\(\)/);
-    assert.match(runner, /credentialEpochOrdinal: descCredential\.ordinal/);
+    assert.match(runner, /const descCredential = flight\.credential\?\.current\(\);\s*const codexOrdinal = flight\.codexAuthority\?\.ordinal;/);
+    assert.match(runner, /\(descCredential\?\.ordinal \?\? codexOrdinal \?\? 0\) > 0/);
+    assert.match(runner, /credentialEpochOrdinal: descCredential\?\.ordinal \?\? codexOrdinal/);
+  });
+
+  it("self-test: Now snapshot pins reject unconditional reads, rereads and a lost epoch", () => {
+    const source = sources.get("now-summary.ts")!;
+    assert.throws(() => assertNowCredentialSnapshot(source.replace(
+      "const cred = authority ? undefined : this.deps.credential?.();", "const cred = this.deps.credential?.();")));
+    assert.throws(() => assertNowCredentialSnapshot(`${source}\nthis.deps.credential?.();\n`));
+    assert.throws(() => assertNowCredentialSnapshot(source.replace(
+      "epoch: authority?.ordinal ?? cred?.ordinal ?? 0", "epoch: 0")));
   });
 
   it("the reviewed lines each still exist as often as listed (a stale entry must be deleted)", () => {

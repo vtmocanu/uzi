@@ -88,7 +88,7 @@ func TestPlanCrossCheckIdentifierCountsAndLengths(t *testing.T) {
 func TestPlanCrossCheckSafeIdentifierTrimAndProseScrub(t *testing.T) {
 	token := "glpat-" + "abcdefghijklmnopqrst"
 	c := PlanCrossCheckCandidate{PlanMd: "Plan\n\u202e" + token, PlanningDiff: "diff\n\x1b",
-		Milestones:           json.RawMessage(`[{"id":"m1","title":"Title","metadata":{"id":12}}]`),
+		Milestones:           json.RawMessage(`[{"id":"m1","title":"Title"}]`),
 		RequiredCapabilities: []string{" go "}, RequiredTools: []string{" git "}, SizeClass: " s "}
 	got, err := NormalizePlanCrossCheckCandidate(c)
 	if err != nil {

@@ -1624,7 +1624,7 @@ export class SteeringChannel {
    *  no-op), read by the runner (pendingCredentialSwitch) so enterCredentialSwitch knows which
    *  generation it is releasing. Never reset within a flight: the flight ends (release or give-up)
    *  the moment it is set. */
-  private pendingSwitch: { generation: number; opId?: string } | undefined;
+  private pendingSwitch: { generation: number; opId?: string; targetSecretId?: string } | undefined;
   /** Issue #4201: ops already settled (applied, gave up or cleared), last SETTLED_OPS_MAX. A late poll
    *  that still carries one (it raced the apply commit) is ignored. */
   private readonly settledOps = new Set<string>();
@@ -1639,6 +1639,7 @@ export class SteeringChannel {
    *  outstanding and a switch signal had spent it (abortCancel); an applied settle replays it onto the fresh controller (issue #4201 review BN1). */
   private deferredCancelAbort: { reason: unknown } | undefined;
   private latchedSwitchOpId: string | undefined;
+  private latchedSwitchTargetSecretId: string | undefined;
   /** PRD #1247 M5b (MAJOR-6 rework): while > 0, a matching credential_switch signal is DEFERRED —
    *  maybeTripCredentialSwitch returns WITHOUT setting pendingSwitch and WITHOUT aborting,
    *  so the signal (which rides every poll) is honored at the NEXT trip point after the window ends.
@@ -1911,9 +1912,9 @@ export class SteeringChannel {
     return this.pendingSwitch?.generation;
   }
 
-  /** Issue #4201: the pending switch's generation and op id (the op id is absent on a v1 server's
-   *  signal), or undefined when none is pending. */
-  pendingCredentialSwitchOp(): { generation: number; opId?: string } | undefined {
+  /** Issue #4201: the pending switch's generation, op id and optional server target (the op id is absent
+   *  on a v1 server's signal), or undefined when none is pending. */
+  pendingCredentialSwitchOp(): { generation: number; opId?: string; targetSecretId?: string } | undefined {
     return this.pendingSwitch ? { ...this.pendingSwitch } : undefined;
   }
 
@@ -2019,11 +2020,13 @@ export class SteeringChannel {
   settleCredentialSwitch(opId: string, outcome: "applied" | "gave_up" | "cleared"): void {
     this.settledOps.delete(opId);
     this.settledOps.add(opId);
-    this.inPlaceSettledGeneration = this.claimGeneration;
     while (this.settledOps.size > SETTLED_OPS_MAX) {
       const oldest = this.settledOps.values().next().value as string;
       this.settledOps.delete(oldest);
     }
+    // A delayed settlement may remember its op, but cannot clear a replacement.
+    if (this.pendingSwitch !== undefined && this.pendingSwitch.opId !== opId) return;
+    this.inPlaceSettledGeneration = this.claimGeneration;
     const spent = this.cancel.signal;
     const spentBySwitch = spent.aborted && spent.reason instanceof CredentialSwitchSignal;
     if (spentBySwitch) this.settledSwitchSignals.add(spent.reason);
@@ -2104,9 +2107,11 @@ export class SteeringChannel {
         if (this.switchHoldDepth > 0) return;
         const generation = this.latchedSwitchGeneration;
         const opId = this.latchedSwitchOpId;
+        const targetSecretId = this.latchedSwitchTargetSecretId;
         this.latchedSwitchGeneration = undefined;
         this.latchedSwitchOpId = undefined;
-        if (service && generation !== undefined) this.maybeTripCredentialSwitch(generation, opId);
+        this.latchedSwitchTargetSecretId = undefined;
+        if (service && generation !== undefined) this.maybeTripCredentialSwitch(generation, opId, targetSecretId);
       },
     };
   }
@@ -2117,8 +2122,8 @@ export class SteeringChannel {
    *  and the defer window — so the two transports compose (a switch trips at most once, whichever the
    *  ack or a poll observes first) and a failing /inputs poll can no longer disable the advertised
    *  secondary transport. */
-  tripCredentialSwitch(generation: number, opId?: string): void {
-    this.maybeTripCredentialSwitch(generation, opId);
+  tripCredentialSwitch(generation: number, opId?: string, targetSecretId?: string): void {
+    this.maybeTripCredentialSwitch(generation, opId, targetSecretId);
   }
 
   /** PRD #1247 M5b (MAJOR-6): open a defer window — a matching credential_switch signal is held
@@ -2793,7 +2798,7 @@ export class SteeringChannel {
    *      case — a run at the plan gate / a question / a follow-up park has NO live SDK turn to
    *      abort, so the awaited promise itself must reject to release the flight).
    */
-  private maybeTripCredentialSwitch(generation: number, opId?: string): void {
+  private maybeTripCredentialSwitch(generation: number, opId?: string, targetSecretId?: string): void {
     // Issue #3974: an owner cancel was committed under a withheld switch; never enter the switch.
     if (this.withheldSwitchCancelCommitted) return;
     if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
@@ -2806,8 +2811,11 @@ export class SteeringChannel {
     // aborted, so the flight looks exactly like one that has not yet polled the stamp. The hold's
     // service-close replays this call at depth 0.
     if (this.holdActive()) {
+      const sameOp = this.latchedSwitchGeneration === generation && this.latchedSwitchOpId === opId;
       this.latchedSwitchGeneration = generation;
       this.latchedSwitchOpId = opId;
+      if (!sameOp || this.latchedSwitchTargetSecretId === undefined)
+        this.latchedSwitchTargetSecretId = targetSecretId;
       return;
     }
     this.revokeStop("switch", new CredentialSwitchSignal());
@@ -2818,10 +2826,13 @@ export class SteeringChannel {
     if (this.pendingSwitch !== undefined) {
       // Already tripped once — idempotent. A NEWER op while one is pending replaces the pending op id
       // (what a `superseded` apply waits for) without aborting again (#4095).
-      if (opId !== undefined && opId !== this.pendingSwitch.opId) this.pendingSwitch = { generation, opId };
+      if (opId !== undefined && opId !== this.pendingSwitch.opId) this.pendingSwitch = { generation, opId, ...(targetSecretId !== undefined ? { targetSecretId } : {}) };
+      else if (opId !== undefined && this.pendingSwitch.targetSecretId === undefined && targetSecretId !== undefined)
+        this.pendingSwitch = { ...this.pendingSwitch, targetSecretId };
       return;
     }
-    this.pendingSwitch = opId === undefined ? { generation } : { generation, opId };
+    this.pendingSwitch = { generation, ...(opId !== undefined ? { opId } : {}),
+      ...(targetSecretId !== undefined ? { targetSecretId } : {}) };
     // A taken approve refused during a hold becomes urgent only now that the switch is pending.
     if (this.parkedReady.some((id) => this.takenApproveIds.has(id)) ||
         this.heldForSwitch.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
@@ -3145,7 +3156,7 @@ export class SteeringChannel {
           // PRD #1247 M5b: the credential-switch signal rides EVERY inputs response (incl. an
           // empty one). It is not an input row — it is the server's "a switch is pending for the
           // current claim" fact — and acting on it releases the claim.
-          if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation, credentialSwitch.op_id);
+          if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation, credentialSwitch.op_id, credentialSwitch.target_secret_id);
           else this.inPlaceSettledGeneration = undefined; // no stamp is pending any more: a refusal cannot be a stale one
           // Issue #3974: a withheld switch hides every input row, cancel included; one probe per poll.
           if (credentialSwitch && this.withheldSwitchCancelEligible(credentialSwitch.generation)) {

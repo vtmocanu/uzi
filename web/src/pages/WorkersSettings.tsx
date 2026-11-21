@@ -433,7 +433,7 @@ export function WorkersSettings() {
     // Resolved #200 (the M3 exhaustive-deps review): `announce` is now listed rather
     // than suppressed. Because it is stable its only effect is lint compliance — no
     // added churn, so the M3 concern (a dep re-creating this callback on churn the
-    // paragraph argues cannot happen) does not arise. Same treatment as Dashboard's
+    // paragraph argues cannot happen) does not arise. Same treatment as the Overview hook's
     // first-load effect; the exhaustive-deps disable directive is gone.
     [pooledCount, announce, acquire, release, acceptWorker],
   );
@@ -761,7 +761,7 @@ export function WorkersSettings() {
             {/* PRD #1349 M6 (D8): the durable custody resolution surface. Self-hides when
                 there is no held work; when present it leads the panel so held work that
                 blocks claims is the first thing the owner sees on the Workers page. It is the
-                deep-link target for the board alert's "Review held work" action. */}
+                deep-link target for the Held work card's "Review held work" action. */}
             <RecoveryHoldsSurface />
 
             <Card className="space-y-3">

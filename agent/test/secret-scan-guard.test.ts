@@ -5,10 +5,12 @@ import {
   commitsScannedFromStderr,
   scanIsTrustworthy,
   gitleaksArgs,
+  literalMatcher,
   type SecretFinding,
 } from "../src/secret-scan-guard.js";
 import { isPushProtectionRejection } from "../src/git.js";
 import { composeLocalScanBlockedReason } from "../src/runner.js";
+import { providerKeyForms } from "../src/redact.js";
 
 // PRD #974 M2 (load-bearing security): the pure, I/O-free helpers behind the finalize
 // pre-push secret scan, plus the two remote-backstop helpers that classify a GH013
@@ -453,5 +455,68 @@ describe("composeLocalScanBlockedReason", () => {
     // The visible path characters survive, just not the control bytes. The path is JSON-quoted after
     // escaping (issue #1932), so each escape's backslash is doubled once more.
     assert.match(reason, /evil\\\\u\{1b\}\[2K\\\\u\{a\}row\.env/, "control bytes are escaped as visible \\u{..}, not stripped");
+  });
+});
+
+// Owner decision, issue #4505: the exact-key push scan's pure matcher. A prefixless provider key
+// has no gitleaks rule, so every encoded form of it (providerKeyForms) is searched byte-for-byte.
+describe("literalMatcher", () => {
+  // Assembled at runtime from fragments, with characters that make every encoded form differ from the raw one.
+  const key = ["Zq9x", "Lm/4", "tR+7", "&kQ2", "<w8>", " vNé"].join("");
+  const forms = providerKeyForms(key);
+
+  it("covers more than one encoded form, so the cases below are not vacuous", () => {
+    assert.ok(forms.length >= 5, `forms: ${forms.length}`);
+  });
+
+  for (const form of forms) {
+    it(`matches the form of length ${form.length} whole, in a surrounding stream`, () => {
+      const m = literalMatcher(forms);
+      assert.equal(m.push(Buffer.from("noise before ")), false);
+      assert.equal(m.push(Buffer.from(`x${form}y`)), true);
+    });
+
+    it(`matches the form of length ${form.length} split at every chunk offset`, () => {
+      const bytes = Buffer.from(`prefix ${form} suffix`);
+      for (let at = 1; at < bytes.length; at++) {
+        const m = literalMatcher(forms);
+        const hit = m.push(bytes.subarray(0, at)) || m.push(bytes.subarray(at));
+        assert.equal(hit, true, `split at ${at}`);
+      }
+    });
+
+    it(`matches the form of length ${form.length} fed one byte at a time`, () => {
+      const m = literalMatcher(forms);
+      let hit = false;
+      for (const b of Buffer.from(`..${form}..`)) hit = m.push(Buffer.from([b])) || hit;
+      assert.equal(hit, true);
+    });
+  }
+
+  it("never matches innocent bytes, including a strict prefix of a form", () => {
+    const m = literalMatcher(forms);
+    assert.equal(m.push(Buffer.from("hello world")), false);
+    assert.equal(m.push(Buffer.from(forms[0]!.slice(0, -1))), false);
+  });
+
+  it("reset drops the carried tail: a form never straddles two objects", () => {
+    const form = forms[0]!;
+    const m = literalMatcher(forms);
+    assert.equal(m.push(Buffer.from(form.slice(0, 5))), false);
+    m.reset();
+    assert.equal(m.push(Buffer.from(form.slice(5))), false, "second half of the form in the NEXT object is not a hit");
+    m.reset();
+    assert.equal(m.push(Buffer.from(form.slice(0, 5))), false);
+    assert.equal(m.push(Buffer.from(form.slice(5))), true, "without a reset the halves join");
+  });
+
+  it("matches in a binary stream with NUL bytes", () => {
+    const m = literalMatcher(forms);
+    assert.equal(m.push(Buffer.concat([Buffer.from([0, 1, 2, 0]), Buffer.from(forms[0]!), Buffer.from([0])])), true);
+  });
+
+  it("ignores empty forms and matches nothing with no usable form", () => {
+    assert.equal(literalMatcher([]).push(Buffer.from("anything")), false);
+    assert.equal(literalMatcher([""]).push(Buffer.from("anything")), false);
   });
 });

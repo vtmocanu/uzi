@@ -66,10 +66,15 @@ describe("issue1924 owed candidate cap", { timeout: 300_000 }, () => {
 
     // N+1: refused, tracking ref unmoved, no stage ref, nothing retained was deleted.
     const tipBefore = gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]);
-    commitTree("over the cap", true);
-    assert.deepEqual(await fetchHead(), { kind: "not_updated", reason: "owed_limit" });
+    const over = commitTree("over the cap", true);
+    assert.deepEqual(await fetchHead(), { kind: "not_updated", reason: "owed_limit", refusedSha: over });
     assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]), tipBefore, "tracking ref is not advanced");
-    assert.deepEqual(stageRefs(), [], "the refused head leaves no stage ref behind");
+    // issue #4481: the refused head is kept as run-attributed evidence: its stage plus the chokepoint's refused ref.
+    const refs = stageRefs();
+    assert.equal(refs.length, 2, "the refused head keeps its attributed stage and refused ref");
+    assert.ok(refs.includes(`refs/uzi-incoming/${RUN}/1/refused-${over}`));
+    assert.ok(refs.some((r) => new RegExp(`^refs/uzi-incoming/${RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36}$`).test(r)));
+    assert.equal(gitIn(bare, ["for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"]).split("\n").every((o) => o === over), true);
     assert.deepEqual(await pinned(), [...kept].sort(), "every retained head is still recoverable after the cap is hit");
     for (const sha of kept) assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${RUN}/${sha}`]), sha);
 
@@ -112,7 +117,7 @@ describe("issue1924 owed candidate cap", { timeout: 300_000 }, () => {
     }
     commitTree("one too many", true);
     const result = await realCap.fetchAgentBranch(bare, clone, BRANCH, RUN, opts);
-    assert.deepEqual(result, { kind: "not_updated", reason: "owed_limit" });
+    assert.deepEqual(result, { kind: "not_updated", reason: "owed_limit", refusedSha: gitIn(clone, ["rev-parse", `refs/heads/${BRANCH}`]) });
     assert.equal(gitIn(bare, ["for-each-ref", `refs/uzi-owed/${RUN}/`]).split("\n").length, MAX_OWED_CANDIDATES_PER_RUN);
   });
 });

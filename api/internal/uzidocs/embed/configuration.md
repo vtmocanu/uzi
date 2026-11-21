@@ -256,11 +256,15 @@ so does every Test, right before it connects) and the claims of runs already bou
 run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
 run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
 
-**Activation is blocked.** Workers do not advertise the capability `claude_provider_v1` that provider
-runs need, because the pinned Claude CLI follows gateway redirects (see
-[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-and-activation-is-blocked)).
-Setting the allowlist lets users define, test and select providers, but a run bound to one stays
-queued ("no worker that supports model providers is online") until a later release removes the block.
+**Activated, with an accepted redirect risk.** Workers advertise the capability `claude_provider_v1`
+by default (no switch), so a run bound to a provider starts on a current worker. The pinned Claude
+CLI follows gateway redirects, so the allowlist is the only control on where provider traffic
+starts: allowlist only gateways you trust not to redirect (see
+[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay) and
+[Model providers](./providers.md)). Workers on an image that predates the capability never claim a
+provider run, which queues ("no worker that supports model providers is online"); update operator
+image overrides and Compose or separately run workers yourself, since only the chart's worker image
+pin is bumped by the release helper.
 
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
@@ -460,7 +464,7 @@ Subagent pins and repository-defined agents are not part of the account view or 
 
 `fixed_at` says when the answer stops changing:
 
-- `create`: frozen when the run is created. The harness, and a Codex credential, are fixed here.
+- `create`: frozen when the run is created. The harness and initial Codex credential are selected here; the credential can later change through an explicit [live owner switch](codex-credentials.md#switching-a-live-run).
 - `claim`: read again each time a worker claims the run, including a queued, scheduled or resumed run. Models, efforts and an Anthropic token (`claim_selection`) are fixed here, so a settings change made before the claim still applies.
 - An honoured schedule model pin is also fixed at `create`: the schedule freezes it into the run when it fires, so the schedule-preview `worker_model` cell for that pin reads `fixed_at: create`.
 
@@ -470,7 +474,7 @@ Two creation-time policies can choose the harness only when the run is created, 
 
 The view is a prediction made now. Between the read and the claim, these can still move:
 
-- **Settings, credentials and templates, until the claim.** Anything fixed at `claim` (models, efforts, the Anthropic token) reads your stored choices, the credentials and the `lead` template again when a worker claims the run, so an edit made after the read applies. Only the `create`-fixed values (the harness and a Codex credential) are frozen at creation.
+- **Settings, credentials and templates, until the claim.** Anything fixed at `claim` (models, efforts, the Anthropic token) reads your stored choices, the credentials and the `lead` template again when a worker claims the run, so an edit made after the read applies. The harness and initial Codex credential are frozen at creation; settings edits do not change them. An explicit [live owner switch](codex-credentials.md#switching-a-live-run) is the narrow exception for the Codex credential.
 - **The Anthropic token.** A Claude run's token is `claim_selection`: it is selected when a worker claims the run, so the view names no token, only that the claim chooses it.
 - **The worker image during a roll.** The view is computed by the API; the claim is served by whichever worker takes the run. While a new worker image rolls out the fleet can mix versions, so a claim can be handled by a worker that behaves differently from what the API predicted.
 - **The SDK default.** A cell noted `sdk_default` sends no model, so the Claude SDK or your account decides at run time; the view cannot name that model.

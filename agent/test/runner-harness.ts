@@ -13,7 +13,7 @@ import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, type GitCacheOptions } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import {
   type Executor,
@@ -89,6 +89,17 @@ export function installHarness(
       }
     }
   });
+}
+
+/**
+ * A brand new GitCache over the same data dir with its own options (e.g. process nonce): no
+ * in-process refusal state of the GitCache survives. The WorkerClient (and anything installed on
+ * it), the fake api and module-level state persist, so this is not a full process restart.
+ */
+export function restartGitCache(opts: GitCacheOptions = {}): GitCache {
+  git = new GitCache(fx.dataDir, nullLogger(), undefined,
+    testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), ...opts }));
+  return git;
 }
 
 // PRD #51 M3 (b): the run's working tree is the RUNNER CLONE under runner/, not a

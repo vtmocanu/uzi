@@ -1,4 +1,4 @@
-// The "Get the factory running" checklist, shared by both Overview pages. The steps are
+// The "Get the factory running" checklist, shown on the Overview. The steps are
 // derived from the same preconditions the board's start-run gate checks
 // (lib/runStream.ts startRunGate); the caller decides when to show it (setupSteps in
 // lib/overview.ts says when every step is done).

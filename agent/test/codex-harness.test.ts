@@ -10,7 +10,8 @@ import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import type { Executor } from "../src/executor.js";
 import { PassThrough } from "node:stream";
-import { createCodexTransport } from "../src/codex/transport.js";
+import { PolicyContinuationRejected } from "../src/provider-policy-refusal.js";
+import { CodexTransportError, createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 
 import {
@@ -2134,7 +2135,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     const { harness } = makeHarness({ transport });
     await assert.rejects(
       collect(harness.startTurn(makeRequest({ resumeSessionId: "requested-session" })).events),
-      (err: unknown) => err instanceof CodexResumeError && err.message === "codex thread/resume failed",
+      (err: unknown) => err instanceof CodexHarnessError && !(err instanceof CodexResumeError) && err.message === "codex thread/resume returned no thread id",
     );
     assert.equal(
       transport.requests.some((r) => r.method === "turn/start"),
@@ -5154,6 +5155,8 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
       mode: "api_key",
       authenticate: async () => {},
       handleServerRequest: async () => false,
+      suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
       drainInterceptedRequests: () => Promise.reject(boom),
       closeAdmissionAndCancel: () => {},
     };
@@ -6604,5 +6607,139 @@ describe("#3247 catalog probe", () => {
       assert.ok(parseCatalogEntry({ data: Array.from({ length: 200 }, () => ({ id: "m", model: "m", supportedReasoningEfforts: [] })) }, "m"));
       assert.ok(parseCatalogEntry(sup(Array.from({ length: 16 }, () => "x".repeat(16))), "m"));
     });
+  });
+});
+
+describe("CodexHarness: no-turn preparation", () => {
+  for (const mode of ["subscription", "api_key"] as const) {
+    it(`${mode}: real app-server authenticates and resumes before model admission`, async () => {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const wire: string[] = [];
+      let buffer = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffer += chunk;
+        let end: number;
+        while ((end = buffer.indexOf("\n")) !== -1) {
+          const frame = rec(JSON.parse(buffer.slice(0, end)));
+          buffer = buffer.slice(end + 1);
+          if (typeof frame.method !== "string") continue;
+          wire.push(frame.method);
+          if (frame.id !== undefined)
+            inbound.write(JSON.stringify({ id: frame.id, result: authResponder(frame.method, frame.params) }) + "\n");
+          if (frame.method === "turn/start") {
+            inbound.write(JSON.stringify({ method: "turn/completed",
+              params: { threadId: "resumed-1", turn: { id: "tn-1", status: "completed" } } }) + "\n");
+          }
+        }
+      });
+      const appServerAuth = mode === "api_key"
+        ? createCodexAppServerAuth({ mode, apiKey: "test-key" })
+        : createCodexAppServerAuth({ mode, initial: { accessToken: "access-B", accountId: "account-B" },
+          bridge: { refresh: async () => ({ accessToken: "access-B", accountId: "account-B" }) } });
+      let callbacks = 0;
+      let observations = 0;
+      let launches = 0;
+      const { harness } = makeHarness({ appServerAuth, authMode: mode,
+        broker: stubBroker(async () => { callbacks++; return { ok: true, output: {} }; }),
+        launchRoot: async () => { launches++; return { root: fakeRoot, transport, supervisorPid: 4321 }; },
+      });
+      const request = makeRequest({ resumeSessionId: "resumed-1", onRuntimeConfig: () => { observations++; } });
+      try {
+        assert.equal(await harness.prepareRootAndThread(request), "resumed-1");
+        assert.deepEqual(wire, ["initialize", "initialized", "account/login/start", "thread/resume"]);
+        assert.equal(callbacks, 0);
+        assert.equal(observations, 0);
+        assert.equal(harness.policyAdmission, undefined);
+        const events = await collect(harness.startTurn(request).events);
+        assert.equal(events.filter(e => e.kind === "initialized").length, 1);
+        assert.equal(observations, 1);
+        assert.equal(launches, 1);
+        assert.deepEqual(wire, ["initialize", "initialized", "account/login/start", "thread/resume", "turn/start"]);
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const result of [{}, { thread: {} }, { thread: { id: "" } }, { thread: { id: " " } }]) {
+    it(`malformed resume ${JSON.stringify(result)} remains uncertain`, async () => {
+      const transport = new FakeTransport(method => method === "thread/resume" ? result : defaultResponder(method));
+      const { harness } = makeHarness({ transport });
+      try {
+        await assert.rejects(harness.prepareRootAndThread(makeRequest({ resumeSessionId: "saved" })),
+          error => error instanceof CodexHarnessError && !(error instanceof CodexResumeError));
+        assert.deepEqual(transport.requests.map(r => r.method), ["thread/resume"]);
+      } finally { await harness.close(); }
+    });
+  }
+
+  it("requires explicit fresh permission and preserves the conversation policy", async () => {
+    const { harness, transport } = makeHarness();
+    try {
+      await assert.rejects(harness.prepareRootAndThread(makeRequest()), PolicyContinuationRejected);
+      assert.equal(transport.requests.length, 0);
+      await assert.rejects(harness.prepareRootAndThread(makeRequest({ preserveConversation: true }), { allowFresh: true }),
+        PolicyContinuationRejected);
+      assert.equal(transport.requests.length, 0);
+      assert.equal(await harness.prepareRootAndThread(makeRequest(), { allowFresh: true }), "th-1");
+      assert.deepEqual(transport.requests.map(r => r.method), ["thread/start"]);
+    } finally { await harness.close(); }
+  });
+
+  it("cancelled preparation never launches a root", async () => {
+    let launches = 0;
+    const { harness } = makeHarness({ launchRoot: async () => {
+      launches++; throw new Error("unexpected launch");
+    } });
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      await assert.rejects(harness.prepareRootAndThread(makeRequest({ resumeSessionId: "saved", signal: controller.signal })));
+      assert.equal(launches, 0);
+    } finally { await harness.close(); }
+  });
+
+  for (const failure of ["refusal", "eof", "cancel"] as const) {
+    it(`real resume ${failure} never starts a fresh thread`, async () => {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const controller = new AbortController();
+      const wire: string[] = [];
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        for (const line of chunk.trim().split("\n")) {
+          const frame = rec(JSON.parse(line));
+          wire.push(String(frame.method));
+          if (failure === "refusal") inbound.write(JSON.stringify({ id: frame.id,
+            error: { code: -32000, message: "resume refused" } }) + "\n");
+          else if (failure === "eof") inbound.end();
+          else controller.abort();
+        }
+      });
+      const { harness } = makeHarness({ launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) });
+      try {
+        await assert.rejects(harness.prepareRootAndThread(makeRequest({ resumeSessionId: "saved", signal: controller.signal })),
+          error => failure === "refusal" ? error instanceof CodexResumeError : !(error instanceof CodexResumeError));
+        assert.deepEqual(wire, ["thread/resume"]);
+      } finally { await harness.close(); }
+    });
+  }
+});
+
+describe("CodexHarness: preparation deadline", () => {
+  it("retains a transport timeout without fresh fallback", async () => {
+    const failure = new CodexTransportError({ category: "timeout", message: "deadline" });
+    const transport = new FakeTransport(method => {
+      if (method === "thread/resume") throw failure;
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    try {
+      await assert.rejects(harness.prepareRootAndThread(makeRequest({ resumeSessionId: "saved" })),
+        error => error === failure);
+      assert.deepEqual(transport.requests.map(r => r.method), ["thread/resume"]);
+    } finally { await harness.close(); }
   });
 });

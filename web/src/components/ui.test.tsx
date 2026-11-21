@@ -200,7 +200,7 @@ describe("StatusPill", () => {
       label: "future status", tone: "text-neutral-fg", pulse: false,
     },
   ])("renders $name with its label, tone and activity", ({ run, label, tone, pulse }) => {
-    // Dashboard and RunsList pass this same effective status to the shared pill.
+    // OverviewRunRow and RunsList pass this same effective status to the shared pill.
     const { container } = render(<StatusPill status={effectiveRunStatus(run)} />);
     const pill = container.firstElementChild as HTMLElement;
     expect(pill.textContent).toBe(label);

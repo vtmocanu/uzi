@@ -15,6 +15,7 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { providerErrorMessage } from "../src/sdk-messages.js";
+import { makeTextRedactor, providerKeyForms } from "../src/redact.js";
 import { SdkExecutor, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
@@ -4270,6 +4271,16 @@ describe("SdkExecutor prd_done_path (PRD #72 M4)", () => {
     const { result } = await runDeclaring({ prd_done_path: huge });
     assert.strictEqual(result.prdDonePath!.length, 512);
     assert.ok(result.prdDonePath!.startsWith("prds/done/aaa"));
+  });
+
+  it("redacts the run's secrets BEFORE the clamp, so a key straddling the bound leaves no prefix", async () => {
+    const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const declared = "prds/done/" + "a".repeat(480) + key + ".md"; // the 512 cut falls inside the key
+    assert.ok(declared.slice(0, 512).includes(key.slice(0, 2)) && !declared.slice(0, 512).includes(key), "fixture straddles the cut");
+    const { result } = await runDeclaring({ prd_done_path: declared }, { redactText: (s: string) => s.split(key).join("[REDACTED]") });
+    assert.ok(result.prdDonePath!.length <= 512);
+    for (let n = 8; n <= key.length; n++) assert.ok(!result.prdDonePath!.includes(key.slice(0, n)), `prefix ${n} leaked`);
+    assert.ok(result.prdDonePath!.includes("[REDACTED]"));
   });
 
   it("forwards a hostile path unchanged — validation is the api's job, not a second implementation", async () => {
@@ -10359,6 +10370,47 @@ describe("SdkExecutor spend-limit terminal (issue #3767)", () => {
     const probe = makeCtx();
     const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(probe.ctx);
     assert.ok(result, "the run completed without throwing");
+  });
+
+  // The provider-failure message is clamped to 200 chars; ctx.redactText must run BEFORE that cut,
+  // else a key straddling it leaves an unmatchable prefix in the thrown message.
+  describe("ctx.redactText reaches the provider failure message before its clamp", () => {
+    const KEY = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const redactText = makeTextRedactor(providerKeyForms(KEY));
+    // First line whose key starts at offset 188 of the status-led text (after the "API Error:" strip),
+    // so 12 key characters survive the 200-char clamp when nothing redacts first.
+    const straddle = (status: number, lead: string): string => {
+      const head = `${status} ${lead}`;
+      return `API Error: ${head}${"x".repeat(188 - head.length)}${KEY}`;
+    };
+    const assertNoPrefix = (message: string): void => {
+      for (let n = 8; n <= KEY.length; n++) assert.ok(!message.includes(KEY.slice(0, n)), `key prefix of length ${n} leaked`);
+    };
+
+    it("SpendLimitHoldError message carries no key prefix", async () => {
+      const raw = straddle(400, SPEND_TEXT);
+      const unredacted = new SdkExecutor(nullLogger(), homeDir, fast(fakeTurns([[resultApiError(400, raw)]]).queryFn));
+      const bare = await rejection(unredacted.run(makeCtx().ctx));
+      assert.ok(bare instanceof SpendLimitHoldError);
+      assert.ok(bare.message.includes(KEY.slice(0, 8)), "without redactText the fixture straddles the cut");
+      const { queryFn } = fakeTurns([[resultApiError(400, raw)]]);
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx({ redactText }).ctx));
+      assert.ok(err instanceof SpendLimitHoldError);
+      assertNoPrefix(err.message);
+    });
+
+    it("ProviderTransientError text (surfaced through the recovery park message) carries no key prefix", async () => {
+      const raw = straddle(529, "Overloaded ");
+      const opts = (queryFn: SdkQueryFn): SdkExecutorOptions => ({ queryFn, emptyTurnBackoffBaseMs: 1, emptyTurnMaxRetries: 0 });
+      const bare = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(fakeTurns([[resultApiError(529, raw)]]).queryFn)).run(makeCtx().ctx));
+      assert.ok(bare instanceof TransientRecoveryError);
+      assert.ok(bare.message.includes(KEY.slice(0, 8)), "without redactText the fixture straddles the cut");
+      const { queryFn } = fakeTurns([[resultApiError(529, raw)]]);
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx({ redactText }).ctx));
+      assert.ok(err instanceof TransientRecoveryError);
+      assert.match(err.message, /provider transient error persisted/);
+      assertNoPrefix(err.message);
+    });
   });
 });
 

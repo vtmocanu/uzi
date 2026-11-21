@@ -3,7 +3,7 @@ import { afterEach, expect, it } from "vitest";
 import { createElement } from "react";
 import { cleanup, render, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { UsageCard } from "../components/UsageCards";
+import { OverviewUsageCard } from "../components/OverviewUsageCard";
 import { mockApi } from "./mockApi";
 
 afterEach(cleanup);
@@ -78,12 +78,15 @@ it("demo users partition every factory metric in both windows", async () => {
 
 it("demo renders selected-window cost exclusions and seven-day per-user totals", async () => {
   const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
-  const { getByRole, getByText } = render(createElement(MemoryRouter, null,
-    createElement(UsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {} }),
+  const view = render(createElement(MemoryRouter, null,
+    createElement(OverviewUsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {}, viewerId: "u-vlad", scope: "you", onScopeChange: () => {} }),
   ));
-  const personal = within(getByRole("region", { name: "Your usage" }));
+  const personal = within(view.getByRole("region", { name: "Your usage" }));
   expect(personal.getByText("+ 2 runs without a cost estimate and 1 unreported run").getAttribute("title")).toBe("Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included");
-  expect(getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
-  const totalRow = getByText("uzi total").closest("tr")!;
-  expect(within(totalRow).getByText("+ 5 runs without a cost estimate and 1 unreported run")).toBeTruthy();
+  view.rerender(createElement(MemoryRouter, null,
+    createElement(OverviewUsageCard, { self, admin, window: "last_7_days", onWindowChange: () => {}, viewerId: "u-vlad", scope: "all", onScopeChange: () => {} }),
+  ));
+  const factoryRow = within(view.getByRole("region", { name: "By user, scrollable" })).getByText("Factory").closest("tr")!;
+  expect(within(factoryRow).getByRole("note", { name: "5 runs without a cost estimate" })).toBeTruthy();
+  expect(within(factoryRow).getByRole("note", { name: "1 unreported run" })).toBeTruthy();
 });

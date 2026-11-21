@@ -311,10 +311,13 @@ export function decodeResult(msg: Record<string, unknown>): {
 export function providerErrorMessage(
   status: number | null | undefined,
   resultText: string | undefined,
+  redactText: (text: string) => string = (s) => s,
 ): string {
   const firstLine =
     resultText?.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
-  const text = firstLine.replace(/^api error:\s*/i, "").slice(0, 200).trim();
+  // Redact BEFORE the 200-char cut so a secret straddling the cut cannot leave a
+  // prefix that later whole-value redaction cannot match.
+  const text = redactText(firstLine.replace(/^api error:\s*/i, "")).slice(0, 200).trim();
   const statusStr = status != null ? String(status) : "";
   // Do not repeat the status if the human text already leads with it.
   const needStatus = statusStr !== "" && !text.startsWith(statusStr);

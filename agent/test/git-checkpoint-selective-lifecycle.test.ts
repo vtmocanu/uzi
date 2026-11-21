@@ -802,7 +802,7 @@ for (const unsafeAt of [0, 1, 2]) {
     });
     const lifecycle = new AbortController();
     const flight = { cancel: lifecycle, steering: { lifecycleSignal: () => lifecycle.signal }, runId: "retry-cleanup", runKind: "issue", barePath: "bare", branch: "task", lastCheckpointRefTip: "old",
-      reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
     const result = git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
       runner["publishCheckpointOutcome"](flight as never, "bare", "task"))
       .then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));

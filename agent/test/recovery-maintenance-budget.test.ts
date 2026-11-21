@@ -130,7 +130,7 @@ for (const late of ["range", "scan", "pack", "cumulative"] as const) {
         cancel: () => { cancelled++; }, exited: Promise.resolve(0).then(code => { order.push("exited"); return code; }) }; },
     } as unknown as HeldGit;
     try {
-      await assert.rejects(MaintenanceBudget.run(budget, () => prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 999_999 })), /maintenance deadline/);
+      await assert.rejects(MaintenanceBudget.run(budget, () => prepareFrozenHeld({ literals: [], git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 999_999 })), /maintenance deadline/);
       if (late === "range") assert.deepEqual(order, ["range"]);
       if (late === "scan" || late === "cumulative") assert.deepEqual(order, ["range", "scan"]);
       if (late === "pack") { assert.equal(cancelled, 1); assert.equal(order.at(-1), "exited"); }
@@ -151,7 +151,7 @@ it("pack abort cancels the stream and awaits child exit before returning", async
     checkpointPack: async () => ({ tipOid: tip, pack: stream, cancel: () => { cancelled++; }, exited: exited.promise.then(() => 0) }),
   } as unknown as HeldGit;
   try {
-    const pending = MaintenanceBudget.run(budget, () => prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 99_999 }));
+    const pending = MaintenanceBudget.run(budget, () => prepareFrozenHeld({ literals: [], git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 99_999 }));
     const rejected = assert.rejects(pending, /maintenance deadline/).then(() => { returned = true; });
     await entered.promise;
     now = 100; assert.throws(() => budget.check());
@@ -181,7 +181,7 @@ it("#4140 R0 held preparation inside a named attempt leaves no budget attached a
   try {
     await MaintenanceBudget.runAttempt("run-4140:7", () => { factories++; return activated = new MaintenanceBudget(600_000); }, async () => {
       assert.equal(MaintenanceBudget.current(), undefined, "the attempt starts with no active budget");
-      const prepared = await prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy: policy0, deadlineMs: 30_000 });
+      const prepared = await prepareFrozenHeld({ literals: [], git, barePath: "bare", branch: "task", sourceSha: tip, policy: policy0, deadlineMs: 30_000 });
       assert.deepEqual(order, ["pack"]);
       assert.ok("pack" in prepared && prepared.pack.toString() === "PACK", "preparation itself succeeds");
       assert.ok(preparingBudget, "preparation runs under its own deadline");
@@ -213,7 +213,7 @@ it("#4140 R0 an owned-pass abort during preparation stops preparation", async ()
   } as unknown as HeldGit;
   await assert.rejects(
     MaintenanceBudget.runOwned(owned.signal, () => MaintenanceBudget.runAttempt("run-4140:8", () => new MaintenanceBudget(600_000), () =>
-      prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000 }))),
+      prepareFrozenHeld({ literals: [], git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000 }))),
     /owned pass cancelled/,
     "inherited owned-pass cancellation must bind preparation",
   );
@@ -236,7 +236,7 @@ it("#4140 R0 cancellation observed during preparation activates the attempt's ow
   try {
     await MaintenanceBudget.runAttempt("run-4140:9", () => { factories++; return activated = new MaintenanceBudget(600_000); }, async () => {
       assert.equal(MaintenanceBudget.current(), undefined);
-      await prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000 });
+      await prepareFrozenHeld({ literals: [], git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000 });
       assert.equal(factories, 1, "the factory runs exactly once");
       assert.ok(activated);
       assert.notEqual(preparingBudget, activated);

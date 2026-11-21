@@ -4853,6 +4853,12 @@ export interface RunStartBody {
  *  and reused, so switch detection keys on the id, not the label); null when the token was
  *  deleted. */
 export interface CredentialEpoch {
+  /** Nullable historical Codex snapshots are omitted rather than reconstructed. */
+  codex_auth_mode?: string;
+  codex_material_revision?: number;
+  codex_account_key?: string;
+  codex_account_id?: string;
+  codex_claim_epoch?: number;
   claim_generation: number;
   secret_id: string | null;
   label: string | null;
@@ -6462,7 +6468,7 @@ export interface RecoveryCustodyHold {
   admission_reason?: string;
 }
 
-// RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
+// RecoveryCustodyAggregate is the owner-level custody summary the Overview Held work card and the
 // one-per-episode Slack DM read. Counts are numeric (0 is meaningful).
 // admission_counted_holds is optional for compatibility with older servers.
 export interface RecoveryCustodyAggregate {

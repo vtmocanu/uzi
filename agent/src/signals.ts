@@ -79,7 +79,14 @@ function validateNonClosing(input: unknown): {
 export interface SignalScanOptions {
   semanticPlanning?: SemanticPlanning;
   ownerDecisionRequested?: boolean;
+  /** The run's text redactor (registered secrets, provider key forms). Applied to agent-authored
+   *  text BEFORE each parse-time clamp: the redactor matches only whole secret forms, so a key
+   *  cut by a clamp first would leave an unmatchable prefix. Identity when absent; the runner and
+   *  batcher still redact later (idempotent). */
+  redactText?: (text: string) => string;
 }
+
+const identityRedact = (s: string): string => s;
 
 const OWNER_DECISION_DIAGNOSTIC = "Invalid owner_decision_requested: expected only a reason of 1–500 Unicode code points after trimming. Completion was not accepted.";
 
@@ -749,7 +756,7 @@ function clamp(s: string, n: number): string {
  * questions and must never throw. A call whose questions all fail to parse yields an
  * empty array, which the executor treats as "no park" rather than as an empty park.
  */
-function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] {
+function parseQuestions(raw: unknown, limit = MAX_QUESTIONS, redact = identityRedact): AskUserQuestion[] {
   if (!Array.isArray(raw)) return [];
   const out: AskUserQuestion[] = [];
   // Inspect at most 64 raw entries per call so malformed entries cannot displace
@@ -759,9 +766,9 @@ function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] 
     const q = asRecord(item);
     if (!q) continue;
     const question =
-      typeof q["question"] === "string" ? q["question"].trim() : "";
+      typeof q["question"] === "string" ? redact(q["question"]).trim() : "";
     if (question === "") continue; // a question with no text is not a question
-    const header = typeof q["header"] === "string" ? q["header"].trim() : "";
+    const header = typeof q["header"] === "string" ? redact(q["header"]).trim() : "";
     const parsed: AskUserQuestion = {
       question: clamp(question, MAX_QUESTION_RUNES),
       header: clamp(header, MAX_HEADER_RUNES),
@@ -772,10 +779,10 @@ function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] 
       for (const rawOpt of rawOptions.slice(0, MAX_OPTIONS)) {
         const o = asRecord(rawOpt);
         if (!o) continue;
-        const label = typeof o["label"] === "string" ? o["label"].trim() : "";
+        const label = typeof o["label"] === "string" ? redact(o["label"]).trim() : "";
         if (label === "") continue;
         const description =
-          typeof o["description"] === "string" ? o["description"] : "";
+          typeof o["description"] === "string" ? redact(o["description"]) : "";
         options.push({
           label: clamp(label, MAX_OPTION_RUNES),
           description: clamp(description, MAX_OPTION_RUNES),
@@ -798,15 +805,15 @@ function parseQuestions(raw: unknown, limit = MAX_QUESTIONS): AskUserQuestion[] 
  * parseMilestones drops has a blank trimmed id or title, so at least one sent entry does too and
  * the server rejects the whole list. Clamped and capped like parseMilestones (hygiene only).
  */
-function rejectedMilestonesOf(raw: unknown): Milestone[] | undefined {
+function rejectedMilestonesOf(raw: unknown, redact = identityRedact): Milestone[] | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw)) return [{ id: "", title: "" }];
   const capped = raw.slice(0, MAX_MILESTONES);
-  if (parseMilestones(capped).length === capped.length) return undefined;
+  if (parseMilestones(capped, redact).length === capped.length) return undefined;
   return capped.map((item) => {
     const m = asRecord(item);
-    const id = typeof m?.["id"] === "string" ? m["id"].trim() : "";
-    const title = typeof m?.["title"] === "string" ? m["title"].trim() : "";
+    const id = typeof m?.["id"] === "string" ? redact(m["id"]).trim() : "";
+    const title = typeof m?.["title"] === "string" ? redact(m["title"]).trim() : "";
     return { id: clamp(id, MAX_MILESTONE_ID_RUNES), title: clamp(title, MAX_MILESTONE_TITLE_RUNES) };
   });
 }
@@ -819,15 +826,15 @@ function rejectedMilestonesOf(raw: unknown): Milestone[] | undefined {
  * capped at 200. The cap here is HYGIENE, NOT the authoritative control — the api
  * validates and is the real cap (Decision 12).
  */
-function parseMilestones(raw: unknown): Milestone[] {
+function parseMilestones(raw: unknown, redact = identityRedact): Milestone[] {
   if (!Array.isArray(raw)) return [];
   const out: Milestone[] = [];
   for (const item of raw.slice(0, MAX_MILESTONES)) {
     const m = asRecord(item);
     if (!m) continue;
-    const id = typeof m["id"] === "string" ? m["id"].trim() : "";
+    const id = typeof m["id"] === "string" ? redact(m["id"]).trim() : "";
     if (id === "") continue;
-    const title = typeof m["title"] === "string" ? m["title"].trim() : "";
+    const title = typeof m["title"] === "string" ? redact(m["title"]).trim() : "";
     if (title === "") continue;
     out.push({
       id: clamp(id, MAX_MILESTONE_ID_RUNES),
@@ -843,8 +850,8 @@ function parseMilestones(raw: unknown): Milestone[] {
  * before parseProgressIds clamps it; any other non-array still yields []. Used only by
  * the report_progress scan: signal_done's `milestones_completed` stays array-only.
  */
-function parseProgressSide(raw: unknown): string[] {
-  return parseProgressIds(typeof raw === "string" ? [raw] : raw);
+function parseProgressSide(raw: unknown, redact = identityRedact): string[] {
+  return parseProgressIds(typeof raw === "string" ? [raw] : raw, redact);
 }
 
 /**
@@ -854,7 +861,7 @@ function parseProgressSide(raw: unknown): string[] {
  * 64 runes and deduped, and the list is capped at MAX_PROGRESS_IDS. Never throws. The cap
  * here is HYGIENE — the api validates membership against the frozen list (Decision 12).
  */
-function parseProgressIds(raw: unknown): string[] {
+function parseProgressIds(raw: unknown, redact = identityRedact): string[] {
   if (!Array.isArray(raw)) return [];
   const out: string[] = [];
   const seen = new Set<string>();
@@ -864,7 +871,7 @@ function parseProgressIds(raw: unknown): string[] {
     // stringifiable id, so it is dropped rather than turned into "[object Object]".
     const id =
       typeof item === "string"
-        ? item.trim()
+        ? redact(item).trim()
         : typeof item === "number" || typeof item === "boolean"
           ? String(item).trim()
           : "";
@@ -894,7 +901,7 @@ function parseProgressIds(raw: unknown): string[] {
  * membership (id must be a frozen, in-progress member) + the identifier shape and is the
  * authoritative control (D4/D5).
  */
-function parseMilestoneAgents(raw: unknown): MilestoneAgent[] {
+function parseMilestoneAgents(raw: unknown, redact = identityRedact): MilestoneAgent[] {
   if (!Array.isArray(raw)) return [];
   const out: MilestoneAgent[] = [];
   // NO client-side dedup by id: the server's milestoneAgentsParam is first-VALID-wins — an
@@ -906,13 +913,13 @@ function parseMilestoneAgents(raw: unknown): MilestoneAgent[] {
   for (const item of raw.slice(0, MAX_PROGRESS_IDS)) {
     const entry = asRecord(item);
     if (!entry) continue;
-    const id = typeof entry["id"] === "string" ? entry["id"].trim() : "";
+    const id = typeof entry["id"] === "string" ? redact(entry["id"]).trim() : "";
     if (id === "") continue;
     const agent = typeof entry["agent"] === "string" ? entry["agent"].trim() : "";
     if (agent === "") continue;
     const parsed: MilestoneAgent = { id: clamp(id, MAX_PROGRESS_ID_RUNES), agent };
     if (typeof entry["agent_label"] === "string") {
-      const label = entry["agent_label"].trim();
+      const label = redact(entry["agent_label"]).trim();
       if (label !== "") parsed.agent_label = clamp(label, MAX_MILESTONE_TITLE_RUNES);
     }
     out.push(parsed);
@@ -938,9 +945,9 @@ function parseProposal(raw: unknown): Proposal | undefined {
 }
 
 /** A trimmed, byte-clamped non-empty string, or undefined for anything else. */
-function claimText(raw: unknown, maxBytes: number): string | undefined {
+function claimText(raw: unknown, maxBytes: number, redact = identityRedact): string | undefined {
   if (typeof raw !== "string") return undefined;
-  const t = clampUtf8Bytes(raw.trim(), maxBytes).trim();
+  const t = clampUtf8Bytes(redact(raw).trim(), maxBytes).trim();
   return t === "" ? undefined : t;
 }
 
@@ -967,20 +974,20 @@ const PR_SUMMARY_SCOPE_KINDS: ReadonlySet<string> = new Set(["added", "changed",
  * raw caps. Returns undefined unless at least one member survived, and never carries
  * `verifiedAtSha` (the executor stamps that from the worktree, never from the model).
  */
-function parsePrSummary(raw: unknown): PrSummaryClaim | undefined {
+function parsePrSummary(raw: unknown, redact = identityRedact): PrSummaryClaim | undefined {
   const p = asRecord(raw);
   if (!p || Array.isArray(raw)) return undefined;
   const out: PrSummaryClaim = {};
-  const what = claimText(p["what"], PR_SUMMARY_TEXT_MAX_BYTES);
+  const what = claimText(p["what"], PR_SUMMARY_TEXT_MAX_BYTES, redact);
   if (what !== undefined) out.what = what;
-  const why = claimText(p["why"], PR_SUMMARY_TEXT_MAX_BYTES);
+  const why = claimText(p["why"], PR_SUMMARY_TEXT_MAX_BYTES, redact);
   if (why !== undefined) out.why = why;
-  const item = (e: unknown): string | undefined => claimText(e, PR_SUMMARY_ITEM_MAX_BYTES);
+  const item = (e: unknown): string | undefined => claimText(e, PR_SUMMARY_ITEM_MAX_BYTES, redact);
   const changes = claimList(p["changes"], item);
   if (changes) out.changes = changes;
   const verification = claimList<PrSummaryVerification>(p["verification"], (e) => {
     const r = asRecord(e);
-    const command = claimText(r?.["command"], PR_SUMMARY_ITEM_MAX_BYTES);
+    const command = claimText(r?.["command"], PR_SUMMARY_ITEM_MAX_BYTES, redact);
     const result = r?.["result"];
     if (command === undefined || (result !== "pass" && result !== "fail")) return undefined;
     return { command, result };
@@ -989,7 +996,7 @@ function parsePrSummary(raw: unknown): PrSummaryClaim | undefined {
   const scopeNotes = claimList<PrSummaryScopeNote>(p["scope_notes"], (e) => {
     const r = asRecord(e);
     const kind = r?.["kind"];
-    const text = claimText(r?.["text"], PR_SUMMARY_ITEM_MAX_BYTES);
+    const text = claimText(r?.["text"], PR_SUMMARY_ITEM_MAX_BYTES, redact);
     if (typeof kind !== "string" || !PR_SUMMARY_SCOPE_KINDS.has(kind) || text === undefined) return undefined;
     return { kind: kind as PrSummaryScopeKind, text };
   });
@@ -1055,6 +1062,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
   const content = inner?.["content"];
   if (!Array.isArray(content)) return {};
   const out: ScannedSignals = {};
+  const redact = opts.redactText ?? identityRedact;
   for (const raw of content) {
     const block = asRecord(raw);
     if (!block || block["type"] !== "tool_use") continue;
@@ -1084,12 +1092,12 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
         catch { out.semanticSubmission = { invalid: true }; }
       }
       const rawMilestones = input?.["milestones"];
-      const rejected = rejectedMilestonesOf(rawMilestones);
+      const rejected = rejectedMilestonesOf(rawMilestones, redact);
       if (rejected) {
         out.rejectedMilestones = rejected;
         delete out.milestones;
       } else {
-        const milestones = parseMilestones(rawMilestones);
+        const milestones = parseMilestones(rawMilestones, redact);
         if (milestones.length > 0) out.milestones = milestones;
         else delete out.milestones;
         delete out.rejectedMilestones;
@@ -1131,7 +1139,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // frozen list is re-checked server-side. Only set when at least one id parsed, so a
       // signal_done with no/garbage milestones_completed stays additive-absent and must
       // never affect `done` — a malformed declaration still means the run finished.
-      const completed = parseProgressIds(input?.["milestones_completed"]);
+      const completed = parseProgressIds(input?.["milestones_completed"], redact);
       if (completed.length > 0) out.milestonesCompleted = completed;
       // issue #279. Extracted HERE, in the same signal_done branch and therefore behind the
       // same main-thread guard as prd_done_path above: `summary` is persisted as report_md and
@@ -1142,7 +1150,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // transport hygiene only; the api is the authoritative control (it also scrubs+clamps).
       const summary = input?.["summary"];
       if (typeof summary === "string")
-        out.summary = summary.slice(0, REPORT_MD_MAX_LEN);
+        out.summary = redact(summary).slice(0, REPORT_MD_MAX_LEN);
       if (input?.["report_only"] === true) out.reportOnly = true;
       // PRD #929 M2. Extracted HERE, in the same signal_done branch and therefore behind the
       // same main-thread guard as summary above: a scheduled prompt run's proposal is filed
@@ -1158,7 +1166,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // least one member parsed (parsePrSummary drops everything malformed and never throws),
       // so a plain signal_done still scans to exactly `{ done: true }` and a malformed
       // declaration never affects `done`.
-      const prSummary = parsePrSummary(input?.["pr_summary"]);
+      const prSummary = parsePrSummary(input?.["pr_summary"], redact);
       if (prSummary !== undefined) out.prSummary = prSummary;
       // Issue #2083. Same signal_done branch, so the same main-thread guard: a subagent frame
       // must never plant the note the next rework run reads. Only non-whitespace strings count.
@@ -1185,7 +1193,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // is a phishing primitive, not merely a spurious park.
       const remaining = MAX_QUESTIONS - (out.questions?.length ?? 0);
       if (remaining > 0) {
-        const parsed = parseQuestions(asRecord(block["input"])?.["questions"], remaining);
+        const parsed = parseQuestions(asRecord(block["input"])?.["questions"], remaining, redact);
         if (parsed.length > 0) out.questions = [...(out.questions ?? []), ...parsed];
       }
     } else if (name === REPORT_PROGRESS_QUALIFIED) {
@@ -1210,11 +1218,11 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // out.progress ONLY when the progress object is being set AND the parsed list is
       // non-empty; it never manufactures a progress signal.
       const input = asRecord(block["input"]);
-      const completed = parseProgressSide(input?.["completed"]);
-      const in_progress = parseProgressSide(input?.["in_progress"]);
+      const completed = parseProgressSide(input?.["completed"], redact);
+      const in_progress = parseProgressSide(input?.["in_progress"], redact);
       if (completed.length > 0 || in_progress.length > 0) {
         out.progress = { completed, in_progress };
-        const milestones_agents = parseMilestoneAgents(input?.["milestones_agents"]);
+        const milestones_agents = parseMilestoneAgents(input?.["milestones_agents"], redact);
         if (milestones_agents.length > 0)
           out.progress.milestones_agents = milestones_agents;
       }

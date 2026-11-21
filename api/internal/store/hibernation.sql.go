@@ -599,6 +599,9 @@ CROSS JOIN LATERAL (
            -- ClaimChatRun: no ephemeral claimant, owner/affinity gate. The released-incarnation
            -- nonce clause is an intentional divergence (a Register rotates the nonce).
            AND NOT w.ephemeral
+           -- ClaimChatRun's provider clause (PRD #4320 / #4505): a provider-bound chat is claimable
+           -- only by a worker advertising claude_provider_v1; chat has no placement function.
+           AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
            AND (r.worker_id IS NULL OR r.worker_id = w.id OR r.updated_at < $5::timestamptz))
           OR
           (r.kind <> 'chat'
@@ -685,6 +688,10 @@ type ListHibernationWakeDemandRow struct {
 // custody-admission limit, the per-lane spread, a released-incarnation nonce (a Register rotates
 // it), the weekly-reserve gate beyond the sweeper's marker, the Codex subscription quarantine and
 // the pending-overflow slot counts.
+//
+// A provider-bound queued chat (model_provider_key_mode set) wakes only a worker advertising
+// 'claude_provider_v1', mirroring ClaimChatRun's provider clause (#4505); other kinds get the same
+// clause through fn_placement_admitting_workers.
 //
 // Deliberately NOT carried over from the ephemeral trigger: its run-level capability-gap filter,
 // the per-user ephemeral opt-in and kind <> 'chat'.

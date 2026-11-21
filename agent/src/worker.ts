@@ -2,6 +2,7 @@ import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import { CLAUDE_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -999,6 +1000,8 @@ export class Worker {
           // keeps draining /inputs while a switch is pending, which only a worker that handles the
           // switch in place can take.
           "credential_switch_in_place_v1",
+          "codex_credential_switch_v1",
+          "codex_switch_stopped_v1",
           // #2944: generation-stamped checkpoint/input/memory requests and fresh-transcript
           // checkpoint restoration. Distinct from the API feature milestone_reconciliation_v1.
           "milestone_reconciliation_claim_v1",
@@ -1074,6 +1077,11 @@ export class Worker {
           // plan turns and the implementation values for the implement turns. Advertised
           // UNCONDITIONALLY; the api sends plan_phase only to a worker advertising it.
           CLAUDE_PHASE_MODELS_CAPABILITY,
+          // PRD #4320 / #4505: activated 2026-11-19 with the gateway-redirect risk accepted
+          // (ADR-4320). Advertised UNCONDITIONALLY: the api offers a provider-bound run only to a
+          // worker advertising it, and client.ts requireProviderCapability still refuses a provider
+          // claim on a registration that did not advertise it.
+          CLAUDE_PROVIDER_CAPABILITY,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

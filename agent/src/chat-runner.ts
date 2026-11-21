@@ -18,7 +18,7 @@ import type { Outbox } from "./outbox.js";
 import type { ChatContext, ChatExecutorLike, ChatExecutorResult } from "./chat-executor.js";
 import { ChatSteering, type ChatInputSource } from "./steering.js";
 import { buildUziToolsServer, UZI_TOOLS_SERVER_NAME } from "./uzi-tools.js";
-import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage } from "./util.js";
 
@@ -140,11 +140,11 @@ export class ChatRunner {
     const oauthToken = claim.secrets.anthropic_oauth_token;
     if (oauthToken) this.log.addSecret(oauthToken);
     // PRD #4320: a provider-bound chat's gateway key is scrubbed exactly like the OAuth token.
-    const providerKey = claim.secrets.provider?.credential;
-    if (providerKey) this.log.addSecret(providerKey);
+    const providerKeys = claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const k of providerKeys) this.log.addSecret(k);
 
     const runLog = this.log.child({ run_id: runId, kind: "chat" });
-    const secrets = [claim.secrets.anthropic_oauth_token, providerKey, this.joinToken];
+    const secrets = [claim.secrets.anthropic_oauth_token, ...providerKeys, this.joinToken];
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
     // redactText also covers the PRD #99 top-level agent_label/agent_instance the
@@ -193,6 +193,7 @@ export class ChatRunner {
       runId,
       emit: (m) => batcher.emit(m),
       log: runLog,
+      redactText,
     });
 
     // Resolve this run's clocks: the claim config (server-pushed, no drift) wins over
@@ -343,7 +344,7 @@ export class ChatRunner {
       await source.stop().catch(() => undefined);
       // Evict this chat's token now the run is terminal (Decision 7).
       if (oauthToken) this.log.removeSecret(oauthToken);
-      if (providerKey) this.log.removeSecret(providerKey);
+      for (const k of providerKeys) this.log.removeSecret(k);
     }
   }
 }

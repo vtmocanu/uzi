@@ -25,7 +25,7 @@ import {
 // visibility. Browsers throttle background timers (often to ~1/min), which is fine —
 // the visibilitychange catch-up re-polls the instant the user returns, closing any
 // gap the throttle opened. The cadence is deliberately gentler than the foreground
-// Board/Dashboard polls (~10s): this is an always-on, tab-wide background poll, so a
+// Board/Overview polls (~10s): this is an always-on, tab-wide background poll, so a
 // ~20s beat keeps it cheap while staying live enough for a status dot. The poll is
 // marked passive (X-Uzi-Passive) so the server does NOT slide the session forward on
 // it (#331), letting an idle backgrounded tab still reach idle expiry while the

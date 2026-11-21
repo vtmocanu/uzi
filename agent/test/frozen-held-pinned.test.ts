@@ -9,7 +9,7 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
-import { prepareFrozenHeld, prepareFrozenHeldPinned, type FrozenHeldPolicy, type HeldGit } from "../src/frozen-held.js";
+import { prepareFrozenHeld, prepareFrozenHeldPinned, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "../src/frozen-held.js";
 import { parseCheckpointRange, serializeCheckpointRange } from "../src/terminal-range.js";
 import type { CheckpointRange } from "../src/git.js";
 
@@ -48,7 +48,7 @@ function fake(o: Opts) {
   return git as unknown as HeldGit;
 }
 const run = (git: HeldGit, extra: Record<string, unknown> = {}, policy = base) =>
-  prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000, ...extra });
+  prepareFrozenHeld({ literals: [] as string[], git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000, ...extra });
 
 const refusals: Array<[string, Opts, Record<string, unknown>?, FrozenHeldPolicy?]> = [
   ["secret_found", { calls: [], scan: { trusted: true, findings: [{}] } }],
@@ -123,14 +123,14 @@ it("one runProducer without a current budget; none when inherited; no leak after
   await run(fake({ calls: [] }));
   assert.equal(spy.mock.callCount(), 1);
   assert.equal(MaintenanceBudget.current(), undefined);
-  await prepareFrozenHeldPinned({ git: fake({ calls: [] }), barePath: "b", branch: "t", sourceSha: tip, policy: base, deadlineMs: 1000 }, range);
+  await prepareFrozenHeldPinned({ literals: [], git: fake({ calls: [] }), barePath: "b", branch: "t", sourceSha: tip, policy: base, deadlineMs: 1000 }, range);
   assert.equal(spy.mock.callCount(), 2);
   assert.equal(MaintenanceBudget.current(), undefined);
   const budget = new MaintenanceBudget(600_000);
   try {
     await MaintenanceBudget.run(budget, async () => {
       await run(fake({ calls: [] }));
-      await prepareFrozenHeldPinned({ git: fake({ calls: [] }), barePath: "b", branch: "t", sourceSha: tip, policy: base, deadlineMs: 1000 }, "resolve");
+      await prepareFrozenHeldPinned({ literals: [], git: fake({ calls: [] }), barePath: "b", branch: "t", sourceSha: tip, policy: base, deadlineMs: 1000 }, "resolve");
       assert.equal(MaintenanceBudget.current(), budget);
     });
     assert.equal(spy.mock.callCount(), 2, "inherited budget creates no producer");
@@ -138,7 +138,7 @@ it("one runProducer without a current budget; none when inherited; no leak after
 });
 
 const pin = (git: HeldGit, r: CheckpointRange | "resolve", extra: Record<string, unknown> = {}, policy = base) =>
-  prepareFrozenHeldPinned({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000, ...extra }, r);
+  prepareFrozenHeldPinned({ literals: [], git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000, ...extra }, r);
 
 it("pinned: resolve exactly once; supplied range never resolves; digests returned", async () => {
   const a: string[] = [];
@@ -274,7 +274,7 @@ describe("pinned replay over a real GitCache", () => {
 
   type Prepared = Exclude<Awaited<ReturnType<typeof prepareFrozenHeldPinned>>, { reason: string }>;
   const input = (r: Rig, tipSha: string, extra: Record<string, unknown> = {}) => ({
-    git: r.cache as unknown as HeldGit, barePath: r.bare, branch: REAL_BRANCH, sourceSha: tipSha, policy: base,
+    literals: [] as string[], git: r.cache as unknown as HeldGit, barePath: r.bare, branch: REAL_BRANCH, sourceSha: tipSha, policy: base,
     deadlineMs: 60_000, defaultBranch: "main", ...extra,
   });
 
@@ -350,5 +350,48 @@ describe("pinned replay over a real GitCache", () => {
     assert.notEqual(fresh?.defaultBlobSha, d1, "control: a fresh resolve after the move would have changed the range");
     const bad = await tampered(r, tip, out.persisted, out.first.digests, { defaultBlobSha: undefined });
     assert.equal((bad as { reason: string }).reason, "digest_mismatch");
+  });
+});
+
+// Owner decision, issue #4505: the held publication scans for the run's provider key like every other upload.
+describe("provider key scan on the held publication", () => {
+  const KEY_FORMS = ["Zq9xLm/4tR+7", "Zq9xLm\\/4tR+7"];
+  const bound: FrozenHeldPolicy = { ...base, providerKeyScan: true };
+
+  it("hands the key forms to the scan and refuses secret_found on a key finding, before any pack", async () => {
+    const calls: string[] = [];
+    let seen: unknown;
+    const git = fake({ calls, scan: { trusted: true, findings: [{ ruleId: "uzi-provider-key" }] } });
+    (git as unknown as Record<string, unknown>).secretScanCheckpointRange = async (_b: string, _r: unknown, o: unknown) => {
+      seen = o; calls.push("scan"); return { trusted: true, findings: [{ ruleId: "uzi-provider-key" }] };
+    };
+    assert.deepEqual(await run(git, { literals: KEY_FORMS }, bound), { reason: "secret_found" });
+    assert.deepEqual((seen as { literals: string[] }).literals, KEY_FORMS);
+    assert.ok(!calls.includes("pack"), "no pack is produced after a finding");
+  });
+
+  it("a provider-bound policy with NO key forms (a caller with no claim) fails closed as scan_untrusted without scanning", async () => {
+    const calls: string[] = [];
+    assert.deepEqual(await run(fake({ calls }), { literals: [] }, bound), { reason: "scan_untrusted" });
+    assert.ok(!calls.includes("scan") && !calls.includes("pack"));
+  });
+
+  it("a vendor policy with no forms is unchanged: it scans and packs", async () => {
+    const calls: string[] = [];
+    const r = await run(fake({ calls, pack: "PACK" }), { literals: [] }, base);
+    assert.ok("pack" in r);
+    assert.deepEqual(calls, ["resolve", "scan", "workflows", "pack"]);
+  });
+
+  it("the pinned (terminal) path refuses the same way", async () => {
+    const calls: string[] = [];
+    const out = await prepareFrozenHeldPinned({ literals: [], git: fake({ calls }), barePath: "b", branch: "t", sourceSha: tip, policy: bound, deadlineMs: 1000 }, range);
+    assert.equal((out as { reason: string }).reason, "scan_untrusted");
+  });
+
+  it("validFrozenHeldPolicy accepts the flag only as true or absent", () => {
+    assert.equal(validFrozenHeldPolicy(base), true);
+    assert.equal(validFrozenHeldPolicy({ ...base, providerKeyScan: true }), true);
+    for (const bad of [false, "true", 1, null, {}]) assert.equal(validFrozenHeldPolicy({ ...base, providerKeyScan: bad }), false, String(bad));
   });
 });

@@ -1811,12 +1811,12 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
       const shim = writeShim(tmp, "fail");
       const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: shim }));
       const { bare, base } = bareWithBranch();
-      assert.deepEqual(await g.secretScanCheckpointRange(bare, { tipSha: base, excludeSha: base }), {
+      assert.deepEqual(await g.secretScanCheckpointRange(bare, { tipSha: base, excludeSha: base }, { literals: [] }), {
         trusted: true,
         findings: [],
       });
       assert.equal(shimCalls(shim).length, 0);
-      assert.deepEqual(await g.secretScanCheckpointRange(bare, { tipSha: "HEAD", excludeSha: base }), {
+      assert.deepEqual(await g.secretScanCheckpointRange(bare, { tipSha: "HEAD", excludeSha: base }, { literals: [] }), {
         trusted: false,
         findings: [],
         reason: "range_invalid",
@@ -2131,7 +2131,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
       const blob = gitIn(bare, ["hash-object", "-w", "--stdin"], randomBytes(9 * 1024 * 1024));
       const tree = gitIn(bare, ["mktree"], `100644 blob ${blob}\tbig.bin\n`);
       const tip = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", base, "-m", "big"]);
-      const r = await g.secretScanCheckpointRange(bare, { tipSha: tip, excludeSha: base });
+      const r = await g.secretScanCheckpointRange(bare, { tipSha: tip, excludeSha: base }, { literals: [] });
       assert.deepEqual(r, { trusted: false, findings: [], reason: "scan_too_large" });
       assert.equal(shimCalls(shim).length, 0, "gitleaks never ran");
       assert.ok(
@@ -2159,7 +2159,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
       const late = new GitCache(fx.dataDir, nullLogger(), undefined, {
         gitleaksBin: writeShim(tmp, "slowclean", { sleepMs: 1_400 }),
       });
-      assert.deepEqual(await late.secretScanCheckpointRange(bare, range, { deadlineMs: 1_500 }), {
+      assert.deepEqual(await late.secretScanCheckpointRange(bare, range, { deadlineMs: 1_500, literals: [] }), {
         trusted: false,
         findings: [],
         reason: "deadline",
@@ -2169,7 +2169,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
         gitleaksBin: writeShim(tmp, "slowclean", { sleepMs: 30_000 }),
       });
       const t0 = Date.now();
-      assert.deepEqual(await hung.secretScanCheckpointRange(bare, range, { deadlineMs: 1_500 }), {
+      assert.deepEqual(await hung.secretScanCheckpointRange(bare, range, { deadlineMs: 1_500, literals: [] }), {
         trusted: false,
         findings: [],
         reason: "deadline",
@@ -2787,7 +2787,7 @@ for (const state of ["persisted", "absent", "attempt-only"] as const) {
     const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1, barePath: bare, branch,
       owedContext: Promise.resolve(context), lastCheckpointRefTip: state === "persisted" ? tip : "OLD",
       lastAttemptedCheckpointRefTip: state === "attempt-only" ? tip : undefined,
-      reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
+      providerKeyForms: [], reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
     try {
       const outcome = await (mkRunner(g, turn(async () => {}), undefined) as unknown as {
         publishCheckpointOutcome: (flight: unknown, bare: string, branch: string) => Promise<unknown>;
@@ -3307,7 +3307,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       const tip = w.git(["rev-parse", "HEAD"]);
       const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: bin }));
       assert.deepEqual(
-        await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }),
+        await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }, { literals: [] }),
         { trusted: true, findings: [] },
         label,
       );
@@ -3327,7 +3327,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       w.git(["commit", "-q", "-m", "delete big"]);
       const tip = w.git(["rev-parse", "HEAD"]);
       const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: shim }));
-      assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: floor }), {
+      assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: floor }, { literals: [] }), {
         trusted: false,
         findings: [],
         reason: "scan_too_large",
@@ -3359,7 +3359,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       const octo = w.git(["rev-parse", "HEAD"]);
       assert.equal(w.git(["rev-list", "--parents", "-n", "1", octo]).split(" ").length, 4, "a real octopus");
       const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: bin }));
-      const r = await g.secretScanCheckpointRange(w.dir, { tipSha: octo, excludeSha: w.base });
+      const r = await g.secretScanCheckpointRange(w.dir, { tipSha: octo, excludeSha: w.base }, { literals: [] });
       assert.equal(r.findings.length > 0, true, `${label}: ${JSON.stringify(r)}`);
       assert.equal(r.findings[0]!.commit, octo);
 
@@ -3372,7 +3372,7 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
       w.git(["commit", "-q", "-am", "edit"]);
       w.git(["merge", "-q", "--no-edit", "ren"]);
       const merged = w.git(["rev-parse", "HEAD"]);
-      assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: merged, excludeSha: octo }), {
+      assert.deepEqual(await g.secretScanCheckpointRange(w.dir, { tipSha: merged, excludeSha: octo }, { literals: [] }), {
         trusted: true,
         findings: [],
       }, label);
@@ -3721,12 +3721,12 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
       w.git(["commit", "-q", "-m", "merge with its own (clean) content"]);
       const tip = w.git(["rev-parse", "HEAD"]);
       const honest = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: writeShim(tmp, "detect") }));
-      assert.deepEqual(await honest.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }), {
+      assert.deepEqual(await honest.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }, { literals: [] }), {
         trusted: true,
         findings: [],
       });
       const liar = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: writeShim(tmp, "stdinlie") }));
-      assert.deepEqual(await liar.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }), {
+      assert.deepEqual(await liar.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }, { literals: [] }), {
         trusted: false,
         findings: [],
         reason: "scan_untrusted",
@@ -3762,7 +3762,7 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
       );
       const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: bin }));
       assert.deepEqual(
-        await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }),
+        await g.secretScanCheckpointRange(w.dir, { tipSha: tip, excludeSha: w.base }, { literals: [] }),
         { trusted: true, findings: [] },
         label,
       );
@@ -4325,11 +4325,11 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
 /** Replace the GitCache's receipt writer so that ONLY the first `phase:"pending"` receipt write runs
  *  the original and then `hook` (the point where a hard abort would strand the receipt). */
 function afterPendingReceipt(g: GitCache, hook: () => Promise<void>): () => void {
-  const internals = g as unknown as { writeOwedFile(bare: string, name: string, value: unknown): Promise<void> };
+  const internals = g as unknown as { writeOwedFile(bare: string, name: string, value: unknown, directory?: string): Promise<void> };
   const original = internals.writeOwedFile.bind(g);
   let fired = false;
-  internals.writeOwedFile = async (bare, name, value) => {
-    await original(bare, name, value);
+  internals.writeOwedFile = async (bare, name, value, directory) => {
+    await original(bare, name, value, directory);
     if (!fired && name.startsWith("receipt-") && (value as { phase?: string }).phase === "pending") {
       fired = true;
       await hook();

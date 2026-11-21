@@ -467,6 +467,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   const leadGrants: RunGrants = {
     semanticPlanning: request.semanticPlanning,
     ownerDecisionRequested: request.ownerDecisionRequested,
+    redactText: request.redactText,
     role: LEAD_ROLE,
     phase: request.phase,
     allowedTools: sortedSet([

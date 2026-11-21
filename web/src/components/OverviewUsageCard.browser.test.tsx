@@ -7,7 +7,7 @@ import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewUsageCard } from "./OverviewUsageCard";
-import type { UsageWindow } from "./UsageCards";
+import type { UsageWindow } from "../lib/usageByUser";
 import type { AdminUsage, SelfUsage } from "../lib/api";
 import { mockApi } from "../mocks/mockApi";
 import { USAGE_SCOPE_NOTE } from "./usageParts";

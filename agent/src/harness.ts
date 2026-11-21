@@ -385,6 +385,8 @@ export interface RunTurnRequest {
   ciEvidencePrepared?: boolean;
   /** Worker-derived eligibility for owner-decision requests, never a model declaration. */
   ownerDecisionRequested?: boolean;
+  /** The run's text redactor, applied to agent-authored signal text before the parse-time clamps. */
+  redactText?: (text: string) => string;
   /** Worker-derived park admission; never supplied by the model. */
   parkRunSupported?: boolean;
   /** Worker-derived, phase-independent run eligibility (issue kind, non-interactive); phase authority stays with the broker. */

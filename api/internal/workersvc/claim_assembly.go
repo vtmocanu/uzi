@@ -367,7 +367,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// are skipped, so it opens no Anthropic credential, never calls SetRunAnthropicSecret and carries
 	// no anthropic_oauth_token (anthropic stays nil → AnthropicOAuthToken == ""). Its credential
 	// epoch (the bound Codex secret, select_reason codex_binding) is journaled by recordCodexEpoch
-	// once the Codex secrets below are attached (issue #4201).
+	// inside the exact-mint finish transaction, before payload delivery (issue #4202).
 	// Its Codex secrets are attached just below, in the harnessCodex block after the payload
 	// literal. A Claude run keeps the exact existing ladder — byte-identical.
 	var anthropic []byte
@@ -1095,7 +1095,6 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		payload.Secrets.Codex = codex
 		// Issue #4201: journal the Codex binding this claim spends as the generation's epoch row,
 		// so a run's credential history is complete for both harnesses.
-		s.recordCodexEpoch(ctx, run)
 	}
 
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
@@ -1513,34 +1512,25 @@ func (s *Service) resolveClaimSummaryModel(ctx context.Context, run store.Run) *
 // frozen Codex binding, never a ladder pick.
 const selectReasonCodexBinding = "codex_binding"
 
-// recordCodexEpoch journals the Codex claim's credential epoch (issue #4201): the bound Codex secret
-// id, its label and select_reason codex_binding, keyed by the claim generation. It uses
-// RecordCodexCredentialEpoch, not the Claude pair, so it never touches runs.anthropic_secret_id and
-// never settles a Claude switch stamp. Idempotent on (run, generation), so a re-assembled claim
-// writes nothing new. Best effort: the journal is attribution history, and the capability the claim
-// already minted must not be orphaned by a failure to record it, so an error is logged and the claim
-// proceeds.
-func (s *Service) recordCodexEpoch(ctx context.Context, run store.Run) {
-	var secretID pgtype.UUID
-	var label string
-	if run.CodexSecretID.Valid {
-		secretID = run.CodexSecretID
-		meta, err := s.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{ID: uuid.UUID(run.CodexSecretID.Bytes), UserID: run.UserID})
-		if err == nil {
-			label = meta.Label
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			slog.Warn("workersvc: codex credential epoch label lookup failed", "run_id", run.ID.String(), "error", err)
-		}
-	}
-	if err := s.q.RecordCodexCredentialEpoch(ctx, store.RecordCodexCredentialEpochParams{
+// codexEpochWriter writes binding metadata only; capability bytes never enter the journal.
+type codexEpochWriter interface {
+	RecordCodexCredentialEpoch(context.Context, store.RecordCodexCredentialEpochParams) error
+}
+
+// recordCodexEpoch is retained for existing journal callers. Claim delivery uses
+// the transaction-bound writer below and handles every error.
+func (s *Service) recordCodexEpoch(ctx context.Context, run store.Run) error {
+	return recordCodexEpoch(ctx, s.q, run)
+}
+
+func recordCodexEpoch(ctx context.Context, q codexEpochWriter, run store.Run) error {
+	return q.RecordCodexCredentialEpoch(ctx, store.RecordCodexCredentialEpochParams{
 		RunID:           run.ID,
 		ClaimGeneration: run.ClaimGeneration,
-		SecretID:        secretID,
-		Label:           pgconv.TextOrNull(label),
+		SecretID:        run.CodexSecretID,
+		Label:           run.CodexSecretLabel,
 		SelectReason:    pgconv.TextOrNull(selectReasonCodexBinding),
-	}); err != nil {
-		slog.Warn("workersvc: codex credential epoch not recorded", "run_id", run.ID.String(), "generation", run.ClaimGeneration, "error", err)
-	}
+	})
 }
 
 // linkedIssueKey is the issue tracker key (PRD #4173) of an issue run on a linked

@@ -1214,7 +1214,7 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
 }
 
 // milestoneBadgeText renders the compact pill's label + tooltip from a MilestoneProgress,
-// so the board (Dashboard/RunsList) stays in lockstep (PRD #265 M2). A
+// so the board (Overview/RunsList) stays in lockstep (PRD #265 M2). A
 // reported run shows `M{done}/{total}`; an unreported one shows an en-dash numerator and
 // says so in the tooltip, never a `0/N` that reads as failure on a done run.
 //

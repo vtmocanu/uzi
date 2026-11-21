@@ -855,9 +855,10 @@ most of the places that check are not the end of the run:
   finalize does (see below), with the clone kept. Codex ordinary recovery can
   first use the credential-free fallback described below; refused or exhausted
   proof retains a nonterminal stop without claiming a verified capture.
-- Codex direct and retained credential switches retain/refuse before capture or
-  credential work. Codex per-run overrides remain unsupported (D9); only Claude
-  invokes the switch callback, including its existing retained-switch hold flow
+- Legacy direct and retained Codex capture-switch entries retain/refuse before
+  capture or credential work. The separate [live owner switch](codex-credentials.md#switching-a-live-run)
+  changes the committed credential within the same claim, without a release/reclaim
+  fallback. Claude keeps its existing retained-switch hold flow
   ([credential-switch holds](run-recovery.md#credential-switch-holds)).
 - On graceful shutdown, an unproven clone means nothing is published to the
   run's checkpoint; the pending requeue stands, and a later resume recovers

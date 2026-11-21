@@ -1,5 +1,5 @@
 // PRD #104 M6 asks for one thing to be ASSERTED rather than assumed: the three
-// "does this user have a token?" checks in the SPA (Dashboard, Board, IssueView)
+// "does this user have a token?" checks in the SPA (Overview, Board, IssueView)
 // keep any-row semantics after a user can hold several tokens.
 //
 // This file used to declare its OWN copy of the predicate while the real
@@ -42,7 +42,7 @@ function secret(over: Partial<SecretMeta> = {}): SecretMeta {
   };
 }
 
-describe("hasToken (Dashboard / Board / IssueView gates)", () => {
+describe("hasToken (Overview / Board / IssueView gates)", () => {
   it("is false for a token-less user", () => {
     expect(hasToken([])).toBe(false);
   });
@@ -245,7 +245,7 @@ describe("hasAnyCodexCredential (harness-appropriate copy)", () => {
   });
 });
 
-describe("hasUsableCredential (Dashboard onboarding step)", () => {
+describe("hasUsableCredential (Overview onboarding step)", () => {
   it("is false with no usable credential of either harness", () => {
     expect(hasUsableCredential([])).toBe(false);
   });

@@ -59,11 +59,16 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.wsvc.SetRunCredential(r.Context(), user.ID, runID, req.Mode, secretID)
 	if err != nil {
-		// The Codex refusal is unchanged. For a run in an unresolved policy episode only, name the
+		// For either Codex refusal, an unresolved policy episode still names the
 		// continuation that does apply, so the owner is not left at a dead end (issue #3607).
-		if errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported) && !errors.Is(err, workersvc.ErrCredentialOverrideProviderSource) {
+		if errors.Is(err, workersvc.ErrCodexSwitchIneligible) ||
+			(errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported) && !errors.Is(err, workersvc.ErrCredentialOverrideProviderSource)) {
 			if held, rerr := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); rerr == nil && blocksOrdinaryResume(held) {
-				httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness."+
+				message := "a credential override is not supported on the codex harness"
+				if errors.Is(err, workersvc.ErrCodexSwitchIneligible) {
+					message = workersvc.ErrCodexSwitchIneligible.Error()
+				}
+				httpx.Error(w, http.StatusUnprocessableEntity, message+"."+
 					" Resume this policy hold with POST /api/runs/"+runID.String()+"/resume-now, an explicit mode and expected_episode_id.")
 				return
 			}
@@ -89,6 +94,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
 	var ownerHeld *workersvc.RunOwnerHeldError
 	switch {
+	case errors.Is(err, workersvc.ErrCodexSwitchIneligible):
+		httpx.Error(w, http.StatusUnprocessableEntity, workersvc.ErrCodexSwitchIneligible.Error())
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
 	case errors.As(err, &workerUnsupported):

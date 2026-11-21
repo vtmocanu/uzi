@@ -157,6 +157,7 @@ func credentialEpochsToDTO(rows []store.RunCredentialEpoch, switches []store.Run
 			AppliedAt:       e.AppliedAt.Time,
 		}
 		setEpochSecret(&dto, e.SecretID, e.Label, e.SelectReason)
+		setEpochCodex(&dto, e.CodexAuthMode, e.CodexMaterialRevision, e.CodexAccountKey, e.CodexAccountID, e.CodexClaimEpoch)
 		out = append(out, dto)
 		keys = append(keys, epochKey{generation: e.ClaimGeneration})
 	}
@@ -169,6 +170,7 @@ func credentialEpochsToDTO(rows []store.RunCredentialEpoch, switches []store.Run
 			AppliedAt:       e.AppliedAt.Time,
 		}
 		setEpochSecret(&dto, e.SecretID, e.Label, e.SelectReason)
+		setEpochCodex(&dto, e.CodexAuthMode, e.CodexMaterialRevision, e.CodexAccountKey, e.CodexAccountID, e.CodexClaimEpoch)
 		seq := e.MessageSeq
 		dto.MessageSeq = &seq
 		out = append(out, dto)
@@ -204,6 +206,25 @@ func credentialEpochsToDTO(rows []store.RunCredentialEpoch, switches []store.Run
 		}
 	}
 	return sorted
+}
+
+// setEpochCodex preserves nullable historical snapshots without inventing authority.
+func setEpochCodex(dto *apitypes.CredentialEpochDTO, mode pgtype.Text, revision pgtype.Int8, key, account pgtype.Text, epoch pgtype.Int8) {
+	if mode.Valid {
+		dto.CodexAuthMode = &mode.String
+	}
+	if revision.Valid {
+		dto.CodexMaterialRevision = &revision.Int64
+	}
+	if key.Valid {
+		dto.CodexAccountKey = &key.String
+	}
+	if account.Valid {
+		dto.CodexAccountID = &account.String
+	}
+	if epoch.Valid {
+		dto.CodexClaimEpoch = &epoch.Int64
+	}
 }
 
 // setEpochSecret maps an epoch's secret id, label and select reason, each null-tolerant and mapped

@@ -1,11 +1,11 @@
 // Non-admin Overview platform line (PRD #1484 M5, D3/D4). Shown to a NON-admin viewer whose
 // own hosted fleet cannot start, so a stuck user can tell a platform problem from a problem
 // with their own run. It is derived ENTIRELY from the viewer's own listRuns + listWorkers
-// (GET /api/workers, the user's OWN workers — never the admin route), which the Dashboard
+// (GET /api/workers, the user's OWN workers — never the admin route), which the Overview
 // already polls. It names no other user and needs no new endpoint (D4: workers are per owner,
 // so "the platform cannot run my work" is already visible in the viewer's own worker list).
 //
-// Admins get the HealthOverviewCard instead — the card and this line are mutually exclusive.
+// Admins get the HealthChip instead — the chip and this line are mutually exclusive.
 
 import type { RunSummaryItem, Worker } from "../lib/api";
 import { workerFailed, workerFailureCause } from "./WorkerUpgradeBadge";

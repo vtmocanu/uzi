@@ -1029,6 +1029,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "recovery_run_open_holds_v1",
     "credential_switch_v1",
     "credential_switch_in_place_v1",
+    "codex_credential_switch_v1",
+    "codex_switch_stopped_v1",
     "milestone_reconciliation_claim_v1",
     "codex_refresh_recovery_v1",
     "codex_account_park_v1",
@@ -1053,6 +1055,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "agent_source_request_v1",
     "issue_key_v1",
     "claude_phase_models_v1",
+    "claude_provider_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // #4007 slice B is production-dark: its capability is never advertised in any permutation below.

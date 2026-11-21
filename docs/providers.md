@@ -11,14 +11,23 @@ example) that you register with its own API key and a map from Claude's model na
 gateway's models. Settings has a **Custom providers** card for them, and `uzi provider` covers
 the same ground from a terminal.
 
-> **Runs through a provider are currently blocked.** You can create, edit, test, retire and
-> select providers, but a run that is bound to one **stays queued** and shows "no worker that
-> supports model providers is online; waiting for a worker roll". Workers do not yet advertise
-> the capability that provider runs need, because the pinned Claude CLI follows redirects from a
-> gateway, which could re-send your key or request body to a location the gateway names. A
-> loopback relay that removes that risk is planned as a separate change. Until it lands, do not
-> select a provider as your Claude source unless you want your Claude runs to queue; clear it to
-> go back to your Anthropic token. Details: [ADR-4320](../adr/4320-custom-model-providers.md).
+> **Runs through a provider are active, and the Claude CLI follows gateway redirects.** The
+> pinned Claude CLI follows HTTP redirects from a gateway. A gateway that answers with a redirect
+> can make the CLI re-send your key to another path on the same host under **both** auth styles,
+> and re-send the request body (your prompts, plus code and tool output the agent read) to any
+> host the redirect names. With `x_api_key` auth the key can also go to another host; Bearer auth
+> drops the `Authorization` header across hosts. The owner accepted this risk on 2026-11-19 and
+> parked the loopback relay that would remove it. The operator allowlist
+> (`UZI_PROVIDER_ALLOWED_BASE_URLS`) is therefore the **only control** on where provider traffic
+> starts: allowlist only gateways you trust not to redirect, and prefer Bearer auth, which limits
+> cross-host key exposure.
+>
+> Two operational notes. A worker image that predates providers never claims a provider run:
+> the run stays queued with "no worker that supports model providers is online" until the worker
+> is updated. And uzi blocks any push to the forge, including checkpoints, whose commits contain
+> your provider key, so work that carries it stays on the worker and the run does not push it
+> (`push_secret_blocked` / `secret_remediation_pending`). Details:
+> [ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay).
 
 ## Which URLs you can use
 
@@ -138,10 +147,6 @@ recovery, restart, automatic rework) and its follow-on rework, review and chat r
 frozen binding, not whatever your source is later. CI-fix and handoff runs have no source run and
 use your current source. Editing a provider's model map creates a new revision for later runs
 and older ones keep theirs.
-
-The rest of this section and the next one (Gateway rate limits) describe how a provider run
-behaves once workers support providers. Until then a provider run waits in the queue (see the note at the top of this
-page), and a revoked binding simply leaves it queued.
 
 Revocation takes effect at the run's **next claim**, not mid-claim, and cancelling is the
 immediate stop. If the operator removes the URL from the allowlist, the run pauses as

@@ -15,7 +15,7 @@ import { SeverityShape } from "./healthSeverity";
 import { keepInRowView, PinnedBlock, TabRow, tabClass } from "./TabRow";
 
 // Health is last (PRD #1484 D1); its entry points are the sidebar pip
-// (M5) and the Overview card (M5), not tab position. `pip: true` marks the aggregate
+// (M5) and the Overview HealthChip (M5), not tab position. `pip: true` marks the aggregate
 // health severity pip; Instance separately carries the agent-source advisory mark.
 export const TABS = [
   { to: "/admin/users", label: "Users" },

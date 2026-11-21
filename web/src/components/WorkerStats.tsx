@@ -155,7 +155,7 @@ function inodeSuffix(d: DiskVolume, sep: string): string {
 
 /** True once the worker has reported a usable sample. The single source of truth for
  *  "does this worker have stats to render" — the gauges, the compact line, and the
- *  Dashboard fleet card's filter all gate on this, so no surface can disagree about
+ *  capacity rail's stats filter all gate on this, so no surface can disagree about
  *  which workers show up (reviewer M3 nit). */
 export function hasStats(w: Worker): boolean {
   return w.stats_source != null && w.stats_mem_bytes != null;

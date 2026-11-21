@@ -933,7 +933,7 @@ for (const cancel of [false, true]) {
   const { fileURLToPath } = await import("node:url");
   const { CrossCheckRunner } = await import("../src/cross-check-runner.js");
   const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
-  const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
+  const { acquireCodexOperationScope, codexOperationAuthorityIdentity } = await import("../src/codex-operation-scope.js");
   const { AdmissionClock } = await import("./operation-admission-clock.js");
   await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
   const root = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-checker-", import.meta.url)));
@@ -962,7 +962,7 @@ for (const cancel of [false, true]) {
    const slept = clock.sleep(ms, signal);
    enteredWait();
    return slept;
-  } });
+  } }, undefined, undefined, undefined, codexOperationAuthorityIdentity(c.secrets.codex!.capability));
   const git = { ensureClone: async () => "bare", runnerCloneAtCommit: async () => "checkout", removeRunnerClone: async () => {} } as never;
   const runner = new CrossCheckRunner(client, git, { ...r.log, warn() {}, info() {}, error() {}, debug() {} } as Logger,
    { homeRoot: root, activeRuns: registry, pollMs: 1000, model: new CodexCrossCheck(client, r.log, r.deps) });

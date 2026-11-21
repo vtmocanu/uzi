@@ -3799,7 +3799,7 @@ export interface InputsResponse {
    *  continuously) — so the worker holding the current claim learns a switch was requested. Present
    *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
    *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
-  credential_switch?: { generation: number; op_id?: string };
+  credential_switch?: { generation: number; op_id?: string; target_secret_id?: string };
   /** PRD #2603: the run's effective "Now summary" setting (admin switch AND the owner's user
    *  setting). Absent means OFF: a new worker against an older api, or a reply that took an
    *  early return, never spends tokens on a summary. */

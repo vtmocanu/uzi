@@ -89,7 +89,7 @@ import type {
   JobRefusedOutput,
   JobResultRequest,
 } from "./protocol.js";
-import { makeRedactor, makeTextRedactor, type TextRedactor } from "./redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms, type TextRedactor } from "./redact.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import fsp from "node:fs/promises";
@@ -752,15 +752,15 @@ export class JobRunner {
     // The secrets every outgoing string is scrubbed of. A lane job adds its fetch credential the
     // moment the grant validates; one list builds the batcher's redactors AND the text redactor
     // finish() and the failure reports use.
-    const providerKey = claim.secrets?.provider?.credential;
-    let secrets: Array<string | undefined> = [token, providerKey, this.joinToken];
+    const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    let secrets: Array<string | undefined> = [token, ...providerKeys, this.joinToken];
     let redactText: TextRedactor = makeTextRedactor(secrets);
     let laneCredential: string | undefined;
     try {
       // PRD #4320: the job lane cannot serve a provider until PRD #4322; the server refuses it first
       // (a job fails terminally), this is the worker's second layer.
       if (claim.secrets?.provider) {
-        this.log.addSecret(claim.secrets.provider.credential);
+        for (const k of providerKeys) this.log.addSecret(k);
         await this.fail(runId, generation, PROVIDER_LANE_UNSUPPORTED);
         return;
       }
@@ -944,7 +944,7 @@ export class JobRunner {
       if (ws) await removeJobWorkspace(ws, runLog);
       this.activeRuns?.remove(runId);
       if (token) this.log.removeSecret(token);
-      if (providerKey) this.log.removeSecret(providerKey);
+      for (const k of providerKeys) this.log.removeSecret(k);
       if (laneCredential) this.log.removeSecret(laneCredential);
     }
   }

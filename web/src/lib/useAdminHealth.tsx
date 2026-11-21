@@ -29,7 +29,7 @@ function healthAttentionCount(doc: HealthDoc): number {
 
 // useHealthPoll is the single best-effort poll of GET /api/admin/health. It polls every 10 s
 // while the tab is visible (usePollWhileVisible) and KEEPS THE LAST-GOOD document on a failed
-// fetch, mirroring CustodyBoardAlert — a transient blip must never blank a pip or the Health
+// fetch, like the Overview's other polls — a transient blip must never blank a pip or the Health
 // page. It fetches ONLY while `enabled`: the provider passes `isAdmin`, so a non-admin NEVER
 // triggers a request to the admin endpoint (exactly UpdateEscalationBanner's `if (!isAdmin)`
 // gate, which "makes no fetch for non-admins"). When disabled it holds no document, so a

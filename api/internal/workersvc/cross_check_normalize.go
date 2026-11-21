@@ -34,7 +34,9 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 		return c, ErrCrossCheckRefused
 	}
 	// Decode the actual apitypes.Milestone shape before prose scrubbing can
-	// erase an unsafe ID. Unknown nested fields are prose, not milestone IDs.
+	// erase an unsafe ID. The stored/state-write contract is exactly {id,title}
+	// objects passing validateMilestones; that is checked below on the
+	// post-scrub canonical JSON.
 	milestones, err := DecodeMilestones(c.Milestones)
 	if err != nil {
 		return c, ErrCrossCheckRefused
@@ -95,6 +97,9 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 	if err != nil || len(c.Milestones) > 256*1024 {
 		return c, ErrCrossCheckRefused
 	}
+	if !checkedPlanMilestonesAdmissible(c.Milestones) {
+		return c, ErrCrossCheckRefused
+	}
 	for i, s := range c.RequiredCapabilities {
 		c.RequiredCapabilities[i], err = normalizeCrossCheckIdentifier(s, 256)
 		if err != nil {
@@ -109,6 +114,35 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 	}
 	c.SizeClass, err = normalizeCrossCheckIdentifier(c.SizeClass, 64)
 	return c, err
+}
+
+// checkedPlanMilestonesAdmissible reports whether canonical (post-scrub) milestone
+// JSON is exactly a list of {id,title} objects that validateMilestones accepts.
+// It only reads: the sanitized slice is never written back, so admissible input
+// keeps byte-identical normalized output.
+func checkedPlanMilestonesAdmissible(raw []byte) bool {
+	var entries []json.RawMessage
+	if json.Unmarshal(raw, &entries) != nil {
+		return false
+	}
+	for _, entry := range entries {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(entry, &fields) != nil || len(fields) != 2 {
+			return false
+		}
+		if _, ok := fields["id"]; !ok {
+			return false
+		}
+		if _, ok := fields["title"]; !ok {
+			return false
+		}
+	}
+	ms, err := DecodeMilestones(raw)
+	if err != nil {
+		return false
+	}
+	_, ok := validateMilestones(ms)
+	return ok
 }
 
 // boundCrossCheckReport is the normalized, digest-bound view of a worker report that claims a

@@ -19,6 +19,7 @@ import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimProviderBinding, ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
+import { createLogger } from "../src/log.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
 import { secretRecordingLogger } from "./runner-harness.js";
@@ -434,6 +435,20 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     assert.match(failed.body.failure_reason ?? "", /provider_lane_unsupported/);
     assert.ok(added.includes(KEY), "the gateway key was registered with the logger");
     assert.ok(removed.includes(KEY), "and evicted again when the job ended");
+  });
+
+  it("job: a sibling holder of the same key keeps it scrubbed after the refusal (add/remove are symmetric)", async () => {
+    const { client } = recordingClient();
+    const logger = createLogger("error");
+    logger.addSecret(KEY); // a concurrent run on the shared logger holds the same key
+    await new JobRunner(client, logger, { queryFn: (() => (async function* () { /* none */ })()) as unknown as SdkQueryFn,
+      jobsRoot: path.join(homeDir, "jobs"), batchMs: 5, cancelPollMs: 10 }).execute({
+      run_id: "job-2", kind: "job", issue_iid: null, issue_title: "", issue_description: "", repo: undefined, secrets: secrets as never, last_seq: 0, agents: [],
+      claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {},
+    } as unknown as ClaimResponse);
+    assert.ok(!logger.redactDiagnostic!(`leak ${KEY} here`).includes(KEY), "the holder's registration survives the refusal");
+    logger.removeSecret(KEY);
+    assert.ok(logger.redactDiagnostic!(`leak ${KEY} here`).includes(KEY), "released once its own holder lets go");
   });
 
   it("isolated: the preflight refuses with provider_lane_unsupported", () => {

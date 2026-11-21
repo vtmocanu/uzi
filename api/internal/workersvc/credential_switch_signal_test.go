@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -75,3 +76,36 @@ func TestPendingCredentialSwitchSignal(t *testing.T) {
 }
 
 func ptrInt64(v int64) *int64 { return &v }
+
+func TestPendingCodexSwitchSignalExactTarget(t *testing.T) {
+	op, target := uuid.New(), uuid.New()
+	run := store.Run{
+		Harness: harnessCodex, ClaimGeneration: 7,
+		CredentialSwitchRequestedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		CredentialSwitchGeneration:  pgtype.Int8{Int64: 7, Valid: true},
+		CredentialSwitchOpID:        pgtype.UUID{Bytes: op, Valid: true},
+		CodexSwitchTargetSecretID:   pgtype.UUID{Bytes: target, Valid: true},
+		CodexSwitchTargetGeneration: pgtype.Int8{Int64: 7, Valid: true},
+		CodexSwitchTargetOpID:       pgtype.UUID{Bytes: op, Valid: true},
+	}
+	if sig := PendingCredentialSwitchSignal(run); sig == nil || sig.TargetSecretID != target.String() || sig.OpID != op.String() {
+		t.Fatal("missing exact pending target")
+	}
+	for _, mutation := range []string{"generation", "operation", "other harness", "absent operation"} {
+		copy := run
+		switch mutation {
+		case "generation":
+			copy.CodexSwitchTargetGeneration.Int64++
+		case "operation":
+			copy.CodexSwitchTargetOpID.Bytes = uuid.New()
+		case "other harness":
+			copy.Harness = "claude"
+		case "absent operation":
+			copy.CredentialSwitchOpID.Valid = false
+			copy.CodexSwitchTargetOpID.Valid = false
+		}
+		if sig := PendingCredentialSwitchSignal(copy); sig == nil || sig.TargetSecretID != "" {
+			t.Fatalf("%s exposed a target", mutation)
+		}
+	}
+}

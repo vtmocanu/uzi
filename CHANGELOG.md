@@ -312,6 +312,36 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A paused paced restore's WaitForFirstConsumer claims are no longer reported stranded ([#4468](https://github.com/vtmocanu/uzi/pull/4468), [#4480](https://github.com/vtmocanu/uzi/pull/4480)).**
   The bind timeout is skipped only for a worker held at zero replicas under its open roll reservation with no consumer pod and a confirmed WaitForFirstConsumer class (needs workers.storageClassRead.create); ages are not reset, so a brief stuck status until the volume binds after replicas return is expected.
 
+- **Docker-tier worker-size quota advisories say they are incomplete ([#4517](https://github.com/vtmocanu/uzi/pull/4517), [#4531](https://github.com/vtmocanu/uzi/pull/4531)).**
+  The size editor now notes that the docker tier's quota check excludes DinD sidecar requests, so a missing warning no longer reads as a fit.
+
+- **A refused worker-size removal no longer lingers after the admin moves on ([#4516](https://github.com/vtmocanu/uzi/pull/4516), [#4529](https://github.com/vtmocanu/uzi/pull/4529)).**
+  Admin → Workers clears the "still in use" explanation when another Add, Edit, Remove or Reset starts, or when the size list is re-read, so it never sits beside a later success or outlives the data it described.
+
+- **Admin Workers keeps each card's saved values when two cards save at once ([#4544](https://github.com/vtmocanu/uzi/pull/4544), [#4545](https://github.com/vtmocanu/uzi/pull/4545)).**
+  A slower response from one settings card no longer reverts the values another card has just confirmed.
+
+- **Plan cross-check refuses milestone lists the approved plan could not store ([#4554](https://github.com/vtmocanu/uzi/pull/4554), [#4558](https://github.com/vtmocanu/uzi/pull/4558)).**
+  A checked plan whose milestones are not valid {id,title} entries now goes to the human plan gate at submission instead of failing the run after the checker approves.
+
+- **The worker upgrade attention badge no longer counts hibernating workers the list shows as unknown ([#4514](https://github.com/vtmocanu/uzi/pull/4514), [#4527](https://github.com/vtmocanu/uzi/pull/4527)).**
+  The badge summary now classifies with each worker's hibernation state, so it matches the worker list while fresh size and PVC refusals still count.
+
+- **Admin Instance: a slower sibling-card save no longer reverts another card's just-saved settings ([#4530](https://github.com/vtmocanu/uzi/pull/4530), [#4535](https://github.com/vtmocanu/uzi/pull/4535)).**
+  A late save response used to replace the whole page state, which could undo a setting another card had just confirmed, reset the label form and hide the single sign-on status line. Each save now confirms only the keys it sent.
+
+- **A hosted-worker roll pool no longer stays held on a stale duplicate canary reservation for a provably absent worker ([#4475](https://github.com/vtmocanu/uzi/pull/4475), [#4504](https://github.com/vtmocanu/uzi/pull/4504)).**
+  When exactly two canary reservations exist, one belongs to a scaled-to-zero worker with no pod, PVC, claim or pending ReplicaSet producer and a drifted template, and the other is a current, non-custody-held canary with no malformed reservation or claim mirror, the controller can cancel the stale reservation with one conditioned metadata write and resume normal planning next tick. Other shapes keep the existing duplicate hold unless they satisfy the existing old-incarnation duplicate proof; the cause of the second canary is not established.
+
+- **A failed run stopped at the 64-head owed cap can release its custody hold ([#4481](https://github.com/vtmocanu/uzi/pull/4481), [#4508](https://github.com/vtmocanu/uzi/pull/4508)).**
+  The refused head is kept and recorded in a durable ledger under `info/uzi-refusals/`, and the existing held publication releases the hold only when a gate proves every refused head covered; runs that crossed a worker-process restart, an old worker or a legacy context keep the hold for the owner, and a run that filled the owed cap keeps it after a restart even if every refusal write failed (a write-once owed-path marker makes the gate require current-process admissions). A below-cap leftover import stage is cleaned up when its own finished import's head is independently anchored, a stage whose producer is unproven keeps the hold, a duplicate's stage is kept unless its refused ref is verified, and a retain no longer pins into a sealed generation. Known residual: a worker killed mid refusal cleanup leaves a running bare record that blocks later writes to that bare until operator intervention.
+
+- **An interactive run that times out or is stopped while waiting for a follow-up now finishes and publishes its work ([#4479](https://github.com/vtmocanu/uzi/pull/4479), [#4495](https://github.com/vtmocanu/uzi/pull/4495)).**
+  The worker moves the parked run back to running before it finalizes, so the branch and merge request are published instead of the run waiting forever; a follow-up sent while the run is finishing is refused with a clear message instead of being silently lost.
+
+- **A Codex run held for its recorded worker is nudged once at the affinity ceiling when a drain overlapped its stale-requeue grace ([#4507](https://github.com/vtmocanu/uzi/pull/4507), [#4534](https://github.com/vtmocanu/uzi/pull/4534)).**
+  The health detector now records an observed draining or maintenance owner hold per episode (runs.health_owner_hold_since); holds that start and clear between ticks, or whose marker write fails, keep the earlier stale-grace timing. Notification timing only.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -491,6 +521,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admins define hosted worker sizes on Admin → Workers ([#4213](https://github.com/vtmocanu/uzi/pull/4213), [#4501](https://github.com/vtmocanu/uzi/pull/4501)).**
   Admins can edit and reset the shipped sizes and add or remove their own (the table holds at most 16 sizes in total, the four shipped ones included); chart limit-range ceilings refuse oversize values, refusals show in Admin health, and `uzi worker list` and `uzi worker get` gain a SIZE column.
 
+- **The schedule modal previews what a fired schedule would use ([#3260](https://github.com/vtmocanu/uzi/pull/3260), [#4537](https://github.com/vtmocanu/uzi/pull/4537)).**
+  A live "If fired and claimed now" block shows the harness, model, effort and credential kind with the server's source and timing, plus subagent behavior, and own-schedule chips with no model pin append the predicted model; the preview never blocks Save, and a draft carries no timing so a new one-time schedule previews without the pre-fire hold.
+
+- **Owners can explicitly switch an eligible live Codex run's credential in place ([#4202](https://github.com/vtmocanu/uzi/pull/4202), [#4474](https://github.com/vtmocanu/uzi/pull/4474)).**
+  Choose a Codex subscription or OpenAI API-key label while keeping the worker and worktree; uncertain switches pause safely, and real cross-account conversation resume remains unproven pending owner acceptance with two accounts.
+
+- **Custom provider runs are activated for every install, with the Claude CLI redirect risk accepted ([#4505](https://github.com/vtmocanu/uzi/pull/4505), [#4551](https://github.com/vtmocanu/uzi/pull/4551)).**
+  Workers now advertise `claude_provider_v1` by default (no switch), so a run bound to a custom provider starts instead of queueing; the loopback relay that would stop redirects ([#4496](https://github.com/vtmocanu/uzi/pull/4496)) is parked. The pinned Claude CLI follows gateway redirects, so a gateway that answers with one can make the CLI re-send the key to another path on the same host under both auth styles and the request body (prompts, plus code and tool output the agent read) to any Location host, and with `x_api_key` auth the key goes cross-host too, while Bearer drops Authorization cross-origin. The operator allowlist (`UZI_PROVIDER_ALLOWED_BASE_URLS`) is the only control on where provider traffic starts, so allowlist only gateways you trust not to redirect and prefer Bearer auth. The worker redacts the provider key and its encoded forms from model, review and summary output, run and chat text, PR descriptions and other forge text, and blocks any forge upload (branch push, checkpoints, held publication) whose objects carry it, keeping the work local (`push_secret_blocked`); recovery-bundle uploads to the uzi API custody archive are not scanned, and a provider run whose new objects exceed the scan caps has checkpoints withheld and its final push refused. Rollout: the release helper bumps the chart's worker image pin, but operator image overrides and Compose or separately run workers must be updated by their operator; an old worker never claims a provider run, which stays queued with "no worker that supports model providers is online", and an old ephemeral worker bound to one is reaped and re-provisioned, with churn that is not bounded while an old image override remains. See ADR-4320 and docs/providers.md.
+
 ### Changed
 
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
@@ -667,6 +706,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A Codex run that has been claimed is held for the worker that last ran it ([#4476](https://github.com/vtmocanu/uzi/pull/4476), [#4500](https://github.com/vtmocanu/uzi/pull/4500)).**
   No fall-open path (stale-requeue grace, affinity ceiling, deleted worker, cross-check) offers it to another worker, and runs already at generation 1 or later at upgrade have no record, so they are held at their next fresh claim: cancel them with `uzi run cancel`. Run health shows "held for worker NAME" or "predecessor provenance unavailable", which now count as genuine waits for `queue.waiting` and `fleet.capacity`; a released worker still fenced by its registration nonce gets restart advice. Hibernation wakes recheck provenance before recording demand and release obsolete wake rows. Rolling the api back leaves claims ungated until re-upgrade.
 
+- **Sidebar icon animations play only when you click an icon ([#4556](https://github.com/vtmocanu/uzi/pull/4556), [#4557](https://github.com/vtmocanu/uzi/pull/4557)).**
+  Hovering or focusing a sidebar row no longer sets off animations; clicking it, or pressing Enter on it, still plays the one-shot animation.
+
 ### Security
 
 - **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
@@ -686,6 +728,14 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Agent dependencies include patched Hono packages (Refs #4378) ([#4381](https://github.com/vtmocanu/uzi/pull/4381)).**
   Update the transitive hono and @hono/node-server lockfile entries to 4.13.18 and 2.1.8, clearing their reported advisories.
+
+- **Codex native patch tools stay inert after cold resume ([#4509](https://github.com/vtmocanu/uzi/pull/4509), [#4526](https://github.com/vtmocanu/uzi/pull/4526)).**
+  App-server roots have no default local execution environment, explicitly disable native goals and preserve worker-owned edits; real-binary tests cover refusal and resource-helper behavior across restarts.
+
+### Removed
+
+- **The old Overview is retired ([#3877](https://github.com/vtmocanu/uzi/pull/3877), [#4553](https://github.com/vtmocanu/uzi/pull/4553)).**
+  `/overview/classic` now redirects to the Overview at `/dashboard`, keeping the query string and hash, and the "Back to the old Overview" link is gone.
 
 ## [0.86.1] - 2026-11-05
 

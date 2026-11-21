@@ -58,7 +58,7 @@ function harness(redactor: ((s: string) => string) | undefined = redact) {
   const lifecycle = new AbortController();
   const flight = { cancel: lifecycle, steering: { lifecycleSignal: () => lifecycle.signal }, runId: "diagnostics", runKind: "issue", barePath: "bare", branch: "branch", lastCheckpointRefTip: "OLD",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
-    reportedPublishOutcomes: new Set<string>(), redactText: redactor,
+    providerKeyForms: [], reportedPublishOutcomes: new Set<string>(), redactText: redactor,
     runLog: { ...nullLogger(), warn: (msg: string, fields: Record<string, unknown> = {}) => logs.push({ msg, fields }) },
     batcher: { emit: (event: unknown) => feed.push(event as typeof feed[number]) } };
   const publish = (signal?: AbortSignal) => seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, signal)

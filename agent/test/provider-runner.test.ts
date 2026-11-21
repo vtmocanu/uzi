@@ -54,6 +54,32 @@ describe("provider-bound issue run: redaction and the gateway-limit park", () =>
     }
   });
 
+  it("scrubs the escaped-slash JSON form and the percent-encoded form a gateway may echo", async () => {
+    const SLASH_KEY = ["gw", "key", "do-not-scan", "9191", "ab/cd/efgh"].join("-");
+    const jsonSlash = SLASH_KEY.replaceAll("/", "\\/");
+    const pct = encodeURIComponent(SLASH_KEY);
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-prov-enc-"));
+    try {
+      const { logger, added, removed } = secretRecordingLogger();
+      const claim = gitlabClaim(933, { secrets: { ...providerSecrets(), provider: { ...providerBinding(), credential: SLASH_KEY } } });
+      await runnerWith(factoryRunning(async (ctx) => {
+        ctx.emit({ kind: "status", agent: "lead", payload: { text: `body: {"key":"${jsonSlash}"} url=?k=${pct}` } });
+        throw new Error(`gateway rejected {"key":"${jsonSlash}"} k=${pct}`);
+      }, homeRoot), gitlab, undefined, logger).execute(claim);
+      const feed = JSON.stringify(api.messages(claim.run_id));
+      assert.ok(!feed.includes(jsonSlash) && !feed.includes(pct) && !feed.includes(SLASH_KEY), "no encoding of the key reaches a run message");
+      const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+      assert.ok(failed, "the run failed");
+      const reason = String(failed.failure_reason);
+      assert.ok(!reason.includes(jsonSlash) && !reason.includes(pct), "nor the failure reason");
+      assert.ok(added.includes(jsonSlash) && added.includes(pct), "every form was registered with the logger");
+      assert.deepEqual([...removed].sort(), [...added].sort(), "and each evicted symmetrically");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("a gateway limit parks as limit_wait with rate_limit_type provider_gateway_limit and NO limit_resets_at", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-prov-limit-"));

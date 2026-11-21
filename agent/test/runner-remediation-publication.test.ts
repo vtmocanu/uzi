@@ -55,7 +55,7 @@ async function fixture() {
   };
   const freshFlight = (): Flight => ({ runId: RUN, branch: BRANCH, barePath: bare, worktreePath: clone.path,
     runnerClone: clone, runLog: nullLogger(), batcher: { emit: () => {} }, claimGenerations: new Map(),
-    reportedPublishOutcomes: new Set(), claimGeneration: 1, runKind: "issue",
+    providerKeyForms: [], reportedPublishOutcomes: new Set(), claimGeneration: 1, runKind: "issue",
     cancel: new AbortController(), steering: { lifecycleSignal: () => new AbortController().signal } });
   await fetch();
   const enroll = async () => {

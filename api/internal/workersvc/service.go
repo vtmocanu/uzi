@@ -2266,6 +2266,9 @@ type Service struct {
 	// inserted in the open transaction, right before that transaction's COMMIT, on every
 	// transactional create path. Nil in production.
 	createBeforeCommitHook func(run store.Run)
+	// planCrossCheckAfterPreflightHook is a test-only seam in SubmitPlanCrossCheck: it runs right
+	// after the preflight transaction commits, before the checker child is created. Nil in production.
+	planCrossCheckAfterPreflightHook func()
 	// reconcileBeforeCommitHook is a test seam in reconcileRunMRGated (issue #4488): it runs after
 	// the gated ReconcileRunMR UPDATE, before that transaction's COMMIT. Nil in production.
 	reconcileBeforeCommitHook func(runID uuid.UUID)
@@ -4328,6 +4331,7 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	ExpectedEpoch *int64 `json:"expected_epoch,omitempty"`
 	// RegistrationEvidence (issue #3859, feature run_registration_evidence_v1) is the worker's own
 	// (claim_generation, register_nonce, registration epoch) on a `running` report. It is recorded
 	// BEFORE the status write and independently of whether that write applies, so a report a
@@ -4351,7 +4355,7 @@ type StateRequest struct {
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
-	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|credential_switch_uncertain|clarification_settled|completed|failed
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|credential_switch_uncertain|codex_switch_stopped|clarification_settled|completed|failed
 	// OpID is the credential-switch operation id (issue #4201, feature credential_switch_apply_v1)
 	// the credential_switch_failed, credential_switch_held and credential_switch_uncertain reports
 	// are fenced to. Optional on the first two (absent keeps the pre-#4201 unfenced behaviour),
@@ -4794,6 +4798,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 
 // setStateWithTx receives the actual parent transaction only from the claim-locked facade.
 func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, parentTx pgx.Tx) (run store.Run, applied bool, err error) {
+	if req.State == stateCodexSwitchStopped {
+		return s.stopCodexSwitch(ctx, wkr, runID, req)
+	}
+	if req.ExpectedEpoch != nil {
+		return store.Run{}, false, fmt.Errorf("%w: expected_epoch requires codex_switch_stopped", ErrInvalidState)
+	}
 	if err := validateRevisionRetry(req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -6706,7 +6716,10 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 // inPlaceSwitchDrains reports whether a pending credential switch leaves the worker's /inputs
 // draining normally: the worker registered the in-place capability AND uses the receipts path
 // (the only drain that is a read-only replay, so a drain the worker never applies loses nothing).
-func inPlaceSwitchDrains(wkr store.Worker) bool {
+func inPlaceSwitchDrains(wkr store.Worker, harness string) bool {
+	if harness == harnessCodex {
+		return codexSwitchNegotiated(wkr) && slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1)
+	}
 	return slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1)
 }
@@ -6722,7 +6735,7 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 		}}, nil
 	}
 	sig := PendingCredentialSwitchSignal(run)
-	if sig != nil && !inPlaceSwitchDrains(wkr) {
+	if sig != nil && !inPlaceSwitchDrains(wkr, run.Harness) {
 		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
 		return ConsumeInputsResult{CredentialSwitch: sig}, nil
 	}

@@ -2971,7 +2971,7 @@ applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 
 has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
 (`use --none` only clears the selection, so it succeeds even with the feature off).
 `--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
-"unknown (custom provider)". Runs through a provider are currently blocked and stay queued; see [Model providers](./providers.md).
+"unknown (custom provider)". Runs start on workers that advertise `claude_provider_v1`; an older worker leaves them queued ("no worker that supports model providers is online"). See [Model providers](./providers.md).
 
 ## Anthropic tokens
 
@@ -4303,8 +4303,7 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   again; `hold_reason: provider_binding_stale` means the provider's key or revision changed
   after the run was created, so it cannot continue. `run get` prints a `HOLD` row reading
   `provider URL not allowed` or `provider binding changed`; `run logs --follow` and `run wait`
-  name the next step (wait, or `uzi run cancel` and start a new run). No worker claims a provider
-  run yet (activation is blocked), so these holds cannot occur until it lands. `run resume` is refused with a 409 for both, and neither
+  name the next step (wait, or `uzi run cancel` and start a new run). `run resume` is refused with a 409 for both, and neither
   falls back to an Anthropic token. See [Model providers](./providers.md#what-a-run-keeps).
   A `paused` run can also be **waiting because your credentials were reset**
   (`hold_reason: credentials_reset`): a Claude or chat run created before an
@@ -4339,8 +4338,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   If the worker cannot prove whether that switch took effect, the run is
   `paused` with no hold reason and a `credential_switch_uncertain` message in
   the run feed (posted by the worker):
-  `uzi run resume <id>` re-resolves the token from the run's current choice
-  and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
+  On Claude, `uzi run resume <id>` re-resolves the token from the run's current
+  choice. Codex new claims use the database-committed binding; set-token refuses
+  paused Codex runs (422), and neither credential executes while unresolved. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced
@@ -4601,6 +4601,29 @@ uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
 
 Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
 
+### Codex live credential switch
+
+`uzi run set-token <run-id> <label>` selects an enabled owner-owned Codex
+subscription or OpenAI API-key label. Codex refuses `--auto`, `--default`
+and `--inherit`; it does not use Anthropic pool or binding selection.
+The web picker offers the same explicit choice. An ambiguous eligible label
+(two or more matching credentials, compared case-insensitively) is refused before anything is written; rename a
+credential in the web UI, since the CLI cannot rename, then retry. Running and worker-held
+awaiting_approval/input/followup runs switch at the next safe boundary.
+Claimed returns 409; queued and every park return 422, including worker-held
+limit_wait/recovery_wait. Policy episodes unresolved at request or apply
+refuse the switch; a busy refresh lease/intent asks you to retry.
+
+Success keeps worker, generation and worktree without an attempt, custody
+or reclaim transition. It attempts the saved session; confirmed provider
+refusal alone permits a fresh thread and lineage notice, subject to
+preservation holds. Unproven teardown keeps settling/unsettled custody.
+An uncertain apply pauses with `credential_switch_uncertain`, and neither
+credential executes until resolved. No release/reclaim fallback is added.
+Real cross-account provider acceptance is unproven; owner two-account
+acceptance remains pending and non-closing. See
+[Codex switch and recovery limits](codex-credentials.md#switching-a-live-run).
+
 ### Codex idle stalls
 
 `recovery_wait` / `codex_idle_stall` covers measured no-output and productive
@@ -4617,8 +4640,8 @@ It preserves lifetime recovery backoff, provider streak, session, affinity,
 worker recovery episode and requeue baseline, with ordinary claim-release and
 custody semantics. Timer promotion preserves the count and grants a fresh wall
 window too; the default can therefore buy three extra full wall windows.
-`set-token` can promote a timed park; a held park returns a named 409 requiring
-Resume first.
+Claude `set-token` can promote a timed park; a held park returns a named 409
+requiring Resume first. Codex `set-token` refuses these parks with 422.
 
 Default wait and log follow stop for a NULL-retry hold, continue through finite
 or unknown timing, and report finite-to-held changes within the same cause/status.

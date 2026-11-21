@@ -777,7 +777,7 @@ export function Providers() {
                       : "a provider that no longer exists"}
               </span>
             </p>
-            <p className="text-xs text-faint">Runs that use a provider wait in the queue until workers support providers.</p>
+            <p className="text-xs text-faint">Use only a gateway you trust not to redirect: a redirect can resend your prompts and code to another host, and your key to another path on the same host (or, with x-api-key auth, to another host). Bearer auth limits this. See the Model providers docs.</p>
           </div>
           {data.providers.length === 0 ? (
             <p className="text-sm text-muted">No providers yet.</p>
