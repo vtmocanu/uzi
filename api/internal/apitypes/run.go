@@ -228,6 +228,14 @@ type CreatedIssueDTO struct {
 	WebURL string `json:"web_url"`
 }
 
+// InjectedEnvVarDTO names one run environment variable the run's current claim delivered
+// (PRD #4416 M2): never a value, a hash or a version. Owner-only, detail read only.
+type InjectedEnvVarDTO struct {
+	Name   string `json:"name"`
+	Scope  string `json:"scope"`
+	Secret bool   `json:"secret"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
 	PolicyHold    *PolicyHoldDTO    `json:"policy_hold,omitempty"`
@@ -244,6 +252,9 @@ type RunDTO struct {
 	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
 	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
 	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
+	// InjectedEnv lists the run environment variables the current claim generation delivered:
+	// names, scope and the secret flag. Detail read, run owner only; never on the worker DTO.
+	InjectedEnv []InjectedEnvVarDTO `json:"injected_env,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for

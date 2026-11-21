@@ -393,8 +393,11 @@ const RecoveryRunOpenHoldsV1 = "recovery_run_open_holds_v1"
 const RecoveryTerminalPreservationV1 = "recovery_terminal_preservation_v1"
 
 // RunEnvV1 (PRD #4416 M2) negotiates run-scoped environment variables: a worker that reports it
-// receives secrets.run_env and secrets.run_env_redact on its claim and may call the redact
-// maintenance route. A worker that does not report it is never sent either field.
+// receives secrets.run_env and secrets.run_env_redact on its claim. A worker that does not report
+// it is never sent either field; a claim that has variables to deliver, or a secret receipt to
+// mask, is requeued instead. The redact maintenance route (GET /api/worker/runs/{id}/run-env-redact)
+// is served to any authenticated worker for the runs it holds or last held and does not check this
+// capability: a worker without it was never sent a value to mask.
 const RunEnvV1 = "run_env_v1"
 
 var protocolVocabulary = map[string]struct{}{

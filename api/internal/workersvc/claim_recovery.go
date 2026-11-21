@@ -75,7 +75,7 @@ type claimFinishQueries interface {
 	ParkRunOverrideUnavailableRun(ctx context.Context, arg store.ParkRunOverrideUnavailableRunParams) (int64, error)
 	InsertRunOverrideUnavailableMessage(ctx context.Context, arg store.InsertRunOverrideUnavailableMessageParams) (int32, error)
 	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
-	LockUserVaultStateForShareNowait(ctx context.Context, userID uuid.UUID) (store.LockUserVaultStateForShareNowaitRow, error)
+	LockUserVaultStateForKeyShareNowait(ctx context.Context, userID uuid.UUID) (store.LockUserVaultStateForKeyShareNowaitRow, error)
 	ListRunEnvEffectiveKeysForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvEffectiveKeysForRunRow, error)
 	ListRunEnvRedactKeysForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvRedactKeysForRunRow, error)
 	UpsertRunEnvReceipt(ctx context.Context, arg store.UpsertRunEnvReceiptParams) error
@@ -131,7 +131,7 @@ type claimTestHooks struct {
 	afterMint func(ctx context.Context, run store.Run)
 	// afterAssembly runs with assembleClaim's result, before finishRunClaim.
 	afterAssembly func(ctx context.Context, run store.Run, payload *ClaimPayload, err error)
-	// afterRunEnvLock runs inside finishRunClaimTx once the owner's users row is held FOR SHARE
+	// afterRunEnvLock runs inside finishRunClaimTx once the owner's users row is held FOR KEY SHARE
 	// (PRD #4416), before the recompute: the seam that proves a writer waits behind the finish.
 	afterRunEnvLock func(ctx context.Context, run store.Run)
 	// afterChatAssembly runs after a successful assembleChatClaim, before finishChatClaim.
@@ -389,23 +389,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", nil // superseded mint; never settle a newer claim's custody
 	}
 
-	// PRD #4416 M2: a lead-lane claim that carries a run-environment snapshot takes the owner's
-	// users row FOR SHARE NOWAIT (order worker -> run -> users, as in vault reset and recovery
-	// wait). A variable write, a vault mode change or any other users write holds the row, and
-	// 55P03 rolls the transaction back into finishRunClaim's bounded retry: the claim never
-	// waits, and never parks or fails because of the lock. Held until commit, it makes the
-	// recompute below see every committed variable write and holds the next one off until the
-	// receipts are committed. A claim that assembled with an error delivers nothing, so it takes
-	// no lock.
+	// A lead-lane claim whose assembly carries a run-environment snapshot takes the owner's
+	// users-row lock immediately before the recompute below (see checkRunEnv's lock).
 	runEnvLocked := assemblyErr == nil && payload != nil && payload.runEnv != nil
-	if runEnvLocked {
-		if _, err := q.LockUserVaultStateForShareNowait(ctx, locked.UserID); err != nil {
-			return nil, "", err
-		}
-		if h := s.claimHooks; h != nil && h.afterRunEnvLock != nil {
-			h.afterRunEnvLock(ctx, run)
-		}
-	}
 
 	holdClass := false
 	var authorityErr error
@@ -523,7 +509,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// a distinct non-terminal park that the authority rewrite and the hold class never touch.
 	var overrideErr *runOverrideUnavailableError
 	overrideUnavailable := !credDisabled && errors.As(assemblyErr, &overrideErr)
+	runEnvHistory := !credDisabled && !overrideUnavailable && errors.Is(assemblyErr, errRunEnvHistoryUnavailable)
 	if overrideUnavailable {
+		holdClass, transient = false, false
+	} else if runEnvHistory {
+		// PRD #4416: decided from assembly like the override park, before the lock-time
+		// authority rewrite below can turn it into a terminal credential failure.
 		holdClass, transient = false, false
 	} else if credDisabled {
 		// A distinct non-terminal outcome: never a transient requeue, never the account
@@ -543,12 +534,25 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			transient = false
 		}
 	}
-	// PRD #4416 M2: recompute both run-environment lists under the users-row lock and compare
+	// PRD #4416 M2: recompute both run-environment lists under the owner's users row and compare
 	// them with the assembly snapshot. Any change (create, rotation, delete, disable, enable), or
 	// a non-empty set on a worker without run_env_v1, returns the run to queued with nothing
 	// delivered; a receipted version that went missing parks it.
-	runEnvPark := errors.Is(decision, errRunEnvHistoryUnavailable)
+	//
+	// The lock is FOR KEY SHARE NOWAIT (order worker -> run -> users), taken as late as possible
+	// so nothing else locks after it, and held to commit: every run_env_vars writer, the account
+	// reset and the user delete lock the users row FOR UPDATE, which conflicts with it, so the
+	// recompute sees every committed variable write and the next one waits for the receipts. A
+	// plain update of a non-key users column does not conflict. 55P03 rolls the transaction back
+	// into finishRunClaim's bounded retry: the claim never waits, parks or fails on the lock.
+	runEnvPark := runEnvHistory || errors.Is(decision, errRunEnvHistoryUnavailable)
 	if decision == nil && runEnvLocked {
+		if _, err := q.LockUserVaultStateForKeyShareNowait(ctx, locked.UserID); err != nil {
+			return nil, "", err
+		}
+		if h := s.claimHooks; h != nil && h.afterRunEnvLock != nil {
+			h.afterRunEnvLock(ctx, run)
+		}
 		envDecision, err := checkRunEnv(ctx, q, locked, payload.runEnv)
 		if err != nil {
 			return nil, "", err

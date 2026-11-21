@@ -69,3 +69,26 @@ func TestHibernationAutoPassRunsBetweenSettleAndWake(t *testing.T) {
 		t.Fatal("worker_hibernation_auto must be listed after worker_hibernation_settle and before worker_hibernation_wake (issue #4207)")
 	}
 }
+
+// TestRunEnvRetiredSweepIsRegisteredNextToTerminalPreservation pins PRD #4416 M2: the retired-version
+// sweeper is registered, and sits right after terminal_preservation (the run-bound custody passes) and
+// before prerequisite_closure. A source-order scan of the inline pass slice in main.go, like its siblings.
+func TestRunEnvRetiredSweepIsRegisteredNextToTerminalPreservation(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	terminal := strings.Index(text, `Name: "terminal_preservation"`)
+	sweep := strings.Index(text, `Name: "run_env_retired_sweep"`)
+	closure := strings.Index(text, `Name: "prerequisite_closure"`)
+	if terminal < 0 || sweep < 0 || closure < 0 {
+		t.Fatalf("pass names not found in main.go (terminal %d, sweep %d, closure %d); update this test if they were renamed", terminal, sweep, closure)
+	}
+	if terminal >= sweep || sweep >= closure {
+		t.Fatal("run_env_retired_sweep must be listed after terminal_preservation and before prerequisite_closure (PRD #4416 M2)")
+	}
+	if strings.Count(text, `Name: "run_env_retired_sweep"`) != 1 {
+		t.Fatal("run_env_retired_sweep must be registered exactly once")
+	}
+}

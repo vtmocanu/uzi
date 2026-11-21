@@ -118,9 +118,9 @@ func (tx *scopedClaimTx) QueryRow(_ context.Context, sql string, args ...any) pg
 		return scopedClaimRow{err: pgx.ErrNoRows}
 	case "LockSecretEnablementForShareNowait":
 		return scopedClaimRow{value: false}
-	case "LockUserVaultStateForShareNowait":
+	case "LockUserVaultStateForKeyShareNowait":
 		// PRD #4416: a lead-lane claim finish share-locks the owner row; the fixture owner is unlocked.
-		return scopedClaimRow{value: store.LockUserVaultStateForShareNowaitRow{VaultMode: store.VaultModeUnprotected}}
+		return scopedClaimRow{value: store.LockUserVaultStateForKeyShareNowaitRow{VaultMode: store.VaultModeUnprotected}}
 	case "GetUserCredentialsResetAt":
 		// Scoped-claim fixture users have never redeemed a reset link (NULL marker).
 		return scopedClaimRow{value: pgtype.Timestamptz{}}

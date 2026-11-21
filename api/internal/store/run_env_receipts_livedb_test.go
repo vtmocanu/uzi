@@ -363,11 +363,11 @@ func TestRunEnvLaneFunctionLiveDB(t *testing.T) {
 	}
 }
 
-func TestLockUserVaultStateForShareNowaitLiveDB(t *testing.T) {
+func TestLockUserVaultStateForKeyShareNowaitLiveDB(t *testing.T) {
 	ctx := context.Background()
 	pool, q := envRunDB(t)
 	user := cjSeedUser(t, pool, nil)
-	st, err := q.LockUserVaultStateForShareNowait(ctx, user)
+	st, err := q.LockUserVaultStateForKeyShareNowait(ctx, user)
 	if err != nil || st.VaultMode == "" {
 		t.Fatalf("lock vault state = %+v, %v", st, err)
 	}
@@ -380,7 +380,7 @@ func TestLockUserVaultStateForShareNowaitLiveDB(t *testing.T) {
 	if _, err := tx.Exec(ctx, `SELECT 1 FROM users WHERE id=$1 FOR UPDATE`, user); err != nil {
 		t.Fatal(err)
 	}
-	_, err = q.LockUserVaultStateForShareNowait(ctx, user)
+	_, err = q.LockUserVaultStateForKeyShareNowait(ctx, user)
 	wantConstraint(t, err, "55P03", "")
 }
 
@@ -412,6 +412,108 @@ func TestParkRunEnvHistoryUnavailableRunLiveDB(t *testing.T) {
 	}
 	if n, err := q.ParkRunEnvHistoryUnavailableRun(ctx, params); err != nil || n != 0 {
 		t.Fatalf("a second park of the released claim changed %d rows, %v", n, err)
+	}
+}
+
+// A park that restores a consumed Fresh grant leaves policy_pending_fresh true; the owner's
+// Resume of the run_env_history_unavailable hold must still requeue it (ResumePausedRun admits
+// the hold the way it admits run_override_unavailable). Without the exception the resume
+// matches no row and the run is stuck.
+func TestResumeRunEnvHistoryUnavailableWithConsumedFreshGrantLiveDB(t *testing.T) {
+	ctx := context.Background()
+	pool, q := envRunDB(t)
+	user := cjSeedUser(t, pool, nil)
+	s := seedEnvRepo(t, pool, user)
+	run := seedEnvRun(t, pool, user, s.repo)
+	worker := uuid.New()
+	cjExec(t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')`, worker, user, worker.String(), worker[:])
+	cjExec(t, pool, `UPDATE runs SET status='claimed', worker_id=$2, claim_generation=2, claim_released_at=NULL,
+ started_at=now(), policy_outcome_id=$3, policy_continuation_mode='same_conversation', policy_applying_worker_id=$2,
+ policy_applying_generation=1, policy_source_generation=1, policy_resolved_at=now(), policy_preserve_required=true,
+ policy_fresh_consumed_generation=2 WHERE id=$1`, run, worker, uuid.New())
+
+	params := ParkRunEnvHistoryUnavailableRunParams{ID: run, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 2}
+	if n, err := q.ParkRunEnvHistoryUnavailableRun(ctx, params); err != nil || n != 1 {
+		t.Fatalf("park = %d, %v", n, err)
+	}
+	var pending bool
+	if err := pool.QueryRow(ctx, `SELECT policy_pending_fresh FROM runs WHERE id=$1`, run).Scan(&pending); err != nil || !pending {
+		t.Fatalf("the park must restore the consumed Fresh grant: pending=%v err=%v", pending, err)
+	}
+	row, err := q.ResumePausedRun(ctx, ResumePausedRunParams{ID: run, UserID: user, GlobalTimeoutSeconds: 3600})
+	if err != nil {
+		t.Fatalf("owner resume of a run_env_history_unavailable hold with a pending Fresh grant: %v", err)
+	}
+	if row.Status != "queued" {
+		t.Fatalf("resumed status = %s; want queued", row.Status)
+	}
+	var stillPending bool
+	if err := pool.QueryRow(ctx, `SELECT policy_pending_fresh FROM runs WHERE id=$1`, run).Scan(&stillPending); err != nil || !stillPending {
+		t.Fatalf("the resume must leave the grant pending for the next claim: %v %v", stillPending, err)
+	}
+	// An ordinary hold with a pending grant stays refused.
+	cjExec(t, pool, `UPDATE runs SET status='paused', hold_reason='manual' WHERE id=$1`, run)
+	if _, err := q.ResumePausedRun(ctx, ResumePausedRunParams{ID: run, UserID: user, GlobalTimeoutSeconds: 3600}); err == nil {
+		t.Fatal("a pending Fresh grant on another hold must still block the resume")
+	}
+}
+
+// A run_env_vars row of another owner on the run's own repo is neither delivered nor
+// redacted: the reads join on the run's owner.
+func TestRunEnvForeignOwnerRowOnOwnRepoIsExcludedLiveDB(t *testing.T) {
+	ctx := context.Background()
+	pool, q := envRunDB(t)
+	user, foreign := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
+	s := seedEnvRepo(t, pool, user)
+	run := seedEnvRun(t, pool, user, s.repo)
+	liveForeign, retiredForeign := uuid.New(), uuid.New()
+	if err := envInsert(pool, foreign, s.repo, "FOREIGN_LIVE", true, 1, liveForeign, "live"); err != nil {
+		t.Fatal(err)
+	}
+	if err := envInsert(pool, foreign, s.repo, "FOREIGN_RETIRED", true, 1, retiredForeign, "retired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := envInsert(pool, user, s.repo, "MINE", true, 1, uuid.New(), "live"); err != nil {
+		t.Fatal(err)
+	}
+	eff, err := q.ListRunEnvEffectiveForRun(ctx, run)
+	if err != nil || len(eff) != 1 || eff[0].Name != "MINE" {
+		t.Fatalf("effective = %+v, %v; want only MINE", eff, err)
+	}
+	keys, err := q.ListRunEnvEffectiveKeysForRun(ctx, run)
+	if err != nil || len(keys) != 1 || keys[0].Name != "MINE" {
+		t.Fatalf("effective keys = %+v, %v; want only MINE", keys, err)
+	}
+	// A receipt of the run naming the foreign retired version: the owner's rows do not hold it.
+	if err := q.UpsertRunEnvReceipt(ctx, UpsertRunEnvReceiptParams{RunID: run, UserID: user, VarID: retiredForeign, Rev: 1, Scope: "repo", Name: "FOREIGN_RETIRED", Secret: true, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	red, err := q.ListRunEnvRedactForRun(ctx, run)
+	if err != nil || len(red) != 1 || red[0].RowID.Valid || red[0].Ciphertext != nil {
+		t.Fatalf("redact = %+v, %v; want one receipt row with NULL row columns (missing)", red, err)
+	}
+	rk, err := q.ListRunEnvRedactKeysForRun(ctx, run)
+	if err != nil || len(rk) != 1 || rk[0].Present {
+		t.Fatalf("redact keys = %+v, %v; want present=false", rk, err)
+	}
+}
+
+// FOR KEY SHARE does not conflict with a plain update of a non-key users column, so a
+// concurrent settings write never fails the claim finish with 55P03.
+func TestLockUserVaultStateKeyShareIgnoresPlainUserUpdateLiveDB(t *testing.T) {
+	ctx := context.Background()
+	pool, q := envRunDB(t)
+	user := cjSeedUser(t, pool, nil)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE users SET default_effort='low' WHERE id=$1`, user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.LockUserVaultStateForKeyShareNowait(ctx, user); err != nil {
+		t.Fatalf("a plain non-key UPDATE of the users row must not block the key-share lock: %v", err)
 	}
 }
 
