@@ -28,7 +28,7 @@
 const REDACTED = "***REDACTED***";
 // Matches log.ts SecretRegistry: don't blanket-replace short strings whose
 // occurrence elsewhere would corrupt unrelated output.
-const MIN_SECRET_LEN = 8;
+export const MIN_SECRET_LEN = 8;
 
 // An ANSI CSI escape sequence, or one control (Cc) / format (Cf) character: what a terminal
 // renderer deletes or interprets without printing, so text either side of it reads as adjacent.

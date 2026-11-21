@@ -1189,6 +1189,40 @@ export interface ClaimSecrets {
    *  omit it (not null, not empty) so their wire is byte-identical. Types only here: decoding the
    *  exclusivity and building the SDK env from it is a later milestone. See {@link ClaimProviderBinding}. */
   provider?: ClaimProviderBinding;
+  /** Run-scoped environment variables (PRD #4416 M2). Present ONLY for a worker that advertises
+   *  run_env_v1 and a run that has variables; otherwise the key is absent (not null, not empty), so
+   *  a claim without variables is byte-identical to today's wire. Plaintext: never logged, never
+   *  persisted. Decode with decodeRunEnvClaim (run-env-claim.ts), which fails closed. */
+  run_env?: ClaimRunEnvVar[];
+  /** Secret value versions for redaction only; same presence and handling rules as `run_env`. */
+  run_env_redact?: ClaimRunEnvRedact[];
+}
+
+/** One resolved run environment variable on a claim (api workersvc.ClaimRunEnvVar). */
+export interface ClaimRunEnvVar {
+  var_id: string;
+  scope: "repo" | "user";
+  rev: number;
+  name: string;
+  value: string;
+  secret: boolean;
+  description: string;
+}
+
+/** One secret value version for redaction only (api workersvc.ClaimRunEnvRedact). */
+export interface ClaimRunEnvRedact {
+  var_id: string;
+  scope: "repo" | "user";
+  rev: number;
+  name: string;
+  value: string;
+}
+
+/** Body of the run-env redact maintenance endpoint (api workersvc.RunEnvRedactResponse). When
+ *  `protected` is false there are no versions. */
+export interface RunEnvRedactResponse {
+  protected: boolean;
+  versions?: ClaimRunEnvRedact[];
 }
 
 /** One mapped gateway model of a provider's model map: the gateway model name and an optional

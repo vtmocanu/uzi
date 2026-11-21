@@ -10,30 +10,158 @@ export const RUN_ENV_HARNESS_VERSIONS = {
   codex: "0.167.0",
 } as const;
 
+/** The worker invariants a denylist entry protects (fixtures/run-env/name-rules.json "invariants"). */
+export type RunEnvInvariant =
+  | "worker_credentials"
+  | "provider_auth"
+  | "harness_control"
+  | "git_authority"
+  | "managed_dirs"
+  | "network_wiring"
+  | "process_loader"
+  | "shell_semantics";
+
+/** One denylist entry. Only `value` takes part in matching. */
+export interface RunEnvDeniedRule {
+  readonly value: string;
+  readonly invariant: RunEnvInvariant;
+  readonly note: string;
+}
+
 /** Exact names a variable may not use. */
-export const RUN_ENV_DENIED_NAMES: readonly string[] = [
-  "HOME", "PATH", "TMPDIR", "LANG", "SHELL", "ENV", "IFS", "PS4", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS",
-  "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "BUILDKIT_HOST",
-  "GOMAXPROCS", "GOFLAGS", "GOTMPDIR", "GOMODCACHE", "GOCACHE", "GOPROXY", "GOSUMDB", "GOENV", "GOTOOLCHAIN",
-  "NPM_CONFIG_CACHE", "npm_config_cache",
-  "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
-  "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
-  "CURL_HOME", "NETRC", "WGETRC", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "RUBYOPT",
-  "AGENT_BROWSER_ARGS", "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH",
-  "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-  "UZI_SQLC_DIR", "UZI_RUN_ATTEMPT", "UZI_RUN_CLONE", "UZI_RUN_CLONE_KEY", "UZI_WORKER_SPAWN",
-  "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
-  "API_TIMEOUT_MS", "MAX_THINKING_TOKENS", "MAX_MCP_OUTPUT_TOKENS",
+export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
+  { value: "HOME", invariant: "managed_dirs", note: "home directory the worker manages for the run" },
+  { value: "PATH", invariant: "process_loader", note: "command lookup path the worker controls" },
+  { value: "TMPDIR", invariant: "managed_dirs", note: "temporary directory the worker manages" },
+  { value: "LANG", invariant: "shell_semantics", note: "locale of the commands the worker runs" },
+  { value: "SHELL", invariant: "shell_semantics", note: "shell the agent harness spawns" },
+  { value: "ENV", invariant: "shell_semantics", note: "POSIX shell startup file" },
+  { value: "IFS", invariant: "shell_semantics", note: "shell field separator" },
+  { value: "PS4", invariant: "shell_semantics", note: "shell trace prompt, expanded by the shell" },
+  { value: "PROMPT_COMMAND", invariant: "shell_semantics", note: "bash command run before each prompt" },
+  { value: "SHELLOPTS", invariant: "shell_semantics", note: "bash options applied to every shell" },
+  { value: "BASHOPTS", invariant: "shell_semantics", note: "bash options applied to every shell" },
+  { value: "DOCKER_HOST", invariant: "network_wiring", note: "Docker endpoint the worker provisions" },
+  { value: "DOCKER_CONFIG", invariant: "network_wiring", note: "Docker client config and credentials the worker provisions" },
+  { value: "DOCKER_CONTEXT", invariant: "network_wiring", note: "Docker endpoint selection" },
+  { value: "DOCKER_TLS_VERIFY", invariant: "network_wiring", note: "Docker endpoint TLS wiring" },
+  { value: "DOCKER_CERT_PATH", invariant: "network_wiring", note: "Docker endpoint TLS wiring" },
+  { value: "BUILDKIT_HOST", invariant: "network_wiring", note: "BuildKit endpoint the worker provisions" },
+  { value: "GOMAXPROCS", invariant: "harness_control", note: "CPU budget the worker sets for Go processes" },
+  { value: "GOFLAGS", invariant: "harness_control", note: "Go build flags the worker sets" },
+  { value: "GOTMPDIR", invariant: "managed_dirs", note: "Go temporary directory the worker manages" },
+  { value: "GOMODCACHE", invariant: "managed_dirs", note: "Go module cache the worker manages" },
+  { value: "GOCACHE", invariant: "managed_dirs", note: "Go build cache the worker manages" },
+  { value: "GOPROXY", invariant: "network_wiring", note: "Go module download routing" },
+  { value: "GOSUMDB", invariant: "network_wiring", note: "Go checksum database routing" },
+  { value: "GOENV", invariant: "managed_dirs", note: "Go environment file location" },
+  { value: "GOTOOLCHAIN", invariant: "process_loader", note: "Go toolchain selection and download" },
+  { value: "NPM_CONFIG_CACHE", invariant: "managed_dirs", note: "npm cache directory the worker manages" },
+  { value: "npm_config_cache", invariant: "managed_dirs", note: "npm cache directory the worker manages" },
+  { value: "NODE_OPTIONS", invariant: "process_loader", note: "Node runtime flags applied to every Node process, harness included" },
+  { value: "NODE_PATH", invariant: "process_loader", note: "Node module resolution path" },
+  { value: "NODE_EXTRA_CA_CERTS", invariant: "network_wiring", note: "extra trust roots for every Node process" },
+  { value: "NODE_TLS_REJECT_UNAUTHORIZED", invariant: "network_wiring", note: "disables TLS verification for every Node process" },
+  { value: "JAVA_TOOL_OPTIONS", invariant: "process_loader", note: "JVM flags applied to every JVM" },
+  { value: "_JAVA_OPTIONS", invariant: "process_loader", note: "JVM flags applied to every JVM" },
+  { value: "JDK_JAVA_OPTIONS", invariant: "process_loader", note: "JVM flags applied by the java launcher" },
+  { value: "CURL_HOME", invariant: "managed_dirs", note: "curl config directory" },
+  { value: "NETRC", invariant: "git_authority", note: "netrc file carries forge credentials" },
+  { value: "WGETRC", invariant: "network_wiring", note: "wget config can set proxies and certificates" },
+  { value: "CURL_CA_BUNDLE", invariant: "network_wiring", note: "trust roots for curl" },
+  { value: "REQUESTS_CA_BUNDLE", invariant: "network_wiring", note: "trust roots for Python requests" },
+  { value: "RUBYOPT", invariant: "process_loader", note: "Ruby flags applied to every Ruby process" },
+  { value: "AGENT_BROWSER_ARGS", invariant: "harness_control", note: "browser launch arguments of the agent browser tool" },
+  { value: "AGENT_BROWSER_EXECUTABLE_PATH", invariant: "harness_control", note: "browser binary of the agent browser tool" },
+  { value: "CHROME_PATH", invariant: "harness_control", note: "browser binary used by the agent browser tool" },
+  { value: "CLAUDE_CODE_OAUTH_TOKEN", invariant: "worker_credentials", note: "Anthropic subscription token the worker injects" },
+  { value: "ANTHROPIC_API_KEY", invariant: "provider_auth", note: "Anthropic API credential" },
+  { value: "ANTHROPIC_AUTH_TOKEN", invariant: "provider_auth", note: "Anthropic gateway credential" },
+  { value: "UZI_SQLC_DIR", invariant: "harness_control", note: "worker-managed sqlc location" },
+  { value: "UZI_RUN_ATTEMPT", invariant: "harness_control", note: "worker-managed run attempt identity" },
+  { value: "UZI_RUN_CLONE", invariant: "harness_control", note: "worker-managed run clone path" },
+  { value: "UZI_RUN_CLONE_KEY", invariant: "harness_control", note: "worker-managed run clone identity" },
+  { value: "UZI_WORKER_SPAWN", invariant: "harness_control", note: "worker-managed spawn marker" },
+  { value: "GIT_CONFIG_COUNT", invariant: "git_authority", note: "git config injection" },
+  { value: "GIT_CONFIG_PARAMETERS", invariant: "git_authority", note: "git config injection" },
+  { value: "API_TIMEOUT_MS", invariant: "harness_control", note: "request timeout of the Claude CLI" },
+  { value: "MAX_THINKING_TOKENS", invariant: "harness_control", note: "thinking budget of the Claude CLI" },
+  { value: "MAX_MCP_OUTPUT_TOKENS", invariant: "harness_control", note: "tool output bound of the Claude CLI" },
+  { value: "NODE_REPL_EXTERNAL_MODULE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_CHANNEL_FD", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_CHANNEL_SERIALIZATION_MODE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_UNIQUE_ID", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_PRESERVE_SYMLINKS", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_PRESERVE_SYMLINKS_MAIN", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_ICU_DATA", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_COMPILE_CACHE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_COMPILE_CACHE_PORTABLE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_DISABLE_COMPILE_CACHE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "OPENSSL_CONF", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "OPENSSL_CONF_INCLUDE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "OPENSSL_ENGINES", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "OPENSSL_MODULES", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "UV_THREADPOOL_SIZE", invariant: "process_loader", note: "Node or OpenSSL runtime loader or startup control" },
+  { value: "NODE_DEBUG", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "NODE_DEBUG_NATIVE", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "NODE_V8_COVERAGE", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "NODE_REDIRECT_WARNINGS", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "NODE_PENDING_DEPRECATION", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "OTEL_LOG_RAW_API_BODIES", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "OTEL_LOG_TOOL_CONTENT", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "BETA_TRACING_ENDPOINT", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "SESSION_INGRESS_URL", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "SDK_NATIVE_BIN", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "AUTOMODE_DECISION_LOG", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "SRT_DEBUG", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "DEBUG_AUTH", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "API_FORCE_IDLE_TIMEOUT", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "SLASH_COMMAND_TOOL_CHAR_BUDGET", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "ENABLE_CLAUDEAI_MCP_SERVERS", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "ENABLE_TOOL_SEARCH", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "ENABLE_ENHANCED_TELEMETRY_BETA", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "IS_SANDBOX", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "COMPUTER_USE_SWIFT_NODE_PATH", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "DS_CHROMIUM_PATH", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "NODE_USE_ENV_PROXY", invariant: "network_wiring", note: "TLS or proxy behavior of the Node runtime" },
+  { value: "NODE_USE_SYSTEM_CA", invariant: "network_wiring", note: "TLS or proxy behavior of the Node runtime" },
+  { value: "SSLKEYLOGFILE", invariant: "network_wiring", note: "would log the TLS keys of the worker's provider traffic" },
 ];
 
-export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [
-  "UZI_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_",
-  "GH_", "GITHUB_", "GITLAB_", "GLAB_",
-  "GIT_", "SSH_",
-  "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
+/** Name prefixes reserved for the worker and the agent harnesses. */
+export const RUN_ENV_DENIED_PREFIXES: readonly RunEnvDeniedRule[] = [
+  { value: "UZI_", invariant: "worker_credentials", note: "worker and run control plane" },
+  { value: "CLAUDE_", invariant: "harness_control", note: "Claude CLI settings, including provider selectors" },
+  { value: "ANTHROPIC_", invariant: "provider_auth", note: "Anthropic provider configuration and credentials" },
+  { value: "CODEX_", invariant: "provider_auth", note: "Codex runtime settings and credentials" },
+  { value: "OPENAI_", invariant: "provider_auth", note: "OpenAI provider configuration and credentials" },
+  { value: "MCP_", invariant: "harness_control", note: "MCP tool settings of the harness" },
+  { value: "DISABLE_", invariant: "harness_control", note: "feature switches read by the Claude CLI" },
+  { value: "GH_", invariant: "git_authority", note: "GitHub CLI authority" },
+  { value: "GITHUB_", invariant: "git_authority", note: "GitHub forge authority" },
+  { value: "GITLAB_", invariant: "git_authority", note: "GitLab forge authority" },
+  { value: "GLAB_", invariant: "git_authority", note: "GitLab CLI authority" },
+  { value: "GIT_", invariant: "git_authority", note: "git behavior and credentials" },
+  { value: "SSH_", invariant: "git_authority", note: "ssh agent and transport authority" },
+  { value: "LD_", invariant: "process_loader", note: "dynamic loader injection" },
+  { value: "DYLD_", invariant: "process_loader", note: "dynamic loader injection" },
+  { value: "BASH_", invariant: "shell_semantics", note: "bash startup and function import" },
+  { value: "XDG_", invariant: "managed_dirs", note: "XDG base directories the worker manages" },
+  { value: "SSL_CERT_", invariant: "network_wiring", note: "OpenSSL trust roots" },
+  { value: "PYTHON", invariant: "process_loader", note: "Python interpreter startup and path" },
+  { value: "PERL5", invariant: "process_loader", note: "Perl module path and options" },
+  { value: "NIX_", invariant: "process_loader", note: "Nix toolchain wiring" },
+  { value: "DEVBOX_", invariant: "process_loader", note: "Devbox toolchain wiring" },
+  { value: "BUN_", invariant: "harness_control", note: "Bun runtime controls (BUN_CONFIG_VERBOSE_FETCH prints request headers, BUN_BE_BUN, BUN_OPTIONS, BUN_INSPECT)" },
+  { value: "CCR_", invariant: "harness_control", note: "Claude CLI internal controls (CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR is auth)" },
+  { value: "SELF_HOSTED_RUNNER_", invariant: "harness_control", note: "Claude CLI internal controls" },
+  { value: "BUGHUNTER_", invariant: "harness_control", note: "Claude CLI internal controls" },
 ];
 
-export const RUN_ENV_DENIED_SUFFIXES: readonly string[] = ["_PROXY"];
+/** Name suffixes that change network routing. */
+export const RUN_ENV_DENIED_SUFFIXES: readonly RunEnvDeniedRule[] = [
+  { value: "_PROXY", invariant: "network_wiring", note: "names ending in it change network routing" },
+];
 
 /** The shape of a variable name. */
 const RUN_ENV_NAME_REGEXP = /^[A-Z_][A-Z0-9_]{0,127}$/;
@@ -45,15 +173,15 @@ export function runEnvNameViolation(name: string): string | null {
   if (!RUN_ENV_NAME_REGEXP.test(name)) {
     return "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)";
   }
-  if (RUN_ENV_DENIED_NAMES.includes(name)) {
+  if (RUN_ENV_DENIED_NAMES.some((r) => r.value === name)) {
     return `${name} is set or reserved by the worker (denied name)`;
   }
-  for (const p of RUN_ENV_DENIED_PREFIXES) {
+  for (const { value: p } of RUN_ENV_DENIED_PREFIXES) {
     if (name.startsWith(p)) {
       return `denied prefix ${p}: names starting with it are reserved for the worker and the agent harness`;
     }
   }
-  for (const s of RUN_ENV_DENIED_SUFFIXES) {
+  for (const { value: s } of RUN_ENV_DENIED_SUFFIXES) {
     if (name.endsWith(s)) {
       return `denied suffix ${s}: names ending in it change network routing and are reserved`;
     }
