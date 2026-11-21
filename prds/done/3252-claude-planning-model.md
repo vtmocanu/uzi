@@ -2,7 +2,7 @@
 
 **Issue:** #3252
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r3 2026-10-21 (child Q-claude of epic #1703; r1 was the single Q draft). Anchors pinned to origin/main `522aab1ba`; no file cited here changed between a50b0366c and 522aab1ba (checked with `git diff --name-only`).\
+**Status:** Done (implemented 2026-11-21; was Draft r3 2026-10-21) (child Q-claude of epic #1703; r1 was the single Q draft). Anchors pinned to origin/main `522aab1ba`; no file cited here changed between a50b0366c and 522aab1ba (checked with `git diff --name-only`).\
 **Implementation:** Implemented 2026-11-21 on branch agent/issue-3252 (M1 and M2); pending exact-head CI. Landing-time notes are in D19.
 **Priority:** `priority::normal`.
 **Parent:** #1703.
