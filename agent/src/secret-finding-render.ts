@@ -21,6 +21,7 @@
 //     miss a token shape it does not know and can withhold an odd but innocent name; the gitleaks
 //     text scan of the path list is the backstop, not this function.
 import type { SecretFinding } from "./secret-scan-guard.js";
+import { RUN_ENV_NAME_REGEXP } from "./run-env-names.js";
 
 export interface RenderSecretFindingOpts {
   /** The run's text redactor (`makeTextRedactor`): a path it changes carries a run secret. */
@@ -174,7 +175,11 @@ export function renderSecretFinding(
     Number.isSafeInteger(f.startLine) && f.startLine >= 0
       ? String(f.startLine)
       : "?";
-  return `${commit} ${renderPath(f.file, opts)}:${line} (rule ${rule})`;
+  // The run-env exact-value scan names the variable (a validated environment-variable name, never a
+  // value) so a user who chose a common word as a secret sees why the work was held.
+  const variable =
+    typeof f.variable === "string" && RUN_ENV_NAME_REGEXP.test(f.variable) ? ` variable ${f.variable}` : "";
+  return `${commit} ${renderPath(f.file, opts)}:${line} (rule ${rule}${variable})`;
 }
 
 /** The distinct, validated rule ids of the findings (first `max`), comma-joined; an invalid id renders `[rule withheld]`. */

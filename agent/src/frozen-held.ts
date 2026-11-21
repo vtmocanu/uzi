@@ -1,6 +1,7 @@
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { CheckpointRange, GitCache } from "./git.js";
 import { flagCIConfigPathsRaw } from "./ci-config-guard.js";
+import type { RunEnvFormsResolution } from "./run-env-scan.js";
 
 /** Authenticated at freeze. No paths or finding text are needed to retain a remediation hold. */
 export interface FrozenHeldPolicy {
@@ -45,6 +46,10 @@ type FrozenHeldInput = {
   deadlineMs: number; maxBytes?: number; defaultBranch?: string;
   /** The encoded forms of the run's provider key; `[]` for a vendor run or a caller with no claim. */
   literals: readonly string[];
+  /** PRD #4416: the run-env exact-value forms to search (`forms`), or `withhold` when no trustworthy form
+   *  source exists (the maintenance endpoint failed): then nothing is packed. Absent only for a caller
+   *  with no run-env wiring (tests). Empty `forms` is a run that holds no secret variable. */
+  runEnv?: RunEnvFormsResolution;
   onScan?: (scan: Awaited<ReturnType<HeldGit["secretScanCheckpointRange"]>>) => void;
   remediationHold?: () => Promise<boolean>;
   ciHold?: () => Promise<"clear" | "blocked" | "unknown">;
@@ -122,7 +127,14 @@ async function prepareOverRange(input: FrozenHeldInput, range: CheckpointRange, 
   };
   // A provider-bound policy with no key forms to scan for cannot prove the range clean: the work stays local.
   if (policy.providerKeyScan === true && input.literals.length === 0) return { reason: "scan_untrusted" };
-  const scan = await git.secretScanCheckpointRange(barePath, range, { deadlineMs: deadlineMs(), literals: input.literals });
+  // PRD #4416: an unavailable form source withholds; the scan below is bound to the SAME tip the pack
+  // will carry (the pinned pack is also checked against `sourceSha` further down).
+  if (input.runEnv?.kind === "withhold") return { reason: "run_env_unavailable" };
+  const runEnvVars = input.runEnv?.kind === "forms" ? input.runEnv.vars : [];
+  if (runEnvVars.length > 0 && range.tipSha !== sourceSha) return { reason: "run_env_candidate_mismatch" };
+  const scan = await git.secretScanCheckpointRange(barePath, range, {
+    deadlineMs: deadlineMs(), literals: input.literals, ...(runEnvVars.length > 0 ? { runEnv: runEnvVars } : {}),
+  });
   check();
   input.onScan?.(scan);
   check();

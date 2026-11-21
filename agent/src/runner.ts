@@ -151,7 +151,8 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { claimRunEnv, deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { claimRunEnvSecretForms } from "./run-env-forms.js";
+import { claimRunEnvNamedForms, claimRunEnvSecretForms, type RunEnvNamedForms } from "./run-env-forms.js";
+import { runEnvFormsFor, runEnvPatchHits, sameScannedCandidate, scanRunEnvRange, type RunEnvFormsResolution, type ScannedRange } from "./run-env-scan.js";
 import { RecoveryCoordinator, PredecessorAuthorityLost, restorePredecessorHolds, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryCloneKey, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
@@ -985,6 +986,22 @@ class ProviderKeyBlockedError extends SecretRemediationPendingError {
 /** The run's provider key forms, `[]` for a vendor run. `RunFlight.providerKeyForms` is required and buildFlight
  *  always sets it; the `?? []` only tolerates the partial flights hand-built by unit tests, which are never provider-bound. */
 const keyFormsOf = (flight: Pick<RunFlight, "providerKeyForms">): readonly string[] => flight.providerKeyForms ?? [];
+
+/** The exact-value scan (PRD #4416) found a registered form of a run-env secret in (or could not clear)
+ *  the objects about to be published. Like {@link ProviderKeyBlockedError} a subclass of
+ *  SecretRemediationPendingError, so the checkpoint catch holds the publish (`secret_remediation_pending`)
+ *  and finalize fails `push_secret_blocked`. `variables` are variable NAMES only; `findings` carry commits
+ *  and names, never a value; `findings` is empty when the scan was merely untrustworthy. */
+class RunEnvBlockedError extends SecretRemediationPendingError {
+  constructor(readonly variables: readonly string[], readonly findings: readonly SecretFinding[]) {
+    super("run env scan blocked the upload");
+    this.name = "RunEnvBlockedError";
+  }
+}
+
+/** The run's registered run-env forms by variable, `[]` when the run holds no secret variable. Like
+ *  keyFormsOf, tolerates the partial flights hand-built by unit tests. */
+const runEnvOf = (flight: Pick<RunFlight, "runEnvScan">): RunEnvNamedForms => flight.runEnvScan ?? [];
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -3149,6 +3166,11 @@ interface RunFlight {
    *  path scans its objects for these before any network write. Empty for a vendor run, which does no
    *  extra git work. */
   providerKeyForms: readonly string[];
+  /** PRD #4416: the registered forms of every run-env SECRET this run holds (live `run_env` secrets plus
+   *  `run_env_redact`), grouped by variable name. Every scanned publish searches the outgoing objects for
+   *  them (agent/src/run-env-scan.ts). Rebuilt from each claim, never persisted. Empty/absent for a run
+   *  without a secret variable, which does no extra git work. */
+  runEnvScan?: RunEnvNamedForms;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -3887,6 +3909,10 @@ export class RunRunner {
   private readonly predecessorBoundaryGrants = new WeakMap<object, PredecessorBoundaryGrant>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
+  /** PRD #4416: the run-env scan forms of each run's CURRENT flight, set when the flight starts and dropped
+   *  with its execution tail (a run's later publishes, after a restart or once the tail is gone, resolve
+   *  their forms from the maintenance endpoint instead: {@link RunRunner.runEnvFormsFor}). */
+  private readonly runEnvLive = new Map<string, RunEnvNamedForms>();
   /** issue #3645: terminal owner run id -> the one claimant flight currently running the coordinated handoff for it.
    *  Set only around {@link RecoveryCoordinator.retireCompletedSourceForHandoff} (see {@link handoffClaimantId}). */
   private readonly handoffClaimants = new Map<string, { flight: RunFlight; tail: Promise<ClosedSourceObservation | void> }>();
@@ -5976,7 +6002,10 @@ export class RunRunner {
         } catch {
           this.log.warn("recovery: terminal saved evidence pass failed; source retained");
         } finally {
-          if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+          if (this.executionTails.get(runId) === tail) {
+            this.executionTails.delete(runId);
+            this.runEnvLive.delete(runId);
+          }
           release(observation);
           if (!ownedMemory) deliver();
           // Saved-evidence replay (issue #3031 N): after the tail is removed and released, and only after confirmed settlement, never during shutdown.
@@ -14383,6 +14412,7 @@ export class RunRunner {
         ? { ciConfigGuardGlobs: [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
         : {}),
       providerKeyForms: claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [],
+      runEnvScan: claimRunEnvNamedForms(claim.secrets),
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -15007,6 +15037,7 @@ export class RunRunner {
     const runId = claim.run_id;
     const active: ActiveRun = (flight.active = { registrationToken: flight.registrationToken, claimGeneration: flight.claimGeneration, cancel, steering, shuttingDown: false, retainedLocalCustody: () => flight.retainedLocalCustody === true });
     this.activeRuns.set(runId, active);
+    this.runEnvLive.set(runId, runEnvOf(flight));
     // Issue #4201 (A.3): for an in-place-eligible flight a switch that arrives during the prologue is
     // latched, not tripped, so none of the retained-recovery windows rethrows it. It is served at the
     // first executor site (closed with service:true just before executor.run) and discarded on any exit.
