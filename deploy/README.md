@@ -766,6 +766,31 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
 6. **Uncordon:** `uzi worker uncordon <worker-id>` (or the Workers page). This removes
    only your manual hold; any automatic drain, maintenance or custody fence still applies.
 
+### Per-run cache cap
+
+`workers.runCacheCapMaxBytes` and `workers.runCacheCapFraction` set the
+worker's per-run cache ceiling (`UZI_RUN_CACHE_CAP_MAX_BYTES`) and cap
+fraction (`UZI_RUN_CACHE_CAP_FRACTION`) per deployment. Both are empty by
+default. When set, the chart renders the controller env
+`UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES` / `UZI_WORKER_RUN_CACHE_CAP_FRACTION`,
+and the controller relays each to the worker container as the matching
+`UZI_RUN_CACHE_CAP_*` env, only when nonempty.
+
+Both values must be strings: quote them in YAML or use `--set-string` (which
+splits on commas). A typed value (an integer or boolean via `--set`, an
+unquoted number, or an unquoted `off`) fails the render with "must be a
+string", even with the controller disabled. A decimal passed through `--set`
+(for example `0.25`) stays a string and renders.
+
+The controller does not trim or parse the values and never fails boot over
+them. An invalid string reaches the worker, whose lenient parser falls back
+to its default instead of crash-looping; `off` for the ceiling disables it.
+Empty values keep the worker defaults (15 GiB ceiling, 0.5 fraction) and
+leave the pod template and spec hash unchanged. Setting or changing a value
+changes the spec and rolls the hosted fleet once through the normal roll
+process. See [Worker disk safety](../docs/configuration.md#worker-disk-safety-prd-1809)
+and the [controller table](../docs/configuration.md#controller).
+
 ### Cross-check capacity
 
 `workers.crossCheckSlots` defaults to 1 for persistent and ephemeral hosted
