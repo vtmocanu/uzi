@@ -28,8 +28,8 @@ confounds listed**, not as conclusions:
   a 128 cache (-16.7%). With the server's default JIT on, 70.0 vs 67.4 MiB (-3.8%), on this
   synthetic workload, with one rep; production effect unmeasured.
 - A cache of 32 showed a stress `ClaimRun` of about 68 ms against about 7 ms for the others.
-- `ClaimRun` planning in this harness: the first execution after a reconnect or re-prepare
-  spent about 69-75 ms planning, and the six prepared executions together about 348-358 ms
+- `ClaimRun` planning in this harness: the first execution on a fresh connection (after a
+  reconnect) spent about 69-75 ms planning, and the six prepared executions together about 348-358 ms
   (see [Latency and reconnect](#latency-and-reconnect-jit-off)).
 
 Never set `statement_cache_capacity` to `0`: with pgx's default exec mode it makes every
@@ -67,8 +67,8 @@ The harness is `TestPoolBackendMemoryMeasurement` in
 `UZI_POOL_MEMORY_MEASURE=1` and `UZI_TEST_DATABASE_URL`, and it refuses to run unless the
 throwaway marker `uzi_test_harness.database_marker` = `recovery-reset-v1` is present. Its
 name does not end in `LiveDB`, so CI never runs it. Numbers below are a recorded one-off from
-a developer host, not a re-runnable fixture; the harness and the commands below make them
-reproducible.
+a developer host, not a re-runnable fixture; the harness and the commands below make the
+method re-runnable.
 
 ### How the method evolved
 
@@ -84,13 +84,13 @@ differences explain why the earlier numbers were set aside. The later numbers ar
    an order confound: the capped candidates read worse than A (B128's Anonymous rose from
    66.7 to 86.8 MiB between runs 1 and 2 while its contexts fell from 31.1 to 25.1 MiB). Its per-candidate
    `Private_Clean` also jumped to about 50 MiB, which was not understood yet.
-3. **Run 3.** Each candidate and rep ran on its own `CREATE DATABASE ... TEMPLATE pm_template`
+3. **Run 3.** Each candidate and rep ran on its own `CREATE DATABASE ... TEMPLATE` clone of the per-invocation template
    clone (schema and fixture seeded once, `ANALYZE`d), two reps, Anonymous as the primary heap
    metric. Order effects disappeared (A, B128 and B32 reproduced to 0.0 MiB across reps). A
    `Private_Clean` jump of about 51 MiB still appeared on every candidate that evicts or
    recycles, and was first read as shared-buffer pages.
 4. **Run 4 (the primary results).** Observed that the jump coincides with LLVM being mapped:
-   `llvmjit.so` and `libLLVM.so.19.1` appear in a backend's memory map from round 8 in the
+   `llvmjit.so` and `libLLVM.so.19.1` appear in a backend's memory map from round 8 (round 10 for C) in the
    candidates that evict or recycle, and `jit = off` removes both the mapping and the jump. A
    library mapping alone is not proof of a JIT compilation (see the `pg_jit_available()` probe
    below). The hypothesis, not established, is that re-planned statements on the bloating clone
@@ -259,10 +259,10 @@ two reps each), per execution: planning about 69-75 ms on the first, about 50-58
 executions 2 to 5, about 60-65 ms on the sixth (when PostgreSQL builds the generic plan);
 execution about 19 ms, then about 8 ms. Planning dominates. 348-358 ms (across the four runs)
 is the **sum** of planning over the six prepared executions, not a per-reconnect charge. In
-this harness, the first execution after a reconnect or re-prepare pays about 69-75 ms of
-planning; the further custom planning (executions 2 to 5, about 50-58 ms each) and the generic
-planning (the sixth, about 60-65 ms) follow on later executions, and a re-prepare restarts that
-sequence. These are distinct from the cold-reconnect latencies above (98.5-103.9 ms first,
+this harness, the first execution on a fresh connection (after a reconnect) pays about 69-75 ms of
+planning (only the reconnect case was measured: `pmRunExplain` uses a fresh connection); the further custom planning (executions 2 to 5, about 50-58 ms each) and the generic
+planning (the sixth, about 60-65 ms) follow on later executions, and a re-prepare on a warm connection restarts the same
+custom-then-generic planning sequence, but its planning time was not measured separately. These are distinct from the cold-reconnect latencies above (98.5-103.9 ms first,
 64-68 ms second `ClaimRun`). They are `ClaimRun` observations only. C showed no steady-heap saving over A; D's two jit-off
 reps (56.6 and 53.9 MiB) were below B128's 57.1 MiB, within a 2.7 MiB rep-to-rep spread, and above it with JIT on
 (69.4 against 67.4 MiB). Neither difference is established by this evidence.
@@ -376,9 +376,10 @@ func (c *Conn) deallocateInvalidatedCachedStatements(ctx context.Context) error 
 `SendBatch`. The pool's lifetime settings are read the same way (`pgxpool/pool.go`):
 `defaultMaxConnLifetime = time.Hour`, `defaultMaxConnIdleTime = time.Minute * 30`,
 `pool_max_conn_lifetime_jitter` unset means 0. A connection past its lifetime leaves the pool
-by one of two paths: pgxpool's background health check closes idle connections that are past
-their lifetime, and a checked-out connection is not interrupted but is destroyed when it is
-released. So the time at which a given connection is replaced has no fixed deadline.
+by one of three paths (pgx v5.12.0): pgxpool's background health check (`checkConnsHealth`)
+closes idle connections that are past their lifetime; `Conn.Release` destroys a checked-out
+connection that is past its lifetime when it is released (it is not interrupted before that);
+and `Pool.Acquire` destroys an expired idle connection instead of handing it out. So the time at which a given connection is replaced has no fixed deadline.
 
 ## Why the measurement is inconclusive
 
@@ -400,8 +401,8 @@ released. So the time at which a given connection is replaced has no fixed deadl
   - Wide: one clone per cache size and plan mode.
   - Explain: one clone per jit mode and rep; a capture connection runs a real `ClaimRun` on
     it before the measured connection.
-  - The template `pm_template` is still read by the validation pool, and discover mode runs
-    on it. All clones share one server.
+  - The per-invocation template (`pm_<32-hex uuid>_tpl`) is still read by the validation pool,
+    and discover mode runs on it. All clones share one server.
 - **The wide phase records other errors rather than failing**, so a wide run can complete
   with unexplained error rows.
 - **JIT confounds the memory comparison.** The headline latency run (c) ran with `jit = off`,
@@ -483,7 +484,8 @@ global default, so `OpenPool` keeps pgx's defaults.
   node (`hash_mem_multiplier` defaults to 2.0 since PostgreSQL 15; see the
   [PostgreSQL 17 resource settings](https://www.postgresql.org/docs/17/runtime-config-resource.html)).
   These multiply by the number of such nodes in a plan and by the number of concurrent
-  queries, so they need headroom. It assumes every pool connection has been opened
+  queries, so they need headroom. Each parallel worker of a parallel query gets its own
+  allowance. It assumes every pool connection has been opened
   and used; pgxpool opens connections lazily and reaps idle ones after 30m. The chart's api
   Deployment uses `Recreate` (`deploy/chart/templates/api-deployment.yaml`), so there is no
   rolling-update overlap term. Measured on PostgreSQL 17.12 with a small synthetic fixture and
@@ -539,8 +541,8 @@ Any JIT investigation is separate work, not done here.
 - **Clones are shared in some phases.** Memory uses one clone per candidate and rep, but
   latency and stress share one clone per round across candidates (later candidates inherit
   rolled-back-write and heartbeat-`UPDATE` bloat), cold shares one clone across all
-  candidates and reps, and `pm_template` is still read by the validation pool and discover
-  mode. All clones share one server. The wide phase records other errors rather than failing.
+  candidates and reps, and the per-invocation template (`pm_<32-hex uuid>_tpl`) is still read by the validation pool
+  and discover mode. All clones share one server. The wide phase records other errors rather than failing.
 - **JIT mismatch between runs.** The headline latency run ran with `jit = off`; the
   normal-JIT memory run showed extra Anonymous memory. The 3.8% normal-JIT difference is on
   this synthetic workload; production effect unmeasured.

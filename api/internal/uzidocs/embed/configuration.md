@@ -1260,7 +1260,7 @@ postgres://app:<password>@example.com:5432/uzi?statement_cache_capacity=256
 | `statement_cache_capacity` | `512` (pgx's default, unchanged) | Per-connection prepared-statement cache. **Never set `0`**: with pgx's default exec mode it makes every query fail except an argument-less `Exec` ("cannot use QueryExecModeCacheStatement with disabled statement cache"); `0` is only valid together with a different `default_query_exec_mode`. |
 | `description_cache_capacity` | pgx's `512` | No effect under the default cached-statement exec mode (`default_query_exec_mode` unset): pgx uses it only under `cache_describe`. |
 | `pool_max_conn_lifetime` | `1h` | Unchanged pgx default. |
-| `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default. In the synthetic harness, `ClaimRun` spent about 69-75 ms planning on the first execution after a reconnect or re-prepare, and about 348-358 ms summed over its six prepared executions (further custom and generic planning on later executions; a re-prepare restarts the sequence). Harness observations, not production figures. |
+| `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default. In the synthetic harness, `ClaimRun` spent about 69-75 ms planning on the first execution on a fresh connection (after a reconnect), and about 348-358 ms summed over its six prepared executions (further custom and generic planning on later executions). A re-prepare on a warm connection restarts the same custom-then-generic planning sequence, but its planning time was not measured separately. Harness observations, not production figures. |
 | `pool_max_conn_idle_time` | `30m` | Unchanged pgx default. |
 
 **Lowering the statement cache.** Lowering `statement_cache_capacity` in `DATABASE_URL`
@@ -1271,7 +1271,7 @@ harness that showed as the `ClaimRun` per-execution mean rising from about 7 ms 
 owner's agreement, compare `pg_stat_statements` plans to calls with `track_planning` on.
 
 **JIT may add memory.** In the synthetic measurement with PostgreSQL's default `jit = on`,
-backends that evicted or recycled statements showed LLVM mapped and about 8.5-14 MiB more heap
+the candidates that evict statements or recycle connections showed LLVM mapped and about 8.5-14 MiB more heap
 than in the `jit = off` runs, plus about 51 MiB of shared library text (counted once per
 instance). Whether statements whose plans cross `jit_above_cost` cause this is a hypothesis;
 it was not established, and a library mapping alone is not proof of a JIT compilation. If you
@@ -1312,7 +1312,8 @@ connections would then be about 1.2 GiB (JIT off) or 1.5 GiB (JIT on). Add:
   per hash node (`hash_mem_multiplier` defaults to 2.0 since PostgreSQL 15; see the
   [PostgreSQL 17 resource settings](https://www.postgresql.org/docs/17/runtime-config-resource.html)).
   These multiply by the number of such nodes in a plan and by the number of concurrent
-  queries, so leave headroom;
+  queries, so leave headroom. Each parallel worker of a parallel query gets its own
+  allowance;
 - other PostgreSQL and container overhead.
 
 The estimate assumes every pool connection has been opened and used; pgxpool opens connections
