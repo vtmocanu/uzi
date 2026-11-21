@@ -27,7 +27,7 @@ import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
-import { mockClaudeProviderId } from "./providers";
+import { mockClaudeProviderId, mockCodexProviderId } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -652,8 +652,9 @@ function mySettingsResponse(): { settings: UserSettings } {
   // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
+  const codex_provider_id = mockCodexProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, codex_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;

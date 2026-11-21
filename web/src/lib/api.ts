@@ -716,8 +716,8 @@ const realApi = {
   createProvider: (input: CreateProviderInput) =>
     request<{ provider: ProviderDTO }>("POST", "/me/providers", {
       ...input,
-      engine: "claude",
-      protocol: "anthropic_messages",
+      engine: input.engine ?? "claude",
+      protocol: input.protocol ?? (input.engine === "codex" ? "openai_responses" : "anthropic_messages"),
     }),
   patchProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
     request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}`, body),
@@ -734,6 +734,8 @@ const realApi = {
   // return to Anthropic. A 409 reason provider_source_unusable names why it cannot serve.
   setClaudeProviderSource: (providerId: string | null) =>
     request<{ claude_provider_id: string | null }>("PUT", "/me/providers/claude-source", { provider_id: providerId }),
+  setCodexProviderSource: (providerId: string | null) =>
+    request<{ codex_provider_id: string | null }>("PUT", "/me/providers/codex-source", { provider_id: providerId }),
   testProvider: (id: string) =>
     request<{ probe: ProviderProbe }>("POST", `/me/providers/${id}/test`),
   testSecret: (kind: "anthropic_token" | "codex_auth" | "openai_api_key", id: string) =>

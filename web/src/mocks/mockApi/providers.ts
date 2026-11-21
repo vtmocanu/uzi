@@ -1,7 +1,7 @@
-// Demo-mode custom providers (PRD #4320 M3). Feature is OFF unless ?mock=providers,
+// Demo-mode custom providers for Claude and Codex. Feature is OFF unless ?mock=providers,
 // matching a real instance whose operator has not set UZI_PROVIDER_ALLOWED_BASE_URLS.
 
-import type { ProviderDTO, ProviderProbe } from "../../lib/api";
+import type { CreateProviderInput, ProviderDTO, ProviderProbe } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { mockProviderAllowedBaseUrls, mockProviders } from "../data";
 import { delay, mockScenario, requireSession } from "./shared";
@@ -11,6 +11,8 @@ let providers: ProviderDTO[] = featureOn ? mockProviders.map((p) => ({ ...p })) 
 let nextId = 1;
 // The user's selected Claude source (UserSettings.claude_provider_id); null = Anthropic.
 let claudeProviderId: string | null = null;
+let codexProviderId: string | null = null;
+export function mockCodexProviderId(): string | null { return codexProviderId; }
 
 /** Read by the mock GET /me/settings so the settings projection and this module agree. */
 export function mockClaudeProviderId(): string | null {
@@ -59,6 +61,15 @@ function update(id: string, patch: Partial<ProviderDTO>): ProviderDTO {
   return { ...next };
 }
 
+function validate(engine: ProviderDTO["engine"], auth: ProviderDTO["auth_style"], map: ProviderDTO["model_map"]) {
+  const roles = engine === "codex" ? ["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] : ["haiku", "sonnet", "opus", "fable"];
+  if (engine === "codex" && auth !== "bearer") fail(400, "invalid_provider", "Codex requires Bearer auth");
+  if (!map[engine === "codex" ? "default" : "haiku"]) fail(400, "invalid_provider", "required model missing");
+  for (const [role, entry] of Object.entries(map)) {
+    if (!roles.includes(role) || !/^[A-Za-z0-9._:/@-]{1,256}$/.test(entry.model) || (entry.context_window !== undefined && (!Number.isInteger(entry.context_window) || entry.context_window < 8192 || entry.context_window > 10000000))) fail(400, "invalid_provider", "invalid model map");
+  }
+}
+
 export const providersApi = {
   listProviders: async () => {
     requireSession();
@@ -68,24 +79,22 @@ export const providersApi = {
       providers: providers.map((p) => ({ ...p })),
     });
   },
-  createProvider: async (input: {
-    name: string;
-    base_url: string;
-    auth_style: ProviderDTO["auth_style"];
-    model_map: ProviderDTO["model_map"];
-  }) => {
+  createProvider: async (input: CreateProviderInput) => {
     requireSession();
     checkUrl(input.base_url);
+    const engine = input.engine ?? "claude";
+    if (input.protocol !== undefined && input.protocol !== (engine === "codex" ? "openai_responses" : "anthropic_messages")) fail(400, "invalid_provider", "protocol does not match engine");
+    validate(engine, input.auth_style, input.model_map);
     if (nameTaken(input.name)) {
       fail(409, "provider_name_taken", "a provider with that name already exists");
     }
     const created: ProviderDTO = {
       id: `prov-mock-${nextId++}`,
       name: input.name,
-      engine: "claude",
+      engine: input.engine ?? "claude",
       retired: false,
       current_revision: 1,
-      protocol: "anthropic_messages",
+      protocol: input.protocol ?? (input.engine === "codex" ? "openai_responses" : "anthropic_messages"),
       base_url: input.base_url,
       auth_style: input.auth_style,
       model_map: input.model_map,
@@ -98,7 +107,8 @@ export const providersApi = {
   },
   patchProvider: async (id: string, body: { name?: string; model_map?: ProviderDTO["model_map"] }) => {
     requireSession();
-    live(id);
+    const p = live(id);
+    if (body.model_map) validate(p.engine, p.auth_style, body.model_map);
     if (body.name !== undefined && nameTaken(body.name, id)) {
       fail(409, "provider_name_taken", "a provider with that name already exists");
     }
@@ -111,7 +121,8 @@ export const providersApi = {
     body: { base_url?: string; auth_style?: ProviderDTO["auth_style"] },
   ) => {
     requireSession();
-    live(id);
+    const p = live(id);
+    validate(p.engine, body.auth_style ?? p.auth_style, p.model_map);
     if (body.base_url !== undefined) checkUrl(body.base_url);
     return delay({ provider: bump(id, body) });
   },
@@ -138,9 +149,9 @@ export const providersApi = {
   deleteProvider: async (id: string) => {
     requireSession();
     find(id);
-    // Mirrors the server: a provider still selected as the Claude source cannot be deleted.
-    if (claudeProviderId === id) {
-      fail(409, "provider_in_use_as_source", "the provider is in use as your Claude source");
+    // Mirrors the server: either engine selection protects its provider from deletion.
+    if (claudeProviderId === id || codexProviderId === id) {
+      fail(409, "provider_in_use_as_source", "the provider is in use as a model source");
     }
     providers = providers.filter((p) => p.id !== id);
     return delay(null);
@@ -154,6 +165,7 @@ export const providersApi = {
       return delay({ claude_provider_id: null });
     }
     const p = find(providerId);
+    if (p.engine !== "claude") fail(404, "provider_not_found", "provider not found");
     const why = p.retired
       ? "the provider is retired"
       : !p.has_key
@@ -164,6 +176,25 @@ export const providersApi = {
     if (why) fail(409, "provider_source_unusable", `the provider cannot be the Claude source: ${why}`);
     claudeProviderId = providerId;
     return delay({ claude_provider_id: providerId });
+  },
+  setCodexProviderSource: async (providerId: string | null) => {
+    requireSession();
+    if (providerId === null) {
+      codexProviderId = null;
+      return delay({ codex_provider_id: null });
+    }
+    const p = find(providerId);
+    if (p.engine !== "codex") fail(404, "provider_not_found", "provider not found");
+    const why = p.retired
+      ? "the provider is retired"
+      : !p.has_key
+        ? "it has no key"
+        : !p.key_enabled
+          ? "its key is disabled"
+          : null;
+    if (why) fail(409, "provider_source_unusable", `the provider cannot be the Codex source: ${why}`);
+    codexProviderId = providerId;
+    return delay({ codex_provider_id: providerId });
   },
   testProvider: async (id: string) => {
     requireSession();

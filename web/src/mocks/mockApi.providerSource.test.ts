@@ -76,3 +76,25 @@ describe("mock claude provider source", () => {
     await expect(api.deleteProvider("prov-gateway")).resolves.toBeNull();
   });
 });
+
+it("roundtrips Codex mappings and keeps source selection independent with mismatch 404", async () => {
+  const api = await load();
+  const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"].map(role => [role, { model: "gw-" + role, context_window: 32768 }]));
+  const { providers, allowed_base_urls } = await api.listProviders();
+  const { provider: code } = await api.createProvider({ name: "code", engine: "codex", protocol: "openai_responses", base_url: allowed_base_urls[0], auth_style: "bearer", model_map: map });
+  expect(code.model_map).toEqual(map);
+  await api.putProviderKey(code.id, "k".repeat(24));
+  await api.setClaudeProviderSource(providers[0].id);
+  await api.setCodexProviderSource(code.id);
+  await expect(api.setClaudeProviderSource(code.id)).rejects.toMatchObject({ status: 404 });
+  await expect(api.setCodexProviderSource(providers[0].id)).rejects.toMatchObject({ status: 404 });
+  await expect(api.setCodexProviderSource("unknown")).rejects.toMatchObject({ status: 404 });
+  await expect(api.deleteProvider(code.id)).rejects.toMatchObject({ status: 409 });
+  await api.setCodexProviderSource(null);
+  const settings = (await api.getMySettings()).settings;
+  expect(settings.codex_provider_id).toBeNull();
+  expect(settings.claude_provider_id).toBe(providers[0].id);
+  expect((await api.listProviders()).providers.find(p => p.id === code.id)?.model_map).toEqual(map);
+  await expect(api.patchProviderEndpoint(code.id, { auth_style: "x_api_key" })).rejects.toMatchObject({ status: 400 });
+  expect(JSON.stringify(await api.listProviders())).not.toContain("k".repeat(24));
+});

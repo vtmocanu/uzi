@@ -27,6 +27,7 @@ vi.mock("../lib/api", async (importActual) => {
       testProvider: vi.fn(),
       getMySettings: vi.fn(),
       setClaudeProviderSource: vi.fn(),
+      setCodexProviderSource: vi.fn(),
     },
   };
 });
@@ -206,6 +207,8 @@ describe("Providers — create", () => {
     fireEvent.click(within(form()).getByRole("button", { name: "Add provider" }));
     await waitFor(() =>
       expect(mockApi.createProvider).toHaveBeenCalledWith({
+        engine: "claude",
+        protocol: "anthropic_messages",
         name: "gw",
         base_url: URL_B,
         auth_style: "x_api_key",
@@ -423,13 +426,13 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     const row = await screen.findByTestId("provider-p1");
     await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/team-gateway/));
     mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: null } } as never);
-    fireEvent.click(within(row).getByRole("button", { name: "Stop using" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Stop using Claude source" }));
     await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null));
     await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/Anthropic/));
   });
 
   it.each([
-    ["retired", { retired: true }, /retired provider cannot be your Claude source/],
+    ["retired", { retired: true }, /retired provider cannot be your model source/],
     ["keyless", { has_key: false, key_enabled: false }, /Set a key before using/],
     ["key disabled", { key_enabled: false }, /Enable the key before using/],
   ])("disables Use as Claude source for a %s provider and says why", async (_n, over, reason) => {
@@ -451,13 +454,13 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
     mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: null });
     await renderCard(list({ enabled: false, allowed_base_urls: [], providers: [] }));
-    const stop = await screen.findByRole("button", { name: "Stop using" });
+    const stop = await screen.findByRole("button", { name: "Stop using Claude source" });
     // A failed refresh must not hide the successful clear returned by the PUT.
     mockApi.getMySettings.mockRejectedValue(new Error("refresh unavailable"));
     fireEvent.click(stop);
     await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null));
-    expect(await screen.findByText("Claude runs use Anthropic again.")).toBeTruthy();
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop using" })).toBeNull());
+    expect(await screen.findByText("Claude runs use the native source again.")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop using Claude source" })).toBeNull());
     expect(screen.queryByRole("button", USE)).toBeNull();
     expect(screen.queryByRole("button", { name: "Add provider" })).toBeNull();
   });
@@ -466,9 +469,9 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
     mockApi.setClaudeProviderSource.mockRejectedValue(new Error("clear unavailable"));
     await renderCard(list({ enabled: false, allowed_base_urls: [], providers: [] }));
-    fireEvent.click(await screen.findByRole("button", { name: "Stop using" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop using Claude source" }));
     expect(await screen.findByRole("alert")).toBeTruthy();
-    const retry = screen.getByRole("button", { name: "Stop using" }) as HTMLButtonElement;
+    const retry = screen.getByRole("button", { name: "Stop using Claude source" }) as HTMLButtonElement;
     await waitFor(() => expect(retry.disabled).toBe(false));
     expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null);
   });
@@ -477,7 +480,7 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     mockApi.setClaudeProviderSource.mockRejectedValue(apiError(409, "provider_source_unusable"));
     await renderCard();
     fireEvent.click(within(await screen.findByTestId("provider-p1")).getByRole("button", USE));
-    expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be your Claude source/);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be your model source/);
   });
 
   it("still renders the list when the settings read fails", async () => {
@@ -486,4 +489,59 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     expect(await screen.findByTestId("provider-p1")).toBeTruthy();
     expect(screen.getByTestId("claude-source").textContent).toMatch(/unknown/);
   });
+});
+
+
+it("creates all six Codex mappings and resets incompatible engine drafts", async () => {
+  await renderCard(list({ providers: [] }));
+  const f = within(screen.getByRole("form", { name: "Add a provider" }));
+  fireEvent.change(f.getByLabelText("Haiku model (required)"), { target: { value: "old" } });
+  fireEvent.change(f.getByLabelText("Auth style"), { target: { value: "x_api_key" } });
+  fireEvent.change(f.getByLabelText("Engine"), { target: { value: "codex" } });
+  expect(f.queryByLabelText("Haiku model (required)")).toBeNull();
+  expect((f.getByLabelText("Auth style") as HTMLSelectElement).options.length).toBe(1);
+  fireEvent.change(f.getByLabelText("Provider name"), { target: { value: "code" } });
+  fireEvent.change(f.getByLabelText("Base URL"), { target: { value: URL_A } });
+  fireEvent.click(f.getByRole("button", { name: "Add provider" }));
+  expect((await screen.findByRole("alert")).textContent).toContain("Default model is required");
+  const map: Record<string, { model: string; context_window: number }> = {};
+  for (const [role, label] of [["default", "Default"], ...["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"].map(r => [r, r])]) {
+    fireEvent.change(f.getByLabelText(label + " model" + (role === "default" ? " (required)" : "")), { target: { value: "gw-" + role } });
+    if (role === "default") expect(screen.getByTestId("ctx-warning-default").textContent).toContain("runtime fallback");
+    fireEvent.change(f.getByLabelText(label + " context window"), { target: { value: "32768" } });
+    map[role] = { model: "gw-" + role, context_window: 32768 };
+  }
+  fireEvent.click(f.getByRole("button", { name: "Add provider" }));
+  await waitFor(() => expect(mockApi.createProvider).toHaveBeenCalledWith({ engine: "codex", protocol: "openai_responses", name: "code", base_url: URL_A, auth_style: "bearer", model_map: map }));
+});
+
+it("edits Codex maps without changing engine and selects only the Codex source", async () => {
+  const code = provider({ id: "code", name: "code", engine: "codex", protocol: "openai_responses", model_map: { default: { model: "gw", context_window: 32768 }, "gpt-6-luna": { model: "moon", context_window: 65536 } } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1", codex_provider_id: null } } as never);
+  mockApi.setCodexProviderSource.mockResolvedValue({ codex_provider_id: "code" });
+  await renderCard(list({ providers: [provider(), code] }));
+  const row = within(await screen.findByTestId("provider-code"));
+  fireEvent.click(row.getByRole("button", { name: "Edit name and models" }));
+  expect(row.queryByLabelText("Engine")).toBeNull();
+  expect((row.getByLabelText("gpt-6-luna context window") as HTMLInputElement).value).toBe("65536");
+  fireEvent.change(row.getByLabelText("Default context window"), { target: { value: "8192" } });
+  fireEvent.click(row.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(mockApi.patchProvider).toHaveBeenCalledWith("code", { model_map: { default: { model: "gw", context_window: 8192 }, "gpt-6-luna": { model: "moon", context_window: 65536 } } }));
+  mockApi.getMySettings.mockRejectedValue(new Error("advisory unavailable"));
+  fireEvent.click(row.getByRole("button", { name: "Use as Codex source" }));
+  await waitFor(() => expect(mockApi.setCodexProviderSource).toHaveBeenCalledWith("code"));
+  await waitFor(() => expect(screen.getByTestId("codex-source").textContent).toContain("code"));
+  expect(screen.getByTestId("claude-source").textContent).toContain("team-gateway");
+  expect((row.getByRole("button", { name: "Delete" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("clears each feature-off source independently", async () => {
+  mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1", codex_provider_id: "c1" } } as never);
+  mockApi.setCodexProviderSource.mockResolvedValue({ codex_provider_id: null });
+  await renderCard(list({ enabled: false }));
+  const stop = await screen.findByRole("button", { name: "Stop using Codex source" });
+  mockApi.getMySettings.mockRejectedValue(new Error("advisory unavailable"));
+  fireEvent.click(stop);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Stop using Codex source" })).toBeNull());
+  expect(screen.getByRole("button", { name: "Stop using Claude source" })).toBeTruthy();
 });
