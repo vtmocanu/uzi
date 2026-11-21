@@ -3862,9 +3862,10 @@ Repair pass (459a299f3, 187208c46, after the cross-check):
   after-publish, before-Now-publish, after-Now-publish, before-prepare, login,
   resume, policy-hold. Results are asserted at top level with the P2/I2
   messages. The D6 diagnostic (both `summaryAllowed` flags removed and
-  `authorityCurrent` forced true) still reddens P2 first at after-publish
-  (inputs 1); the scope stages and before-publish stay refused under it (masked,
-  recorded), and the later stages, including the Now stages, are unobserved
+  `authorityCurrent` forced true) was run by the implementer in a scratch export
+  of the 459a299f3 candidate (`.uzi/scratch/gate-log.oBo3Vp`; the log does not
+  record the applied edit). It reddens P2 first at after-publish (inputs 1); the
+  scope stages and before-publish record zero-work attempts under it (masked), and the later stages, including the Now stages, are unobserved
   because the assertion stops at the first failing stage.
 - The I4 follow-on execute is joined (bounded) in the fixture cleanup before
   mocks are restored, and that join never replaces a failing test body's error.
@@ -3873,7 +3874,8 @@ Repair pass (459a299f3, 187208c46, after the cross-check):
   671.1 s (`.uzi/scratch/gate-log.0pXZ4s`); `git diff --check` clean
   (`.uzi/scratch/gate-log.zyBkM1`). At 187208c46 (cleanup-only test change): the
   focused 'publication gates Now|plan summary|intent summary' selection 24/24
-  (`.uzi/scratch/gate-log.Di171j`), typecheck and lint clean.
+  (`.uzi/scratch/gate-log.Di171j`), typecheck and lint clean
+  (`.uzi/scratch/gate-log.5bBUjb`).
 
 Not applicable (production-path reasons):
 - Plan production trigger at the barriers: the Runner is inside the switch, not
@@ -3904,8 +3906,11 @@ Timing (not a finding; no wait change is established):
     16.99 s (M2 suite 15.39 s, `.uzi/scratch/gate-log.eoDLII`).
   - 'M2 actualRunner': base 96 tests, 124.6 s (suite 123.10 s,
     `.uzi/scratch/gate-log.bmB3rE`); candidate 109 tests, 141.3 s (suite
-    139.74 s, `.uzi/scratch/gate-log.XFgV3M`), so about +16.6 s for 13 leaves.
-  - Single samples: noise is unmeasured.
+    139.74 s, `.uzi/scratch/gate-log.XFgV3M`), so about +16.7 s for the run
+    (suite +16.6 s) for 13 leaves.
+  - Single samples: noise is unmeasured. The command, environment, export setup
+    and node version are as reported by the gate owner; the logs record the
+    results, not those run conditions.
 - Earlier, unmatched figures kept for the record: base 'publication gates Now'
   alone 2 tests, 8.1 s (describe 3.34 s, `.uzi/scratch/gate-log.QEGFlu`); the
   focused selection 19.8 s at c1b399b07 (`.uzi/scratch/gate-log.FGj8Dj`) and
