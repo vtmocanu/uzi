@@ -24,7 +24,7 @@
 //     lowers any of the seven gated columns (the six wire buckets, or the clamped uncached input)
 //     is refused and marks the thread incomplete.
 //   - MODEL SEGMENTS (#4580): `beginModelSegment` splits a thread's cumulative at the running max
-//     into model segments. For safe-integer buckets (what Codex emits) each raw column's segment
+//     into model segments. For non-negative safe-integer buckets (what Codex emits) each raw column's segment
 //     deltas sum exactly to `maxTotal - baseline`; non-integer values are subject to float rounding;
 //     reconciliation and pricing run per segment against that segment's own model. No production
 //     caller cuts a segment yet (#3253 adds it), so the behavior is exercised by tests only.
@@ -433,7 +433,7 @@ export class CodexUsageAccountant {
    * incompleteness taints every model it used, including a model replaced by a rebind.
    *
    * TOKEN buckets are always the cumulative `total` deltas (unchanged from C4a), split per model
-   * segment so, for safe-integer buckets (what Codex emits), each raw column's segment deltas sum
+   * segment so, for non-negative safe-integer buckets (what Codex emits), each raw column's segment deltas sum
    * exactly to the thread's `maxTotal - baseline` (non-integer values are subject to float rounding).
    * Uncached input of a thread cut into two or more segments is the per-segment difference of the
    * clamped cumulative uncached value, which telescopes the same way; a single-segment thread

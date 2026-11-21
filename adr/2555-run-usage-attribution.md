@@ -139,8 +139,8 @@ changes; malformed reasoning or total-token dips are now refused (see Admission)
   delivered after the cut that advances the running max is attributed to the new
   segment and its model. #3253 owns enforcing this ordering. The first registration of
   a thread still wins and claim-shared deduplication is kept. Segment differences are
-  clamped at zero as a defensive floor, identical to the plain difference under the
-  monotone gate.
+  clamped at zero as a defensive floor, identical to the plain difference for
+  non-negative buckets under the monotone gate.
 - **Admission.** The monotone gate covers seven columns: the six wire buckets plus
   clamped uncached input. A malformed reasoning or `totalTokens` dip on an advancing
   note is refused, the model is reported `unreported`, and proven tokens are retained.

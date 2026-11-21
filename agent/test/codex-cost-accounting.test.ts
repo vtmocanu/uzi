@@ -414,7 +414,7 @@ describe("#4580 model segments (priced)", () => {
     assert.equal(micro(sol.costUSD), 20000);
   });
 
-  it("a segment that misses a response degrades only its own model", () => {
+  it("a missing response inside a later segment degrades that segment's model while the earlier one stays metered", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, ASTRA, false);
     acct.record(ROOT, out(1000, 1000));
