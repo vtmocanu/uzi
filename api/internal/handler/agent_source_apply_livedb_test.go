@@ -51,7 +51,7 @@ type agentSourceFixture struct {
 var agentSourceSharedTemplateNames = []string{
 	"coder", "my-admin-global", "kept-synced-global", "changed-synced-global",
 	"old-synced-global", "tester", "admin-untouched", "reviewer-bot", "endpoint-role",
-	"endpoint-role-2", "restage-victim", "effort-role", "effort-legacy", "effort-bad",
+	"endpoint-role-2", "restage-victim", "effort-role", "effort-legacy", "effort-bad", "effort-existing",
 }
 
 // clearAgentSourceSharedState removes this suite's instance-wide rows (the singleton
@@ -483,7 +483,8 @@ func (d agentSourceDTO) stagedRole(t *testing.T, name string) agentSourceRoleDTO
 func TestAgentSourceEffortApplyLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newAgentSourceFixture(ctx, t)
-	roles := []byte(`[` +
+	var roles []byte
+	roles = []byte(`[` +
 		`{"name":"effort-role","ok":true,"description":"effort desc","effort":"high","prompt_body":"effort body\n"},` +
 		`{"name":"effort-legacy","ok":true,"description":"legacy desc","prompt_body":"legacy body\n"},` +
 		`{"name":"effort-bad","ok":true,"description":"bad desc","prompt_body":"bad body\n","notes":["effort_ignored"]}]`)
@@ -535,5 +536,24 @@ func TestAgentSourceEffortApplyLiveDB(t *testing.T) {
 	res2, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-effort-2")
 	if err != nil || res2.Applied != 0 || res2.Unchanged != 3 {
 		t.Fatalf("re-apply of identical content: %+v, %v; want 0 applied, 3 unchanged", res2, err)
+	}
+
+	// An EXISTING synced row with a stale Claude effort and a locally set Codex effort: the sync
+	// replaces the Claude effort with the source's and clears the Codex effort (the source has
+	// none), like codex_model, on the real UPDATE path.
+	_ = f.seedTemplate(ctx, t, "effort-existing", "global", "synced", false, "existing desc", "existing body\n")
+	mustExecT(ctx, t, f.pool, `UPDATE agent_templates SET effort = 'low', codex_effort = 'max' WHERE name = 'effort-existing' AND scope = 'global'`)
+	roles = []byte(`[` +
+		`{"name":"effort-role","ok":true,"description":"effort desc","effort":"high","prompt_body":"effort body\n"},` +
+		`{"name":"effort-legacy","ok":true,"description":"legacy desc","prompt_body":"legacy body\n"},` +
+		`{"name":"effort-bad","ok":true,"description":"bad desc","prompt_body":"bad body\n","notes":["effort_ignored"]},` +
+		`{"name":"effort-existing","ok":true,"description":"existing desc","effort":"high","prompt_body":"existing body\n"}]`)
+	stage("sha-effort-3")
+	res3, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-effort-3")
+	if err != nil || res3.Applied != 1 || res3.Unchanged != 3 {
+		t.Fatalf("apply over an existing row: %+v, %v; want 1 applied, 3 unchanged", res3, err)
+	}
+	if e, ce := effortOf("effort-existing"); !e.Valid || e.String != "high" || ce.Valid {
+		t.Fatalf("effort-existing stored effort=%+v codex_effort=%+v, want high/NULL", e, ce)
 	}
 }

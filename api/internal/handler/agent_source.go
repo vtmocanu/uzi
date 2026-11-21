@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -386,9 +387,9 @@ func stagedToDTO(staged store.AgentSourceStaged, lastAppliedSHA string) *agentSo
 			Model:       termsafe.CellText(role.Model),
 			ClaudeModel: termsafe.CellText(def.Model),
 			CodexModel:  termsafe.CellText(def.CodexModel),
-			// Effort is closed-set at parse time (one of the five levels or ""); CellText
-			// keeps a hand-edited legacy snapshot from carrying anything else to the panel.
-			Effort:     termsafe.CellText(def.Effort),
+			// Effort is closed-set at parse time (one of the five levels or ""); projecting
+			// through the closed set keeps a tampered snapshot value off the panel.
+			Effort:     agenttmpl.EffortForHarness("claude", def.Effort, ""),
 			Tools:      role.Tools,
 			PromptBody: sanitizedBody,
 			// body_sanitized: true only when sanitization changed the body, i.e. the raw

@@ -129,10 +129,11 @@ export const AgentTemplateEditor = forwardRef<
         name: name || "unnamed",
         description,
         model: model.trim() || null,
+        effort: effort || null,
         tools: tools.length ? tools : null,
         prompt_body: promptBody,
       }),
-    [name, description, model, tools, promptBody],
+    [name, description, model, effort, tools, promptBody],
   );
 
   // currentContent is the form's live values in the shape the comparison reads.

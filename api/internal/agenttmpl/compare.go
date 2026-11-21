@@ -34,7 +34,7 @@ import "slices"
 //     TrimSpace cannot make a pristine row look drifted.
 //
 // IT DOES NOT RENDER EITHER SIDE AND COMPARE THE BYTES, which is the tempting
-// shortcut. CodexModel, Effort and CodexEffort deliberately have no rendered
+// shortcut. CodexModel and CodexEffort deliberately have no rendered
 // representation; comparing rendered bytes would miss changes to those pins. Two more reasons it stays
 // column-based:
 //

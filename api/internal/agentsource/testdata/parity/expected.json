@@ -98,6 +98,26 @@
     "prompt_body": "body\n",
     "tools": null
   },
+  "effort-duplicate.md": {
+    "description": "Two effort lines; the first wins.",
+    "effort": "high",
+    "model": "",
+    "name": "effort-duplicate",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "effort-empty.md": {
+    "description": "An empty effort inherits without a note.",
+    "effort": "",
+    "model": "",
+    "name": "effort-empty",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
   "effort-invalid.md": {
     "description": "Declares an effort outside the five levels.",
     "effort": "",

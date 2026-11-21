@@ -1,7 +1,7 @@
 // Package agentsource parses external agent-role markdown files fetched from an
 // admin-configured source repo (PRD #602 M3). It is the API-side twin of the
 // worker's agent/src/repoagents.ts and reproduces that parsing contract EXACTLY,
-// so a role file parses to the same {name, description, tools, model, prompt_body}
+// so a role file parses to the same {name, description, tools, model, effort, prompt_body}
 // — or the same skip/clamp reason — on both sides. The pairing is pinned by a
 // hand-authored differential golden (parser_test.go + testdata/parity/) that a Go
 // test and a TS test each assert against independently.

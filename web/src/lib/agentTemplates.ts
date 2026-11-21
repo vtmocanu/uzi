@@ -97,12 +97,14 @@ export const KNOWN_TOOLS: string[] = [
 ];
 
 // renderSubagent mirrors the server renderer (fixed field order, inline
-// comma-separated tools, model/tools omitted when empty). Used for the live
-// preview; the server's /rendered output is the authoritative export.
+// comma-separated tools, model/tools/effort omitted when empty; the Claude effort
+// follows model, the Codex pins are never rendered). Used for the live preview;
+// the server's /rendered output is the authoritative export.
 export function renderSubagent(t: {
   name: string;
   description: string;
   model: string | null;
+  effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }): string {
@@ -111,6 +113,7 @@ export function renderSubagent(t: {
   s += `description: ${t.description}\n`;
   if (t.tools && t.tools.length > 0) s += `tools: ${t.tools.join(", ")}\n`;
   if (t.model) s += `model: ${t.model}\n`;
+  if (t.effort) s += `effort: ${t.effort}\n`;
   s += "---\n\n";
   s += t.prompt_body;
   return s;

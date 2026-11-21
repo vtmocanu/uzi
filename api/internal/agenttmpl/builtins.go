@@ -69,7 +69,7 @@ func BuiltinByName(name string) (Definition, bool) {
 
 // parse reads a Claude Code subagent Markdown file into a Definition. It is the
 // inverse of Render for the subset of frontmatter these files use (name,
-// version, description, tools, model). It is only ever fed the embedded builtin
+// version, description, tools, model, effort). It is only ever fed the embedded builtin
 // files; user templates never go through it (they arrive as structured JSON). The
 // round-trip parse->Render is pinned byte-for-byte by the parse/validity test.
 func parse(raw []byte) (Definition, error) {

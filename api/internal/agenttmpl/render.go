@@ -43,9 +43,9 @@ type Definition struct {
 // Render produces the canonical Claude Code subagent Markdown for a template:
 // YAML frontmatter in fixed field order (name, version, description, tools,
 // model, effort), with tools serialized as an inline comma-separated string (not a YAML
-// sequence), then a blank line, then the prompt body. version, tools and model
-// lines are omitted when empty (version when zero, like tools/model when empty
-// — inherit). The frontmatter is built as ordered strings rather than via
+// sequence), then a blank line, then the prompt body. version, tools, model and
+// effort lines are omitted when empty (version when zero, like tools/model/effort
+// when empty — inherit). The frontmatter is built as ordered strings rather than via
 // yaml.Marshal, which would reorder the map keys and break byte-stability.
 func Render(d Definition) []byte {
 	var b strings.Builder

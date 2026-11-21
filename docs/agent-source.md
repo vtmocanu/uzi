@@ -196,7 +196,8 @@ a source never sets a Codex effort. The staged review shows it as a **Claude
 effort** row, with **Default** when the source has none. Any other value is
 ignored: the role still stages with no effort pin, and the review flags the
 ignored value without showing it. Snapshots staged before this upgrade carry no
-effort and apply with none.
+effort and apply with none until the source's commit changes, since an
+unchanged commit is not re-parsed.
 
 ### What approving does
 
