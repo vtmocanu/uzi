@@ -245,8 +245,8 @@ uzi settings set <setting> [--harness claude|codex] <value>
 uzi settings reset <setting> [--harness claude|codex]
 uzi agent-template list
 uzi agent-template show <name|id>
-uzi agent-template set <name|id> --harness claude|codex <model>
-uzi agent-template reset <name|id> --harness claude|codex
+uzi agent-template set <name|id> --harness claude|codex [<model>] [--effort <level>]
+uzi agent-template reset <name|id> --harness claude|codex [--effort]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -3549,30 +3549,38 @@ or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
 `judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
 already-enabled judge and summary work uses, and cannot turn that work on.
 
-### Agent-template model pins
+### Agent-template model and effort pins
 
 ```sh
 uzi agent-template list
 uzi agent-template show my-reviewer
 uzi agent-template set my-reviewer --harness claude sonnet
 uzi agent-template set my-reviewer --harness codex <model-id>
+uzi agent-template set my-reviewer --harness codex --effort high
+uzi agent-template set my-reviewer --harness claude sonnet --effort medium
 uzi agent-template reset my-reviewer --harness claude
+uzi agent-template reset my-reviewer --harness claude --effort
 ```
 
-`uzi agent-template` reads and edits the Claude pin (`model`) and the Codex pin
-(`codex_model`) of **your own** agent templates over `GET /api/me/agent-templates`
+`uzi agent-template` reads and edits the Claude pins (`model`, `effort`) and the
+Codex pins (`codex_model`, `codex_effort`) of **your own** agent templates over `GET /api/me/agent-templates`
 and `PUT /api/me/agent-templates/{id}/model-pins`, both of which accept a `uzc_`
 or `uza_` Bearer token. A pin is stored per family; `--harness claude` or
 `--harness codex` is required for `set` and `reset`, and the other family is left
 unchanged. `set` passes the model id through and the server validates it like the
-web editor (see [Model pins](./agent-templates.md#model-pins)). `reset` clears
-that pin so the family inherits again. Only the two pins change; description,
+web editor (see [Model pins](./agent-templates.md#model-pins)). `set` needs a
+model, `--effort <level>` (`low`, `medium`, `high`, `xhigh` or `max`), or both;
+`runtime` is not a template effort. `reset` clears the model pin so the family
+inherits again; `reset --effort` clears only the effort pin and keeps the model
+pin (see [Reasoning effort pins](./agent-templates.md#reasoning-effort-pins)).
+Only the pins change; description,
 tools and prompt are untouched, and the template's `customized` flag stays as it
 was.
 
 `list` prints your builtin, global and own templates with `NAME`, `SCOPE`,
-`CLAUDE PIN`, `CODEX PIN`, `EDITABLE` and `ID`. `show`, `set` and `reset` print
-the template's stored pins, each as the value or `inherit`. The output states
+`CLAUDE PIN`, `CODEX PIN`, `CLAUDE EFFORT`, `CODEX EFFORT`, `EDITABLE` and `ID`.
+`show`, `set` and `reset` print the template's stored pins (`Claude pin`,
+`Codex pin`, `Claude effort`, `Codex effort`), each as the value or `inherit`. The output states
 stored pins only and never a resolved model, because the model a template
 actually uses depends on the run role it fills (see [Model
 pins](./agent-templates.md#model-pins)). `--json` prints the server's envelope;
@@ -3593,8 +3601,8 @@ lists the ids; pass the id of one.
 | Exit | Meaning |
 | --- | --- |
 | 0 | The template was read or the pin written. |
-| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
-| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
+| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), or the write answered 400 `unknown field effort` / `unknown field codex_effort` (a server that predates effort pins), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, an invalid `--effort`, `set` with neither a model nor `--effort`, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
 | 3 | Authentication failed, or the template is builtin or global. |
 | 4 | The template does not exist or belongs to another user, including a `404` on the write. |
 | 6 | Server error or rate limit, including a typed 500 for an unknown commit outcome or a failed readback. |
@@ -3613,7 +3621,7 @@ setting prints once. The rows, in order:
 | --- | --- | --- |
 | `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
 | `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
-| `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `worker effort` | `claude`, `codex` | As the existing effort rows. `SOURCE` reads `lead template` when you have no per-harness effort preference and the lead template's effort is used (see [the lead template's effort](./worker-effort.md#the-lead-templates-effort)). |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
 | `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
 | `task review effort` | `claude`, `codex` | `not sent` for both. |

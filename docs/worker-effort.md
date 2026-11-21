@@ -18,7 +18,8 @@ effort](#a-run-level-effort)) is frozen on the run and beats the setting.
 For a run without one, the setting is resolved when a worker claims the run,
 including a scheduled or already queued run and a resumed run; there is no
 per-schedule effort freeze. Subagents without their own effort pin inherit
-the run's effort. Other users and the shared lead template are unaffected.
+the run's effort (see [Subagent effort pins](#subagent-effort-pins)). Other
+users and the shared lead template are unaffected.
 
 ## A run-level effort
 
@@ -43,9 +44,42 @@ effort does not opt the run out of the automatic harness choice.
 
 When upgrading from the shared setting, every existing explicit value is
 copied into the Codex setting and retained for Claude. An unset or blank
-preference uses the built-in medium. Changing one harness's setting does not change the
+preference uses the lead template's effort for that harness when it has one
+(see [The lead template's effort](#the-lead-templates-effort)), otherwise the
+built-in medium. Changing one harness's setting does not change the
 other. Schema rollback keeps the Claude/shared value but loses independently
 edited Codex preferences.
+
+## Subagent effort pins
+
+A [template](./agent-templates.md#reasoning-effort-pins) can pin an effort per
+harness (`effort` for Claude, `codex_effort` for Codex). The rule for a
+subagent is:
+
+1. A pin for the run's harness is used.
+2. An empty pin follows the run's resolved lead effort for the phase the
+   subagent runs in.
+3. When that is **Runtime default**, nothing is sent.
+
+Only the pin for the run's harness is considered. A worker that predates
+template effort never receives the pins and shows a run-feed notice; see
+[Older workers](./agent-templates.md#reasoning-effort-pins).
+
+## The lead template's effort
+
+The lead's effort for a harness resolves in this order:
+
+1. The effort chosen for the run ([A run-level effort](#a-run-level-effort)).
+2. Your per-harness preference: a level, or **Runtime default**.
+3. The lead template's effort for the run's harness, shown with the source
+   *lead template*.
+4. The built-in **medium**.
+
+The template tier applies only when your preference is unset or blank, so
+choosing **Runtime default** keeps sending no level even when the lead template
+pins one. It reaches the worker as the claimed default effort. `uzi settings get` and
+`GET /api/me/effective-settings` show it with the source `lead template`. The
+Codex catalog advisory below still applies to the lead only.
 
 ## Set an override
 
