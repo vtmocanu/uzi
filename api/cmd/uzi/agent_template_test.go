@@ -346,3 +346,126 @@ func TestAgentTemplateWireBody(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentTemplateEffortPatches(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		patch map[string]*string
+	}{
+		{"set claude effort only", []string{"set", "reviewer", "--harness", "claude", "--effort", "high"}, map[string]*string{"effort": msPtr("high")}},
+		{"set codex effort only", []string{"set", "reviewer", "--harness", "codex", "--effort", "xhigh"}, map[string]*string{"codex_effort": msPtr("xhigh")}},
+		{"set model and effort", []string{"set", "reviewer", "--harness", "codex", "gpt-9", "--effort", "max"},
+			map[string]*string{"codex_model": msPtr("gpt-9"), "codex_effort": msPtr("max")}},
+		{"effort flag before model", []string{"set", "reviewer", "--effort", "low", "--harness", "claude", "opus-9"},
+			map[string]*string{"model": msPtr("opus-9"), "effort": msPtr("low")}},
+		{"reset effort claude", []string{"reset", "reviewer", "--harness", "claude", "--effort"}, map[string]*string{"effort": nil}},
+		{"reset effort codex", []string{"reset", "reviewer", "--harness", "codex", "--effort"}, map[string]*string{"codex_effort": nil}},
+		{"reset without effort stays model-only", []string{"reset", "reviewer", "--harness", "codex"}, map[string]*string{"codex_model": nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := tplFixture()
+			_, stderr, code := runCLI(t, fakeEnv(fc), append([]string{"agent-template"}, tc.args...)...)
+			if code != 0 || fc.AgentTemplatePutCalls != 1 {
+				t.Fatalf("code=%d puts=%d stderr=%s", code, fc.AgentTemplatePutCalls, stderr)
+			}
+			if !reflect.DeepEqual(fc.LastAgentTemplatePatch, tc.patch) {
+				t.Fatalf("patch = %v, want %v", fc.LastAgentTemplatePatch, tc.patch)
+			}
+		})
+	}
+}
+
+func TestAgentTemplateEffortUsageErrorsSendNothing(t *testing.T) {
+	for _, args := range [][]string{
+		{"set", "reviewer", "--harness", "claude", "--effort", "runtime"}, // not a template effort
+		{"set", "reviewer", "--harness", "claude", "--effort", "High"},
+		{"set", "reviewer", "--harness", "claude", "--effort", "extreme"},
+		{"set", "reviewer", "--harness", "claude", "--effort", ""},
+		{"set", "reviewer", "--harness", "claude", "m", "--effort", "bogus"},
+		{"set", "reviewer", "--effort", "high"}, // harness missing
+		{"set", "reviewer", "--harness", "claude"},
+		{"set", "reviewer", "--harness", "claude", "a", "b"},
+		{"reset", "reviewer", "--effort"}, // harness missing
+	} {
+		fc := tplFixture()
+		_, stderr, code := runCLI(t, fakeEnv(fc), append([]string{"agent-template"}, args...)...)
+		if code != uzicli.ExitUsage || fc.AgentTemplateListCalls != 0 || fc.AgentTemplatePutCalls != 0 {
+			t.Errorf("%v: code=%d lists=%d puts=%d stderr=%s", args, code, fc.AgentTemplateListCalls, fc.AgentTemplatePutCalls, stderr)
+		}
+	}
+}
+
+func TestAgentTemplateListAndShowCarryEffortPins(t *testing.T) {
+	fc := &uzicli.FakeClient{AgentTemplates: []uzicli.AgentTemplatePins{
+		{ID: tplMine, Name: "reviewer", Scope: "user", Effort: msPtr("high"), CodexEffort: msPtr("xhigh"), Editable: true},
+		{ID: tplDupe, Name: "plain", Scope: "user", Editable: true},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "agent-template", "list")
+	if code != 0 {
+		t.Fatalf("code=%d", code)
+	}
+	for _, want := range []string{"CLAUDE EFFORT", "CODEX EFFORT", "high", "xhigh"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("list output missing %q:\n%s", want, out)
+		}
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "agent-template", "show", "reviewer")
+	if code != 0 || !strings.Contains(out, "Claude effort: high (pinned)") || !strings.Contains(out, "Codex effort: xhigh (pinned)") {
+		t.Fatalf("code=%d show=%q", code, out)
+	}
+	out, _, _ = runCLI(t, fakeEnv(fc), "agent-template", "show", "plain")
+	if !strings.Contains(out, "Claude effort: inherit") || !strings.Contains(out, "Codex effort: inherit") {
+		t.Fatalf("show=%q", out)
+	}
+	out, _, _ = runCLI(t, fakeEnv(fc), "agent-template", "reset", "reviewer", "--harness", "codex", "--effort")
+	if !strings.Contains(out, "Codex effort: inherit") || !strings.Contains(out, "Claude effort: high (pinned)") {
+		t.Fatalf("reset out=%q", out)
+	}
+}
+
+func TestAgentTemplateEffortWireBodyAndOlderServer(t *testing.T) {
+	var got string
+	var putStatus int
+	var putBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"templates":[{"id":"` + tplMine + `","name":"reviewer","scope":"user","model":null,"codex_model":null,"customized":false,"editable":true}]}`))
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.WriteHeader(putStatus)
+		_, _ = w.Write([]byte(putBody))
+	}))
+	defer srv.Close()
+	ok := `{"template":{"id":"` + tplMine + `","name":"reviewer","scope":"user","model":null,"codex_model":null,"effort":"high","codex_effort":null,"customized":false,"editable":true}}`
+	putStatus, putBody = 200, ok
+	out, stderr, code := runCLI(t, httpEnv(srv), "agent-template", "set", "reviewer", "--harness", "claude", "--effort", "high")
+	if code != 0 || strings.TrimSpace(got) != `{"effort":"high"}` || !strings.Contains(out, "Claude effort: high (pinned)") {
+		t.Fatalf("code=%d body=%q out=%q stderr=%s", code, got, out, stderr)
+	}
+	_, _, code = runCLI(t, httpEnv(srv), "agent-template", "reset", "reviewer", "--harness", "codex", "--effort")
+	if code != 0 || strings.TrimSpace(got) != `{"codex_effort":null}` {
+		t.Fatalf("reset code=%d body=%q", code, got)
+	}
+	// A server that predates the effort pins refuses the key with a 400: exit 1, upgrade message.
+	for _, field := range []string{"effort", "codex_effort"} {
+		putStatus, putBody = 400, `{"error":"unknown field `+field+`","field":"`+field+`"}`
+		args := []string{"agent-template", "set", "reviewer", "--harness", "claude", "--effort", "high"}
+		if field == "codex_effort" {
+			args[4] = "codex"
+		}
+		out, stderr, code = runCLI(t, httpEnv(srv), args...)
+		if code != uzicli.ExitGeneric || !strings.Contains(stderr, "upgrade the server") || out != "" {
+			t.Errorf("%s: code=%d out=%q stderr=%q", field, code, out, stderr)
+		}
+	}
+	// Any other 400 keeps its server message and the usage exit.
+	putStatus, putBody = 400, `{"error":"effort: effort must be one of low, medium, high, xhigh, max","field":"effort"}`
+	_, stderr, code = runCLI(t, httpEnv(srv), "agent-template", "set", "reviewer", "--harness", "claude", "--effort", "high")
+	if code == uzicli.ExitGeneric || !strings.Contains(stderr, "effort must be one of") {
+		t.Errorf("code=%d stderr=%q", code, stderr)
+	}
+}

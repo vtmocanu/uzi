@@ -187,3 +187,33 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+func TestStoreColumnsMapsEffortPinsAndBlankToNull(t *testing.T) {
+	cols, err := storeColumns(agenttmpl.Definition{Effort: " high ", CodexEffort: "  "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cols.effort.Valid || cols.effort.String != "high" {
+		t.Errorf("effort=%+v", cols.effort)
+	}
+	if cols.codexEffort.Valid {
+		t.Errorf("whitespace codex_effort must be NULL: %+v", cols.codexEffort)
+	}
+	// A Claude-format source carries no codex fields: both lanes stay NULL, like codex_model.
+	cols, err = storeColumns(agenttmpl.Definition{Model: "opus"})
+	if err != nil || cols.effort.Valid || cols.codexEffort.Valid || cols.codexModel.Valid {
+		t.Errorf("cols=%+v err=%v", cols, err)
+	}
+}
+
+func TestRowToDefinitionCarriesEffortPins(t *testing.T) {
+	row := store.AgentTemplate{
+		Name:        "r",
+		Effort:      pgtype.Text{String: "low", Valid: true},
+		CodexEffort: pgtype.Text{String: "max", Valid: true},
+	}
+	d := rowToDefinition(row)
+	if d.Effort != "low" || d.CodexEffort != "max" {
+		t.Fatalf("definition=%+v", d)
+	}
+}

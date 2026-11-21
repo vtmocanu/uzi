@@ -70,6 +70,8 @@ type AgentTemplate struct {
 	Customized  bool               `json:"customized"`
 	Origin      pgtype.Text        `json:"origin"`
 	CodexModel  pgtype.Text        `json:"codex_model"`
+	Effort      pgtype.Text        `json:"effort"`
+	CodexEffort pgtype.Text        `json:"codex_effort"`
 }
 
 type AgentTemplateAllocation struct {

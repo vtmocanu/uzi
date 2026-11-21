@@ -252,18 +252,22 @@ export function looseSecretWarning(text: string): string {
   return "";
 }
 
-// TemplateContent is the five mutable columns the drift comparison reads —
+// TemplateContent is the seven mutable columns the drift comparison reads —
 // exactly the fields agenttmpl.Definition carries, minus the name, which is the
 // lookup key rather than content.
 export interface TemplateContent {
   description: string;
   model: string | null;
   codex_model: string | null;
+  // Per-harness reasoning-effort pins (PRD #3258). Optional for api/web rollout skew: a
+  // server that predates them omits the key, which reads as null.
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
 
-// driftedColumns names which of the five columns differ between the shipped
+// driftedColumns names which of the seven columns differ between the shipped
 // definition and a template's current values, in display order.
 //
 // IT IS THE ONLY CLIENT-SIDE COPY OF THESE RULES, and it lives here rather than
@@ -278,6 +282,8 @@ export function driftedColumns(shipped: TemplateContent, current: TemplateConten
   if (shipped.description !== current.description) out.push("description");
   if ((shipped.model ?? "") !== (current.model ?? "")) out.push("model");
   if ((shipped.codex_model ?? "") !== (current.codex_model ?? "")) out.push("codex model");
+  if ((shipped.effort ?? "") !== (current.effort ?? "")) out.push("effort");
+  if ((shipped.codex_effort ?? "") !== (current.codex_effort ?? "")) out.push("codex effort");
   const a = shipped.tools ?? [];
   const b = current.tools ?? [];
   if (a.length !== b.length || a.some((t, i) => t !== b[i])) out.push("tools");

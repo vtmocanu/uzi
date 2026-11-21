@@ -427,6 +427,12 @@ func rowToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	if t.CodexModel.Valid {
 		d.CodexModel = t.CodexModel.String
 	}
+	if t.Effort.Valid {
+		d.Effort = t.Effort.String
+	}
+	if t.CodexEffort.Valid {
+		d.CodexEffort = t.CodexEffort.String
+	}
 	return d
 }
 

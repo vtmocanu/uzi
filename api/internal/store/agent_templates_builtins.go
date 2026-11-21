@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -46,16 +47,18 @@ type builtinReconcilerQueries interface {
 func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) (TemplatesReconciled, error) {
 	var inserted int
 	for _, def := range agenttmpl.Builtins() {
-		model, codexModel, tools, err := builtinColumns(def)
+		cols, err := builtinColumns(def)
 		if err != nil {
 			return TemplatesReconciled{}, fmt.Errorf("encode builtin %q: %w", def.Name, err)
 		}
 		n, err := q.InsertBuiltinAgentTemplate(ctx, InsertBuiltinAgentTemplateParams{
 			Name:        def.Name,
 			Description: def.Description,
-			Model:       model,
-			CodexModel:  codexModel,
-			Tools:       tools,
+			Model:       cols.model,
+			CodexModel:  cols.codexModel,
+			Effort:      cols.effort,
+			CodexEffort: cols.codexEffort,
+			Tools:       cols.tools,
 			PromptBody:  def.PromptBody,
 		})
 		if err != nil {
@@ -79,9 +82,11 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 			if _, err := q.RefreshPristineBuiltin(ctx, RefreshPristineBuiltinParams{
 				Name:        def.Name,
 				Description: def.Description,
-				Model:       model,
-				CodexModel:  codexModel,
-				Tools:       tools,
+				Model:       cols.model,
+				CodexModel:  cols.codexModel,
+				Effort:      cols.effort,
+				CodexEffort: cols.codexEffort,
+				Tools:       cols.tools,
 				PromptBody:  def.PromptBody,
 			}); err != nil {
 				return TemplatesReconciled{}, fmt.Errorf("refresh pristine builtin %q: %w", def.Name, err)
@@ -113,25 +118,30 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 	return TemplatesReconciled{done: true}, nil
 }
 
-// builtinColumns converts both model pins and tools into DB column types:
-// an empty pin is NULL (inherit), an empty tools list is a NULL tools
-// column (inherit all), and a non-empty tools list is a JSON array.
-func builtinColumns(def agenttmpl.Definition) (pgtype.Text, pgtype.Text, []byte, error) {
-	var model pgtype.Text
-	if def.Model != "" {
-		model = pgtype.Text{String: def.Model, Valid: true}
+// builtinCols is the DB-typed form of a builtin's pins and tools.
+type builtinCols struct {
+	model, codexModel, effort, codexEffort pgtype.Text
+	tools                                  []byte
+}
+
+// builtinColumns converts the model and effort pins and tools into DB column types:
+// an empty pin (or a whitespace-only effort, as agenttmpl.ValidateEffort treats it) is NULL
+// (inherit), an empty tools list is a NULL tools column (inherit all), and a non-empty tools
+// list is a JSON array.
+func builtinColumns(def agenttmpl.Definition) (builtinCols, error) {
+	text := func(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }
+	c := builtinCols{
+		model:       text(def.Model),
+		codexModel:  text(def.CodexModel),
+		effort:      text(strings.TrimSpace(def.Effort)),
+		codexEffort: text(strings.TrimSpace(def.CodexEffort)),
 	}
-	var codexModel pgtype.Text
-	if def.CodexModel != "" {
-		codexModel = pgtype.Text{String: def.CodexModel, Valid: true}
-	}
-	var tools []byte
 	if len(def.Tools) > 0 {
 		b, err := json.Marshal(def.Tools)
 		if err != nil {
-			return pgtype.Text{}, pgtype.Text{}, nil, err
+			return builtinCols{}, err
 		}
-		tools = b
+		c.tools = b
 	}
-	return model, codexModel, tools, nil
+	return c, nil
 }

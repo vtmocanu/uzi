@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -230,5 +231,119 @@ func TestAgentTemplateOriginLiveDB(t *testing.T) {
 	}
 	if err := insertRaw("p-gsync-"+suffix, "global", false, "synced", nil); err != nil {
 		t.Errorf("scope='global', origin='synced' must be accepted; got %v", err)
+	}
+}
+
+// TestAgentTemplateEffortOriginLiveDB pins the PRD #3258 effort pins against the SQL the
+// origin/customized lockstep runs on: an effort edit on a builtin is a customization that blocks
+// the boot refresh (origin 'admin'), and Reset restores the shipped NULL with customized=false.
+func TestAgentTemplateEffortOriginLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	suffix := uuid.NewString()[:8]
+	admin := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash, is_admin) VALUES ($1, $2, 'x', true)`,
+		admin, fmt.Sprintf("effort-origin-%s@e2e", suffix))
+	text := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
+
+	name := "effort-" + suffix
+	if _, err := q.InsertBuiltinAgentTemplate(ctx, store.InsertBuiltinAgentTemplateParams{
+		Name: name, Description: "d1", PromptBody: "v1\n",
+	}); err != nil {
+		t.Fatalf("seed builtin: %v", err)
+	}
+	row, err := q.GetSharedAgentTemplateByName(ctx, name)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if row.Effort.Valid || row.CodexEffort.Valid {
+		t.Fatalf("a seeded builtin with no shipped effort must store NULL; got %+v %+v", row.Effort, row.CodexEffort)
+	}
+
+	// An effort-only edit (customized=true, as the handler decides via SameContent) sets origin
+	// 'admin' and both effort lanes are stored independently.
+	edited, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
+		ID: row.ID, Description: "d1", PromptBody: "v1\n", UpdatedBy: pgUUID(admin), Customized: true,
+		Effort: text("high"), CodexEffort: text("xhigh"),
+	})
+	if err != nil {
+		t.Fatalf("effort edit: %v", err)
+	}
+	if !edited.Customized || edited.Origin.String != "admin" ||
+		edited.Effort.String != "high" || edited.CodexEffort.String != "xhigh" {
+		t.Fatalf("effort edit: customized=%v origin=%+v effort=%+v codex=%+v", edited.Customized, edited.Origin, edited.Effort, edited.CodexEffort)
+	}
+	// The boot refresh, even with a shipped body change, leaves the customized row alone.
+	n, err := q.RefreshPristineBuiltin(ctx, store.RefreshPristineBuiltinParams{Name: name, Description: "d2", PromptBody: "v2\n"})
+	if err != nil || n != 0 {
+		t.Fatalf("customized effort row must be excluded from refresh: n=%d err=%v", n, err)
+	}
+	kept, _ := q.GetAgentTemplate(ctx, row.ID)
+	if kept.Effort.String != "high" || kept.CodexEffort.String != "xhigh" || kept.PromptBody != "v1\n" {
+		t.Errorf("customized row changed: %+v", kept)
+	}
+
+	// The save that restores the shipped values (NULL effort) is customized=false and 'embedded'.
+	back, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
+		ID: row.ID, Description: "d1", PromptBody: "v1\n", UpdatedBy: pgUUID(admin), Customized: false,
+	})
+	if err != nil || back.Customized || back.Origin.String != "embedded" || back.Effort.Valid || back.CodexEffort.Valid {
+		t.Fatalf("shipped-values save: %+v err=%v", back, err)
+	}
+
+	// Reset after a customization restores the shipped NULL effort and customized=false.
+	if _, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
+		ID: row.ID, Description: "d1", PromptBody: "v1\n", UpdatedBy: pgUUID(admin), Customized: true,
+		Effort: text("max"), CodexEffort: text("low"),
+	}); err != nil {
+		t.Fatalf("effort edit before reset: %v", err)
+	}
+	reset, err := q.ResetBuiltinAgentTemplate(ctx, store.ResetBuiltinAgentTemplateParams{
+		ID: row.ID, Description: "d1", PromptBody: "v1\n", UpdatedBy: pgUUID(admin),
+	})
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if reset.Customized || reset.Origin.String != "embedded" || reset.Effort.Valid || reset.CodexEffort.Valid {
+		t.Errorf("reset must restore NULL efforts, customized=false, origin embedded; got %+v", reset)
+	}
+
+	// A global synced row stores the pins through the synced writers too.
+	ins, err := q.InsertSyncedGlobalTemplate(ctx, store.InsertSyncedGlobalTemplateParams{
+		Name: "gs-" + suffix, Description: "d", PromptBody: "b", UpdatedBy: pgUUID(admin), Effort: text("low"),
+	})
+	if err != nil || ins.Effort.String != "low" || ins.CodexEffort.Valid {
+		t.Fatalf("synced insert: %+v err=%v", ins, err)
+	}
+	upd, err := q.UpdateSyncedGlobalTemplate(ctx, store.UpdateSyncedGlobalTemplateParams{
+		Name: "gs-" + suffix, Description: "d", PromptBody: "b", UpdatedBy: pgUUID(admin), CodexEffort: text("max"),
+	})
+	if err != nil || upd.Effort.Valid || upd.CodexEffort.String != "max" {
+		t.Fatalf("synced update: %+v err=%v", upd, err)
+	}
+	ov, err := q.ApplySyncedOverrideBuiltin(ctx, store.ApplySyncedOverrideBuiltinParams{
+		ID: row.ID, Description: "d1", PromptBody: "v1\n", UpdatedBy: pgUUID(admin), Effort: text("medium"),
+	})
+	if err != nil || ov.Effort.String != "medium" || ov.CodexEffort.Valid || ov.Origin.String != "synced" {
+		t.Fatalf("synced override: %+v err=%v", ov, err)
+	}
+	// The CHECK rejects an out-of-contract value written through a query (defence in depth).
+	if _, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
+		ID: row.ID, Description: "d1", PromptBody: "v1\n", UpdatedBy: pgUUID(admin), Customized: true, Effort: text("runtime"),
+	}); err == nil {
+		t.Error("the CHECK must reject effort 'runtime'")
 	}
 }

@@ -72,6 +72,8 @@ export function sameContent(row: AgentTemplate, def: BuiltinDefinition): boolean
     row.description === def.description &&
     (row.model ?? "") === (def.model ?? "") &&
     (row.codex_model ?? "") === (def.codex_model ?? "") &&
+    (row.effort ?? "") === (def.effort ?? "") &&
+    (row.codex_effort ?? "") === (def.codex_effort ?? "") &&
     row.prompt_body === def.prompt_body &&
     a.length === b.length &&
     a.every((t, i) => t === b[i])
@@ -195,6 +197,8 @@ export const agentsApi = {
       description: input.description,
       model: input.model?.trim() || null,
       codex_model: input.codex_model?.trim() || null,
+      effort: input.effort?.trim() || null,
+      codex_effort: input.codex_effort?.trim() || null,
       tools: input.tools,
       prompt_body: input.prompt_body,
       is_builtin: false,
@@ -250,6 +254,8 @@ export const agentsApi = {
     t.model = input.model?.trim() || null;
     // Old clients omit the pin; merge it before comparing with the shipped content.
     if (input.codex_model !== undefined) t.codex_model = input.codex_model?.trim() || null;
+    if (input.effort !== undefined) t.effort = input.effort?.trim() || null;
+    if (input.codex_effort !== undefined) t.codex_effort = input.codex_effort?.trim() || null;
     t.tools = input.tools;
     t.prompt_body = input.prompt_body;
     t.updated_by = me.email;
@@ -277,6 +283,8 @@ export const agentsApi = {
       description: shipped.description,
       model: shipped.model,
       codex_model: shipped.codex_model,
+      effort: shipped.effort ?? null,
+      codex_effort: shipped.codex_effort ?? null,
       tools: shipped.tools,
       prompt_body: shipped.prompt_body,
       // Reset restores the embedded default in every sense, including provenance:

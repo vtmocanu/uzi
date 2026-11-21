@@ -26,6 +26,10 @@ type Definition struct {
 	Model string
 	// CodexModel is the Codex pin; Claude Markdown deliberately omits it.
 	CodexModel string
+	// Effort and CodexEffort are the per-harness reasoning-effort pins (PRD #3258): one of
+	// EffortLevels, or "" for no pin. Render does not emit them yet.
+	Effort      string
+	CodexEffort string
 	// Tools is the allowlist. Empty means inherit all — the rendered
 	// frontmatter omits the tools line.
 	Tools []string

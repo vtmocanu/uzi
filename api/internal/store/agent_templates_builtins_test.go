@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 // reconcilerFake implements builtinReconcilerQueries in memory so the collision
@@ -148,5 +150,35 @@ func TestReconcileLogsReadBackErrorAtDebug(t *testing.T) {
 	}
 	if strings.Contains(logs, "shadowed by a custom row") {
 		t.Errorf("a read-back error must not be reported as a shadow; logs:\n%s", logs)
+	}
+}
+
+func TestBuiltinColumnsMapBlankEffortToNull(t *testing.T) {
+	for _, tc := range []struct {
+		name, effort, codex string
+		wantEffort          string
+		wantValid           bool
+	}{
+		{"empty", "", "", "", false},
+		{"whitespace", "  \t", " ", "", false},
+		{"level", "high", "", "high", true},
+		{"padded level", " max ", "", "max", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cols, err := builtinColumns(agenttmpl.Definition{Effort: tc.effort, CodexEffort: tc.codex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cols.effort.Valid != tc.wantValid || cols.effort.String != tc.wantEffort {
+				t.Errorf("effort=%+v", cols.effort)
+			}
+			if cols.codexEffort.Valid && cols.codexEffort.String == "" {
+				t.Errorf("codex_effort is a non-NULL empty string: %+v", cols.codexEffort)
+			}
+		})
+	}
+	cols, err := builtinColumns(agenttmpl.Definition{Effort: "low", CodexEffort: "xhigh"})
+	if err != nil || cols.effort.String != "low" || cols.codexEffort.String != "xhigh" {
+		t.Fatalf("lanes crossed: %+v err=%v", cols, err)
 	}
 }

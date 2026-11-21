@@ -698,6 +698,10 @@ export interface AgentTemplate {
   description: string;
   model: string | null;
   codex_model: string | null;
+  // Per-harness reasoning-effort pins (PRD #3258): one of low|medium|high|xhigh|max, or null for
+  // no pin. Optional for api/web rollout skew (a server that predates them omits the keys).
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
@@ -742,6 +746,8 @@ export interface BuiltinDefinition {
   description: string;
   model: string | null;
   codex_model: string | null;
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -756,6 +762,9 @@ export interface AgentTemplateInput {
   model: string | null;
   // Omitted on PUT preserves the stored pin; null or blank clears it.
   codex_model?: string | null;
+  // Omitted on PUT preserves the stored effort pin; null or blank clears it.
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
   scope?: "global" | "user";
