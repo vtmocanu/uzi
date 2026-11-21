@@ -49,7 +49,14 @@ session-cumulative fold and what it does not backfill.
 
 ## Rejected runs and failure accounting
 
-Usage outcomes count finished run rows, including runs with no usage. A failed
+Usage outcomes count finished run rows, including runs with no usage. They
+cover every terminal run kind except chat: issue, task, prompt, job,
+self_improve, mr_rework, ci_fix, cross_check and judge. Chat runs are
+conversation sessions and are excluded. The `Runs` count stays primary work
+only. Membership is by run status alone: each run is one row, with no
+deduplication against its parent run, and cross-check metadata (supersession,
+`approved_not_stored`, a negative verdict) never moves a run between buckets.
+The numerator and denominator are the same population. A failed
 run with `fail_origin = base_diverged` has its own count, as does
 `plan_rejected`; neither contributes to the `failed` count, `fail_origins`
 map or lifetime failure recency. These definitions apply to personal, factory

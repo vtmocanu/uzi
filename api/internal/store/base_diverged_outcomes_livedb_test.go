@@ -70,8 +70,9 @@ func TestBaseDivergedOutcomesAndBoardLiveDB(t *testing.T) {
 	seed(b, "failed", "issue", "base_diverged", 0, now.Add(2*time.Hour))
 	// The existing policy refusal remains an ordinary, judge-eligible failure.
 	policyRun := seed(c, "failed", "issue", "provider_policy_refusal", 0, now.Add(-7*time.Hour))
-	// Every excluded kind carries the new origin for every user, including the
-	// refusal-only owner, so all three query scopes must exclude all three kinds.
+	// Every non-primary kind carries the new origin for every user, including the
+	// refusal-only owner. Issue #4577: all three query scopes exclude chat only, so the judge
+	// and cross_check base_diverged rows count in the base_diverged bucket (finished too).
 	for _, user := range []uuid.UUID{a, b, c} {
 		for _, kind := range []string{"chat", "judge", "cross_check"} {
 			seed(user, "failed", kind, "base_diverged", 0, now.Add(3*time.Hour))
@@ -104,9 +105,9 @@ func TestBaseDivergedOutcomesAndBoardLiveDB(t *testing.T) {
 		failedOrigin     string
 	}
 	want := map[uuid.UUID]expected{
-		a: {[]int64{8, 2, 1, 1, 2, 2, 0}, []int64{5, 1, 1, 1, 1, 1, 0}, map[string]int64{"agent_failure": 1, "unknown": 1}, map[string]int64{"agent_failure": 1}, latestFailure, 1, now.Add(-4 * time.Hour), "agent_failure"},
-		b: {[]int64{2, 0, 0, 0, 2, 0, 0}, []int64{1, 0, 0, 0, 1, 0, 0}, map[string]int64{}, map[string]int64{}, uuid.Nil, 0, time.Time{}, ""},
-		c: {[]int64{1, 0, 0, 0, 0, 1, 0}, []int64{1, 0, 0, 0, 0, 1, 0}, map[string]int64{"provider_policy_refusal": 1}, map[string]int64{"provider_policy_refusal": 1}, policyRun, 0, now.Add(-7 * time.Hour), "provider_policy_refusal"},
+		a: {[]int64{10, 2, 1, 1, 4, 2, 0}, []int64{7, 1, 1, 1, 3, 1, 0}, map[string]int64{"agent_failure": 1, "unknown": 1}, map[string]int64{"agent_failure": 1}, latestFailure, 1, now.Add(-4 * time.Hour), "agent_failure"},
+		b: {[]int64{4, 0, 0, 0, 4, 0, 0}, []int64{3, 0, 0, 0, 3, 0, 0}, map[string]int64{}, map[string]int64{}, uuid.Nil, 0, time.Time{}, ""},
+		c: {[]int64{3, 0, 0, 0, 2, 1, 0}, []int64{3, 0, 0, 0, 2, 1, 0}, map[string]int64{"provider_policy_refusal": 1}, map[string]int64{"provider_policy_refusal": 1}, policyRun, 0, now.Add(-7 * time.Hour), "provider_policy_refusal"},
 	}
 	for user, w := range want {
 		s, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: user, LandableOrigins: origins})
@@ -144,8 +145,8 @@ func TestBaseDivergedOutcomesAndBoardLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check("factory lifetime", []int64{s.LifetimeFinished, s.LifetimeCompleted, s.LifetimeCancelled, s.LifetimePlanRejected, s.LifetimeBaseDiverged, s.LifetimeFailed, s.LifetimeNeedsLanding}, s.LifetimeFailOrigins, []int64{11, 2, 1, 1, 4, 3, 0}, map[string]int64{"agent_failure": 1, "unknown": 1, "provider_policy_refusal": 1})
-	check("factory week", []int64{s.Last7Finished, s.Last7Completed, s.Last7Cancelled, s.Last7PlanRejected, s.Last7BaseDiverged, s.Last7Failed, s.Last7NeedsLanding}, s.Last7FailOrigins, []int64{7, 1, 1, 1, 2, 2, 0}, map[string]int64{"agent_failure": 1, "provider_policy_refusal": 1})
+	check("factory lifetime", []int64{s.LifetimeFinished, s.LifetimeCompleted, s.LifetimeCancelled, s.LifetimePlanRejected, s.LifetimeBaseDiverged, s.LifetimeFailed, s.LifetimeNeedsLanding}, s.LifetimeFailOrigins, []int64{17, 2, 1, 1, 10, 3, 0}, map[string]int64{"agent_failure": 1, "unknown": 1, "provider_policy_refusal": 1})
+	check("factory week", []int64{s.Last7Finished, s.Last7Completed, s.Last7Cancelled, s.Last7PlanRejected, s.Last7BaseDiverged, s.Last7Failed, s.Last7NeedsLanding}, s.Last7FailOrigins, []int64{13, 1, 1, 1, 8, 2, 0}, map[string]int64{"agent_failure": 1, "provider_policy_refusal": 1})
 	if !s.LastFailedAt.Valid || !s.LastFailedAt.Time.Equal(now.Add(-4*time.Hour)) || s.LastFailedRunID != latestFailure || s.LastFailedUserID != a || s.LastFailedOrigin != "agent_failure" || s.CompletedSinceLastFailure != 1 {
 		t.Fatalf("factory recency: %+v", s)
 	}

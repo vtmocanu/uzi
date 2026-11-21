@@ -129,6 +129,9 @@ WITH candidates AS MATERIALIZED (
     SELECT r.id, r.kind FROM runs r, worker_active_runs a
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
@@ -202,6 +205,9 @@ WITH candidates AS MATERIALIZED (
       AND EXISTS (
           SELECT 1 FROM runs r WHERE r.id = cc.checker_run_id
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
             AND EXISTS (
     SELECT 1
@@ -259,6 +265,9 @@ UPDATE runs r SET
 FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = @worker_id
   AND r.status = 'queued'

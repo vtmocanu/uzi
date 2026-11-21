@@ -225,9 +225,9 @@ func TestSinceLastFailureBoundaries(t *testing.T) {
 	}
 }
 
-// TestAdminUsageHelpStatesBothDefinitions pins issue #4209: the help separates the RUNS
-// population (primary work runs with usage) from the outcome population (terminal primary
-// work runs, usage or not) and names the helper kinds whose tokens and cost still count.
+// TestAdminUsageHelpStatesBothDefinitions pins issues #4209 and #4577: the help separates the
+// RUNS population (primary work runs with usage) from the outcome population (every terminal
+// run except chat, usage or not) and names the helper kinds whose tokens and cost still count.
 func TestAdminUsageHelpStatesBothDefinitions(t *testing.T) {
 	out, errOut, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "admin", "usage", "--help")
 	if code != uzicli.ExitOK {
@@ -236,7 +236,7 @@ func TestAdminUsageHelpStatesBothDefinitions(t *testing.T) {
 	help := strings.Join(strings.Fields(out+errOut), " ")
 	for _, want := range []string{
 		"RUNS counts primary work runs (issue, task, prompt, job, self_improve) with recorded usage.",
-		"Finished, failed and fail rate count terminal primary work runs, including runs with no recorded usage.",
+		"Finished, failed and fail rate count every terminal run except chat (helper runs included), including runs with no recorded usage.",
 		"Tokens and cost also include helper runs (judge, cross_check, mr_rework, ci_fix); chat is excluded.",
 	} {
 		if !strings.Contains(help, want) {

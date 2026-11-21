@@ -26,6 +26,12 @@ const HoldReasonBaseAttestationMissing = "base_attestation_missing"
 // again until the run is cancelled and replaced.
 const HoldReasonRunOverrideUnavailable = "run_override_unavailable"
 
+// HoldReasonPhaseSwitchUnavailable (PRD #3252 m4) is the hold a Claude run enters when its worker
+// cannot bind the next plan/implement phase to a supported model configuration. The worker keeps
+// its clone and claim; the owner may resume it (ResumePausedRun admits this reason, keeping the
+// worker, the marker and the generation) or cancel it. No automatic promoter touches it.
+const HoldReasonPhaseSwitchUnavailable = "phase_switch_unavailable"
+
 // ErrBaseAttestationHeld refuses every owner verb that would run the agent on a run held on
 // HoldReasonBaseAttestationMissing (resume, extend, set-token). The hold is resolved by recovering
 // the kept work or starting a successor, never by running this run again.

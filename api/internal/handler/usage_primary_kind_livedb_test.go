@@ -22,9 +22,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// Issue #4209: run counts and outcomes on GET /api/usage and GET /api/admin/usage measure
-// primary work runs; token and cost sums still include helper runs. The wire shape does not
-// change. Everything runs inside one rolled-back transaction so the factory totals are
+// Issue #4209: run counts on GET /api/usage and GET /api/admin/usage measure primary work
+// runs; token and cost sums still include helper runs. Issue #4577: the outcome counts cover
+// every terminal run kind except chat. The wire shape does not change. Everything runs inside one rolled-back transaction so the factory totals are
 // exact, and every expectation is a literal derived from the seeded rows below.
 
 type pkHandlerRun struct {
@@ -221,7 +221,7 @@ func TestUsagePrimaryKindWireLiveDB(t *testing.T) {
 	eq("self lifetime output", num(life, "output_tokens"), 4*1127)
 	cost("self lifetime cost", num(life, "cost_usd"), 5*1127)
 	outs := sub(selfA, "outcomes")
-	for label, w := range map[string]struct{ fin, comp, fail float64 }{"last_7_days": {2, 1, 1}, "lifetime": {4, 3, 1}} {
+	for label, w := range map[string]struct{ fin, comp, fail float64 }{"last_7_days": {5, 3, 2}, "lifetime": {7, 5, 2}} {
 		o := sub(outs, label)
 		eq("self "+label+" finished", num(o, "finished"), w.fin)
 		eq("self "+label+" completed", num(o, "completed"), w.comp)
@@ -234,8 +234,10 @@ func TestUsagePrimaryKindWireLiveDB(t *testing.T) {
 	keys("self usage (helper-only)", selfB, reflect.TypeOf(apitypes.SelfUsageDTO{}))
 	eq("helper-only self run_count", num(selfB, "run_count"), 0)
 	eq("helper-only self input", num(sub(selfB, "lifetime"), "input_tokens"), 500)
-	eq("helper-only self failed", num(sub(sub(selfB, "outcomes"), "lifetime"), "failed"), 0)
-	eq("helper-only self finished", num(sub(sub(selfB, "outcomes"), "lifetime"), "finished"), 0)
+	// Helper runs are outcomes (issue #4577): judge + mr_rework completed, ci_fix failed.
+	eq("helper-only self failed", num(sub(sub(selfB, "outcomes"), "lifetime"), "failed"), 1)
+	eq("helper-only self finished", num(sub(sub(selfB, "outcomes"), "lifetime"), "finished"), 3)
+	eq("helper-only self completed", num(sub(sub(selfB, "outcomes"), "lifetime"), "completed"), 2)
 
 	// ---- GET /api/admin/usage.
 	admin := call(h.AdminUsage, userA, true)
@@ -250,9 +252,9 @@ func TestUsagePrimaryKindWireLiveDB(t *testing.T) {
 	eq("factory last7 input", num(fl7, "input_tokens"), 1617)
 	cost("factory lifetime cost", num(fl, "cost_usd"), 5*1627)
 	fo := sub(sub(factory, "outcomes"), "lifetime")
-	eq("factory finished", num(fo, "finished"), 4)
-	eq("factory failed (helper failures excluded)", num(fo, "failed"), 1)
-	eq("factory last7 failed", num(sub(sub(factory, "outcomes"), "last_7_days"), "failed"), 1)
+	eq("factory finished (every kind but chat)", num(fo, "finished"), 10)
+	eq("factory failed (helper failures included)", num(fo, "failed"), 3)
+	eq("factory last7 failed", num(sub(sub(factory, "outcomes"), "last_7_days"), "failed"), 3)
 
 	rows := map[string]map[string]any{}
 	list, _ := admin["users"].([]any)
@@ -272,8 +274,8 @@ func TestUsagePrimaryKindWireLiveDB(t *testing.T) {
 	eq("A last7 harness claude", num(sub(a, "last7_harness_runs"), "claude"), 1)
 	eq("A last7 harness codex", num(sub(a, "last7_harness_runs"), "codex"), 0)
 	eq("A input", num(sub(a, "usage"), "input_tokens"), 1127)
-	eq("A failed", num(sub(a, "outcomes"), "failed"), 1)
-	eq("A finished", num(sub(a, "outcomes"), "finished"), 4)
+	eq("A failed (ci_fix failure included)", num(sub(a, "outcomes"), "failed"), 2)
+	eq("A finished (chat excluded)", num(sub(a, "outcomes"), "finished"), 7)
 
 	eq("B run_count", num(b, "run_count"), 0)
 	eq("B last7_run_count", num(b, "last7_run_count"), 0)
@@ -282,7 +284,7 @@ func TestUsagePrimaryKindWireLiveDB(t *testing.T) {
 	eq("B last7 harness claude", num(sub(b, "last7_harness_runs"), "claude"), 0)
 	eq("B input (helper tokens present)", num(sub(b, "usage"), "input_tokens"), 500)
 	cost("B cost", num(sub(b, "usage"), "cost_usd"), 5*500)
-	eq("B failed (helper failure excluded)", num(sub(b, "outcomes"), "failed"), 0)
-	eq("B finished", num(sub(b, "outcomes"), "finished"), 0)
-	eq("B last7 failed", num(sub(b, "last7_outcomes"), "failed"), 0)
+	eq("B failed (helper failure included)", num(sub(b, "outcomes"), "failed"), 1)
+	eq("B finished", num(sub(b, "outcomes"), "finished"), 3)
+	eq("B last7 failed", num(sub(b, "last7_outcomes"), "failed"), 1)
 }

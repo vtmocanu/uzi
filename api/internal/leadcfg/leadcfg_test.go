@@ -155,6 +155,40 @@ func TestLeadLaneRegistryMatrix(t *testing.T) {
 	}
 }
 
+// planningRunKinds is the explicit set of run kinds whose Claude claims may carry a planning phase
+// (PRD #3252 section 1): exactly the lead-lane kinds. The claude_phase_models_v1 SQL predicate in
+// store/queries/runtime.sql and fn_placement_admitting_workers repeats this list; the pin test
+// store.TestPhaseModelsPredicateKindListMatchesLeadLane compares every site with the same set.
+var planningRunKinds = map[string]bool{
+	"issue": true, "ci_fix": true, "self_improve": true, "prompt": true, "mr_rework": true, "task": true,
+}
+
+// TestEveryRunKindIsClassifiedPlanningOrNot walks the registry so a new run kind must be placed
+// deliberately: it is planning exactly when it is a lead lane, and the explicit expected set above
+// must agree for every kind (an unclassified new kind fails here until it is added or declined).
+func TestEveryRunKindIsClassifiedPlanningOrNot(t *testing.T) {
+	seen := map[string]bool{}
+	for _, c := range leadcfgtest.LaneMatrix(t) {
+		if c.ReviewTarget || c.EgressBound {
+			if leadcfg.LeadLane(c.Kind, c.ReviewTarget, c.EgressBound) {
+				t.Errorf("%s with review=%v egress=%v must not be planning", c.Kind, c.ReviewTarget, c.EgressBound)
+			}
+			continue
+		}
+		seen[c.Kind] = true
+		planning := leadcfg.LeadLane(c.Kind, false, false)
+		if planning != c.Want || planning != planningRunKinds[c.Kind] {
+			t.Errorf("kind %q: LeadLane=%v matrix=%v explicit planning set=%v; classify the new kind deliberately",
+				c.Kind, planning, c.Want, planningRunKinds[c.Kind])
+		}
+	}
+	for k := range planningRunKinds {
+		if !seen[k] {
+			t.Errorf("planning kind %q is not in the run-kinds registry", k)
+		}
+	}
+}
+
 func s(v string) *string { return &v }
 
 func validReq() apitypes.LeadConfigReportRequest {

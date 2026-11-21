@@ -50,7 +50,7 @@ interface Harness {
   inPlaceHold: { until?: Promise<void> };
 }
 
-function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: TrimTarget) => number; threshold?: number } = {}): Harness {
+function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: TrimTarget) => number; threshold?: number; volume?: number } = {}): Harness {
   const sizes = new Map<string, number>();
   const trims: { home: string; target: TrimTarget }[] = [];
   const stops: string[] = [];
@@ -69,7 +69,7 @@ function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: Tri
   const options: DiskGovernorOptions = {
     config: { ...CONFIG, ...opts.config },
     log,
-    volumeTotalBytes: () => VOLUME,
+    volumeTotalBytes: () => opts.volume ?? VOLUME,
     thresholdOf: () => opts.threshold,
     reclaim: async () => {
       reclaims++;
@@ -140,6 +140,23 @@ describe("cache cap math (PRD #1809 D4)", () => {
     assert.strictEqual(runCacheCapBytes(VOLUME, 0.5, 1), 12.5 * GIB);
     assert.strictEqual(runCacheCapBytes(undefined, 0.5, 2), undefined, "an unknown volume enforces no cap");
     assert.strictEqual(runCacheCapBytes(0, 0.5, 2), undefined);
+  });
+
+  it("an absolute ceiling bounds the fraction-derived cap (cap = min of the two)", () => {
+    assert.strictEqual(runCacheCapBytes(100 * GIB, 0.5, 2, 15 * GIB), 15 * GIB, "25 GiB derived is clamped to the ceiling");
+  });
+
+  it("a ceiling above the derived cap changes nothing, and no ceiling means none", () => {
+    assert.strictEqual(runCacheCapBytes(25 * GIB, 0.5, 2, 15 * GIB), 6.25 * GIB);
+    assert.strictEqual(runCacheCapBytes(50 * GIB, 0.5, 2, 15 * GIB), 12.5 * GIB);
+    assert.strictEqual(runCacheCapBytes(100 * GIB, 0.5, 2, undefined), 25 * GIB);
+    assert.strictEqual(runCacheCapBytes(100 * GIB, 0.25, 2, 15 * GIB), 12.5 * GIB);
+    assert.strictEqual(runCacheCapBytes(100 * GIB, 0.5, 4, 15 * GIB), 12.5 * GIB);
+  });
+
+  it("an unknown or zero volume enforces no cap even with a ceiling", () => {
+    assert.strictEqual(runCacheCapBytes(undefined, 0.5, 2, 15 * GIB), undefined);
+    assert.strictEqual(runCacheCapBytes(0, 0.5, 2, 15 * GIB), undefined);
   });
 
   it("the hard threshold is the api threshold minus the margin (0.87 by default)", () => {
@@ -228,6 +245,33 @@ describe("hard layer and retained-seed admission share one pressure predicate (i
 });
 
 describe("soft layer: the per-run cache cap at turn boundaries", () => {
+  const BIG_VOLUME = 100 * GIB;
+  const CEILING = 15 * GIB;
+
+  it("the absolute ceiling lowers the cap: a run over it is trimmed although under the fraction-derived cap", async () => {
+    const h = harness({ volume: BIG_VOLUME, config: { capMaxBytes: CEILING } });
+    watch(h, "r1", 16 * GIB);
+    assert.strictEqual(await h.gov.boundary("r1", quiet), "continue");
+    assert.deepStrictEqual(h.trims, [
+      { home: "/data/agent-home/r1", target: { totalBytes: 16 * GIB, capBytes: CEILING, lowWaterBytes: Math.floor(CEILING * 0.6) } },
+    ]);
+  });
+
+  it("a 20 GiB run is trimmed under the ceiling", async () => {
+    const h = harness({ volume: BIG_VOLUME, config: { capMaxBytes: CEILING } });
+    watch(h, "r1", 20 * GIB);
+    await h.gov.boundary("r1", quiet);
+    assert.strictEqual(h.trims.length, 1);
+    assert.strictEqual(h.trims[0]?.target.capBytes, CEILING);
+  });
+
+  it("without a ceiling the same 20 GiB run is under the fraction-derived 25 GiB cap and is not trimmed", async () => {
+    const h = harness({ volume: BIG_VOLUME });
+    watch(h, "r1", 20 * GIB);
+    await h.gov.boundary("r1", quiet);
+    assert.strictEqual(h.trims.length, 0);
+  });
+
   it("a run under the cap is neither trimmed nor parked", async () => {
     const h = harness();
     watch(h, "r1", CAP - 1);

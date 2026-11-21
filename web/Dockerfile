@@ -81,6 +81,9 @@ COPY fixtures/policy-hold/ /app/fixtures/policy-hold/
 # issue #3250: the hold presentation table and the run start-options cases the web and the CLI share.
 COPY fixtures/hold-reasons/ /app/fixtures/hold-reasons/
 COPY fixtures/run-start-options/ /app/fixtures/run-start-options/
+# Same reason for the planning-defaults cases (PRD #3252): mockApi.planningDefaults.test.ts statically imports
+# `../../../fixtures/settings/planning-defaults-cases.json`, shared with the Go handler test.
+COPY fixtures/settings/ /app/fixtures/settings/
 RUN npm run build
 
 # --- runtime stage ---

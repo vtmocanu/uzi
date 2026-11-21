@@ -1315,6 +1315,15 @@ export interface ClaimConfig {
   /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
    *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
   default_effort_source?: LeadEffortSource;
+  /** PRD #3252: the Claude lead's planning-phase model/effort, present only on a Claude lead-lane
+   *  claim whose owner/schedule configured a planning value. Each key resolves independently:
+   *  an absent key means the planning phase uses the implement value. Sources are omitted when empty. */
+  plan_phase?: {
+    model?: string;
+    effort?: EffortLevel;
+    model_source?: LeadModelSource;
+    effort_source?: LeadEffortSource;
+  };
   /** Issue #3251: the opaque catalog context (64 lowercase hex) of a Codex lead-lane claim with a
    *  complete credential binding; echoed verbatim when reporting the catalog default effort. */
   codex_catalog_context?: string;
@@ -2517,6 +2526,8 @@ export interface CompletionPermitResponse {
 /** issue #3194: the `hold_reason` of the `--require-base` base-attestation hold (POST
  *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
 export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
+/** Issue #3252: the owner hold an active Claude run parks on when the runtime did not switch between the planning and implementation model or effort. */
+export const PHASE_SWITCH_HOLD_REASON = "phase_switch_unavailable";
 
 export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
 
@@ -2530,6 +2541,15 @@ export const PLAN_AGENT_SOURCE_FEATURE = "plan_agent_source_v1";
 export type BaseAttestationHoldOutcome =
   | { outcome: "held"; status: string }
   | { outcome: "stale"; status: string }
+  | { outcome: "unknown"; detail: string };
+
+/** Issue #3252: what one phase-switch hold request established. `held` is the server's positive ACK
+ *  (paused + phase_switch_unavailable); `refused` is a 409 carrying the row's current status and hold
+ *  reason (and `reason` such as plan_not_approved); `unknown` proves neither (transport, 5xx, a 404, a
+ *  400 or an unreadable body). */
+export type PhaseSwitchHoldOutcome =
+  | { outcome: "held"; status: string }
+  | { outcome: "refused"; status: string; holdReason: string | null; reason?: string }
   | { outcome: "unknown"; detail: string };
 
 /** Dedicated iteration park evidence. Counters/allowances are positive int32 values;

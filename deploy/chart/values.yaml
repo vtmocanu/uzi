@@ -902,6 +902,19 @@ workers:
   # an aggregate worker limit. See docs/configuration.md.
   goBuildParallelism: ""
   goMaxProcs: ""
+  # Optional per-run cache cap settings (issue #4576). Relayed through
+  # UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES / UZI_WORKER_RUN_CACHE_CAP_FRACTION to the worker
+  # pod's UZI_RUN_CACHE_CAP_MAX_BYTES / UZI_RUN_CACHE_CAP_FRACTION.
+  #   - Empty means nothing is rendered and the worker defaults apply (a 15 GiB ceiling,
+  #     a 0.5 fraction).
+  #   - Any nonempty STRING is relayed verbatim: "off" disables the ceiling, and an invalid
+  #     string reaches the worker, whose lenient parser falls back to its default.
+  #   - Quote the value in YAML or use --set-string. A typed value (integer, boolean,
+  #     unquoted number, unquoted off) fails the render with "must be a string".
+  #   - --set-string splits on commas.
+  #   - Setting or changing a value changes the pod spec and rolls hosted workers.
+  runCacheCapMaxBytes: ""
+  runCacheCapFraction: ""
   # The WORKER container's requests.ephemeral-storage (issue #224 →
   # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
   # INSTEAD of this, not on top of it.

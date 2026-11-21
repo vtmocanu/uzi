@@ -42,6 +42,7 @@ import {
   decodeResult,
   decodeUserItems,
   orphanInstanceKind,
+  gatedPromptStream,
   promptStream,
   providerErrorMessage,
   sessionIdOf,
@@ -54,6 +55,8 @@ import {
   type RateLimitObservation,
 } from "./limit.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
+import { expectedAppliedModel, expectedOmittedEffort } from "./claude-canonical-models.js";
+import { PhaseSwitchUnverifiedError, type PhaseSettings, type PhaseSwitchCause } from "./phase-switch-unverified.js";
 import type { UsageLeg, UsageSink } from "./usage-recorder.js";
 import { ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { GUARDED_COMMAND_TOOL } from "./claude-command/grants.js";
@@ -146,6 +149,9 @@ type SdkQueryInstance = AsyncIterable<SDKMessage> & {
 
 /** PRD #3244 M2 settings probe bound, in ms. */
 const SETTINGS_PROBE_TIMEOUT_MS = 2000;
+
+/** PRD #3252 D8: bound of the pre-prompt settings barrier (one `getSettings` while the prompt is withheld). */
+const PHASE_BARRIER_TIMEOUT_MS = 30_000;
 
 export interface SettingsProbeTimers {
   setTimeout(fn: () => void, ms: number): unknown;
@@ -286,7 +292,7 @@ export interface ClaudeHarnessDeps {
   /** Per-run SDK HOME, for session inspection. */
   homeDir: string;
   /** PRD #3244 M2: bound and timers of the single settings probe (tests inject the timers). */
-  settingsProbe?: { timeoutMs?: number; timers?: SettingsProbeTimers };
+  settingsProbe?: { timeoutMs?: number; barrierTimeoutMs?: number; timers?: SettingsProbeTimers };
 }
 
 export class ClaudeHarness implements RunHarness {
@@ -427,8 +433,12 @@ export class ClaudeHarness implements RunHarness {
       // exactly where the pre-extraction loop created the query.
       // issue #2213: the last statement before the credential-bearing provider spawn.
       assertResidueQuarantineOpen("provider_turn");
+      const verify = request.verifyApplied;
+      let releasePrompt: (() => void) | undefined;
       queryInstance = deps.queryFn({
-        prompt: promptStream(request.prompt),
+        prompt: verify
+          ? gatedPromptStream(request.prompt, new Promise<void>((resolve) => { releasePrompt = resolve; }), sdkAbort.signal)
+          : promptStream(request.prompt),
         options: turnOptions,
       });
       setReader(queryInstance);
@@ -436,8 +446,38 @@ export class ClaudeHarness implements RunHarness {
       // issue #2014: one usage leg per query(); its close marker is enqueued in the finally below.
       const leg = sink?.startLeg();
       let runtimeConfigPending = request.onRuntimeConfig;
+      let admitted: PhaseSettings | undefined;
       try {
+        if (verify) {
+          try {
+            admitted = await verifyAppliedSettings(
+              queryInstance,
+              verify,
+              deps.settingsProbe?.barrierTimeoutMs ?? PHASE_BARRIER_TIMEOUT_MS,
+              deps.settingsProbe?.timers ?? realProbeTimers,
+              sdkAbort.signal,
+            );
+          } catch (err) {
+            sdkAbort.abort();
+            throw err;
+          }
+          if (admitted !== undefined) {
+            releasePrompt?.();
+            try {
+              request.onPhaseVerified?.();
+            } catch (err) {
+              deps.log.warn("phase verified callback threw", { error: err instanceof Error ? err.message : String(err) });
+            }
+          }
+        }
         for await (const msg of queryInstance) {
+          if (admitted !== undefined && isLeadInitFrame(msg)) {
+            const contradiction = initContradiction(asRecord(msg)!, admitted, verify!);
+            if (contradiction) {
+              sdkAbort.abort();
+              throw contradiction;
+            }
+          }
           if (runtimeConfigPending && isLeadInitFrame(msg)) {
             const cb = runtimeConfigPending;
             runtimeConfigPending = undefined;
@@ -593,6 +633,89 @@ export class ClaudeHarness implements RunHarness {
     }
     return { kind: "activity", sessionId, orphanInstanceFrameKind };
   }
+}
+
+/**
+ * PRD #3252 D8: the pre-prompt settings barrier. Reads the runtime's applied settings once (feature-
+ * detected, bounded) and compares them with the requested pair; only a match returns the admitted pair.
+ * Every other outcome throws a {@link PhaseSwitchUnverifiedError}, so the caller aborts the query before
+ * the withheld prompt is ever released. An unknown expectation or a malformed answer is a failure, never
+ * a pass. Returns undefined, throwing nothing, when the turn itself was already aborted: the owner's
+ * trip then decides the outcome.
+ */
+async function verifyAppliedSettings(
+  qi: SdkQueryInstance,
+  requested: PhaseSettings,
+  timeoutMs: number,
+  timers: SettingsProbeTimers,
+  signal: AbortSignal,
+): Promise<PhaseSettings | undefined> {
+  const fail = (cause: PhaseSwitchCause, observed: PhaseSettings = {}): never => {
+    throw new PhaseSwitchUnverifiedError(cause, requested, observed);
+  };
+  const getSettings = qi.getSettings;
+  if (typeof getSettings !== "function") return fail("method_missing");
+  if (signal.aborted) return undefined;
+  let handle: unknown;
+  let onAbort: (() => void) | undefined;
+  let response: unknown;
+  try {
+    response = await Promise.race([
+      getSettings.call(qi),
+      new Promise<never>((_, reject) => {
+        handle = timers.setTimeout(() => reject(new TimeoutMarker()), timeoutMs);
+      }),
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(new TurnAbortedMarker());
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } catch (err) {
+    if (signal.aborted) return undefined;
+    return fail(err instanceof TimeoutMarker ? "timeout" : "malformed");
+  } finally {
+    if (handle !== undefined) timers.clearTimeout(handle);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+  const applied = asRecord(asRecord(response)?.["applied"]);
+  if (!applied) return fail("malformed");
+  const observed: PhaseSettings = {
+    ...(typeof applied["model"] === "string" ? { model: applied["model"] } : {}),
+    ...(typeof applied["effort"] === "string" ? { effort: applied["effort"] } : {}),
+  };
+  const expectation = expectedAppliedModel(requested.model);
+  if (expectation.kind === "uncharacterized") return fail("no_characterized_expectation", observed);
+  if (expectation.kind === "id") {
+    if (observed.model === undefined) return fail("malformed", observed);
+    if (observed.model !== expectation.id) return fail("model_mismatch", observed);
+  }
+  let expectedEffort = requested.effort;
+  if (expectedEffort === undefined) {
+    if (observed.model === undefined) return fail("malformed", observed);
+    expectedEffort = expectedOmittedEffort(observed.model);
+    if (expectedEffort === undefined) return fail("no_characterized_expectation", observed);
+  }
+  if (observed.effort === undefined) return fail("malformed", observed);
+  if (observed.effort !== expectedEffort) return fail("effort_mismatch", observed);
+  return observed;
+}
+
+class TimeoutMarker extends Error {}
+class TurnAbortedMarker extends Error {}
+
+/** After release: an init frame that names a model or effort other than the admitted pair stops the turn.
+ *  A missing optional init field is not a contradiction. */
+function initContradiction(init: Record<string, unknown>, admitted: PhaseSettings, requested: PhaseSettings): PhaseSwitchUnverifiedError | undefined {
+  const model = typeof init["model"] === "string" ? init["model"] : undefined;
+  const effort = typeof init["effort"] === "string" ? init["effort"] : undefined;
+  const observed: PhaseSettings = { ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) };
+  if (model !== undefined && admitted.model !== undefined && model !== admitted.model) {
+    return new PhaseSwitchUnverifiedError("model_mismatch", requested, observed);
+  }
+  if (effort !== undefined && admitted.effort !== undefined && effort !== admitted.effort) {
+    return new PhaseSwitchUnverifiedError("effort_mismatch", requested, observed);
+  }
+  return undefined;
 }
 
 /** The lead's own init frame (a subagent frame carries a parent tool-use id). */

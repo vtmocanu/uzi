@@ -626,6 +626,12 @@ type RenderConfig struct {
 	// (and its spec hash) byte-identical.
 	GoBuildParallelism int
 	GoMaxProcs         int
+	// RunCacheCapMaxBytes / RunCacheCapFraction are relayed verbatim as the worker
+	// container's UZI_RUN_CACHE_CAP_MAX_BYTES / UZI_RUN_CACHE_CAP_FRACTION. Empty omits
+	// the env (no trimming or parsing here; the worker parses leniently), so unset config
+	// leaves the pod template and its spec hash byte-identical.
+	RunCacheCapMaxBytes string
+	RunCacheCapFraction string
 	// CrossCheckSlots is rendered as WORKER_CROSS_CHECK_SLOTS without a fallback:
 	// zero disables cross-checks. config.Load supplies the production default 1.
 	CrossCheckSlots int
@@ -1189,6 +1195,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 	if cfg.GoMaxProcs > 0 {
 		env = append(env, corev1.EnvVar{Name: "WORKER_GO_MAXPROCS", Value: strconv.Itoa(cfg.GoMaxProcs)})
+	}
+	if cfg.RunCacheCapMaxBytes != "" {
+		env = append(env, corev1.EnvVar{Name: "UZI_RUN_CACHE_CAP_MAX_BYTES", Value: cfg.RunCacheCapMaxBytes})
+	}
+	if cfg.RunCacheCapFraction != "" {
+		env = append(env, corev1.EnvVar{Name: "UZI_RUN_CACHE_CAP_FRACTION", Value: cfg.RunCacheCapFraction})
 	}
 	if len(cfg.workerCABundle()) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch

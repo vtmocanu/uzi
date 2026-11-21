@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -26,6 +27,13 @@ type predictFake struct {
 	templates      []store.AgentTemplate
 	pinsErr        error
 	candidateReads int
+	// planning is the owner's Claude planning pair (PRD #3252); planningErr fails the strict read.
+	planning    store.GetUserPlanningClaudeRow
+	planningErr error
+}
+
+func (f *predictFake) GetUserPlanningClaude(context.Context, uuid.UUID) (store.GetUserPlanningClaudeRow, error) {
+	return f.planning, f.planningErr
 }
 
 func (f *predictFake) GetUserDefaultHarness(context.Context, uuid.UUID) (pgtype.Text, error) {
@@ -531,6 +539,46 @@ func TestPredictLeadSubagents(t *testing.T) {
 		got := predictLead(t, f, HarnessClaude, nil, false, false).Subagents
 		if len(got.Pinned) != 32 || !got.PinnedTruncated || got.Pinned[0].Name != "agent-01" || got.Pinned[31].Name != "agent-32" {
 			t.Fatalf("pinned = %d truncated=%v first=%v last=%v", len(got.Pinned), got.PinnedTruncated, got.Pinned[0], got.Pinned[len(got.Pinned)-1])
+		}
+	})
+}
+
+// TestPredictLeadPlanPair pins the plan pair PredictLead carries (PRD #3252): Claude only, nil when
+// no planning value applies, and the frozen schedule pin wins the plan model.
+func TestPredictLeadPlanPair(t *testing.T) {
+	planning := store.GetUserPlanningClaudeRow{PlanningClaudeModel: pgconv.TextOrNull("opus"), PlanningClaudeEffort: pgconv.TextOrNull("high")}
+	t.Run("claude planning pair", func(t *testing.T) {
+		f := &predictFake{poolFakeStore: &poolFakeStore{}, pins: pinRow(nil), planning: planning}
+		got := predictLead(t, f, HarnessClaude, nil, false, false)
+		want := &ClaimPhaseSettings{Model: strp("opus"), Effort: strp("high"), ModelSource: "user_planning_default", EffortSource: "user_planning_default"}
+		if !reflect.DeepEqual(got.Plan, want) {
+			t.Fatalf("plan = %+v, want %+v", got.Plan, want)
+		}
+	})
+	t.Run("nothing set predicts no plan", func(t *testing.T) {
+		f := &predictFake{poolFakeStore: &poolFakeStore{}, pins: pinRow(nil)}
+		if got := predictLead(t, f, HarnessClaude, nil, false, false); got.Plan != nil {
+			t.Fatalf("plan = %+v, want nil", got.Plan)
+		}
+	})
+	t.Run("codex never reads the planning pair", func(t *testing.T) {
+		f := &predictFake{poolFakeStore: &poolFakeStore{}, pins: pinRow(nil), planning: planning, planningErr: errors.New("must not be read")}
+		if got := predictLead(t, f, HarnessCodex, nil, false, false); got.Plan != nil {
+			t.Fatalf("plan = %+v, want nil", got.Plan)
+		}
+	})
+	t.Run("a schedule pin is the plan model", func(t *testing.T) {
+		f := &predictFake{poolFakeStore: &poolFakeStore{}, pins: pinRow(nil), planning: planning}
+		got := predictLead(t, f, HarnessClaude, strp("sonnet"), false, false)
+		want := &ClaimPhaseSettings{Model: strp("sonnet"), Effort: strp("high"), ModelSource: "schedule_pin", EffortSource: "user_planning_default"}
+		if !reflect.DeepEqual(got.Plan, want) {
+			t.Fatalf("plan = %+v, want %+v", got.Plan, want)
+		}
+	})
+	t.Run("a planning read error fails the prediction", func(t *testing.T) {
+		f := &predictFake{poolFakeStore: &poolFakeStore{}, pins: pinRow(nil), planningErr: errors.New("boom")}
+		if _, err := (&Service{q: f}).PredictLead(context.Background(), uuid.New(), HarnessClaude, nil, false, false); err == nil {
+			t.Fatal("PredictLead swallowed a planning read error")
 		}
 	})
 }

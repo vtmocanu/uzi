@@ -328,6 +328,36 @@ describe("loadConfig cache cap and pressure stop knobs (PRD #1809 D4)", () => {
       assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_LOW_WATER: v })).runCacheLowWater, 0.6, `value ${v}`);
     }
   });
+
+  describe("UZI_RUN_CACHE_CAP_MAX_BYTES, the absolute per-run ceiling", () => {
+    const DEFAULT_MAX = 16106127360;
+
+    it("defaults to 15 GiB", () => {
+      assert.strictEqual(loadConfig(baseEnv()).runCacheCapMaxBytes, DEFAULT_MAX);
+    });
+
+    it("falls back to the default on unset, blank and invalid values", () => {
+      const bad = ["", "   ", "0", "000", "-1", "1.5", "Infinity", "NaN", "9007199254740993", "1e10", "0x10", "+5", "15GiB", "abc"];
+      for (const v of bad) {
+        assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_MAX_BYTES: v })).runCacheCapMaxBytes, DEFAULT_MAX, `value ${JSON.stringify(v)}`);
+      }
+    });
+
+    it("honours a positive integer, leading zeros included", () => {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_MAX_BYTES: "1073741824" })).runCacheCapMaxBytes, 1073741824);
+      assert.strictEqual(loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_MAX_BYTES: "0001073741824" })).runCacheCapMaxBytes, 1073741824);
+    });
+
+    it("a trimmed, case-insensitive off disables only the ceiling", () => {
+      assert.strictEqual(loadConfig(baseEnv()).runCacheCapMaxBytes, DEFAULT_MAX, "control: unset gives the default");
+      for (const v of ["off", " OFF ", "Off"]) {
+        const c = loadConfig(baseEnv({ UZI_RUN_CACHE_CAP_MAX_BYTES: v }));
+        assert.strictEqual(Object.hasOwn(c, "runCacheCapMaxBytes"), true, `value ${JSON.stringify(v)}: the key is present`);
+        assert.strictEqual(c.runCacheCapMaxBytes, undefined, `value ${JSON.stringify(v)}`);
+        assert.strictEqual(c.runCacheCapFraction, 0.5, `value ${JSON.stringify(v)}: the fraction is untouched`);
+      }
+    });
+  });
 });
 
 // PRD #1391 M1: the outbox knobs. These pin the VALUES (not just "parses to a

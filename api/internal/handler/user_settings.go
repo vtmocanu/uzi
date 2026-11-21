@@ -110,6 +110,13 @@ type userSettingsDTO struct {
 	// EffortSettings is the read-only resolved view of both ordinary effort preferences
 	// (PRD #3247), ordered claude then codex. It is never accepted on a PUT.
 	EffortSettings []apitypes.EffortSettingCellDTO `json:"effort_settings"`
+	// PlanningClaudeModel and PlanningClaudeEffort are the owner's Claude planning pair (PRD
+	// #3252): null = "Same as the run". PlanningModels and PlanningEfforts are the read-only
+	// resolved views (Claude entry only); they are never accepted on a PUT.
+	PlanningClaudeModel  *string                         `json:"planning_claude_model"`
+	PlanningClaudeEffort *string                         `json:"planning_claude_effort"`
+	PlanningModels       []apitypes.ModelSettingCellDTO  `json:"planning_models"`
+	PlanningEfforts      []apitypes.EffortSettingCellDTO `json:"planning_efforts"`
 	// WeeklyReservePct and WeeklyReservePauseRunning are the weekly usage reserve (PRD
 	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
@@ -149,7 +156,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		slog.Error("get user settings", "error", err)
 		return userSettingsDTO{}, err
 	}
-	pins, leadCodexPin, err := h.crossCheckPinSettings(r.Context(), userID)
+	pins, leadCodexPin, leadClaudePin, err := h.crossCheckPinSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get cross-check pins", "error", err)
 		return userSettingsDTO{}, err
@@ -208,6 +215,8 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 	// The codex cell's catalog default (issue #3251): the lane default_codex_model wins, then
 	// the lead template's Codex pin read with the pin rows above, then the provider default.
 	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
+	planningModel := textPtrValue(s.PlanningClaudeModel.Valid, s.PlanningClaudeModel.String)
+	planningEffort := textPtrValue(s.PlanningClaudeEffort.Valid, s.PlanningClaudeEffort.String)
 	return userSettingsDTO{
 		VaultAutoReunlock:      settingsAutoReunlock(r),
 		CrossCheckPins:         pins,
@@ -240,6 +249,12 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 			textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
 			textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
 			catalogDefault),
+		PlanningClaudeModel:  planningModel,
+		PlanningClaudeEffort: planningEffort,
+		PlanningModels: planningModelCells(planningModel,
+			textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+			textPtrValue(leadClaudePin.Valid, leadClaudePin.String)),
+		PlanningEfforts:           planningEffortCells(planningEffort, textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String)),
 		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		CodexAccountMode:          codexMode,
@@ -344,6 +359,11 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		// absent ⇒ column unchanged, null ⇒ clear to NULL ("same as the run"), a
 		// claude|codex value ⇒ validated then set.
 		JudgeRunsOn json.RawMessage `json:"judge_runs_on"`
+		// planning_claude_model / planning_claude_effort (PRD #3252), same absent/null/value
+		// tri-state: absent ⇒ unchanged, null or blank ⇒ clear ("Same as the run"), a validated
+		// value ⇒ set. planning_models / planning_efforts are read-only and rejected as unknown.
+		PlanningClaudeModel  json.RawMessage `json:"planning_claude_model"`
+		PlanningClaudeEffort json.RawMessage `json:"planning_claude_effort"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -526,6 +546,28 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		judgeRunsOnVal = v
+	}
+
+	var planningModelVal pgtype.Text
+	planningModelPresent := req.PlanningClaudeModel != nil
+	if planningModelPresent {
+		v, ferr := decodePlanningClaudeModelField(req.PlanningClaudeModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningModelVal = v
+	}
+
+	var planningEffortVal pgtype.Text
+	planningEffortPresent := req.PlanningClaudeEffort != nil
+	if planningEffortPresent {
+		v, ferr := decodePlanningEffortField(req.PlanningClaudeEffort)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningEffortVal = v
 	}
 
 	var mrVal pgtype.Bool
@@ -734,6 +776,20 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			CodexJudgeModel: codexJudgeVal,
 		}); err != nil {
 			slog.Error("set user codex judge model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if planningModelPresent || planningEffortPresent {
+		if _, err := h.q.SetUserPlanningClaude(r.Context(), store.SetUserPlanningClaudeParams{
+			ID:                   user.ID,
+			SetModel:             planningModelPresent,
+			PlanningClaudeModel:  planningModelVal,
+			SetEffort:            planningEffortPresent,
+			PlanningClaudeEffort: planningEffortVal,
+		}); err != nil {
+			slog.Error("set user planning claude", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
