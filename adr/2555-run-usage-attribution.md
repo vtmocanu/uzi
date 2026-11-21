@@ -120,3 +120,37 @@ Future consumers must distinguish accounting evidence from visible activity and
 preserve raw cursor progress. Changing adoption or pricing to improve presentation,
 using token values as Codex response identity, or attributing an unbound child to lead
 would violate this contract.
+
+## Amendment (#4580, 2026-11-21)
+
+The decision above stands. This amendment lets the Codex accountant attribute one
+thread's usage to more than one model. It does not change what is recorded or billed.
+
+- **Segments.** A thread's usage is split into model segments. Root response
+  attribution uses the root thread's current segment model, which qualifies "The root
+  uses the lead lane and its registered model": the registered model is the current
+  segment's, not necessarily the first. Child lane and identity rules are unchanged,
+  and attribution stays distinct from result-frame billing.
+- **Cuts.** A cut is made only after the caller has recorded the historical replay
+  boundary, so replayed history stays in the earlier segment or is never charged. The
+  first registration of a thread still wins and claim-shared deduplication is kept.
+- **Admission.** The monotone gate covers seven columns: the six wire buckets plus
+  clamped uncached input. A malformed reasoning or `totalTokens` dip on an advancing
+  note is refused, the model is reported `unreported`, and proven tokens are retained.
+- **Reconciliation and pricing** run per segment on that segment's own responses and
+  evidence flag. A segment that misses a response degrades only its own model.
+  Incompleteness of the thread taints every segment model.
+- **Rebinding an incomplete thread** keeps the replaced model as a zero-token
+  `unreported` entry (PRD D5). Healthy rebinds drop the old model.
+- **Uncached input** for threads with two or more segments is the difference of
+  clamped cumulative uncached values per segment, so it is conserved per thread under
+  malformed cache splits. A malformed split at any boundary marks the thread
+  incomplete, every segment model `unreported`, tokens retained (PRD D6). Single-segment
+  output is unchanged. Incompleteness also sets the claim-wide `usageIncomplete`,
+  which an uncut thread with the same data does not; this asymmetry is accepted.
+- **Not shipped.** No production caller cuts a segment yet; #3253 supplies that
+  integration. Until then the new behavior is reachable only from tests, and
+  production attribution is the single-model behavior described above.
+
+Rationale and rejected alternatives are in the PRD Decision Log
+([PRD #4580](../prds/4580-codex-usage-model-segments.md)).
