@@ -14,9 +14,21 @@ package store_test
 // candidates, UZI_POOL_MEMORY_MAX_RECYCLE_WAIT (12m) cap on one recycling candidate's run,
 // UZI_POOL_MEMORY_DISCOVER=1 (run only the breadth table once and write each entry's
 // observed outcome, used to re-pin the table after a schema change), UZI_POOL_MEMORY_REPS (2)
-// memory repetitions per candidate, and UZI_POOL_MEMORY_PHASES (all) a comma list of
-// memory,latency,cold,wide,stress to run only those phases, so one run can be split into
-// several go test invocations.
+// memory repetitions per candidate (an integer >= 1, else the test fails),
+// UZI_POOL_MEMORY_PHASES (all) a comma list of memory,latency,cold,wide,stress,explain to run
+// only those phases, so one run can be split into several go test invocations, and
+// UZI_POOL_MEMORY_JIT (default) "default" or "off": "off" runs ALTER DATABASE <clone> SET
+// jit = off on every clone right after creating it, before any measured connection opens.
+// That is a measurement control only; product code and server defaults are untouched.
+//
+// PRIMARY METRIC: Anonymous (smaps_rollup), the process's private heap. Every headline
+// number (steady state, sampled peak, the per-connection-age buckets) is keyed on Anonymous
+// first, with the Private_Clean+Private_Dirty variants beside it. Private_Clean is NOT a heap
+// metric: it counts file-backed pages only this backend has mapped, such as the LLVM JIT
+// libraries once a backend JIT-compiles a statement (each post-round sample reads the
+// backend's memory-map listing through pg_read_file and records whether any mapped path
+// contains "llvm", and the first round it did). Run once with UZI_POOL_MEMORY_JIT=default and
+// once with off to separate the JIT confound.
 //
 // Isolation: the schema and fixture are seeded ONCE into database pm_template on the server
 // named by UZI_TEST_DATABASE_URL (which is also where the throwaway marker is checked and
@@ -143,15 +155,45 @@ func pmEnvDuration(key string, def time.Duration) time.Duration {
 	return def
 }
 
-func pmEnvInt(key string, def int) int {
-	if s := os.Getenv(key); s != "" {
-		n, err := strconv.Atoi(s)
-		if err != nil {
-			panic(fmt.Sprintf("%s=%q: %v", key, s, err))
-		}
-		return n
+// pmEnvMinInt reads an integer knob that must be >= min; anything else is a t.Fatalf with a
+// message, never a panic.
+func pmEnvMinInt(t *testing.T, key string, def, minVal int) int {
+	t.Helper()
+	s := os.Getenv(key)
+	if s == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		t.Fatalf("%s=%q: not an integer (%v)", key, s, err)
+	}
+	if n < minVal {
+		t.Fatalf("%s=%d: must be >= %d", key, n, minVal)
+	}
+	return n
+}
+
+func pmSortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// pmJITSetting returns the validated UZI_POOL_MEMORY_JIT value: "default" or "off".
+func pmJITSetting(t *testing.T) string {
+	t.Helper()
+	switch v := strings.TrimSpace(os.Getenv("UZI_POOL_MEMORY_JIT")); v {
+	case "", "default":
+		return "default"
+	case "off":
+		return "off"
+	default:
+		t.Fatalf("UZI_POOL_MEMORY_JIT=%q: want default or off", v)
+		return ""
+	}
 }
 
 // ---------------------------------------------------------------------------------------
@@ -305,7 +347,21 @@ const (
 	pmSkipKey pmCtxKey = iota + 1
 	pmSQLKey
 	pmViaQueryKey
+	pmCaptureKey
 )
+
+// pmArgTracer records the arguments of the one call made with pmCaptureKey in its context,
+// so the explain phase can replay ClaimRun with exactly the bindings the sqlc method sends.
+type pmArgTracer struct{ got *[]any }
+
+func (tr pmArgTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	if ctx.Value(pmCaptureKey) != nil {
+		*tr.got = append([]any(nil), d.Args...)
+	}
+	return ctx
+}
+
+func (pmArgTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 // pmSkip marks a call as measurement plumbing: the tracer neither counts it as a served
 // execution nor as a statement identity.
@@ -321,7 +377,16 @@ type pmPID struct {
 	PlanCacheMode string
 	PeakPrivateKB int64
 	PeakSampleAge float64
+	PeakAnonKB    int64
+	PeakAnonAge   float64
 	HWMKB         int64
+	// JIT is SHOW jit on this backend, read once through the measured connection.
+	JIT string
+	// LLVM* record the first post-round sample whose backend had an llvm-named mapping.
+	LLVMSeen  bool
+	LLVMRound int
+	LLVMAgeS  float64
+	LLVMPaths map[string]struct{}
 }
 
 type pmTracer struct{ env *pmEnv }
@@ -359,9 +424,10 @@ type pmMem struct {
 	AnonymousKB    int64 `json:"anonymous_kb"`
 	RssKB          int64 `json:"rss_kb"`
 	PssKB          int64 `json:"pss_kb"`
-	// PssShmemKB is smaps_rollup's Pss_Shmem when the kernel reports it. It includes
-	// shared_buffers shmem pages that only this backend has mapped, so it is not a heap metric.
-	PssShmemKB     *int64 `json:"pss_shmem_kb_includes_shmem_pages_only_this_backend_mapped,omitempty"`
+	// PssShmemKB is smaps_rollup's Pss_Shmem when the kernel reports it. It includes a
+	// proportional share of shmem pages mapped by several processes (shared_buffers) as well
+	// as pages only this backend has mapped, so it is not a heap metric.
+	PssShmemKB     *int64 `json:"pss_shmem_kb_includes_proportional_share_of_shared_shmem,omitempty"`
 	VmHWMKB        int64  `json:"vmhwm_kb_includes_shared"`
 	VmRSSKB        int64  `json:"vmrss_kb"`
 	CgroupCurrentB *int64 `json:"cgroup_memory_current_bytes"`
@@ -486,6 +552,44 @@ func (o *pmObserver) read(ctx context.Context, pid uint32, raw *[3]string) (pmMe
 	return m, nil
 }
 
+// pmLLVMPaths returns the deduplicated, sorted mapped paths whose name contains "llvm"
+// (case-insensitive) from the text of a backend's memory-map listing. A line is
+// "addr perms offset dev inode path"; the path is everything after the fifth field.
+func pmLLVMPaths(maps string) []string {
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(maps, "\n") {
+		fs := strings.Fields(line)
+		if len(fs) < 6 {
+			continue
+		}
+		path := strings.Join(fs[5:], " ")
+		if strings.Contains(strings.ToLower(path), "llvm") {
+			seen[path] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// llvmMaps reads the backend's memory-map listing through the observer and returns the
+// llvm-named mapped paths.
+func (o *pmObserver) llvmMaps(ctx context.Context, pid uint32) ([]string, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var maps string
+	if err := o.conn.QueryRow(ctx, `SELECT pg_read_file($1::text)`, fmt.Sprintf("/proc/%d/maps", pid)).Scan(&maps); err != nil {
+		return nil, fmt.Errorf("read maps of pid %d: %w", pid, err)
+	}
+	if strings.TrimSpace(maps) == "" {
+		return nil, fmt.Errorf("empty maps read for pid %d", pid)
+	}
+	return pmLLVMPaths(maps), nil
+}
+
 func (o *pmObserver) queryRow(ctx context.Context, sql string, args []any, dest ...any) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -524,6 +628,8 @@ type pmSample struct {
 	Executions int64        `json:"executions_served"`
 	Identities int          `json:"identities_cumulative"`
 	Mem        pmMem        `json:"mem"`
+	LLVMMapped bool         `json:"llvm_mapped"`
+	LLVMPaths  []string     `json:"llvm_paths,omitempty"`
 	Retained   *int         `json:"retained_statements,omitempty"`
 	Generic    *int64       `json:"generic_plans,omitempty"`
 	Custom     *int64       `json:"custom_plans,omitempty"`
@@ -541,6 +647,9 @@ type pmEnv struct {
 	dsn  string
 	cand pmCand
 	rep  int // memory repetition (1-based); 0 outside the memory phase
+	// jitSetting is UZI_POOL_MEMORY_JIT (default or off); off makes AfterConnect fail closed
+	// unless the measured backend really reports jit = off.
+	jitSetting string
 	// dbName is the clone database this environment's pool and observer are connected to.
 	dbName string
 	fx     *pmFixture
@@ -567,7 +676,7 @@ type pmEnv struct {
 
 func newPMEnv(t *testing.T, out *pmOut, dsn string, cand pmCand, fx *pmFixture, obs *pmObserver, rawDir string) *pmEnv {
 	return &pmEnv{t: t, out: out, dsn: dsn, cand: cand, fx: fx, obs: obs, start: time.Now(), rawDir: rawDir,
-		pids: map[uint32]*pmPID{}}
+		pids: map[uint32]*pmPID{}, jitSetting: pmJITSetting(t)}
 }
 
 func (e *pmEnv) pidRec(pid uint32) *pmPID {
@@ -632,12 +741,23 @@ func (e *pmEnv) openPool(ctx context.Context) {
 		if err := c.QueryRow(ctx, `SHOW plan_cache_mode`, pgx.QueryExecModeSimpleProtocol).Scan(&mode); err != nil {
 			return err
 		}
+		// Effective jit setting, read once per backend on the simple protocol (prepares
+		// nothing). pg_jit_available() is deliberately NOT run here: it initialises the JIT
+		// provider, which would map the LLVM libraries into the measured backend.
+		var jit string
+		if err := c.QueryRow(ctx, `SHOW jit`, pgx.QueryExecModeSimpleProtocol).Scan(&jit); err != nil {
+			return err
+		}
+		if e.jitSetting == "off" && jit != "off" {
+			return fmt.Errorf("UZI_POOL_MEMORY_JIT=off but SHOW jit = %q on the measured connection", jit)
+		}
 		pid := c.PgConn().PID()
 		e.mu.Lock()
 		p := e.pidRec(pid)
 		p.ConnectedAt = time.Now()
 		p.StmtCapacity = c.Config().StatementCacheCapacity
 		p.PlanCacheMode = mode
+		p.JIT = jit
 		e.mu.Unlock()
 		e.curPID.Store(pid)
 		return nil
@@ -998,6 +1118,11 @@ func (e *pmEnv) sampleHeld(ctx context.Context, c *pgxpool.Conn, kind string, ro
 	}
 	e.saveRaw(raw)
 	s.Mem = mem
+	llvm, err := e.obs.llvmMaps(ctx, pid)
+	if err != nil {
+		t.Fatalf("%s: llvm detection: %v", e.cand.Name, err)
+	}
+	s.LLVMMapped, s.LLVMPaths = len(llvm) > 0, llvm
 	s.ConnAgeS, s.Executions, s.Identities = e.pidStats(pid)
 	s.TMs = time.Since(e.start).Milliseconds()
 	// Working-set evidence, fail closed.
@@ -1013,6 +1138,17 @@ func (e *pmEnv) sampleHeld(ctx context.Context, c *pgxpool.Conn, kind string, ro
 	p := e.pidRec(pid)
 	if mem.VmHWMKB > p.HWMKB {
 		p.HWMKB = mem.VmHWMKB
+	}
+	if s.LLVMMapped {
+		if !p.LLVMSeen {
+			p.LLVMSeen, p.LLVMRound, p.LLVMAgeS = true, round, s.ConnAgeS
+		}
+		if p.LLVMPaths == nil {
+			p.LLVMPaths = map[string]struct{}{}
+		}
+		for _, lp := range llvm {
+			p.LLVMPaths[lp] = struct{}{}
+		}
 	}
 	e.mu.Unlock()
 	e.out.emit("sample", s)
@@ -1046,17 +1182,19 @@ func (e *pmEnv) postRoundSample(ctx context.Context, kind string, round int) pmS
 }
 
 type pmSamplerResult struct {
-	N          int     `json:"samples"`
-	Errors     int     `json:"errors"`
-	Dropped    int     `json:"dropped_for_recycled_pid"`
-	FirstError string  `json:"first_error,omitempty"`
-	MeanMs     float64 `json:"achieved_interval_mean_ms"`
-	P95Ms      float64 `json:"achieved_interval_p95_ms"`
-	MaxMs      float64 `json:"achieved_interval_max_ms"`
-	PeakKB     int64   `json:"peak_private_kb"`
-	PeakAnonKB int64   `json:"peak_anonymous_kb"`
-	PeakPID    uint32  `json:"peak_pid"`
-	PeakAgeS   float64 `json:"peak_conn_age_s"`
+	N            int     `json:"samples"`
+	Errors       int     `json:"errors"`
+	Dropped      int     `json:"dropped_for_recycled_pid"`
+	FirstError   string  `json:"first_error,omitempty"`
+	MeanMs       float64 `json:"achieved_interval_mean_ms"`
+	P95Ms        float64 `json:"achieved_interval_p95_ms"`
+	MaxMs        float64 `json:"achieved_interval_max_ms"`
+	PeakAnonKB   int64   `json:"peak_sampled_anonymous_kb"`
+	PeakAnonPID  uint32  `json:"peak_anonymous_pid"`
+	PeakAnonAgeS float64 `json:"peak_anonymous_conn_age_s"`
+	PeakKB       int64   `json:"peak_sampled_private_kb"`
+	PeakPID      uint32  `json:"peak_private_pid"`
+	PeakAgeS     float64 `json:"peak_private_conn_age_s"`
 }
 
 type pmSampler struct {
@@ -1106,6 +1244,9 @@ func (e *pmEnv) startSampler(ctx context.Context) *pmSampler {
 			if mem.PrivateKB > p.PeakPrivateKB {
 				p.PeakPrivateKB, p.PeakSampleAge = mem.PrivateKB, age
 			}
+			if mem.AnonymousKB > p.PeakAnonKB {
+				p.PeakAnonKB, p.PeakAnonAge = mem.AnonymousKB, age
+			}
 			if mem.VmHWMKB > p.HWMKB {
 				p.HWMKB = mem.VmHWMKB
 			}
@@ -1114,7 +1255,7 @@ func (e *pmEnv) startSampler(ctx context.Context) *pmSampler {
 				s.res.PeakKB, s.res.PeakPID, s.res.PeakAgeS = mem.PrivateKB, pid, age
 			}
 			if mem.AnonymousKB > s.res.PeakAnonKB {
-				s.res.PeakAnonKB = mem.AnonymousKB
+				s.res.PeakAnonKB, s.res.PeakAnonPID, s.res.PeakAnonAgeS = mem.AnonymousKB, pid, age
 			}
 			e.out.emit("sampler", map[string]any{"cand": e.cand.Name, "rep": e.rep, "t_ms": smp.TMs, "pid": pid, "conn_age_s": age,
 				"executions_served": execs, "identities_cumulative": idents, "private_kb": mem.PrivateKB,
@@ -2349,7 +2490,7 @@ type pmMemSummary struct {
 	SampledPeakAnonKB  int64            `json:"sampled_peak_anonymous_kb"`
 	SteadyPrivCleanKB  int64            `json:"steady_private_clean_kb"`
 	SteadyPrivDirtyKB  int64            `json:"steady_private_dirty_kb"`
-	SteadyPssShmemKB   *int64           `json:"steady_pss_shmem_kb_includes_shmem_pages_only_this_backend_mapped,omitempty"`
+	SteadyPssShmemKB   *int64           `json:"steady_pss_shmem_kb_includes_proportional_share_of_shared_shmem,omitempty"`
 	SteadyRssKB        int64            `json:"steady_rss_kb"`
 	SteadyPssKB        int64            `json:"steady_pss_kb"`
 	SteadyCgroupB      *int64           `json:"steady_cgroup_memory_current_bytes"`
@@ -2368,6 +2509,13 @@ type pmMemSummary struct {
 	SampledPeakKB      int64            `json:"sampled_peak_private_kb"`
 	Sampler            pmSamplerResult  `json:"sampler"`
 	AgeBucketsPrivate  map[string]int64 `json:"median_private_kb_by_conn_age_bucket,omitempty"`
+	AgeBucketsAnon     map[string]int64 `json:"median_anonymous_kb_by_conn_age_bucket,omitempty"`
+	JITSetting         string           `json:"jit_setting_requested"`
+	JITOnBackends      []string         `json:"show_jit_per_backend"`
+	LLVMMapped         bool             `json:"llvm_mapped_any_post_round_sample"`
+	LLVMPaths          []string         `json:"llvm_paths"`
+	LLVMFirstRound     *int             `json:"llvm_first_round"`
+	LLVMFirstConnAgeS  *float64         `json:"llvm_first_conn_age_s"`
 }
 
 func pmMedianOf(ss []pmSample, f func(pmSample) int64) int64 {
@@ -2389,7 +2537,7 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 	e.evictionDemo(ctx)
 	sampler := e.startSampler(ctx)
 
-	minRounds := pmEnvInt("UZI_POOL_MEMORY_ROUNDS", 20)
+	minRounds := pmEnvMinInt(t, "UZI_POOL_MEMORY_ROUNDS", 20, 1)
 	maxWait := pmEnvDuration("UZI_POOL_MEMORY_MAX_RECYCLE_WAIT", 12*time.Minute)
 	var post []pmSample
 	rounds := 0
@@ -2427,12 +2575,24 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 
 	e.mu.Lock()
 	sum := pmMemSummary{Cand: name, Rep: e.rep, Database: e.dbName, Desc: e.cand.Desc, Rounds: rounds, DurationS: time.Since(candStart).Seconds(),
-		BackendPIDs: len(e.order), Sampler: sres, SampledPeakKB: sres.PeakKB}
+		BackendPIDs: len(e.order), Sampler: sres, SampledPeakKB: sres.PeakKB, JITSetting: e.jitSetting}
 	var pidRecs []pmPID
+	llvmUnion := map[string]struct{}{}
 	for _, pid := range e.order {
 		p := *e.pids[pid]
 		p.Idents = nil
 		pidRecs = append(pidRecs, p)
+		sum.JITOnBackends = append(sum.JITOnBackends, p.JIT)
+		if p.LLVMSeen {
+			sum.LLVMMapped = true
+			if sum.LLVMFirstRound == nil || p.LLVMRound < *sum.LLVMFirstRound {
+				r, a := p.LLVMRound, p.LLVMAgeS
+				sum.LLVMFirstRound, sum.LLVMFirstConnAgeS = &r, &a
+			}
+			for lp := range p.LLVMPaths {
+				llvmUnion[lp] = struct{}{}
+			}
+		}
 		if n := len(e.pids[pid].Idents); n > sum.MaxIdentities {
 			sum.MaxIdentities = n
 		}
@@ -2441,6 +2601,7 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 		}
 	}
 	e.mu.Unlock()
+	sum.LLVMPaths = pmSortedKeys(llvmUnion)
 	sum.Recycles = len(pidRecs) - 1
 	for _, p := range pidRecs[1:] {
 		sum.RecycleAtS = append(sum.RecycleAtS, p.ConnectedAt.Sub(candStart).Seconds())
@@ -2452,8 +2613,10 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 		}
 		e.out.emit("pid", map[string]any{"cand": name, "rep": e.rep, "pid": p.PID, "connected_at": p.ConnectedAt, "closed_at": p.ClosedAt,
 			"lifetime_s": life.Seconds(), "executions_served": p.Executions, "identities": len(e.pids[p.PID].Idents),
-			"peak_sampled_private_kb": p.PeakPrivateKB, "peak_at_conn_age_s": p.PeakSampleAge, "vmhwm_kb_includes_shared": p.HWMKB,
-			"statement_cache_capacity": p.StmtCapacity, "plan_cache_mode": p.PlanCacheMode})
+			"peak_sampled_anonymous_kb": p.PeakAnonKB, "peak_anonymous_at_conn_age_s": p.PeakAnonAge,
+			"peak_sampled_private_kb": p.PeakPrivateKB, "peak_private_at_conn_age_s": p.PeakSampleAge, "vmhwm_kb_includes_shared": p.HWMKB,
+			"statement_cache_capacity": p.StmtCapacity, "plan_cache_mode": p.PlanCacheMode, "show_jit": p.JIT,
+			"llvm_mapped": p.LLVMSeen, "llvm_first_round": p.LLVMRound, "llvm_first_conn_age_s": p.LLVMAgeS, "llvm_paths": pmSortedKeys(p.LLVMPaths)})
 		if p.StmtCapacity != e.cand.capacity() || p.PlanCacheMode != "auto" {
 			t.Fatalf("%s: pid %d ran with statement cache capacity %d (want %d), plan_cache_mode %q (want auto)",
 				name, p.PID, p.StmtCapacity, e.cand.capacity(), p.PlanCacheMode)
@@ -2537,13 +2700,17 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 	}
 	if e.cand.Recycle {
 		buckets := map[string][]int64{}
+		anonBuckets := map[string][]int64{}
 		for _, s := range post {
 			b := fmt.Sprintf("%02d-%02ds", int(s.ConnAgeS)/10*10, int(s.ConnAgeS)/10*10+10)
 			buckets[b] = append(buckets[b], s.Mem.PrivateKB)
+			anonBuckets[b] = append(anonBuckets[b], s.Mem.AnonymousKB)
 		}
 		sum.AgeBucketsPrivate = map[string]int64{}
+		sum.AgeBucketsAnon = map[string]int64{}
 		for b, xs := range buckets {
 			sum.AgeBucketsPrivate[b] = pmMedianInt(xs)
+			sum.AgeBucketsAnon[b] = pmMedianInt(anonBuckets[b])
 		}
 	}
 	e.out.emit("candidate_summary", sum)
@@ -2838,6 +3005,190 @@ func pmRunWide(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pm
 }
 
 // ---------------------------------------------------------------------------------------
+// ClaimRun plan / execution / JIT split (phase "explain")
+
+type pmExplainDoc struct {
+	Plan struct {
+		TotalCost float64 `json:"Total Cost"`
+	} `json:"Plan"`
+	PlanningTime  float64 `json:"Planning Time"`
+	ExecutionTime float64 `json:"Execution Time"`
+	JIT           *struct {
+		Functions int `json:"Functions"`
+		Timing    struct {
+			Generation   float64 `json:"Generation"`
+			Inlining     float64 `json:"Inlining"`
+			Optimization float64 `json:"Optimization"`
+			Emission     float64 `json:"Emission"`
+			Total        float64 `json:"Total"`
+		} `json:"Timing"`
+	} `json:"JIT"`
+}
+
+type pmExplainExec struct {
+	JIT        string  `json:"jit_clone_setting"`
+	Rep        int     `json:"rep"`
+	PID        uint32  `json:"pid"`
+	Exec       int     `json:"execution_n"`
+	WallMs     float64 `json:"client_wall_ms"`
+	PlanningMs float64 `json:"planning_ms"`
+	ExecMs     float64 `json:"execution_ms"`
+	TotalCost  float64 `json:"plan_total_cost"`
+	JITPresent bool    `json:"jit_block_present"`
+	JITFuncs   int     `json:"jit_functions"`
+	JITTotalMs float64 `json:"jit_timing_total_ms"`
+	JITGenMs   float64 `json:"jit_generation_ms"`
+	JITInlMs   float64 `json:"jit_inlining_ms"`
+	JITOptMs   float64 `json:"jit_optimization_ms"`
+	JITEmitMs  float64 `json:"jit_emission_ms"`
+}
+
+// pmRunExplain runs ClaimRun's exact SQL text, with the bindings the sqlc method sends,
+// under EXPLAIN (ANALYZE, SUMMARY ON, FORMAT JSON) EXECUTE of a server-side PREPARE six times
+// on one fresh connection of a fresh clone (execution 1 = first use of the backend, 2-6 =
+// the same connection again; EXECUTE follows the same custom-then-generic plan cache logic
+// as a pgx-prepared statement). Each execution is its own transaction, rolled back. The
+// clone's jit follows lab.jit. The bindings are replayed on the simple protocol so each is
+// a literal that EXECUTE coerces to the prepared parameter type.
+func pmRunExplain(ctx context.Context, lab *pmLab, rep int) {
+	t, out := lab.t, lab.out
+	sqlText := pmSQLTexts()["ClaimRun"]
+	if sqlText == "" {
+		t.Fatalf("no sqlc text for ClaimRun")
+	}
+	lab.withClone(ctx, fmt.Sprintf("expl_%s_r%d", lab.jit, rep), func(dsn string, obs *pmObserver) {
+		// 1. Capture ClaimRun's real bindings on a throwaway connection.
+		var args []any
+		ccfg, err := pgx.ParseConfig(dsn)
+		if err != nil {
+			t.Fatalf("explain: parse config: %v", err)
+		}
+		ccfg.Tracer = pmArgTracer{got: &args}
+		cc, err := pgx.ConnectConfig(ctx, ccfg)
+		if err != nil {
+			t.Fatalf("explain: capture connect: %v", err)
+		}
+		ctx0, err := cc.Begin(ctx)
+		if err != nil {
+			t.Fatalf("explain: capture begin: %v", err)
+		}
+		run, err := store.New(ctx0).ClaimRun(context.WithValue(ctx, pmCaptureKey, true), lab.fx.claimParams())
+		if err != nil || run.ID != lab.fx.QueuedRun || run.Status != "claimed" {
+			t.Fatalf("explain: capture ClaimRun run %s status %q err %v", run.ID, run.Status, err)
+		}
+		_ = ctx0.Rollback(ctx)
+		_ = cc.Close(ctx)
+		if len(args) == 0 {
+			t.Fatalf("explain: captured no ClaimRun bindings")
+		}
+
+		// 2. Does pg_jit_available() itself map LLVM into a backend? (Why the harness never
+		// runs it on a measured connection.)
+		pc, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatalf("explain: probe connect: %v", err)
+		}
+		ppid := pc.PgConn().PID()
+		before, err := obs.llvmMaps(ctx, ppid)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		var avail bool
+		if err := pc.QueryRow(ctx, `SELECT pg_jit_available()`, pgx.QueryExecModeSimpleProtocol).Scan(&avail); err != nil {
+			t.Fatalf("explain: pg_jit_available: %v", err)
+		}
+		after, err := obs.llvmMaps(ctx, ppid)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		_ = pc.Close(ctx)
+		out.emit("jit_available_probe", map[string]any{"jit_clone_setting": lab.jit, "rep": rep, "pg_jit_available": avail,
+			"llvm_mapped_before": len(before) > 0, "llvm_mapped_after": len(after) > 0, "llvm_paths_after": after})
+
+		// 3. The measured connection.
+		xc, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatalf("explain: connect: %v", err)
+		}
+		defer func() { _ = xc.Close(ctx) }()
+		pid := xc.PgConn().PID()
+		var showJIT string
+		if err := xc.QueryRow(ctx, `SHOW jit`, pgx.QueryExecModeSimpleProtocol).Scan(&showJIT); err != nil {
+			t.Fatalf("explain: SHOW jit: %v", err)
+		}
+		if lab.jit == "off" && showJIT != "off" {
+			t.Fatalf("explain: clone jit off but SHOW jit = %q", showJIT)
+		}
+		memBefore, err := obs.read(ctx, pid, nil)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		llvmBefore, err := obs.llvmMaps(ctx, pid)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		if _, err := xc.Exec(ctx, `PREPARE pmclaim AS `+sqlText, pgx.QueryExecModeSimpleProtocol); err != nil {
+			t.Fatalf("explain: PREPARE: %v", err)
+		}
+		ph := make([]string, len(args))
+		for i := range ph {
+			ph[i] = fmt.Sprintf("$%d", i+1)
+		}
+		explain := `EXPLAIN (ANALYZE, SUMMARY ON, FORMAT JSON) EXECUTE pmclaim(` + strings.Join(ph, ",") + `)`
+		qargs := append([]any{pgx.QueryExecModeSimpleProtocol}, args...)
+		var execs []pmExplainExec
+		for n := 1; n <= 6; n++ {
+			tx, err := xc.Begin(ctx)
+			if err != nil {
+				t.Fatalf("explain: begin: %v", err)
+			}
+			t0 := time.Now()
+			var raw []byte
+			err = tx.QueryRow(ctx, explain, qargs...).Scan(&raw)
+			wall := time.Since(t0)
+			_ = tx.Rollback(ctx)
+			if err != nil {
+				t.Fatalf("explain: execution %d: %v", n, err)
+			}
+			var docs []pmExplainDoc
+			if err := json.Unmarshal(raw, &docs); err != nil || len(docs) != 1 {
+				t.Fatalf("explain: execution %d: unparseable EXPLAIN JSON (%d docs, err %v): %.200s", n, len(docs), err, raw)
+			}
+			d := docs[0]
+			ex := pmExplainExec{JIT: lab.jit, Rep: rep, PID: pid, Exec: n, WallMs: float64(wall.Microseconds()) / 1e3,
+				PlanningMs: d.PlanningTime, ExecMs: d.ExecutionTime, TotalCost: d.Plan.TotalCost}
+			if d.JIT != nil {
+				ex.JITPresent, ex.JITFuncs, ex.JITTotalMs = true, d.JIT.Functions, d.JIT.Timing.Total
+				ex.JITGenMs, ex.JITInlMs, ex.JITOptMs, ex.JITEmitMs = d.JIT.Timing.Generation, d.JIT.Timing.Inlining, d.JIT.Timing.Optimization, d.JIT.Timing.Emission
+			}
+			if d.ExecutionTime <= 0 {
+				t.Fatalf("explain: execution %d reports Execution Time %v", n, d.ExecutionTime)
+			}
+			execs = append(execs, ex)
+			out.emit("explain_exec", ex)
+		}
+		var generic, custom int64
+		if err := xc.QueryRow(ctx, `SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'pmclaim'`,
+			pgx.QueryExecModeSimpleProtocol).Scan(&generic, &custom); err != nil {
+			t.Fatalf("explain: pg_prepared_statements: %v", err)
+		}
+		memAfter, err := obs.read(ctx, pid, nil)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		llvmAfter, err := obs.llvmMaps(ctx, pid)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		out.emit("explain_run", map[string]any{"jit_clone_setting": lab.jit, "rep": rep, "pid": pid, "show_jit": showJIT,
+			"generic_plans": generic, "custom_plans": custom, "executions": len(execs),
+			"anonymous_kb_before": memBefore.AnonymousKB, "anonymous_kb_after": memAfter.AnonymousKB,
+			"private_clean_kb_before": memBefore.PrivateCleanKB, "private_clean_kb_after": memAfter.PrivateCleanKB,
+			"llvm_mapped_before": len(llvmBefore) > 0, "llvm_mapped_after": len(llvmAfter) > 0, "llvm_paths_after": llvmAfter})
+	})
+}
+
+// ---------------------------------------------------------------------------------------
 // Orchestration
 
 // pmRequireThrowawayDB refuses to run against a database that lacks the throwaway marker
@@ -2871,14 +3222,24 @@ type pmLab struct {
 	adminDSN string
 	fx       *pmFixture
 	rawDir   string
+	// jit is "default" (clones keep the server's jit setting) or "off" (every clone gets
+	// ALTER DATABASE ... SET jit = off before anything connects to it).
+	jit string
 }
 
 // pmDSNForDB returns dsn with its database name replaced. Only URL-form DSNs are supported.
+// A dbname or database query parameter is refused: pgx copies query parameters over the path
+// database, which would silently point every "clone" connection back at the same database.
 func pmDSNForDB(t *testing.T, dsn, db string) string {
 	t.Helper()
 	u, err := url.Parse(dsn)
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
 		t.Fatalf("UZI_TEST_DATABASE_URL must be a postgres:// URL to derive per-clone DSNs (err %v)", err)
+	}
+	for k := range u.Query() {
+		if lk := strings.ToLower(k); lk == "dbname" || lk == "database" {
+			t.Fatalf("UZI_TEST_DATABASE_URL carries a %q query parameter, which overrides the path database and defeats per-clone isolation; put the database in the URL path", k)
+		}
 	}
 	u.Path, u.RawPath = "/"+db, ""
 	return u.String()
@@ -2924,21 +3285,26 @@ func (l *pmLab) withClone(ctx context.Context, label string, fn func(dsn string,
 			t.Errorf("drop clone %s: %v", name, err)
 		}
 	}()
+	if l.jit == "off" {
+		if err := pmAdminExec(ctx, l.adminDSN, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" SET jit = off"); err != nil {
+			t.Fatalf("disable jit on clone %s: %v", name, err)
+		}
+	}
 	dsn := pmDSNForDB(t, l.adminDSN, name)
 	oc, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("observer connect to clone %s: %v", name, err)
 	}
 	defer func() { _ = oc.Close(ctx) }()
-	l.out.emit("clone", map[string]any{"database": name, "label": label, "created_at": time.Now().UTC()})
+	l.out.emit("clone", map[string]any{"database": name, "label": label, "created_at": time.Now().UTC(), "jit": l.jit})
 	fn(dsn, &pmObserver{conn: oc})
 }
 
-// pmPhaseSet parses UZI_POOL_MEMORY_PHASES, a comma list of memory,latency,cold,wide,stress
-// (default: all), so one run can be split into several go test invocations.
+// pmPhaseSet parses UZI_POOL_MEMORY_PHASES, a comma list of memory,latency,cold,wide,stress,
+// explain (default: all), so one run can be split into several go test invocations.
 func pmPhaseSet(t *testing.T) map[string]bool {
 	t.Helper()
-	known := []string{"memory", "latency", "cold", "wide", "stress"}
+	known := []string{"memory", "latency", "cold", "wide", "stress", "explain"}
 	set := map[string]bool{}
 	raw := strings.TrimSpace(os.Getenv("UZI_POOL_MEMORY_PHASES"))
 	if raw == "" {
@@ -3070,8 +3436,28 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 		cgMax = "unavailable: " + err.Error()
 	}
 	_ = mc.Close(ctx)
-	lab := &pmLab{t: t, out: out, adminDSN: adminDSN, fx: fx, rawDir: rawDir}
-	reps := pmEnvInt("UZI_POOL_MEMORY_REPS", 2)
+	// Server-level JIT facts, read on a separate maintenance connection (never a measured
+	// one): pg_jit_available() initialises the JIT provider, so it runs only here.
+	var jitSrv, jitAbove, jitInlineAbove, jitOptAbove string
+	var jitAvail bool
+	jc, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("jit meta connect: %v", err)
+	}
+	for _, x := range []struct {
+		sql string
+		dst *string
+	}{{"SHOW jit", &jitSrv}, {"SHOW jit_above_cost", &jitAbove}, {"SHOW jit_inline_above_cost", &jitInlineAbove}, {"SHOW jit_optimize_above_cost", &jitOptAbove}} {
+		if err := jc.QueryRow(ctx, x.sql, pgx.QueryExecModeSimpleProtocol).Scan(x.dst); err != nil {
+			t.Fatalf("%s: %v", x.sql, err)
+		}
+	}
+	if err := jc.QueryRow(ctx, `SELECT pg_jit_available()`, pgx.QueryExecModeSimpleProtocol).Scan(&jitAvail); err != nil {
+		t.Fatalf("pg_jit_available: %v", err)
+	}
+	_ = jc.Close(ctx)
+	lab := &pmLab{t: t, out: out, adminDSN: adminDSN, fx: fx, rawDir: rawDir, jit: pmJITSetting(t)}
+	reps := pmEnvMinInt(t, "UZI_POOL_MEMORY_REPS", 2, 1)
 	cands := pmCandidates()
 	if len(cands) != pmLatencyRounds {
 		t.Fatalf("%d candidates but pmLatencyRounds %d: latency rotation would not lead each candidate once", len(cands), pmLatencyRounds)
@@ -3079,6 +3465,8 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	out.emit("meta", map[string]any{
 		"started_at": time.Now().UTC(), "server_version": ver, "shared_buffers": sb, "max_connections": maxConn,
 		"autovacuum": autovac, "phases": phases, "memory_reps": reps, "template_database": pmTemplateDB,
+		"jit_requested": lab.jit, "server_show_jit": jitSrv, "server_pg_jit_available": jitAvail, "server_jit_above_cost": jitAbove,
+		"server_jit_inline_above_cost": jitInlineAbove, "server_jit_optimize_above_cost": jitOptAbove,
 		"cgroup_memory_max": strings.TrimSpace(cgMax), "go_version": runtime.Version(), "num_cpu": runtime.NumCPU(),
 		"breadth_entries": len(pmBreadth), "sqlc_query_texts": len(pmSQLTexts()), "candidates": cands,
 		"latency_n": pmLatencyN, "latency_rounds": pmLatencyRounds, "hot_reps_per_round": pmHotReps,
@@ -3134,6 +3522,17 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 				lab.withClone(ctx, fmt.Sprintf("wide_%s_%t", c.Name, generic), func(cdsn string, obs *pmObserver) {
 					pmRunWide(ctx, t, out, cdsn, fx, obs, rawDir, c, generic, order)
 				})
+			}
+		}
+	}
+	// Phase 5: ClaimRun plan/execution/JIT split, once with the server's jit and once with
+	// jit off on the clone, regardless of UZI_POOL_MEMORY_JIT.
+	if phases["explain"] {
+		for _, mode := range []string{"default", "off"} {
+			el := *lab
+			el.jit = mode
+			for rep := 1; rep <= 2; rep++ {
+				pmRunExplain(ctx, &el, rep)
 			}
 		}
 	}
