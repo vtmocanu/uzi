@@ -1331,10 +1331,11 @@
       "harness": "codex",
       "phase": "plan",
       "config": {
-        "default_effort_source": "builtin",
+        "default_effort_source": "user_default",
         "plan_phase": {
           "model": "owner-custom-plan",
-          "model_source": "user_planning_default"
+          "model_source": "user_planning_default",
+          "effort_source": "user_default"
         }
       },
       "providerDefaultModel": "gpt-6.1-sol",
@@ -1342,14 +1343,14 @@
         "model": "owner-custom-plan",
         "modelSource": "user_planning_default",
         "effortMode": "runtime_default",
-        "effortSource": "builtin"
+        "effortSource": "user_default"
       },
       "server": {
         "run_model": null,
         "template_claude": null,
         "template_codex": null,
         "lane": null,
-        "user_effort": null,
+        "user_effort": "runtime",
         "planning_model": "owner-custom-plan"
       }
     },
