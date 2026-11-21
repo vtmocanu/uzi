@@ -2,7 +2,8 @@
 SET LOCAL lock_timeout = '5s';
 -- The backfill and the identity trigger below read a table whose writers must not interleave.
 -- runs and users are locked first (the two foreign keys below take these modes anyway), so the
--- migration keeps the application's runs/users -> run_env_vars order and cannot deadlock with it.
+-- migration takes the parent locks before the run_env_vars lock, the same order as the claim and
+-- the env writers; any remaining deadlock is detected and rolls the migration back.
 LOCK TABLE runs, users IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE run_env_vars IN ACCESS EXCLUSIVE MODE;
 
