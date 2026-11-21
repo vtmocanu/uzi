@@ -87,8 +87,12 @@ type AdminWorkerSizesDTO struct {
 	MaxSizes     int                     `json:"max_sizes"`
 	// Refusals lists hosted workers whose latest fresh controller report refused their size or
 	// PVC (kind size_refused or pvc_rejected), keyed by the worker's hosted size. Always an
-	// array, at most 50, sorted by size then worker name.
+	// array, at most three per size and at most 16 sizes, sorted by size then worker name.
 	Refusals []WorkerSizeRefusalDTO `json:"refusals"`
+	// RefusalTotals maps each size returned in Refusals to the count of every fresh size_refused
+	// or pvc_rejected refusal for it before the three-per-size cap. Its keys are exactly the
+	// sizes in Refusals; always an object. Additive: older clients ignore it.
+	RefusalTotals map[string]int `json:"refusal_totals"`
 }
 
 // WorkerSizeRefusalDTO is one hosted worker the controller refused to render or provision.
