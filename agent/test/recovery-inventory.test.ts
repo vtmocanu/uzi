@@ -2792,6 +2792,8 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   }>();
   const client = {
     hasFeature: () => state.feature,
+    // PRD 4416 M2: the runner-built coordinator resolves scan needles through this route; the fixture run holds no secret variables.
+    getRunEnvRedact: async () => ({ protected: false as const }),
     getRunOwnership: async () => {
       if (state.ownershipError) throw state.ownershipError;
       return { status: state.status, claim_generation: state.ownGeneration, inventory_guarded: state.ownGuarded };
