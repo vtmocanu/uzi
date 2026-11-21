@@ -119,7 +119,7 @@ func newEpochInitHost(t *testing.T) *epochInitHost {
 		if err := os.Chown(p, -1, os.Getgid()); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chmod(p, 0o700); err != nil {
+		if err := os.Chmod(p, 0o700); err != nil { //nolint:gosec // G302: private test directory; clears inherited setgid, keeps owner search permission.
 			t.Fatal(err)
 		}
 		st, err := os.Stat(p)
