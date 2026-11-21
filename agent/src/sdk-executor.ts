@@ -2528,7 +2528,10 @@ export class SdkExecutor implements Executor {
               },
             });
             if (summary && this.intentFlight === flight && !flight.abandoned && !flight.ctrl.signal.aborted
-                && !ctx.claimFenced?.() && !ctx.cancelRequested?.()) await this.client!.postIntentSummary(ctx.runId, summary);
+                && !ctx.claimFenced?.() && !ctx.cancelRequested?.()) {
+              // PRD #4416 M2: redacted like the plan summary, since the intent text derives from the issue and PRD.
+              await this.client!.postIntentSummary(ctx.runId, ctx.redactText?.(summary) ?? summary);
+            }
           } catch (err) {
             this.log.warn("intent summary hook failed", {
               run_id: ctx.runId,

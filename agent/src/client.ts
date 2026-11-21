@@ -15,7 +15,7 @@ import type { PublicationIntentRequest, PublicationIntentResult } from "./public
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
-import { decodeRunEnvClaim } from "./run-env-claim.js";
+import { decodeRunEnvClaim, decodeRunEnvRedactResponse } from "./run-env-claim.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -113,6 +113,7 @@ import {
   type UserInput,
   type InputsResponse,
   type RunOwnershipResponse,
+  type RunEnvRedactResponse,
   type RunOrphanClassificationResponse,
   type MessageGapsResponse,
   type WorkerProposal,
@@ -4796,6 +4797,19 @@ export class WorkerClient {
       signal)) as RunOwnershipResponse;
   }
 
+  /** PRD 4416 M2: the secret variable versions a run was delivered, for a publish scan that has no live
+   *  claim (after a restart or once the run is terminal). GET /worker/runs/{id}/run-env-redact. Resolves to
+   *  `{protected:false}` when the run holds no secret receipt. Throws a RequestError on 404 (not this
+   *  worker's run, deleted, or a run kind that never receives variables) and 409 (`vault_locked`,
+   *  `run_env_history_unavailable`), and a decoder error on a malformed body: the caller treats every
+   *  throw as "cannot prove the publish clean". The body carries plaintext secrets and is never logged. */
+  async getRunEnvRedact(runId: string, signal?: AbortSignal): Promise<RunEnvRedactResponse> {
+    const timeout = AbortSignal.timeout(RUN_ENV_REDACT_TIMEOUT_MS);
+    const raw = await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/run-env-redact`,
+      RUN_ENV_REDACT_TIMEOUT_MS, RUN_ENV_REDACT_MAX_RESPONSE_BYTES, signal ? AbortSignal.any([signal, timeout]) : timeout);
+    return decodeRunEnvRedactResponse(raw);
+  }
+
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
    *  (GET /worker/runs/{id}/message-gaps?claim_generation=G&through=N&limit=&cursor=), index-backed
    *  and keyset-paginated so the read never materialises N rows. The terminal-resolve path calls it
@@ -6306,6 +6320,10 @@ class ResponseBodyOverflowError extends Error {
 
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
+/** The run-env redact answer: at most 2621440 value bytes (RUN_ENV_MAX_REDACT_TOTAL_BYTES), each possibly
+ *  escaped to six bytes in JSON, plus per-entry metadata; 24 MiB bounds it with room to spare. */
+const RUN_ENV_REDACT_MAX_RESPONSE_BYTES = 24 * 1024 * 1024;
+const RUN_ENV_REDACT_TIMEOUT_MS = 20_000;
 /** The publication-intent ack and its refusal bodies are a few small members. */
 const PUBLICATION_ACK_MAX_BYTES = 16 * 1024;
 

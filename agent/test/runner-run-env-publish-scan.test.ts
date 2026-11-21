@@ -1,0 +1,365 @@
+import { describe, it, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { Executor, RunContext } from "../src/executor.js";
+import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
+import { LimitReachedError } from "../src/limit.js";
+import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
+import {
+  HELD_LINUX_ONLY, JOIN_TOKEN, assertCustodyRetained, commit, failingWork, heldServer, skipCheckpoints, type Work,
+} from "./runner-held-publication-fixture.js";
+
+installHarness();
+
+// PRD 4416 M2: every scanned publish of a run that holds secret variables searches the whole outgoing range
+// for the registered forms of their values, before any network write, and withholds on a hit and whenever it
+// cannot prove the range clean. Plain values are never needles. Real git; every value is an obvious dummy.
+
+const UUID = "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44";
+const SECRET = ["rv-Qk7", "Zp2m", "Xw9d", "Lt4s"].join("-");
+const OLD_SECRET = ["rv-Hn3b", "Yc6v", "Fd1g", "Ke8j"].join("-");
+const PLAIN = ["plain-visible", "value", "9876"].join("-");
+const BASE64 = Buffer.from(`ci-user:${SECRET}`).toString("base64");
+const DOCKER_CONFIG = JSON.stringify({ auths: { "registry.example.test": { auth: BASE64 } } });
+
+const runEnv = (): ClaimRunEnvVar[] => [
+  { var_id: UUID, scope: "repo", rev: 2, name: "DB_PASSWORD", value: SECRET, secret: true, description: "" },
+  { var_id: UUID, scope: "repo", rev: 1, name: "REGION", value: PLAIN, secret: false, description: "" },
+];
+const retired = (): ClaimRunEnvRedact[] => [{ var_id: UUID, scope: "repo", rev: 1, name: "OLD_API_KEY", value: OLD_SECRET }];
+const withVars = () => ({ forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "vendor-oauth-token-000000", run_env: runEnv(), run_env_redact: retired() });
+const noVars = () => ({ forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "vendor-oauth-token-000000" });
+
+let iid = 46100;
+
+function assertNoValue(label: string, value: unknown): void {
+  const text = JSON.stringify(value);
+  for (const form of runEnvRedactionForms(runEnv(), retired())) assert.ok(!text.includes(form), `${label}: no registered form of a value appears`);
+}
+
+function spyPublish(): { uploads: number } {
+  const seen = { uploads: 0 };
+  client.publishCheckpoint = async (_run, _tip, pack) => {
+    for await (const chunk of pack) assert.ok(chunk.length);
+    seen.uploads++;
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
+  };
+  return seen;
+}
+
+type Content = { path: string; body: string };
+const leak = (body: string): Content => ({ path: "notes.txt", body: `leaked: ${body}\n` });
+const CLEAN: Content = { path: "notes.txt", body: "ordinary notes\n" };
+
+/** A run whose executor commits `content`, checkpoints once, and keeps going. */
+async function checkpointRun(secrets: object, content: Content, opts: { reap?: boolean } = {}) {
+  const seen = spyPublish();
+  const { gitlab } = fakeGitlab();
+  const claim = gitlabClaim(iid++, { secrets: secrets as never });
+  let continued = false;
+  const exec: Executor = {
+    run: async (ctx) => {
+      commit(ctx.worktreePath, content.path, content.body);
+      await ctx.checkpoint!({ reap: opts.reap === true });
+      continued = true;
+      return { branch: ctx.branch };
+    },
+  };
+  await runner(exec, gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 }).execute(claim);
+  return { seen, claim, continued: () => continued };
+}
+
+describe("run variable scan: checkpoint publication (tick, milestone, iteration)", () => {
+  const hits: Array<[string, Content]> = [
+    ["the value", leak(SECRET)],
+    ["the base64 form inside a docker config auth entry", { path: ".docker/config.json", body: DOCKER_CONFIG }],
+    ["a retired version delivered only through run_env_redact", leak(OLD_SECRET)],
+  ];
+  for (const [label, content] of hits) {
+    it(`does not upload a checkpoint carrying ${label}, and keeps running`, async () => {
+      const { seen, continued, claim } = await checkpointRun(withVars(), content);
+      assert.equal(seen.uploads, 0, "ZERO checkpoint uploads");
+      assert.equal(continued(), true, "the withhold never stops the executor");
+      assertNoValue("run feed", api.messages(claim.run_id));
+    });
+  }
+
+  it("a done checkpoint (reap) carrying the value is also withheld", async () => {
+    assert.equal((await checkpointRun(withVars(), leak(SECRET), { reap: true })).seen.uploads, 0);
+  });
+
+  it("a run without variables uploads the very same commit, and does no scan work", async (t) => {
+    const probe = t.mock.method(git, "scanObjectsForRunEnv");
+    assert.equal((await checkpointRun(noVars(), leak(SECRET))).seen.uploads, 1);
+    assert.equal(probe.mock.callCount(), 0);
+  });
+
+  it("a PLAIN value in the tree holds nothing", async () => {
+    assert.equal((await checkpointRun(withVars(), leak(PLAIN))).seen.uploads, 1);
+  });
+
+  it("a clean commit still uploads, and the exact-value scan was reached", async (t) => {
+    const probe = t.mock.method(git, "scanObjectsForRunEnv");
+    assert.equal((await checkpointRun(withVars(), CLEAN)).seen.uploads, 1);
+    assert.ok(probe.mock.callCount() > 0, "the scan ran");
+  });
+
+  it("the upload seam alone withholds (the pre-publish scan is bypassed)", async (t) => {
+    const real = git.secretScanCheckpointRange.bind(git);
+    t.mock.method(git, "secretScanCheckpointRange", (b: string, r: never, o: { deadlineMs?: number; literals: readonly string[] }) =>
+      real(b, r, { deadlineMs: o.deadlineMs, literals: o.literals }));
+    assert.equal((await checkpointRun(withVars(), leak(SECRET))).seen.uploads, 0, "the guard at the pack seam refuses on its own");
+  });
+
+  it("FAILS CLOSED: a scanner that throws, or cannot establish a clean verdict, uploads nothing", async (t) => {
+    t.mock.method(git, "scanObjectsForRunEnv", async () => { throw new Error("scanner exploded"); });
+    assert.equal((await checkpointRun(withVars(), CLEAN)).seen.uploads, 0, "throwing scanner");
+    t.mock.restoreAll();
+    t.mock.method(git, "scanObjectsForRunEnv", async () => ({ trusted: false as const, reason: "read_failed" }));
+    assert.equal((await checkpointRun(withVars(), CLEAN)).seen.uploads, 0, "untrusted scanner (timeout, git error, overflow, unresolved ref)");
+  });
+});
+
+function parkRun(secrets: object, content: Content) {
+  const seen = spyPublish();
+  const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-re-park-"));
+  const { gitlab } = fakeGitlab();
+  const claim = gitlabClaim(iid++, { wait_on_limit: true, secrets: secrets as never });
+  const exec: Executor = {
+    run: async (ctx: RunContext) => {
+      commit(ctx.worktreePath, content.path, content.body);
+      fs.mkdirSync(path.join(homeRoot, ctx.runId), { recursive: true });
+      throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+    },
+  };
+  const done = runnerWith((runId) => ({ homeDir: path.join(homeRoot, runId), executor: exec }), gitlab).execute(claim)
+    .finally(() => fs.rmSync(homeRoot, { recursive: true, force: true }));
+  return { seen, claim, done };
+}
+
+describe("run variable scan: park, shutdown and pause uploads", () => {
+  it("a limit park does not upload a checkpoint carrying the value; the run still parks", async (t) => {
+    const probe = t.mock.method(git, "scanObjectsForRunEnv");
+    const { seen, claim, done } = parkRun(withVars(), leak(SECRET));
+    await done;
+    assert.equal(seen.uploads, 0);
+    assert.ok(probe.mock.callCount() > 0, "the park publish reached the scan");
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "limit_wait"), "the run parked");
+  });
+
+  it("a limit park with a clean commit uploads, through the scan", async (t) => {
+    const probe = t.mock.method(git, "scanObjectsForRunEnv");
+    const { seen, done } = parkRun(withVars(), CLEAN);
+    await done;
+    assert.equal(seen.uploads, 1);
+    assert.ok(probe.mock.callCount() > 0);
+  });
+
+  async function shutdown(secrets: object, content: Content) {
+    const seen = spyPublish();
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: secrets as never });
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, content.path, content.body);
+        ready();
+        await new Promise<void>((resolve) => ctx.signal!.addEventListener("abort", () => resolve(), { once: true }));
+        throw new Error("worker shutdown");
+      },
+    };
+    const r = runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, { checkpointTickIntervalMs: 0 });
+    const execution = r.execute(claim);
+    try {
+      await Promise.race([started, execution.then(() => { throw new Error("run ended before readiness"); })]);
+      r.shutdown();
+      await execution;
+    } finally {
+      r.shutdown();
+      await execution;
+    }
+    return seen;
+  }
+
+  it("a graceful shutdown does not upload a checkpoint carrying the value", async () => {
+    assert.equal((await shutdown(withVars(), leak(SECRET))).uploads, 0);
+  });
+
+  async function pause(secrets: object, content: Content) {
+    const seen = spyPublish();
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: secrets as never });
+    const out: { parked?: boolean } = {};
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, content.path, content.body);
+        await ctx.checkpoint!({ reap: false });
+        const at = { completedCount: 1, total: 3 };
+        out.parked = await ctx.parkForPause!(at);
+        return out.parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab, JOIN_TOKEN, { checkpointIntervalMs: 0 }).execute(claim);
+    return { seen, out };
+  }
+
+  it("a pause whose range carries the value uploads nothing and does not park", async () => {
+    const { seen, out } = await pause(withVars(), leak(SECRET));
+    assert.equal(seen.uploads, 0);
+    assert.equal(out.parked, false, "no durable checkpoint, so no park");
+  });
+
+  it("a pause with a clean commit uploads and parks as before", async () => {
+    const { seen, out } = await pause(withVars(), CLEAN);
+    assert.equal(seen.uploads, 1);
+    assert.equal(out.parked, true);
+  });
+});
+
+describe("run variable scan: overlay (GitHub milestone) checkpoint upload", () => {
+  const githubRepo = () => ({ id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" as const });
+  async function overlayMilestone(t: TestContext, secrets: object, content: Content) {
+    const seen = spyPublish();
+    const { github } = fakeGitHub();
+    const { gitlab } = fakeGitlab();
+    t.mock.method(git, "fetchDefaultTip", async () => { throw new Error("stub: no network"); });
+    const claim = gitlabClaim(iid++, { secrets: secrets as never, repo: githubRepo() });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, content.path, content.body);
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab, JOIN_TOKEN, { github, checkpointIntervalMs: 1000 }).execute(claim);
+    return seen;
+  }
+
+  it("a milestone carrying the value uploads nothing", async (t) => {
+    assert.equal((await overlayMilestone(t, withVars(), leak(SECRET))).uploads, 0);
+  });
+});
+
+describe("run variable scan: the final branch push (every forge)", () => {
+  const branchOnOrigin = (iidN: number): boolean => {
+    try {
+      execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "--quiet", `refs/heads/agent/issue-${iidN}`], { stdio: "pipe" });
+      return true;
+    } catch { return false; }
+  };
+  async function finalize(secrets: object, content: Content) {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: secrets as never });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, content.path, content.body);
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab, JOIN_TOKEN).execute(claim);
+    return claim;
+  }
+  const failed = (runId: string) => api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
+
+  for (const [label, content] of [
+    ["the value", leak(SECRET)],
+    ["the base64 form in a docker config", { path: ".docker/config.json", body: DOCKER_CONFIG }],
+    ["a retired version", leak(OLD_SECRET)],
+  ] as Array<[string, Content]>) {
+    it(`a GitLab run that committed ${label} fails push_secret_blocked, names the variable and pushes nothing`, async () => {
+      const claim = await finalize(withVars(), content);
+      assert.equal(branchOnOrigin(claim.issue_iid!), false, "the branch never reached origin");
+      const body = failed(claim.run_id);
+      assert.ok(body, "the run failed");
+      assert.equal(body.fail_origin, "push_secret_blocked");
+      assert.equal(body.preserved_patch, undefined);
+      assert.match(String(body.failure_reason), /DB_PASSWORD|OLD_API_KEY/, "the variable is named");
+      assertNoValue("terminal report", body);
+      assertNoValue("run feed", api.messages(claim.run_id));
+    });
+  }
+
+  it("the push seam alone withholds (every pre-push scan is bypassed), with a fixed typed refusal naming the variable", async (t) => {
+    const real = git.secretScanCheckpointRange.bind(git);
+    t.mock.method(git, "secretScanCheckpointRange", (b: string, r: never, o: { deadlineMs?: number; literals: readonly string[] }) =>
+      real(b, r, { deadlineMs: o.deadlineMs, literals: o.literals }));
+    const claim = await finalize(withVars(), leak(SECRET));
+    assert.equal(branchOnOrigin(claim.issue_iid!), false, "ZERO pushes");
+    const body = failed(claim.run_id);
+    assert.equal(body?.fail_origin, "push_secret_blocked");
+    assert.match(String(body?.failure_reason), /secret variable DB_PASSWORD/);
+    assertNoValue("terminal report", body);
+  });
+
+  it("FAILS CLOSED when the push-seam scanner throws: nothing is pushed", async (t) => {
+    t.mock.method(git, "scanObjectsForRunEnv", async () => { throw new Error("scanner exploded"); });
+    const claim = await finalize(withVars(), CLEAN);
+    assert.equal(branchOnOrigin(claim.issue_iid!), false);
+    assert.equal(failed(claim.run_id)?.fail_origin, "push_secret_blocked");
+  });
+
+  it("a run without variables pushes the same commit; a PLAIN value and a clean commit push too", async () => {
+    assert.equal(branchOnOrigin((await finalize(noVars(), leak(SECRET))).issue_iid!), true);
+    assert.equal(branchOnOrigin((await finalize(withVars(), leak(PLAIN))).issue_iid!), true);
+    assert.equal(branchOnOrigin((await finalize(withVars(), CLEAN)).issue_iid!), true);
+  });
+});
+
+describe("run variable scan: held publication and the recovery archive", () => {
+  async function held(secrets: object, content: Content) {
+    const claim = gitlabClaim(iid++, { claim_generation: 50, inventory_guarded: true, secrets: secrets as never });
+    const { gitlab } = fakeGitlab();
+    const server = heldServer(claim);
+    skipCheckpoints();
+    const work: Partial<Work> = {};
+    const r = runner(failingWork(work, (ctx) => { commit(ctx.worktreePath, content.path, content.body); }), gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+    await r.execute(claim);
+    return { claim, server, work };
+  }
+
+  it("a run whose held range carries the value uploads neither a held pack nor the archive, and keeps custody", { skip: HELD_LINUX_ONLY }, async () => {
+    const { claim, server, work } = await held(withVars(), leak(SECRET));
+    assert.equal(server.heldCalls.length, 0, "ZERO held uploads");
+    assert.equal(server.archiveUploads(), 0, "the recovery archive carries the same objects and is withheld too");
+    await assertCustodyRetained(server, claim, work, "value in held range");
+  });
+
+  it("the same commit from a run without variables is published held, as before", { skip: HELD_LINUX_ONLY }, async () => {
+    const { server } = await held(noVars(), leak(SECRET));
+    assert.equal(server.heldCalls.length, 1);
+  });
+});
+
+describe("run variable scan: preserved_patch", () => {
+  const GUARD = { ci_config_guard: true, ci_config_paths: ["deploy/ci.yml"] };
+  async function refused(secrets: object, body: string) {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { config: GUARD, secrets: secrets as never });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, ".forgejo/workflows/x.yml", body);
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab).execute(claim);
+    return api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+  }
+
+  it("withholds a patch whose raw text carries the value, and attaches the same patch without it", async () => {
+    const withValue = await refused(withVars(), `name: ci\n# ${SECRET}\n`);
+    assert.ok(withValue, "the guard refused the run");
+    assert.equal(withValue.preserved_patch, undefined, "the raw patch carried the value");
+    assertNoValue("terminal report", withValue);
+    const clean = await refused(withVars(), "name: ci\n");
+    assert.match(clean?.preserved_patch ?? "", /workflows\/x\.yml/, "a patch without the value is still attached");
+  });
+
+  it("withholds a patch carrying the base64 form", async () => {
+    assert.equal((await refused(withVars(), `name: ci\n# ${BASE64}\n`))?.preserved_patch, undefined);
+  });
+});

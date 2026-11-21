@@ -120,6 +120,7 @@ import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { CapabilitySources } from "./runView/CapabilitySources";
+import { InjectedEnvSection } from "./runView/InjectedEnvSection";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
 import { CompletionPending } from "./runView/CompletionPending";
 import { SemanticDrift } from "./runView/SemanticDrift";
@@ -1710,6 +1711,24 @@ function RunOverrideHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
   </Card>;
 }
 
+// PRD #4416 M2: a receipted secret variable version the run was given is missing or cannot be
+// opened, so the run's output cannot be masked and the agent was not started. Resume re-attempts the
+// claim and parks again while the version is still missing; otherwise the owner cancels.
+function RunEnvHistoryHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "run_env_history_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Variable history unavailable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The run is paused because a secret variable version it was given can no longer be read, so its output cannot be masked. The agent was not started.</p>
+    <p className="mt-1 text-xs text-muted">Resume retries once the variable history is restored; it pauses again while the version is still missing. Otherwise, Cancel the run. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
+  </Card>;
+}
+
 // The screen-reader sentence for a `publication:<mode>:<reason>` park key (parkAnnounce).
 function publicationAnnounce(parkKey: string): string {
   const [, mode, ...rest] = parkKey.split(":");
@@ -2600,6 +2619,8 @@ export function RunView() {
               ? "repo_agent_source_unavailable"
             : run?.status === "paused" && run.hold_reason === "run_override_unavailable"
               ? "run_override_unavailable"
+            : run?.status === "paused" && run.hold_reason === "run_env_history_unavailable"
+              ? "run_env_history_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2676,6 +2697,8 @@ export function RunView() {
               ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
             : parkKey === "run_override_unavailable"
               ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. Resume retries only if the choice has become available on that harness; otherwise Cancel and start a new run with a different choice."
+            : parkKey === "run_env_history_unavailable"
+              ? "Variable history unavailable. A secret variable version the run was given can no longer be read, so its output cannot be masked. Resume retries once the variable history is restored; otherwise Cancel the run."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -3092,6 +3115,7 @@ export function RunView() {
           <CapabilitySources provenance={run.capability_provenance} />
         </section>
       )}
+      <InjectedEnvSection vars={run.injected_env} />
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (
@@ -3287,6 +3311,12 @@ export function RunView() {
         }); }}
         onCancel={() => { void cancelRun(); }} />
       <RunOverrideHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
+      <RunEnvHistoryHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
         onResume={() => { void act(async (isCurrent) => {
           await api.resumeRun(run.id);
           if (isCurrent()) await refreshRun();

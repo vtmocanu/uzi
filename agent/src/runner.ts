@@ -1,5 +1,6 @@
-import { runEnvRedactionForms } from "./run-env-forms.js";
-import { leadLaneRunEnv } from "./run-env-lane.js";
+import { runEnvRedactionForms, runEnvScanNeedles, type ScanNeedle } from "./run-env-forms.js";
+import { hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
+import { runEnvContextField } from "./run-env-lane.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
@@ -986,6 +987,20 @@ class ProviderKeyBlockedError extends SecretRemediationPendingError {
 /** The run's provider key forms, `[]` for a vendor run. `RunFlight.providerKeyForms` is required and buildFlight
  *  always sets it; the `?? []` only tolerates the partial flights hand-built by unit tests, which are never provider-bound. */
 const keyFormsOf = (flight: Pick<RunFlight, "providerKeyForms">): readonly string[] => flight.providerKeyForms ?? [];
+
+/** PRD 4416 M2: the exact-value scan found a registered form of one of the run's secret variables in the
+ *  objects about to be published. A subclass, so every catch of SecretRemediationPendingError classifies it
+ *  (finalize: push_secret_blocked; checkpoint: secret_remediation_pending). `findings` name the variables
+ *  and carry no value; the message is fixed text. */
+class RunEnvBlockedError extends SecretRemediationPendingError {
+  constructor(readonly findings: SecretFinding[], readonly tip: string) {
+    super("run variable scan blocked the upload");
+    this.name = "RunEnvBlockedError";
+  }
+}
+
+/** The run's scan needles, `[]` when the claim carried no secret variable (or a hand-built test flight). */
+const needlesOf = (flight: Pick<RunFlight, "scanNeedles">): readonly ScanNeedle[] => flight.scanNeedles ?? [];
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -3159,6 +3174,10 @@ interface RunFlight {
    *  path scans its objects for these before any network write. Empty for a vendor run, which does no
    *  extra git work. */
   providerKeyForms: readonly string[];
+  /** PRD 4416 M2: the exact-value scan needles of this run's secret variables, one per variable name, built from
+   *  the claim and never persisted. Empty when the claim carried no secret variable; every scanned publish
+   *  searches its whole outgoing range for them (requireNoRunEnv). */
+  scanNeedles?: readonly ScanNeedle[];
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -3881,6 +3900,8 @@ export class RunRunner {
    *  its persisted gate under the persisted presentation id (or adopt an id-less one). Consumed by
    *  the claim's first gatePlan; cleared with gatedRuns. */
   private readonly gateResumes = new Map<string, GateResume>();
+  /** PRD 4416 M2: per live run, the exact-value scan needles of the claim in flight (memory only). */
+  private readonly liveScanNeedles = new Map<string, readonly ScanNeedle[]>();
   /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
    *  catch fetch the committed work back before the container dies. Registered before
    *  retained discovery so shutdown can interrupt pre-clone work too; deregistered
@@ -3988,6 +4009,8 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        // PRD 4416 M2: bundle uploads and held or terminal packs are searched for the run's secret variable values.
+        scanNeedlesFor: (runId, signal) => this.resolveRunScanNeedles(runId, signal),
         // Operator Case B: the clone inventory with identities, and the worker-wide retained-source view (no selector,
         // no bare filter: the coordinator filters and judges completeness itself).
         operatorSourceEvidence: async (runId, bare, signal) => ({
@@ -6359,6 +6382,9 @@ export class RunRunner {
       runScopedSecrets,
     );
     flight.policyReservation = reservation;
+    // PRD 4416 M2: a live flight's claim set is the authority for lanes that publish with no flight in hand
+    // (the recovery coordinator's held, terminal and bundle lanes); removed with the run's other secrets.
+    this.liveScanNeedles.set(runId, flight.scanNeedles!);
     if (admission) {
       flight.policyAdmission = true;
       flight.policyHold = { outcomeId: admission.outcome_id, body: admission };
@@ -7712,6 +7738,7 @@ export class RunRunner {
       // will not resume". The park is the first path that reaches here and DOES
       // resume, so both sentences are corrected above rather than left to mislead.)
       for (const s of runScopedSecrets) this.log.removeSecret(s);
+      if (this.liveScanNeedles.get(runId) === flight.scanNeedles) this.liveScanNeedles.delete(runId);
       // ── The park / shutdown carve-out (PRD #35 Decision 6a; PRD #556 M1) ──────
       // EXACTLY two filesystem removals below are skipped for a parked run, and
       // nothing else in this finally is. The two are what a resume needs: the
@@ -11413,10 +11440,18 @@ export class RunRunner {
       withholdFromState: boolean,
       knownFinding = true,
       providerKey = false,
+      runEnvFindings?: SecretFinding[],
     ): Promise<void> => {
       let reason: string;
       let statusText: string;
-      if (providerKey) {
+      if (runEnvFindings) {
+        // PRD 4416 M2: the exact-value scan names the variable(s) and nothing else: no value, form or path.
+        const names = hitVariableNames(runEnvFindings).slice(0, 10).join(", ");
+        reason = `This run's branch was not pushed: the pre-push scan found the value of the secret variable${names.includes(",") ? "s" : ""} ${names} in the objects to push. ` +
+          "The diff is withheld because it carries the value; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
+        statusText = `the pre-push scan found the value of the secret variable ${names} in the objects to push; failing without pushing and withholding the diff`;
+        runLog.info("run failed: the run variable scan blocked the push; withholding diff", { run_id: runId, variables: names });
+      } else if (providerKey) {
         // The exact-key push scan: fixed text only, so no key form, path or match can reach the api.
         reason = "This run's branch was not pushed: the pre-push scan found this run's provider key in the objects to push, or could not verify they are free of it. " +
           "The diff is withheld because it may carry the key; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
@@ -11930,6 +11965,15 @@ export class RunRunner {
     // is not enough on its own: it can be trustworthy AND carry findings.
     const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
       if (rawPatch === null) return undefined;
+      // PRD 4416 M2: the RAW patch is searched for the run's secret variable values first. Redaction below would
+      // scrub a registered form, but a patch that carries one is withheld whole rather than shipped scrubbed.
+      const variableHits = textHitVariables(rawPatch, needlesOf(flight));
+      if (variableHits.length > 0) {
+        runLog.warn("preserved patch withheld: it carries the value of a run secret variable", {
+          run_id: runId, site, variables: variableHits.slice(0, 10),
+        });
+        return undefined;
+      }
       const patch = redactText(rawPatch);
       const scan = await this.git.scanPatchForSecrets(patch);
       if (scan.trusted && scan.findings.length === 0) return patch;
@@ -12382,6 +12426,11 @@ export class RunRunner {
       } catch (error) {
         // A deadline/cancel abort stays permanent: an aborted fetch classifies transient but is not an outage.
         if (boundarySignal?.aborted) throw error;
+        if (error instanceof RunEnvBlockedError) {
+          await this.persistRunEnvHit(flight, finalizeBarePath, result.branch, error);
+          await reportRemediationBlocked(undefined, false, true, false, error.findings);
+          throw new PushSecretBlockedSignal();
+        }
         if (error instanceof SecretRemediationPendingError) {
           await reportRemediationBlocked(undefined, false, flight.secretRemediation?.everKnown === true ||
             Boolean(flight.remediationRestrictions?.flaggedOIDs?.length), error instanceof ProviderKeyBlockedError);
@@ -14421,6 +14470,7 @@ export class RunRunner {
         ? { ciConfigGuardGlobs: [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
         : {}),
       providerKeyForms: claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [],
+      scanNeedles: runEnvScanNeedles(claim.secrets.run_env, claim.secrets.run_env_redact),
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -16583,7 +16633,9 @@ export class RunRunner {
           // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
           // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
           // which do not come through here) is byte-unchanged and not scanned.
-          if (!resolvedOverlay && inPermit) {
+          // PRD 4416 M2: a run holding secret variables defers every in-permit publish, overlay or not, because the
+          // exact-value scan at the pack seam must not run inside a permit either.
+          if (inPermit && (!resolvedOverlay || needlesOf(flight).length > 0)) {
             // issue #1597 M2 (round 3): NEVER run gitleaks inside a Codex permit. A permit-held child
             // cannot be killed on its own and execScoped's scoped branch ignores `timeout`, while
             // gitleaks' own git-mode `--timeout` yields a silent clean partial scan — so a slow scan
@@ -17280,7 +17332,7 @@ export class RunRunner {
       ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
       // PRD #4416 M2: the run's user variables, for the lead lane's env builders.
       // Only a lead-lane run (leadLaneRunEnv mirrors the api's LeadLane); redaction forms are registered for every kind.
-      ...(leadLaneRunEnv(claim, claim.secrets.run_env) ? { runEnv: leadLaneRunEnv(claim, claim.secrets.run_env)! } : {}),
+      ...runEnvContextField(claim, claim.secrets.run_env),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
@@ -20359,6 +20411,7 @@ export class RunRunner {
     return prepareFrozenHeld({
       git: this.git, barePath: flight.barePath!, branch: record.branch, sourceSha: record.sourceSha,
       policy: record.heldPolicy!, deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight),
+      needles: needlesOf(flight),
       defaultBranch: claim.repo.default_branch ?? undefined,
       maxBytes: this.checkpointTestHooks?.heldPackMaxBytes,
       onScan: scan => {
@@ -21565,7 +21618,7 @@ export class RunRunner {
         return untrusted("range_unresolved");
       }
       const scan = await (scanScope ?? ((fn) => fn()))(() =>
-        this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight) }),
+        this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }),
       );
       if (scan.findings.length > 0) {
         // A TRUSTED finding is remembered as flaggedCommits (without setting `known`). Its SHA
@@ -21663,7 +21716,7 @@ export class RunRunner {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
     const scan = await (options?.scanScope ?? ((fn) => fn()))(() =>
-      this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight) }));
+      this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }));
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
     return { trusted: true, range, findings: scan.findings, floorCandidates };
   }
@@ -23091,6 +23144,63 @@ export class RunRunner {
     throw new ProviderKeyBlockedError();
   }
 
+  /**
+   * PRD 4416 M2: the fail-closed exact-value scan of the objects an upload of `tip` would carry, for the
+   * registered forms of this run's secret variables (same range rules as {@link requireNoProviderKey}). Throws
+   * {@link RunEnvBlockedError} on a hit, after latching it into the existing remediation state (flagged commit,
+   * trusted-finding evidence) so the hold, the held-publication outcomes and the follow-up all fire; throws
+   * {@link SecretRemediationPendingError} when the range could not be proven clean (the work stays local and the
+   * caller retries later). Returns the clean verdict so a caller can bind it to the candidate it then publishes.
+   * Called from guards that hold the bare lock, so it takes none and persists nothing: the catch sites persist
+   * a hit with {@link persistRunEnvHit}. No variable in the claim: no git work.
+   */
+  private async requireNoRunEnv(
+    flight: RunFlight, barePath: string, tip: string, excludes: readonly string[], what: string,
+    excludeRemoteTracking = false,
+  ): Promise<RunEnvScanVerdict> {
+    const needles = needlesOf(flight);
+    const range = { tip, excludes, ...(excludeRemoteTracking ? { excludeRemoteTracking: true } : {}) };
+    if (needles.length === 0) return { kind: "clean", range };
+    let verdict: RunEnvScanVerdict;
+    try {
+      verdict = await scanRunEnvRange(this.git, barePath, range, needles, { deadlineMs: this.scanDeadlineMs() });
+    } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      verdict = { kind: "withhold", reason: "scan_threw" };
+    }
+    if (verdict.kind === "clean") return verdict;
+    if (verdict.kind === "withhold") {
+      flight.runLog.warn("run variable scan withheld an upload", { run_id: flight.runId, what, reason: verdict.reason });
+      throw new SecretRemediationPendingError();
+    }
+    this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), verdict.findings, flight.runLog);
+    if (barePath === flight.barePath && flight.branch) this.noteTrustedFinding(flight, barePath, flight.branch, "scan");
+    flight.runLog.warn("run variable scan blocked an upload", {
+      run_id: flight.runId, what, variables: hitVariableNames(verdict.findings).slice(0, 10),
+    });
+    throw new RunEnvBlockedError(verdict.findings, tip);
+  }
+
+  /** Persists a run-variable hit into the remediation record, outside any bare lock. Best effort: the in-memory
+   *  latch of {@link requireNoRunEnv} already holds every later publish, and a failure here only logs. */
+  private async persistRunEnvHit(flight: RunFlight, barePath: string, branch: string, hit: RunEnvBlockedError): Promise<void> {
+    try {
+      await this.persistRemediationScan(flight, barePath, branch, hit.tip, hit.findings, "checkpoint-pending");
+    } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      flight.runLog.warn("could not persist a run variable finding", { run_id: flight.runId, error: errMessage(e) });
+    }
+  }
+
+  /** The needles for a publish that has no flight in hand: the live claim's set, else the api's maintenance
+   *  answer ({@link resolveScanNeedles}); an unresolvable answer withholds. */
+  private resolveRunScanNeedles(runId: string, signal?: AbortSignal): Promise<NeedleResolution> {
+    return resolveScanNeedles({
+      live: this.liveScanNeedles.get(runId),
+      fetchProtected: () => this.client.getRunEnvRedact(runId, signal),
+    });
+  }
+
   /** Final push seam, shared by plain and aligned candidates and every network retry. */
   private async pushRemediationCandidate(flight: RunFlight, barePath: string, branch: string,
     pat: string, repoUrl: string, username: string | undefined,
@@ -23104,6 +23214,10 @@ export class RunRunner {
             [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
             context.restrictionFacts);
           await this.requireNoProviderKey(flight, barePath, candidate,
+            [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
+            "branch push", true);
+          // PRD 4416 M2: every forge, fail closed, bound to this exact candidate; gitleaks stays as it was.
+          await this.requireNoRunEnv(flight, barePath, candidate,
             [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
             "branch push", true);
         }, admission.identity)), signal, deadlineAt);
@@ -23357,6 +23471,8 @@ export class RunRunner {
       // re-captures); an accepted publication clears the episode only if no trusted finding arrived
       // after this version (noteCheckpointPublished).
       let admittedEvidenceSeq: number | undefined;
+      // PRD 4416 M2: every clean exact-value verdict this publish took, one per guarded candidate.
+      const scannedForVariables: RunEnvScanVerdict[] = [];
       let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
       const produce = <T,>(start: (identity: RemediationRestrictionIdentity) => Promise<T>) =>
         this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
@@ -23373,6 +23489,11 @@ export class RunRunner {
             // Exact-key scan of exactly what the producer will send (packExcludeShas is the exclude
             // list the pack uses, including the zero-range parent form), before any producer starts.
             await this.requireNoProviderKey(flight, barePath, wantedSha, context.packExcludeShas, "checkpoint publish");
+            // PRD 4416 M2: the exact-value scan of the objects this very pack carries (same tip, same
+            // excludes), before any producer starts. The clean verdict is remembered so the candidate that is
+            // then sent can be checked against it below.
+            const scanned = await this.requireNoRunEnv(flight, barePath, wantedSha, context.packExcludeShas, "checkpoint publish");
+            scannedForVariables.push(scanned);
             signal?.throwIfAborted();
             admittedEvidenceSeq = flight.trustedFindingSeq ?? 0;
           };
@@ -23399,6 +23520,12 @@ export class RunRunner {
       producer = packed;
       observeProducer();
       packedTip = packed.tipOid;
+      // PRD 4416 M2: the pack's tip must be a candidate the exact-value scan covered; otherwise what would be
+      // published is not what was scanned, and nothing is sent.
+      if (needlesOf(flight).length > 0 && !scanCoversCandidate(scannedForVariables, { tip: packed.tipOid })) {
+        flight.runLog.warn("run variable scan does not cover the candidate; withholding the upload", { run_id: flight.runId });
+        throw new SecretRemediationPendingError();
+      }
       let res;
       // Only an explicit 5xx is retriable. Three requests share the caller's deadline AND one
       // request allowance, created once here and never renewed by a retry; any failed guard,
@@ -23479,6 +23606,7 @@ export class RunRunner {
     } catch (e) {
       if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof SecretRemediationPendingError) {
+        if (e instanceof RunEnvBlockedError) await this.persistRunEnvHit(flight, barePath, branch, e);
         this.noteCheckpointWithheld(flight, true);
         this.reportPublishOutcome(flight, "secret:remediation", "checkpoint publish skipped: secret_remediation_pending");
         return { published: false, reason: "secret_remediation_pending" };
@@ -32308,7 +32436,10 @@ export class RunRunner {
         signal.throwIfAborted();
         if (!scan.trusted || ownerSignal.aborted) return { refusal: "scan_failed", diagnostic: "scan_untrusted" };
         if (scan.findings.length) return { refusal: "secret_detected", diagnostic: "secret_detected" };
-        return { diff: redactText ? redactText(diff) : diff };
+        const redacted = redactText ? redactText(diff) : diff;
+        // Redaction can grow the text (each match becomes a longer placeholder), so the cap holds for what leaves.
+        if (Buffer.byteLength(redacted, "utf8") > 512 * 1024) return { refusal: "diff_too_large", diagnostic: "output_cap" };
+        return { diff: redacted };
       });
     } finally {
       clearTimeout(timer);
