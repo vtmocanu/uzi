@@ -164,7 +164,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(ctx)
+		defer func() { _ = tx.Rollback(ctx) }()
 		stmts := migrationDownStatements(t, "00503_runs_codex_provider_exclusive.sql")
 		for i, stmt := range stmts {
 			_, err = tx.Exec(ctx, stmt)
@@ -187,7 +187,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(ctx)
+		defer func() { _ = tx.Rollback(ctx) }()
 		for _, id := range runs {
 			if _, err := tx.Exec(ctx, `DELETE FROM runs WHERE id=$1`, id); err != nil {
 				t.Fatal(err)
