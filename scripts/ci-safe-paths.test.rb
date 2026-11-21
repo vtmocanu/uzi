@@ -443,6 +443,7 @@ audited_prd_refs = %w[
   e2e/codex-m4/README.md
   e2e/codex-m4/receipts.test.ts
   e2e/codex-m4/receipts.ts
+  e2e/go-cache-admission/environment.md
   e2e/phases/05-lane-forgejo.sh
   e2e/phases/06-lane-github.sh
   e2e/phases/12-cancel-queued.sh
