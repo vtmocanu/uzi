@@ -14,9 +14,10 @@ afterEach(() => vi.resetModules());
 
 type Case = {
   id: string;
+  harness?: "claude" | "codex";
   seed: Record<string, string | null>;
   body: Record<string, string | null>;
-  expect: { status: number; error_contains?: string; planning_claude_model?: string | null; planning_claude_effort?: string | null; default_effort?: string };
+  expect: { [key: string]: string | number | null | undefined; status: number; error_contains?: string; planning_claude_model?: string | null; planning_claude_effort?: string | null; default_effort?: string };
 };
 
 // PRD #3252 M2: the mock PUT is a second implementation of the server's planning
@@ -38,8 +39,10 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
       expect(status, c.id).toBe(c.expect.status);
       if (c.expect.error_contains) expect(message, c.id).toContain(c.expect.error_contains);
       const { settings } = await api.getMySettings();
-      expect(settings.planning_claude_model ?? null, `${c.id} model`).toBe(c.expect.planning_claude_model);
-      expect(settings.planning_claude_effort ?? null, `${c.id} effort`).toBe(c.expect.planning_claude_effort);
+      const harness = c.harness ?? "claude";
+      expect(settings[`planning_${harness}_model`] ?? null, `${c.id} model`).toBe(c.expect[`planning_${harness}_model`]);
+      expect(settings[`planning_${harness}_effort`] ?? null, `${c.id} effort`).toBe(c.expect[`planning_${harness}_effort`]);
+      if (c.expect.default_codex_effort !== undefined) expect(settings.default_codex_effort, c.id).toBe(c.expect.default_codex_effort);
       if (c.expect.default_effort !== undefined) expect(settings.default_effort, `${c.id} default_effort`).toBe(c.expect.default_effort);
       got.add(c.id);
     }
@@ -77,13 +80,13 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
       .toBe("planning_claude_model: model must be a single token with no spaces");
   });
 
-  it("serves one Claude planning cell each, resolving like the server", async () => {
+  it("serves both harness planning cells, resolving like the server", async () => {
     const api = await reload();
     let { settings } = await api.getMySettings();
-    expect(settings.planning_models).toEqual([
+    expect(settings.planning_models?.filter(c => c.harness === "claude")).toEqual([
       { harness: "claude", model: null, default_model: "", default_source: "builtin", resolved_model: "", source: "builtin" },
     ]);
-    expect(settings.planning_efforts).toEqual([
+    expect(settings.planning_efforts?.filter(c => c.harness === "claude")).toEqual([
       { harness: "claude", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
     ]);
     ({ settings } = await api.putMySettings({

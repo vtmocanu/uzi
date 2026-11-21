@@ -183,6 +183,7 @@ export function ModelSelect({
           onChange={(e) => onCustom(e.target.value)}
           placeholder={customPlaceholder}
           aria-label={customAriaLabel}
+          aria-describedby={ariaDescribedBy}
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
