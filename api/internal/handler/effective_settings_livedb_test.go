@@ -895,10 +895,8 @@ func TestEffectiveSettingsCellsEqualMySettingsLiveDB(t *testing.T) {
 	}
 }
 
-// TestEffectiveSettingsPlanningCellsLiveDB pins both harnesses' planning cells and plan_phase (PRD
-// #3252): the effective cells equal the /me/settings planning cells, resolved/source follow the
-// claim's plan pair (user_planning_default), a Codex role id stored in the planning column is
-// ignored, and every preview is plan_phase-free until a planning value applies.
+// TestCodexPlanningRuntimeSaveOrdersLiveDB preserves explicit planning effort with Runtime
+// default implementation effort in both save orders, and rejects aliases without changing the pair.
 func TestCodexPlanningRuntimeSaveOrdersLiveDB(t *testing.T) {
 	for _, planFirst := range []bool{true, false} {
 		t.Run(fmt.Sprintf("plan_first_%v", planFirst), func(t *testing.T) {
@@ -926,10 +924,22 @@ func TestCodexPlanningRuntimeSaveOrdersLiveDB(t *testing.T) {
 				!plan.PlanningCodexEffort.Valid || plan.PlanningCodexEffort.String != "high" || !run.Valid || run.String != "runtime" {
 				t.Fatalf("saved model/plan effort/run effort = %v / %v / %v", plan.PlanningCodexModel, plan.PlanningCodexEffort, run)
 			}
+			rec := httptest.NewRecorder()
+			f.h.PutMySettings(rec, userReq(http.MethodPut, "/api/me/settings",
+				`{"planning_codex_model":"opus","planning_codex_effort":"low"}`, f.user, nil))
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "planning_codex_model") {
+				t.Fatalf("Claude alias status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			after, err := f.h.q.GetUserPlanningCodex(f.ctx, f.user)
+			if err != nil || after != plan {
+				t.Fatal("rejected Claude alias changed the stored planning pair")
+			}
 		})
 	}
 }
 
+// TestEffectiveSettingsPlanningCellsLiveDB compares both harnesses' planning cells and previews
+// with the settings response, preserving claim-time resolution and independent frozen overrides.
 func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
 	mySettings := func(f *effFix) (models []apitypes.ModelSettingCellDTO, efforts []apitypes.EffortSettingCellDTO) {
 		rec := httptest.NewRecorder()

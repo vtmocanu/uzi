@@ -21,10 +21,30 @@ func TestCodexPhasePlacementMigrationRoundTripLiveDB(t *testing.T) {
 		}
 		return value
 	}
+	columnsVersion := migrationVersionByName(t, "user_planning_codex")
+	if columnsVersion != version-1 {
+		t.Fatal("planning columns must immediately precede placement migration")
+	}
+	assertColumns := func(want bool) {
+		t.Helper()
+		for _, column := range []string{"planning_codex_model", "planning_codex_effort"} {
+			var exists bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema='public' AND table_name='users' AND column_name=$1)`, column).Scan(&exists); err != nil {
+				t.Fatal(err)
+			}
+			if exists != want {
+				t.Fatalf("column %s present=%v, want %v", column, exists, want)
+			}
+		}
+	}
+	assertColumns(true)
 	before := definition()
 	if err := MigrateTo(ctx, dsn, version); err != nil {
 		t.Fatal(err)
 	}
+	assertColumns(true)
 	after := definition()
 	if before == after {
 		t.Fatal("Up did not change the placement function")
@@ -35,9 +55,18 @@ func TestCodexPhasePlacementMigrationRoundTripLiveDB(t *testing.T) {
 	if definition() != before {
 		t.Fatal("Down did not restore the exact predecessor")
 	}
+	// The predecessor no longer references the Codex columns, so their Down can run.
+	if err := MigrateDownTo(ctx, dsn, columnsVersion-1); err != nil {
+		t.Fatal(err)
+	}
+	assertColumns(false)
+	if definition() != before {
+		t.Fatal("columns Down changed the restored predecessor function")
+	}
 	if err := MigrateTo(ctx, dsn, version); err != nil {
 		t.Fatal(err)
 	}
+	assertColumns(true)
 	if definition() != after {
 		t.Fatal("second Up did not restore the same Codex placement function")
 	}
