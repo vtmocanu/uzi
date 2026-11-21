@@ -564,7 +564,13 @@ refusal is recorded as a `no_usable_credential` skip.
 | `self_improve` | As above, and a Claude run spends the credential of your Judge binding, not a worker's and not a per-schedule override. The credential source is `token_override` for a pinned Judge token, `auto_selection` for an automatic Judge binding (an empty pool falls back to your default, shown as `owner_default`), and `owner_default` for the default binding. The notes carry `token_fixed` unless the binding is automatic. No token id or label is shown. |
 
 `worker_model`, `worker_effort`, `credential` and `subagents` are those of
-the chosen harness. A Codex run accepts only the curated model pins, so a
+the chosen harness. On a Claude fire where your
+[planning settings](./worker-model.md#planning-model-and-effort) apply, the
+preview also carries `plan_phase` (`model`, `effort`, `model_source`,
+`effort_source`, each omitted when absent), per alternative when the harness is
+chosen at creation; see [Effective
+settings](./configuration.md#where-each-value-comes-from). A schedule's model
+pin is frozen into both phases, so the planning model then yields to it. A Codex run accepts only the curated model pins, so a
 model pin it cannot run is not used: the cell shows the default model, the
 pin appears as `ignored` (with source `schedule_pin`) and the notes carry
 `schedule_pin_ignored`.

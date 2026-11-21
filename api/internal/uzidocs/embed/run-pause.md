@@ -393,7 +393,13 @@ it by default. Nothing resumes this hold on a timer.
   recovery](./run-recovery.md).
 
 If the worker cannot reach the server while parking, it retries for up to 30
-minutes. After that the server's usual stale-worker handling applies.
+minutes. After that the worker's flight ends and it keeps its copy of the work.
+If the worker is still alive, its next heartbeat no longer lists the run, and
+the server treats it as missing from the snapshot: once the run has been silent
+past the stale window plus one heartbeat interval, it is requeued while it is
+under its requeue budget (`RUN_MAX_REQUEUES`), otherwise it fails with "worker
+lost the execution; exceeded re-queue budget". The stale-worker sweep applies
+only when the worker itself is gone.
 
 ## Not the same as a completion hold
 

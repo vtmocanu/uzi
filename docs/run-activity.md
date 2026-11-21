@@ -1030,10 +1030,12 @@ status line from the worker, then the run parks (see [the hold](./run-pause.md#h
 - `Paused: this worker cannot verify a switch to <target>. Choose a supported
   model (opus, sonnet, haiku, fable) or a full model id, or clear the Claude
   planning setting, then Resume; Cancel ends the run.` The target is not in the
-  characterized set the worker can check.
+  characterized set the worker can check. The runtime not offering a
+  `getSettings` method gives this same line, since the worker cannot verify a
+  switch without it.
 
-Model and effort values in these lines come from the runtime and are shortened
-and stripped of control characters. If the worker then cannot get the park
+Model and effort values in these lines are the value uzi requested and the value
+the runtime reported, reduced to printable ASCII and clipped to 80 characters. If the worker then cannot get the park
 confirmed, it adds a follow-up line instead of leaving the first one standing:
 either `This worker no longer holds the run and has stopped working on it. This
 worker keeps its copy of the work.` (the server definitively no longer lists the

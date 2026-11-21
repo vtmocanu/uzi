@@ -36,7 +36,7 @@ The worker compares `applied.model` and `applied.effort` with an expectation uzi
 
 - **Characterized aliases only.** `opus` to `claude-opus-5-5`, `sonnet` to `claude-sonnet-5-5`, `haiku` to `claude-haiku-5-5`, `fable` to `claude-fable-5-1`. Omitted-effort defaults are `medium`, `medium`, `medium`, `high` respectively. An alias outside the table cannot be verified and holds.
 - **Full ids compared verbatim.** A full model id, or a provider-mapped id (`ANTHROPIC_DEFAULT_<ALIAS>_MODEL` taken verbatim), is compared as given.
-- **Omitted effort.** The Q-spike finding is that an omitted effort reverts to the model default on resume, so an explicit planning effort with a Runtime-default implementation effort is allowed; the combination rule in the original PRD text is inactive (D19). The expected default must still be established independently, or the run holds. Provider runs with no implementation effort always hold.
+- **Omitted effort.** The Q-spike finding is that an omitted effort reverts to the model default on resume, so an explicit planning effort with a Runtime-default implementation effort is allowed; the combination rule in the original PRD text is inactive (D19). The expected default must still be established independently, or the run holds: with no effort sent, it comes from the model the runtime reports, and that model must be one of the four characterized ids. A provider run with no implementation effort therefore holds unless the provider maps the alias to one of those ids.
 - **Missing method, timeout or malformed answer holds.** `getSettings` is present at runtime but absent from the public typing, so a pin-sensitivity characterization test guards every SDK or CLI bump.
 - **Init reports, never gates.** A later contradictory init stops the query and holds; it cannot undo a request already admitted, and the docs do not claim it can.
 
@@ -44,18 +44,18 @@ Rejected: abort-on-init (lets a request through), an unverified switch, and a fr
 
 ### Unsupported configuration
 
-A planning model with no implementation model (no worker model and no template model) is refused before any turn as an unsupported phase configuration naming both remedies. A fresh pre-approved start with no session is exempt because it never plans. A resumed run at its gate is refused even if the owner would just approve. An empty worker-model lane with the builtin lead template (`opus`) implements on the template model.
+A planning model with no implementation model (no worker model and no template model) is refused before any turn as an unsupported phase configuration naming both remedies. A fresh pre-approved start with no session is exempt because it never plans. A resumed run at its gate is refused even if the owner would just approve. An empty worker-model lane with the builtin lead template (`opus`) implements on the template model. The refusal is skipped on provider runs, because the provider map always yields an explicit model or fails with `provider_model_unmapped`.
 
 ### The hold
 
-A run whose switch cannot be confirmed parks `paused` with `hold_reason: phase_switch_unavailable`, owner-resumable, through a generation-fenced active-run park that records which phase it was verifying. The server admits a plan-phase hold without an approval check and checks plan approval only for the implement phase, answering `409` with reason `plan_not_approved` for an unapproved run.
+A run whose switch cannot be confirmed parks `paused` with `hold_reason: phase_switch_unavailable`, owner-resumable, through a generation-fenced active-run park. The hold request names the phase, which only decides whether the plan-approval check applies; nothing stores it. The server admits a plan-phase hold without an approval check and checks plan approval only for the implement phase, answering `409` with reason `plan_not_approved` for an unapproved run.
 
 - **Resume** queues a new claim that is already approved, implements directly and re-verifies. **Cancel** is the ordinary path. Nothing promotes or extends out of the hold on a timer.
 - **Outcome classification.** The worker classifies the server's answer: applied, already applied for this generation (a lost-ACK retry), refused with the run's real status, or no longer this worker's. An implement-to-plan re-post is a distinct classified outcome, not an error. An owner Cancel during an unconfirmed hold reports cancelled.
 - **Readopt exclusion.** A held run is not readopted as ordinary running work.
 - **Late-report guards.** In both `paused` and `queued`, late worker reports that would move the run on are refused: AwaitingInput, AwaitingFollowup, AwaitingApproval, Completed, Failed, FailedPlanRejected and SupersedeRunByWorker. CancelRunByWorker is exempt because it carries owner intent. RecordCompletionAttempt is left unguarded, like the base-attestation hold.
 - **Lost-ACK and Resume race.** If the hold was applied but the worker never saw the answer, the worker's retry is classified by the server's answer for that generation (already applied, or refused with the run's real status), so an owner Resume that raced the lost ACK is not undone by the retry.
-- **Unknown outcome.** When reads fail and the outcome stays unknown, the worker retries for a bounded 30 minutes and then stops, keeping its copy of the work and posting a feed line that says only what is known. The server's stale-worker sweep then requeues the run within its budget, else it goes to `recovery_wait` or `failed`.
+- **Unknown outcome.** When reads fail and the outcome stays unknown, the worker retries for a bounded 30 minutes and then stops, keeping its copy of the work and posting a feed line that says only what is known. If the worker is still alive, its heartbeat snapshot no longer lists the run, and the server's missing-from-snapshot handling takes over: once the run has been silent past the stale window plus one heartbeat interval, it is requeued while under `RUN_MAX_REQUEUES`, else failed with "worker lost the execution; exceeded re-queue budget". The stale-worker sweep applies only when the worker itself is gone.
 - **Process death** is not a new route. A worker crash before the hold is recorded follows the existing worker-lost policy and the existing stale-worker handling.
 
 Presentation is added to the shared hold-reason set (web texts, CLI renderers, agent protocol unions) beside `run_override_unavailable`, without reusing its park path.
@@ -73,7 +73,7 @@ Deploy the API before relying on the capability. A worker deployed first against
 - **Provider check is create-time only.** The provider-lane check is made at creation, not re-checked at approval.
 - **Late effort re-derivation.** The effort expectation is re-derived late, when the switch is verified; see PRD D19 for the boundary.
 - **Cost.** Task (handoff) runs plan first, so a strong planning model raises their cost.
-- **Over-approximation** can leave a run pinned to a custodian that cannot claim it, for about two minutes of resume affinity and, rarely, longer; cancel and restart clears it.
+- **Over-approximation** can leave a run pinned to a custodian that cannot claim it, for a short resume-affinity window and, rarely, longer; cancel and restart clears it.
 - **Pin sensitivity.** Any SDK or CLI bump must pass the barrier characterization first; if the barrier stops holding, a fresh-conversation fallback needs its own design and review pass.
 
 ## Codex

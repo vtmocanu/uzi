@@ -66,8 +66,9 @@ card; no CLI command sets it. Phases, scope and the planning model are in
 - **Which defaults apply.** After approval the runtime default is the one
   characterized for the implementation model: `medium` for `opus`, `sonnet`
   and `haiku`, and `high` for `fable`. An unlisted model has no independently
-  established default, so that switch holds. A provider run with no
-  implementation effort always holds.
+  established default, so that switch holds. The model is the one the runtime
+  reports, so a provider run with no implementation effort holds unless its
+  provider maps the alias to one of those four characterized models.
 - **A run-level effort wins.** An effort chosen when starting the run applies to
   both phases, and the planning effort never overrides it.
 

@@ -430,8 +430,8 @@ The body holds, for a manual start of an issue run with no model and no Anthropi
 |---|---|
 | `harnesses` | Claude then Codex, each taken as an explicit choice: `usable`, a `refusal` (and optional `refusal_detail`) when not, and the `credential` it would use. |
 | `start` | The three start choices (`default`, `claude`, `codex`): the predicted `harness` (`value`, `source`, `fixed_at`, `notes`) or a refusal, plus `anthropic_override_allowed`. |
-| `models` | Eight cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex. |
-| `efforts` | Four cells: worker effort and task-review effort, each for Claude then Codex. |
+| `models` | Nine cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex, then the Claude-only `planning_model` appended last. |
+| `efforts` | Five cells: worker effort and task-review effort, each for Claude then Codex, then the Claude-only `planning_effort` appended last. |
 | `cross_check` | Eight cells: plan then code, Claude then Codex, as `models` and `efforts`. |
 | `judge_harness` | One cell, always present: the harness a [judge](./judge.md#judge-runs-on) run would use (`value`, `source`, `fixed_at`, `notes`). An explicit **Judge runs on** choice is `value` `claude` or `codex` with `source` `user_default`; unset is `value` null with `source` `same_as_run`, because the judge follows the harness of the run it reviews, known only once that run exists. `fixed_at` is `create` in both cases. |
 
@@ -451,6 +451,8 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
 
 For a Claude lead-lane run, a preview may show the planning-phase and implementation-phase model and effort as a pair, because the lead plans on your [planning settings](./worker-model.md#planning-model-and-effort) and implements on its own. A model or effort chosen for the run or pinned by a schedule applies to both.
+
+On the start preview and the schedule preview (and on each of their `alternatives`), that pair is the optional `plan_phase` key: `model`, `effort`, `model_source` and `effort_source`, each omitted when absent. A `model` or `effort` is omitted when the plan phase ships none on that side, which then follows the implement side (the preview's own `worker_model` and `worker_effort`). A source is `user_planning_default` for a planning value, else the implement value's source. The whole key is omitted unless the harness is Claude and your planning model or effort applies, so every other preview body is unchanged. A start-time model or effort in the request, or a schedule's model pin, is frozen into both phases and stays out of the planning lane.
 
 Subagent pins and repository-defined agents are not part of the account view or the start-preview; the [schedule preview](./scheduling.md#settings-preview) predicts your own subagents' pins, and not repository-defined agents.
 

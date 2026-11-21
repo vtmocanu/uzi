@@ -257,8 +257,13 @@ Known limits:
   like a mismatch and hold the run.
 - The alias table was characterized with a dummy key; alias stability under
   subscription auth is not separately proven.
-- Provider runs with no implementation effort always hold, because the default
-  effort cannot be established independently.
+- With no implementation effort sent, the expected effort comes from the model
+  the runtime reports. A provider run holds unless its provider maps the alias
+  (`ANTHROPIC_DEFAULT_<ALIAS>_MODEL`, compared as given) to one of the four
+  characterized model ids.
+- The refusal of a planning model with no implementation model is skipped on
+  provider runs, because the provider map always yields an explicit model or
+  fails with `provider_model_unmapped`.
 
 ### When the switch cannot be confirmed
 

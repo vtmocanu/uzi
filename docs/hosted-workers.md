@@ -1157,7 +1157,7 @@ reason reads **no worker supporting separate planning settings is online**.
   resolved when a worker claims it, so the change reaches it at its next claim.
 
 A run that was just requeued because its worker lacked the capability may stay
-tied to that worker for about two minutes before another can take it. A
+tied to that worker for a short affinity window before another can take it. A
 placement that over-approximates which runs need the capability can, in rare
 cases, leave a run pinned to a worker that cannot claim it; cancel and restart
 it if the health reason does not clear after you roll the fleet.
