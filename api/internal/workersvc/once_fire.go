@@ -33,7 +33,7 @@ var (
 	errOnceFireRequiresTx = errors.New("once fire run creation requires an atomic transaction")
 )
 
-// onceFireRunsPkey is the ledger's explicitly named primary key (migration 00499). A 23505 on
+// onceFireRunsPkey is the ledger's explicitly named primary key (migration 00502). A 23505 on
 // it is a lost race for the same issue, not an active-run conflict.
 const onceFireRunsPkey = "schedule_once_fire_runs_pkey"
 

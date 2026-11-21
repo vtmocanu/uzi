@@ -17,7 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4512 (ADR-4007 T3a), migrations 00498 (fire_epoch trigger) and 00499 (the per-fire
+// Issue #4512 (ADR-4007 T3a), migrations 00501 (fire_epoch trigger) and 00502 (the per-fire
 // progress tables). Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres
 // (./e2e/run-store-it.sh). Every name ends LiveDB so the store-IT sweep selects it.
 
@@ -182,7 +182,7 @@ func (f *onceFireFx) legacyUpdate(t *testing.T, p store.UpdateRunScheduleParams)
 		p.CredentialOverrideMode, p.CredentialOverrideSecretID, p.Customized, p.ID, p.UserID)
 }
 
-// TestOnceFireEpochTriggerMatrixLiveDB pins the trigger's exact predicate (migration 00498):
+// TestOnceFireEpochTriggerMatrixLiveDB pins the trigger's exact predicate (migration 00501):
 // rows in states active, error and fired crossed with every writer of run_schedules.
 func TestOnceFireEpochTriggerMatrixLiveDB(t *testing.T) {
 	f := newOnceFireFx(t)
@@ -421,7 +421,7 @@ func (l ledgerFx) insertRun(t *testing.T, iid int64, runUUID uuid.UUID) error {
 	return err
 }
 
-// TestOnceFireLedgerSchemaLiveDB pins the ledger's constraints and cascades (migration 00499).
+// TestOnceFireLedgerSchemaLiveDB pins the ledger's constraints and cascades (migration 00502).
 func TestOnceFireLedgerSchemaLiveDB(t *testing.T) {
 	f := newOnceFireFx(t)
 
@@ -650,7 +650,7 @@ func TestOnceFireQueriesLiveDB(t *testing.T) {
 	}
 }
 
-// TestOnceFireMigrationDownUpLiveDB runs 00499's and 00498's Down and Up again, in order.
+// TestOnceFireMigrationDownUpLiveDB runs 00502's and 00501's Down and Up again, in order.
 func TestOnceFireMigrationDownUpLiveDB(t *testing.T) {
 	f := newOnceFireFx(t)
 	count := func(sql string) int { return f.count(t, sql) }
@@ -662,20 +662,20 @@ func TestOnceFireMigrationDownUpLiveDB(t *testing.T) {
 	if count(objects) != 3 || count(epochObjects) != 3 {
 		t.Fatalf("objects before Down: %d %d", count(objects), count(epochObjects))
 	}
-	if err := store.MigrateDownTo(f.ctx, f.dsn, 498); err != nil {
-		t.Fatalf("down to 498: %v", err)
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 501); err != nil {
+		t.Fatalf("down to 501: %v", err)
 	}
 	if n := count(objects); n != 0 {
-		t.Fatalf("progress objects left after 00499's Down: %d", n)
+		t.Fatalf("progress objects left after 00502's Down: %d", n)
 	}
 	if n := count(epochObjects); n != 3 {
-		t.Fatalf("00499's Down must leave 00498's objects: %d", n)
+		t.Fatalf("00502's Down must leave 00501's objects: %d", n)
 	}
-	if err := store.MigrateDownTo(f.ctx, f.dsn, 497); err != nil {
-		t.Fatalf("down to 497: %v", err)
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 500); err != nil {
+		t.Fatalf("down to 500: %v", err)
 	}
 	if n := count(epochObjects); n != 0 {
-		t.Fatalf("epoch objects left after 00498's Down: %d", n)
+		t.Fatalf("epoch objects left after 00501's Down: %d", n)
 	}
 	if err := store.Migrate(f.ctx, f.dsn); err != nil {
 		t.Fatalf("up again: %v", err)
