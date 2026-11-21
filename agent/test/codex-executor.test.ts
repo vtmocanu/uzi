@@ -32470,7 +32470,7 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-preserve-intent-summary", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "tool-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "gated-plan-summary", "gated-plan-summary-late", "gated-plan-summary-unacked", "gated-intent-summary", "gated-intent-summary-retained", "gated-intent-summary-late", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-preserve-intent-summary", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "tool-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "gated-plan-summary", "gated-plan-summary-late", "gated-plan-summary-unacked", "gated-plan-summary-probe-cleanup", "gated-intent-summary", "gated-intent-summary-retained", "gated-intent-summary-late", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
@@ -32529,7 +32529,9 @@ describe("M2 actualRunner credential replacement", () => {
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
         // Plan-summary variants: the executor's own real SummaryRunner over a plan-gated claim.
         const planSummaryLate = publication === "gated-plan-summary-late";
-        const planSummaryUnacked = publication === "gated-plan-summary-unacked";
+        const summaryProbeCleanup = publication === "gated-plan-summary-probe-cleanup";
+        if (summaryProbeCleanup && oldClaim !== API_KEY) continue;
+        const planSummaryUnacked = publication === "gated-plan-summary-unacked" || summaryProbeCleanup;
         const planSummary = publication === "gated-plan-summary" || planSummaryLate || planSummaryUnacked;
         // Intent-summary variants: the executor's own real SummaryRunner over a pre-approved claim whose intent
         // summary is not yet present, so the runLeg intent flight launches.
@@ -32595,6 +32597,7 @@ describe("M2 actualRunner credential replacement", () => {
           : intentRetained ? "retained unlaunched A build never starts through B publication and finishB"
           : "A joins before suspension; retired A launch never starts; follow-on flight uses B's credential"}`
         : planSummary ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} plan summary ${planSummaryLate ? "late A result settles before B publication and never posts as B"
+          : summaryProbeCleanup ? "failure path joins detached probes before restoring fixtures"
           : planSummaryUnacked ? "uninvoked A plan callback admits no work through B publication" : "joins before suspension and B build is admitted with B's credential"}`
         : crashRecovery ? publication === "crash-after-a-teardown-recovery"
           ? "Codex switch crash after A teardown before apply recovers committed A without switching"
@@ -32651,6 +32654,7 @@ describe("M2 actualRunner credential replacement", () => {
         const summaryOwners: import("../src/codex/summary-ownership.js").SummaryOwnership[] = [];
         const planInputs: { capability: string | undefined; authMode: string | undefined }[] = [];
         const planPosts: string[] = [];
+        const planPostRequests: { runId: string; summary: string }[] = [];
         const planSummaryEvents: string[] = [];
         const planWorkEntered = installerBarrier(), planAborted = installerBarrier(), planRelease = installerBarrier();
         const refreshDrained = installerBarrier(), depsSettled = installerBarrier();
@@ -32679,7 +32683,7 @@ describe("M2 actualRunner credential replacement", () => {
         let ownedUnverifiedAtABuild: number | undefined, ownedUnverifiedAtSuspensionReturn: number | undefined;
         let bIntentBuildsAtFinish: number | undefined;
         const followOnIntentPosted = installerBarrier();
-        let followOnActive = false, followOnCancelRequested = false;
+        let followOnActive = false;
         const retiredIntentLaunches: { stage: string; startCalls: number; refusal: boolean; message: string;
           lifecycleAborted: boolean | undefined; inputs: number; builds: number; releases: number; refreshes: number;
           posts: number; aSends: number; bSends: number; bInputs: number; bBuilds: number }[] = [];
@@ -32689,7 +32693,7 @@ describe("M2 actualRunner credential replacement", () => {
         const awaitPlanAbortThenRelease = async (signal: AbortSignal | undefined): Promise<void> => {
           if (signal && !signal.aborted)
             await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
-          planAbortObserved = signal === undefined || signal.aborted;
+          planAbortObserved = signal?.aborted === true;
           planSummaryEvents.push("A-plan-aborted");
           planAborted.resolve();
           await planRelease.promise;
@@ -32725,7 +32729,7 @@ describe("M2 actualRunner credential replacement", () => {
             if (intentRetained || intentPreserve) {
               if (params.signal && !params.signal.aborted)
                 await new Promise<void>(resolve => params.signal!.addEventListener("abort", () => resolve(), { once: true }));
-              planAbortObserved = params.signal === undefined || params.signal.aborted;
+              planAbortObserved = params.signal?.aborted === true;
               planSummaryEvents.push("A-plan-aborted");
             } else await awaitPlanAbortThenRelease(params.signal);
             aIntentBuildEnded = true;
@@ -32770,8 +32774,13 @@ describe("M2 actualRunner credential replacement", () => {
         // probe starts synchronously at the production call and is recorded, never thrown, so a refusal defect reports
         // at the top-level named assertions; the pending set is joined before the next executor barrier.
         const summaryStageProbes: Promise<void>[] = [];
+        let summaryProbesClosing = false;
+        const cleanupProbeRelease = installerBarrier();
+        const cleanupFault = new Error("expected summary-probe cleanup fault");
+        let cleanupFaultObserved = false, cleanupProbeSettled = false;
         const summaryStageVariant = planSummaryUnacked || intentGatedHold || intentRetained || intentPreserve;
         const startSummaryStageProbe = (stage: string): void => {
+          if (summaryProbesClosing) return;
           if (intentGatedHold || intentRetained || intentPreserve) {
             summaryStageProbes.push(probeRetiredIntentLaunch(stage));
           } else if (planSummaryUnacked) {
@@ -33065,7 +33074,7 @@ describe("M2 actualRunner credential replacement", () => {
           });
         }
         client.getInputs = async (...args) => ({ ...(preserveCleanupFollowup
-          ? await originalGetInputs(...args) : { inputs: [] }), nowSummary: true, ...((followOnActive ? followOnCancelRequested : (cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B"))))) ? { terminalCancelled: { run_id: claim.run_id, generation: followOnActive ? 8 : 7 } } : {}),
+          ? await originalGetInputs(...args) : { inputs: [] }), nowSummary: true, ...((!followOnActive && (cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B"))))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
           ...(pending ? { credentialSwitch: { generation: 7,
             op_id: clearOpChangedBefore && persistFailures > 0 ? "M2-changed-op" : pendingOp,
             target_secret_id: clearTargetChangedBefore && persistFailures > 0 ? "M2-changed-target" : "M2-target" } } : {}) });
@@ -33585,7 +33594,7 @@ describe("M2 actualRunner credential replacement", () => {
             planInputs.push(entry);
             const isA = entry.capability === oldClaim.capability;
             if (planSummaryLate) {
-              if (!isA) { bPlanSettled.resolve(); return null; }
+              if (!isA) return null;
               // The real call is not delegated: this stands in for a late A result that outlives its abort.
               lateInput = { ...entry, aborted: input.signal?.aborted === true };
               planWorkStarted = true;
@@ -33601,7 +33610,11 @@ describe("M2 actualRunner credential replacement", () => {
             return planPass.run(true, () => realPlan(input));
           };
           (rig.client as unknown as { postPlanSummary: (id: string, plan: { summary: string }) => Promise<void> }).postPlanSummary =
-            async (_id, plan) => { planPosts.push(plan.summary); bPlanSettled.resolve(); };
+            async (id, plan) => {
+              planPosts.push(plan.summary);
+              planPostRequests.push({ runId: id, summary: plan.summary });
+              bPlanSettled.resolve();
+            };
           const settleDeps = (executor as unknown as { settleDepsInstall(...args: unknown[]): Promise<boolean> }).settleDepsInstall.bind(executor);
           Reflect.set(executor, "settleDepsInstall", async (...args: unknown[]) => {
             try { return await settleDeps(...args); } finally { if (planSuspensionInFlight) depsSettled.resolve(); }
@@ -33860,13 +33873,19 @@ describe("M2 actualRunner credential replacement", () => {
           retainedPrepareRootDispatch = ctx.prepareCodexRootDispatch;
           worktree = ctx.worktreePath;
           await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
-          if (planSummaryUnacked) {
-            // Retain A's FIRST onPlanPersisted callback (3rd gatePlan argument): the Runner never invokes it because
-            // the switch refused A's presentation. It is forwarded unchanged.
+          if (planSummary) {
+            // Retain A's first unacknowledged callback unchanged. A fresh B callback reports its actual
+            // completion, including null/no-post results, so a timeout never masquerades as settlement.
             const gate = ctx.gatePlan!;
             ctx.gatePlan = async (...gateArgs) => {
-              if (gateArgs[2] && retainedPlanCallbacks.length === 0) retainedPlanCallbacks.push(gateArgs[2]);
-              return gate(...gateArgs);
+              if (planSummaryUnacked && gateArgs[2] && retainedPlanCallbacks.length === 0)
+                retainedPlanCallbacks.push(gateArgs[2]);
+              const persisted = gateArgs[2];
+              if (!persisted || !bFinished) return gate(...gateArgs);
+              return gate(gateArgs[0], gateArgs[1], async planMd => {
+                try { await persisted(planMd); }
+                finally { bPlanSettled.resolve(); }
+              });
             };
           }
           const attempt = ctx.attemptCodexCredentialSwitch!;
@@ -34309,17 +34328,20 @@ describe("M2 actualRunner credential replacement", () => {
         let bLookupScope: ReturnType<typeof acquireCodexOperationScope> | undefined;
         let actualAController: ReturnType<typeof acquireCodexOperationScope>["controller"] | undefined;
         const running = runner.execute(claim);
-        // The I4 follow-on flight is owned here so the outer cleanup joins it (bounded) before mocks are restored and
-        // the fixture directory is removed.
+        // The I4 follow-on flight is owned here. Shutdown reaches it even before its next inputs poll;
+        // fixture waiters are released below and actual settlement precedes mock restoration/removal.
         let followingFlight: Promise<unknown> | undefined;
+        const stopFollowOn = () => {
+          if (followingFlight) runner.shutdown();
+        };
         // Set when the test body throws: a follow-on join failure must not replace that body error in cleanup.
         let bodyFailed = false;
         const joinExecution = async () => {
           const settled = await Promise.allSettled([running, ...triggers]);
-          // A follow-on join failure never hides the primary join failure, and never skips the bounded join.
-          followOnCancelRequested = true;
+          // A timeout is not settlement: never restore fixtures while the owned flight still runs.
+          stopFollowOn();
           const followJoin = followingFlight
-            ? await withTimeout(followingFlight, 5000, "follow-on flight joins at cleanup").then(() => undefined, (error: unknown) => ({ error }))
+            ? await followingFlight.then(() => undefined, (error: unknown) => ({ error }))
             : undefined;
           for (const result of settled) {
             if (result.status === "rejected") throw result.reason;
@@ -34781,6 +34803,13 @@ describe("M2 actualRunner credential replacement", () => {
             }
             for (const barrier of publicationBarriers.slice(0, failureBoundaryCount)) {
               await withTimeout(barrier.entered.promise, 5000, barrier.stage);
+              if (summaryProbeCleanup && barrier.stage === "before-publish") {
+                summaryStageProbes.push(cleanupProbeRelease.promise.then(async () => {
+                  await new Promise<void>(resolve => setImmediate(resolve));
+                  cleanupProbeSettled = true;
+                }));
+                throw cleanupFault;
+              }
               await joinSummaryStageProbes();
               const builds = nowBuilds.length;
               const aRequests: number = a.transport.requests.length;
@@ -35187,6 +35216,7 @@ describe("M2 actualRunner credential replacement", () => {
               assert.ok(switchError instanceof PolicyContinuationRejected);
               assert.equal(switchError.cause, "provider_resume_rejected");
               if (intentPreserve) {
+                assert.equal(planAbortObserved, true, "preserve-only A intent work observed its supplied signal aborted");
                 assertRetiredIntentLaunches([...expectedAssignmentStages, "before-publish", "after-publish",
                   "before-Now-publish", "after-Now-publish", "before-prepare", "login", "resume", "policy-hold"]);
                 const hold = retiredIntentLaunches.find(launch => launch.stage === "policy-hold")!;
@@ -35763,7 +35793,7 @@ describe("M2 actualRunner credential replacement", () => {
             // B presents the retried plan gate and its own plan work (if any) settles; the run is then stopped at
             // that gate, so no implementation epoch is recreated and B's ordinary work never starts.
             await withTimeout(bGatePresented.promise, 5000, "B presents the retried plan gate");
-            await Promise.race([bPlanSettled.promise, new Promise<void>(resolve => setTimeout(resolve, 1500))]);
+            await withTimeout(bPlanSettled.promise, 5000, "B plan callback completes before cancellation");
             cancelled = true;
             cleanupContinue.resolve();
             await withTimeout(running, 5000, "plan-gated run stops at B's retried gate");
@@ -35800,6 +35830,8 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(bInputsAtFinish, 0, "retired A plan callback never builds or posts with B");
               assert.equal(planInputs.filter(input => input.capability === next.capability).length, 1,
                 "only B's own retried gate summarises, with B's credential");
+              assert.deepEqual(planPostRequests, [{ runId: claim.run_id, summary: `Plan summary built with ${next.capability}` }],
+                "exactly one B plan summary post for this run before cancellation");
             } else {
               // Preconditions, recorded when the executor suspension was entered and when the barrier was released.
               assert.deepEqual(planAtSuspend, { flights: 1, workEntered: true, released: false },
@@ -36107,7 +36139,7 @@ describe("M2 actualRunner credential replacement", () => {
                 // Record whether the event happened within its bound instead of throwing, so the named assertions below report the defect.
                 let followOnTimer: ReturnType<typeof setTimeout> | undefined;
                 try {
-                  await Promise.race([followOnIntentPosted.promise, following.then(() => undefined),
+                  await Promise.race([followOnIntentPosted.promise, following.then(() => undefined, () => undefined),
                     new Promise<void>(resolve => { followOnTimer = setTimeout(resolve, 5000); })]);
                 } finally { clearTimeout(followOnTimer); }
                 // The batcher delivers frames on its own interval: hold the flight open (bounded) until the usage frame lands.
@@ -36115,7 +36147,9 @@ describe("M2 actualRunner credential replacement", () => {
                 while (Date.now() < deliveryDeadline && !api.messages(claim.run_id).slice(switchedFeedLength)
                   .some(message => message.kind === "summary_usage" && rec(message.payload).pass === "intent"))
                   await new Promise<void>(resolve => setTimeout(resolve, 10));
-              } finally { followOnCancelRequested = true; }
+              } finally { stopFollowOn(); }
+              assert.equal(runFlights.some(flight => flight.claimGeneration === 8 && flight.steering.lifecycleSignal().aborted), true,
+                "follow-on flight stops independently of its next inputs poll");
               // Record the stop instead of throwing, so a defective follow-on flight reports the named assertions first.
               const followStopError = await withTimeout(following, 5000, "follow-on flight stops after its intent summary")
                 .then(() => undefined, (error: unknown) => error);
@@ -36136,9 +36170,14 @@ describe("M2 actualRunner credential replacement", () => {
               if (followStopError !== undefined) throw followStopError;
             }
           }
-        } catch (error) { bodyFailed = true; throw error; } finally {
+        } catch (error) {
+          bodyFailed = true;
+          if (summaryProbeCleanup && error === cleanupFault) cleanupFaultObserved = true;
+          else throw error;
+        } finally {
           try {
-            followOnCancelRequested = true;
+            summaryProbesClosing = true;
+            stopFollowOn();
             planRelease.resolve(); planGateRelease.resolve(); bPlanSettled.resolve();
             scopeProbesArmed = false;
             aRefreshRelease.resolve(); aRefreshContinue.resolve();
@@ -36152,9 +36191,15 @@ describe("M2 actualRunner credential replacement", () => {
             try {
               await joinExecution();
             } finally {
+              cleanupProbeRelease.resolve();
               await aSuspendOwned?.catch(() => {});
-              try { await joinNowConsumerProbes(); }
+              try {
+                await joinNowConsumerProbes();
+                await joinSummaryStageProbes();
+              }
               finally {
+                if (cleanupFaultObserved)
+                  assert.equal(cleanupProbeSettled, true, "failure-path summary probes settle before fixture restoration");
                 scopeProbesArmed = false;
                 try {
                   if (scopeIntercepted && actualFlight) {

@@ -3867,8 +3867,9 @@ Repair pass (459a299f3, 187208c46, after the cross-check):
   record the applied edit). It reddens P2 first at after-publish (inputs 1); the
   scope stages and before-publish record zero-work attempts under it (masked), and the later stages, including the Now stages, are unobserved
   because the assertion stops at the first failing stage.
-- The I4 follow-on execute is joined (bounded) in the fixture cleanup before
-  mocks are restored, and that join never replaces a failing test body's error.
+- At 187208c46 the I4 follow-on execute had a timeout-bounded cleanup join;
+  a timeout could still leave it running. The maintainer correction below
+  supplies an independent stop and requires actual settlement before restoration.
 - Gates at 459a299f3: `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` EXIT 0
   (`.uzi/scratch/gate-log.gNJ2af`); full test/codex-executor.test.ts 1979/1979,
   671.1 s (`.uzi/scratch/gate-log.0pXZ4s`); `git diff --check` clean
@@ -3940,10 +3941,41 @@ Not credited or open:
 - Deferred non-blocking notes: late result synthesized at the `summaryRunner`
   seam; decorations; dead entry-time `lateInput.aborted`; redundant final order
   check; message wording; `summaryInputs` reads the live `currentAuthority`;
-  launch probe does not pin the refusal reason; retained/preserve abort check is
-  vacuous if the signal is undefined; duplicated release block; follow-on `.then`
-  lacks a rejection handler; pre-existing leak of a hung follow-on run (about
-  197 s on base too); CI time unmeasured.
+  launch probe does not pin the refusal reason; duplicated release block;
+  CI time unmeasured.
+
+Maintainer fixture corrections (2026-11-21, review r6005818453):
+
+These tighten observations and fixture ownership. They do not upgrade P2, I2,
+I3, I1b post isolation, REST post-body attribution or I4 switched-claim ordinal
+attribution. The product's `admittedAuthority` fix is unchanged.
+
+| Control | Change and observed result | Scope |
+| --- | --- | --- |
+| S1 plan factory abort observation | At A's raw fixture factory, `Reflect.set(params, "signal", undefined)`: the old test passes; the corrected test fails at "A plan work observed its signal aborted by the switch" in both directions | Observation sensitivity, not an independent production-fence proof |
+| S2 intent factory abort observation | The same missing-signal fault at the intent factory: the old retained/preserve-only leaves pass; corrected retained leaves fail at "A intent work observed its signal aborted by the switch", and the preserve-only leaf at "preserve-only A intent work observed its supplied signal aborted" | Three named assertion reds; no guard-credit upgrade |
+| S3 fresh B post after an unacknowledged A gate | Omit only `postPlanSummary`: the old unacknowledged-gate leaves pass; corrected leaves fail at "exactly one B plan summary post for this run before cancellation" in both directions | Pins the positive post's run id and B-generated summary, after the existing retired-A assertions |
+| S4 B completion rather than timer cancellation | A diagnostic 1700 ms delay in the B fixture factory makes the old 1500 ms cancellation race fail the valid plan summary; the corrected leaves pass in both directions | The delay is diagnostic-only. Committed tests wait for the post or explicit callback completion; timeout reports failure instead of successful readiness |
+| S5 independent follow-on stop | The generation-8 inputs fixture deliberately never reports cancellation. Omit the body's independent stop while retaining outer cleanup: both leaves fail at "follow-on flight stops independently of its next inputs poll" | Runner shutdown stops the owned flight; cleanup awaits actual settlement before restoring fixtures |
+| S6 failure-path probe join | The new cleanup-only variant deliberately throws at the first publication barrier with a detached probe outstanding. Removing only the cleanup summary-probe join fails at "failure-path summary probes settle before fixture restoration" | Test-fixture regression only; it does not execute or credit the U20 publication assertions |
+
+Restoring the same fixture passes the focused selection (25 cases, including
+one cleanup-only case; zero skips). The missing-signal and missing-post controls
+show the former observation gaps without disabling other production guards.
+Probe scheduling is sealed before teardown releases barriers, and all started
+summary probes are joined before mock restoration. The follow-on readiness race
+records rejection before its named assertions, and its owned flight is stopped
+independently of polling; a timeout is never treated as proof of settlement.
+
+Control driver: `cdr-4583-fixture-mutants.py`; individual `cdr-4583-*-old.log`
+and `cdr-4583-*-fixed.log` records. The diagnostic factory delay is not a CI wait.
+On one local Linux sample the old 24-case selection took 6.724 s and the
+25-case selection 6.517 s; noise and CI critical-path impact are unmeasured.
+The new cleanup-only leaf took about 0.15 s. The full-file and check results
+were independently executed: all 1980 cases in the touched file passed on
+Linux with zero skips or cancellations, 219.150 s, concurrency 2 and the
+unchanged 120000 ms timeout. `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`
+passed as one job. The full agent suite remains an exact-head PR CI obligation.
 
 ### U21 — decision 11: no worker-side use of delivered Codex material before the predecessor proof (2026-11-18)
 
