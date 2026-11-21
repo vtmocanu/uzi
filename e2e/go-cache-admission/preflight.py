@@ -258,6 +258,7 @@ def docker_get(endpoint, route):
     # One absolute deadline for connect, request, headers and body.
     deadline = time.monotonic()+5
     conn.response_class = lambda sock, **kwargs: http.client.HTTPResponse(_DeadlineSocket(sock, deadline), **kwargs)
+    response = None
     try:
         conn.request("GET", route)
         response = conn.getresponse()
@@ -273,7 +274,11 @@ def docker_get(endpoint, route):
             chunks.append(chunk)
         return json.loads(b"".join(chunks))
     finally:
-        conn.close()
+        try:
+            if response is not None:
+                response.close()
+        finally:
+            conn.close()
 
 
 def inventory(raw_root):

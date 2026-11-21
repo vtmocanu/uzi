@@ -266,6 +266,37 @@ class PreflightTests(unittest.TestCase):
         endpoint = self.hostile_header_server(modest)
         self.assertEqual(p.docker_get(endpoint, "/version"), {})
 
+    @staticmethod
+    def header_of(total):
+        """A complete response header block of exactly `total` bytes, CRLFCRLF included."""
+        head, end = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: ", b"\r\n\r\n"
+        return head + b"a"*(total-len(head)-len(end)) + end
+
+    def test_header_block_exactly_at_the_cap_is_accepted(self):
+        block = self.header_of(p.LIMITS["header"])
+        self.assertEqual(len(block), p.LIMITS["header"])
+        endpoint = self.hostile_header_server(lambda conn, stop, end: conn.sendall(block + b"{}"))
+        self.assertEqual(p.docker_get(endpoint, "/version"), {})
+
+    def test_terminated_header_block_just_over_the_cap_is_refused(self):
+        # The terminator arrives in the same send as the overflow: only the terminator-chunk check sees it.
+        block = self.header_of(p.LIMITS["header"]+16)
+        endpoint = self.hostile_header_server(lambda conn, stop, end: conn.sendall(block + b"{}"))
+        with self.assertRaises(ValueError):
+            p.docker_get(endpoint, "/version")
+
+    def test_unterminated_header_over_the_cap_is_refused_before_any_stall_timeout(self):
+        # No terminator ever arrives and the stub then stalls: only the running count can refuse in time.
+        def stall(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a"*(p.LIMITS["header"]+6000))
+            while not stop.is_set() and time.monotonic() < end:
+                time.sleep(0.05)
+        endpoint = self.hostile_header_server(stall)
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            p.docker_get(endpoint, "/version")
+        self.assertLess(time.monotonic()-started, 2.5)
+
     def test_unix_socket_setup_failure_closes_resources(self):
         # A bind failure (here: missing parent) must still close the socket that was opened.
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

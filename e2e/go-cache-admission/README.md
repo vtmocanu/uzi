@@ -333,10 +333,13 @@ python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
   `driver-type` DriverStatus value), CgroupVersion, CgroupDriver, MemoryLimit, SwapLimit,
   PidsLimit, LoggingDriver, DefaultRuntime, RuncVersion (Runtimes annotations, when present),
   `rootless` and `seccomp` (booleans from SecurityOptions). Each string must match a short fixed
-  pattern or is dropped to null. ServerVersion and RuncVersion must be exactly `N.N.N`
+  pattern or allowlist, or is dropped to null. Os, Arch, Driver, DriverType, CgroupVersion,
+  CgroupDriver, LoggingDriver and DefaultRuntime must equal an entry of an exact allowlist
+  (for example CgroupDriver is `cgroupfs` or `systemd`, DriverType is
+  `io.containerd.snapshotter.v1`), so a hostname-shaped value never survives. ServerVersion and RuncVersion must be exactly `N.N.N`
   (else null); KernelVersion keeps its numeric prefix `N.N.N[-N]` plus an optional `.elN` and
   `.x86_64`/`.aarch64` suffix and nothing after it; any daemon string containing `uzi-` or
-  `.internal` is null. Reduced or dropped version strings are counted in
+  `.internal` is null. Every reduced or dropped daemon string, version or not, is counted in
   `dropped_daemon_strings`. MemoryLimit, SwapLimit and PidsLimit are true or false as reported
   and null when the daemon did not report a boolean; null is missing evidence
   (`daemon-info-missing`, UNVERIFIED), never a negative `daemon-capability-unsupported`. Name, ID, DockerRootDir, hostnames, labels, proxy settings and
@@ -372,7 +375,8 @@ Output lifecycle (the order is part of the contract):
 
 1. The `--out-dir` (default `.uzi/scratch/go-cache-env`) is pinned: its parent must be exactly
    `.uzi/scratch` and its name `go-cache-env` or `go-cache-env-<1-32 of [a-z0-9-]>`, without
-   symlink components or `..`; any other name is refused. It is validated, then deleted and
+   symlink components or `..`; any other name is refused. `.uzi/scratch` must already exist
+   (the collector never creates it; a missing one is an `out-dir-invalid` refusal). It is validated, then deleted and
    recreated before anything else, through descriptors walked from the filesystem root with
    `O_NOFOLLOW|O_DIRECTORY`. An existing out-dir is deleted only when it holds nothing but
    regular files named `run.log`, `artifact.json` and `verdict.json`; any other entry (a

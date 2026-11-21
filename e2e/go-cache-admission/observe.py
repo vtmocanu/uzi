@@ -70,7 +70,6 @@ SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
 KERNEL_RE = re.compile(r"(\d+\.\d+\.\d+(?:-\d+)?)((?:\.el\d+(?:_\d+)?)?(?:\.x86_64|\.aarch64)?)")
 KERNEL_PREFIX_RE = re.compile(r"\d+\.\d+\.\d+(?:-\d+)?")
 HOST_MARKS = ("uzi-", ".internal")
-TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+-]{0,63}")
 GO_PATH_RE = re.compile(r"(?<![\w.-])/usr/local/go(?![\w.-])|(?<![\w.-])/go/bin(?![\w.-])")
 
 HOST_ERRORS = (ValueError, OSError, KeyError, TypeError, OverflowError, RecursionError)
@@ -317,6 +316,25 @@ def dsafe(value, pattern):
     return safe(value, pattern) if host_free(value) else None
 
 
+# Exact allowlists for the non-version daemon fields: a hostname-shaped value can never match one.
+ENUMS = dict(
+    CgroupDriver=frozenset(("cgroupfs", "systemd")),
+    CgroupVersion=frozenset(("1", "2")),
+    LoggingDriver=frozenset(("json-file", "local", "journald", "syslog", "none", "fluentd", "gelf", "awslogs",
+                             "splunk", "etwlogs", "gcplogs")),
+    DefaultRuntime=frozenset(("runc", "crun", "runsc", "io.containerd.runc.v2", "youki")),
+    Driver=frozenset(("overlay2", "overlayfs", "fuse-overlayfs", "btrfs", "zfs", "vfs", "devicemapper", "aufs",
+                      "stargz", "windowsfilter")),
+    DriverType=frozenset(("io.containerd.snapshotter.v1",)),
+    Os=frozenset(("linux", "windows")),
+    Arch=frozenset(("amd64", "arm64", "x86_64", "aarch64", "arm", "ppc64le", "s390x", "riscv64")),
+)
+
+
+def dchoice(value, allowed):
+    return value if type(value) is str and host_free(value) and value in allowed else None
+
+
 def kernel_version(raw):
     """Numeric kernel release; an optional .elN and architecture suffix survive, anything else after
     the numeric prefix is dropped."""
@@ -357,17 +375,17 @@ def tri(value):
 
 def daemon_section(version, info, counts=None):
     """Allowlisted daemon fields only; Name, ID, DockerRootDir, labels and paths are never copied.
-    A version string that is reduced or dropped is counted in counts["daemon"] when given."""
+    Any string field that is reduced or dropped is counted in counts["daemon"] when given."""
     v = version if isinstance(version, dict) else {}
     i = info if isinstance(info, dict) else {}
     options = i.get("SecurityOptions")
     names = {o.split(",")[0] for o in (options[:32] if type(options) is list else [])
              if type(o) is str and len(o) <= 256}
-    driver_type = None
+    driver_raw = None
     status = i.get("DriverStatus")
     for pair in (status[:32] if type(status) is list else []):
         if type(pair) is list and len(pair) == 2 and pair[0] == "driver-type":
-            driver_type = dsafe(pair[1], TYPE_RE)
+            driver_raw = pair[1]
             break
     server_raw = i.get("ServerVersion") or v.get("Version")
     kernel_raw = i.get("KernelVersion") or v.get("KernelVersion")
@@ -375,20 +393,25 @@ def daemon_section(version, info, counts=None):
     server = dsafe(server_raw, SEMVER_RE)
     kernel = kernel_version(kernel_raw)
     runc = dsafe(runc_raw, SEMVER_RE)
+    fields = {
+        "ServerVersion": (server_raw, server), "KernelVersion": (kernel_raw, kernel), "RuncVersion": (runc_raw, runc),
+        "DriverType": (driver_raw, dchoice(driver_raw, ENUMS["DriverType"])),
+    }
+    for key, raw in (("Driver", i.get("Driver")), ("CgroupVersion", i.get("CgroupVersion")),
+                     ("CgroupDriver", i.get("CgroupDriver")), ("LoggingDriver", i.get("LoggingDriver")),
+                     ("DefaultRuntime", i.get("DefaultRuntime")), ("Os", v.get("Os")), ("Arch", v.get("Arch"))):
+        fields[key] = (raw, dchoice(raw, ENUMS[key]))
     if counts is not None:
-        counts["daemon"] += sum(1 for raw, got in ((server_raw, server), (kernel_raw, kernel), (runc_raw, runc))
-                                if raw is not None and raw != got)
+        counts["daemon"] += sum(1 for raw, got in fields.values() if raw is not None and raw != got)
     return dict(
-        ServerVersion=server,
-        Os=dsafe(v.get("Os"), TOKEN_RE), Arch=dsafe(v.get("Arch"), TOKEN_RE),
+        ServerVersion=server, Os=fields["Os"][1], Arch=fields["Arch"][1],
         KernelVersion=kernel,
-        Driver=dsafe(i.get("Driver"), TOKEN_RE), DriverType=driver_type,
-        CgroupVersion=dsafe(i.get("CgroupVersion"), re.compile(r"[12]")),
-        CgroupDriver=dsafe(i.get("CgroupDriver"), TOKEN_RE),
+        Driver=fields["Driver"][1], DriverType=fields["DriverType"][1],
+        CgroupVersion=fields["CgroupVersion"][1], CgroupDriver=fields["CgroupDriver"][1],
         MemoryLimit=tri(i.get("MemoryLimit")), SwapLimit=tri(i.get("SwapLimit")),
         PidsLimit=tri(i.get("PidsLimit")),
-        LoggingDriver=dsafe(i.get("LoggingDriver"), TOKEN_RE),
-        DefaultRuntime=dsafe(i.get("DefaultRuntime"), TOKEN_RE), RuncVersion=runc,
+        LoggingDriver=fields["LoggingDriver"][1],
+        DefaultRuntime=fields["DefaultRuntime"][1], RuncVersion=runc,
         rootless="name=rootless" in names, seccomp="name=seccomp" in names)
 
 

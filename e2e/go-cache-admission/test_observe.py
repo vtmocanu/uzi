@@ -356,6 +356,41 @@ class SanitizationTests(Base):
         del i["ServerVersion"]
         self.assertIsNone(o.daemon_section(dict(VERSION, Version="29.8.0+uzi-hw-abc123"), i)["ServerVersion"])
 
+    def test_non_version_daemon_fields_use_exact_allowlists_and_are_counted(self):
+        probes = dict(DefaultRuntime="ci-runner-7.corp.example", LoggingDriver="fluentd-a.lan",
+                      CgroupDriver="host9.example.com")
+        for key, bad in probes.items():
+            with self.subTest(key=key):
+                self.assertIsNone(o.daemon_section(VERSION, info(**{key: bad}))[key])
+        hostile = info(KernelVersion="6.1.0", DefaultRuntime=probes["DefaultRuntime"], LoggingDriver=probes["LoggingDriver"],
+                       CgroupDriver=probes["CgroupDriver"],
+                       DriverStatus=[["driver-type", "buildhost.example.org/snap"]])
+        counts = dict(daemon=0)
+        section = o.daemon_section(VERSION, hostile, counts)
+        self.assertIsNone(section["DriverType"])
+        self.assertEqual(counts["daemon"], 4)
+        counts = dict(daemon=0)
+        section = o.daemon_section(dict(VERSION, Os="box.example.org", Arch="cpu7.lan"), info(KernelVersion="6.1.0"), counts)
+        self.assertEqual((section["Os"], section["Arch"], counts["daemon"]), (None, None, 2))
+        daemon, r = self.go([image("1")], daemon_info=hostile)
+        self.assertEqual(r.returncode, 2, r)
+        artifact, verdict = self.docs()
+        self.assertEqual(artifact["binding"]["dropped_daemon_strings"], 4)
+        self.assertEqual(verdict["observation"]["dropped_daemon_strings"], 4)
+        blob = "".join(self.texts().values())
+        for leaked in ("example", "fluentd-a", "ci-runner", ".lan"):
+            self.assertNotIn(leaked, blob)
+        # Real values pass unchanged and are not counted.
+        counts = dict(daemon=0)
+        real = o.daemon_section(VERSION, info(KernelVersion="6.1.0"), counts)
+        self.assertEqual(counts["daemon"], 0)
+        self.assertEqual((real["CgroupDriver"], real["CgroupVersion"], real["LoggingDriver"], real["DefaultRuntime"],
+                          real["Driver"], real["DriverType"], real["Os"], real["Arch"]),
+                         ("systemd", "2", "json-file", "runc", "overlay2", "io.containerd.snapshotter.v1",
+                          "linux", "amd64"))
+        for key, good in (("CgroupDriver", "cgroupfs"), ("Driver", "overlayfs")):
+            self.assertEqual(o.daemon_section(VERSION, info(**{key: good}))[key], good)
+
     def test_hyphenated_hostile_versions_never_reach_the_reports_and_are_counted(self):
         hostile = info(ServerVersion="29.8.0+uzi-hw-abc123", KernelVersion="6.12.0-uzi-hw-worker7-prod.internal",
                        Runtimes={"runc": {"status": {"org.opencontainers.runtime-spec.features": json.dumps(
@@ -712,6 +747,20 @@ class LifecycleTests(Base):
         self.addCleanup(a_file.unlink)
         self.assertEqual(self.observe(daemon.endpoint, out=a_file).returncode, 3)
         self.assertEqual(a_file.read_text(), "keep")
+        self.assertEqual(daemon.requests, [])
+
+    def test_out_dir_name_pin_alone_refuses_a_tool_only_victim(self):
+        # Only run.log inside: the foreign-entry guard would accept it, so the name pin is the sole refusal.
+        victim = p.SCRATCH/("snap-"+os.urandom(4).hex())
+        victim.mkdir()
+        self.addCleanup(shutil.rmtree, victim, True)
+        (victim/"run.log").write_text("keep")
+        daemon = self.stub([image("1")])
+        r = self.observe(daemon.endpoint, out=victim)
+        self.assertEqual(r.returncode, 3, r)
+        self.assertIn(b"reason=out-dir-invalid", r.stdout)
+        self.assertEqual(sorted(os.listdir(victim)), ["run.log"])
+        self.assertEqual((victim/"run.log").read_text(), "keep")
         self.assertEqual(daemon.requests, [])
 
     def test_default_out_dir_is_the_pinned_name(self):
