@@ -387,14 +387,14 @@ and `WorkerSizeAdvisoryDTO` ride inside element 0 of the full fixture, and `ceil
 
 | DTO | field | mapper guarantee |
 |---|---|---|
-| `AdminWorkerSizes` | `sizes` | `make([]apitypes.AdminWorkerSizeDTO, 0, len(rows))` in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:200`) → `[]` |
-| `AdminWorkerSizes` | `advisories` | `[]apitypes.WorkerSizeAdvisoryDTO{}` literal in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:203`) → `[]` |
-| `AdminWorkerSizes` | `refusals` | `sizeRefusals` returns a non-nil slice, `out := []apitypes.WorkerSizeRefusalDTO{}` (`handler/admin_worker_sizes.go:240`) |
-| `AdminWorkerSizes` | `refusal_totals` | `sizeRefusals` returns a non-nil map, `totals := map[string]int{}` (`handler/admin_worker_sizes.go:241`) → `{}` |
+| `AdminWorkerSizes` | `sizes` | `make([]apitypes.AdminWorkerSizeDTO, 0, len(rows))` in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:201`) → `[]` |
+| `AdminWorkerSizes` | `advisories` | `[]apitypes.WorkerSizeAdvisoryDTO{}` literal in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:204`) → `[]` |
+| `AdminWorkerSizes` | `refusals` | `sizeRefusals` returns a non-nil slice on every path, `out := []apitypes.WorkerSizeRefusalDTO{}` (`handler/admin_worker_sizes.go:241` early returns, `:284` in `selectSizeRefusals`) |
+| `AdminWorkerSizes` | `refusal_totals` | `sizeRefusals` returns a non-nil map on every path, `totals := map[string]int{}` (`handler/admin_worker_sizes.go:242` early returns, `:285` in `selectSizeRefusals`) → `{}` |
 
 No exemption: `ceilings.cpu_limit_millicores`, `memory_limit_mib`, `data_gib`,
 `dind_data_gib` (null when no ceiling applies) and `ceilings.enabled_tiers` (null when the api
-does not know the tiers, `ceilingsDTO` at `handler/admin_worker_sizes.go:158-176`), and
+does not know the tiers, `ceilingsDTO` at `handler/admin_worker_sizes.go:159-177`), and
 `read_only_reason` / `read_only_code` (null when editable) are genuinely nullable on the wire.
 `AdminWorkerSizeDTO.shipped` is `null` for an admin-added size.
 
