@@ -392,9 +392,21 @@ describe("WorkerSizesCard", () => {
       expect(screen.queryByText(/more workers?/)).toBeNull();
     });
 
+    // Above the details count, so only the integer check keeps it out (unguarded: "and 4.5 more").
     it("ignores a total that is not a non-negative integer", () => {
-      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 2.5 } }));
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 7.5 } }));
       expect(items()).toHaveLength(3);
+      expect(screen.queryByText(/more workers?/)).toBeNull();
+    });
+
+    // A valid size name can be an Object.prototype key; it must never read the prototype's value.
+    it("reads no total for a size named like a prototype key", () => {
+      const base = sizes();
+      const row = { ...base.sizes[0], name: "constructor", builtin: false, shipped: null, display_order: 9 };
+      const refused = [1, 2, 3, 4, 5].map((n) => ({ ...r(n), size: "constructor" }));
+      renderCard({ ...base, sizes: [...base.sizes, row], refusals: refused, refusal_totals: {} });
+      const list = within(within(rowOf("CONSTRUCTOR")).getByRole("list", { name: "Workers refused at size CONSTRUCTOR" })).getAllByRole("listitem");
+      expect(within(list[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
     });
   });
 

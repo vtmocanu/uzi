@@ -88,14 +88,17 @@ const REFUSALS: WorkerSizeRefusal[] = [{
   reported_at: "2026-11-18T14:20:00Z",
 }];
 
+const byteOrder = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
 // The api's per-size cap on refusal details; the totals count every refusal before it.
 const MAX_REFUSALS_PER_SIZE = 3;
 
-// As the api serves them: only listed sizes, sorted by size then worker name, at most three
-// details per size, and per size the count before that cap.
+// The api's shape for the sizes the card can show: listed sizes only (the api may also return
+// unlisted sizes, which have no row), sorted by size, worker name, then id in code-unit order (Go's
+// byte order for ASCII names), at most three details per size, and per size the count before that cap.
 function refusals(): { refusals: WorkerSizeRefusal[]; refusal_totals: Record<string, number> } {
   const listed = REFUSALS.filter((r) => rows.some((row) => row.name === r.size)).sort(
-    (a, b) => a.size.localeCompare(b.size) || a.worker_name.localeCompare(b.worker_name),
+    (a, b) => byteOrder(a.size, b.size) || byteOrder(a.worker_name, b.worker_name) || byteOrder(a.worker_id, b.worker_id),
   );
   const refusal_totals: Record<string, number> = {};
   const kept: WorkerSizeRefusal[] = [];
