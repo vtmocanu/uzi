@@ -252,13 +252,17 @@ CLI or `evaluate()` path.
   capabilities may remain and pre-existing writable fds are unaccounted).
 - aliasing: the domain key is the superblock, and a sink's declared superblock is not
   trusted. It must appear in mountinfo, agree with the mount its `mount_id` names, and
-  agree with the mount its realpaths resolve to by longest mountpoint prefix (the same
-  resolution readonly-rootfs uses); a container sink with neither a `mount_id` nor
-  resolvable paths, or any disagreement, is `sink-mapping-mismatch`. Daemon-side sinks
+  agree with the mount every one of its listed paths resolves to by longest mountpoint
+  prefix (the same resolution readonly-rootfs uses). A listed path with no recorded
+  realpath cannot be checked, and a `mount_id` never substitutes for a contradicting
+  realpath. A container sink with neither a `mount_id` nor resolvable paths, an unresolved
+  path, or any disagreement is `sink-mapping-mismatch`. Daemon-side sinks
   (`daemon_image_store`, `daemon_build_cache`, `daemon_metadata_snapshots`) and
   `container_logs` live in an outer domain: they carry an explicit `outer_domain: true`
   and no superblock or `mount_id` (a made-up one is `sink-malformed`) and are charged only
-  through the backing leg. The flag exempts nothing else. `domain-overcommitted`
+  through the backing leg. An outer sink whose paths resolve into a container mount, a
+  non-outer sink whose parent chain reaches an outer sink, and `outer_domain` on any other
+  sink name are `sink-malformed`. `domain-overcommitted`
   when sink ceilings on one superblock exceed its limit, `domain-alias-split` when sinks
   on one superblock claim different backing domains; a child charged inside its parent
   counts once.

@@ -270,6 +270,17 @@ def _parent_cycle(sinks, name):
     return False
 
 
+def _outer_ancestor(sinks, name):
+    """Whether a parent-chain ancestor of `name` is an outer sink. Callers have already rejected
+    cycles, so the walk ends."""
+    cur = sinks[name].get("parent")
+    while isinstance(sinks.get(cur), dict):
+        if outer_exempt(cur, sinks[cur]):
+            return True
+        cur = sinks[cur].get("parent")
+    return False
+
+
 def check_sinks(sinks):
     require(type(sinks) is dict)
     reasons = []
@@ -287,7 +298,11 @@ def check_sinks(sinks):
                 _add(reasons, "sink-missing")
             elif _parent_cycle(sinks, name):
                 _add(reasons, "sink-parent-cycle")
+            elif name not in OUTER_EXEMPT and _outer_ancestor(sinks, name):
+                _add(reasons, "sink-malformed")
             continue
+        if "outer_domain" in s and name not in OUTER_EXEMPT:
+            _add(reasons, "sink-malformed")
         require(type(s.get("paths")) is list and all(type(x) is str for x in s["paths"]))
         require(type(s.get("backing_domain")) is str)
         require(s.get("mount_id") is None or _is_int(s["mount_id"]))
@@ -380,12 +395,12 @@ def superblock_limits(mounts):
 
 
 def _path_superblocks(mounts, real, paths):
-    """Superblocks the sink's realpaths resolve to by longest mountpoint prefix, or None when
-    the sink has no paths or any path has no recorded realpath."""
-    if not paths or any(type(real.get(x)) is not str for x in paths):
-        return None
-    hits = [_longest_prefix(mounts, real[x]) for x in paths]
-    return {m["superblock"] for m in hits if m is not None} | ({None} if None in hits else set())
+    """(superblocks, unresolved): the superblocks of every path that has a recorded realpath, by
+    longest mountpoint prefix (None when no path resolved), and whether any listed path lacks one."""
+    resolvable = [x for x in paths if type(real.get(x)) is str]
+    hits = [_longest_prefix(mounts, real[x]) for x in resolvable]
+    found = {m["superblock"] for m in hits if m is not None} | ({None} if None in hits else set())
+    return (found or None), len(resolvable) != len(paths)
 
 
 def check_aliasing(sinks, mounts, realpaths=None):
@@ -401,12 +416,19 @@ def check_aliasing(sinks, mounts, realpaths=None):
     by_id = {m["mount_id"]: m for m in mounts}
     known = {m["superblock"] for m in mounts}
     for name, s in sinks.items():
-        if "parent" in s or outer_exempt(name, s):
+        if "parent" in s:
+            continue
+        if outer_exempt(name, s):
+            # An outer sink resolving into a container mount is charged to the wrong domain.
+            if any(type(real.get(x)) is str and _longest_prefix(mounts, real[x]) is not None
+                   for x in s["paths"]):
+                _add(reasons, "sink-malformed")
             continue
         sb = s["superblock"]
-        resolved = _path_superblocks(mounts, real, s["paths"])
+        resolved, unresolved = _path_superblocks(mounts, real, s["paths"])
         mount = by_id.get(s.get("mount_id"))
         if (sb not in known
+                or unresolved
                 or (s.get("mount_id") is None and resolved is None)
                 or (s.get("mount_id") is not None and (mount is None or mount["superblock"] != sb))
                 or (resolved is not None and resolved != {sb})):
@@ -818,13 +840,18 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
                 collector=None if collector is None else dict(daemon_id_hash=collector.daemon_id_hash))
 
 
+def _revision(value):
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise argparse.ArgumentTypeError("must be 40 lowercase hex characters")
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True, help="absolute path of an artifact under .uzi/scratch")
     parser.add_argument("--experimental", action="store_true",
                         help="exit 0 on an unqualified verdict; never sets qualified")
-    parser.add_argument("--head-revision", type=lambda v: v if re.fullmatch(r"[0-9a-f]{40}", v) else parser.error(
-        "--head-revision must be 40 lowercase hex characters"),
+    parser.add_argument("--head-revision", type=_revision,
                         help="repo revision the artifact must be bound to; without it a stale repo_revision is not detected")
     args = parser.parse_args(argv)
     try:

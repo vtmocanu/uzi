@@ -481,11 +481,12 @@ class AliasingTests(Base):
         mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]
         sinks = {"work": sink("work", "/t/w", 10, "sb-shared", b=3*MIB),
                  "output": sink("output", "/t/o", 10, "sb-shared", b=3*MIB)}
-        self.assertIn("domain-overcommitted", q.check_aliasing(sinks, mounts))
+        real = {"/t/w": "/t/w", "/t/o": "/t/o"}
+        self.assertIn("domain-overcommitted", q.check_aliasing(sinks, mounts, real))
         sinks["output"]["bytes"] = MIB
-        self.assertEqual(q.check_aliasing(sinks, mounts), [])
+        self.assertEqual(q.check_aliasing(sinks, mounts, real), [])
         sinks["output"]["inodes"] = 95
-        self.assertIn("domain-overcommitted", q.check_aliasing(sinks, mounts))
+        self.assertIn("domain-overcommitted", q.check_aliasing(sinks, mounts, real))
 
     def test_alias_split(self):
         mounts = [tmpfs(10, "/t", sb="sb-shared")]
@@ -504,7 +505,7 @@ class AliasingTests(Base):
         sinks = {"tmp": sink("tmp", "/t", 10, "sb-shared", b=3*MIB),
                  "temp_extraction": dict(identity="temp_extraction", parent="tmp",
                                          bytes=3*MIB, inodes=10)}
-        self.assertEqual(q.check_aliasing(sinks, mounts), [])
+        self.assertEqual(q.check_aliasing(sinks, mounts, {"/t": "/t"}), [])
 
     def test_declared_superblock_is_checked_against_mountinfo(self):
         mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]
@@ -529,12 +530,52 @@ class AliasingTests(Base):
         self.assertIn("sink-mapping-mismatch",
                       q.check_aliasing(pair(superblock="sb-shared"), mounts, None))
 
+    def test_recorded_realpath_contradicting_mount_id_is_not_masked_by_another_path(self):
+        mounts = [mnt(1, "/", "overlay", True, sb="sb-root"), tmpfs(10, "/t", sb="sb-t")]
+        s = sink("work", "/t/w", 10, "sb-t")
+        s["paths"] = ["/t/w", "/x/y"]
+        self.assertIn("sink-mapping-mismatch",
+                      q.check_aliasing({"work": s}, mounts, {"/x/y": "/x/y"}))
+        # Every path resolving into the declared superblock is accepted.
+        self.assertEqual(q.check_aliasing({"work": s}, mounts, {"/t/w": "/t/w", "/x/y": "/t/y"}), [])
+        # A listed path with no recorded realpath cannot be checked and is a mismatch.
+        self.assertIn("sink-mapping-mismatch", q.check_aliasing({"work": s}, mounts, {"/t/w": "/t/w"}))
+
+    def test_mount_id_must_name_a_mount_with_the_declared_superblock(self):
+        mounts = [tmpfs(10, "/t", sb="sb-t"), tmpfs(11, "/u", sb="sb-u")]
+        s = sink("work", "/t/w", 11, "sb-t")
+        s["paths"] = []
+        self.assertIn("sink-mapping-mismatch", q.check_aliasing({"work": s}, mounts))
+        s["mount_id"] = 10
+        self.assertEqual(q.check_aliasing({"work": s}, mounts), [])
+
+    def test_outer_sink_must_not_resolve_into_a_container_mount(self):
+        mounts = [mnt(1, "/", "overlay", True, sb="sb-root"), tmpfs(10, "/t", sb="sb-t")]
+        outer = dict(identity="daemon_build_cache", paths=["/t/cache"], mount_id=None, bytes=MIB,
+                     inodes=10, backing_domain="outer-A", outer_domain=True)
+        self.assertIn("sink-malformed", q.check_aliasing({"daemon_build_cache": outer}, mounts,
+                                                         {"/t/cache": "/t/cache"}))
+        outer["paths"] = []
+        self.assertNotIn("sink-malformed", q.check_aliasing({"daemon_build_cache": outer}, mounts, {}))
+
+    def test_sink_hierarchy_and_outer_flag_validation(self):
+        outer = dict(identity="daemon_build_cache", paths=[], mount_id=None, bytes=MIB, inodes=10,
+                     backing_domain="outer-A", outer_domain=True)
+        child = dict(identity="temp_extraction", parent="daemon_build_cache")
+        got = q.check_sinks({"daemon_build_cache": outer, "temp_extraction": child})
+        self.assertIn("sink-malformed", got)
+        # outer_domain on a sink whose name is not exempt.
+        flagged = sink("work", "/t/w", 10, "sb-t")
+        flagged["outer_domain"] = True
+        self.assertIn("sink-malformed", q.check_sinks({"work": flagged}))
+        self.assertNotIn("sink-malformed", q.check_sinks({"work": sink("work", "/t/w", 10, "sb-t")}))
+
     def test_outer_domain_sinks_are_exempt_only_when_flagged(self):
         mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]
         outer = dict(identity="daemon_image_store", paths=[], mount_id=None, bytes=3*MIB, inodes=10,
                      backing_domain="outer-A", outer_domain=True)
         sinks = {"work": sink("work", "/t/w", 10, "sb-shared", b=MIB), "daemon_image_store": outer}
-        self.assertEqual(q.check_aliasing(sinks, mounts, {}), [])
+        self.assertEqual(q.check_aliasing(sinks, mounts, {"/t/w": "/t/w"}), [])
         # The flag does not exempt an ordinary container sink.
         flagged = sink("output", "/t/o", None, "sb-bogus")
         flagged["outer_domain"] = True
@@ -1007,6 +1048,15 @@ class EvaluateTests(Base):
                 self.assertNotEqual(got["backing"]["status"], "PROVEN", got["backing"])
                 self.assertIn("file", got["backing"]["tier"])
 
+    def test_enforcement_needs_the_collector_to_supply_claims_and_charge_map(self):
+        for missing in ("claims", "charge_map"):
+            art = full_artifact()
+            ce = q.collect(StubObserver(art, tuple(n for n in ALL_SECTIONS if n != missing)))
+            got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]
+            with self.subTest(missing=missing):
+                self.assertEqual(got["enforcement"]["status"], "FIXTURE-CONSISTENT", got["enforcement"])
+                self.assertIn("file", got["enforcement"]["tier"])
+
     def test_collector_evidence_cannot_be_forged(self):
         art = full_artifact()
         with self.assertRaises(ValueError):
@@ -1090,9 +1140,10 @@ class CliTests(Base):
                                    "--head-revision", "c"*40])
         self.assertIn("binding-source-unbound", reasons(verdict["legs"]["binding"]))
         for bad in ("c"*39, "C"*40, "zz"):
-            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), \
-                    self.assertRaises(SystemExit):
+            err = io.StringIO()
+            with self.subTest(bad=bad), contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
                 q.main(["--artifact", self.artifact(), "--head-revision", bad])
+            self.assertIn("argument --head-revision: ", err.getvalue())
 
     def test_unreadable_artifact(self):
         for argv in (["--artifact", "/tmp/outside-scratch.json"], ["--artifact", str(self.root/"missing.json")]):
