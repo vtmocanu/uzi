@@ -836,6 +836,46 @@ describe("#4580 model segments (token-only)", () => {
     assert.equal(acct.usageIncomplete, true);
     assertEntry(acct.aggregateByModel()?.[MODEL_A], want(10, 10, 0, 0, 5));
   });
+
+  it("a malformed proved-replay baseline marks the thread incomplete at a cut even when the cut point is well-formed", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, true);
+    // Replay baseline: cached exceeds input (malformed split).
+    acct.record(ROOT, wf({ inputTokens: 10, cachedInputTokens: 20, outputTokens: 10 }, { inputTokens: 10, outputTokens: 10 }), true);
+    assert.equal(acct.usageIncomplete, false, "an uncut malformed baseline is accepted, as before");
+    // A well-formed advance: cached unchanged, input grew past it.
+    assert.ok(acct.record(ROOT, wf({ inputTokens: 50, cachedInputTokens: 20, outputTokens: 20 }, { inputTokens: 40, outputTokens: 10 })));
+    assert.equal(acct.usageIncomplete, false);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.usageIncomplete, true);
+    assert.match(acct.incompleteNoticeText ?? "", /Diagnostic: bucket relationship \(total\.cachedInputTokens\)\./);
+  });
+
+  it("a healthy rebind does not remember the replaced model once the thread later becomes incomplete", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, true);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.usageIncomplete, false);
+    // A live note with no proved baseline: missing replay boundary, quarantine.
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 })), undefined);
+    assert.equal(acct.usageIncomplete, true);
+    const agg = acct.aggregateByModel();
+    assert.equal(agg?.[MODEL_A], undefined, "the replaced model was never used while incomplete");
+    assertEntry(agg?.[MODEL_B], want(0, 0));
+  });
+
+  it("pins the caller ordering contract owned by #3253: a note delivered after a cut that advances the max belongs to the new model", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 }));
+    acct.beginModelSegment(ROOT, MODEL_B);
+    // An earlier turn's note arriving late: it advances the max, so it is attributed to MODEL_B.
+    const late = acct.record(ROOT, wf({ inputTokens: 200, outputTokens: 100 }, { inputTokens: 100, outputTokens: 50 }));
+    assert.equal(late?.model, MODEL_B);
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(100, 50));
+    assertEntry(agg?.[MODEL_B], want(100, 50));
+  });
 });
 
 // Seeded randomized conservation (#4580): per column, the sum over emitted models equals the
@@ -854,7 +894,7 @@ describe("#4580 randomized conservation across cuts", () => {
   }
   const MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6.1-sol"];
 
-  function runFamily(family: "well-formed" | "malformed", baseSeed: number): string | undefined {
+  function runFamily(family: "well-formed" | "malformed", baseSeed: number, stats = { multiModel: 0 }): string | undefined {
     for (let k = 0; k < 200; k++) {
       const seed = baseSeed + k;
       const rnd = mulberry32(seed);
@@ -865,17 +905,18 @@ describe("#4580 randomized conservation across cuts", () => {
       const s = { inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
       let accepted = { ...s };
       const history: CodexThreadTokenUsage[] = [];
-      const steps = 1 + int(11);
+      const steps = 3 + int(9);
       let cuts = 0;
       for (let i = 0; i < steps; i++) {
         const kind = int(9);
-        if (kind <= 2 && cuts < 4) {
+        if (kind <= 3 && cuts < 4) {
           cuts++;
-          cur = kind === 0 ? cur : MODELS[int(2)]!; // kind 0: a same-model cut
+          // kind 0: a same-model cut; otherwise always a different model, so cuts change attribution.
+          cur = kind === 0 ? cur : MODELS[(MODELS.indexOf(cur) + 1 + int(1)) % MODELS.length]!;
           acct.beginModelSegment("t", cur);
           continue;
         }
-        if (kind === 3 && history.length > 0) {
+        if (kind === 4 && history.length > 0) {
           const old = history[int(history.length - 1)]!;
           const r = acct.record("t", old);
           if (r !== undefined) return `seed ${seed}: a stale or duplicate note was adopted`;
@@ -886,10 +927,11 @@ describe("#4580 randomized conservation across cuts", () => {
         s.outputTokens += int(50);
         s.reasoningOutputTokens = Math.min(s.reasoningOutputTokens + int(20), s.outputTokens);
         if (family === "well-formed") {
-          const room = s.inputTokens - s.cachedInputTokens - s.cacheWriteInputTokens;
-          const c = int(room);
+          // Bound the cache increments by this step's input increment so the clamped uncached
+          // input never decreases: the family is monotone in all gated columns.
+          const c = int(inInc);
           s.cachedInputTokens += c;
-          s.cacheWriteInputTokens += int(room - c);
+          s.cacheWriteInputTokens += int(inInc - c);
         } else {
           if (i === 0 || rnd() < 0.5) s.cachedInputTokens = Math.max(s.cachedInputTokens, s.inputTokens + int(5));
           else s.cachedInputTokens += int(60);
@@ -907,7 +949,11 @@ describe("#4580 randomized conservation across cuts", () => {
         }
         if (int(5) === 0) acct.record("t", note); // an immediate duplicate must not move anything
       }
+      if (family === "well-formed" && acct.usageIncomplete) return `seed ${seed}: a well-formed sequence ended incomplete`;
       const agg = acct.aggregateByModel() ?? {};
+      const withTokens = Object.values(agg).filter(e =>
+        e.inputTokens + e.outputTokens + e.cacheReadInputTokens + e.cacheCreationInputTokens > 0).length;
+      if (withTokens >= 2) stats.multiModel++;
       const sum = (key: keyof CodexModelUsageEntry) => Object.values(agg).reduce((t, e) => t + (e[key] as number), 0);
       const expected: [keyof CodexModelUsageEntry, number][] = [
         ["inputTokens", Math.max(accepted.inputTokens - accepted.cachedInputTokens - accepted.cacheWriteInputTokens, 0)],
@@ -925,8 +971,10 @@ describe("#4580 randomized conservation across cuts", () => {
   }
 
   it("well-formed notes: 200 seeded sequences conserve every emitted column", () => {
-    const mismatch = runFamily("well-formed", 1000);
+    const stats = { multiModel: 0 };
+    const mismatch = runFamily("well-formed", 1000, stats);
     assert.equal(mismatch, undefined, mismatch ?? "");
+    assert.ok(stats.multiModel >= 100, `only ${stats.multiModel} of 200 sequences carried tokens on 2+ models`);
   });
 
   it("malformed cache splits: 200 seeded sequences conserve every emitted column", () => {

@@ -124,7 +124,8 @@ would violate this contract.
 ## Amendment (#4580, 2026-11-21)
 
 The decision above stands. This amendment lets the Codex accountant attribute one
-thread's usage to more than one model. It does not change what is recorded or billed.
+thread's usage to more than one model. For well-formed usage nothing recorded or billed
+changes; malformed reasoning or total-token dips are now refused (see Admission).
 
 - **Segments.** A thread's usage is split into model segments. Root response
   attribution uses the root thread's current segment model, which qualifies "The root
@@ -133,13 +134,22 @@ thread's usage to more than one model. It does not change what is recorded or bi
   and attribution stays distinct from result-frame billing.
 - **Cuts.** A cut is made only after the caller has recorded the historical replay
   boundary, so replayed history stays in the earlier segment or is never charged. The
-  first registration of a thread still wins and claim-shared deduplication is kept.
+  caller contract: before cutting, it must have recorded every usage note belonging to
+  the earlier segment, historical replay and live notes of earlier turns. A note
+  delivered after the cut that advances the running max is attributed to the new
+  segment and its model. #3253 owns enforcing this ordering. The first registration of
+  a thread still wins and claim-shared deduplication is kept. Segment differences are
+  clamped at zero as a defensive floor, identical to the plain difference under the
+  monotone gate.
 - **Admission.** The monotone gate covers seven columns: the six wire buckets plus
   clamped uncached input. A malformed reasoning or `totalTokens` dip on an advancing
   note is refused, the model is reported `unreported`, and proven tokens are retained.
 - **Reconciliation and pricing** run per segment on that segment's own responses and
-  evidence flag. A segment that misses a response degrades only its own model.
-  Incompleteness of the thread taints every segment model.
+  evidence flag. A segment that misses a response degrades its own model. When the
+  dropped note is the last one before a cut, its tokens appear in the next segment's
+  delta, so the next model degrades and the earlier model may stay metered while
+  understated per model; the run-level cost is still unreported. Incompleteness of the
+  thread taints every segment model.
 - **Rebinding an incomplete thread** keeps the replaced model as a zero-token
   `unreported` entry (PRD D5). Healthy rebinds drop the old model.
 - **Uncached input** for threads with two or more segments is the difference of
@@ -149,8 +159,10 @@ thread's usage to more than one model. It does not change what is recorded or bi
   output is unchanged. Incompleteness also sets the claim-wide `usageIncomplete`,
   which an uncut thread with the same data does not; this asymmetry is accepted.
 - **Not shipped.** No production caller cuts a segment yet; #3253 supplies that
-  integration. Until then the new behavior is reachable only from tests, and
-  production attribution is the single-model behavior described above.
+  integration. Until then segment behavior (`beginModelSegment`, D5, D6) is reachable
+  only from tests, and production attribution is the single-model behavior described
+  above. The seven-column gate is not gated on segments: it applies now through every
+  `record()` call.
 
 Rationale and rejected alternatives are in the PRD Decision Log
 ([PRD #4580](../prds/4580-codex-usage-model-segments.md)).

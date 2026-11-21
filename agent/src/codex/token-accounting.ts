@@ -1,10 +1,10 @@
 // PRD #1332 (M5A, C4a) — Codex per-thread/per-model token accounting.
 //
 // The accounting spine for Codex runs: a `threadId -> configured model` map (the model of a
-// thread's CURRENT segment; see ThreadAccount) plus a per-thread cumulative-snapshot reconciler. The {@link CodexHarness} feeds it every typed
-// `thread/tokenUsage/updated` notification (root AND demuxed child) and reads it at each turn
-// terminal to project the result frame's per-model `modelUsage`, metered or unreported per
-// model as COST below describes.
+// thread's CURRENT segment; see ThreadAccount) plus a per-thread cumulative-snapshot reconciler.
+// The {@link CodexHarness} feeds it every typed `thread/tokenUsage/updated` notification (root
+// AND demuxed child) and reads it at each turn terminal to project the result frame's per-model
+// `modelUsage`, metered or unreported per model as COST below describes.
 //
 // RECONCILIATION (D5), stated as invariants the tests pin:
 //   - `total` is the thread's CUMULATIVE usage; `last` is the single most-recent response.
@@ -24,7 +24,8 @@
 //     lowers any of the seven gated columns (the six wire buckets, or the clamped uncached input)
 //     is refused and marks the thread incomplete.
 //   - MODEL SEGMENTS (#4580): `beginModelSegment` splits a thread's cumulative at the running max
-//     into model segments. Each raw column's segment deltas sum exactly to `maxTotal - baseline`;
+//     into model segments. For safe-integer buckets (what Codex emits) each raw column's segment
+//     deltas sum exactly to `maxTotal - baseline`; non-integer values are subject to float rounding;
 //     reconciliation and pricing run per segment against that segment's own model. No production
 //     caller cuts a segment yet (#3253 adds it), so the behavior is exercised by tests only.
 //   - UNKNOWN / unregistered threads are dropped, NEVER attributed to the root model.
@@ -124,16 +125,17 @@ function magnitude(b: CodexUsageBreakdown): number {
   return Math.max(b.totalTokens, b.inputTokens + b.outputTokens);
 }
 
-/** Per-bucket plain difference `a[k] - b[k]` of two cumulatives. Adopted totals are monotone under
- *  the advancing gate and buckets are floored at zero upstream, so each delta is non-negative. */
-function diffPlain(a: Cumulative, b: Cumulative): Cumulative {
+/** Per-bucket difference `max(a[k] - b[k], 0)` of two cumulatives. A defensive floor: under the
+ *  monotone advancing gate, for non-negative buckets, it is identical to the plain difference. It
+ *  keeps a malformed direct note (e.g. a negative bucket) from producing a negative delta. */
+function diffClamp(a: Cumulative, b: Cumulative): Cumulative {
   return {
-    inputTokens: a.inputTokens - b.inputTokens,
-    cachedInputTokens: a.cachedInputTokens - b.cachedInputTokens,
-    cacheWriteInputTokens: a.cacheWriteInputTokens - b.cacheWriteInputTokens,
-    outputTokens: a.outputTokens - b.outputTokens,
-    reasoningOutputTokens: a.reasoningOutputTokens - b.reasoningOutputTokens,
-    totalTokens: a.totalTokens - b.totalTokens,
+    inputTokens: Math.max(a.inputTokens - b.inputTokens, 0),
+    cachedInputTokens: Math.max(a.cachedInputTokens - b.cachedInputTokens, 0),
+    cacheWriteInputTokens: Math.max(a.cacheWriteInputTokens - b.cacheWriteInputTokens, 0),
+    outputTokens: Math.max(a.outputTokens - b.outputTokens, 0),
+    reasoningOutputTokens: Math.max(a.reasoningOutputTokens - b.reasoningOutputTokens, 0),
+    totalTokens: Math.max(a.totalTokens - b.totalTokens, 0),
   };
 }
 
@@ -317,7 +319,10 @@ export class CodexUsageAccountant {
 
   /**
    * Switch a registered thread to `model` for the usage recorded from now on. The caller must have
-   * recorded any historical replay first. Unknown thread, or the current segment already on
+   * recorded any historical replay first. Caller contract: EVERY usage note of the previous
+   * segment's work (historical replay AND live notes of earlier turns) must already have been
+   * recorded. A note delivered after the cut that advances the running max is attributed to the NEW
+   * segment, so the caller (#3253) must drain or fence earlier-turn notes before cutting. Unknown thread, or the current segment already on
    * `model`: no-op. Before the thread has an accepted cumulative (including a resumed thread
    * awaiting proved replay, and a quarantined thread) the current segment has no responses, so it
    * is rebound in place; on an already-incomplete thread the replaced model is remembered so it
@@ -364,7 +369,7 @@ export class CodexUsageAccountant {
     const total = toCumulative(usage.total);
     const segment = acct.segments[acct.segments.length - 1]!;
     // PRD #1332 m3 (CodeRabbit 4004800884): a note carrying a present-but-malformed pricing-required
-    // bucket taints THIS thread's pricing evidence. Applied ONLY when the note is adopted (below),
+    // bucket taints the CURRENT segment's pricing evidence. Applied ONLY when the note is adopted (below),
     // so a duplicate/stale/out-of-order note — which is neither charged nor priced — cannot taint.
     const evidenceIncomplete = usage.pricingEvidenceComplete === false;
     if (acct.maxTotal === undefined) {
@@ -428,9 +433,10 @@ export class CodexUsageAccountant {
    * incompleteness taints every model it used, including a model replaced by a rebind.
    *
    * TOKEN buckets are always the cumulative `total` deltas (unchanged from C4a), split per model
-   * segment so each raw column's segment deltas sum exactly to the thread's `maxTotal - baseline`.
+   * segment so, for safe-integer buckets (what Codex emits), each raw column's segment deltas sum
+   * exactly to the thread's `maxTotal - baseline` (non-integer values are subject to float rounding).
    * Uncached input of a thread cut into two or more segments is the per-segment difference of the
-   * clamped cumulative uncached value, which also sums exactly; a single-segment thread
+   * clamped cumulative uncached value, which telescopes the same way; a single-segment thread
    * contributes raw deltas to the model's clamped uncached derivation as before. COST (C4b, D5)
    * depends on `pricing`:
    *   - `pricing` omitted            → every entry `unreported`, no `costUSD` (token-only caller).
@@ -481,7 +487,7 @@ export class CodexUsageAccountant {
         // next one starts, the last at the running max. No accepted cumulative means no usage.
         const start = seg.start ?? baseline;
         const end = acct.segments[i + 1]?.start ?? acct.maxTotal;
-        const charged = end === undefined ? zeroCumulative() : diffPlain(end, start);
+        const charged = end === undefined ? zeroCumulative() : diffClamp(end, start);
         const agg = aggFor(seg.model);
         agg.incomplete ||= incomplete;
         if (incomplete) agg.priceable = false;
@@ -519,12 +525,12 @@ export class CodexUsageAccountant {
           }
         }
       }
-      if (incomplete) {
-        for (const model of acct.taintModels) {
-          const agg = aggFor(model);
-          agg.incomplete = true;
-          agg.priceable = false;
-        }
+      // taintModels is only pushed when incompleteCauses is non-empty and causes are never removed,
+      // so a non-empty taintModels implies this thread is incomplete.
+      for (const model of acct.taintModels) {
+        const agg = aggFor(model);
+        agg.incomplete = true;
+        agg.priceable = false;
       }
     }
     const out: Record<string, CodexModelUsageEntry> = {};

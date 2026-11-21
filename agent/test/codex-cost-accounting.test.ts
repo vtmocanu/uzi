@@ -478,6 +478,29 @@ describe("#4580 model segments (priced)", () => {
     assert.match(acct.incompleteNoticeText ?? "", /Diagnostic: bucket relationship \(total\.cachedInputTokens\)\./);
   });
 
+  it("a direct note with a negative output bucket is never metered", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(-1000000, -1000000));
+    // The clamped delta is zero, so the model may be omitted; it must never be metered.
+    const entry = acct.aggregateByModel(API_KEY_EARLY)?.[ASTRA];
+    assert.notEqual(entry?.costStatus, "metered");
+    assert.equal(entry !== undefined && "costUSD" in entry, false);
+  });
+
+  it("pricing-evidence taint after a cut degrades only the segment's own model", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(1000, 1000));
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, { ...out(2000, 1000), pricingEvidenceComplete: false });
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    assert.equal(get(agg, ASTRA).costStatus, "metered");
+    assert.equal(micro(get(agg, ASTRA).costUSD), 50000);
+    assert.equal(get(agg, SOL).costStatus, "unreported");
+    assert.equal(get(agg, SOL).outputTokens, 1000);
+  });
+
   describe("extended advancing gate", () => {
     const cases: [string, Partial<CodexUsageBreakdown>, Partial<CodexUsageBreakdown>, number][] = [
       ["reasoning",
