@@ -39,6 +39,25 @@ CREATE TABLE run_env_var_ids (
     name    text NOT NULL
 );
 
+-- The backfill below keeps one identity per var_id, so a var_id that already names more than one
+-- (user, repo, name) cannot be bound to a single identity. Refuse the migration loudly rather than
+-- pick one silently: the data is fixed by hand first.
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM run_env_vars GROUP BY var_id
+        HAVING count(DISTINCT user_id) > 1
+            OR count(DISTINCT name) > 1
+            OR count(DISTINCT repo_id) > 1
+            OR (count(*) FILTER (WHERE repo_id IS NULL) > 0 AND count(repo_id) > 0)
+    ) THEN
+        RAISE EXCEPTION 'run_env_vars: a var_id maps to more than one (user_id, repo_id, name); resolve the rows before this migration';
+    END IF;
+END
+$$;
+-- +goose StatementEnd
+
 INSERT INTO run_env_var_ids (var_id, user_id, repo_id, scope, name)
 SELECT DISTINCT ON (var_id)
        var_id, user_id, repo_id, CASE WHEN repo_id IS NULL THEN 'user' ELSE 'repo' END, name
@@ -110,6 +129,18 @@ $$;
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
+-- Version-2 rows and receipts have no version-1 representation: dropping aad_version would leave
+-- ciphertexts the older code cannot open, and dropping the receipts would forget which secret
+-- versions runs still need masked. Refuse, and let the owner decide what to do with that data.
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM run_env_vars WHERE aad_version = 2) OR EXISTS (SELECT 1 FROM run_env_receipts) THEN
+        RAISE EXCEPTION 'cannot roll back run_env_receipts: version-2 sealed variables or delivery receipts exist, and removing them would leave values unopenable or unmasked';
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 DROP FUNCTION fn_run_env_lane(text, uuid, uuid);
 DROP INDEX run_env_vars_sweep_idx;
 ALTER TABLE run_env_vars

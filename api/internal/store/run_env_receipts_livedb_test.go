@@ -2,11 +2,16 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 )
 
 // PRD #4416 M2: delivery receipts, the never-reused variable identity, the claim-time
@@ -313,34 +318,48 @@ func TestRunEnvClaimReadsLiveDB(t *testing.T) {
 	}
 }
 
+// TestRunEnvLaneFunctionLiveDB pins fn_run_env_lane to leadcfg.LeadLane (the Go predicate behind
+// workersvc.RunEnvDelivered) for every run kind of the shared registry, with and without a
+// review target and an egress profile, so a kind added to one side cannot silently miss the other.
 func TestRunEnvLaneFunctionLiveDB(t *testing.T) {
 	pool, _ := envRunDB(t)
-	cases := []struct {
-		kind   string
-		review bool
-		egress bool
-		want   bool
-	}{
-		{"issue", false, false, true}, {"ci_fix", false, false, true}, {"prompt", false, false, true},
-		{"self_improve", false, false, true}, {"mr_rework", false, false, true}, {"task", false, false, true},
-		{"task", true, false, false}, {"issue", false, true, false}, {"chat", false, false, false},
-		{"judge", false, false, false},
+	raw, err := os.ReadFile("../../../fixtures/run-kinds/registry.json")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, c := range cases {
-		var review, egress any
-		if c.review {
-			review = uuid.New()
+	var reg struct {
+		Kinds []string `json:"kinds"`
+	}
+	if err := json.Unmarshal(raw, &reg); err != nil || len(reg.Kinds) == 0 {
+		t.Fatalf("registry kinds: %v %v", reg.Kinds, err)
+	}
+	delivered := 0
+	for _, kind := range reg.Kinds {
+		for _, review := range []bool{false, true} {
+			for _, egress := range []bool{false, true} {
+				var reviewID, egressID any
+				if review {
+					reviewID = uuid.New()
+				}
+				if egress {
+					egressID = uuid.New()
+				}
+				var got bool
+				if err := pool.QueryRow(context.Background(), `SELECT fn_run_env_lane($1::text, $2::uuid, $3::uuid)`, kind, reviewID, egressID).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				want := leadcfg.LeadLane(kind, review, egress)
+				if got != want {
+					t.Errorf("fn_run_env_lane(%s, review=%v, egress=%v) = %v, leadcfg.LeadLane = %v", kind, review, egress, got, want)
+				}
+				if want {
+					delivered++
+				}
+			}
 		}
-		if c.egress {
-			egress = uuid.New()
-		}
-		var got bool
-		if err := pool.QueryRow(context.Background(), `SELECT fn_run_env_lane($1::text, $2::uuid, $3::uuid)`, c.kind, review, egress).Scan(&got); err != nil {
-			t.Fatal(err)
-		}
-		if got != c.want {
-			t.Errorf("fn_run_env_lane(%s, review=%v, egress=%v) = %v, want %v", c.kind, c.review, c.egress, got, c.want)
-		}
+	}
+	if delivered == 0 {
+		t.Fatal("no kind is delivered: the pin compared nothing")
 	}
 }
 
@@ -411,5 +430,65 @@ func TestRunEnvReceiptsMigrationRoundTripLiveDB(t *testing.T) {
 	}
 	if err := MigrateTo(ctx, dsn, version); err != nil {
 		t.Fatalf("up again: %v", err)
+	}
+}
+
+// A var_id that already names more than one variable cannot be backfilled into a single
+// identity: the migration refuses and names the problem instead of picking one silently.
+func TestRunEnvReceiptsMigrationRefusesAmbiguousVarIDLiveDB(t *testing.T) {
+	_, dsn := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool := cjOpenPool(t, dsn)
+	user := cjSeedUser(t, pool, nil)
+	s := seedEnvRepo(t, pool, user)
+	varID := uuid.New()
+	if err := envInsert(pool, user, s.repo, "FIRST_NAME", true, 1, varID, "retired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := envInsert(pool, user, s.repo, "SECOND_NAME", true, 2, varID, "live"); err != nil {
+		t.Fatal(err)
+	}
+	err := MigrateTo(context.Background(), dsn, migrationVersionByName(t, "run_env_receipts"))
+	if err == nil || !strings.Contains(err.Error(), "more than one (user_id, repo_id, name)") {
+		t.Fatalf("migrate with an ambiguous var_id: %v, want the refusal", err)
+	}
+	// Rows of one variable that keep their name migrate.
+	cjExec(t, pool, `DELETE FROM run_env_vars WHERE var_id=$1`, varID)
+	if err := envInsert(pool, user, s.repo, "ONE_NAME", true, 1, varID, "retired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := envInsert(pool, user, s.repo, "ONE_NAME", true, 2, varID, "live"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateTo(context.Background(), dsn, migrationVersionByName(t, "run_env_receipts")); err != nil {
+		t.Fatalf("migrate with a consistent var_id: %v", err)
+	}
+}
+
+// The rollback refuses while version-2 rows or receipts exist, and runs once they are gone.
+func TestRunEnvReceiptsMigrationDownRefusesWithDataLiveDB(t *testing.T) {
+	version := migrationVersionByName(t, "run_env_receipts")
+	_, dsn := codexJudgeMigrationDB(t, version)
+	pool := cjOpenPool(t, dsn)
+	user := cjSeedUser(t, pool, nil)
+	s := seedEnvRepo(t, pool, user)
+	varID := uuid.New()
+	if err := envInsert(pool, user, s.repo, "TOKEN", true, 1, varID, "live"); err != nil {
+		t.Fatal(err)
+	}
+	cjExec(t, pool, `UPDATE run_env_vars SET aad_version=2 WHERE var_id=$1`, varID)
+	ctx := context.Background()
+	if err := MigrateDownTo(ctx, dsn, version-1); err == nil || !strings.Contains(err.Error(), "cannot roll back run_env_receipts") {
+		t.Fatalf("down with a version-2 row: %v, want the refusal", err)
+	}
+	cjExec(t, pool, `UPDATE run_env_vars SET aad_version=1 WHERE var_id=$1`, varID)
+	run := seedEnvRun(t, pool, user, s.repo)
+	cjExec(t, pool, `INSERT INTO run_env_receipts (run_id,user_id,var_id,rev,scope,name,secret,first_claim_generation,last_claim_generation)
+	    VALUES ($1,$2,$3,1,'repo','TOKEN',true,1,1)`, run, user, varID)
+	if err := MigrateDownTo(ctx, dsn, version-1); err == nil || !strings.Contains(err.Error(), "cannot roll back run_env_receipts") {
+		t.Fatalf("down with a receipt: %v, want the refusal", err)
+	}
+	cjExec(t, pool, `DELETE FROM run_env_receipts WHERE run_id=$1`, run)
+	if err := MigrateDownTo(ctx, dsn, version-1); err != nil {
+		t.Fatalf("down with nothing to lose: %v", err)
 	}
 }

@@ -1,12 +1,14 @@
 package handler
 
-// run_env_vars.go: per-repo environment variables for runs (PRD #4416 M1). Variables
-// are stored and managed here; nothing injects them into a run yet (M2).
+// run_env_vars.go: per-repo environment variables for runs (PRD #4416). Variables are stored
+// and managed here, and the claim path (api/internal/workersvc) delivers them to runs.
 //
-// Every value, plain or secret, is sealed through the vault seam with the AAD that
-// runenv.AADKind builds. A secret's value is never opened for a response. Writes run
-// in one transaction that takes the owner's secret-mutation advisory lock and then
-// the users-row fence, like every other secret writer (withSecretLock).
+// Every value, plain or secret, is sealed through the vault seam with the context that
+// runenv.AADFor selects by the row's aad_version: new seals use version 2 (AADKindV2, which
+// also binds the owner, the variable id and the version number), and a version-1 row keeps
+// opening under AADKind until its value is next written. A secret's value is never opened for
+// a response. Writes run in one transaction that takes the owner's secret-mutation advisory
+// lock and then the users-row fence, like every other secret writer (withSecretLock).
 
 import (
 	"bytes"
@@ -651,6 +653,8 @@ func (h *Handler) EnableRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 // again, it still counts toward the per-scope limit, and it is never refused for a
 // budget reason. Neither answer revokes the credential at its provider.
 func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
+	// The answer names a state about retained secret history; no cache keeps it.
+	w.Header().Set("Cache-Control", "no-store")
 	userID, repoID, ok := h.runEnvOwner(w, r)
 	if !ok {
 		return

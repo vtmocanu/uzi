@@ -1,6 +1,7 @@
 package runenv
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -56,18 +57,77 @@ func TestAADKindV2EveryFieldChangesTheContext(t *testing.T) {
 	}
 }
 
+// Without the per-field length prefixes these tuples concatenate to the same bytes: the scope
+// "user" followed by a repo id, against the scope "user<repo id>" with no repo. Each pair is
+// checked to collide when prefixes are left out, so the test fails if AADKindV2 ever drops them.
 func TestAADKindV2LengthPrefixPreventsAmbiguity(t *testing.T) {
-	user, varA, varB := uuid.New(), uuid.New(), uuid.New()
+	user, varID, repo := uuid.New(), uuid.New(), uuid.New()
+	unprefixed := func(c aadV2Case) string {
+		r := ""
+		if c.repo != nil {
+			r = c.repo.String()
+		}
+		flag := "0"
+		if c.secret {
+			flag = "1"
+		}
+		var rev [4]byte
+		binary.BigEndian.PutUint32(rev[:], uint32(c.rev)) //nolint:gosec // G115: the fixture revisions are small positive counters.
+		return c.user.String() + c.scope + r + flag + c.name + c.varID.String() + string(rev[:])
+	}
 	pairs := [][2]aadV2Case{
-		{{user, ScopeUser, nil, true, "A", varA, 1}, {user, ScopeUser, nil, true, "A\x00", varA, 1}},
-		{{user, ScopeUser, nil, true, "AB", varA, 1}, {user, ScopeUser, nil, true, "A", varB, 1}},
-		{{user, ScopeUser, nil, false, "A", varA, 1}, {user, ScopeUser, nil, true, "A", varA, 1}},
-		{{user, ScopeUser, nil, true, "X", varA, 1}, {user, ScopeUser, nil, true, "X", varA, 256}},
+		{{user, "user", &repo, true, "A", varID, 1}, {user, "user" + repo.String(), nil, true, "A", varID, 1}},
+		{{user, "", &repo, true, "A", varID, 1}, {user, repo.String(), nil, true, "A", varID, 1}},
 	}
 	for i, p := range pairs {
-		if p[0].kind() == p[1].kind() {
-			t.Errorf("pair %d collides", i)
+		if unprefixed(p[0]) != unprefixed(p[1]) {
+			t.Fatalf("pair %d does not collide without length prefixes: the test would prove nothing", i)
 		}
+		if p[0].kind() == p[1].kind() {
+			t.Errorf("pair %d collides under AADKindV2", i)
+		}
+	}
+	// Other single-field neighbours stay distinct too.
+	varB := uuid.New()
+	for i, p := range [][2]aadV2Case{
+		{{user, ScopeUser, nil, true, "A", varID, 1}, {user, ScopeUser, nil, true, "A\x00", varID, 1}},
+		{{user, ScopeUser, nil, false, "A", varID, 1}, {user, ScopeUser, nil, true, "A", varID, 1}},
+		{{user, ScopeUser, nil, true, "X", varID, 1}, {user, ScopeUser, nil, true, "X", varID, 256}},
+		{{user, ScopeUser, nil, true, "X", varID, 1}, {user, ScopeUser, nil, true, "X", varB, 1}},
+	} {
+		if p[0].kind() == p[1].kind() {
+			t.Errorf("neighbour pair %d collides", i)
+		}
+	}
+}
+
+// The exact layout is a contract with every stored version-2 ciphertext: a change to it makes
+// existing rows undecryptable. The expected bytes are written out by hand, field by field.
+func TestAADKindV2GoldenBytes(t *testing.T) {
+	user := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	repo := uuid.MustParse("00000000-0000-4000-8000-000000000002")
+	varID := uuid.MustParse("00000000-0000-4000-8000-000000000003")
+	want := "uzi-run-env-v2" +
+		"\x00\x00\x00\x24" + "00000000-0000-4000-8000-000000000001" +
+		"\x00\x00\x00\x04" + "repo" +
+		"\x00\x00\x00\x24" + "00000000-0000-4000-8000-000000000002" +
+		"\x00\x00\x00\x01" + "1" +
+		"\x00\x00\x00\x05" + "TOKEN" +
+		"\x00\x00\x00\x24" + "00000000-0000-4000-8000-000000000003" +
+		"\x00\x00\x00\x04" + "\x00\x00\x00\x07"
+	if got := AADKindV2(user, ScopeRepo, &repo, true, "TOKEN", varID, 7); got != want {
+		t.Errorf("repo scope layout changed:\n got %q\nwant %q", got, want)
+	}
+	wantUser := "uzi-run-env-v2" +
+		"\x00\x00\x00\x24" + "00000000-0000-4000-8000-000000000001" +
+		"\x00\x00\x00\x04" + "user" +
+		"\x00\x00\x00\x00" +
+		"\x00\x00\x00\x01" + "0" +
+		"\x00\x00\x00\x01" + "N" +
+		"\x00\x00\x00\x24" + "00000000-0000-4000-8000-000000000003" +
+		"\x00\x00\x00\x04" + "\x01\x02\x03\x04"
+	if got := AADKindV2(user, ScopeUser, nil, false, "N", varID, 0x01020304); got != wantUser {
+		t.Errorf("user scope layout changed:\n got %q\nwant %q", got, wantUser)
 	}
 }
 

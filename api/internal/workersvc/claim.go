@@ -477,6 +477,12 @@ type ClaimPayload struct {
 	// never a Codex block (isolateClaim). omitempty keeps every other claim byte-identical
 	// to today's wire. Never logged: Credential is a live bearer secret.
 	IsolatedFetch *ClaimIsolatedFetch `json:"isolated_fetch,omitempty"`
+
+	// runEnv is the (var_id, rev) snapshot of the run environment lists assembleClaim delivered
+	// (PRD #4416 M2). Unexported on purpose: encoding/json never serializes it, so it reaches
+	// neither the wire nor any outbox. finishRunClaimTx recomputes both lists under the owner's
+	// users-row lock and compares them with this snapshot.
+	runEnv *runEnvSnapshot
 }
 
 // ClaimIsolatedFetch is the per-run fetch grant: Credential is the plaintext uzf_ token

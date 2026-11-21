@@ -2,13 +2,16 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runenv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #4416 M2: version-2 sealing context and the real receipt query behind the
@@ -119,5 +122,119 @@ func cjTestExecScan(t *testing.T, f *envFixture, dst any, sql string, args ...an
 	t.Helper()
 	if err := f.pool.QueryRow(context.Background(), sql, args...).Scan(dst); err != nil {
 		t.Fatalf("query: %v", err)
+	}
+}
+
+// receiptedRun seeds a run of the fixture's owner and repo and records a delivery receipt
+// for one version, through the real receipt table (no stub on the handler).
+func (f *envFixture) receiptedRun(name string, secret bool, rev int32) {
+	f.t.Helper()
+	var runID uuid.UUID
+	cjTestExecScan(f.t, f, &runID, `INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+ VALUES (gen_random_uuid(), $1, $2, floor(random()*1000000)::int, 't', 'd', 'running', 'issue') RETURNING id`, f.owner, f.repo)
+	v := f.versions(name)[rev]
+	if err := store.New(f.pool).UpsertRunEnvReceipt(context.Background(), store.UpsertRunEnvReceiptParams{
+		RunID: runID, UserID: f.owner, VarID: v.varID, Rev: rev, Scope: "repo", Name: name, Secret: secret, Generation: 1,
+	}); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// Delete keeps a secret some run holds a receipt for (202 pending_deletion, the row stays and
+// the response is not cacheable) and drops everything else at once (200).
+func TestRunEnvDeleteWithRealReceiptsLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("HELD_SECRET", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+	f.put("FREE_SECRET", jsonBody(map[string]any{"value": secretFixture(2)}), http.StatusCreated)
+	f.put("HELD_PLAIN", jsonBody(map[string]any{"value": "plain-one", "secret": false}), http.StatusCreated)
+	f.receiptedRun("HELD_SECRET", true, 1)
+	f.receiptedRun("HELD_PLAIN", false, 1)
+
+	rec := f.do(http.MethodDelete, "/HELD_SECRET", "")
+	f.must(rec, http.StatusAccepted)
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("DELETE Cache-Control = %q, want no-store", got)
+	}
+	var d apitypes.RunEnvDeleteDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil || d.State != apitypes.RunEnvStatePendingDeletion {
+		t.Fatalf("delete body = %s (%v), want pending_deletion", rec.Body.String(), err)
+	}
+	if f.rowCount("name='HELD_SECRET' AND pending_delete_at IS NOT NULL") != 1 {
+		t.Fatal("the receipted secret was not kept pending deletion")
+	}
+	rec = f.do(http.MethodDelete, "/FREE_SECRET", "")
+	f.must(rec, http.StatusOK)
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("DELETE (200) Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
+	}
+	if f.rowCount("name='FREE_SECRET'") != 0 {
+		t.Fatal("an unreceipted secret was kept")
+	}
+	f.must(f.do(http.MethodDelete, "/HELD_PLAIN", ""), http.StatusOK)
+	if f.rowCount("name='HELD_PLAIN'") != 0 {
+		t.Fatal("a plain version with a plain receipt was kept")
+	}
+}
+
+// With the retired-version budget full, a rotation of a really receipted secret is refused with
+// env_history_full and changes nothing; an unreceipted one needs no history and succeeds.
+func TestRunEnvHistoryFullWithRealReceiptsLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("HELD_TOKEN", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+	f.put("OTHER_TOKEN", jsonBody(map[string]any{"value": secretFixture(2)}), http.StatusCreated)
+	f.receiptedRun("HELD_TOKEN", true, 1)
+	for range runenv.MaxRetiredVersions {
+		cjTestExec(t, f, `INSERT INTO run_env_vars (var_id,user_id,repo_id,name,secret,ciphertext,sealed_with,value_bytes,rev,retired_at)
+ VALUES ($1,$2,$3,'PADDING',true,'\x01','master_aad',1,1,now())`, uuid.New(), f.owner, f.repo)
+	}
+	rec := f.do(http.MethodPut, "/HELD_TOKEN", jsonBody(map[string]any{"value": secretFixture(3)}))
+	f.must(rec, http.StatusConflict)
+	var e struct{ Code string }
+	_ = json.Unmarshal(rec.Body.Bytes(), &e)
+	if e.Code != "env_history_full" {
+		t.Fatalf("rotation of a receipted secret at the budget: %s", rec.Body.String())
+	}
+	if k := f.find(f.list(), "HELD_TOKEN"); k == nil || k.Rev != 1 {
+		t.Fatalf("a refused rotation changed the variable: %+v", k)
+	}
+	// Nothing holds a receipt for OTHER_TOKEN: its old version is dropped, not retained.
+	f.put("OTHER_TOKEN", jsonBody(map[string]any{"value": secretFixture(4)}), http.StatusOK)
+	// Disable and Delete are never refused for budget reasons.
+	f.must(f.do(http.MethodPost, "/HELD_TOKEN/disable", ""), http.StatusOK)
+	f.must(f.do(http.MethodDelete, "/HELD_TOKEN", ""), http.StatusAccepted)
+}
+
+// A version-1 plain row, written before the version-2 context existed, converts to a secret
+// with PUT {"secret":true}: the new row is version 2 and opens under its own context.
+func TestRunEnvVersionOnePlainRowConvertsToSecretLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("LEGACY_PLAIN", jsonBody(map[string]any{"value": "legacy-plain-value", "secret": false}), http.StatusCreated)
+	v1 := f.versions("LEGACY_PLAIN")[1]
+	// Reseal the stored value under the version-1 context and mark the row version 1.
+	kind1, err := runenv.AADFor(runenv.AADVersion1, f.owner, runenv.ScopeRepo, &f.repo, false, "LEGACY_PLAIN", v1.varID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := f.h.vault.Seal(context.Background(), f.owner, kind1, []byte("legacy-plain-value"), vault.SealForUse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cjTestExec(t, f, `UPDATE run_env_vars SET ciphertext=$2, sealed_with=$3, aad_version=1 WHERE id=$1`, v1.id, material.Ciphertext, material.SealedWith)
+
+	rec := f.do(http.MethodPut, "/LEGACY_PLAIN", jsonBody(map[string]any{"secret": true}))
+	f.must(rec, http.StatusOK)
+	versions := f.versions("LEGACY_PLAIN")
+	live, ok := versions[2]
+	if !ok {
+		t.Fatalf("versions = %+v, want a new rev 2", versions)
+	}
+	if live.aadVersion != runenv.AADVersion2 {
+		t.Fatalf("converted row aad_version = %d, want 2", live.aadVersion)
+	}
+	if got, err := f.openVersion("LEGACY_PLAIN", live); err != nil || got != "legacy-plain-value" {
+		t.Fatalf("the converted secret opens to %q, %v", got, err)
+	}
+	if k := f.find(f.list(), "LEGACY_PLAIN"); k == nil || !k.Secret || k.Value != nil {
+		t.Fatalf("listed variable = %+v, want a secret without a value", k)
 	}
 }

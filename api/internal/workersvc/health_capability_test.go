@@ -601,3 +601,52 @@ func TestHealthQueuedUnlinkedRepoNeverAsksIssueKeyWorker(t *testing.T) {
 		t.Fatalf("issued %d issue_key lookups for an unlinked run", len(fs.issueKeyCalls))
 	}
 }
+
+// -------------------------------------------------------------------------
+// PRD #4416 M2: the run_env rung. A queued lead-lane run that receives repo variables, whose
+// owner has no online worker reporting run_env_v1, surfaces reasonNoRunEnvCapableWorker.
+
+func runEnvSvc(kind string, missing bool) (*healthFakeStore, *Service, store.ListActiveRunsForHealthRow) {
+	r := queuedRunPastThreshold()
+	r.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	r.Kind = kind
+	fs := &healthFakeStore{
+		active:          []store.ListActiveRunsForHealthRow{r},
+		runEnvMissing:   missing,
+		onlineWorkers:   1,
+		freeSlotWorkers: 1,
+	}
+	return fs, healthSvc(fs, defaultHealthSettings()), r
+}
+
+func TestHealthQueuedRunEnvNoCapableWorkerFlagsReason(t *testing.T) {
+	fs, svc, r := runEnvSvc("issue", true)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonNoRunEnvCapableWorker {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonNoRunEnvCapableWorker)
+	}
+	if len(fs.runEnvCalls) != 1 || fs.runEnvCalls[0].RunID != r.ID || fs.runEnvCalls[0].UserID != r.UserID {
+		t.Fatalf("run_env lookups = %v, want exactly one for the run and its owner", fs.runEnvCalls)
+	}
+}
+
+func TestHealthQueuedRunEnvWithCapableWorkerFallsThrough(t *testing.T) {
+	fs, svc, r := runEnvSvc("issue", false)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonWaitingWorker {
+		t.Fatalf("reason = %q, want the generic %q", w.HealthReason.String, reasonWaitingWorker)
+	}
+}
+
+func TestHealthQueuedNonDeliveredKindNeverAsksRunEnvWorker(t *testing.T) {
+	for _, kind := range []string{"chat", "judge", "cross_check"} {
+		fs, svc, r := runEnvSvc(kind, true)
+		svc.detectRunHealth(context.Background(), t0)
+		if w := lastWrite(t, fs, r.ID); w.HealthReason.String == reasonNoRunEnvCapableWorker {
+			t.Fatalf("%s: emitted the run_env reason for a kind that never receives variables", kind)
+		}
+		if len(fs.runEnvCalls) != 0 {
+			t.Fatalf("%s: issued %d run_env lookups", kind, len(fs.runEnvCalls))
+		}
+	}
+}
