@@ -365,8 +365,8 @@ func TestTemplateEffortJudgeLaneIgnoresTemplateLiveDB(t *testing.T) {
 // template pins codex_effort `low` keeps its frozen cross-check default (high), never the template's.
 //
 // MUTATION: in claim_assembly.go set the checker arm's defaultEffort to
-// leadTemplateEffort(templates, harness) instead of the frozen checkerResolution.Effort; this test
-// then reads "low" and fails.
+// leadTemplateEffort(templates, harness) instead of the frozen checkerResolution.Effort; the claim
+// then loses the frozen high (measured: it reads medium) and this test fails.
 func TestTemplateEffortCheckerLaneIgnoresTemplateLiveDB(t *testing.T) {
 	env, svc, w, lead, c := roundsPinsFixture(t)
 	env.exec("UPDATE users SET default_codex_effort = NULL, default_effort = NULL WHERE id = $1", w.UserID)
