@@ -411,7 +411,7 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 	}
 	b.model = &model
 
-	effort := effortSettingCell(string(hn), lead.UserEffort)
+	effort := leadEffortSettingCell(string(hn), lead)
 	if hn == workersvc.HarnessCodex {
 		effort.CatalogDefault = h.codexCatalogDefaultForModel(ctx, d.userID, lead.Model)
 	}

@@ -491,6 +491,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		defaultModel = pgconv.TextPtr(checkerResolution.Model)
 	}
 
+	// Issue #3258 N6: stored subagent effort pins ride the claim only to a worker advertising
+	// template_effort_v1. For one that does not, the withheld pins get exactly one run-feed line per
+	// claim generation. Recorded here, before the payload literal reads recordedLastSeq.
+	templateEffortSupported := slices.Contains(wkr.ProtocolCapabilities, capability.TemplateEffortV1)
+	if !templateEffortSupported && hasWithheldTemplateEffort(templates, run.Harness) {
+		recordedLastSeq = s.recordTemplateEffortOmittedNote(ctx, run, recordedLastSeq)
+	}
+
 	// PRD #1551 M4 (D6): post-claim custom-Codex capability re-check. ClaimRun commits BEFORE
 	// assembleClaim runs (service.go), so the owner's Codex lane could have flipped to a CUSTOM
 	// (non-curated) id in the window between the claim's SQL gate and here. For an ordinary
@@ -543,7 +551,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		shippedEffort = eff
 	}
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
+		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortWithTemplate(harness, run.Effort, run.EffortSource, defaultEffort, leadTemplateEffort(templates, harness))
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es
@@ -963,7 +971,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			AnthropicOAuthToken: string(anthropic),
 			Provider:            providerBinding,
 		},
-		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
+		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness, templateEffortSupported),
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{

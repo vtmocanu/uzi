@@ -7,6 +7,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func txt(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
@@ -135,5 +136,100 @@ func TestResolveLeadEffort(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestLeadEffortTemplateTier(t *testing.T) {
+	override := func(level string) (pgtype.Text, pgtype.Text) {
+		return txt(level), txt(string(leadcfg.EffortSourceRunOverride))
+	}
+	runEffort, runSource := override("max")
+	cases := []struct {
+		name       string
+		harness    Harness
+		in         LeadSettingsInput
+		wantEffort string // "" = nothing sent
+		wantSource leadcfg.EffortSource
+	}{
+		{"NULL preference takes the template", HarnessClaude,
+			LeadSettingsInput{Harness: HarnessClaude, TemplateEffort: txt("high")}, "high", leadcfg.EffortSourceTemplate},
+		{"blank preference takes the template", HarnessCodex,
+			LeadSettingsInput{Harness: HarnessCodex, UserEffort: txt("  \t"), TemplateEffort: txt("low")}, "low", leadcfg.EffortSourceTemplate},
+		{"user level wins over the template", HarnessClaude,
+			LeadSettingsInput{Harness: HarnessClaude, UserEffort: txt("low"), TemplateEffort: txt("high")}, "low", leadcfg.EffortSourceUserDefault},
+		{"runtime preference wins and sends nothing", HarnessCodex,
+			LeadSettingsInput{Harness: HarnessCodex, UserEffort: txt("runtime"), TemplateEffort: txt("high")}, "", leadcfg.EffortSourceUserDefault},
+		{"corrupt preference keeps the builtin, not the template", HarnessClaude,
+			LeadSettingsInput{Harness: HarnessClaude, UserEffort: txt("ultra"), TemplateEffort: txt("high")}, "medium", leadcfg.EffortSourceBuiltin},
+		{"run override wins over the template and the preference", HarnessClaude,
+			LeadSettingsInput{Harness: HarnessClaude, UserEffort: txt("low"), TemplateEffort: txt("high"), RunEffort: runEffort, RunEffortSource: runSource},
+			"max", leadcfg.EffortSourceRunOverride},
+		{"run override wins over the template with no preference", HarnessCodex,
+			LeadSettingsInput{Harness: HarnessCodex, TemplateEffort: txt("high"), RunEffort: runEffort, RunEffortSource: runSource},
+			"max", leadcfg.EffortSourceRunOverride},
+		{"no template is the builtin", HarnessClaude,
+			LeadSettingsInput{Harness: HarnessClaude}, "medium", leadcfg.EffortSourceBuiltin},
+		{"hostile template value is ignored", HarnessCodex,
+			LeadSettingsInput{Harness: HarnessCodex, TemplateEffort: txt("High")}, "medium", leadcfg.EffortSourceBuiltin},
+		{"runtime is not a template level", HarnessCodex,
+			LeadSettingsInput{Harness: HarnessCodex, TemplateEffort: txt("runtime")}, "medium", leadcfg.EffortSourceBuiltin},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveLeadSettings(tc.in)
+			if got.Unhonorable != nil {
+				t.Fatalf("unexpected unhonorable %+v", got.Unhonorable)
+			}
+			if gotEffort := derefOr(got.Effort, ""); gotEffort != tc.wantEffort {
+				t.Errorf("effort = %q, want %q", gotEffort, tc.wantEffort)
+			}
+			if (got.Effort == nil) != (tc.wantEffort == "") {
+				t.Errorf("effort nil-ness = %v, want nothing sent = %v", got.Effort == nil, tc.wantEffort == "")
+			}
+			if got.EffortSource != tc.wantSource {
+				t.Errorf("source = %q, want %q", got.EffortSource, tc.wantSource)
+			}
+		})
+	}
+}
+
+func TestLeadEffortTemplateTierUnhonorableOverrideStillParks(t *testing.T) {
+	got := resolveLeadSettings(LeadSettingsInput{
+		Harness: HarnessClaude, TemplateEffort: txt("high"),
+		RunEffort: txt("runtime"), RunEffortSource: txt(string(leadcfg.EffortSourceRunOverride)),
+	})
+	if got.Unhonorable == nil || got.Unhonorable.Setting != "effort" {
+		t.Fatalf("an out-of-set run_override effort must stay unhonorable, got %+v", got.Unhonorable)
+	}
+}
+
+// Lane control: the non-lead consumers resolve through leadEffortFor, which never reads a template
+// tier, so the lead template's effort cannot reach them.
+func TestLeadEffortForIgnoresTemplateTier(t *testing.T) {
+	for _, h := range []Harness{HarnessClaude, HarnessCodex} {
+		effort, source, bad := leadEffortFor(h, pgtype.Text{}, pgtype.Text{}, pgtype.Text{})
+		if bad || derefOr(effort, "") != "medium" || source != leadcfg.EffortSourceBuiltin {
+			t.Errorf("%s: leadEffortFor with no preference = %v %q %v, want builtin medium", h, effort, source, bad)
+		}
+	}
+}
+
+func TestLeadTemplateEffortPicksTheLeadTemplateByFamily(t *testing.T) {
+	rows := []store.AgentTemplate{
+		{Name: "coder", Effort: txt("low"), CodexEffort: txt("low")},
+		{Name: "orchestrator", Effort: txt("high"), CodexEffort: txt("xhigh")},
+		{Name: "lead", Effort: txt("max")},
+	}
+	if got := leadTemplateEffort(rows, HarnessClaude); got.String != "high" || !got.Valid {
+		t.Errorf("claude = %+v, want the first lead-shaped template's claude effort", got)
+	}
+	if got := leadTemplateEffort(rows, HarnessCodex); got.String != "xhigh" || !got.Valid {
+		t.Errorf("codex = %+v, want codex_effort", got)
+	}
+	if got := leadTemplateEffort(rows[:1], HarnessClaude); got.Valid {
+		t.Errorf("no lead template = %+v, want unset", got)
+	}
+	if got := leadTemplateEffort([]store.AgentTemplate{{Name: "lead", Effort: txt("bogus")}}, HarnessClaude); got.Valid {
+		t.Errorf("hostile lead effort = %+v, want unset", got)
 	}
 }

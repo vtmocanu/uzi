@@ -57,6 +57,11 @@
     },
     {
       "field": "effort",
+      "token": "template",
+      "label": "lead template"
+    },
+    {
+      "field": "effort",
       "token": "cross_check_pin",
       "label": "checker pin"
     },

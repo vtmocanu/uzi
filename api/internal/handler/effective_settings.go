@@ -272,8 +272,8 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 	}
 	dto.Models = append(dto.Models, reviewModelCell(reviews[workersvc.HarnessClaude]), reviewModelCell(reviews[workersvc.HarnessCodex]))
 
-	claudeEffort := effortSettingCell("claude", leads[workersvc.HarnessClaude].UserEffort)
-	codexEffort := effortSettingCell("codex", leads[workersvc.HarnessCodex].UserEffort)
+	claudeEffort := leadEffortSettingCell("claude", leads[workersvc.HarnessClaude])
+	codexEffort := leadEffortSettingCell("codex", leads[workersvc.HarnessCodex])
 	codexEffort.CatalogDefault = h.codexCatalogDefaultForModel(ctx, userID, leads[workersvc.HarnessCodex].Model)
 	reviewCodexEffort := reviewEffortCell("codex")
 	reviewCodexEffort.CatalogDefault = h.codexCatalogDefaultForModel(ctx, userID, reviews[workersvc.HarnessCodex].Model)

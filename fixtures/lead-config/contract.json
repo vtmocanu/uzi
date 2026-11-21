@@ -975,6 +975,137 @@
         "template_claude": null,
         "template_codex": null
       }
+    },
+    {
+      "id": "claude-template-effort-fills-unset-preference",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "high",
+        "default_effort_source": "template"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "sonnet",
+        "modelSource": "user_default",
+        "effort": "high",
+        "effortMode": "explicit",
+        "effortSource": "template"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "user_effort": null,
+        "template_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "codex-template-effort-fills-unset-preference",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_effort": "low",
+        "default_effort_source": "template"
+      },
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6.1-sol",
+        "modelSource": "builtin",
+        "effort": "low",
+        "effortMode": "explicit",
+        "effortSource": "template"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_effort": "low",
+        "template_claude": null,
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-user-effort-beats-template-effort",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "low",
+        "default_effort_source": "user_default"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "sonnet",
+        "modelSource": "user_default",
+        "effort": "low",
+        "effortMode": "explicit",
+        "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "user_effort": "low",
+        "template_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "codex-owner-runtime-default-beats-template-effort",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_effort_source": "user_default"
+      },
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6.1-sol",
+        "modelSource": "builtin",
+        "effortMode": "runtime_default",
+        "effortSource": "user_default"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": "runtime",
+        "template_effort": "high",
+        "template_claude": null,
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-run-override-effort-beats-template-effort",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "xhigh",
+        "default_effort_source": "run_override"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "sonnet",
+        "modelSource": "user_default",
+        "effort": "xhigh",
+        "effortMode": "explicit",
+        "effortSource": "run_override"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "run_effort": "xhigh",
+        "run_effort_source": "run_override",
+        "user_effort": null,
+        "template_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
+      }
     }
   ],
   "display_cases": [

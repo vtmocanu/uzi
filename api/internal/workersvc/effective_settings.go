@@ -391,7 +391,13 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 	}
 	tClaude, tCodex := textPtr(row.TemplateModel), textPtr(row.TemplateCodexModel)
 
-	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort}
+	// Issue #3258 N3: the lead template's effort for this harness's family, the tier below the
+	// owner's default (the same value a claim derives from agenttmpl.SelectLead over its templates).
+	var templateEffort pgtype.Text
+	if e := agenttmpl.EffortForHarness(string(harness), derefString(textPtr(row.TemplateEffort)), derefString(textPtr(row.TemplateCodexEffort))); e != "" {
+		templateEffort = pgtype.Text{String: e, Valid: true}
+	}
+	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort, TemplateEffort: templateEffort}
 	choice.apply(&in)
 	settings := resolveLeadSettings(in)
 	if settings.Unhonorable != nil {

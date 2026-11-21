@@ -30251,7 +30251,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
     }> };
     const cases = contract.request_cases.filter((c) => c.harness === "codex");
-    assert.equal(cases.length, 20, "all Codex request cases loaded");
+    assert.equal(cases.length, 22, "all Codex request cases loaded");
     const visited: string[] = [];
     const phases = new Set<string>();
     for (const c of cases) {
@@ -30309,7 +30309,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 20);
+    assert.equal(visited.length, 22);
     assert.deepEqual([...phases].sort(), ["implement", "plan"]);
   });
 

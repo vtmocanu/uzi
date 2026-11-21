@@ -80,7 +80,7 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 			got := resolveLeadSettings(LeadSettingsInput{
 				Harness: harness, RunModel: text(s.RunModel), RunModelSource: text(s.RunModelSource),
 				RunEffort: text(s.RunEffort), RunEffortSource: text(s.RunEffortSource),
-				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort),
+				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort), TemplateEffort: text(s.TemplateEffort),
 			})
 
 			wantStr := func(key string) string {
