@@ -69,8 +69,9 @@ func (s *Service) recordTemplateEffortOmittedNote(ctx context.Context, run store
 		return startLastSeq
 	}
 	if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: run.ID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
+		// The row is already inserted: returning the old seq would make the worker's first frame
+		// collide with it, so adopt the new seq regardless.
 		slog.Warn("workersvc: advance last_seq for template effort omitted note", "run_id", run.ID.String(), "error", err)
-		return startLastSeq
 	}
 	if s.bcast != nil {
 		s.bcast.PublishMessage(run.ID, seq, "status", templateEffortOmittedAgent, "", "", raw, s.now())

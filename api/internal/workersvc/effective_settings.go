@@ -310,6 +310,9 @@ type LeadPrediction struct {
 	// Effort is the claim's default_effort (nil: nothing is sent); EffortSource its provenance.
 	Effort       *string
 	EffortSource string
+	// TemplateEffort is the lead template's valid effort for the harness (nil: none), what an unset
+	// preference resolves to.
+	TemplateEffort *string
 	// Subagents is nil for a review.
 	Subagents *SubagentPrediction
 	// Unhonorable is set when a start-time run_override model or effort cannot run on Harness; every
@@ -407,6 +410,7 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 		Harness: harness, LaneModel: textPtr(lane), UserEffort: textPtr(effort),
 		Effort: settings.Effort, EffortSource: string(settings.EffortSource),
 		DroppedRunModel: textPtr(settings.DroppedRunModel),
+		TemplateEffort:  textPtr(templateEffort),
 	}
 	out.DefaultModel, out.DefaultModelSource = agenttmpl.ResolveWorkerDefaultModel(string(harness), nil, tClaude, tCodex)
 	if settings.Model.Valid {

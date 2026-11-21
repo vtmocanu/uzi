@@ -119,8 +119,8 @@ func newAgentTemplateSetCmd(env Env, gf *globalFlags) *cobra.Command {
 			"The effort is one of " + strings.Join(crossCheckEffortLevels, ", ") + ". The template is named by name or id; a name\n" +
 			"that matches more than one template is refused and the ids are listed. Pins are stored per family\n" +
 			"and the other family is left unchanged. A model id is passed through and the server validates it.\n" +
-			"Builtin and global templates are edited in the web UI by an admin. Undo with\n" +
-			"`uzi agent-template reset`, which makes the template inherit again.",
+			"Builtin and global templates are edited in the web UI by an admin. Undo a model pin with\n" +
+			"`uzi agent-template reset` and an effort pin with `uzi agent-template reset --effort`; the template then inherits again.",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			field, err := agentTemplateField(harness)

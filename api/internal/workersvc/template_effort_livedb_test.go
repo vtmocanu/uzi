@@ -94,9 +94,9 @@ func TestTemplateEffortClaimProjectionLiveDB(t *testing.T) {
 			run := fx.mustCreate(&h)
 			p := fx.claimWith(run, 1, newWorkerCaps)
 			got := agentEfforts(p)
-			wantLead := map[Harness]string{HarnessClaude: "max", HarnessCodex: "xhigh"}[h]
-			if len(got) != 2 || got["eff-coder"] != wantCoder || got[effLeadName] != wantLead {
-				t.Fatalf("agent efforts = %v, want eff-coder=%s %s=%s only", got, wantCoder, effLeadName, wantLead)
+			// The lead template's effort travels only via default_effort, never as an agent pin.
+			if len(got) != 1 || got["eff-coder"] != wantCoder {
+				t.Fatalf("agent efforts = %v, want eff-coder=%s only (the lead carries no effort)", got, wantCoder)
 			}
 			if n := fx.effortNotes(run.ID); len(n) != 0 {
 				t.Fatalf("capable worker got notices: %+v", n)
@@ -263,5 +263,38 @@ func TestTemplateEffortLeadSelectionParityLiveDB(t *testing.T) {
 				t.Errorf("delivered orchestrator effort = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// TestTemplateEffortNonLeadLaneIgnoresTemplateLiveDB is the lane control for the lead-template tier:
+// a Claude task-review run (not a lead lane) of an owner whose lead template pins an effort keeps the
+// builtin default_effort and carries no source, never the template's value.
+//
+// MUTATION: in claim_assembly.go change the non-lead leadEffortFor line to leadEffortWithTemplate
+// with leadTemplateEffort(templates, harness); this test then reads "high" and fails.
+func TestTemplateEffortNonLeadLaneIgnoresTemplateLiveDB(t *testing.T) {
+	fx := newEffFix(t)
+	fx.anthropic()
+	fx.templateEffort(effLeadName, "high", "high")
+
+	targetID := uuid.New()
+	fx.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, issue_title, issue_description, status, harness)
+	          VALUES ($1, $2, $3, 'task', $4, 'main', 't', 'd', 'completed', 'claude')`,
+		targetID, fx.userID, fx.repoID, "uzi/task/"+targetID.String())
+	reviewID := uuid.New()
+	fx.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, review_target_run_id, dispatched_at, issue_title, issue_description, status, worker_id, harness)
+	          VALUES ($1, $2, $3, 'task', $4, 'main', $5, now(), 't', 'd', 'claimed', $6, 'claude')`,
+		reviewID, fx.userID, fx.repoID, "uzi/task/"+reviewID.String(), targetID, fx.workerID)
+	run := mustRun(t, fx.env, reviewID)
+	if !run.ReviewTargetRunID.Valid {
+		t.Fatal("fixture must be a review run")
+	}
+
+	p := fx.claimWith(run, 1, newWorkerCaps)
+	if got := derefOr(p.Config.DefaultEffort, ""); got != "medium" {
+		t.Errorf("non-lead claim default_effort = %q, want the builtin medium, not the lead template's high", got)
+	}
+	if p.Config.DefaultEffortSource != nil {
+		t.Errorf("non-lead claim default_effort_source = %q, want none", *p.Config.DefaultEffortSource)
 	}
 }

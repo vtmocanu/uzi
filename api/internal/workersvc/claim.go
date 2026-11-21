@@ -883,7 +883,8 @@ func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[strin
 		if m := agenttmpl.PinForHarness(harness, claudePin, codexPin); m != "" {
 			a.Model = &m
 		}
-		if templateEffort {
+		// The lead template's effort is not a per-agent pin: it travels only via default_effort.
+		if templateEffort && !agenttmpl.IsLeadName(t.Name) {
 			if e := templateEffortPin(t, harness); e != "" {
 				a.Effort = &e
 			}
