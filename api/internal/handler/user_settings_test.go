@@ -26,7 +26,7 @@ import (
 // SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
 // single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
 // one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
-// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-two (default_model,
+// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-five (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
@@ -297,7 +297,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 24: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here)
+	case 25: // GetUserSettings: 22 settings columns + two provider IDs + sidebar_motion.
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -376,8 +376,15 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[21].(*pgtype.Text); ok {
 			*p = r.judgeRunsOn
 		}
-		// sidebar_motion (issue #4510) is the 24th column, after claude_provider_id.
-		if p, ok := dest[23].(*pgtype.Bool); ok {
+		// Provider sources (issues #4320/#4323) are both NULL in this general settings fake.
+		if p, ok := dest[22].(*pgtype.UUID); ok {
+			*p = pgtype.UUID{}
+		}
+		if p, ok := dest[23].(*pgtype.UUID); ok {
+			*p = pgtype.UUID{}
+		}
+		// sidebar_motion (issue #4510) is the 25th column, after both provider IDs.
+		if p, ok := dest[24].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
 	}
