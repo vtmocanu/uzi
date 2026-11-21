@@ -240,13 +240,20 @@ export const workerSizesApi = {
       refusals: refusals(),
     });
   },
-  // Both verbs are the api's one PUT: an existing name is edited, an absent one created.
+  // Both verbs are the api's one PUT. Without a precondition an existing name is edited and an
+  // absent one created (update); the create verb sends If-None-Match: * and so is create-only.
   updateAdminWorkerSize: async (name: string, spec: WorkerSizeSpec): Promise<AdminWorkerSizeWrite> => {
     requireAdmin();
     return delay(put(name, pick(spec)));
   },
   createAdminWorkerSize: async (name: string, spec: WorkerSizeSpec): Promise<AdminWorkerSizeWrite> => {
     requireAdmin();
+    refuseIfReadOnly();
+    if (!SIZE_NAME_PATTERN.test(name)) throw new ApiError(400, INVALID_NAME);
+    if (rows.some((r) => r.name === name)) {
+      const error = `worker size ${name} already exists`;
+      throw new ApiError(412, error, { error, reason: "size_exists" });
+    }
     return delay(put(name, pick(spec)));
   },
   deleteAdminWorkerSize: async (name: string): Promise<{ deleted: string }> => {
