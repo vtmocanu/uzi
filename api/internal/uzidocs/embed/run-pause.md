@@ -402,9 +402,12 @@ hold is recorded, the owner already resumed it, the plan was not approved (the
 hold is re-posted for the plan phase), the claim is gone, or an owner Cancel is
 confirmed. It also ends if the worker shuts down, or if the server parks the run
 first: ownership shows the run `paused` at this claim with another hold reason,
-for example the wall-clock limit's park. Then the flight ends without posting and
-the feed says "The server paused the run first (<reason>); this worker keeps the
-work." That park is the server's own and follows its own resume rules.
+with the claim kept. Then the flight ends without posting and the feed says "The
+server paused the run first (<reason>); this worker keeps the work." (No server
+path is known to produce this today.) The wall-clock limit's park releases the
+claim, so it ends as "This worker no longer holds the run…". The wall-clock
+sweep skips interactive runs and runs waiting for approval, so for those an
+unconfirmed hold is retried until shutdown, an owner Cancel or a claim change.
 
 If the worker shuts down or dies with the hold unapplied, its flight ends and it
 keeps its copy of the work.

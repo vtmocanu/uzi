@@ -3554,7 +3554,7 @@ export interface RunnerOptions {
   /** TEST-ONLY (issue #3252): an independent wall-clock bound for enterPhaseSwitchHold's unknown-outcome
    *  retry loop. Production sets none: ending a flight whose hold row may still be running would let the
    *  missing-from-snapshot path requeue or fail it, so the loop stops only on a definitive ownership
-   *  answer, the worker's shutdown signal, or a server-side park (the run's wall sweep). */
+   *  answer, the worker's shutdown signal, or a run paused at this claim with another reason. */
   phaseSwitchHoldDeadlineMs?: number;
   /** TEST-ONLY bound (ms) for the single owner-cancel read at a held-predecessor refusal. Default 10s. */
   heldSeamCancelObserveMs?: number;
@@ -26638,12 +26638,14 @@ export class RunRunner {
    * Only a positive, fully populated ownership observation at THIS flight's generation settles the
    * outcome; every other answer (transport, 5xx, a 404 on the POST, missing fields, an unexpected status)
    * is unknown and is retried, ownership read first, with a bounded backoff until the hold is proven,
-   * the claim is provably gone, the server parks the run itself (`server_parked`: paused at this
-   * generation with another hold reason, e.g. the wall sweep), or the worker shuts down. There is no
+   * the claim is provably gone (the wall-clock sweep's ParkRunsAtWall releases the claim, so it ends here as
+   * non-live), the run is paused at this generation with another hold reason and the claim kept
+   * (`server_parked`, a defensive arm: no server-only path is known to produce it today), or the worker shuts down. There is no
    * independent timeout (only the test-only {@link phaseSwitchHoldDeadlineMs}): ending a flight whose row
    * may still be running would let the missing-from-snapshot path requeue or fail it. A wall pause request
-   * reaches the executor loop, which is stopped here, so it is honoured server-side by the wall sweep and
-   * observed through `server_parked`. The flight stays registered meanwhile, so its heartbeats continue.
+   * reaches the executor loop, which is stopped here, so it is honoured server-side by ParkRunsAtWall,
+   * which releases the claim (observed as non-live). The wall sweep skips interactive and
+   * awaiting_approval rows, so an unknown outcome on those retries until shutdown, cancel or a claim change. The flight stays registered meanwhile, so its heartbeats continue.
    * An unknown read never counts as success.
    *
    * Returns true when an owner Cancel was observed while the hold was unconfirmed (the cancel input, or
@@ -26753,8 +26755,8 @@ export class RunRunner {
       // flight ends non-terminally with clone, session and custody kept, and frees its slot.
       runLog.info("phase switch hold already applied and resumed; ending the flight without a report", { run_id: runId, phase, cause });
     } else if (outcome === "server_parked") {
-      // The server parked the run first (for example the wall sweep, RequestWallParks / ParkRunsAtWall):
-      // a resumable server-side park at our generation. Nothing more is posted; clone and session stay.
+      // Defensive: the run is paused at our generation with another hold reason and the claim kept
+      // (no server-only producer is known today; the wall sweep releases the claim and ends as non-live). Nothing more is posted; clone and session stay.
       runLog.info("phase switch hold: the server parked the run first; ending the flight without a report", {
         run_id: runId, phase, cause, hold_reason: serverParked.reason,
       });
@@ -26824,8 +26826,8 @@ export class RunRunner {
       return "unknown";
     }
     if (own.hold_reason === null && (own.status === "running" || own.status === "awaiting_approval")) return "live";
-    // The server parked the run itself (the wall sweep's budget_exhausted, an owner pause, ...) at our
-    // generation with the claim not released: a definitive, resumable park that is not our hold.
+    // Defensive: paused at our generation with another hold reason and the claim not released — a park
+    // that is not our hold. (The wall sweep releases the claim, so it is classified non-live above.)
     if (own.status === "paused" && typeof own.hold_reason === "string" && own.hold_reason !== "") {
       parked.reason = own.hold_reason;
       return "server_parked";

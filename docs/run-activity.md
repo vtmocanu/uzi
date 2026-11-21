@@ -1041,9 +1041,9 @@ confirmed, it adds a follow-up line instead of leaving the first one standing:
 either `This worker no longer holds the run and has stopped working on it. This
 worker keeps its copy of the work.` (the server definitively no longer lists the
 worker as owner), `The server paused the run first (<reason>); this worker
-keeps the work.` (the run is already `paused` at this claim for another reason,
-for example the wall-clock limit, so the worker ends without recording its own
-hold), or `The pause could not be confirmed; the run may not be paused. This
+keeps the work.` (the run is already `paused` at this claim for another reason
+with the claim kept, so the worker ends without recording its own hold; the
+wall-clock limit's park releases the claim and gives the first line instead), or `The pause could not be confirmed; the run may not be paused. This
 worker keeps the work.` (undetermined, because the worker shut down while
 still retrying; check `uzi run get`). The worker keeps retrying until it gets
 one of these answers, a confirmed hold or owner Cancel, or shuts down; it has no

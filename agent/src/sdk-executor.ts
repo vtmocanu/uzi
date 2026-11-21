@@ -1857,8 +1857,8 @@ export class SdkExecutor implements Executor {
     const planLeadModel = planRequest.model;
     // PRD #3252: a planning model with no implementation model to fall back to is an unsupported
     // phase configuration. It is refused (before any turn) only where the planning model could
-    // reach the implement turn: on every start except a fresh pre-approved one with no session (a
-    // resumed gate is refused too: a revise there would plan on the planning model). That check sits below, once `preApproved` is known. On a provider run the
+    // reach the implement turn, and per PRD #3252 it fails visibly rather than being replaced, so it is
+    // refused on every non-provider start regardless of approval state. That check sits below, once `preApproved` is known. On a provider run the
     // provider map's default (the sonnet alias) counts as the implementation model only if the map
     // yields a name; resolveProviderModel below throws otherwise.
     // PRD #4320 module 7: a provider run resolves the lead through the bound map BEFORE any content is
