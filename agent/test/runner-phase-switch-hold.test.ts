@@ -239,12 +239,12 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       assert.deepEqual(terminal(r.states), []);
       assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
       assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), "the Paused line was posted");
-      assert.ok(r.feed.includes("This worker no longer holds the run, so it did not pause it. This worker keeps its copy of the work."),
+      assert.ok(r.feed.includes("This worker no longer holds the run, so it stopped working on it. This worker keeps its copy of the work."),
         `the feed corrects the Paused line: ${r.feed.join(" | ")}`);
     });
   }
 
-  it("an applied hold whose ACK and every ownership read are lost ends at the deadline without claiming the run is not paused", async () => {
+  it("a hold request whose reply and every ownership read are lost ends at the deadline without claiming the run is not paused", async () => {
     const r = await runHold({ iid: 32575, post: [unknown], ownership: [{ status: 503 }] });
     assert.deepEqual(terminal(r.states), [], "no terminal report");
     assert.ok(r.elapsedMs >= 2_500, `waited for the hold deadline (${r.elapsedMs} ms)`);

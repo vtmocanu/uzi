@@ -3389,7 +3389,7 @@ function phaseSwitchHoldText(
  *  claim is gone); "stopped" (deadline, shutdown) is not, since an applied hold whose ACK was lost
  *  followed by failed reads is indistinguishable from an unapplied one, so it states only what is known. */
 const PHASE_SWITCH_NONLIVE_TEXT =
-  "This worker no longer holds the run, so it did not pause it. This worker keeps its copy of the work.";
+  "This worker no longer holds the run, so it stopped working on it. This worker keeps its copy of the work.";
 const PHASE_SWITCH_UNCONFIRMED_TEXT =
   "The pause could not be confirmed; the run may not be paused. This worker keeps the work.";
 
