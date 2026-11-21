@@ -4,8 +4,8 @@
 closed; #4203 and #2013 remain open; nothing here is an A/B verdict or production
 authorization.**
 
-Labelled assertions use these labels; the unlabelled items (section 5 carry-forward, section 8
-notes and the R5 and R7 "declared" lists) are cited or declared as stated where they appear, and
+Labelled assertions use these labels; some items carry no label (for example the section 4 requests, section 5 carry-forward, section 7
+and section 8 notes, and the R7 declared envelope); they are cited or declared as stated where they appear, and
 section 2's source table names the instrument and binding per requirement:
 
 - **observed**: read from the daemon or host by the collector, bound to the collector-run revision.
@@ -25,10 +25,10 @@ See [README.md](README.md) for the verifier (`qualify.py`) and collector (`obser
   revision**: d75ab6f0d5b3d5d94326bb454dc109f4e5d63f92 (the #4214 merge of the scaffold whose
   branch repair revision was 6d521c57a, per [PRD 4203](../../prds/4203-go-cache-admission-proof.md)).
 - **Evidence files**: [evidence/artifact.json](evidence/artifact.json) and
-  [evidence/verdict.json](evidence/verdict.json). Later commits only tightened daemon-field
-  allowlists and, after the evidence run, also added image Arch/Os allowlists, response close in
-  `docker_get` and a rootless missing-`CgroupDriver` rule; none changes the evidence. A unittest
-  (`test_observe.py`) checks that each committed daemon string passes the current `daemon_section`
+  [evidence/verdict.json](evidence/verdict.json). Commits after the evidence run tightened daemon-field
+  allowlists and added image Arch/Os allowlists, response close in
+  `docker_get` and a rootless missing-`CgroupDriver` rule; none changes the evidence. Two unittests
+  in `test_observe.py` check that each committed daemon string passes the current `daemon_section`
   unchanged and that the artifact still re-evaluates to NO-QUALIFIED-ENVIRONMENT; the images,
   binding and verdict were not re-collected. Daemon identity appears only as a per-run salted hash.
 
@@ -42,10 +42,10 @@ not an observation.
 
 | # | Source | Instrument | Binding |
 | --- | --- | --- | --- |
-| R1 | PRD 2013 and 4203 Decision Logs | cited text | the PRD files at HEAD |
+| R1 | PRD 2013 Decision Log (linked from PRD 4203) | cited text | acbed9921 |
 | R2 | daemon GET responses | `observe.py` collector; `qualify.py` binding leg | collector revision 6e02e276f |
 | R3 | owner inputs; agent code | issue text for the owner inputs (none supplied); code citations | acbed9921 |
-| R4 | `qualify.py` rules; kernel memcg docs | code citations; no mount facts collected | acbed9921 |
+| R4 | `qualify.py` rules; kernel cgroup-v2 docs (docs.kernel.org, current) | code citations; no mount facts collected | acbed9921 |
 | R5 | `qualify.py` rules; daemon support flags | `qualify.py` enforcement leg; collector support flags | acbed9921 and 6e02e276f |
 | R6 | render and compose source; issue text | code citations; none observed | acbed9921 (anchor revision for the cited lines) |
 | R7 | issue text, PRD envelope | declared values; `qualify.py` envelope leg | acbed9921 |
@@ -170,19 +170,19 @@ Nothing below is observed for a container; "rendered" means cited from source.
 
 | Lane | Verdict | Rendered (cited) | Observed | Missing mechanism | Owner decision |
 | --- | --- | --- | --- | --- | --- |
-| Hosted k8s without Docker | UNVERIFIED | Worker data PVC shared by runs. No `limits.ephemeral-storage` by design (`controller/internal/kube/render.go`, comment near line 250); that decision is unchanged. emptyDir `sizeLimit` and ephemeral-storage are eviction-only ([Kubernetes ephemeral storage](https://kubernetes.io/docs/concepts/storage/ephemeral-storage/)). A memory-backed tmpfs needs a new mount. | None. | No per-experiment synchronous byte or inode bound inside the shared data PVC; ephemeral limits are eviction-only; a memory-backed emptyDir would be a new mount. | Whether to add a memory-backed mount (a new rendered volume). |
+| Hosted k8s without Docker | UNVERIFIED | Worker data PVC shared by runs. No `limits.ephemeral-storage` by design (`controller/internal/kube/render.go`, comment near line 250); that decision is unchanged. Disk-backed emptyDir `sizeLimit` and ephemeral-storage are eviction-only ([Kubernetes ephemeral storage](https://kubernetes.io/docs/concepts/storage/ephemeral-storage/)). A memory-backed tmpfs needs a new mount. | None. | No per-experiment synchronous byte or inode bound inside the shared data PVC; ephemeral limits are eviction-only; a memory-backed emptyDir would be a new mount. | Whether to add a memory-backed mount (a new rendered volume). |
 | Hosted Docker-wired | UNVERIFIED | `dind-data` daemon volume (`render_dind.go:43`, mounted at `:357`). The `runner-shared` subPath at `/data/runner` is shared by worker and dind (`:73-74`, `:82-83`): excluded as shared and not quota'd. DinD memory default 2Gi (`:121`; the chart default was not observed). `--storage-opt size` is unproven on overlayfs with the containerd snapshotter ([dockerd reference](https://docs.docker.com/reference/cli/dockerd/)). | Only the loopback daemon facts in R2. | No Go-bearing image verified; threshold inputs not supplied; no applied-limit or mount facts. | Section 4 requests (a)-(d). |
 | Compose | UNVERIFIED | `agentdata:/data`, `agentnix:/nix` (persistent, seeded from the image) and `pgdata`; `mem_limit` only (`docker-compose.yml:20`, `:362`, `:421-438`). The dev stack was not touched. | None. | Not observed; named volumes have no per-experiment ceiling and `/nix` is persistent. | A disposable compose fixture, only if ever wanted. |
 
-A Kubernetes memory-backed emptyDir's `sizeLimit` does size the tmpfs ([Kubernetes volumes](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)); disk-backed emptyDir and ephemeral-storage limits stay eviction-only.
+A Kubernetes memory-backed emptyDir's `sizeLimit` does size the tmpfs on Kubernetes versions with memory-backed volume sizing (default-on since 1.22) ([Kubernetes volume types](https://kubernetes.io/docs/reference/storage/volume-types/#emptydir)); disk-backed emptyDir and ephemeral-storage limits stay eviction-only.
 
 A fixture proves only that fixture.
 
 ### R7 Frozen envelope (declared, not enforced)
 
 - **Memory accounting.** tmpfs and `/dev/shm` pages charge to the container's memory cgroup
-  (cited: kernel memcg docs; inferred for this layout). That cgroup sits inside the DinD
-  container's memory limit, rendered default 2Gi at `render_dind.go:121` (cited at acbed9921, not
+  (cited: [kernel cgroup-v2 docs](https://docs.kernel.org/admin-guide/cgroup-v2.html), "a memory area is charged to the cgroup which instantiated it"; inferred for this layout). That cgroup sits inside the DinD
+  container's memory limit (inferred: cgroup nesting was not observed), rendered default 2Gi at `render_dind.go:121` (cited at acbed9921, not
   observed). The 1 GiB memory envelope and the tmpfs byte ceilings are upper bounds, not a
   requirement to fill tmpfs and anonymous memory simultaneously, and a shared charge is counted
   once (inferred).
@@ -253,8 +253,8 @@ Each is a request; none is granted.
 ## 5. Parent-gate carry-forward
 
 - Parent M2 stays blocked unless the selected environment can exercise the unchanged
-  `measureRunCaches` and the Go-unit helpers (defined in `agent/src/rmtree.ts`, imported by
-  `agent/src/cache-cap.ts`) and `trimRunCaches` (`agent/src/run-caches.ts`) under the real runner/UID layout; otherwise it needs a separate
+  `measureRunCaches` and the Go-unit helpers (all defined in `agent/src/rmtree.ts`; `measureRunCaches` is imported by
+  `agent/src/cache-cap.ts`, the Go-unit helpers such as `listGoBuildUnits` by `agent/src/run-caches.ts`) and `trimRunCaches` (`agent/src/run-caches.ts`) under the real runner/UID layout; otherwise it needs a separate
   qualification and a justification of any transferred evidence.
 - Parent M3 needs an explicit owner resource/scope decision, including narrowing of the
   representative set and limits on conclusions. A production decision is separate.
@@ -267,7 +267,7 @@ Each is a request; none is granted.
 Reported by the dispatch unless marked otherwise; none of it is an environment result.
 
 - `test:go-cache-preflight`: at base f99e8a84d, 18 tests in about 0.063 s (validator-reported).
-  At acbed9921 the fact-checker measured 179 tests in about 22.7 s: `test_observe` 48 tests in
+  At acbed9921 the fact-checker measured 179 tests in about 22.7 s (per-file times below come from separate per-module runs, so they do not sum exactly): `test_observe` 48 tests in
   about 17.8 s (collector subprocesses), `test_preflight` 26 tests in about 5.4 s (including one
   deadline-bound slow-header test that trickles with `time.sleep(0.3)` until its 5 s deadline,
   about 5.1 s) and `test_qualify` 105 tests in about 0.1 s. Earlier, validator-reported: 5 of 5

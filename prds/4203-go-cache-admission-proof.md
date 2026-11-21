@@ -148,7 +148,7 @@ Formal partial delivery (2026-11-12) retains M4 and defers incomplete M1 and uns
 
 ## Follow-up 2026-11-21: #4575 environment verification
 
-Issue #4575 evaluated one candidate environment read-only: this run's own DinD daemon, through GET requests only. No container, pull, mount, privilege or configuration change occurred. The verdict is **NO-QUALIFIED-ENVIRONMENT**. The full record, whose assertions are labelled observed, cited, inferred or UNVERIFIED (unlabelled items are cited or declared as stated there) with a per-requirement source, instrument and binding table, is [environment.md](../e2e/go-cache-admission/environment.md).
+Issue #4575 evaluated one candidate environment read-only: this run's own DinD daemon, through GET requests only. No container, pull, mount, privilege or configuration change occurred. The verdict is **NO-QUALIFIED-ENVIRONMENT**. The full record, which labels many assertions observed, cited, inferred or UNVERIFIED (items without a label are cited or declared as stated there) with a per-requirement source, instrument and binding table, is [environment.md](../e2e/go-cache-admission/environment.md).
 
 The daemon facts were observed. The prerequisites remain UNVERIFIED, each with its missing mechanism named there:
 
