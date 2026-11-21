@@ -93,7 +93,7 @@ func (b liveListBody) assertHeavy(t *testing.T, label string, present bool) {
 
 // TestRunListSummaryViewLiveDB drives ?view=summary through the real router against Postgres:
 // the real queries, auth chain and scoping. The two views must return the same rows in the
-// same order, and differ only by the four heavy keys.
+// same order, and differ only by the summaryHeavyKeys (the heavy detail and run-start choice keys).
 func TestRunListSummaryViewLiveDB(t *testing.T) {
 	_, router, pool := cliLiveDB(t)
 
