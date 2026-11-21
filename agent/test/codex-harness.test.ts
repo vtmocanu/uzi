@@ -753,6 +753,8 @@ describe("#3253 phase transition harness seam", () => {
     try {
       transport.push(turnStarted()).push(turnCompleted("completed"));
       await collect(harness.startTurn(makeRequest()).events);
+      // A broken model guard must finish and fail the refusal assertion, not hang.
+      transport.push(turnStarted()).push(turnCompleted("completed"));
       await assert.rejects(collect(harness.startTurn(makeRequest({ model: implModel })).events),
         /codex lead model changed inside a provider epoch/);
       assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
