@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -122,6 +123,34 @@ def child_env(private, mode, toolchain_path=None, cacheprog=None):
     return env
 
 
+def project_domains(charges, samples=None, statfs=os.statvfs, names=None, *, allow_zero_inodes=False):
+    """Group charges by backing domain and sum bytes and inodes once per domain.
+
+    A charge names its domain explicitly ("domain": key, resolved in `samples`) or,
+    without that key, by the superblock device of its scratch "path" (st_dev), sampled
+    with `statfs`. Returns {domain: (sample, bytes, inodes)}; the sample of the last
+    charge in a domain is kept (the most recent observation). Fails closed on any
+    malformed charge or sample. allow_zero_inodes is only for separately validated synthetic
+    capacity deltas; declared sink charges must retain the default positive-inode rule.
+    """
+    devices = {}
+    for name in (charges if names is None else names):
+        entry = charges[name]
+        b, i = entry["bytes"], entry["inodes"]
+        require(type(b) is int and b >= 0 and type(i) is int and (i >= 0 if allow_zero_inodes else i > 0))
+        if "domain" in entry:
+            require(samples is not None and entry["domain"] in samples)
+            dev, s = entry["domain"], samples[entry["domain"]]
+        else:
+            path = scratch_path(entry["path"])
+            s = statfs(path)
+            dev = path.stat().st_dev
+        require(s.f_blocks > 0 and s.f_files > 0 and s.f_frsize > 0)
+        old = devices.get(dev, (s, 0, 0))
+        devices[dev] = (s, old[1]+b, old[2]+i)
+    return devices
+
+
 def headroom(charges, soft, statfs=os.statvfs):
     """Re-sample all sinks each call. Sum projections per device; fail closed.
     M1 has no potential producing launches. Later launchers must call immediately
@@ -135,17 +164,7 @@ def headroom(charges, soft, statfs=os.statvfs):
     require(sum(charges[name]["bytes"] for name in SINKS
                 if name not in ("retained", "staging")) >= LIMITS["work_modules_output_logs"])
     require(sum(charges[name]["bytes"] for name in SINKS) == LIMITS["aggregate"])
-    devices = {}
-    for name in SINKS:
-        entry = charges[name]
-        p = scratch_path(entry["path"])
-        b, i = entry["bytes"], entry["inodes"]
-        require(type(b) is int and b >= 0 and type(i) is int and i > 0)
-        s = statfs(p)
-        require(s.f_blocks > 0 and s.f_files > 0 and s.f_frsize > 0)
-        dev = p.stat().st_dev
-        old = devices.get(dev, (s, 0, 0))
-        devices[dev] = (s, old[1]+b, old[2]+i)
+    devices = project_domains(charges, statfs=statfs, names=SINKS)
     return all((s.f_blocks-s.f_bavail)*s.f_frsize+b < soft*s.f_blocks*s.f_frsize
                and s.f_files-s.f_favail+i < soft*s.f_files for s, b, i in devices.values())
 
@@ -157,26 +176,107 @@ class UnixHTTP(http.client.HTTPConnection):
 
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(2)
+        self.sock.settimeout(self.timeout)
         self.sock.connect(self.endpoint)
 
 
-def docker_get(endpoint, route):
+class LoopbackHTTP(http.client.HTTPConnection):
+    """Literal loopback address only; the Host header stays the fixed "localhost"."""
+    def __init__(self, family, address, port, **kwargs):
+        self.target = (family, address, port)
+        super().__init__("localhost", **kwargs)
+
+    def connect(self):
+        family, address, port = self.target
+        self.sock = socket.socket(family, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((address, port))
+
+
+TCP_ENDPOINT = re.compile(r"tcp://(?:(127\.0\.0\.1)|\[(::1)\]):([1-9][0-9]{0,4})")
+DOCKER_ROUTES = ("/version", "/info", "/images/json")
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Raw reader for the response: every recv is bounded by min(2, time left to the absolute
+    deadline), and the status line plus headers by LIMITS["header"] bytes in total."""
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline, self.seen, self.tail, self.in_head = sock, deadline, 0, b"", True
+
+    def readable(self):
+        return True
+
+    def close(self):
+        # The reader owns a duplicate descriptor, so the connection may close its own socket first.
+        try:
+            self.sock.close()
+        finally:
+            super().close()
+
+    def readinto(self, buf):
+        remaining = self.deadline-time.monotonic()
+        require(remaining > 0)
+        self.sock.settimeout(min(2, remaining))
+        n = self.sock.recv_into(buf)
+        if self.in_head and n:
+            data = self.tail+bytes(buf[:n])
+            end = data.find(b"\r\n\r\n")
+            if end >= 0:
+                self.in_head = False
+                require(self.seen+end+4-len(self.tail) <= LIMITS["header"])
+            else:
+                self.seen += n
+                self.tail = data[-3:]
+                require(self.seen <= LIMITS["header"])
+        return n
+
+
+class _DeadlineSocket:
+    """Hands http.client a deadline-bounded reader instead of a plain socket file."""
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def makefile(self, mode="rb", *args, **kwargs):
+        require(mode == "rb")
+        return io.BufferedReader(_DeadlineReader(self.sock.dup(), self.deadline), 4096)
+
+
+class _FinalHTTPResponse(http.client.HTTPResponse):
+    """Docker GET metadata requires a final response, never interim header blocks."""
+    def _read_status(self):
+        version, status, reason = super()._read_status()
+        require(not 100 <= status < 200)
+        return version, status, reason
+
+
+def docker_get(endpoint, route, *, timeout=5):
     # Fixed GET routes; no CLI, context, config, inherited env or process inspection.
-    require(route == "/version" or re.fullmatch("/images/sha256:[0-9a-f]{64}/json", route))
-    require(Path(endpoint).is_absolute() and stat.S_ISSOCK(Path(endpoint).stat().st_mode))
-    conn = UnixHTTP(endpoint, timeout=2)
+    require(route in DOCKER_ROUTES or re.fullmatch("/images/sha256:[0-9a-f]{64}/json", route))
+    require(type(endpoint) is str)
+    require(type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0)
+    deadline = time.monotonic()+min(5, timeout)
+    socket_timeout = min(2, timeout)
+    match = TCP_ENDPOINT.fullmatch(endpoint)
+    if match:
+        # Literal 127.0.0.1 or [::1] only: no name resolution and no environment read.
+        port = int(match.group(3))
+        require(1 <= port <= 65535)
+        family, address = ((socket.AF_INET, match.group(1)) if match.group(1)
+                           else (socket.AF_INET6, match.group(2)))
+        conn = LoopbackHTTP(family, address, port, timeout=socket_timeout)
+    else:
+        require(Path(endpoint).is_absolute() and stat.S_ISSOCK(Path(endpoint).stat().st_mode))
+        conn = UnixHTTP(endpoint, timeout=socket_timeout)
+    # One absolute deadline for connect, request, headers and body.
+    conn.response_class = lambda sock, **kwargs: _FinalHTTPResponse(_DeadlineSocket(sock, deadline), **kwargs)
+    response = None
     try:
         conn.request("GET", route)
         response = conn.getresponse()
         require(response.status == 200)
-        deadline = time.monotonic()+5
         chunks, size = [], 0
         while True:
-            remaining = deadline-time.monotonic()
-            require(remaining > 0)
-            if conn.sock is not None:
-                conn.sock.settimeout(min(2, remaining))
+            require(deadline-time.monotonic() > 0)
             chunk = response.read1(min(65536, MAX_JSON+1-size))
             if not chunk:
                 break
@@ -185,7 +285,11 @@ def docker_get(endpoint, route):
             chunks.append(chunk)
         return json.loads(b"".join(chunks))
     finally:
-        conn.close()
+        try:
+            if response is not None:
+                response.close()
+        finally:
+            conn.close()
 
 
 def inventory(raw_root):

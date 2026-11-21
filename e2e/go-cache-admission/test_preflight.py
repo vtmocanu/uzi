@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import threading
+import time
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -13,6 +14,17 @@ import unittest
 from unittest.mock import patch
 
 import preflight as p
+
+
+def read_request_headers(conn):
+    """Bounded stub request read; EOF is a disconnect, never a completed request."""
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < 8192:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return None
+        data += chunk
+    return data if b"\r\n\r\n" in data else None
 
 
 class PreflightTests(unittest.TestCase):
@@ -87,6 +99,39 @@ class PreflightTests(unittest.TestCase):
                                  f_files=100, f_favail=100)
         self.assertTrue(p.headroom(charges, 0.8, lambda _: sample))
 
+    def test_headroom_keeps_last_sample_per_device(self):
+        # Every sink is on one real device; the statfs sample differs per sink path. The last
+        # sample taken for the device (staging, the last of SINKS) is the one judged.
+        other = self.root/"last"
+        other.mkdir()
+        charges = self.charges()
+        charges["staging"]["path"] = str(other)
+        roomy = SimpleNamespace(f_blocks=10**12, f_bavail=10**12, f_frsize=1, f_files=100, f_favail=100)
+        full = SimpleNamespace(f_blocks=10**12, f_bavail=0, f_frsize=1, f_files=100, f_favail=100)
+        sampled = lambda path: full if Path(path) == other else roomy
+        self.assertFalse(p.headroom(charges, 0.8, sampled))
+        got = p.project_domains(charges, statfs=sampled, names=p.SINKS)
+        self.assertEqual(len(got), 1)
+        self.assertIs(next(iter(got.values()))[0], full)
+        self.assertTrue(p.headroom(charges, 0.8, lambda _: roomy))
+
+    def test_headroom_domain_is_the_real_device_not_the_path(self):
+        # Two distinct real subdirectories of one device: only the per-device sum exceeds soft.
+        a, b = self.root/"a", self.root/"b"
+        a.mkdir()
+        b.mkdir()
+        charges = self.charges()
+        for name in p.SINKS:
+            charges[name]["path"] = str(a if name == "retained" else b)
+        capacity = 2560*p.MIB
+        sample = SimpleNamespace(f_blocks=capacity, f_bavail=capacity, f_frsize=1,
+                                 f_files=10**9, f_favail=10**9)
+        domains = p.project_domains(charges, statfs=lambda _: sample, names=p.SINKS)
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(next(iter(domains.values()))[1], p.LIMITS["aggregate"])
+        self.assertFalse(p.headroom(charges, 0.8, lambda _: sample))
+        self.assertTrue(p.headroom(charges, 0.9, lambda _: sample))
+
     def test_missing_expectations_before_probes(self):
         args = argparse.Namespace(manifest=None, endpoint="/fixture", docker_version=None,
             image=None, repo_digest=None, go_root="/fixture", source_sha256=None, experimental=True)
@@ -146,12 +191,9 @@ class PreflightTests(unittest.TestCase):
                 for _ in range(2):
                     with server.accept()[0] as conn:
                         conn.settimeout(2)
-                        data = b""
-                        while b"\r\n\r\n" not in data and len(data) < 8192:
-                            chunk = conn.recv(1024)
-                            if not chunk:
-                                break
-                            data += chunk
+                        data = read_request_headers(conn)
+                        if data is None:
+                            return
                         requests.append(data)
                         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
             except Exception as error:
@@ -170,6 +212,159 @@ class PreflightTests(unittest.TestCase):
         for request, route in zip(requests, ("/version", "/images/sha256:"+"a"*64+"/json")):
             self.assertTrue(request.startswith(("GET "+route+" HTTP/1.1").encode()))
             self.assertIn(b"Host: localhost\r\n", request)
+
+    def hostile_header_server(self, send):
+        """Loopback TCP stub that answers one request through `send(conn, stop)`; bounded to 20 s."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(2)
+        server.settimeout(0.2)
+        stop = threading.Event()
+
+        def serve():
+            end = time.monotonic()+20
+            while not stop.is_set() and time.monotonic() < end:
+                try:
+                    conn = server.accept()[0]
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        if read_request_headers(conn) is None:
+                            return
+                        send(conn, stop, end)
+                    except OSError:
+                        pass
+                return
+        thread = threading.Thread(target=serve)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join(5)
+        self.addCleanup(finish)
+        return "tcp://127.0.0.1:%d" % server.getsockname()[1]
+
+    def test_slow_header_phase_is_bounded_by_the_absolute_deadline(self):
+        def trickle(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nX-Pad: ")
+            while not stop.is_set() and time.monotonic() < end:
+                conn.sendall(b"a")
+                time.sleep(0.3)
+        endpoint = self.hostile_header_server(trickle)
+        started = time.monotonic()
+        with self.assertRaises((ValueError, OSError)):
+            p.docker_get(endpoint, "/version")
+        self.assertLess(time.monotonic()-started, 8)
+
+    def test_oversized_header_block_is_refused(self):
+        def flood(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: " + b"a"*(p.LIMITS["header"]*2)
+                         + b"\r\n\r\n{}")
+        endpoint = self.hostile_header_server(flood)
+        with self.assertRaises(ValueError):
+            p.docker_get(endpoint, "/version")
+        def modest(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: " + b"a"*1024 + b"\r\n\r\n{}")
+        endpoint = self.hostile_header_server(modest)
+        self.assertEqual(p.docker_get(endpoint, "/version"), {})
+
+    @staticmethod
+    def header_of(total):
+        """A complete response header block of exactly `total` bytes, CRLFCRLF included."""
+        head, end = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: ", b"\r\n\r\n"
+        return head + b"a"*(total-len(head)-len(end)) + end
+
+    def test_header_block_exactly_at_the_cap_is_accepted(self):
+        block = self.header_of(p.LIMITS["header"])
+        self.assertEqual(len(block), p.LIMITS["header"])
+        endpoint = self.hostile_header_server(lambda conn, stop, end: conn.sendall(block + b"{}"))
+        self.assertEqual(p.docker_get(endpoint, "/version"), {})
+
+    def test_terminated_header_block_just_over_the_cap_is_refused(self):
+        # One byte over the cap, terminator in the same send: only the terminator-chunk check sees it.
+        block = self.header_of(p.LIMITS["header"]+1)
+        endpoint = self.hostile_header_server(lambda conn, stop, end: conn.sendall(block + b"{}"))
+        with self.assertRaises(ValueError):
+            p.docker_get(endpoint, "/version")
+
+    def test_unterminated_header_over_the_cap_is_refused_before_any_stall_timeout(self):
+        # No terminator ever arrives and the stub then stalls: only the running count can refuse in time.
+        def stall(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a"*(p.LIMITS["header"]+6000))
+            while not stop.is_set() and time.monotonic() < end:
+                time.sleep(0.05)
+        endpoint = self.hostile_header_server(stall)
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            p.docker_get(endpoint, "/version")
+        self.assertLess(time.monotonic()-started, 2.5)
+
+    @staticmethod
+    def open_fds():
+        count = 0
+        for fd in range(256):
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            count += 1
+        return count
+
+    def test_refused_response_closes_its_descriptors_even_with_exceptions_kept_alive(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        server.settimeout(0.2)
+        stop = threading.Event()
+        served = []
+
+        def serve():
+            end = time.monotonic()+20
+            while not stop.is_set() and time.monotonic() < end:
+                try:
+                    conn = server.accept()[0]
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        if read_request_headers(conn) is None:
+                            return
+                        conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n"
+                                     b"Connection: close\r\n\r\nbody")
+                    except OSError:
+                        pass
+                served.append(1)
+        thread = threading.Thread(target=serve)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join(5)
+        self.addCleanup(finish)
+        endpoint = "tcp://127.0.0.1:%d" % server.getsockname()[1]
+        kept = []
+        before = self.open_fds()
+        for _ in range(5):
+            try:
+                p.docker_get(endpoint, "/version")
+            except ValueError as error:
+                kept.append(error)
+        self.assertEqual(len(kept), 5)
+        # The stub shares this process: wait until it has closed its side of every connection.
+        settle = time.monotonic()+5
+        while len(served) < 5 and time.monotonic() < settle:
+            time.sleep(0.01)
+        self.assertEqual(len(served), 5)
+        self.assertEqual(self.open_fds(), before)
 
     def test_unix_socket_setup_failure_closes_resources(self):
         # A bind failure (here: missing parent) must still close the socket that was opened.

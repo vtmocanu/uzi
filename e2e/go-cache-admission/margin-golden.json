@@ -1,0 +1,95 @@
+{
+ "source_scope": "marginFraction+diskSoftMargin/1",
+ "margin_source_sha256": "7a6bb34c088abdb5c2768f2cfeed80e0a00378d245cc6bb9ecad56b08e25022f",
+ "revision": "157fb0366fbb10a94584a83530d27f250ee2835a",
+ "rows": [
+  {
+   "input": null,
+   "expected": 0.1
+  },
+  {
+   "input": "",
+   "expected": 0.1
+  },
+  {
+   "input": "   ",
+   "expected": 0.1
+  },
+  {
+   "input": " ",
+   "expected": 0.1
+  },
+  {
+   "input": "\u3000 0.2 ",
+   "expected": 0.2
+  },
+  {
+   "input": "0.1",
+   "expected": 0.1
+  },
+  {
+   "input": "0.25",
+   "expected": 0.25
+  },
+  {
+   "input": "1e-1",
+   "expected": 0.1
+  },
+  {
+   "input": ".5",
+   "expected": 0.5
+  },
+  {
+   "input": "5.",
+   "expected": 0.1
+  },
+  {
+   "input": "0x0",
+   "expected": 0
+  },
+  {
+   "input": "0b0",
+   "expected": 0
+  },
+  {
+   "input": "-0.1",
+   "expected": 0.1
+  },
+  {
+   "input": "1",
+   "expected": 0.1
+  },
+  {
+   "input": "1.5",
+   "expected": 0.1
+  },
+  {
+   "input": "abc",
+   "expected": 0.1
+  },
+  {
+   "input": "NaN",
+   "expected": 0.1
+  },
+  {
+   "input": "Infinity",
+   "expected": 0.1
+  },
+  {
+   "input": "1_0",
+   "expected": 0.1
+  },
+  {
+   "input": "0.5abc",
+   "expected": 0.1
+  },
+  {
+   "input": "+0.3",
+   "expected": 0.3
+  },
+  {
+   "input": " 0.3\n",
+   "expected": 0.3
+  }
+ ]
+}
