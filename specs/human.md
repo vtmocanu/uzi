@@ -2010,6 +2010,11 @@ PRD at `prds/done/3264-cli-model-settings.md` (milestones M1 to M3 shipped).
 - `uzi agent-template list|show <name|id>|set <name|id> --harness claude|codex <model>|reset <name|id> --harness claude|codex` reads and edits the Claude and Codex model pins of the caller's own user-scope templates over `GET /api/me/agent-templates` and `PUT /api/me/agent-templates/{id}/model-pins` (CLI-token reachable). Output shows stored pins and `inherit`, never a resolved model. (AI-synced 2026-11-19)
 - Builtin and global templates exit 3 ("edited in the web UI by an admin"), even with an admin token; another user's or an unknown template exits 4; an ambiguous name exits 2 listing ids and an exact id beats a name. An older server (the list answers an error-less 404 or 405, or the write an error-less 405) exits 1 with the upgrade message. A pin edit leaves `customized` unchanged. (AI-synced 2026-11-19)
 
+## Feature #4510: Sidebar icon animations
+
+- Animated sidebar icons default on for new users and users whose `sidebar_motion` is NULL. Explicit true and false remain personal choices; clearing the choice follows the on default. No backfill is needed. (AI-synced 2026-11-21)
+- The server, web fallback, mocks and uncached pre-paint behavior agree on that default. The Appearance control shows the default; `prefers-reduced-motion` still suppresses animations. (AI-synced 2026-11-21)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

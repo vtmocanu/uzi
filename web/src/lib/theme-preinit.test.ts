@@ -122,15 +122,15 @@ describe("theme-preinit.js pre-paint stamp (PRD #1167 m5)", () => {
     expect(off["data-motion"]).toBe("off");
   });
 
-  it("stamps data-motion=off for a string, absent field, no cache, or a parse error", () => {
+  it("uses the on default for a malformed field, absent field, no cache, or a parse error", () => {
     expect(
       run({ storage: { "uzi.appearance": appearance({ sidebarMotion: "true" }) }, osDark: false })["data-motion"],
-    ).toBe("off");
-    expect(run({ storage: { "uzi.appearance": appearance() }, osDark: false })["data-motion"]).toBe("off");
-    expect(run({ storage: {}, osDark: false })["data-motion"]).toBe("off");
+    ).toBe("on");
+    expect(run({ storage: { "uzi.appearance": appearance() }, osDark: false })["data-motion"]).toBe("on");
+    expect(run({ storage: {}, osDark: false })["data-motion"]).toBe("on");
     const broken = run({ storage: { "uzi.appearance": "{not json" }, osDark: false });
     expect(broken["data-theme"]).toBe("hall");
-    expect(broken["data-motion"]).toBe("off");
+    expect(broken["data-motion"]).toBe("on");
   });
 
   // The legacy uzi.theme migration lookup is guarded the same way: a prototype
