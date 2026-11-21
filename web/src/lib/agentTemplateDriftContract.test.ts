@@ -59,7 +59,7 @@ function loadTable(): DriftTable {
   return JSON.parse(raw) as DriftTable;
 }
 
-// sameContent takes the stored row and the shipped definition. Only the five content
+// sameContent takes the stored row and the shipped definition. Only the seven content
 // columns vary; the rest are inert defaults, present because AgentTemplate requires them.
 function asRow(c: FixtureContent): AgentTemplate {
   return {

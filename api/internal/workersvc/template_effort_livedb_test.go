@@ -8,6 +8,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -365,15 +366,39 @@ func TestTemplateEffortJudgeLaneIgnoresTemplateLiveDB(t *testing.T) {
 // template pins codex_effort `low` keeps its frozen cross-check default (high), never the template's.
 //
 // MUTATION: in claim_assembly.go set the checker arm's defaultEffort to
-// leadTemplateEffort(templates, harness) instead of the frozen checkerResolution.Effort; the claim
-// then loses the frozen high (measured: it reads medium) and this test fails.
+// leadTemplateEffort(templates, harness) instead of the frozen checkerResolution.Effort, or prefer
+// that template effort only when it is set; either way the claim reads the template's low and this
+// test fails.
 func TestTemplateEffortCheckerLaneIgnoresTemplateLiveDB(t *testing.T) {
 	env, svc, w, lead, c := roundsPinsFixture(t)
 	env.exec("UPDATE users SET default_codex_effort = NULL, default_effort = NULL WHERE id = $1", w.UserID)
+	// Make the fixture template the delivered lead in every test order, as newEffFix does: seed the
+	// builtin roster, switch all of it off for this user, and refuse a shared-name collision (a user
+	// template sharing a shared name is excluded from the claim roster).
+	if _, err := store.ReconcileBuiltinTemplates(env.ctx, env.q); err != nil {
+		t.Fatalf("reconcile builtins: %v", err)
+	}
+	env.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled)
+		SELECT id,$1,false FROM agent_templates
+		ON CONFLICT (template_id,(COALESCE(user_id,'00000000-0000-0000-0000-000000000000'::uuid)))
+		DO UPDATE SET enabled=false`, w.UserID)
+	var shared int
+	if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM agent_templates WHERE scope <> 'user' AND name = $1`, effLeadName).Scan(&shared); err != nil || shared != 0 {
+		t.Fatalf("shared name probe for %q: count=%d err=%v", effLeadName, shared, err)
+	}
 	tid := uuid.New()
 	env.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id,effort,codex_effort)
 		VALUES($1,$2,'d','b','user',$3,'low','low')`, tid, effLeadName, w.UserID)
 	env.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled) VALUES($1,$2,true)`, tid, w.UserID)
+	// Precondition: the claim roster's lead is this template and it pins codex_effort low, so the
+	// control below compares against a template the checker claim really sees.
+	rows, err := env.q.ListClaimAgentTemplates(env.ctx, pgconv.UUID(w.UserID))
+	if err != nil {
+		t.Fatalf("list claim templates: %v", err)
+	}
+	if te := leadTemplateEffort(rows, HarnessCodex); !te.Valid || te.String != "low" {
+		t.Fatalf("fixture lead template effort = %+v, want codex low on the claim roster", te)
+	}
 
 	cc := roundsPinsSubmit(t, env, svc, w, lead, c, 1)
 	p := roundsPinsClaim(t, env, svc, w, cc)
@@ -383,7 +408,7 @@ func TestTemplateEffortCheckerLaneIgnoresTemplateLiveDB(t *testing.T) {
 	if p.CrossCheck.EffortSource == nil || *p.CrossCheck.EffortSource != "cross-check default" {
 		t.Errorf("checker effort source = %v, want cross-check default", p.CrossCheck.EffortSource)
 	}
-	if p.Config.DefaultEffortSource != nil && *p.Config.DefaultEffortSource == "template" {
-		t.Errorf("checker claim default_effort_source = template")
+	if p.Config.DefaultEffortSource != nil {
+		t.Errorf("checker claim default_effort_source = %q, want none", *p.Config.DefaultEffortSource)
 	}
 }

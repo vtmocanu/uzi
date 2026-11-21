@@ -398,7 +398,8 @@ func storeColumns(def agenttmpl.Definition) (storedColumns, error) {
 	text := func(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }
 	// Efforts go through agenttmpl.ValidateEffort: blank or whitespace is NULL, and an
 	// out-of-contract value is a named error here rather than a CHECK violation inside the apply
-	// transaction. The parsers that fill Definition are expected to drop such values first.
+	// transaction. No source parser reads effort yet; when one does it must skip an invalid value
+	// per role, or one bad role fails every apply.
 	effort, err := agenttmpl.ValidateEffort(def.Effort)
 	if err != nil {
 		return storedColumns{}, fmt.Errorf("effort: %w", err)
