@@ -417,8 +417,9 @@ export interface RunTurnRequest {
   effort?: HarnessEffort;
   phase: "plan" | "implement";
   /** PRD #3252 D8 (Claude only): withhold the prompt until the runtime's applied settings match this
-   *  requested pair; a mismatch or an unverifiable runtime throws PhaseSwitchUnverifiedError before any
-   *  provider request. Absent = today's behaviour. */
+   *  requested pair; a pre-release failure throws PhaseSwitchUnverifiedError without sending a prompt.
+   *  A later contradictory init also stops the turn, but a request may already have been admitted.
+   *  Absent = today's behaviour. */
   verifyApplied?: { model?: string; effort?: string };
   /** Called once when the barrier's verdict admitted the turn (the owner latches "verified" on it). */
   onPhaseVerified?: () => void;

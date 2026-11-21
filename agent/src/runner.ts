@@ -7365,7 +7365,8 @@ export class RunRunner {
         await this.enterBaseAttestationHold(claim, flight, err, runLog);
       } else if (err instanceof PhaseSwitchUnverifiedError && !flight.steering.isCancelled()) {
         // PRD #3252 D8 (m4): a plan-phase switch back to the planning model could not be verified. The
-        // turn never reached the provider; hold the run for its owner, never fail it.
+        // pre-release failure sent no prompt; a contradictory init may follow an admitted request.
+        // Stop further work and hold the run for its owner, never fail it.
         if (await this.enterPhaseSwitchHold(flight, claim, "plan", err.cause, err.requested, err.observed, runLog)) {
           // An owner Cancel arrived while the hold was unconfirmed: take the ordinary cancelled route.
           // This dispatch is not a stopped-source denial, so restore the default selected above.
@@ -11138,8 +11139,8 @@ export class RunRunner {
         });
         return;
       }
-      // PRD #3252 D8 (m4): the implement turn's settings barrier refused to admit the prompt, so no
-      // provider request was made. Hold the run for its owner (quiesce, preserve, status, hold post)
+      // PRD #3252 D8 (m4): implement-phase verification failed. A contradictory init may follow an
+      // admitted request. Hold the run for its owner (quiesce, preserve, status, hold post)
       // and skip finalization: no push, no PR, no terminal report.
       if (result.phaseSwitchHeld) {
         const held = result.phaseSwitchHeld;
@@ -27360,8 +27361,9 @@ export class RunRunner {
 
   /**
    * Issue #3252 D8 (m4): hold a Claude run whose settings barrier could not prove the runtime applied
-   * the requested phase model or effort. The turn never reached the provider, so the run is held for its
-   * owner (paused, phase_switch_unavailable), never failed. Order: quiesce the agent tree, preserve the
+   * the requested phase model or effort, or a later init contradicted the admitted pair. Stop further work
+   * and retain any effects of an already admitted request: the run is held for its owner
+   * (paused, phase_switch_unavailable), never failed. Order: quiesce the agent tree, preserve the
    * clone and session (plus a best-effort checkpoint), post the status line, then request the hold.
    *
    * Only a positive, fully populated ownership observation at THIS flight's generation settles the

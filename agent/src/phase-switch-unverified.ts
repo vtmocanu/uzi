@@ -1,6 +1,6 @@
-// PRD #3252 D8 (m4): the settings barrier could not prove the runtime applied the requested phase model
-// and effort, so the turn was stopped before any provider request. Thrown by the Claude harness, carried
-// through the executor's retry arms untouched, and turned into a worker hold by the runner.
+// PRD #3252 D8 (m4): phase verification failed before prompt release, or a later init contradicted
+// the admitted settings. Pre-release failures send no prompt; a contradictory init may follow an
+// admitted request. The executor propagates this error without retry and the runner holds the work.
 
 export type PhaseSwitchCause =
   | "model_mismatch"

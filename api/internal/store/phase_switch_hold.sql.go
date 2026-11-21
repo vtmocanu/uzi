@@ -16,6 +16,10 @@ const setRunPhaseSwitchHold = `-- name: SetRunPhaseSwitchHold :one
 UPDATE runs SET
     status             = 'paused',
     status_since       = now(),
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
     hold_reason        = 'phase_switch_unavailable',
     hold_captured_head = $1,
     open_question_id   = NULL,
@@ -41,8 +45,8 @@ type SetRunPhaseSwitchHoldParams struct {
 
 // PRD #3252 m4: hold a Claude run whose plan/implement phase cannot be bound to a supported model
 // configuration on this worker. running|awaiting_approval -> paused, hold_reason
-// 'phase_switch_unavailable', NON-TERMINAL. The worker sends this from its phase-switch guard BEFORE
-// the agent runs on the unsupported phase, keeping its clone and claim; the owner resumes it
+// 'phase_switch_unavailable', NON-TERMINAL. The worker stops further work when phase verification
+// fails, keeping its clone and claim (a contradictory init may follow an admitted request); the owner resumes it
 // (ResumePausedRun admits this reason) or cancels. No automatic promoter touches it.
 //
 // THE FENCE mirrors SetRunBaseAttestationHold: the same worker, a live claim (claim_released_at IS NULL)
@@ -58,6 +62,8 @@ type SetRunPhaseSwitchHoldParams struct {
 // mandatory for SetRunPaused's reason: ListActiveRunsForHealth never revisits a paused run, so a flag
 // live at hold time would freeze for the whole hold. The question pointer is cleared: an
 // awaiting_approval run carries none, and a resumed run must not inherit a stale one.
+// Bank the old approval wait before replacing status_since, as SetRunRunning does. Only the first
+// transition updates the bank: an idempotent repeat is answered by the service's held-row read.
 func (q *Queries) SetRunPhaseSwitchHold(ctx context.Context, arg SetRunPhaseSwitchHoldParams) (Run, error) {
 	row := q.db.QueryRow(ctx, setRunPhaseSwitchHold,
 		arg.HoldCapturedHead,

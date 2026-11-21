@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -20,6 +21,64 @@ import (
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
 const phaseSwitchReason = "phase_switch_unavailable"
+
+// A hold taken at the human gate must bank that wait before replacing status_since. Resume only
+// banks the later hold interval, so it cannot recover a gate interval the hold discarded.
+func TestPhaseSwitchHoldPreservesApprovalWaitBudgetLiveDB(t *testing.T) {
+	fx := newWPFixture(t)
+	worker := fx.worker("phase-budget", wpWorker{})
+	budget := int32(3600)
+	const priorBank = int32(120)
+	for _, status := range []string{"running", "awaiting_approval"} {
+		t.Run(status, func(t *testing.T) {
+			startedAgo := 10*time.Second + time.Duration(priorBank)*time.Second
+			sinceAgo := 5 * time.Second
+			if status == "awaiting_approval" {
+				startedAgo = 3*time.Hour + time.Duration(priorBank)*time.Second
+				sinceAgo = 3*time.Hour - 10*time.Second
+			}
+			id := fx.run(wpRun{status: status, worker: &worker, claimGen: 3,
+				startedAgo: startedAgo, sinceAgo: sinceAgo, budgetWall: &budget, budgetPaused: priorBank})
+			before := fx.mustRun(id)
+			request := store.SetRunPhaseSwitchHoldParams{
+				ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 3}
+			held, err := fx.q.SetRunPhaseSwitchHold(fx.ctx, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The service's lost-ACK re-read is reached via this no-op: no repeat UPDATE or bank.
+			if _, err := fx.q.SetRunPhaseSwitchHold(fx.ctx, request); !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("repeat statement: %v, want no rows", err)
+			}
+			again := fx.mustRun(id)
+			if again.BudgetPausedSeconds != held.BudgetPausedSeconds || !again.StatusSince.Time.Equal(held.StatusSince.Time) {
+				t.Fatal("repeat changed the hold's pause bank or status clock")
+			}
+			if _, err := fx.q.ResumePausedRun(fx.ctx, store.ResumePausedRunParams{
+				ID: id, UserID: fx.userID, GlobalTimeoutSeconds: 3600}); err != nil {
+				t.Fatal(err)
+			}
+			var active int
+			if err := fx.pool.QueryRow(fx.ctx, `SELECT GREATEST(0, EXTRACT(EPOCH FROM (now()-started_at))::int)-budget_paused_seconds FROM runs WHERE id=$1`, id).Scan(&active); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("source=%s banked_before_resume=%d active_seconds_after_resume=%d wall_budget=%d", status, held.BudgetPausedSeconds, active, budget)
+			if active < 0 || active > 30 {
+				t.Fatalf("human gate wait became active time: got %d active seconds, expected about 10", active)
+			}
+			wantBank := priorBank
+			if status == "awaiting_approval" {
+				wantBank += int32(held.StatusSince.Time.Sub(before.StatusSince.Time).Seconds())
+				// PostgreSQL rounds an epoch-to-int cast, whereas Duration.Seconds truncates here.
+				if held.BudgetPausedSeconds < wantBank || held.BudgetPausedSeconds > wantBank+1 {
+					t.Fatalf("bank=%d, want %d (+1 for rounding)", held.BudgetPausedSeconds, wantBank)
+				}
+			} else if held.BudgetPausedSeconds != priorBank {
+				t.Fatalf("running hold changed bank: got %d, want %d", held.BudgetPausedSeconds, priorBank)
+			}
+		})
+	}
+}
 
 // TestSetRunPhaseSwitchHoldStatementLiveDB executes the setter's fence directly: the six eligible
 // kinds, interactive or not, in running or awaiting_approval, hold; every other shape matches 0 rows.

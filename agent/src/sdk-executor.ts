@@ -3344,7 +3344,7 @@ export class SdkExecutor implements Executor {
       // the runner reads it in phasePublish to SKIP finalize (the wall seam already parked the run or
       // left it non-terminal, and the finally preserves clone + HOME).
       let walled: { reason: string } | undefined;
-      // PRD #3252 D8: latched when the implement turn's settings barrier refused to admit the prompt.
+      // PRD #3252 D8: latched when implement-phase verification fails, before or after prompt release.
       let phaseSwitchHeld: NonNullable<ExecutorResult["phaseSwitchHeld"]> | undefined;
       const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
         if (!ctx.completionInterlock || !(completionAttempted || history.priorAttempt)) return false;
@@ -4053,7 +4053,7 @@ export class SdkExecutor implements Executor {
 
         } catch (err) {
           // PRD #3252 D8: checked FIRST so no credential-switch, pause-now, wall or idle arm below can
-          // swallow it. The turn never reached the provider; the runner holds the run for the owner.
+          // swallow it. A contradictory init may follow an admitted request; stop further work and hold.
           if (err instanceof PhaseSwitchUnverifiedError) {
             state.phaseVerified?.delete("implement");
             phaseSwitchHeld = { cause: err.cause, requested: err.requested, observed: err.observed, phase: "implement" };
