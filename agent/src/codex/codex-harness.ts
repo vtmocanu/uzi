@@ -63,6 +63,7 @@ import { CATALOG_PROBE_LIMIT, parseCatalogEntry, type CodexCatalogEntry } from "
 export type { CodexCatalogEntry } from "./catalog-probe.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
+import { PhaseSwitchUnverifiedError } from "../phase-switch-unverified.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { DRAFT_PLAN_ACK } from "../draft-plan.js";
 import { emptyCounts, sanitizeText } from "../sanitize.js";
@@ -213,7 +214,25 @@ export interface CodexChildSink {
   push(note: CodexNotification): void;
 }
 
+/** Executor-owned, claim-local approval intent; share the cell across provider epochs. */
+export interface CodexPhaseTransition {
+  readonly threadId: string;
+  readonly model: string;
+  readonly effort?: RunTurnRequest["effort"];
+  readonly modelSource?: RunTurnRequest["modelSource"];
+  pending: boolean;
+  verifiedHarness?: CodexHarness;
+}
+
+export interface CodexPhaseTransitionCell {
+  current?: CodexPhaseTransition;
+}
+
 export interface CodexHarnessOptions {
+  /** One cell per executor claim, shared with the claim's accountant across all epochs.
+   *  Mint current only at approval; model is the canonical rendered implementation model.
+   *  A later claim creates a new cell and must not inherit pending transition intent. */
+  readonly phaseTransition?: CodexPhaseTransitionCell;
   readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly registry: ExecutionRegistry;
   readonly launchRoot: LaunchRootSeam;
@@ -564,6 +583,62 @@ export class CodexHarness implements RunHarness {
     return this.threadId;
   }
   private currentModel?: string;
+  private readonly phaseTransition?: CodexPhaseTransitionCell;
+  private verifiedTransition?: CodexPhaseTransition;
+  private attemptedResumedRoot?: { threadId: string; ordinal: number };
+
+  private assertOpen(): void {
+    if (this.closed)
+      throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
+  }
+
+  private latchModel(rendered: RenderedCodexRun): void {
+    const model = rendered.lead.model ?? this.provider.model;
+    if (this.currentModel !== undefined && this.currentModel !== model)
+      throw new CodexHarnessError({ category: "protocol", message: "codex lead model changed inside a provider epoch" });
+    this.currentModel ??= model;
+  }
+
+  /** Recheck saved thread response after credential coordination, without consuming notes. */
+  verifyPreparedPhaseModel(request: RunTurnRequest): void {
+    this.assertOpen();
+    request.signal.throwIfAborted();
+    const rendered = this.render(request);
+    this.latchModel(rendered);
+    const expected = decodeObservedModel(rendered.lead.model ?? this.provider.model);
+    const observed = decodeObservedModel(this.threadResponse?.model);
+    const transition = this.phaseTransition?.current;
+    // Do not expose unsafe provider strings or thread IDs in the error evidence.
+    const fail = (cause: "malformed" | "model_mismatch"): never => {
+      if (transition?.verifiedHarness === this) transition.verifiedHarness = undefined;
+      this.verifiedTransition = undefined;
+      const evidence = (model: string | undefined): { model?: string } => {
+        if (model === undefined) return {};
+        try { return { model: this.scrubProjected(sanitizeText(model, emptyCounts())) }; }
+        catch { return {}; }
+      };
+      throw new PhaseSwitchUnverifiedError(cause, evidence(expected), evidence(observed));
+    };
+    if (request.phase !== "implement" || request.resumeSessionId === undefined ||
+        this.threadId !== request.resumeSessionId || expected === undefined || observed === undefined)
+      fail("malformed");
+    if (observed !== expected) fail("model_mismatch");
+    if (transition?.pending) {
+      if (transition.threadId !== this.threadId || transition.model !== expected ||
+          transition.effort !== request.effort || transition.modelSource !== request.modelSource)
+        fail("model_mismatch");
+      transition.verifiedHarness = this;
+      this.verifiedTransition = transition;
+    }
+  }
+
+  private settleResumeAttempt(ordinal?: number): void {
+    const attempt = this.attemptedResumedRoot;
+    if (this.closed || attempt === undefined || (ordinal !== undefined && attempt.ordinal !== ordinal)) return;
+    if (!this.accountant.hasBaseline(attempt.threadId))
+      this.accountant.markIncomplete(attempt.threadId, "attempted_resume_without_baseline");
+    this.attemptedResumedRoot = undefined;
+  }
   private readonly nowMs: () => number;
   private dispatchStartedAt?: number;
   // Usage lanes are independent of display bindings: normal child close retains the lane.
@@ -761,6 +836,7 @@ export class CodexHarness implements RunHarness {
     this.credentialValue = opts.credentialValue;
     this.authMode = opts.authMode;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
+    this.phaseTransition = opts.phaseTransition;
     this.onTokenUsageIncomplete = opts.onTokenUsageIncomplete;
     this.emitClaimInit = opts.emitClaimInit ?? true;
     this.scrubProjected = opts.scrubProjected ?? ((s: string): string => s);
@@ -808,6 +884,7 @@ export class CodexHarness implements RunHarness {
    *  the child's token-usage notes to its ACTUAL model rather than the root's. A child thread
    *  is always fresh (ephemeral, never resumed), so it baselines at zero. */
   recordChildThreadModel(threadId: string, model: string): void {
+    if (this.closed) return;
     this.accountant.registerThread(threadId, model, false);
   }
 
@@ -1117,27 +1194,33 @@ export class CodexHarness implements RunHarness {
    */
   async prepareRootAndThread(
     request: RunTurnRequest,
-    options: { allowFresh?: boolean } = {},
+    options: { allowFresh?: boolean; verifyPhaseModel?: true } = {},
   ): Promise<string> {
     this.registry.assertWorkAdmission();
     if (this.closed) throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
     request.signal.throwIfAborted();
+    if (options.verifyPhaseModel === true && request.resumeSessionId === undefined)
+      throw new PhaseSwitchUnverifiedError("malformed", {}, {});
     if (request.resumeSessionId === undefined && options.allowFresh !== true)
       throw new PolicyContinuationRejected("session_missing");
     const rendered = this.render(request);
     if (!await this.prepareThread(request, rendered))
       throw new CodexHarnessError({ category: "transport", message: "codex thread preparation stopped" });
+    this.assertOpen();
     request.signal.throwIfAborted();
     if (this.stopRequested)
       throw new CodexHarnessError({ category: "transport", message: "codex thread preparation stopped" });
+    if (options.verifyPhaseModel === true) this.verifyPreparedPhaseModel(request);
     return this.threadId!;
   }
 
   private async prepareThread(request: RunTurnRequest, rendered: RenderedCodexRun): Promise<boolean> {
-    this.currentModel = rendered.lead.model ?? this.provider.model;
+    this.assertOpen();
+    this.latchModel(rendered);
     if (request.signal.aborted || this.stopRequested) return false;
     // 1. Ensure the provider root + transport (launched once, reused after).
     await this.ensureRoot(request.signal);
+    this.assertOpen();
     if (request.signal.aborted || this.stopRequested) {
       return false;
     }
@@ -1169,6 +1252,7 @@ export class CodexHarness implements RunHarness {
       // PRD #1332 C4a: capture the ROOT thread->model mapping the moment the thread id is
       // known. The model is the immutable configured root model (currentModel); a resumed
       // thread baselines at its pre-resume cumulative rather than zero.
+      this.assertOpen();
       this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
       this.runtimeConfigPending = true;
     }
@@ -1295,6 +1379,12 @@ export class CodexHarness implements RunHarness {
   }
 
   private async closeOwned(): Promise<void> {
+    this.settleResumeAttempt();
+    const transition = this.phaseTransition?.current;
+    if (transition?.verifiedHarness === this) transition.verifiedHarness = undefined;
+    if (this.verifiedTransition?.verifiedHarness === this)
+      this.verifiedTransition.verifiedHarness = undefined;
+    this.verifiedTransition = undefined;
     this.closed = true;
     this.turnClosed = true;
     this.stopRequested = true;
@@ -1363,14 +1453,14 @@ export class CodexHarness implements RunHarness {
 
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
     this.registry.assertWorkAdmission();
-    this.currentModel = rendered.lead.model ?? this.provider.model;
+    this.assertOpen();
+    this.latchModel(rendered);
     const ordinal = this.turnOrdinal;
     this.liveProjectionTurn = ordinal;
 
     // A local watchdog/cancel (owner-aborted signal) ends the stream FIRST (rule 9).
     // requestStop()/close() also settle it via `stopTurn`, so a turn wedged in a pending
     // broker callback ends promptly and does not depend on a new notification arriving.
-    let attemptedResumedRoot: string | undefined;
     let onAbort: (() => void) | undefined;
     let settleStop: (() => void) | undefined;
     const abortPromise = new Promise<"aborted">((resolve) => {
@@ -1408,12 +1498,14 @@ export class CodexHarness implements RunHarness {
         this.turnClosed = true;
         return;
       }
+      this.assertOpen();
       const transport = this.transport!;
       const notes = this.notes!;
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
       await this.runCatalogProbe(abortPromise, request.signal);
 
+      this.assertOpen();
       // 3. Stop before sending model work if cancellation arrived during thread setup.
       if (request.signal.aborted || this.stopRequested) {
         this.turnClosed = true;
@@ -1423,7 +1515,11 @@ export class CodexHarness implements RunHarness {
       if (threadId === undefined)
         throw new CodexHarnessError({ category: "protocol", message: "codex prepared thread is unavailable" });
       this.activeTurnId = await this.startTurnRpc(transport, threadId, rendered, request.signal, request.rootDispatch,
-        () => { if (this.resumedRoot) attemptedResumedRoot = threadId; });
+        () => {
+          this.assertOpen();
+          if (this.phaseTransition?.current?.pending) this.verifyPreparedPhaseModel(request);
+          if (this.resumedRoot) this.attemptedResumedRoot = { threadId, ordinal };
+        });
       // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
       // that was cancelled or refused before dispatch.
       if (this.runtimeConfigPending) {
@@ -1675,8 +1771,7 @@ export class CodexHarness implements RunHarness {
       refuseDeferred();
       // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
       // A later epoch must not baseline that work away as history of this same claim.
-      if (attemptedResumedRoot !== undefined && !this.accountant.hasBaseline(attemptedResumedRoot))
-        this.accountant.markIncomplete(attemptedResumedRoot, "attempted_resume_without_baseline");
+      this.settleResumeAttempt(ordinal);
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
       // Close the outbox for this turn: a callback settling after the stream ended drops its
@@ -1695,7 +1790,7 @@ export class CodexHarness implements RunHarness {
   }
 
   private async deliverIncompleteNotice(): Promise<void> {
-    if (!this.onTokenUsageIncomplete || !this.accountant.takeIncompleteNotice()) return;
+    if (this.closed || !this.onTokenUsageIncomplete || !this.accountant.takeIncompleteNotice()) return;
     // One attempt per shared claim. A rejected diagnostic is nonfatal, with no retry.
     try { await this.onTokenUsageIncomplete(this.accountant.incompleteNoticeText!); } catch { /* execution continues */ }
   }
@@ -1793,7 +1888,7 @@ export class CodexHarness implements RunHarness {
   }
 
   /** The raw `model` / `reasoningEffort` of the last thread/start or thread/resume response; every
-   *  other field is ignored. Read once by reportRuntimeConfig. */
+   *  other field is ignored. Used by reportRuntimeConfig and verifyPreparedPhaseModel. */
   private threadResponse: { model?: unknown; reasoningEffort?: unknown } | undefined;
   /** Set when a thread is established; cleared when its runtime config is reported after the first
    *  accepted turn/start on it. */
@@ -1923,12 +2018,14 @@ export class CodexHarness implements RunHarness {
     } while (dispatch?.check() === false);
     // No await separates the final local controls/source/capture guard from send.
     signal.throwIfAborted();
+    this.assertOpen();
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
+    onDispatch?.();
     this.admissionAttempt = this.admissionReporter?.begin(threadId);
     this.dispatchStartedAt = this.nowMs();
     // A sent RPC can spend even if its acknowledgement never arrives.
-    onDispatch?.();
+    this.assertOpen();
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -2481,6 +2578,7 @@ export class CodexHarness implements RunHarness {
 
   /** Observe usage in inbound order. Outbound turn/start is not a replay boundary. */
   private recordUsageNote(note: CodexNotification): void {
+    if (this.closed) return;
     const root = noteThreadId(note) === this.threadId;
     if (this.resumedRoot && root &&
         ((note.kind === "turn_started" && note.turnId === this.activeTurnId) ||
@@ -2491,6 +2589,14 @@ export class CodexHarness implements RunHarness {
           this.accountant.record(this.threadId!, this.resumeReplay, true);
         else if (!this.accountant.hasBaseline(this.threadId!))
           this.accountant.markIncomplete(this.threadId!, "missing_replay_boundary");
+        if (note.kind === "turn_started") {
+          const transition = this.phaseTransition?.current;
+          if (transition?.pending && transition === this.verifiedTransition &&
+              transition.verifiedHarness === this && transition.threadId === this.threadId) {
+            this.accountant.beginModelSegment(transition.threadId, transition.model);
+            transition.pending = false;
+          }
+        }
         this.resumeBoundarySeen = true;
       }
     }
