@@ -635,9 +635,10 @@ function toHarnessAgent(t: AgentTemplate, repoSkills?: readonly string[]): Harne
     description: t.description,
     prompt: t.prompt_body,
     model: t.model ?? undefined,
-    // Passed through unvalidated on purpose: renderCodexRun's resolveEffort drops an
-    // out-of-contract value with an `unknown_effort` diagnostic the executor reports.
-    ...(t.effort != null ? { effort: t.effort as HarnessEffort } : {}),
+    // A string is passed through unvalidated on purpose: renderCodexRun's resolveEffort drops an
+    // out-of-contract value with an `unknown_effort` diagnostic the executor reports. A non-string
+    // (never sent by the api) is no pin, so it cannot reach the renderer's string sanitizer.
+    ...(typeof t.effort === "string" ? { effort: t.effort as HarnessEffort } : {}),
     tools: t.tools == null ? { kind: "inherit" } : { kind: "allow", names: t.tools },
     deniedTools: repoSkills ? [...REPO_AGENT_DENIED_TOOLS] : [],
     toolServers: [],
@@ -651,7 +652,8 @@ const unknownEffortNoticed = new WeakMap<RunContext, Set<string>>();
 
 /** Emit one `status` run message per subagent role whose template effort was dropped by the
  *  renderer (an `unknown_effort` diagnostic on a non-lead role). The text carries the sanitized
- *  role name only, never the raw effort value. The lead's own diagnostics are reported elsewhere. */
+ *  role name only, never the raw effort value. Lead diagnostics are out of scope here: the lead's
+ *  effort arrives already closed-set from the claim guard. */
 function emitUnknownEffortNotices(ctx: RunContext, diagnostics: readonly CodexRenderDiagnostic[]): void {
   for (const d of diagnostics) {
     if (d.kind !== "unknown_effort" || d.role === "lead") continue;

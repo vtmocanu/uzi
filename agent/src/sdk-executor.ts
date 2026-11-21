@@ -3086,7 +3086,7 @@ export class SdkExecutor implements Executor {
       // PRD #305: repo-source defs are freshly built from repo files here and were NOT
       // touched by the own-roster override above; apply it so the flag covers the repo
       // roster (the primary case: an auto-approved scheduled run resolves to the repo
-      // roster). Own-source defs were copied by reference from the already-overridden
+      // roster). Own-source defs are effort-filled copies of the already-overridden
       // assembled.subagents, so this repeat is idempotent for them.
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
@@ -3115,7 +3115,7 @@ export class SdkExecutor implements Executor {
       // `assembled.subagents` — because the repo-source path's defs come from the repo
       // roster and are absent from `assembled.subagents`, so reusing the plan map would
       // miss every repo name and mislabel a write-capable repo subagent read-only.
-      // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
+      // `selectedSubagents` is pre-strip on both sources (own: effort-filled copies of the assembled defs;
       // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
       drive.enableImplementationSignals();
