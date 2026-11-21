@@ -1,6 +1,7 @@
 // The worker-side mirror of the api's leadcfg.LeadLane (PRD 4416 M2): which runs have a lead agent whose
-// commands may receive the run's user variables. The api already withholds nothing by lane in the claim,
-// so the worker applies the same predicate before it hands the variables to an executor.
+// commands may receive the run's user variables. The api's attachRunEnv already withholds the variables by
+// lane, so a non-lead claim carries none; the worker applies the same predicate again before it hands the
+// variables to an executor, as defense in depth against a claim that carries them anyway.
 
 import type { ClaimRunEnvVar, RunKind } from "./protocol.js";
 
@@ -27,4 +28,11 @@ export function isRunEnvLeadLane(claim: RunEnvLaneClaim): boolean {
 export function leadLaneRunEnv(claim: RunEnvLaneClaim, runEnv: readonly ClaimRunEnvVar[] | undefined): ClaimRunEnvVar[] | undefined {
   if (!runEnv || runEnv.length === 0 || !isRunEnvLeadLane(claim)) return undefined;
   return [...runEnv];
+}
+
+/** The RunContext field for a claim: `{ runEnv }` for a lead-lane run that has variables, else `{}`. Computes
+ *  the lane once; the key is absent (not undefined) when there is nothing to hand over. */
+export function runEnvContextField(claim: RunEnvLaneClaim, runEnv: readonly ClaimRunEnvVar[] | undefined): { runEnv?: ClaimRunEnvVar[] } {
+  const vars = leadLaneRunEnv(claim, runEnv);
+  return vars ? { runEnv: vars } : {};
 }

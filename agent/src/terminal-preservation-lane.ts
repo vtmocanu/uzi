@@ -14,6 +14,7 @@ import fs from "node:fs/promises";
 import type { CheckpointRange, GitCache, TerminalDefaultBranch } from "./git.js";
 import type { TerminalPreservationResult } from "./client.js";
 import { prepareFrozenHeldPinned, type FrozenHeldPolicy, type HeldGit, type TerminalDigestGit } from "./frozen-held.js";
+import type { ScanNeedle } from "./run-env-forms.js";
 import type { RecoveryCoordinator } from "./recovery.js";
 import type { TerminalPreservationRequest } from "./protocol.js";
 import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
@@ -55,6 +56,8 @@ export interface TerminalLaneFlight {
   secretBlocked?: boolean;
   /** The encoded forms of the run's provider key (absent or empty for a vendor run). */
   providerKeyForms?: readonly string[];
+  /** The exact-value scan needles of the run's secret variables (absent or empty when it holds none). */
+  scanNeedles?: readonly ScanNeedle[];
   terminalPreservation?: TerminalLaneResult;
 }
 
@@ -252,6 +255,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
         const out = await prepareFrozenHeldPinned({
           git: env.git, barePath, branch, sourceSha: tip, policy: env.policy(), deadlineMs: left(),
           literals: flight.providerKeyForms ?? [],
+          needles: flight.scanNeedles ?? [],
           ...(defaultBranch ? { defaultBranch } : {}),
           perCommitCi: true, ...(ciTarget ? { ciTarget } : {}), ...(expectDigests ? { expectDigests } : {}),
           onScan: scan => { if (scan.trusted && scan.findings.length) flagged = scan.findings.map(f => f.commit); },

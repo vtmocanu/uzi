@@ -4349,7 +4349,8 @@ export class CodexExecutor implements Executor {
             });
             if ((summary || skip.reason) && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
               // Issue #3248 M3: a skipped summary posts nothing and leaves one visible note instead.
-              if (summary) await this.opts.client.postIntentSummary(ctx.runId, summary);
+              // PRD #4416 M2: redacted like the plan summary, since the intent text derives from the issue and PRD.
+              if (summary) await this.opts.client.postIntentSummary(ctx.runId, ctx.redactText?.(summary) ?? summary);
               else if (skip.reason) ctx.emit({ kind: "status", agent: "worker", payload: summarySkipPayload("intent", skip.reason) });
             }
           } catch (error) {

@@ -15,6 +15,13 @@ const RUN_ENV_PROMPT_DESCRIPTION_MAX_BYTES = 1024;
 const ESC = 0x1b;
 const BEL = 0x07;
 
+/** Unsafe in a prompt: everything isUnsafeNameChar rejects plus the invisible characters it lets through that
+ *  can hide or reorder text for a reader: the Arabic letter mark U+061C, the soft hyphen U+00AD, the Mongolian
+ *  vowel separator U+180E and the tag characters U+E0000 to U+E007F. A prompt-only rule; the name rules stay as they are. */
+function isUnsafePromptChar(cp: number): boolean {
+  return isUnsafeNameChar(cp) || cp === 0x061c || cp === 0x00ad || cp === 0x180e || (cp >= 0xe0000 && cp <= 0xe007f);
+}
+
 /** Index just past the ANSI escape sequence that starts at `cps[i]` (an ESC), or `i` when none parses.
  *  CSI `ESC [ params final(0x40-0x7E)`, OSC `ESC ] ... (BEL | ESC \)` and two-character `ESC x`.
  *  An unterminated OSC swallows the rest of the text; a CSI cut short by a byte outside the parameter
@@ -58,7 +65,7 @@ export function sanitizeRunEnvPromptText(text: string): string {
         continue;
       }
     }
-    const ch = isUnsafeNameChar(cp) ? "�" : String.fromCodePoint(cp);
+    const ch = isUnsafePromptChar(cp) ? "�" : String.fromCodePoint(cp);
     const size = Buffer.byteLength(ch, "utf8");
     if (bytes + size > RUN_ENV_PROMPT_DESCRIPTION_MAX_BYTES) break;
     out += ch;
@@ -72,7 +79,7 @@ function quotePlainValue(value: string): string {
   let out = "";
   for (const ch of JSON.stringify(value)) {
     const cp = ch.codePointAt(0) ?? 0;
-    out += isUnsafeNameChar(cp) ? `\\u${cp.toString(16).padStart(4, "0")}` : ch;
+    out += isUnsafePromptChar(cp) ? (cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`) : ch;
   }
   return out;
 }

@@ -33,6 +33,33 @@ export function secretForms(value: string): string[] {
   return forms.filter((f) => f.length >= MIN_SECRET_LEN);
 }
 
+/** One variable's scan needle: its NAME (the only text a finding may show) and every registered form of
+ *  every secret value it has held. Plain values never appear. */
+export interface ScanNeedle {
+  readonly name: string;
+  readonly forms: readonly string[];
+}
+
+/** The exact-value scan needles for a claim's (or the maintenance endpoint's) secret variables, grouped by
+ *  name so a hit names the variable. Same forms as {@link runEnvRedactionForms}; a name with no usable form
+ *  (every value too short) is dropped. */
+export function runEnvScanNeedles(
+  runEnv: readonly ClaimRunEnvVar[] | undefined,
+  runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
+): ScanNeedle[] {
+  const byName = new Map<string, Set<string>>();
+  const add = (name: string, value: string): void => {
+    const set = byName.get(name) ?? new Set<string>();
+    for (const f of secretForms(value)) set.add(f);
+    byName.set(name, set);
+  };
+  for (const v of runEnv ?? []) if (v.secret) add(v.name, v.value);
+  for (const r of runEnvRedact ?? []) add(r.name, r.value);
+  return [...byName]
+    .filter(([, forms]) => forms.size > 0)
+    .map(([name, forms]) => ({ name, forms: [...forms] }));
+}
+
 /** The deduplicated registration list for a claim's secret variables: every live secret and every
  *  run_env_redact entry. Longest first, so a longer form is replaced before a shorter one inside it. */
 export function runEnvRedactionForms(

@@ -58,6 +58,31 @@ describe("runner wiring of run variables", () => {
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
   });
 
+  it("a non-lead claim (a review-target task) carries no runEnv although its redaction forms are still registered", async () => {
+    const { gitlab } = fakeGitlab();
+    const { logger, added } = secretRecordingLogger();
+    const n = iid++;
+    // Defense in depth: the api never sends variables to this lane, but a claim that did must not reach the executor.
+    const claim = gitlabClaim(n, {
+      secrets: secrets(), kind: "task", issue_iid: null, open_mr: false, branch: `uzi/task/review-${n}`,
+      review_target_run_id: "6c1f0e2a-3b4d-4f5a-8c7e-9d0a1b2c3d4e",
+    } as never);
+    let seen: RunContext | undefined;
+    let scrubbed = "";
+    const exec: Executor = {
+      run: async (ctx) => {
+        seen = ctx;
+        scrubbed = ctx.redactText!(`token ${SECRET} old ${OLD_SECRET}`);
+        return { branch: ctx.branch, reportOnly: true, summary: "ok" };
+      },
+    };
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+    assert.ok(seen, "the executor ran");
+    assert.equal(seen!.runEnv, undefined, "no variables for a non-lead lane");
+    for (const f of runEnvRedactionForms(runEnv(), runEnvRedact())) assert.ok(added.includes(f), "the redaction form is registered for every kind");
+    assert.ok(!scrubbed.includes(SECRET) && !scrubbed.includes(OLD_SECRET), "and the flight redactor still scrubs both versions");
+  });
+
   it("a run without variables carries no runEnv", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(iid++);

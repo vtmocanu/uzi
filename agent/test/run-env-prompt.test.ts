@@ -54,6 +54,20 @@ describe("sanitizeRunEnvPromptText", () => {
     for (const cp of unsafe) assert.equal(sanitizeRunEnvPromptText(`x${String.fromCodePoint(cp)}y`), "x�y", `U+${cp.toString(16)}`);
   });
 
+  it("also replaces the invisible characters U+061C, U+00AD, U+180E and the tag block U+E0000 to U+E007F", () => {
+    for (const cp of [0x061c, 0x00ad, 0x180e, 0xe0000, 0xe0041, 0xe007f]) {
+      assert.equal(sanitizeRunEnvPromptText(`x${String.fromCodePoint(cp)}y`), "x�y", `U+${cp.toString(16)}`);
+    }
+    // The neighbours stay: U+E0080 is outside the tag block, U+061B is an ordinary Arabic semicolon.
+    for (const cp of [0xe0080, 0x061b, 0x00ae]) assert.equal(sanitizeRunEnvPromptText(`x${String.fromCodePoint(cp)}y`), `x${String.fromCodePoint(cp)}y`);
+  });
+
+  it("escapes those characters in a plain value, as \\u escapes that name the code point", () => {
+    const block = buildRunEnvBlock([v("TAGGED", { value: `a${String.fromCodePoint(0xe0041)}b­c؜d᠎e` })]);
+    assert.ok(block.includes("\\u{e0041}") && block.includes("\\u00ad") && block.includes("\\u061c") && block.includes("\\u180e"));
+    for (const cp of [0xe0041, 0x00ad, 0x061c, 0x180e]) assert.ok(!block.includes(String.fromCodePoint(cp)), `U+${cp.toString(16)} not raw`);
+  });
+
   it("keeps ordinary text, including non-ASCII", () => {
     assert.equal(sanitizeRunEnvPromptText("Données: 日本語 ok"), "Données: 日本語 ok");
   });
