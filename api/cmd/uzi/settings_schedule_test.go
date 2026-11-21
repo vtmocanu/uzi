@@ -217,3 +217,59 @@ func TestSettingsGetScheduleHostileTextAndBounds(t *testing.T) {
 		t.Fatalf("hostile failure text on stderr: exit %d, %q", code, stderr)
 	}
 }
+
+// TestSettingsGetSchedulePreviewPlanPhaseRows pins the plan-phase rows (PRD #3252): shown next to the
+// worker rows for an exact harness and per alternative, labelled with the planning source for a
+// planning value and the ordinary one for a frozen pin, and absent when the preview carries none.
+func TestSettingsGetSchedulePreviewPlanPhaseRows(t *testing.T) {
+	render := func(d *apitypes.ScheduleSettingsPreviewDTO) string {
+		out, stderr, code := runCLI(t, fakeEnv(&uzicli.FakeClient{Settings: settingsWithLegacyCells(), Effective: effectiveFixture(), SchedulePreview: d}), "settings", "get", "--schedule", schedID)
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit %d: %s", code, stderr)
+		}
+		return fields(strings.ReplaceAll(out, "\n", " "))
+	}
+	exact := &apitypes.ScheduleSettingsPreviewDTO{
+		Version: 1,
+		Harness: harnessValue(sptr("claude"), "schedule_pin"),
+		PlanPhase: &apitypes.EffectivePlanPhaseDTO{
+			Model: sptr("sonnet"), Effort: sptr("high"), ModelSource: "schedule_pin", EffortSource: "user_planning_default",
+		},
+		Notes: []string{},
+	}
+	joined := render(exact)
+	for _, want := range []string{
+		"plan phase model claude - - sonnet schedule pin",
+		"plan phase effort claude - - high your choice",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in:\n%s", want, joined)
+		}
+	}
+	exact.PlanPhase = nil
+	if got := render(exact); strings.Contains(got, "plan phase") {
+		t.Errorf("a preview without plan_phase rendered plan rows: %s", got)
+	}
+	// Only the effort comes from the planning lane: the model follows the implement side.
+	alt := &apitypes.ScheduleSettingsPreviewDTO{
+		Version: 1,
+		Harness: harnessValue(nil, "chosen_at_create", "overflow"),
+		Alternatives: []apitypes.ScheduleAlternativeDTO{
+			{Harness: "claude", PlanPhase: &apitypes.EffectivePlanPhaseDTO{Effort: sptr("max"), EffortSource: "user_planning_default"}},
+			{Harness: "codex"},
+		},
+		Notes: []string{},
+	}
+	got := render(alt)
+	for _, want := range []string{
+		"plan phase model claude - - same as the worker model",
+		"plan phase effort claude - - max your choice",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "plan phase model codex") {
+		t.Errorf("a codex alternative rendered plan rows: %s", got)
+	}
+}

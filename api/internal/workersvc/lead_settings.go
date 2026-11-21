@@ -27,6 +27,10 @@ type LeadSettingsInput struct {
 	// caller via leadTemplateEffort. It applies only when UserEffort is NULL or blank, below the
 	// owner's choice and above the built-in default. Zero means no lead template effort.
 	TemplateEffort pgtype.Text
+	// PlanningModel and PlanningEffort are the owner's Claude planning columns (PRD #3252), read
+	// only for a Claude lead-lane claim; blank (after trim) is unset.
+	PlanningModel  pgtype.Text
+	PlanningEffort pgtype.Text
 }
 
 // RunOverrideUnhonorable names the start-time run_override choice the claim cannot honor. It is
@@ -56,6 +60,9 @@ type LeadSettings struct {
 	// Unhonorable is set when a run_override model or effort cannot be honored (model checked first).
 	// The other fields are not meaningful then, and DroppedRunModel is never set for a run_override.
 	Unhonorable *RunOverrideUnhonorable
+	// Plan is the plan-phase pair (PRD #3252), nil unless the owner's planning lane contributed a
+	// value; see resolvePlanPhase.
+	Plan *ClaimPhaseSettings
 }
 
 // resolveLeadSettings is the one server-side home of lead precedence (PRD #3244 section 3). It is
@@ -100,7 +107,9 @@ func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
 	out.Effort, out.EffortSource, unhonorable = leadEffortWithTemplate(in.Harness, in.RunEffort, in.RunEffortSource, in.UserEffort, in.TemplateEffort)
 	if unhonorable {
 		out.Unhonorable = &RunOverrideUnhonorable{Setting: "effort", Value: in.RunEffort.String, Harness: in.Harness}
+		return out
 	}
+	out.Plan = resolvePlanPhase(in, out)
 	return out
 }
 

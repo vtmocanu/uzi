@@ -313,6 +313,9 @@ type LeadPrediction struct {
 	// TemplateEffort is the lead template's valid effort for the harness (nil: none), what an unset
 	// preference resolves to.
 	TemplateEffort *string
+	// Plan is the claim's plan_phase pair (PRD #3252), nil unless the owner's Claude planning lane
+	// contributes a value; it is exactly what resolveLeadSettings ships on the claim.
+	Plan *ClaimPhaseSettings
 	// Subagents is nil for a review.
 	Subagents *SubagentPrediction
 	// Unhonorable is set when a start-time run_override model or effort cannot run on Harness; every
@@ -401,6 +404,16 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 		templateEffort = pgtype.Text{String: e, Valid: true}
 	}
 	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort, TemplateEffort: templateEffort}
+	// PRD #3252: the claim reads the owner's Claude planning pair for a Claude lead-lane run, so the
+	// prediction reads the same two columns (GetUserPlanningClaude) and resolveLeadSettings returns
+	// the plan pair the claim would ship.
+	if harness == HarnessClaude {
+		planning, perr := s.q.GetUserPlanningClaude(ctx, userID)
+		if perr != nil {
+			return LeadPrediction{}, fmt.Errorf("lead predict: read planning defaults: %w", perr)
+		}
+		in.PlanningModel, in.PlanningEffort = planning.PlanningClaudeModel, planning.PlanningClaudeEffort
+	}
 	choice.apply(&in)
 	settings := resolveLeadSettings(in)
 	if settings.Unhonorable != nil {
@@ -411,6 +424,7 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 		Effort: settings.Effort, EffortSource: string(settings.EffortSource),
 		DroppedRunModel: textPtr(settings.DroppedRunModel),
 		TemplateEffort:  textPtr(templateEffort),
+		Plan:            settings.Plan,
 	}
 	out.DefaultModel, out.DefaultModelSource = agenttmpl.ResolveWorkerDefaultModel(string(harness), nil, tClaude, tCodex)
 	if settings.Model.Valid {

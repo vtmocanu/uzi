@@ -134,6 +134,12 @@ describe("AuthContext — appearance fallback for an older API (PRD #1167)", () 
     return s;
   };
 
+  it("defaults sidebar motion on when an older server omits appearance", async () => {
+    mockApi.me.mockResolvedValue(olderSession());
+    renderProbe();
+    await waitFor(() => expect(document.documentElement.dataset.motion).toBe("on"));
+  });
+
   it("honors the older server's resolved theme, not just the instance default", async () => {
     // The user saved `mission` on the old server (theme resolves to mission,
     // override = mission) while the instance default is ember. The new SPA must

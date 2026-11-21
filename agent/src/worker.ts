@@ -15,6 +15,7 @@ import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
+import { CLAUDE_PHASE_MODELS_CAPABILITY } from "./lead-config-report.js";
 import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, PublicationResumeEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
@@ -1075,6 +1076,10 @@ export class Worker {
           // writes Closes #<iid>. Advertised UNCONDITIONALLY: the api offers a run on a linked
           // repo only to a worker advertising it.
           "issue_key_v1",
+          // PRD #3252: this image resolves a Claude claim's plan_phase (planning model/effort) for the
+          // plan turns and the implementation values for the implement turns. Advertised
+          // UNCONDITIONALLY; the api sends plan_phase only to a worker advertising it.
+          CLAUDE_PHASE_MODELS_CAPABILITY,
           // PRD #4320 / #4505: activated 2026-11-19 with the gateway-redirect risk accepted
           // (ADR-4320). Advertised UNCONDITIONALLY: the api offers a provider-bound run only to a
           // worker advertising it, and client.ts requireProviderCapability still refuses a provider

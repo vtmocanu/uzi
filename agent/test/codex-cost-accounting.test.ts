@@ -378,3 +378,175 @@ describe("deriveCodexRunCost: api-key rollup edges", () => {
     assert.deepEqual(deriveCodexRunCost(entries), { kind: "unreported" });
   });
 });
+
+// #4580 M1: model segments with pricing. A thread cut with `beginModelSegment` prices and
+// reconciles each segment against its own model and responses; no production caller cuts yet.
+describe("#4580 model segments (priced)", () => {
+  /** An output-only note: total = output, `last` = the response's own output. */
+  const out = (total: number, last: number) =>
+    usage({ outputTokens: total, totalTokens: total }, { outputTokens: last, totalTokens: last });
+  const wf = (t: Partial<CodexUsageBreakdown>, l: Partial<CodexUsageBreakdown>): CodexThreadTokenUsage => {
+    const full = bd(t);
+    const last = bd(l);
+    return {
+      total: { ...full, totalTokens: full.inputTokens + full.outputTokens },
+      last: { ...last, totalTokens: last.inputTokens + last.outputTokens },
+    };
+  };
+
+  it("A to B to A prices each segment's responses with that segment's model", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(1000, 1000));
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, out(2000, 1000));
+    acct.beginModelSegment(ROOT, ASTRA);
+    acct.record(ROOT, out(4000, 2000));
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    const astra = get(agg, ASTRA);
+    const sol = get(agg, SOL);
+    assertTokens(astra, { input: 0, output: 3000, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
+    assertTokens(sol, { input: 0, output: 1000, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
+    // Output at $50/M (astra) and $20/M (sol): 3000 tokens and 1000 tokens.
+    assert.equal(astra.costStatus, "metered");
+    assert.equal(sol.costStatus, "metered");
+    assert.equal(micro(astra.costUSD), 150000);
+    assert.equal(micro(sol.costUSD), 20000);
+  });
+
+  it("a missing response inside a later segment degrades that segment's model while the earlier one stays metered", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(1000, 1000));
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, out(2000, 500)); // the cumulative moved by 1000, its observed response was 500
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    assert.equal(get(agg, ASTRA).costStatus, "metered");
+    assert.equal(micro(get(agg, ASTRA).costUSD), 50000);
+    const sol = get(agg, SOL);
+    assert.equal(sol.costStatus, "unreported");
+    assert.equal(sol.outputTokens, 1000, "tokens retained");
+    assert.equal("costUSD" in sol, false);
+  });
+
+  it("incompleteness spreads to every segment model with tokens retained", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(1000, 1000));
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, out(2000, 1000));
+    acct.markIncomplete(ROOT, "invalid_identity");
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    assert.equal(get(agg, ASTRA).costStatus, "unreported");
+    assert.equal(get(agg, SOL).costStatus, "unreported");
+    assert.equal(get(agg, ASTRA).outputTokens, 1000);
+    assert.equal(get(agg, SOL).outputTokens, 1000);
+  });
+
+  it("a replay advance recorded before the cut stays in the earlier segment", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, true);
+    acct.record(ROOT, out(1000, 1000), true); // proved replay baseline
+    acct.record(ROOT, out(1500, 500), true); // a further replay advance: charged, never a response
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, out(2500, 1000));
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    const astra = get(agg, ASTRA);
+    assert.equal(astra.costStatus, "unreported", "the replayed span has no observed response");
+    assert.equal(astra.outputTokens, 500, "tokens retained");
+    const sol = get(agg, SOL);
+    assert.equal(sol.costStatus, "metered");
+    assert.equal(sol.outputTokens, 1000);
+    assert.equal(micro(sol.costUSD), 20000);
+  });
+
+  it("the checker's malformed split across a cut keeps uncached at the unsplit value and reports both models unreported", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, wf({ inputTokens: 10, cachedInputTokens: 20, outputTokens: 10 }, { inputTokens: 10, cachedInputTokens: 20, outputTokens: 10 }));
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, wf({ inputTokens: 20, cachedInputTokens: 20, outputTokens: 20 }, { inputTokens: 10, outputTokens: 10 }));
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    const astra = get(agg, ASTRA);
+    const sol = get(agg, SOL);
+    assert.equal(astra.inputTokens + sol.inputTokens, 0, "the unsplit uncached value, never 10 for the new model");
+    assertTokens(astra, { input: 0, output: 10, cacheRead: 20, cacheCreation: 0, reasoning: 0 });
+    assertTokens(sol, { input: 0, output: 10, cacheRead: 0, cacheCreation: 0, reasoning: 0 });
+    assert.equal(astra.costStatus, "unreported");
+    assert.equal(sol.costStatus, "unreported");
+    assert.equal(acct.usageIncomplete, true);
+    assert.match(acct.incompleteNoticeText ?? "", /Diagnostic: bucket relationship \(total\.cachedInputTokens\)\./);
+  });
+
+  it("a direct note with a negative output bucket is never metered", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(-1000000, -1000000));
+    // The clamped delta is zero, so the model may be omitted; it must never be metered.
+    const entry = acct.aggregateByModel(API_KEY_EARLY)?.[ASTRA];
+    assert.notEqual(entry?.costStatus, "metered");
+    assert.equal(entry !== undefined && "costUSD" in entry, false);
+  });
+
+  it("pricing-evidence taint after a cut degrades only the segment's own model", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    acct.record(ROOT, out(1000, 1000));
+    acct.beginModelSegment(ROOT, SOL);
+    acct.record(ROOT, { ...out(2000, 1000), pricingEvidenceComplete: false });
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    assert.equal(get(agg, ASTRA).costStatus, "metered");
+    assert.equal(micro(get(agg, ASTRA).costUSD), 50000);
+    assert.equal(get(agg, SOL).costStatus, "unreported");
+    assert.equal(get(agg, SOL).outputTokens, 1000);
+  });
+
+  describe("extended advancing gate", () => {
+    const cases: [string, Partial<CodexUsageBreakdown>, Partial<CodexUsageBreakdown>, number][] = [
+      ["reasoning",
+        { inputTokens: 10, outputTokens: 10, reasoningOutputTokens: 5, totalTokens: 20 },
+        { inputTokens: 20, outputTokens: 20, reasoningOutputTokens: 4, totalTokens: 40 }, 5],
+      ["totalTokens",
+        { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+        { inputTokens: 20, outputTokens: 20, totalTokens: 19 }, 0],
+    ];
+    for (const [column, prev, next, reasoning] of cases) {
+      it(`refuses an advancing note whose ${column} regresses, marks the model unreported and retains proven tokens`, () => {
+        const acct = new CodexUsageAccountant();
+        acct.registerThread(ROOT, ASTRA, false);
+        const first = acct.record(ROOT, usage(prev, { inputTokens: 10, outputTokens: 10, totalTokens: 20 }));
+        assert.ok(first, "the first note is adopted");
+        assert.equal(acct.record(ROOT, usage(next, { inputTokens: 10, outputTokens: 10, totalTokens: 20 })), undefined);
+        assert.equal(acct.usageIncomplete, true);
+        assert.match(acct.incompleteNoticeText ?? "", /advancing cumulative token usage regression/);
+        const astra = get(acct.aggregateByModel(API_KEY_EARLY), ASTRA);
+        assert.equal(astra.costStatus, "unreported");
+        assertTokens(astra, { input: 10, output: 10, cacheRead: 0, cacheCreation: 0, reasoning });
+      });
+    }
+  });
+
+  it("a multi-note single-segment thread keeps its totals, cost and adopted sequence", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, ASTRA, false);
+    const adopted = [
+      acct.record(ROOT, wf({ inputTokens: 1000, cachedInputTokens: 200, outputTokens: 100 },
+        { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 100 })),
+      acct.record(ROOT, wf({ inputTokens: 2500, cachedInputTokens: 700, cacheWriteInputTokens: 100, outputTokens: 300 },
+        { inputTokens: 1500, cachedInputTokens: 500, cacheWriteInputTokens: 100, outputTokens: 200 })),
+    ];
+    assert.deepEqual(adopted, [
+      { model: ASTRA, pricingEvidenceComplete: true,
+        last: { inputTokens: 1000, cachedInputTokens: 200, cacheWriteInputTokens: 0, outputTokens: 100, reasoningOutputTokens: 0, totalTokens: 1100 } },
+      { model: ASTRA, pricingEvidenceComplete: true,
+        last: { inputTokens: 1500, cachedInputTokens: 500, cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 0, totalTokens: 1700 } },
+    ]);
+    const agg = acct.aggregateByModel(API_KEY_EARLY);
+    assert.deepEqual(Object.keys(agg ?? {}), [ASTRA]);
+    const astra = get(agg, ASTRA);
+    assertTokens(astra, { input: 1700, output: 300, cacheRead: 700, cacheCreation: 100, reasoning: 0 });
+    assert.equal(astra.costStatus, "metered");
+    // $13,200 + $20,750 microdollars: (800*10 + 200*1 + 100*50) and (900*10 + 500*1 + 100*12.5 + 200*50).
+    assert.equal(micro(astra.costUSD), 33950);
+  });
+});

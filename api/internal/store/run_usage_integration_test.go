@@ -667,8 +667,8 @@ func TestUsageRollupsLiveDB(t *testing.T) {
 // TestRunOutcomesRollupsLiveDB proves the PRD #1293 M1 failed-run rate aggregates against
 // a REAL Postgres: the outcome counts are a straight scan over `runs` (NOT the usage join,
 // D1 — a run that fails before spending has no usage row and must still count), restricted
-// to terminal non-chat/judge runs and windowed on created_at (D3). It asserts the
-// exclusions (chat/judge never counted), both contract invariants (finished == sum of the
+// to terminal non-chat runs (issue #4577: judge and the other helper kinds count) and
+// windowed on created_at (D3). It asserts the exclusion (chat never counted), both contract invariants (finished == sum of the
 // four outcomes; sum(fail_origins) == failed), that a NULL fail_origin buckets as
 // "unknown", the plan_rejected split (out of failed, in finished, D4), the 7-day window,
 // and that the per-user and factory aggregates agree (per-user rows sum to the factory).
@@ -736,7 +736,8 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	agentFailure := "agent_failure"
 
 	// userA: one run per terminal status + a plan_rejected + a real-origin failure + a
-	// NULL-origin failure, plus one chat and one judge failure that MUST be excluded. The
+	// NULL-origin failure, plus one chat failure that MUST be excluded and one judge failure that
+	// counts (issue #4577: outcomes count every kind except chat). The
 	// NULL-origin failure is backdated 10 days (outside the 7-day window) to prove windowing.
 	aCompleted := seedOutcomeRun(userA, repoA, "completed", "issue", nil, 0, nil)
 	seedOutcomeRun(userA, repoA, "cancelled", "issue", nil, 0, nil)
@@ -758,26 +759,27 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SelfRunOutcomes(A): %v", err)
 	}
-	// finished == 5 (completed, cancelled, plan_rejected, failed-agent, failed-null); the
-	// chat and judge failures are EXCLUDED (a 7 here would mean the kind filter is broken).
-	if selfA.LifetimeFinished != 5 {
-		t.Fatalf("A lifetime finished = %d, want 5 (chat+judge excluded)", selfA.LifetimeFinished)
+	// finished == 6 (completed, cancelled, plan_rejected, failed-agent, failed-null, failed
+	// judge); the chat failure is EXCLUDED (a 7 here would mean the chat filter is broken).
+	if selfA.LifetimeFinished != 6 {
+		t.Fatalf("A lifetime finished = %d, want 6 (judge counts, chat excluded)", selfA.LifetimeFinished)
 	}
 	if selfA.LifetimeCompleted != 1 || selfA.LifetimeCancelled != 1 || selfA.LifetimePlanRejected != 1 {
 		t.Fatalf("A lifetime completed/cancelled/plan_rejected = %d/%d/%d, want 1/1/1",
 			selfA.LifetimeCompleted, selfA.LifetimeCancelled, selfA.LifetimePlanRejected)
 	}
-	// failed == 2 (agent_failure + NULL origin); the plan_rejected run is split OUT of failed.
-	if selfA.LifetimeFailed != 2 {
-		t.Fatalf("A lifetime failed = %d, want 2 (plan_rejected split out)", selfA.LifetimeFailed)
+	// failed == 3 (agent_failure + NULL origin + the judge's agent_failure); the plan_rejected
+	// run is split OUT of failed.
+	if selfA.LifetimeFailed != 3 {
+		t.Fatalf("A lifetime failed = %d, want 3 (plan_rejected split out)", selfA.LifetimeFailed)
 	}
 	// Invariant 1: finished == completed + cancelled + plan_rejected + base_diverged + failed.
 	if got := selfA.LifetimeCompleted + selfA.LifetimeCancelled + selfA.LifetimePlanRejected + selfA.LifetimeBaseDiverged + selfA.LifetimeFailed; got != selfA.LifetimeFinished {
 		t.Fatalf("A lifetime invariant: finished %d != sum %d", selfA.LifetimeFinished, got)
 	}
-	// Windowing: the NULL-origin failure is 10 days old, so last7 sees 4 finished / 1 failed.
-	if selfA.Last7Finished != 4 || selfA.Last7Failed != 1 {
-		t.Fatalf("A last7 finished/failed = %d/%d, want 4/1 (the 10-day-old NULL failure is out of window)",
+	// Windowing: the NULL-origin failure is 10 days old, so last7 sees 5 finished / 2 failed.
+	if selfA.Last7Finished != 5 || selfA.Last7Failed != 2 {
+		t.Fatalf("A last7 finished/failed = %d/%d, want 5/2 (the 10-day-old NULL failure is out of window)",
 			selfA.Last7Finished, selfA.Last7Failed)
 	}
 	if got := selfA.Last7Completed + selfA.Last7Cancelled + selfA.Last7PlanRejected + selfA.Last7BaseDiverged + selfA.Last7Failed; got != selfA.Last7Finished {
@@ -788,15 +790,15 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	// the counts): NULL buckets as "unknown"; sum == failed per window.
 	lifeOrigins := decodeOutcomeOrigins(t, "A lifetime", selfA.LifetimeFailOrigins)
 	last7Origins := decodeOutcomeOrigins(t, "A last7", selfA.Last7FailOrigins)
-	if lifeOrigins["agent_failure"] != 1 || lifeOrigins["unknown"] != 1 {
-		t.Fatalf("A lifetime origins = %v, want agent_failure:1 unknown:1", lifeOrigins)
+	if lifeOrigins["agent_failure"] != 2 || lifeOrigins["unknown"] != 1 {
+		t.Fatalf("A lifetime origins = %v, want agent_failure:2 unknown:1", lifeOrigins)
 	}
 	// Invariant 2: sum(fail_origins) == failed, per window.
 	if s := lifeOrigins["agent_failure"] + lifeOrigins["unknown"]; s != selfA.LifetimeFailed {
 		t.Fatalf("A lifetime sum(origins)=%d != failed=%d", s, selfA.LifetimeFailed)
 	}
-	if last7Origins["agent_failure"] != 1 || last7Origins["unknown"] != 0 {
-		t.Fatalf("A last7 origins = %v, want agent_failure:1 (the NULL failure is out of window)", last7Origins)
+	if last7Origins["agent_failure"] != 2 || last7Origins["unknown"] != 0 {
+		t.Fatalf("A last7 origins = %v, want agent_failure:2 (the NULL failure is out of window)", last7Origins)
 	}
 	if last7Origins["agent_failure"] != selfA.Last7Failed {
 		t.Fatalf("A last7 sum(origins)=%d != failed=%d", last7Origins["agent_failure"], selfA.Last7Failed)
@@ -888,8 +890,8 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 
 	// --- Per-user origins agree with the self origins for userA (NULL -> "unknown").
 	puOriginsA := decodeOutcomeOrigins(t, "per-user A", perUserByID[userA].FailOrigins)
-	if puOriginsA["agent_failure"] != 1 || puOriginsA["unknown"] != 1 {
-		t.Fatalf("per-user origins for A = %v, want agent_failure:1 unknown:1", puOriginsA)
+	if puOriginsA["agent_failure"] != 2 || puOriginsA["unknown"] != 1 {
+		t.Fatalf("per-user origins for A = %v, want agent_failure:2 unknown:1", puOriginsA)
 	}
 	if puOriginsB := decodeOutcomeOrigins(t, "per-user B", perUserByID[userB].FailOrigins); puOriginsB["agent_failure"] != 1 || len(puOriginsB) != 1 {
 		t.Fatalf("per-user origins for B = %v, want exactly agent_failure:1", puOriginsB)

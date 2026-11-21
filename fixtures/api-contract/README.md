@@ -375,6 +375,29 @@ returned alone). `ZeroOf` exemptions, each a mapper guarantee: `hosts` and
 always `[]` on the real wire. `created_by`/`updated_by` are `string | null` in TS, so their
 zero-value `null` needs no exemption. No drift.
 
+### Issue #4518: `AdminWorkerSizesDTO → AdminWorkerSizes` (stem `admin_worker_sizes`)
+
+The admin worker-sizes envelope (`GET /api/admin/worker-sizes`), registered in
+`apitypes/contract_test.go`. `refusals` carries at most three entries per size and at most 16
+sizes; `refusal_totals` is the additive per-size count of every fresh refusal before that cap
+(keys exactly the sizes in `refusals`). Its nested `AdminWorkerSizeDTO`, `WorkerSizeRefusalDTO`
+and `WorkerSizeAdvisoryDTO` ride inside element 0 of the full fixture, and `ceilings`
+(`WorkerSizeCeilingsDTO`) is one nested object. `ZeroOf` exemptions, each a handler guarantee
+(the zero-marshal's `null` over-approximates the real wire):
+
+| DTO | field | mapper guarantee |
+|---|---|---|
+| `AdminWorkerSizes` | `sizes` | `make([]apitypes.AdminWorkerSizeDTO, 0, len(rows))` in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:201`) → `[]` |
+| `AdminWorkerSizes` | `advisories` | `[]apitypes.WorkerSizeAdvisoryDTO{}` literal in `AdminListWorkerSizes` (`handler/admin_worker_sizes.go:204`) → `[]` |
+| `AdminWorkerSizes` | `refusals` | `sizeRefusals` returns a non-nil slice on every path, `out := []apitypes.WorkerSizeRefusalDTO{}` (`handler/admin_worker_sizes.go:241` early returns, `:289` in `selectSizeRefusals`) |
+| `AdminWorkerSizes` | `refusal_totals` | `sizeRefusals` returns a non-nil map on every path, `totals := map[string]int{}` (`handler/admin_worker_sizes.go:242` early returns, `:290` in `selectSizeRefusals`) → `{}` |
+
+No exemption: `ceilings.cpu_limit_millicores`, `memory_limit_mib`, `data_gib`,
+`dind_data_gib` (null when no ceiling applies) and `ceilings.enabled_tiers` (null when the api
+does not know the tiers, `ceilingsDTO` at `handler/admin_worker_sizes.go:159-177`), and
+`read_only_reason` / `read_only_code` (null when editable) are genuinely nullable on the wire.
+`AdminWorkerSizeDTO.shipped` is `null` for an admin-added size.
+
 ## What this contract CANNOT catch
 
 - **Enum narrowing.** `Widen` maps a string-literal union to `string`, so an enum

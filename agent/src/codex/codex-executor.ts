@@ -3377,16 +3377,20 @@ export class CodexExecutor implements Executor {
       const generation = supersedePlanSummary();
       // A later accepted candidate may start fresh after a refused capture/switch.
       this.summaryLifecycleClosed = false;
+      // The callback belongs to the credential authority current when it was created: after a switch
+      // replaces it, this retired callback must not start work (summaryInputs reads the live authority).
+      const admittedAuthority = currentAuthority;
+      const authorityCurrent = (): boolean => currentAuthority === admittedAuthority;
       let flight: CodexExecutor["planFlight"];
       return planMd => {
         if (flight) return flight.done;
-        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
+        if (!summariesOn || !authorityCurrent() || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
         flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false,
           abandoned: false, closed: false, generation };
         const owned = flight;
         this.planFlight = owned;
         this.planFlights.add(owned);
-        const allowed = (): boolean => summaryAllowed() && generation === planGeneration
+        const allowed = (): boolean => authorityCurrent() && summaryAllowed() && generation === planGeneration
           && this.planFlight === owned && !owned.closed && !owned.abandoned && !owned.ctrl.signal.aborted;
         owned.done = (async () => {
           try {

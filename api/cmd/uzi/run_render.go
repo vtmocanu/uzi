@@ -602,7 +602,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	// Only the paused state is still an owner hold.
 	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
 		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) ||
-		(*r.HoldReason == holdRunOverrideUnavailable && !isRunOverrideHold(r)) {
+		(*r.HoldReason == holdRunOverrideUnavailable && !isRunOverrideHold(r)) ||
+		(*r.HoldReason == holdPhaseSwitchUnavailable && !isPhaseSwitchHold(r)) {
 		return nil
 	}
 	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
@@ -635,6 +636,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, repoAgentSourceAction(r))
 	case holdRunOverrideUnavailable:
 		clauses = append(clauses, runOverrideAction(r))
+	case holdPhaseSwitchUnavailable:
+		clauses = append(clauses, phaseSwitchAction(r))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -669,6 +672,8 @@ func holdReasonLabel(reason string) string {
 		return "repo agents unreadable"
 	case holdRunOverrideUnavailable:
 		return "model choice unavailable"
+	case holdPhaseSwitchUnavailable:
+		return "planning switch unavailable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	case holdProviderDestinationNotAllowed:
@@ -695,6 +700,19 @@ func isRunOverrideHold(r apitypes.RunDTO) bool {
 func runOverrideAction(r apitypes.RunDTO) string {
 	id := cellText(r.ID)
 	return "the run's chosen model or effort cannot run on its harness; Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice; Resume: uzi run resume " +
+		id + "; Cancel: uzi run cancel " + id
+}
+
+// isPhaseSwitchHold reports whether r is paused on a phase_switch_unavailable hold. Resume keeps the
+// marker through queued/claimed until the run starts, so only paused is an owner hold.
+func isPhaseSwitchHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdPhaseSwitchUnavailable
+}
+
+// phaseSwitchAction is the owner's next step for a phase_switch_unavailable hold (issue #3252).
+func phaseSwitchAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	return "the runtime did not switch between the planning and implementation model or effort; Resume retries on a new claim, otherwise Cancel to end the run; Resume: uzi run resume " +
 		id + "; Cancel: uzi run cancel " + id
 }
 
@@ -807,6 +825,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
 	case holdRunOverrideUnavailable:
 		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
+	case holdPhaseSwitchUnavailable:
+		return "held, " + holdReasonLabel(reason) + "; " + phaseSwitchAction(r)
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	case holdProviderDestinationNotAllowed:

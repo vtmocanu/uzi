@@ -239,13 +239,13 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     expect(restored.typeface).toBe("plex");
   });
 
-  it("sidebar_motion: defaults off, round-trips true/false, clears with null, rejects non-booleans", async () => {
+  it("sidebar_motion: defaults on, round-trips true/false, clears with null, rejects non-booleans", async () => {
     installStorage();
     let api = await reload();
 
     const initial = (await api.getMySettings()).settings;
     expect(initial.sidebar_motion).toBeNull();
-    expect(initial.effective_sidebar_motion).toBe(false);
+    expect(initial.effective_sidebar_motion).toBe(true);
 
     await api.putMySettings({ sidebar_motion: true });
     let s = (await api.getMySettings()).settings;
@@ -270,7 +270,7 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     await api.putMySettings({ sidebar_motion: null });
     s = (await api.getMySettings()).settings;
     expect(s.sidebar_motion).toBeNull();
-    expect(s.effective_sidebar_motion).toBe(false);
+    expect(s.effective_sidebar_motion).toBe(true);
 
     await expect(
       api.putMySettings({ sidebar_motion: "yes" as unknown as boolean }),
@@ -379,14 +379,14 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
       light_theme: "hall",
       dark_theme: "ember",
       typeface: "system",
-      sidebar_motion: false,
+      sidebar_motion: true,
       overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: null },
       defaults: {
         mode: "dark",
         light_theme: "hall",
         dark_theme: "ember",
         typeface: "system",
-        sidebar_motion: false,
+        sidebar_motion: true,
       },
     });
 
@@ -401,12 +401,12 @@ describe("mockApi appearance settings (PRD #1167 Lights on m2)", () => {
     expect(session.appearance.overrides.light_theme).toBe("dawn");
     expect(session.appearance.overrides.dark_theme).toBeNull();
 
-    // Sidebar motion resolves against the compiled off default and tracks the override.
+    // Sidebar motion resolves against the compiled on default and tracks the override.
     await api.putMySettings({ sidebar_motion: true });
     session = await api.me();
     expect(session.appearance.sidebar_motion).toBe(true);
     expect(session.appearance.overrides.sidebar_motion).toBe(true);
-    expect(session.appearance.defaults.sidebar_motion).toBe(false);
+    expect(session.appearance.defaults.sidebar_motion).toBe(true);
     // The deprecated trio stays coherent: resolved mode light → the resolved light slot.
     expect(session.theme).toBe("dawn");
   });

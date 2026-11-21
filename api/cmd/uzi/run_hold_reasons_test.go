@@ -94,6 +94,29 @@ func TestHoldRowRunOverrideUnavailableOnlyWhilePaused(t *testing.T) {
 	}
 }
 
+func TestHoldRowPhaseSwitchUnavailable(t *testing.T) {
+	reason := holdPhaseSwitchUnavailable
+	r := apitypes.RunDTO{ID: "run-1", Status: statusPaused, Kind: "issue", HoldReason: &reason}
+	row := holdRow(r, statusEnteredAt(r))
+	if len(row) != 2 || row[0] != "HOLD" {
+		t.Fatalf("holdRow = %v", row)
+	}
+	if !strings.HasPrefix(row[1], "planning switch unavailable · parked ") || !strings.HasSuffix(row[1], " · "+phaseSwitchAction(r)) {
+		t.Errorf("HOLD cell = %q, want the label first and the owner action last", row[1])
+	}
+}
+
+// A queued/claimed run after Resume keeps hold_reason until it starts, but it is no longer an owner hold.
+func TestHoldRowPhaseSwitchUnavailableOnlyWhilePaused(t *testing.T) {
+	reason := holdPhaseSwitchUnavailable
+	for _, status := range []string{"queued", "claimed", "running"} {
+		r := apitypes.RunDTO{ID: "run-1", Status: status, Kind: "issue", HoldReason: &reason}
+		if row := holdRow(r, time.Now()); row != nil {
+			t.Errorf("%s: holdRow = %v, want no HOLD row", status, row)
+		}
+	}
+}
+
 func TestRunOverrideNoticeCopy(t *testing.T) {
 	reason := holdRunOverrideUnavailable
 	r := apitypes.RunDTO{ID: "run-1", Status: statusPaused, Kind: "issue", HoldReason: &reason}
@@ -108,10 +131,10 @@ func TestRunOverrideNoticeCopy(t *testing.T) {
 // The set drives the default `run wait` stop and the TUI owner band and count: membership is pinned.
 func TestHoldSetStopAndBoardMembership(t *testing.T) {
 	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
-		holdProviderBindingStale: true}
+		holdPhaseSwitchUnavailable: true, holdProviderBindingStale: true}
 	wantBoard := map[string]bool{holdCredentialDisabled: true, holdCredentialsReset: true, holdProviderUnavailable: true, holdIterationExhausted: true,
 		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
-		holdProviderDestinationNotAllowed: true, holdProviderBindingStale: true}
+		holdPhaseSwitchUnavailable: true, holdProviderDestinationNotAllowed: true, holdProviderBindingStale: true}
 	for reason := range nonCompletionHolds {
 		reason := reason
 		r := apitypes.RunDTO{ID: "r1", Status: statusPaused, HoldReason: &reason}

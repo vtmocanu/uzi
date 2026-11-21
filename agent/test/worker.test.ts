@@ -1056,6 +1056,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "repo_agent_source_v1",
     "agent_source_request_v1",
     "issue_key_v1",
+    "claude_phase_models_v1",
     "claude_provider_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];

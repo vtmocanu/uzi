@@ -130,6 +130,7 @@ import type {
   AdminDeleteProductResponse,
   MintableProduct,
   EgressProfile,
+  AdminWorkerSizes,
   ProductSkills,
 } from "./apiTypes";
 
@@ -308,6 +309,8 @@ import v1WhoamiZero from "../../../fixtures/api-contract/v1_whoami.zero.json";
 import v1WhoamiFull from "../../../fixtures/api-contract/v1_whoami.full.json";
 import egressProfileZero from "../../../fixtures/api-contract/egress_profile.zero.json";
 import egressProfileFull from "../../../fixtures/api-contract/egress_profile.full.json";
+import adminWorkerSizesZero from "../../../fixtures/api-contract/admin_worker_sizes.zero.json";
+import adminWorkerSizesFull from "../../../fixtures/api-contract/admin_worker_sizes.full.json";
 import productSkillsZero from "../../../fixtures/api-contract/product_skills.zero.json";
 import productSkillsFull from "../../../fixtures/api-contract/product_skills.full.json";
 
@@ -594,6 +597,32 @@ void _releaseCheckStatusFull;
   void _egressProfileExtra;
   void _egressProfileZero;
   void _egressProfileFull;
+}
+
+// ── AdminWorkerSizes (issue #4518) ───────────────────────────────────────────
+// GET /api/admin/worker-sizes. ZeroOf exemptions: sizes, advisories, refusals and
+// refusal_totals — the handler always sends [] / {} (see the README's AdminWorkerSizes rows),
+// though json.Marshal(AdminWorkerSizesDTO{}) is a null nil-slice / nil-map. ceilings' four
+// entries, enabled_tiers, read_only_reason and read_only_code are genuinely null on the wire
+// and typed `| null`, so they need no exemption. refusals / refusal_totals are optional in TS
+// (absent from an older api) but always present in the recorded fixtures.
+{
+  const _sizesMissing: never = null as unknown as Exclude<keyof AdminWorkerSizes, keyof typeof adminWorkerSizesFull>;
+  const _sizesExtra: never = null as unknown as Exclude<keyof typeof adminWorkerSizesFull, keyof AdminWorkerSizes>;
+  type SizeRow = AdminWorkerSizes["sizes"][number];
+  type RecordedSizeRow = typeof adminWorkerSizesFull.sizes[number];
+  const _rowKeys: never = null as unknown as Exclude<keyof SizeRow, keyof RecordedSizeRow> | Exclude<keyof RecordedSizeRow, keyof SizeRow>;
+  type RecordedCeilings = typeof adminWorkerSizesFull.ceilings;
+  const _ceilingKeys: never = null as unknown as Exclude<keyof AdminWorkerSizes["ceilings"], keyof RecordedCeilings> | Exclude<keyof RecordedCeilings, keyof AdminWorkerSizes["ceilings"]>;
+  type Advisory = AdminWorkerSizes["advisories"][number];
+  type RecordedAdvisory = typeof adminWorkerSizesFull.advisories[number];
+  const _advisoryKeys: never = null as unknown as Exclude<keyof Advisory, keyof RecordedAdvisory> | Exclude<keyof RecordedAdvisory, keyof Advisory>;
+  type Refusal = NonNullable<AdminWorkerSizes["refusals"]>[number];
+  type RecordedRefusal = typeof adminWorkerSizesFull.refusals[number];
+  const _refusalKeys: never = null as unknown as Exclude<keyof Refusal, keyof RecordedRefusal> | Exclude<keyof RecordedRefusal, keyof Refusal>;
+  const _sizesZero: ZeroOf<AdminWorkerSizes, "sizes" | "advisories" | "refusals" | "refusal_totals"> = adminWorkerSizesZero;
+  const _sizesFull: Widen<AdminWorkerSizes> = adminWorkerSizesFull;
+  void [_sizesMissing, _sizesExtra, _rowKeys, _ceilingKeys, _advisoryKeys, _refusalKeys, _sizesZero, _sizesFull];
 }
 
 // ── RunMessage (M2) ─────────────────────────────────────────────────────────
@@ -918,14 +947,14 @@ void _releaseCheckStatusFull;
 // ZeroOf exemption: sidebar_token_ids and sidebar_codex_account_ids — the handler mapper
 // runs uuidStrings on both, which returns a non-nil [] (handler/user_settings.go), so the
 // wire is [] though the nil-slice zero marshals null. Every other field is typed X|null in
-// TS. cross_check_pins, judge_models, summary_models and effort_settings also exempt the Go nil-slice zero; GET always emits their cells.
+// TS. cross_check_pins, judge_models, summary_models, effort_settings, planning_models and planning_efforts also exempt the Go nil-slice zero; GET always emits their cells.
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings" | "planning_models" | "planning_efforts"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
   const _settingsUserFull: Widen<UserSettings> = settingsUserSettingsFull;
-  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings"> = settingsUserSettingsZero;
+  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings" | "planning_models" | "planning_efforts"> = settingsUserSettingsZero;
   void _settingsUserFull;
   void _settingsUserZero;
   void _userSettingsMissing;
@@ -2027,6 +2056,9 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1906 M1w: the admin egress profile. created_by/updated_by are present-as-null
   // pointers and the three slices are nil-slice nulls the handler normalizes to [].
   { stem: "egress_profile", nullable: true },
+  // issue #4518: admin_worker_sizes' sizes/advisories/refusals/refusal_totals are nil-slice and
+  // nil-map nulls the handler normalizes, and ceilings carries real nulls.
+  { stem: "admin_worker_sizes", nullable: true },
   // PRD #1909 M6: applied_at/applied_by/staged are present-as-null and applied.skills is a
   // nil-slice null in zero.json.
   { stem: "product_skills", nullable: true },

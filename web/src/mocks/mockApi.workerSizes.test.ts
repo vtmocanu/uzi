@@ -30,6 +30,7 @@ describe("mock admin worker sizes", () => {
     const api = await fresh();
     const got = await api.getAdminWorkerSizes();
     expect(got.refusals?.map((r) => [r.size, r.kind, r.worker_name])).toEqual([["m", "size_refused", "base.m-9f3c"]]);
+    expect(got.refusal_totals).toEqual({ m: 1 });
     const { workers } = await api.listWorkers();
     const w = workers.find((x) => x.id === got.refusals![0].worker_id);
     expect(w).toMatchObject({ name: "base.m-9f3c", hosted_size: "m" });
@@ -126,6 +127,21 @@ describe("mock admin worker sizes", () => {
     // The same PUT on the now-existing name edits it, as the api's does.
     const edited = await api.updateAdminWorkerSize("xs", { ...xs, data_gib: 6 });
     expect(edited.size).toMatchObject({ name: "xs", data_gib: 6, builtin: false, customized: false });
+  });
+
+  it("create is create-only: an existing name is refused 412 size_exists and left unchanged; update still edits", async () => {
+    const api = await fresh();
+    const l = (await api.getAdminWorkerSizes()).sizes.find((s) => s.name === "l")!;
+    await expect(api.createAdminWorkerSize("l", { ...l, data_gib: 40 })).rejects.toMatchObject({
+      status: 412,
+      message: "worker size l already exists",
+      body: { error: "worker size l already exists", reason: "size_exists" },
+    });
+    expect((await api.getAdminWorkerSizes()).sizes.find((s) => s.name === "l")).toEqual(l);
+    await api.createAdminWorkerSize("xs", xs);
+    await expect(api.createAdminWorkerSize("xs", { ...xs, data_gib: 9 })).rejects.toMatchObject({ status: 412, body: { reason: "size_exists" } });
+    expect((await api.getAdminWorkerSizes()).sizes.find((s) => s.name === "xs")?.data_gib).toBe(5);
+    await expect(api.updateAdminWorkerSize("l", { ...l, data_gib: 40 })).resolves.toMatchObject({ size: { name: "l", data_gib: 40 } });
   });
 
   it("refuses a malformed name, invalid values and a 17th size with the api's text", async () => {

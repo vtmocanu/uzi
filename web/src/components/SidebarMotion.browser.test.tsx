@@ -12,7 +12,7 @@ import { SIDEBAR_MOTION_ICONS } from "./sidebarMotion";
 import { ClockIcon } from "./icons";
 import type { HealthDoc } from "../lib/api";
 
-// Issue #4510: the opt-in animated sidebar icons, against the real stylesheet in Chromium.
+// Issue #4510: animated sidebar icons, against the real stylesheet in Chromium.
 // jsdom cannot run CSS animations, rasterize SVG or emulate reduced motion, so the contract
 // (gating, one-shot restart, stationary geometry, rest pixels) is proven here.
 

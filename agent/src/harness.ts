@@ -418,6 +418,13 @@ export interface RunTurnRequest {
   modelSource?: "worker_default";
   effort?: HarnessEffort;
   phase: "plan" | "implement";
+  /** PRD #3252 D8 (Claude only): withhold the prompt until the runtime's applied settings match this
+   *  requested pair; a pre-release failure throws PhaseSwitchUnverifiedError without sending a prompt.
+   *  A later contradictory init also stops the turn, but a request may already have been admitted.
+   *  Absent = today's behaviour. */
+  verifyApplied?: { model?: string; effort?: string };
+  /** Called once when the barrier's verdict admitted the turn (the owner latches "verified" on it). */
+  onPhaseVerified?: () => void;
   agents: Readonly<Record<string, HarnessAgent>>;
   leadSkills: readonly string[];
   // false suppresses attribution; true/absent preserve today's SDK default.

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { WorkerSizesCard } from "./WorkerSizesCard";
 import { api, type AdminWorkerSize, type AdminWorkerSizes } from "../../lib/api";
@@ -357,6 +357,59 @@ describe("WorkerSizesCard", () => {
     expect(within(items[3]).getByRole("link", { name: "and 2 more workers in Admin health" }).getAttribute("href")).toBe("/admin/health");
   });
 
+  describe("refusal totals", () => {
+    const r = (n: number) => ({
+      size: "l", worker_id: `w-${n}`, worker_name: `base.l-${n}`, kind: "size_refused" as const, reason: `reason ${n}`, reported_at: "2026-11-18T14:20:00Z",
+    });
+    const items = () => within(within(rowOf("L")).getByRole("list", { name: "Workers refused at size L" })).getAllByRole("listitem");
+
+    it("counts the remainder from the api's total when it is past the three details", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 7 } }));
+      const list = items();
+      expect(list).toHaveLength(4);
+      expect(within(list[3]).getByRole("link", { name: "and 4 more workers in Admin health" })).toBeTruthy();
+    });
+
+    // An older api sends details without totals: the remainder is what was sent.
+    it("falls back to the details count when the api sent no totals", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3), r(4), r(5)] }));
+      expect(within(items()[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+
+    it("falls back to the details count when totals have no entry for the size", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3), r(4), r(5)], refusal_totals: { m: 9 } }));
+      expect(within(items()[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+
+    it("never shrinks the remainder below the details sent", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3), r(4), r(5)], refusal_totals: { l: 1 } }));
+      expect(within(items()[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+
+    it("shows no more-item when the total equals the three details", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 3 } }));
+      expect(items()).toHaveLength(3);
+      expect(screen.queryByText(/more workers?/)).toBeNull();
+    });
+
+    // Above the details count, so only the integer check keeps it out (unguarded: "and 4.5 more").
+    it("ignores a total that is not a non-negative integer", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 7.5 } }));
+      expect(items()).toHaveLength(3);
+      expect(screen.queryByText(/more workers?/)).toBeNull();
+    });
+
+    // A valid size name can be an Object.prototype key; it must never read the prototype's value.
+    it("reads no total for a size named like a prototype key", () => {
+      const base = sizes();
+      const row = { ...base.sizes[0], name: "constructor", builtin: false, shipped: null, display_order: 9 };
+      const refused = [1, 2, 3, 4, 5].map((n) => ({ ...r(n), size: "constructor" }));
+      renderCard({ ...base, sizes: [...base.sizes, row], refusals: refused, refusal_totals: {} });
+      const list = within(within(rowOf("CONSTRUCTOR")).getByRole("list", { name: "Workers refused at size CONSTRUCTOR" })).getAllByRole("listitem");
+      expect(within(list[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+  });
+
   it("renders no refusal when an older api sends no refusals field", () => {
     const data = sizes();
     delete (data as Partial<AdminWorkerSizes>).refusals;
@@ -412,7 +465,7 @@ describe("WorkerSizesCard", () => {
       ["1x", "Start with a lowercase letter, then use only lowercase letters, digits or hyphens"],
       ["x_s", "Start with a lowercase letter, then use only lowercase letters, digits or hyphens"],
       ["abcdefghijklmnopq", "Use at most 16 characters"],
-      // A PUT on an existing name would edit that size, so it is refused here.
+      // An existing name is refused here for a fast answer; the api refuses it too (412).
       ["l", "A size named l already exists; edit it in the table instead"],
     ] as const) {
       fireEvent.change(input("New size name"), { target: { value: typed } });
@@ -509,6 +562,101 @@ describe("WorkerSizesCard", () => {
     expect(screen.getByText("16 of 16 sizes. At most 16 sizes: remove an added size to add another.")).toBeTruthy();
     expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
     expect(document.activeElement).not.toBe(document.body);
+  });
+
+  const fillAdd = (name: string) => {
+    fireEvent.change(input("New size name"), { target: { value: name } });
+    for (const [label, value] of [["CPU request", "1"], ["CPU limit", "2"], ["Memory request", "4"], ["Memory limit", "8"], ["Data disk", "10"], ["DinD data disk", "20"]]) {
+      fireEvent.change(input(`New size ${label} (${label.startsWith("CPU") ? "cores" : "GiB"})`), { target: { value } });
+    }
+  };
+  const sizeExists = () => new ApiError(412, "worker size xs already exists", { error: "worker size xs already exists", reason: "size_exists" });
+  const EXISTS_TEXT = "A size named xs already exists; edit it in the table instead";
+
+  it("keeps the add form and every typed value on a 412 size_exists, names the clash and re-reads", async () => {
+    mockApi.createAdminWorkerSize.mockRejectedValue(sizeExists());
+    const onChanged = renderCard();
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fillAdd("xs");
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    const form = within(screen.getByRole("form", { name: "Add a size" }));
+    expect(form.getByText(EXISTS_TEXT)).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain(EXISTS_TEXT);
+    expect(input("New size name").value).toBe("xs");
+    expect(input("New size name").getAttribute("aria-invalid")).toBe("true");
+    expect(input("New size CPU request (cores)").value).toBe("1");
+    expect(input("New size CPU limit (cores)").value).toBe("2");
+    expect(input("New size Memory request (GiB)").value).toBe("4");
+    expect(input("New size Memory limit (GiB)").value).toBe("8");
+    expect(input("New size Data disk (GiB)").value).toBe("10");
+    expect(input("New size DinD data disk (GiB)").value).toBe("20");
+    expect(screen.queryByText(/Size XS added/)).toBeNull();
+    expect(screen.queryByText(/read-only/i)).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(input("New size name")));
+  });
+
+  // The re-read resolves later, so the 412 lands while the form still sees 15 rows.
+  function DeferredHarness({ release }: { release: { run: () => void } }) {
+    const [data, setData] = useState(withAdded(...Array.from({ length: 11 }, (_, i) => `x${i}`)));
+    const full = withAdded(...Array.from({ length: 12 }, (_, i) => `x${i}`));
+    return (
+      <MemoryRouter>
+        <WorkerSizesCard
+          data={data}
+          loadError=""
+          onChanged={() => new Promise<void>((resolve) => { release.run = () => { setData(full); resolve(); }; })}
+        />
+      </MemoryRouter>
+    );
+  }
+
+  const atCapAfter412 = async () => {
+    mockApi.createAdminWorkerSize.mockRejectedValue(sizeExists());
+    const release = { run: () => {} };
+    render(<DeferredHarness release={release} />);
+    expect(screen.getByText("15 of 16 sizes.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fillAdd("xs");
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    await waitFor(() => expect(screen.getByRole("form", { name: "Add a size" }).textContent).toContain(EXISTS_TEXT));
+    act(() => release.run());
+    return within(screen.getByRole("form", { name: "Add a size" }));
+  };
+
+  it("keeps the form, a disabled submit and focus on the name when the 412 re-read lands at the cap; Cancel then lands on the cap note", async () => {
+    const form = await atCapAfter412();
+    expect(form.getByText("16 of 16 sizes. At most 16 sizes: remove an added size to add another.")).toBeTruthy();
+    expect((form.getByRole("button", { name: /^Add size/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(input("New size name").value).toBe("xs");
+    expect(document.activeElement).toBe(input("New size name"));
+
+    fireEvent.click(form.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    const note = screen.getByText("16 of 16 sizes. At most 16 sizes: remove an added size to add another.");
+    expect(document.activeElement).toBe(note);
+  });
+
+  it("Escape in the form at the cap also lands on the cap note", async () => {
+    await atCapAfter412();
+    fireEvent.keyDown(input("New size name"), { key: "Escape" });
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByText("16 of 16 sizes. At most 16 sizes: remove an added size to add another."));
+  });
+
+  it("clears a stale already-exists name error when a size is removed", async () => {
+    mockApi.createAdminWorkerSize.mockRejectedValue(sizeExists());
+    mockApi.deleteAdminWorkerSize.mockResolvedValue({ deleted: "x0" });
+    renderCard(withAdded("x0"));
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fillAdd("xs");
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    expect(await screen.findAllByText(EXISTS_TEXT)).not.toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Remove size X0" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(mockApi.deleteAdminWorkerSize).toHaveBeenCalledWith("x0"));
+    await waitFor(() => expect(screen.queryByText(EXISTS_TEXT)).toBeNull());
+    expect(input("New size name").getAttribute("aria-invalid")).toBeNull();
   });
 
   it("moves focus to the first invalid input when local validation refuses a submit", async () => {

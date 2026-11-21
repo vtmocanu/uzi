@@ -44,3 +44,17 @@ func ptrOrEmpty(p *string) string {
 	}
 	return *p
 }
+
+func TestPlanningEffortCellFollowsLeadTemplate(t *testing.T) {
+	level := "low"
+	lead := workersvc.LeadPrediction{Effort: &level, EffortSource: "template", TemplateEffort: &level}
+	inherited := planningEffortCell(lead, nil)
+	if ptrOrEmpty(inherited.ResolvedEffort) != level || inherited.Source != "template" || inherited.DefaultEffort != level {
+		t.Fatalf("planning inheritance lost the lead template: %+v", inherited)
+	}
+	planning := "high"
+	pinned := planningEffortCell(lead, &planning)
+	if ptrOrEmpty(pinned.ResolvedEffort) != planning || pinned.Source != "user_planning_default" || pinned.DefaultEffort != level {
+		t.Fatalf("planning pin must win while its default follows the lead: %+v", pinned)
+	}
+}
