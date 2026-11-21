@@ -58,15 +58,17 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 		}
 		exec(`INSERT INTO runs (id,user_id,repo_id,issue_iid,issue_title,issue_description,status,kind,fail_origin,finished_at,status_since,target_run_id) VALUES ($1,$2,$3,$4,'t','d',$5,$6,$7,$8,$9,$10)`, id, user, rid, issue, status, kind, origin, finished, end, target)
 	}
-	// The higher UUID wins the end-time tie; its missing timestamp and origin
-	// exercise both historical fallbacks. No run_usage row is ever inserted.
+	// These two failures tie at `at` but are older than the last failure (at+3h, below), so
+	// they only count toward failed/finished totals. No run_usage row is ever inserted.
 	lower := uuid.MustParse("00000000-0000-4000-8000-000000002399")
 	winner := uuid.MustParse("ffffffff-ffff-4fff-8fff-ffffffff2399")
 	seed(lower, owner, "failed", "issue", "agent_failure", at, false, nil)
 	seed(winner, owner, "failed", "issue", nil, at, true, nil)
 	seed(uuid.New(), owner, "completed", "issue", nil, at.Add(time.Hour), true, nil)
 	seed(uuid.New(), owner, "completed", "issue", nil, at.Add(-time.Hour), false, nil)
-	seed(uuid.New(), owner, "completed", "issue", nil, at, false, nil) // strict greater-than
+	// Completed at exactly the last failure's end time (at+3h): strict greater-than, so it
+	// does not count as completed since the last failure.
+	seed(uuid.New(), owner, "completed", "issue", nil, at.Add(3*time.Hour), false, nil)
 	seed(uuid.New(), clean, "completed", "issue", nil, at.Add(4*time.Hour), false, nil)
 	for _, tc := range []struct {
 		status, kind string
@@ -74,8 +76,9 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 		target       any
 		end          time.Duration
 	}{
-		{"cancelled", "issue", nil, nil, 3 * time.Hour}, {"failed", "issue", "plan_rejected", nil, 3 * time.Hour},
-		{"failed", "issue", "base_diverged", nil, 3 * time.Hour},
+		// Controls end after the last failure (at+3h), so each would win if not excluded.
+		{"cancelled", "issue", nil, nil, 5 * time.Hour}, {"failed", "issue", "plan_rejected", nil, 5 * time.Hour},
+		{"failed", "issue", "base_diverged", nil, 5 * time.Hour},
 		// Chat is the only kind outside the outcome population (issue #4577): neither chat row
 		// may become the last failure or count as completed after it.
 		{"failed", "chat", "agent_failure", nil, 8 * time.Hour}, {"completed", "chat", nil, nil, 8 * time.Hour},
@@ -85,7 +88,7 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 		seed(uuid.New(), owner, tc.status, tc.kind, tc.origin, at.Add(tc.end), false, tc.target)
 	}
 	// Judge and cross_check children count as outcomes (issue #4577). The failed judge and
-	// failed cross_check child tie at the newest end time; the higher UUID (the judge, whose
+	// failed cross_check child tie at the last failure's end time (at+3h); the higher UUID (the judge, whose
 	// missing finished_at and NULL origin exercise both fallbacks) wins the tie.
 	judgeWinner := uuid.MustParse("ffffffff-ffff-4fff-8fff-ffffffff2398")
 	seed(judgeWinner, owner, "failed", "judge", nil, at.Add(3*time.Hour), true, lower)

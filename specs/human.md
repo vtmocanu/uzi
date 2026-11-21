@@ -1971,8 +1971,7 @@ Design record: issue #4335 (epic #3873); target mock `prds/mockups/3873-overview
 Design record: issue #4209 (epic #3873).
 
 - Usage Runs counts only usage-bearing issue, task, prompt, job, and self_improve runs. Chat, judge, cross_check, mr_rework, and every ci_fix are excluded. Manual and automatic CI fixes remain indistinguishable without an immutable origin field. (AI-synced 2026-11-13)
-- Superseded by #4577: usage outcomes now count every terminal run kind except chat; Runs stays primary-only. (AI-synced 2026-11-21)
-- Usage outcomes count terminal primary work runs directly, including those without usage. Their failure details and both windows use the same primary-kind population. (AI-synced 2026-11-13)
+- Usage outcomes count terminal primary work runs directly, including those without usage. Their failure details and both windows use the same primary-kind population. (AI-synced 2026-11-13) Superseded by #4577: outcomes now count every terminal run kind except chat; Runs stays primary-only. (AI-synced 2026-11-21)
 - Token and cost totals and subscription/unreported disclosure counts retain all non-chat helper spend. PR counts and cost per PR are unchanged. The API field names and JSON shape stay the same, and no stored run or usage values are rewritten. The Overview card and the CLI explain the scope; the outcome bar carries its own caption. (AI-synced 2026-11-21)
 
 ## Feature #4577: Outcomes count every run kind except chat

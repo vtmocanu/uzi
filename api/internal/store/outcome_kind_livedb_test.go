@@ -53,6 +53,8 @@ type okRun struct {
 	patch   bool
 	harness string
 	id      uuid.UUID
+	noUsage bool  // seeded without a run_usage row (factor 0)
+	factor  int64 // usage factor seeded for the run; 0 = no run_usage row
 }
 
 // okInsideWeek reports whether a seeded age falls inside the seven-day window.
@@ -90,8 +92,11 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 	var factor int64
 	seed := func(r okRun) uuid.UUID {
 		t.Helper()
-		factor++
-		r.id = f.seed(pkRun{user: users[r.u], kind: r.kind, status: r.status, origin: r.origin, age: r.age, patch: r.patch, harness: r.harness, factor: factor})
+		if !r.noUsage {
+			factor++
+			r.factor = factor
+		}
+		r.id = f.seed(pkRun{user: users[r.u], kind: r.kind, status: r.status, origin: r.origin, age: r.age, patch: r.patch, harness: r.harness, factor: r.factor})
 		recs = append(recs, r)
 		return r.id
 	}
@@ -151,6 +156,9 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 		seed(okRun{u: 1, kind: kind, status: "failed", origin: "agent_failure", age: "7 days 1 hour"})
 		seed(okRun{u: 1, kind: kind, status: "cancelled", age: "6 days 23 hours"})
 	}
+	// A failed helper with no run_usage row: an outcome (finished, failed, fail origin) that
+	// contributes nothing to the usage figures.
+	seed(okRun{u: 1, kind: "ci_fix", status: "failed", origin: "agent_failure", age: "1 day", noUsage: true})
 	// User 2: helper-heavy.
 	for _, kind := range []string{"judge", "cross_check", "mr_rework", "ci_fix", "chat"} {
 		seed(okRun{u: 2, kind: kind, status: "failed", origin: "agent_failure", age: "1 day"})
@@ -320,14 +328,10 @@ func TestOutcomeKindRunOutcomesLiveDB(t *testing.T) {
 	uwant := map[int]*uf{0: {}, 1: {}, 2: {}}
 	var fac uf
 	for _, r := range recs {
-		if r.id == f.first || r.kind == "chat" { // the fixture issue has no usage row; chat usage is excluded
+		if r.factor == 0 || r.kind == "chat" { // no usage row (fixture issue, seeded helper); chat usage is excluded
 			continue
 		}
-		// seed() numbered the usage factor in insertion order, so recover it from run_usage.
-		var in int64
-		if err := f.tx.QueryRow(ctx, `SELECT input_tokens FROM run_usage WHERE run_id = $1`, r.id).Scan(&in); err != nil {
-			t.Fatal(err)
-		}
+		in := r.factor
 		h := r.harness
 		if h == "" {
 			h = "claude"
