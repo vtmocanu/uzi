@@ -158,7 +158,8 @@ func isDeadlock(err error) bool {
 
 // TestOnceFireAdmissionRecordsRunAndLedgerLiveDB: an admission writes the run, the header (with the
 // passed cap) and a ledger row whose run_uuid is that run, through both scheduled seams; a repeat of the
-// same issue and a spent cap create nothing; nil progress writes no progress rows at all.
+// same issue and a spent cap create nothing. (nil progress writing no progress rows is asserted in
+// TestOnceFireNilProgressWritesNothingLiveDB.)
 func TestOnceFireAdmissionRecordsRunAndLedgerLiveDB(t *testing.T) {
 	f := newOnceFx(t)
 
@@ -411,7 +412,11 @@ func TestOnceFireConcurrentAdmissionsAtCapOneLiveDB(t *testing.T) {
 	}
 }
 
-// TestOnceFireConcurrentSameIssueLiveDB: concurrent admissions of ONE issue record it once.
+// TestOnceFireConcurrentSameIssueLiveDB is a smoke test of concurrent same-issue creates: exactly one
+// run and one ledger row result. It cannot fail on the ledger: the pre-existing branch lock
+// serializes the creates (losers get ErrBranchInUse / ErrActiveRunExists) before the ledger is read.
+// Ledger dedupe is pinned by TestOnceFireAdmissionRecordsRunAndLedgerLiveDB (repeat of a recorded issue)
+// and TestOnceFireLedgerPkeyConflictMapsToRecordedLiveDB (the primary-key race).
 func TestOnceFireConcurrentSameIssueLiveDB(t *testing.T) {
 	f := newOnceFx(t)
 	iid := f.issue(t)

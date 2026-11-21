@@ -205,6 +205,29 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("once_fire_ledger_only", func(t *testing.T) {
+		// Pins the schedule_once_fire_runs clause of RepoStoresIssueNumber on its own: the only
+		// stored issue number for this repo is one ledger row. Its parent schedule is a prompt
+		// schedule (no issue_iid) and the repo has no issues or runs rows, so no other clause
+		// can report true.
+		repo, err := q.UpsertRepo(ctx, store.UpsertRepoParams{ConnectionID: f.forgeConn, ForgeProjectID: 50, PathWithNamespace: "o/ledger", WebUrl: "https://example.com/o/ledger"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stores, err := q.RepoStoresIssueNumber(ctx, repo.ID); err != nil || stores {
+			t.Fatalf("RepoStoresIssueNumber on an empty repo: %v %v", stores, err)
+		}
+		// The guard refuses a ledger insert while the repo awaits its first enable.
+		itlExec(t, pool, `UPDATE repos SET enabled=true WHERE id=$1`, repo.ID)
+		itlExec(t, pool, `WITH s AS (INSERT INTO run_schedules (user_id,repo_id,target,prompt,timing,run_at) VALUES ($1,$2,'prompt','p','once',now()) RETURNING id),
+			h AS (INSERT INTO schedule_once_fires (schedule_id,fire_epoch) SELECT id,0 FROM s RETURNING schedule_id)
+			INSERT INTO schedule_once_fire_runs (schedule_id,fire_epoch,repo_id,issue_iid,issue_title,web_url,run_uuid) SELECT schedule_id,0,$2,5,'t','u',gen_random_uuid() FROM h`, f.user, repo.ID)
+		stores, err := q.RepoStoresIssueNumber(ctx, repo.ID)
+		if err != nil || !stores {
+			t.Fatalf("RepoStoresIssueNumber with only a once-fire ledger row: %v %v", stores, err)
+		}
+	})
+
 	t.Run("continued_issue_iid", func(t *testing.T) {
 		// A task run continues an issue through continued_issue_iid while issue_iid stays
 		// NULL (runs_continued_issue_shape), so this column alone carries the number.

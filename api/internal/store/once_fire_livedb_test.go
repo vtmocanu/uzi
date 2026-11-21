@@ -198,6 +198,19 @@ func TestOnceFireEpochTriggerMatrixLiveDB(t *testing.T) {
 	always := func(string) bool { return true }
 	// revival: the status arm fires only on a real transition into active.
 	revival := func(state string) bool { return state != "active" }
+	// All four guarded writers (queries/once_fire.sql, credential_disabled.sql) require
+	// status='active' on a once row at the claimed epoch 0, so the write lands (1 row) only on
+	// an active row and an error/fired row is skipped (0 rows): "no bump" is then not vacuous.
+	wantGuardedRows := func(t *testing.T, name string, s store.RunSchedule, got int64) {
+		t.Helper()
+		want := int64(0)
+		if s.Status == "active" {
+			want = 1
+		}
+		if got != want {
+			t.Fatalf("%s on a %s once row matched %d rows, want %d", name, s.Status, got, want)
+		}
+	}
 
 	cases := []c{
 		{"enabled-only pause", never, func(t *testing.T, s store.RunSchedule) {
@@ -219,26 +232,34 @@ func TestOnceFireEpochTriggerMatrixLiveDB(t *testing.T) {
 			f.exec(t, `UPDATE run_schedules SET sibling_group_id = NULL WHERE id=$1`, s.ID)
 		}},
 		{"held write", never, func(t *testing.T, s store.RunSchedule) {
-			if _, err := f.q.RecordScheduleHeldFire(f.ctx, store.RecordScheduleHeldFireParams{ID: s.ID, LastFire: []byte(`{"matched":0}`), FireEpoch: 0}); err != nil {
+			n, err := f.q.RecordScheduleHeldFire(f.ctx, store.RecordScheduleHeldFireParams{ID: s.ID, LastFire: []byte(`{"matched":0}`), FireEpoch: 0})
+			if err != nil {
 				t.Fatal(err)
 			}
+			wantGuardedRows(t, "RecordScheduleHeldFire", s, n)
 		}},
 		{"partial write", never, func(t *testing.T, s store.RunSchedule) {
-			if _, err := f.q.RecordOnceFirePartial(f.ctx, store.RecordOnceFirePartialParams{ID: s.ID, LastFire: []byte(`{"matched":1}`), FireEpoch: 0}); err != nil {
+			n, err := f.q.RecordOnceFirePartial(f.ctx, store.RecordOnceFirePartialParams{ID: s.ID, LastFire: []byte(`{"matched":1}`), FireEpoch: 0})
+			if err != nil {
 				t.Fatal(err)
 			}
+			wantGuardedRows(t, "RecordOnceFirePartial", s, n)
 		}},
 		{"guarded advance", never, func(t *testing.T, s store.RunSchedule) {
-			if _, err := f.q.AdvanceOnceScheduleGuarded(f.ctx, store.AdvanceOnceScheduleGuardedParams{
+			n, err := f.q.AdvanceOnceScheduleGuarded(f.ctx, store.AdvanceOnceScheduleGuardedParams{
 				ID: s.ID, FireEpoch: 0, Status: "fired", LastFire: []byte(`{"matched":1}`),
-				LastFiredAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}); err != nil {
+				LastFiredAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}})
+			if err != nil {
 				t.Fatal(err)
 			}
+			wantGuardedRows(t, "AdvanceOnceScheduleGuarded", s, n)
 		}},
 		{"guarded park", never, func(t *testing.T, s store.RunSchedule) {
-			if _, err := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: s.ID, FireEpoch: 0}); err != nil {
+			n, err := f.q.ParkScheduleGuarded(f.ctx, store.ParkScheduleGuardedParams{ID: s.ID, FireEpoch: 0})
+			if err != nil {
 				t.Fatal(err)
 			}
+			wantGuardedRows(t, "ParkScheduleGuarded", s, n)
 		}},
 		{"secret delete SET NULL", never, func(t *testing.T, s store.RunSchedule) {
 			secret := uuid.New()
