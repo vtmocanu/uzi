@@ -264,7 +264,7 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
    **Codex effort**, or restrict tools.
    Leave either harness on **Default** (effort: **Default · follows the run's
    effort**) so a subagent follows the lead on that harness. **Use the run's resolved model for subagents too** on a schedule overrides
-   these pins.
+   these model pins; effort pins are kept.
 4. The live Markdown preview exports the Claude definition, including its
    Claude pin. The Codex pin is saved separately.
 

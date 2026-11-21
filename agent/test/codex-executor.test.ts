@@ -6845,10 +6845,16 @@ describe("CodexExecutor: template effort pins on delegated children (issue #3258
     assert.ok(!text.includes("ultra-secret"), "the raw value is never echoed");
   });
 
-  it("the schedule model override clears the child's model but keeps its effort pin", async () => {
+  it("the schedule model override keeps the child's effort pin", async () => {
     const { turns } = await delegate([lead, { ...coder("high"), model: "gpt-6-luna" }],
       { default_effort: "medium", override_subagent_model: true });
     assert.equal(rec(turns[1]!.params).effort, "high");
+  });
+
+  it("a non-string effort on the wire is no pin: the child inherits and no notice is emitted", async () => {
+    const { turns, emitted } = await delegate([lead, { ...coder(), effort: 7 as unknown as string }], { default_effort: "medium" });
+    assert.equal(rec(turns[1]!.params).effort, "medium");
+    assert.equal(noticesFor(emitted).length, 0);
   });
 
   it("a valid pin or no pin emits no notice", async () => {

@@ -3115,8 +3115,8 @@ export class SdkExecutor implements Executor {
       // `assembled.subagents` — because the repo-source path's defs come from the repo
       // roster and are absent from `assembled.subagents`, so reusing the plan map would
       // miss every repo name and mislabel a write-capable repo subagent read-only.
-      // `selectedSubagents` is pre-strip on both sources (own: effort-filled copies of the assembled defs;
-      // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
+      // `selectedSubagents` is pre-strip on both sources (effort-filled copies of the assembled
+      // or freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
       drive.enableImplementationSignals();
       const implementConfig: ClaudeTurnConfig = {
