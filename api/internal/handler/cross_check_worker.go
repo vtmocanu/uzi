@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -120,6 +121,10 @@ func (req *crossCheckVerdictRequest) UnmarshalJSON(raw []byte) error {
 }
 
 func crossCheckError(w http.ResponseWriter, err error) {
+	if errors.Is(err, workersvc.ErrCrossCheckCandidateInvalid) {
+		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
+		return
+	}
 	if errors.Is(err, workersvc.ErrCrossCheckRefused) {
 		reason := "cross_check_refused"
 		switch {
@@ -134,6 +139,27 @@ func crossCheckError(w http.ResponseWriter, err error) {
 		return
 	}
 	httpx.Error(w, http.StatusInternalServerError, "cross-check failed")
+}
+
+// cloneCandidateSlices gives a normalization call its own capability and tool slices, because
+// NormalizePlanCrossCheckCandidate rewrites them in place.
+func cloneCandidateSlices(c workersvc.PlanCrossCheckCandidate) workersvc.PlanCrossCheckCandidate {
+	c.RequiredCapabilities = append([]string(nil), c.RequiredCapabilities...)
+	c.RequiredTools = append([]string(nil), c.RequiredTools...)
+	return c
+}
+
+func withEmptyMilestones(c workersvc.PlanCrossCheckCandidate) workersvc.PlanCrossCheckCandidate {
+	c = cloneCandidateSlices(c)
+	c.Milestones = json.RawMessage("[]")
+	return c
+}
+
+// planCandidateInvalid reports whether a normalized plan candidate fails the boundary checks.
+func planCandidateInvalid(c workersvc.PlanCrossCheckCandidate, normalizeErr error) bool {
+	return normalizeErr != nil || c.PlanMd == "" || len(c.BaseCommit) != 40 ||
+		strings.Trim(c.BaseCommit, "0123456789abcdefABCDEF") != "" ||
+		(c.SizeClass != "s" && c.SizeClass != "m" && c.SizeClass != "l")
 }
 
 func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Request) {
@@ -190,13 +216,36 @@ func (h *Handler) WorkerSubmitPlanCrossCheck(w http.ResponseWriter, r *http.Requ
 		httpx.ErrorReason(w, http.StatusBadRequest, "candidate exceeds limit", "candidate_too_large")
 		return
 	}
-	c, normalizeErr := workersvc.NormalizePlanCrossCheckCandidate(c)
-	if normalizeErr != nil || c.PlanMd == "" || len(c.BaseCommit) != 40 ||
-		strings.Trim(c.BaseCommit, "0123456789abcdefABCDEF") != "" ||
-		(c.SizeClass != "s" && c.SizeClass != "m" && c.SizeClass != "l") {
-		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
-		return
+	// Today's path first: a candidate whose milestones normalize is passed on unchanged for every
+	// lead kind. Only when it fails does the lead kind matter: a non-issue lead has no milestones
+	// to check, so the candidate is re-validated with milestones dropped.
+	full, fullErr := workersvc.NormalizePlanCrossCheckCandidate(cloneCandidateSlices(c))
+	if planCandidateInvalid(full, fullErr) {
+		pn, pErr := workersvc.NormalizePlanCrossCheckCandidate(withEmptyMilestones(c))
+		if planCandidateInvalid(pn, pErr) {
+			httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
+			return
+		}
+		if h.wsvc == nil {
+			// No service to resolve the lead kind: keep today's rejection.
+			httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
+			return
+		}
+		leadKind, kindErr := h.wsvc.PlanCrossCheckLeadKind(r.Context(), worker, id)
+		if kindErr != nil && !errors.Is(kindErr, workersvc.ErrCrossCheckRefused) {
+			crossCheckError(w, workersvc.ErrCrossCheckRefused)
+			return
+		}
+		if kindErr != nil || leadKind == runkind.Issue {
+			// Unowned (the service refuses ownership) or an issue lead: today's rejection.
+			httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
+			return
+		}
+		// Keep the raw milestones so the service can derive the legacy retry identity.
+		pn.Milestones = c.Milestones
+		full = pn
 	}
+	c = full
 	round := int32(1)
 	if req.Round != nil {
 		round = *req.Round

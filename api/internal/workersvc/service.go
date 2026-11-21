@@ -2258,6 +2258,9 @@ type Service struct {
 	// inserted in the open transaction, right before that transaction's COMMIT, on every
 	// transactional create path. Nil in production.
 	createBeforeCommitHook func(run store.Run)
+	// planCrossCheckAfterPreflightHook is a test-only seam in SubmitPlanCrossCheck: it runs right
+	// after the preflight transaction commits, before the checker child is created. Nil in production.
+	planCrossCheckAfterPreflightHook func()
 	// reconcileBeforeCommitHook is a test seam in reconcileRunMRGated (issue #4488): it runs after
 	// the gated ReconcileRunMR UPDATE, before that transaction's COMMIT. Nil in production.
 	reconcileBeforeCommitHook func(runID uuid.UUID)
