@@ -41,6 +41,8 @@ interface HoldOptions {
   /** Reclaim of an earlier flight: its run id, so the retained clone is the same run's. */
   runId?: string;
   iid: number;
+  /** Queue an owner cancel input while the nth (1-based) hold request is in flight. */
+  cancelDuringPost?: number;
 }
 
 const IMPLEMENT_HELD = {
@@ -78,6 +80,7 @@ async function runHold(opts: HoldOptions) {
       phase: args.phase, generation: args.claimGeneration, ...(args.head !== undefined ? { head: args.head } : {}),
       sawStatus: api.messages(runId).some((m) => PAUSED_TEXT.test(String((m.payload as { text?: unknown } | undefined)?.text ?? ""))),
     });
+    if (opts.cancelDuringPost === posts.length) api.setInputs(runId, [{ id: 1, kind: "cancel" }]);
     return opts.post[Math.min(posts.length, opts.post.length) - 1]!;
   };
   if (opts.ownership) {
@@ -96,10 +99,10 @@ async function runHold(opts: HoldOptions) {
   } finally {
     (client as unknown as { requestPhaseSwitchHold: unknown }).requestPhaseSwitchHold = original;
   }
-  const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+  const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);  const cancelReports = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed" && s.body.failure_reason === "run cancelled").length;
   const feed = api.messages(claim.run_id).map((m) => String((m.payload as { text?: unknown } | undefined)?.text ?? ""));
   return {
-    runId: claim.run_id, order, posts, runs, ownershipReads: () => ownershipReads, states, feed, elapsedMs: Date.now() - t0,
+    runId: claim.run_id, order, posts, runs, cancelReports, ownershipReads: () => ownershipReads, states, feed, elapsedMs: Date.now() - t0,
     finished: () => finished, cloneKept: fs.existsSync(worktreeDirFor(opts.iid)),
   };
 }
@@ -142,7 +145,7 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       iid: 32524, post: [held],
       held: { cause: "no_characterized_expectation", phase: "implement", requested: { model: "opusplan" }, observed: {} },
     });
-    assert.ok(deterministic.feed.includes("Paused: this worker cannot verify a switch to opusplan. Clear the Claude planning setting, or set an explicit model and effort, then Resume; Cancel ends the run."), deterministic.feed.join(" | "));
+    assert.ok(deterministic.feed.includes("Paused: this worker cannot verify a switch to opusplan. Choose a supported model (opus, sonnet, haiku, fable) or a full model id, or clear the Claude planning setting, then Resume; Cancel ends the run."), deterministic.feed.join(" | "));
     const transient = await runHold({
       iid: 32525, post: [held],
       held: { cause: "timeout", phase: "implement", requested: { model: "sonnet" }, observed: {} },
@@ -173,6 +176,8 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       ownership: [ownRow(1, { status: "queued", hold_reason: PHASE_SWITCH_HOLD_REASON })],
     });
     assert.equal(r.posts.length, 1, "no post after the observation");
+    assert.equal(r.ownershipReads(), 1, "the queued observation settled the outcome at once");
+    assert.ok(r.elapsedMs < 1_500, `resumed is recognised promptly, not at the hold deadline (${r.elapsedMs} ms)`);
     assert.equal(r.runs, 1);
     assert.deepEqual(terminal(r.states), []);
     assert.deepEqual([...new Set(r.states)], ["running"], "no report changed the row after the observation");
@@ -189,6 +194,8 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       ownership: [ownRow(1, { status: "queued", hold_reason: PHASE_SWITCH_HOLD_REASON })],
     });
     assert.equal(r.posts.length, 1);
+    assert.equal(r.ownershipReads(), 1, "one read confirmed it");
+    assert.ok(r.elapsedMs < 1_500, `confirmed promptly, not at the hold deadline (${r.elapsedMs} ms)`);
     assert.deepEqual(terminal(r.states), []);
   });
 
@@ -222,7 +229,6 @@ describe("phase-switch hold (issue #3252 m4)", () => {
     ["ownership 404", { status: 404 }],
     ["the claim released", ownRow(1, { claim_released: true })],
     ["a different claim generation", ownRow(2)],
-    ["a cancellation request", ownRow(1, { cancellation_requested: true })],
     ["a terminal status", ownRow(1, { status: "completed" })],
   ] as Array<[string, Own]>) {
     it(`definitive non-live (${name}) stops at once: one post, one read, no report`, async () => {
@@ -231,8 +237,37 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       assert.equal(r.ownershipReads(), 1);
       assert.deepEqual(terminal(r.states), []);
       assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+      assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), "the Paused line was posted");
+      assert.ok(r.feed.includes("The pause could not be confirmed, so the run is not paused. This worker keeps the work."),
+        `the feed corrects the Paused line: ${r.feed.join(" | ")}`);
     });
   }
+
+  it("an owner Cancel queued during an unknown hold request reports cancelled and cleans up like any cancel", async () => {
+    const r = await runHold({ iid: 32560, post: [unknown], cancelDuringPost: 1, ownership: [ownRow(1)] });
+    assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
+    assert.equal(r.cloneKept, false, "the normal cancelled cleanup removed the clone");
+    assert.ok(!r.feed.includes("The pause could not be confirmed, so the run is not paused. This worker keeps the work."));
+    assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+  });
+
+  it("an ownership read naming a cancellation request reports cancelled and cleans up like any cancel", async () => {
+    const r = await runHold({
+      iid: 32561, post: [unknown], cancelDuringPost: 1,
+      ownership: [ownRow(1, { cancellation_requested: true })],
+    });
+    assert.ok(r.ownershipReads() >= 1);
+    assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
+    assert.equal(r.cloneKept, false, "the normal cancelled cleanup removed the clone");
+    assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
+  });
+
+  it("a plan-phase hold interrupted by an owner Cancel also reports cancelled", async () => {
+    const err = new PhaseSwitchUnverifiedError("model_mismatch", { model: "opus", effort: "high" }, { model: "claude-sonnet-5-5", effort: "high" });
+    const r = await runHold({ iid: 32562, throws: err, post: [unknown], cancelDuringPost: 1, ownership: [ownRow(1)] });
+    assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
+    assert.equal(r.cloneKept, false);
+  });
 });
 
 describe("WorkerClient.requestPhaseSwitchHold classification (issue #3252 m4)", () => {

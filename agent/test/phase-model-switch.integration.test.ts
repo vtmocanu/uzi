@@ -115,6 +115,9 @@ test("Claude phase case 9: init precedes requests but is not a prompt or abort a
 
 // PRD #3252 m4 (D8): the pin-sensitivity characterization behind claude-canonical-models.ts. Each alias
 // is driven as a RESUMED turn with the prompt withheld, the way the production barrier runs it.
+// A non-default explicit effort, so an alias that honours an explicit effort is told apart from one that
+// merely applies its own default.
+const EXPLICIT_EFFORT = "low" as const;
 const CHARACTERIZED_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 interface Characterization {
   hasGetSettings: boolean;
@@ -124,7 +127,7 @@ interface Characterization {
   arrivalsWhileWithheld: number;
   failure: string | undefined;
 }
-async function characterize(model: string, effort: "high" | undefined, resume: string): Promise<Characterization> {
+async function characterize(model: string, effort: "low" | "high" | undefined, resume: string): Promise<Characterization> {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   async function* prompt(): AsyncGenerator<SDKUserMessage> {
@@ -150,7 +153,7 @@ test("Claude phase characterization: canonical ids and omitted-effort defaults m
   const observed: Record<string, { model: unknown; effort: unknown; omittedEffort: unknown; wireModel: unknown; wireEffort: unknown }> = {};
   const characterized = new Set<string>();
   for (const alias of CHARACTERIZED_ALIASES) {
-    const withEffort = await characterize(alias, "high", seed.session);
+    const withEffort = await characterize(alias, EXPLICIT_EFFORT, seed.session);
     const omitted = await characterize(alias, undefined, seed.session);
     const applied = (withEffort.settings as { applied?: { model?: unknown; effort?: unknown } } | undefined)?.applied;
     const appliedOmitted = (omitted.settings as { applied?: { model?: unknown; effort?: unknown } } | undefined)?.applied;
@@ -159,8 +162,10 @@ test("Claude phase characterization: canonical ids and omitted-effort defaults m
     assert.equal(withEffort.hasGetSettings, true, `${alias}: getSettings answers while the prompt is withheld`);
     assert.equal(withEffort.arrivalsWhileWithheld, 0, `${alias}: no provider request while the prompt is withheld`);
     assert.equal(omitted.arrivalsWhileWithheld, 0, `${alias}: no provider request while the prompt is withheld (omitted effort)`);
+    assert.equal(omitted.wireEffort, appliedOmitted?.effort,
+      `${alias}: the first wire request's effort equals the applied omitted-effort default`);
     if (typeof applied?.model === "string" && withEffort.failure === undefined && applied.model === withEffort.wireModel
-        && applied.effort === "high" && withEffort.wireEffort === "high") characterized.add(alias);
+        && applied.effort === EXPLICIT_EFFORT && withEffort.wireEffort === EXPLICIT_EFFORT) characterized.add(alias);
   }
   console.log(`PHASE_CLAUDE_CANONICAL ${JSON.stringify(observed)}`);
   assert.deepEqual([...characterized].sort(), Object.keys(CLAUDE_CANONICAL_MODELS).sort(),
