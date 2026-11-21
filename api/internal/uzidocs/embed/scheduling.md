@@ -388,6 +388,12 @@ The Anthropic token's default option reads `Default · worker's token (worker
 binding)`, and the auto-rework inherit option reads `Default · on (your
 setting)` or `Default · off (your setting)`.
 
+A model a schedule pins also applies while a Claude run plans: it wins over
+your [planning model](./worker-model.md#planning-model-and-effort) in both the
+planning and implementation phases, so a pinned schedule never switches models
+at plan approval. A schedule left on **Default** uses your planning setting
+for the plan phase and your worker model afterwards.
+
 Schedule rows and job catalog cards show a model chip: `model: default`, or
 `model: <value> · pinned` when the schedule pins a model. Rows add `+ agents`
 when the subagent toggle is on. Your own schedule rows with no model pin also
@@ -558,7 +564,13 @@ refusal is recorded as a `no_usable_credential` skip.
 | `self_improve` | As above, and a Claude run spends the credential of your Judge binding, not a worker's and not a per-schedule override. The credential source is `token_override` for a pinned Judge token, `auto_selection` for an automatic Judge binding (an empty pool falls back to your default, shown as `owner_default`), and `owner_default` for the default binding. The notes carry `token_fixed` unless the binding is automatic. No token id or label is shown. |
 
 `worker_model`, `worker_effort`, `credential` and `subagents` are those of
-the chosen harness. A Codex run accepts only the curated model pins, so a
+the chosen harness. On a Claude fire where your
+[planning settings](./worker-model.md#planning-model-and-effort) apply, the
+preview also carries `plan_phase` (`model`, `effort`, `model_source`,
+`effort_source`, each omitted when absent), per alternative when the harness is
+chosen at creation; see [Effective
+settings](./configuration.md#where-each-value-comes-from). A schedule's model
+pin is frozen into both phases, so the planning model then yields to it. A Codex run accepts only the curated model pins, so a
 model pin it cannot run is not used: the cell shows the default model, the
 pin appears as `ignored` (with source `schedule_pin`) and the notes carry
 `schedule_pin_ignored`.

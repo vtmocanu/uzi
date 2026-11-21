@@ -27,8 +27,9 @@ import type { WorkerClient } from "./client.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
-import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, CHECKPOINT_PUBLICATION_WITHHELD_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
+import { PhaseSwitchUnverifiedError, type PhaseSettings, type PhaseSwitchCause } from "./phase-switch-unverified.js";
+import type { BaseAttestationHoldOutcome, PhaseSwitchHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, PHASE_SWITCH_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, CHECKPOINT_PUBLICATION_WITHHELD_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
 import { RequestError, ReportPreconditionError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE, FOLLOWUP_FINALIZE_ADMISSION_FEATURE, isFollowupFinalizeUnsupported } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
@@ -3381,10 +3382,49 @@ function publicationOnlyExecutor(claim: Pick<ClaimResponse, "publication_resume"
  * A credential-switch release still passes through it and takes phasePublish's early return.
  */
 export function isFinalizeBoundResult(
-  result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased" | "iterationParked">,
+  result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased" | "iterationParked" | "phaseSwitchHeld">,
 ): boolean {
-  return !result.pausedAt && !result.completionHeld && !result.walled && !result.switchReleased && !result.iterationParked;
+  return !result.pausedAt && !result.completionHeld && !result.walled && !result.switchReleased && !result.iterationParked &&
+    !result.phaseSwitchHeld;
 }
+
+/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are clipped
+ *  and stripped of control characters; nothing else from the runtime reaches the feed. */
+function phaseSwitchHoldText(
+  phase: "plan" | "implement",
+  cause: PhaseSwitchCause,
+  requested: PhaseSettings,
+  observed: PhaseSettings,
+): string {
+  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : v.replace(/[^\x20-\x7e]/g, "").slice(0, 80));
+  const tail = "Resume retries on a new claim; Cancel ends the run.";
+  const kept = phase === "implement" ? "planning" : "implementation";
+  const mismatch = (noun: "model" | "effort"): string => {
+    const have = clip(observed[noun]);
+    const want = clip(requested[noun]);
+    return phase === "implement"
+      ? `Paused: the runtime kept the ${kept} ${noun} ${have} instead of switching to ${want}. ${tail}`
+      : `Paused: the runtime kept the ${kept} ${noun} ${have} instead of switching back to the planning ${noun} ${want}. ${tail}`;
+  };
+  if (cause === "model_mismatch") return mismatch("model");
+  if (cause === "effort_mismatch") return mismatch("effort");
+  if (cause === "timeout" || cause === "malformed") {
+    return `Paused: the runtime's settings could not be verified before switching models. ${tail}`;
+  }
+  const target = requested.model !== undefined ? clip(requested.model) : requested.effort !== undefined ? clip(requested.effort) : "the requested settings";
+  return `Paused: this worker cannot verify a switch to ${target}. Choose a supported model (opus, sonnet, haiku, fable) or a full model id, or clear the Claude planning setting, then Resume; Cancel ends the run.`;
+}
+
+/** Issue #3252: follow-up feed lines when a phase-switch hold ended without the server confirming it,
+ *  so the earlier "Paused:" line is not left standing. "nonlive" is a definitive ownership answer (this
+ *  claim is released, terminal or superseded); "stopped" (deadline, shutdown) is not, since an applied hold whose ACK was lost
+ *  followed by failed reads is indistinguishable from an unapplied one, so it states only what is known. */
+const PHASE_SWITCH_NONLIVE_TEXT =
+  "This worker no longer holds the run and has stopped working on it. This worker keeps its copy of the work.";
+const PHASE_SWITCH_UNCONFIRMED_TEXT =
+  "The pause could not be confirmed; the run may not be paused. This worker keeps the work.";
+const phaseSwitchServerParkedText = (reason: string): string =>
+  `The server paused the run first (${reason}); this worker keeps the work.`;
 
 function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | undefined {
   return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
@@ -3542,6 +3582,11 @@ export interface RunnerOptions {
   recoveryRetryMs?: number;
   /** TEST-ONLY budget for the single ambiguous completion-hold ownership read. */
   completionHoldReconcileTimeoutMs?: number;
+  /** TEST-ONLY (issue #3252): an independent wall-clock bound for enterPhaseSwitchHold's unknown-outcome
+   *  retry loop. Production sets none: ending a flight whose hold row may still be running would let the
+   *  missing-from-snapshot path requeue or fail it, so the loop stops only on a definitive ownership
+   *  answer, the worker's shutdown signal, or a run paused at this claim with another reason. */
+  phaseSwitchHoldDeadlineMs?: number;
   /** TEST-ONLY bound (ms) for the single owner-cancel read at a held-predecessor refusal. Default 10s. */
   heldSeamCancelObserveMs?: number;
   /** PRD #1171 m4: the bounded absolute deadline (ms) for a Codex durability-sink
@@ -3798,6 +3843,7 @@ export class RunRunner {
   private readonly recoveryRetryMs: number;
   private readonly afterPublicationEnrolled: RunnerOptions["afterPublicationEnrolled"];
   private readonly completionHoldReconcileTimeoutMs: number;
+  private readonly phaseSwitchHoldDeadlineMs: number;
   private readonly heldSeamCancelObserveMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
@@ -4110,6 +4156,8 @@ export class RunRunner {
       throw new Error("completionHoldReconcileTimeoutMs must be positive and finite");
     }
     this.completionHoldReconcileTimeoutMs = holdBudget;
+    this.phaseSwitchHoldDeadlineMs = opts.phaseSwitchHoldDeadlineMs !== undefined && opts.phaseSwitchHoldDeadlineMs > 0
+      ? opts.phaseSwitchHoldDeadlineMs : Number.POSITIVE_INFINITY;
     this.heldSeamCancelObserveMs = opts.heldSeamCancelObserveMs !== undefined && opts.heldSeamCancelObserveMs > 0
       ? opts.heldSeamCancelObserveMs : 10_000;
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
@@ -7315,6 +7363,18 @@ export class RunRunner {
         // never failed, so it reports NO terminal state and keeps its clone and custody on every
         // outcome of the hold request (enterBaseAttestationHold).
         await this.enterBaseAttestationHold(claim, flight, err, runLog);
+      } else if (err instanceof PhaseSwitchUnverifiedError && !flight.steering.isCancelled()) {
+        // PRD #3252 D8 (m4): a plan-phase switch back to the planning model could not be verified. The
+        // pre-release failure sent no prompt; a contradictory init may follow an admitted request.
+        // Stop further work and hold the run for its owner, never fail it.
+        if (await this.enterPhaseSwitchHold(flight, claim, "plan", err.cause, err.requested, err.observed, runLog)) {
+          // An owner Cancel arrived while the hold was unconfirmed: take the ordinary cancelled route.
+          // This dispatch is not a stopped-source denial, so restore the default selected above.
+          flight.sourceDispatchDenied = priorSourceExitDenied;
+          await dispatchFailure(new Error("run cancelled"));
+          return;
+        }
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof RepoAgentSourceUnavailableError && this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
         await this.enterRepoAgentSourceHold(claim, flight, err, runLog);
         if (err.beforeSeed && flight.parked) await this.settleUnadoptedGuardedClaim(claim, flight, runLog, true);
@@ -7463,6 +7523,7 @@ export class RunRunner {
         flight.result?.iterationParked ||
         flight.result?.pausedAt ||
         flight.result?.completionHeld ||
+        flight.result?.phaseSwitchHeld ||
         (flight.result?.walled && flight.holdOrWallParkConfirmed) ||
         (flight.result?.walled && flight.uncertainWallPark) ||
         (flight.result?.walled && flight.completionHoldOutcome === "refused")
@@ -11075,6 +11136,23 @@ export class RunRunner {
           hold_outcome: flight.completionHoldOutcome,
           run_id: runId,
           reason: result.completionHeld.reason,
+        });
+        return;
+      }
+      // PRD #3252 D8 (m4): implement-phase verification failed. A contradictory init may follow an
+      // admitted request. Hold the run for its owner (quiesce, preserve, status, hold post)
+      // and skip finalization: no push, no PR, no terminal report.
+      if (result.phaseSwitchHeld) {
+        const held = result.phaseSwitchHeld;
+        if (await this.enterPhaseSwitchHold(flight, claim, held.phase, held.cause, held.requested, held.observed, runLog)) {
+          // An owner Cancel arrived while the hold was unconfirmed: the generic arm reports it cancelled.
+          throw new Error("run cancelled");
+        }
+        await closeBatcher().catch(() => undefined);
+        runLog.info("phase switch hold handled; skipping finalization", {
+          run_id: runId,
+          cause: held.cause,
+          hold_parked: flight.parked,
         });
         return;
       }
@@ -27279,6 +27357,213 @@ export class RunRunner {
       runLog.warn("base attestation hold: ownership read failed", { run_id: flight.runId, error: errMessage(e) });
     }
     return undefined;
+  }
+
+  /**
+   * Issue #3252 D8 (m4): hold a Claude run whose settings barrier could not prove the runtime applied
+   * the requested phase model or effort, or a later init contradicted the admitted pair. Stop further work
+   * and retain any effects of an already admitted request: the run is held for its owner
+   * (paused, phase_switch_unavailable), never failed. Order: quiesce the agent tree, preserve the
+   * clone and session (plus a best-effort checkpoint), post the status line, then request the hold.
+   *
+   * Only a positive, fully populated ownership observation at THIS flight's generation settles the
+   * outcome; every other answer (transport, 5xx, a 404 on the POST, missing fields, an unexpected status)
+   * is unknown and is retried, ownership read first, with a bounded backoff until the hold is proven,
+   * the claim is provably gone (the wall-clock sweep's ParkRunsAtWall releases the claim, so it ends here as
+   * non-live), the run is paused at this generation with another hold reason and the claim kept
+   * (`server_parked`, a defensive arm: no server-only path is known to produce it today), or the worker shuts down. There is no
+   * independent timeout (only the test-only {@link phaseSwitchHoldDeadlineMs}): ending a flight whose row
+   * may still be running would let the missing-from-snapshot path requeue or fail it. A wall pause request
+   * reaches the executor loop, which is stopped here, so it is honoured server-side by ParkRunsAtWall,
+   * which releases the claim (observed as non-live). The wall sweep skips interactive and
+   * awaiting_approval rows, so an unknown outcome on those retries until shutdown, cancel or a claim change. The flight stays registered meanwhile, so its heartbeats continue.
+   * An unknown read never counts as success.
+   *
+   * Returns true when an owner Cancel was observed while the hold was unconfirmed (the cancel input, or
+   * an ownership read naming a cancellation request). The preserve flags are then released like
+   * enterCompletionHold's cancellation check does, the batcher is left open, and the caller throws
+   * "run cancelled" into the generic terminal arm so the run reports cancelled.
+   */
+  private async enterPhaseSwitchHold(
+    flight: RunFlight,
+    claim: ClaimResponse,
+    phase: "plan" | "implement",
+    cause: PhaseSwitchCause,
+    requested: PhaseSettings,
+    observed: PhaseSettings,
+    runLog: Logger,
+  ): Promise<boolean> {
+    const { batcher } = flight;
+    const runId = flight.runId;
+    // 1. Quiesce: nothing of the agent may run while the hold is requested or the clone is captured.
+    await flight.executor.closeAndSettlePlanSummary?.();
+    await this.settleGuardedCommands(flight.executor);
+    flight.executor.killAgentTree?.();
+    const quiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "phase_switch_hold" });
+    // 2. Preserve: the clone and the plan session survive on every outcome below.
+    const previousClone = flight.preserveRecoveryClone;
+    const previousSession = flight.preserveSession;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    let head: string | undefined;
+    if (!quiescence.blocked && !flight.steering.isCancelled()) {
+      try {
+        const captured = await this.captureHoldContext(claim, flight, runLog);
+        if (captured.verified && captured.head) head = captured.head;
+      } catch (error) {
+        runLog.warn("phase switch hold: checkpoint capture failed; holding without a head", { run_id: runId, error: errMessage(error) });
+      }
+    }
+    // 3. Status line, flushed ahead of the hold request.
+    batcher.emit({ kind: "status", agent: "worker", payload: { text: phaseSwitchHoldText(phase, cause, requested, observed) } });
+    await batcher.flush(AbortSignal.timeout(this.completionHoldReconcileTimeoutMs)).catch(() => undefined);
+    // 4. The hold request, retried against ownership evidence.
+    const deadline = Date.now() + this.phaseSwitchHoldDeadlineMs;
+    const perRequest = (): AbortSignal =>
+      AbortSignal.timeout(Math.max(1, Math.min(this.completionHoldReconcileTimeoutMs, deadline - Date.now())));
+    const post = (at: "plan" | "implement"): Promise<PhaseSwitchHoldOutcome> =>
+      this.client.requestPhaseSwitchHold(runId, { ...(head !== undefined ? { head } : {}), claimGeneration: flight.claimGeneration, phase: at }, perRequest())
+        .catch((e: unknown): PhaseSwitchHoldOutcome => ({ outcome: "unknown", detail: errMessage(e) }));
+    const stopped = (): boolean =>
+      flight.active?.shuttingDown === true || this.shuttingDownGlobal || flight.steering.isCancelled() ||
+      flight.steering.claimFence() !== undefined || Date.now() >= deadline;
+    let postPhase = phase;
+    let planRepostSpent = false;
+    let backoff = this.recoveryRetryMs;
+    const wait = async (): Promise<void> => {
+      await this.waitRecoveryRetry(flight, true, Math.min(backoff, Math.max(1, deadline - Date.now())));
+      backoff = Math.min(backoff * 2, this.recoveryRetryMs * 16);
+    };
+    let outcome: "held" | "resumed" | "nonlive" | "server_parked" | "stopped" | undefined;
+    const serverParked: { reason?: string } = {};
+    // An owner Cancel that arrived while the agent was quiescing needs no hold: skip the first post.
+    let ack: PhaseSwitchHoldOutcome = flight.steering.isCancelled()
+      ? { outcome: "unknown", detail: "cancelled" }
+      : await post(postPhase);
+    for (;;) {
+      if (ack.outcome === "held") { outcome = "held"; break; }
+      if (ack.outcome === "refused" && ack.reason === "plan_not_approved" && postPhase === "implement" && !planRepostSpent) {
+        postPhase = "plan";
+        planRepostSpent = true;
+        if (stopped()) { outcome = "stopped"; break; }
+        ack = await post(postPhase);
+        continue;
+      }
+      if (stopped()) { outcome = "stopped"; break; }
+      // Anything else: only an ownership observation can say what happened.
+      const verdict = await this.observePhaseSwitchOwnership(flight, perRequest(), runLog, serverParked);
+      if (verdict === "held" || verdict === "resumed" || verdict === "nonlive" || verdict === "server_parked") { outcome = verdict; break; }
+      if (verdict === "live") {
+        if (ack.outcome === "refused" && postPhase === "implement" && !planRepostSpent) {
+          // An implement hold the server refused although the run is live and unheld: the plan is
+          // not approved yet, so the hold belongs to the plan phase.
+          postPhase = "plan";
+          planRepostSpent = true;
+        } else {
+          await wait();
+        }
+        if (stopped()) { outcome = "stopped"; break; }
+        ack = await post(postPhase);
+        continue;
+      }
+      // unknown: no post without a live observation; read again after a backoff.
+      await wait();
+      if (stopped()) { outcome = "stopped"; break; }
+      ack = { outcome: "unknown", detail: "ownership unknown" };
+    }
+    // A cancel observed in the loop (either signal) wins over every unconfirmed outcome; a confirmed
+    // hold or resume stands, since the server already owns that row's state.
+    const cancelled = outcome !== "held" && outcome !== "resumed" && outcome !== "server_parked" &&
+      flight.steering.isCancelled() && flight.steering.claimFence() === undefined;
+    if (outcome === "held") {
+      flight.parked = true;
+      flight.holdOrWallParkConfirmed = true;
+      runLog.info("run held on an unverified phase switch; clone, HOME and custody retained", {
+        run_id: runId, hold_reason: PHASE_SWITCH_HOLD_REASON, phase, cause,
+      });
+    } else if (outcome === "resumed") {
+      // Held, then resumed by the owner: the row is queued for a new claim. Nothing more is sent; the
+      // flight ends non-terminally with clone, session and custody kept, and frees its slot.
+      runLog.info("phase switch hold already applied and resumed; ending the flight without a report", { run_id: runId, phase, cause });
+    } else if (outcome === "server_parked") {
+      // Defensive: the run is paused at our generation with another hold reason and the claim kept
+      // (no server-only producer is known today; the wall sweep releases the claim and ends as non-live). Nothing more is posted; clone and session stay.
+      runLog.info("phase switch hold: the server parked the run first; ending the flight without a report", {
+        run_id: runId, phase, cause, hold_reason: serverParked.reason,
+      });
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: phaseSwitchServerParkedText(serverParked.reason ?? "unknown") } });
+    } else if (cancelled) {
+      // An owner Cancel (the input poll, or an ownership read naming a cancellation request) ended the
+      // hold attempt. Release the hold's provisional retention exactly as enterCompletionHold's
+      // cancellation check does, and let the caller route "run cancelled" into the generic terminal arm.
+      flight.preserveRecoveryClone = previousClone || this.captureRetentions.has(flight);
+      flight.preserveSession = previousSession || this.captureRetentions.has(flight);
+      runLog.info("phase switch hold: the run was cancelled while the hold was unconfirmed; reporting the cancel", {
+        run_id: runId, phase, cause,
+      });
+      return true;
+    } else {
+      if (outcome === "nonlive") {
+        runLog.info("phase switch hold: this claim is no longer live; ending the flight", { run_id: runId, phase, cause });
+      } else {
+        runLog.warn("phase switch hold not confirmed; ending the flight non-terminal with clone and custody retained", {
+          run_id: runId, phase, cause, claim_generation: claim.claim_generation,
+        });
+      }
+      // The feed said "Paused:" but the hold was not confirmed: say what is known.
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: outcome === "nonlive" ? PHASE_SWITCH_NONLIVE_TEXT : PHASE_SWITCH_UNCONFIRMED_TEXT,
+      } });
+    }
+    await batcher.close().catch(() => undefined);
+    return false;
+  }
+
+  /** Issue #3252: one ownership read, classified for the phase-switch hold. `held`, `resumed` and
+   *  `live` need a fully populated row at this flight's generation with the claim not released;
+   *  `nonlive` is a definitive loss of the claim (404, released, another generation, a cancellation
+   *  request the input read confirmed, or a terminal status); `server_parked` is paused at this
+   *  generation with a hold reason other than the phase-switch one (reason copied into `parked`);
+   *  everything else, a failed read included, is `unknown`. */
+  private async observePhaseSwitchOwnership(
+    flight: RunFlight, signal: AbortSignal, runLog: Logger, parked: { reason?: string },
+  ): Promise<"held" | "resumed" | "live" | "nonlive" | "server_parked" | "unknown"> {
+    let own: RunOwnershipResponse;
+    try {
+      own = await this.getObservedRunOwnership(flight, signal);
+    } catch (e) {
+      if (e instanceof RequestError && e.status === 404) return "nonlive";
+      runLog.warn("phase switch hold: ownership read failed", { run_id: flight.runId, error: errMessage(e) });
+      return "unknown";
+    }
+    const generation = Number.isSafeInteger(own.claim_generation) ? own.claim_generation : undefined;
+    if (own.claim_released === true ||
+        (typeof own.status === "string" && TERMINAL_RUN_STATUSES.has(own.status)) ||
+        (generation !== undefined && generation !== flight.claimGeneration)) {
+      return "nonlive";
+    }
+    if (own.cancellation_requested === true) {
+      // The claim is still ours: an owner Cancel is pending. Mark it through the input read so the
+      // caller takes the ordinary cancel path; if that read fails or names no cancel yet, this is not
+      // a definitive answer, so retry rather than end the flight as if the claim were gone.
+      await flight.steering.observePendingCancellation(signal).catch(() => undefined);
+      return flight.steering.isCancelled() ? "nonlive" : "unknown";
+    }
+    if (generation !== flight.claimGeneration || own.claim_released !== false || typeof own.status !== "string" ||
+        own.hold_reason === undefined) return "unknown";
+    if (own.hold_reason === PHASE_SWITCH_HOLD_REASON) {
+      if (own.status === "paused") return "held";
+      if (own.status === "queued") return "resumed";
+      return "unknown";
+    }
+    if (own.hold_reason === null && (own.status === "running" || own.status === "awaiting_approval")) return "live";
+    // Defensive: paused at our generation with another hold reason and the claim not released — a park
+    // that is not our hold. (The wall sweep releases the claim, so it is classified non-live above.)
+    if (own.status === "paused" && typeof own.hold_reason === "string" && own.hold_reason !== "") {
+      parked.reason = own.hold_reason;
+      return "server_parked";
+    }
+    return "unknown";
   }
 
   /** Entry is synchronous: admission, capture and reporting cannot precede local retention.

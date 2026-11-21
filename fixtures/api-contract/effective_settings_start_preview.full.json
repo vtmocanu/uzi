@@ -40,6 +40,12 @@
       "observed_at": "2020-01-02T03:04:05Z"
     }
   },
+  "plan_phase": {
+    "model": "x",
+    "effort": "x",
+    "model_source": "x",
+    "effort_source": "x"
+  },
   "alternatives": [
     {
       "harness": "x",
@@ -66,6 +72,12 @@
           "runtime_version": "x",
           "observed_at": "2020-01-02T03:04:05Z"
         }
+      },
+      "plan_phase": {
+        "model": "x",
+        "effort": "x",
+        "model_source": "x",
+        "effort_source": "x"
       }
     }
   ]

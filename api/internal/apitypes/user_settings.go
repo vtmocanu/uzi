@@ -95,6 +95,15 @@ type UserSettingsDTO struct {
 	// EffortSettings is read-only (never sent on a PUT): the resolved ordinary effort
 	// preference per harness (PRD #3247), claude then codex.
 	EffortSettings []EffortSettingCellDTO `json:"effort_settings"`
+	// PlanningClaudeModel and PlanningClaudeEffort are the owner's Claude planning pair (PRD
+	// #3252): used only while a Claude lead-lane run plans; null = "Same as the run". Writable on
+	// PUT /api/me/settings.
+	PlanningClaudeModel  *string `json:"planning_claude_model"`
+	PlanningClaudeEffort *string `json:"planning_claude_effort"`
+	// PlanningModels and PlanningEfforts are read-only (never sent on a PUT): the resolved view of
+	// the Claude planning pair, one claude cell each.
+	PlanningModels  []ModelSettingCellDTO  `json:"planning_models"`
+	PlanningEfforts []EffortSettingCellDTO `json:"planning_efforts"`
 	// WeeklyReservePct and WeeklyReservePauseRunning mirror the weekly usage reserve (PRD
 	// #3522): the 7-day utilization percent (1..100) at which uzi stops spending the user's
 	// subscription (null = off), and whether a running run is also paused. They are NOT

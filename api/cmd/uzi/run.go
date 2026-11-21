@@ -136,6 +136,9 @@ const (
 	// holdRunOverrideUnavailable (issue #3250) holds a run whose chosen model or effort cannot run on
 	// its harness. Resume retries only if the choice has become available; otherwise the owner cancels.
 	holdRunOverrideUnavailable = "run_override_unavailable"
+	// holdPhaseSwitchUnavailable (issue #3252) holds an active Claude run whose runtime did not switch
+	// between the planning and implementation model or effort. Resume retries on a new claim; Cancel ends it.
+	holdPhaseSwitchUnavailable = "phase_switch_unavailable"
 	// holdProviderDestinationNotAllowed and holdProviderBindingStale (PRD #4320 module 5) are the parks of a
 	// provider-bound run whose next claim was refused: the operator no longer allows its provider URL (it
 	// re-queues by itself once allowed again), or its provider or key changed after the run was created
@@ -177,6 +180,7 @@ var nonCompletionHolds = map[string]nonCompletionHold{
 	holdCredentialSwitchUnsettled: {ownerResumable: true, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
 	holdIterationExhausted:        {ownerResumable: true, announcesEntry: true, boardOwnerHold: true},
 	holdRunOverrideUnavailable:    {ownerResumable: true, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
+	holdPhaseSwitchUnavailable:    {ownerResumable: true, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
 	// PRD #4320 module 5: not owner-resumable (the promoter re-queues the first; the second is final).
 	holdProviderDestinationNotAllowed: {ownerResumable: false, announcesEntry: true, boardOwnerHold: true},
 	holdProviderBindingStale:          {ownerResumable: false, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},

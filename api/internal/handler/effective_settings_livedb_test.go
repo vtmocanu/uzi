@@ -385,7 +385,7 @@ func TestEffectiveSettingsClaudeOnlyLiveDB(t *testing.T) {
 	f.leadTemplate("opus", "")
 	dto, _ := f.get()
 
-	if dto.Version != 1 || len(dto.Harnesses) != 2 || len(dto.Start) != 3 || len(dto.Models) != 8 || len(dto.Efforts) != 4 ||
+	if dto.Version != 1 || len(dto.Harnesses) != 2 || len(dto.Start) != 3 || len(dto.Models) != 9 || len(dto.Efforts) != 5 ||
 		len(dto.CrossCheck.Models) != 4 || len(dto.CrossCheck.Efforts) != 4 {
 		t.Fatalf("shape: version=%d harnesses=%d start=%d models=%d efforts=%d cross-check=%d/%d", dto.Version, len(dto.Harnesses), len(dto.Start),
 			len(dto.Models), len(dto.Efforts), len(dto.CrossCheck.Models), len(dto.CrossCheck.Efforts))
@@ -895,6 +895,127 @@ func TestEffectiveSettingsCellsEqualMySettingsLiveDB(t *testing.T) {
 	}
 }
 
+// TestEffectiveSettingsPlanningCellsLiveDB pins the Claude planning cells and plan_phase (PRD
+// #3252): the effective cells equal the /me/settings planning cells, resolved/source follow the
+// claim's plan pair (user_planning_default), a Codex role id stored in the planning column is
+// ignored, and every preview is plan_phase-free until a planning value applies.
+func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
+	mySettings := func(f *effFix) (models []apitypes.ModelSettingCellDTO, efforts []apitypes.EffortSettingCellDTO) {
+		rec := httptest.NewRecorder()
+		f.h.GetMySettings(rec, userReq(http.MethodGet, "/api/me/settings", "", f.user, nil))
+		var mine struct {
+			Settings struct {
+				PlanningModels  []apitypes.ModelSettingCellDTO  `json:"planning_models"`
+				PlanningEfforts []apitypes.EffortSettingCellDTO `json:"planning_efforts"`
+			} `json:"settings"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &mine); err != nil {
+			t.Fatalf("GET /me/settings: %v %s", err, rec.Body.String())
+		}
+		return mine.Settings.PlanningModels, mine.Settings.PlanningEfforts
+	}
+	t.Run("nothing set", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.anthropic()
+		f.set("default_claude_model", "sonnet")
+		dto, _ := f.get()
+		m, e := modelCell(t, dto.Models, "planning_model", "claude"), effortCell(t, dto.Efforts, "planning_effort", "claude")
+		if m.Model != nil || m.ResolvedModel != "sonnet" || m.Source != "user_default" || m.DefaultModel != "sonnet" || m.FixedAt != "claim" {
+			t.Errorf("planning model = %+v, want the implement lane as default and resolved", m)
+		}
+		if e.Effort != nil || e.Source != "builtin" || e.ResolvedEffort == nil || *e.ResolvedEffort != "medium" {
+			t.Errorf("planning effort = %+v, want the implement effort", e)
+		}
+		mm, me := mySettings(f)
+		if !sameCell(m.ModelSettingCellDTO, mm[0]) {
+			t.Errorf("planning model %+v != /me/settings %+v", m.ModelSettingCellDTO, mm[0])
+		}
+		if !eqStr(e.Effort, me[0].Effort) || e.DefaultEffort != me[0].DefaultEffort || e.Source != me[0].Source || e.Mode != me[0].Mode {
+			t.Errorf("planning effort %+v != /me/settings %+v", e, me[0])
+		}
+		pv, body := f.preview(`{"harness":"claude","credential_override":null}`)
+		if pv.PlanPhase != nil || bytes.Contains(body, []byte("plan_phase")) {
+			t.Errorf("start preview carries plan_phase with no planning value: %s", body)
+		}
+		sched, sbody := f.schedulePreview(`{"target":"sweep","harness":"claude"}`)
+		if sched.PlanPhase != nil || bytes.Contains(sbody, []byte("plan_phase")) {
+			t.Errorf("schedule preview carries plan_phase with no planning value: %s", sbody)
+		}
+	})
+	t.Run("planning pair set", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.bothUsable(10, 10)
+		f.set("default_claude_model", "sonnet")
+		f.set("default_effort", "low")
+		f.set("planning_claude_model", "opus")
+		f.set("planning_claude_effort", "xhigh")
+		dto, _ := f.get()
+		m, e := modelCell(t, dto.Models, "planning_model", "claude"), effortCell(t, dto.Efforts, "planning_effort", "claude")
+		if m.Model == nil || *m.Model != "opus" || m.ResolvedModel != "opus" || m.Source != "user_planning_default" || m.DefaultModel != "sonnet" || m.DefaultSource != "user_default" {
+			t.Errorf("planning model = %+v", m)
+		}
+		if e.Effort == nil || *e.Effort != "xhigh" || e.ResolvedEffort == nil || *e.ResolvedEffort != "xhigh" || e.Source != "user_planning_default" || e.DefaultEffort != "low" {
+			t.Errorf("planning effort = %+v", e)
+		}
+		mm, me := mySettings(f)
+		if !sameCell(m.ModelSettingCellDTO, mm[0]) {
+			t.Errorf("planning model %+v != /me/settings %+v", m.ModelSettingCellDTO, mm[0])
+		}
+		if !eqStr(e.Effort, me[0].Effort) || e.DefaultEffort != me[0].DefaultEffort || e.Source != me[0].Source || e.Mode != me[0].Mode ||
+			!eqStr(e.ResolvedEffort, me[0].ResolvedEffort) {
+			t.Errorf("planning effort %+v != /me/settings %+v", e, me[0])
+		}
+		// The worker cells stay the implement pair.
+		if w := modelCell(t, dto.Models, "worker_model", "claude"); w.ResolvedModel != "sonnet" || w.Source != "user_default" {
+			t.Errorf("worker model = %+v", w)
+		}
+		want := &apitypes.EffectivePlanPhaseDTO{Model: sp("opus"), Effort: sp("xhigh"), ModelSource: "user_planning_default", EffortSource: "user_planning_default"}
+		check := func(name string, got *apitypes.EffectivePlanPhaseDTO, want *apitypes.EffectivePlanPhaseDTO) {
+			t.Helper()
+			if got == nil || !eqStr(got.Model, want.Model) || !eqStr(got.Effort, want.Effort) || got.ModelSource != want.ModelSource || got.EffortSource != want.EffortSource {
+				t.Errorf("%s plan_phase = %+v, want %+v", name, got, want)
+			}
+		}
+		pv, _ := f.preview(`{"harness":"claude","credential_override":null}`)
+		check("start preview", pv.PlanPhase, want)
+		// A start-time model is frozen into both phases; the planning effort still applies.
+		pv, _ = f.preview(`{"harness":"claude","credential_override":null,"model":"haiku"}`)
+		check("start preview with a model", pv.PlanPhase, &apitypes.EffectivePlanPhaseDTO{Model: sp("haiku"), Effort: sp("xhigh"), ModelSource: "run_override", EffortSource: "user_planning_default"})
+		// Codex has no plan phase.
+		pv, body := f.preview(`{"harness":"codex","credential_override":null}`)
+		if pv.PlanPhase != nil || bytes.Contains(body, []byte("plan_phase")) {
+			t.Errorf("codex start preview carries plan_phase: %s", body)
+		}
+		spv, _ := f.schedulePreview(`{"target":"sweep","harness":"claude"}`)
+		check("schedule preview", spv.PlanPhase, want)
+		// A schedule's model pin is the plan model too.
+		spv, _ = f.schedulePreview(`{"target":"sweep","harness":"claude","model":"sonnet"}`)
+		check("schedule preview with a pin", spv.PlanPhase, &apitypes.EffectivePlanPhaseDTO{Model: sp("sonnet"), Effort: sp("xhigh"), ModelSource: "schedule_pin", EffortSource: "user_planning_default"})
+		// The harness chosen at creation answers per alternative: Claude carries the pair, Codex none.
+		f.policy("codex", true)
+		spv, _ = f.schedulePreview(`{"target":"sweep"}`)
+		for _, a := range spv.Alternatives {
+			if a.Harness == "claude" {
+				check("schedule alternative", a.PlanPhase, want)
+			} else if a.PlanPhase != nil {
+				t.Errorf("codex alternative carries plan_phase %+v", a.PlanPhase)
+			}
+		}
+	})
+	t.Run("a codex role id in the planning column is ignored", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.anthropic()
+		f.set("planning_claude_model", "gpt-6-luna")
+		dto, _ := f.get()
+		if m := modelCell(t, dto.Models, "planning_model", "claude"); m.Source == "user_planning_default" || m.ResolvedModel == "gpt-6-luna" {
+			t.Errorf("planning model = %+v, want the claim's own default (the codex id is ignored)", m)
+		}
+		if pv, _ := f.preview(`{"harness":"claude","credential_override":null}`); pv.PlanPhase != nil {
+			t.Errorf("plan_phase = %+v, want none", pv.PlanPhase)
+		}
+	})
+}
+
 // ---- instance cache posture, through the route ----
 
 func TestEffectiveSettingsInstanceSettingsUnavailableLiveDB(t *testing.T) {
@@ -945,7 +1066,7 @@ func TestEffectiveSettingsSizeBoundsAndNoCredentialMaterialLiveDB(t *testing.T) 
 	if len(body) >= 16<<10 {
 		t.Errorf("GET body = %d bytes, want < 16 KiB", len(body))
 	}
-	if len(dto.Models) != 8 {
+	if len(dto.Models) != 9 || len(dto.Efforts) != 5 {
 		t.Fatalf("models = %d", len(dto.Models))
 	}
 	const inherit = `{"harness":null,"credential_override":{"mode":"inherit"}}`
@@ -1114,6 +1235,25 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 	), SchedulePreviews: schedules(f,
 		[2]string{"unpinned sweep", `{"target":"sweep"}`},
 		[2]string{"unpinned sweep with an explicit inherit", `{"target":"sweep","credential_override":null}`},
+	)})
+
+	// PRD #3252: a Claude planning pair. The planning cells resolve with user_planning_default, and
+	// the Claude previews carry plan_phase; a start-time model or a schedule model pin is the plan
+	// model too, and Codex carries none.
+	f = newEffFix(t, nil)
+	both(f)
+	f.set("planning_claude_model", "opus")
+	f.set("planning_claude_effort", "high")
+	dto, _ = f.get()
+	corpus.Scenarios = append(corpus.Scenarios, effCorpusScenario{Name: "planning", Get: dto, StartPreviews: previews(f,
+		[2]string{"claude", `{"harness":"claude","credential_override":null}`},
+		[2]string{"codex", `{"harness":"codex","credential_override":null}`},
+		[2]string{"claude with a model", `{"harness":"claude","credential_override":null,"model":"sonnet"}`},
+		[2]string{"effort only without a harness", `{"harness":null,"credential_override":null,"effort":"medium"}`},
+	), SchedulePreviews: schedules(f,
+		[2]string{"unpinned sweep pinned to claude", `{"target":"sweep","harness":"claude"}`},
+		[2]string{"sweep with a model pin and no harness", `{"target":"sweep","model":"sonnet"}`},
+		[2]string{"sweep pinned to codex", `{"target":"sweep","harness":"codex"}`},
 	)})
 
 	var buf bytes.Buffer

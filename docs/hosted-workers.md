@@ -1140,6 +1140,28 @@ existing fences; otherwise cancel with `uzi run cancel <id>`. Cancellation does
 not itself release custody (see
 [Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker)).
 
+## My run says "no worker supporting separate planning settings is online"
+
+A Claude run that uses a [planning model or planning effort](./worker-model.md#planning-model-and-effort)
+needs a worker advertising the `claude_phase_models_v1` capability, which ships
+with a newer worker image. A run on an older worker image never claims it and
+never plans and implements on one pair silently; it stays queued, and its health
+reason reads **no worker supporting separate planning settings is online**.
+
+- Ask your admin to upgrade or roll the hosted worker fleet to an image that
+  advertises `claude_phase_models_v1`. Ephemeral and hosted placement provisions
+  a current worker for such a run on its own once hosting can supply one.
+- Or clear the **Claude planning model** and **Claude planning effort** in
+  [Settings → Run defaults](./worker-model.md#planning-model-and-effort) if you
+  don't need them right now. A run that already queued uses the settings
+  resolved when a worker claims it, so the change reaches it at its next claim.
+
+A run that was just requeued because its worker lacked the capability may stay
+tied to that worker for a short affinity window before another can take it. A
+placement that over-approximates which runs need the capability can, in rare
+cases, leave a run pinned to a worker that cannot claim it; cancel and restart
+it if the health reason does not clear after you roll the fleet.
+
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges

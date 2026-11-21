@@ -32,7 +32,7 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
+import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ModelSettingCell, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
 import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "../data/effectiveSettings";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
@@ -89,6 +89,10 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_codex_model: null,
   default_effort: null,
   default_codex_effort: null,
+  // PRD #3252: the Claude planning pair; null = "Same as the run". Resolved into
+  // planning_models / planning_efforts (mockPlanningModelCells / mockPlanningEffortCells).
+  planning_claude_model: null,
+  planning_claude_effort: null,
   judge_model: null,
   // PRD #3245: the Codex judge lane; null = inherit. Resolved per harness into
   // judge_models (mockJudgeModelCells) and edited on Run defaults.
@@ -299,6 +303,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // provides it going forward (like judge_model).
     (u.default_effort === undefined || u.default_effort === null || typeof u.default_effort === "string") &&
     (u.default_codex_effort === undefined || u.default_codex_effort === null || typeof u.default_codex_effort === "string") &&
+    // Optional so a pre-#3252 blob stays valid; absent reads as "Same as the run".
+    (u.planning_claude_model === undefined || u.planning_claude_model === null || typeof u.planning_claude_model === "string") &&
+    (u.planning_claude_effort === undefined || u.planning_claude_effort === null || typeof u.planning_claude_effort === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
     // Optional so a pre-#3245 blob stays valid; absent reads as inherit.
@@ -590,6 +597,68 @@ function mockEffortCell(harness: Harness, stored: string | null | undefined): Ef
   return { ...base, resolved_effort: "medium", source: "builtin", mode: "explicit" };
 }
 
+// PRD #3252: the planning effort validator, mirroring Go's planning_claude_effort rule:
+// blank clears to null; otherwise one of the five levels (the preference-only "runtime"
+// token is refused), stored trimmed.
+function mockPlanningEffort(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return null;
+  if (!["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
+    throw new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh, max");
+  }
+  return trimmed;
+}
+
+// PRD #3252: the planning model validator (Claude-lane rules), mirroring
+// agenttmpl.ValidateModel: blank clears; at most 100 UTF-8 BYTES (agenttmpl.MaxModelLen,
+// measured with len(), not runes); no control (Cc) or format (Cf) character and no U+FFFD;
+// a single token; and no Codex role id.
+function mockPlanningModel(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return null;
+  if (new TextEncoder().encode(trimmed).length > 100) throw new ApiError(400, "planning_claude_model: model must be at most 100 characters");
+  for (const ch of trimmed) {
+    if (ch === "�" || /[\p{Cc}\p{Cf}]/u.test(ch)) {
+      throw new ApiError(400, "planning_claude_model: model must not contain newlines or control characters");
+    }
+    if (/\s/.test(ch)) throw new ApiError(400, "planning_claude_model: model must be a single token with no spaces");
+  }
+  if (CODEX_ROLE_MODELS.includes(trimmed)) throw new ApiError(400, "planning_claude_model: model is a Codex model id");
+  return trimmed;
+}
+
+// PRD #3252: the read-only Claude planning cells, mirroring Go planningModelCells /
+// planningEffortCells. The default pair is the implement lane's resolution (the user's
+// Claude model lane, else the built-in with an empty model = the SDK decides; the mock has
+// no lead-template pin) and the ordinary Claude effort cell's resolution ("runtime" token
+// in runtime mode); a stored value resolves with source user_planning_default.
+function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined): ModelSettingCell[] {
+  const laneModel = lane?.trim() ?? "";
+  const def = laneModel !== "" && !CODEX_ROLE_MODELS.includes(laneModel)
+    ? { model: laneModel, source: "user_default" }
+    : { model: "", source: "builtin" };
+  const stored = planning?.trim() ?? "";
+  const set = stored !== "" && !CODEX_ROLE_MODELS.includes(stored);
+  return [{
+    harness: "claude", model: planning ?? null,
+    default_model: def.model, default_source: def.source,
+    resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source,
+  }];
+}
+
+function mockPlanningEffortCells(planning: string | null | undefined, claudeEffort: string | null | undefined): EffortSettingCell[] {
+  const ordinary = mockEffortCell("claude", claudeEffort);
+  const level = (planning ?? "").trim();
+  const set = ["low", "medium", "high", "xhigh", "max"].includes(level);
+  return [{
+    harness: "claude", effort: planning ?? null,
+    default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source,
+    resolved_effort: set ? level : ordinary.resolved_effort,
+    source: set ? "user_planning_default" : ordinary.source,
+    mode: set ? "explicit" : ordinary.mode,
+  }];
+}
+
 // Issue #3251: the Codex cell's catalog_default as the mock serves it. The mock returns
 // STATIC samples (the server's selection rule is not reimplemented here); a test
 // picks one with setMockCodexCatalogSample, and a module reload restores "known".
@@ -643,6 +712,8 @@ function mySettingsResponse(): { settings: UserSettings } {
     mockEffortCell("claude", userSettings.default_effort),
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
+  const planning_models = mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model);
+  const planning_efforts = mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort);
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
   const me = state.session;
@@ -653,7 +724,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, planning_models, planning_efforts, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -834,7 +905,7 @@ export function sessionBody() {
 }
 
 function recordedEffectiveScenario(): RecordedEffectiveScenario {
-  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault" } as Record<string, string>)[mockScenario()] ?? "default";
+  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault", "planning-pair": "planning" } as Record<string, string>)[mockScenario()] ?? "default";
   const found = RECORDED_EFFECTIVE_SCENARIOS.find(s => s.name === name);
   if (!found) throw new Error(`no recorded effective-settings scenario ${name}`);
   return found;
@@ -852,6 +923,22 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
       ? { ...c, notes: [...c.notes, "not_used"] }
       : c,
   );
+  return view;
+}
+
+// PRD #3252: the recordings are taken with no planning value, so the mock user's stored planning
+// pair is applied at response time on the Claude planning cells, through the same mock cell
+// builders /me/settings uses. With neither value set the recording is served unchanged.
+function withPlanning(view: EffectiveSettings): EffectiveSettings {
+  const model = userSettings.planning_claude_model, effort = userSettings.planning_claude_effort;
+  if (model == null && effort == null) return view;
+  const [m] = mockPlanningModelCells(model, userSettings.default_claude_model);
+  const [e] = mockPlanningEffortCells(effort, userSettings.default_effort);
+  // The recording's default pair stays; only the stored value and, when it applies, the resolution move.
+  view.models = view.models.map(c => c.setting !== "planning_model" ? c
+    : m.source === "user_planning_default" ? { ...c, model: m.model, resolved_model: m.resolved_model, source: "user_planning_default" } : { ...c, model: m.model });
+  view.efforts = view.efforts.map(c => c.setting !== "planning_effort" ? c
+    : e.source === "user_planning_default" ? { ...c, effort: e.effort, resolved_effort: e.resolved_effort, source: "user_planning_default", mode: "explicit" } : { ...c, effort: e.effort });
   return view;
 }
 
@@ -1587,10 +1674,11 @@ export const settingsApi = {
   },
   // PRD #3254 M2: the recorded server behavior for the active demo scenario, not a second
   // resolver. "codex-only" serves the codexOnly recording and "overflow-codex-default" the
-  // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
+  // overflowCodexDefault one (the recorded refused-alternative case) and "planning-pair" the
+  // planning one (an owner with a Claude planning pair, PRD #3252); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
+    return delay(withPlanning(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on)), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();
@@ -1712,6 +1800,14 @@ export const settingsApi = {
     }
     if (patch.default_codex_effort !== undefined) {
       next = { ...next, default_codex_effort: mockDefaultEffort(patch.default_codex_effort) };
+    }
+    // PRD #3252: absent keeps, null/blank clears. Both validate before `next` is committed,
+    // so a bad field writes nothing.
+    if (patch.planning_claude_model !== undefined) {
+      next = { ...next, planning_claude_model: mockPlanningModel(patch.planning_claude_model) };
+    }
+    if (patch.planning_claude_effort !== undefined) {
+      next = { ...next, planning_claude_effort: mockPlanningEffort(patch.planning_claude_effort) };
     }
     if (patch.judge_model !== undefined) {
       // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with

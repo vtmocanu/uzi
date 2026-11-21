@@ -189,7 +189,7 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// the visible reserve reason. It is deliberately NOT mapped by claudeCheckerClaimError, so a held
 	// Claude checker stays queued and expires through its own cc.deadline_at path.
 	transient := errors.Is(assemblyErr, store.ErrVaultSealStale) || errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
-		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
+		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errPhaseModelsCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
 		errors.Is(assemblyErr, errReserveHeld)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park. So is

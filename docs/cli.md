@@ -3614,6 +3614,7 @@ setting prints once. The rows, in order:
 | `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
 | `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
 | `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `planning model`, `planning effort` | `claude` | The optional [Claude planning settings](./worker-model.md#planning-model-and-effort), shown only for Claude. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
 | `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
 | `task review effort` | `claude`, `codex` | `not sent` for both. |
@@ -3639,8 +3640,7 @@ usable. The CLI shows the `GET` only; it does not call the start-preview.
 `--schedule` adds the schedule preview, below.
 
 `--json` carries every key of the settings read plus an `effective` key holding
-the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and
-`cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes the Claude `planning_model` cell and `efforts` the `planning_effort` cell) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
 `effective` is `null` when the server does not have the view or the read failed.
 In that case the human output falls back to the previous Model settings rows, a
 line goes to stderr (`Effective settings: not available on this server` for an
@@ -3665,6 +3665,7 @@ the same columns:
 | --- | --- | --- |
 | `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
 | `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
+| `plan phase model`, `plan phase effort` | `claude` | Printed between the worker effort and credential rows, and only on a Claude fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
 | `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
 
 When the harness is chosen at creation, the rows for both harnesses follow
@@ -3674,8 +3675,10 @@ run on this harness; the default applies`).
 
 `--json` adds a `schedule_preview` key holding the response body
 (`version`, `harness`, `refusal`, `refusal_detail`, `worker_model`,
-`worker_effort`, `credential`, `subagents`, `notes` and, when the harness is
-chosen at creation, `alternatives`). The key is absent without `--schedule`.
+`worker_effort`, `credential`, `subagents`, `notes`, the optional `plan_phase`
+(`model`, `effort`, `model_source`, `effort_source`, each omitted when absent;
+also on each alternative) and, when the harness is chosen at creation,
+`alternatives`). The key is absent without `--schedule`.
 
 Exit codes follow the schedule being something you asked for: a schedule that
 does not exist for your account (or a server that predates the route) is a 404
@@ -4361,6 +4364,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
   if the choice has become available on that harness; otherwise cancel the run
   (`uzi run cancel <id>`) and start a new run with a different choice.
+  A `paused` run can also be **held because the switch from its planning
+  model and effort to its own could not be verified**
+  (`hold_reason: phase_switch_unavailable`): `run get` prints a `HOLD` row
+  reading `planning switch unavailable`, and `run wait` and `run logs --follow`
+  print a notice naming the hold. `uzi run resume <id>` retries on a new
+  claim, which verifies the switch again; `uzi run cancel <id>` ends the run.
+  See [Planning model and effort](./worker-model.md#planning-model-and-effort).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -4736,8 +4746,8 @@ except a default wait also stops at `recovery_wait` with cause
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
 owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
 Anthropic API spend-limit or exhausted-credit hold, Resume, Switch token or Cancel), and at a `paused` run held on
-`base_attestation_missing`, `run_override_unavailable` or a credential-switch
-hold, for an owner decision:
+`base_attestation_missing`, `run_override_unavailable`, `phase_switch_unavailable`
+or a credential-switch hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,
