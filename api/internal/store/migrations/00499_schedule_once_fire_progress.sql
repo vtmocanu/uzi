@@ -1,7 +1,8 @@
 -- +goose Up
 -- Issue #4512 (ADR-4007 T3a): durable per-fire progress for one-time sweeps. Both tables
--- are new and the two triggers attach to the new ledger only, but the 00474 guard function
--- reads repos; keep the same bounded wait as the sibling migrations (the 00438/00439 split).
+-- are new, but creating their foreign keys takes SHARE ROW EXCLUSIVE on the referenced
+-- tables (run_schedules and repos); keep the same bounded wait as the sibling migrations
+-- (the 00438/00439 split) so it fails fast instead of queueing behind a long transaction.
 SET LOCAL lock_timeout = '5s';
 
 -- One header per (schedule, occurrence). effective_cap is the fire's ORIGINAL cap; NULL
@@ -63,6 +64,7 @@ CREATE TRIGGER schedule_once_fire_runs_awaiting_first_enable_guard
     FOR EACH ROW EXECUTE FUNCTION issue_number_awaiting_first_enable_guard('repo_id', 'issue_iid');
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TRIGGER schedule_once_fire_runs_awaiting_first_enable_guard ON schedule_once_fire_runs;
 DROP TRIGGER schedule_once_fire_runs_identity_immutable ON schedule_once_fire_runs;
 DROP FUNCTION schedule_once_fire_runs_identity_immutable();
