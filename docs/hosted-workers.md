@@ -143,6 +143,9 @@ can be edited and reset but never removed.
 - **Refusals.** A size the controller refuses (above its own ceilings) or a PVC the
   cluster rejects at create shows on the worker as provisioning or upgrade
   failed, and in [Admin health](./admin-health.md) on the **Worker image roll** check (`fleet.roll`).
+  The Worker sizes card marks each refused size **Refused** in its row, names up
+  to three of its affected workers, and says how many more there are, linking to
+  Admin health. Only fresh controller reports count.
 
 `uzi worker list` and `uzi worker get` show a `SIZE` column; see
 [CLI reference](./cli.md#worker-size).

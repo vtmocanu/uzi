@@ -110,9 +110,12 @@ const HEALTH_ROUTE = "/admin/health";
 
 // The workers the cluster would not run at this size: a danger badge in the row's badges,
 // then up to three workers, each linking to Admin health where its report lives.
-function SizeRefusals({ label, items }: { label: string; items: WorkerSizeRefusal[] }) {
+// total is the api's count before its per-size cap; without a usable one the remainder is
+// whatever details were sent (an older api), never an invented number.
+function SizeRefusals({ label, items, total }: { label: string; items: WorkerSizeRefusal[]; total?: number }) {
   const shown = items.slice(0, REFUSALS_SHOWN);
-  const more = items.length - shown.length;
+  const known = typeof total === "number" && Number.isInteger(total) && total >= 0 ? total : 0;
+  const more = Math.max(items.length, known) - shown.length;
   return (
     <ul aria-label={`Workers refused at size ${label}`} className="mt-2 w-[8rem] space-y-1.5 text-xs font-normal sm:w-auto sm:max-w-[16rem]">
       {shown.map((r, i) => {
@@ -636,7 +639,8 @@ export function WorkerSizesCard({
   const orphanAdvisories = data.advisories.filter((a) => !data.sizes.some((s) => s.name === a.size));
   if (orphanAdvisories.length > 0) advisoriesBySize.push({ size: "", items: orphanAdvisories });
 
-  // Refusals per size; an older api sends none, and one for a size no longer listed has no row.
+  // Refusals per size; an older api sends none (nor totals), and one for a size no longer listed has no row.
+  const refusalTotals = data.refusal_totals ?? {};
   const refusalsBySize = new Map<string, WorkerSizeRefusal[]>();
   for (const r of data.refusals ?? []) refusalsBySize.set(r.size, [...(refusalsBySize.get(r.size) ?? []), r]);
 
@@ -710,6 +714,9 @@ export function WorkerSizesCard({
                 const confirmAction = confirming?.name === row.name ? confirming.action : null;
                 const isConfirming = (confirmAction === "reset" && canReset) || (confirmAction === "remove" && canRemove);
                 const refused = refusalsBySize.get(row.name) ?? [];
+                const refusedTotal = Object.prototype.hasOwnProperty.call(refusalTotals, row.name)
+                  ? refusalTotals[row.name]
+                  : undefined;
                 const resetLowers =
                   !!row.shipped && (row.shipped.data_gib < row.data_gib || row.shipped.dind_data_gib < row.dind_data_gib);
                 return (
@@ -721,7 +728,7 @@ export function WorkerSizesCard({
                         {row.customized && <Badge tone="brand">Customized</Badge>}
                         {refused.length > 0 && <Badge tone="danger">Refused</Badge>}
                       </div>
-                      {refused.length > 0 && <SizeRefusals label={label} items={refused} />}
+                      {refused.length > 0 && <SizeRefusals label={label} items={refused} total={refusedTotal} />}
                       {canReset && (
                         <p className="mt-1 w-[8rem] text-xs font-normal text-faint sm:w-auto sm:max-w-[16rem]">
                           Shipped: {specSummary(row.shipped!)}

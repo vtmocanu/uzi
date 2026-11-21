@@ -3488,8 +3488,16 @@ export interface AdminWorkerSizes {
   read_only_code: string | null;
   advisories: WorkerSizeAdvisory[];
   max_sizes: number;
-  /** Always an array on a current api; absent from an older one, which reads as none. */
+  /**
+   * At most three details per size and sixteen sizes. Always an array on a current api;
+   * absent from an older one, which reads as none.
+   */
   refusals?: WorkerSizeRefusal[];
+  /**
+   * Per size present in refusals, the true count of fresh refusals before the three-per-size
+   * cap. Always an object on a current api; absent from an older one.
+   */
+  refusal_totals?: Record<string, number>;
 }
 
 /** PUT /admin/worker-sizes/{name} and POST /admin/worker-sizes/{name}/reset. */

@@ -357,6 +357,59 @@ describe("WorkerSizesCard", () => {
     expect(within(items[3]).getByRole("link", { name: "and 2 more workers in Admin health" }).getAttribute("href")).toBe("/admin/health");
   });
 
+  describe("refusal totals", () => {
+    const r = (n: number) => ({
+      size: "l", worker_id: `w-${n}`, worker_name: `base.l-${n}`, kind: "size_refused" as const, reason: `reason ${n}`, reported_at: "2026-11-18T14:20:00Z",
+    });
+    const items = () => within(within(rowOf("L")).getByRole("list", { name: "Workers refused at size L" })).getAllByRole("listitem");
+
+    it("counts the remainder from the api's total when it is past the three details", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 7 } }));
+      const list = items();
+      expect(list).toHaveLength(4);
+      expect(within(list[3]).getByRole("link", { name: "and 4 more workers in Admin health" })).toBeTruthy();
+    });
+
+    // An older api sends details without totals: the remainder is what was sent.
+    it("falls back to the details count when the api sent no totals", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3), r(4), r(5)] }));
+      expect(within(items()[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+
+    it("falls back to the details count when totals have no entry for the size", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3), r(4), r(5)], refusal_totals: { m: 9 } }));
+      expect(within(items()[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+
+    it("never shrinks the remainder below the details sent", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3), r(4), r(5)], refusal_totals: { l: 1 } }));
+      expect(within(items()[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+
+    it("shows no more-item when the total equals the three details", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 3 } }));
+      expect(items()).toHaveLength(3);
+      expect(screen.queryByText(/more workers?/)).toBeNull();
+    });
+
+    // Above the details count, so only the integer check keeps it out (unguarded: "and 4.5 more").
+    it("ignores a total that is not a non-negative integer", () => {
+      renderCard(sizes({}, { refusals: [r(1), r(2), r(3)], refusal_totals: { l: 7.5 } }));
+      expect(items()).toHaveLength(3);
+      expect(screen.queryByText(/more workers?/)).toBeNull();
+    });
+
+    // A valid size name can be an Object.prototype key; it must never read the prototype's value.
+    it("reads no total for a size named like a prototype key", () => {
+      const base = sizes();
+      const row = { ...base.sizes[0], name: "constructor", builtin: false, shipped: null, display_order: 9 };
+      const refused = [1, 2, 3, 4, 5].map((n) => ({ ...r(n), size: "constructor" }));
+      renderCard({ ...base, sizes: [...base.sizes, row], refusals: refused, refusal_totals: {} });
+      const list = within(within(rowOf("CONSTRUCTOR")).getByRole("list", { name: "Workers refused at size CONSTRUCTOR" })).getAllByRole("listitem");
+      expect(within(list[3]).getByRole("link", { name: "and 2 more workers in Admin health" })).toBeTruthy();
+    });
+  });
+
   it("renders no refusal when an older api sends no refusals field", () => {
     const data = sizes();
     delete (data as Partial<AdminWorkerSizes>).refusals;
