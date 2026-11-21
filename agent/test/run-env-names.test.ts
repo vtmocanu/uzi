@@ -98,7 +98,6 @@ describe("runEnvNameViolation", () => {
     "NODE_ENV",
     "NODE_AUTH_TOKEN",
     "UV_INDEX_URL",
-    "DEBUG",
     "TZ",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "DOCKER_AUTH_CONFIG",
@@ -119,6 +118,7 @@ describe("runEnvNameViolation", () => {
     "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
     "ANT_OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_LOG_USER_PROMPTS",
+    "DEBUG",
     "LC_ALL",
     "LC_CTYPE",
   ]) {

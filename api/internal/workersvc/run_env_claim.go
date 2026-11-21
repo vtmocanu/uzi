@@ -7,8 +7,12 @@ import (
 	"slices"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runenv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -78,6 +82,11 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 		return errRunEnvCapabilityMissing
 	}
 	for _, row := range eff {
+		// The run's owner is the only owner a value is opened for: a row of another owner is
+		// never delivered, whatever the query returned.
+		if row.UserID != run.UserID {
+			return errRunEnvHistoryUnavailable
+		}
 		scope := runenv.ScopeUser
 		var repoID *uuid.UUID
 		if row.RepoID.Valid {
@@ -85,11 +94,11 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 			id := uuid.UUID(row.RepoID.Bytes)
 			repoID = &id
 		}
-		kind, aerr := runenv.AADFor(row.AadVersion, row.UserID, scope, repoID, row.Secret, row.Name, row.VarID, row.Rev)
+		kind, aerr := runenv.AADFor(row.AadVersion, run.UserID, scope, repoID, row.Secret, row.Name, row.VarID, row.Rev)
 		if aerr != nil {
 			return fmt.Errorf("%w: %w", errRunEnvHistoryUnavailable, aerr)
 		}
-		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, row.UserID, kind, row.SealedWith, row.Ciphertext)
+		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, run.UserID, kind, row.SealedWith, row.Ciphertext)
 		if oerr != nil {
 			return mapRunEnvOpenError(oerr)
 		}
@@ -107,37 +116,127 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 			continue
 		}
 		seen[k] = true
-		// Missing version, a name that no longer matches the receipt, or a row that is not a
-		// secret: the history cannot be masked completely.
-		if !row.RowID.Valid || !row.RowName.Valid || row.RowName.String != row.Name ||
-			!row.RowSecret.Valid || !row.RowSecret.Bool || !row.SealedWith.Valid ||
-			!row.AadVersion.Valid || !row.RowUserID.Valid {
-			return errRunEnvHistoryUnavailable
-		}
-		scope := runenv.ScopeUser
-		var repoID *uuid.UUID
-		if row.RowRepoID.Valid {
-			scope = runenv.ScopeRepo
-			id := uuid.UUID(row.RowRepoID.Bytes)
-			repoID = &id
-		}
-		owner := uuid.UUID(row.RowUserID.Bytes)
-		// The AAD binds the owner, scope, repo, secret flag, name, var id and rev (v2), so a
-		// ciphertext copied from another version of the variable fails to open here.
-		kind, aerr := runenv.AADFor(row.AadVersion.Int16, owner, scope, repoID, true, row.RowName.String, row.VarID, row.Rev)
-		if aerr != nil {
-			return fmt.Errorf("%w: %w", errRunEnvHistoryUnavailable, aerr)
-		}
-		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, owner, kind, row.SealedWith.String, row.Ciphertext)
-		if oerr != nil {
-			return mapRunEnvOpenError(oerr)
+		plain, err := s.openRunEnvRedact(run.UserID, runEnvRedactRow{
+			VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
+			SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
+			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName,
+		})
+		if err != nil {
+			return err
 		}
 		snap.redact = append(snap.redact, runEnvEntry{VarID: row.VarID, Rev: row.Rev, Scope: row.Scope, Name: row.Name, Secret: true})
 		payload.Secrets.RunEnvRedact = append(payload.Secrets.RunEnvRedact, ClaimRunEnvRedact{
-			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: string(plain),
+			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
 		})
 	}
 	return nil
+}
+
+// runEnvRedactRow is a receipt with the owner's stored row, as both redact reads return it.
+// The row columns are NULL (invalid) when no row of the run's owner holds the version.
+type runEnvRedactRow struct {
+	VarID      uuid.UUID
+	Rev        int32
+	Name       string
+	RowID      pgtype.UUID
+	Ciphertext []byte
+	SealedWith pgtype.Text
+	AadVersion pgtype.Int2
+	RowSecret  pgtype.Bool
+	RowRepoID  pgtype.UUID
+	RowUserID  pgtype.UUID
+	RowName    pgtype.Text
+}
+
+// openRunEnvRedact opens one receipted secret version for masking. The value is opened for the
+// RUN's owner only, with a context built from that owner (never from the row): a missing
+// version, a name that no longer matches the receipt, a row that is not a secret or one of
+// another owner means the history cannot be masked completely (errRunEnvHistoryUnavailable).
+// The AAD binds the owner, scope, repo, secret flag, name, var id and rev (v2), so a ciphertext
+// copied from another version of the variable fails to open here.
+func (s *Service) openRunEnvRedact(owner uuid.UUID, row runEnvRedactRow) (string, error) {
+	if !row.RowID.Valid || !row.RowName.Valid || row.RowName.String != row.Name ||
+		!row.RowSecret.Valid || !row.RowSecret.Bool || !row.SealedWith.Valid ||
+		!row.AadVersion.Valid || !row.RowUserID.Valid || uuid.UUID(row.RowUserID.Bytes) != owner {
+		return "", errRunEnvHistoryUnavailable
+	}
+	scope := runenv.ScopeUser
+	var repoID *uuid.UUID
+	if row.RowRepoID.Valid {
+		scope = runenv.ScopeRepo
+		id := uuid.UUID(row.RowRepoID.Bytes)
+		repoID = &id
+	}
+	kind, aerr := runenv.AADFor(row.AadVersion.Int16, owner, scope, repoID, true, row.RowName.String, row.VarID, row.Rev)
+	if aerr != nil {
+		return "", fmt.Errorf("%w: %w", errRunEnvHistoryUnavailable, aerr)
+	}
+	plain, oerr := secretopen.OpenSealed(s.vlt, s.box, owner, kind, row.SealedWith.String, row.Ciphertext)
+	if oerr != nil {
+		return "", mapRunEnvOpenError(oerr)
+	}
+	return string(plain), nil
+}
+
+// ErrRunEnvVaultLocked and ErrRunEnvHistoryUnavailable are the redact maintenance route's two
+// typed refusals: the owner's vault is locked, or a receipted version is missing or cannot be
+// opened. Neither carries a value.
+var (
+	ErrRunEnvVaultLocked        = errors.New("run environment redact: vault locked")
+	ErrRunEnvHistoryUnavailable = errors.New("run environment redact: history unavailable")
+)
+
+type runEnvRedactReader interface {
+	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
+	ListRunEnvSecretReceiptVersionsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvSecretReceiptVersionsForRunRow, error)
+}
+
+// RunEnvRedact answers the redact maintenance route (PRD #4416 M2): every secret version the
+// run was ever delivered, opened for the run's owner, so a worker can mask the run's output
+// after the claim that delivered them. Protected is false, with no versions, when the run has no
+// secret receipt. The run must be the worker's user's and one this worker holds or last held
+// (runs.worker_id); anything else is ErrRunNotOwned. The result carries plaintext secrets: the
+// caller must never log or cache it.
+func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid.UUID) (RunEnvRedactResponse, error) {
+	rr, ok := s.q.(runEnvRedactReader)
+	if !ok {
+		return RunEnvRedactResponse{}, errors.New("run env redact: queries are not wired")
+	}
+	run, err := rr.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RunEnvRedactResponse{}, ErrRunNotOwned
+	}
+	if err != nil {
+		return RunEnvRedactResponse{}, fmt.Errorf("run env redact run: %w", err)
+	}
+	if run.WorkerID != pgconv.UUID(wkr.ID) || !RunEnvDelivered(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+		return RunEnvRedactResponse{}, ErrRunNotOwned
+	}
+	rows, err := rr.ListRunEnvSecretReceiptVersionsForRun(ctx, runID)
+	if err != nil {
+		return RunEnvRedactResponse{}, fmt.Errorf("run env redact receipts: %w", err)
+	}
+	if len(rows) == 0 {
+		return RunEnvRedactResponse{Protected: false}, nil
+	}
+	out := RunEnvRedactResponse{Protected: true, Versions: make([]ClaimRunEnvRedact, 0, len(rows))}
+	for _, row := range rows {
+		plain, err := s.openRunEnvRedact(run.UserID, runEnvRedactRow{
+			VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
+			SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
+			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName,
+		})
+		switch {
+		case errors.Is(err, errVaultLocked):
+			return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
+		case err != nil:
+			return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
+		}
+		out.Versions = append(out.Versions, ClaimRunEnvRedact{
+			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
+		})
+	}
+	return out, nil
 }
 
 // mapRunEnvOpenError maps a secretopen failure to the claim lane's domain errors: a locked
@@ -219,4 +318,28 @@ func runEnvKeysMatch[T any](snap []runEnvEntry, now []T, key func(T) runEnvKey) 
 		}
 	}
 	return true
+}
+
+// runEnvReceiptReader is the receipt read behind the run page, satisfied by *store.Queries.
+type runEnvReceiptReader interface {
+	ListRunEnvReceiptsForRunGeneration(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvReceiptsForRunGenerationRow, error)
+}
+
+// InjectedRunEnv lists what the run's current claim generation delivered (names, scope and the
+// secret flag from the delivery receipts; no value, no ciphertext, no vault key). The caller
+// decides who may see it. A store without the receipt table reads as nothing delivered.
+func (s *Service) InjectedRunEnv(ctx context.Context, runID uuid.UUID) ([]apitypes.InjectedEnvVarDTO, error) {
+	rr, ok := s.q.(runEnvReceiptReader)
+	if !ok {
+		return nil, nil
+	}
+	rows, err := rr.ListRunEnvReceiptsForRunGeneration(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]apitypes.InjectedEnvVarDTO, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, apitypes.InjectedEnvVarDTO{Name: r.Name, Scope: r.Scope, Secret: r.Secret})
+	}
+	return out, nil
 }

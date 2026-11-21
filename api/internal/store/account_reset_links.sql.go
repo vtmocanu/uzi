@@ -138,8 +138,8 @@ SELECT credentials_reset_at FROM users WHERE id = $1
 `
 
 // PRD #3989 M3: the claim finisher's reset marker. A plain read (no row lock of its own): a
-// lead-lane claim's finisher takes the users row FOR SHARE NOWAIT separately
-// (LockUserVaultStateForShareNowait, PRD #4416), always after the run lock, so this read adds no
+// lead-lane claim's finisher takes the users row FOR KEY SHARE NOWAIT separately
+// (LockUserVaultStateForKeyShareNowait, PRD #4416), always after the run lock, so this read adds no
 // edge to the run-then-users lock order. NULL means the user never redeemed a reset link.
 func (q *Queries) GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error) {
 	row := q.db.QueryRow(ctx, getUserCredentialsResetAt, id)

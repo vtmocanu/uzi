@@ -278,20 +278,88 @@ func (q *Queries) ListRunEnvRedactKeysForRun(ctx context.Context, runID uuid.UUI
 	return items, nil
 }
 
-const lockUserVaultStateForShareNowait = `-- name: LockUserVaultStateForShareNowait :one
-SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR SHARE NOWAIT
+const listRunEnvSecretReceiptVersionsForRun = `-- name: ListRunEnvSecretReceiptVersionsForRun :many
+SELECT rc.var_id, rc.rev, rc.name, rc.scope,
+       v.id AS row_id, v.ciphertext, v.sealed_with, v.aad_version, v.secret AS row_secret,
+       v.repo_id AS row_repo_id, v.user_id AS row_user_id, v.name AS row_name
+FROM run_env_receipts rc
+JOIN runs r ON r.id = rc.run_id
+LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_id = r.user_id
+WHERE rc.run_id = $1 AND rc.secret
+ORDER BY rc.var_id, rc.rev
 `
 
-type LockUserVaultStateForShareNowaitRow struct {
+type ListRunEnvSecretReceiptVersionsForRunRow struct {
+	VarID      uuid.UUID   `json:"var_id"`
+	Rev        int32       `json:"rev"`
+	Name       string      `json:"name"`
+	Scope      string      `json:"scope"`
+	RowID      pgtype.UUID `json:"row_id"`
+	Ciphertext []byte      `json:"ciphertext"`
+	SealedWith pgtype.Text `json:"sealed_with"`
+	AadVersion pgtype.Int2 `json:"aad_version"`
+	RowSecret  pgtype.Bool `json:"row_secret"`
+	RowRepoID  pgtype.UUID `json:"row_repo_id"`
+	RowUserID  pgtype.UUID `json:"row_user_id"`
+	RowName    pgtype.Text `json:"row_name"`
+}
+
+// Every secret version this run was ever delivered, current or not, with the owner's stored
+// row (NULL row columns when no row of the run's owner holds it): the maintenance endpoint that
+// hands a worker everything it must mask for the run. One row per secret receipt.
+func (q *Queries) ListRunEnvSecretReceiptVersionsForRun(ctx context.Context, runID uuid.UUID) ([]ListRunEnvSecretReceiptVersionsForRunRow, error) {
+	rows, err := q.db.Query(ctx, listRunEnvSecretReceiptVersionsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunEnvSecretReceiptVersionsForRunRow{}
+	for rows.Next() {
+		var i ListRunEnvSecretReceiptVersionsForRunRow
+		if err := rows.Scan(
+			&i.VarID,
+			&i.Rev,
+			&i.Name,
+			&i.Scope,
+			&i.RowID,
+			&i.Ciphertext,
+			&i.SealedWith,
+			&i.AadVersion,
+			&i.RowSecret,
+			&i.RowRepoID,
+			&i.RowUserID,
+			&i.RowName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockUserVaultStateForKeyShareNowait = `-- name: LockUserVaultStateForKeyShareNowait :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR KEY SHARE NOWAIT
+`
+
+type LockUserVaultStateForKeyShareNowaitRow struct {
 	VaultMode  string `json:"vault_mode"`
 	VaultEpoch int64  `json:"vault_epoch"`
 }
 
-// The owner's vault mode and epoch under a share lock that fails at once (55P03) when a
-// vault mode change holds the row, so a claim never waits behind one.
-func (q *Queries) LockUserVaultStateForShareNowait(ctx context.Context, userID uuid.UUID) (LockUserVaultStateForShareNowaitRow, error) {
-	row := q.db.QueryRow(ctx, lockUserVaultStateForShareNowait, userID)
-	var i LockUserVaultStateForShareNowaitRow
+// The owner's vault mode and epoch under FOR KEY SHARE NOWAIT: it fails at once (55P03) when
+// a writer holds the row FOR UPDATE, so a claim never waits behind one, and it does NOT
+// conflict with a plain UPDATE of a non-key users column (FOR NO KEY UPDATE). That is enough
+// because every run_env_vars writer takes the users row FOR UPDATE: the variable writes
+// (handler run_env_vars.go via LockUserVaultState), the vault lifecycle and rewrap
+// (LockVaultAuthState), the account reset (DeleteAllRunEnvVarsForOwner, inside the vault
+// lifecycle lock) and a user delete. A future run_env_vars writer must lock the users row
+// FOR UPDATE, never FOR NO KEY UPDATE, or the claim finisher's recompute would not see it.
+func (q *Queries) LockUserVaultStateForKeyShareNowait(ctx context.Context, userID uuid.UUID) (LockUserVaultStateForKeyShareNowaitRow, error) {
+	row := q.db.QueryRow(ctx, lockUserVaultStateForKeyShareNowait, userID)
+	var i LockUserVaultStateForKeyShareNowaitRow
 	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
 	return i, err
 }

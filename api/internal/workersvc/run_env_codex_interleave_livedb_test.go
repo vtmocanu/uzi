@@ -15,8 +15,8 @@ import (
 )
 
 // A Codex refresh commit takes the owner's locks in the order advisory -> users row -> account
-// row (withCodexVaultWrite). The claim finish takes run -> users (FOR SHARE NOWAIT) -> account
-// (FOR SHARE NOWAIT). Neither ever waits behind the other while holding what the other needs, so
+// row (withCodexVaultWrite). The claim finish takes run -> account (FOR SHARE NOWAIT) -> users
+// (FOR KEY SHARE NOWAIT, last, just before the recompute). Neither ever waits behind the other while holding what the other needs, so
 // the two interleavings below both finish. Each runs the refresh writer's real statement
 // sequence (the secret-mutation advisory lock, FenceVaultWrite's users lock, AcquireCodexRefreshLease
 // and CommitCodexRefresh) against a Codex run that receives run environment variables.
@@ -121,7 +121,7 @@ func TestRunEnvCodexFinishAgainstRefreshHoldingLocksLiveDB(t *testing.T) {
 	}
 }
 
-// The finish holds the users row FOR SHARE when the refresh writer arrives: the writer waits for
+// The finish holds the users row FOR KEY SHARE when the refresh writer arrives: the writer waits for
 // the claim's commit, then completes; the claim is not disturbed.
 func TestRunEnvCodexRefreshWaitsBehindFinishShareLockLiveDB(t *testing.T) {
 	fx := newCodexRunEnvFix(t)

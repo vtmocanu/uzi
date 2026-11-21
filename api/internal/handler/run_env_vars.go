@@ -142,13 +142,48 @@ func writeRunEnvConflict(w http.ResponseWriter, code, message string) {
 	httpx.JSON(w, http.StatusConflict, map[string]string{"error": message, "code": code})
 }
 
+// runEnvHeldByRunsMax bounds held_by_runs on an env_history_full answer.
+const runEnvHeldByRunsMax = 20
+
+// runEnvHistoryFullError is an env_history_full conflict that also names the held runs keeping
+// retired secret versions of the owner sealed (up to runEnvHeldByRunsMax run ids).
+type runEnvHistoryFullError struct {
+	*runEnvConflictError
+	heldByRuns []string
+}
+
+// withHeldByRuns adds held_by_runs to a history-full conflict, using the same hold predicate as
+// the retired-version sweeper. A failed lookup returns the conflict unchanged: the answer is
+// still correct, only less informative.
+func withHeldByRuns(ctx context.Context, q *store.Queries, userID uuid.UUID, err error) error {
+	var conflict *runEnvConflictError
+	if !errors.As(err, &conflict) {
+		return err
+	}
+	ids, lerr := q.ListRunsHoldingRunEnvVersions(ctx, store.ListRunsHoldingRunEnvVersionsParams{UserID: userID, MaxRuns: runEnvHeldByRunsMax})
+	if lerr != nil {
+		slog.Warn("run env held_by_runs lookup", "error", lerr)
+		return err
+	}
+	held := make([]string, 0, len(ids))
+	for _, id := range ids {
+		held = append(held, id.String())
+	}
+	return &runEnvHistoryFullError{runEnvConflictError: conflict, heldByRuns: held}
+}
+
 // writeRunEnvTxError maps an error out of a write transaction.
 func (h *Handler) writeRunEnvTxError(w http.ResponseWriter, err error, op string) {
 	var conflict *runEnvConflictError
+	var historyFull *runEnvHistoryFullError
 	var pgErr *pgconn.PgError
 	switch {
 	case h.writeVaultStale(w, err):
 	case h.writeVaultLocked(w, err):
+	case errors.As(err, &historyFull):
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error": historyFull.message, "code": historyFull.code, "held_by_runs": historyFull.heldByRuns,
+		})
 	case errors.As(err, &conflict):
 		writeRunEnvConflict(w, conflict.code, conflict.message)
 	case errors.Is(err, errRunEnvRepoGone), errors.As(err, &pgErr) && pgErr.Code == "23503":
@@ -511,10 +546,10 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 				if retired.RetiredCount+1 > runenv.MaxRetiredVersions || retired.ValueBytes+int64(live.ValueBytes) > runenv.MaxRetiredValueBytes {
-					return &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)}
+					return withHeldByRuns(ctx, q, userID, &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)})
 				}
 				if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
-					return runEnvHeadroomConflict(runEnvCodeHistoryFull, err)
+					return withHeldByRuns(ctx, q, userID, runEnvHeadroomConflict(runEnvCodeHistoryFull, err))
 				}
 				if n, err := q.RetireRunEnvVarVersion(ctx, store.RetireRunEnvVarVersionParams{ID: live.ID, UserID: userID}); err != nil || n != 1 {
 					if err == nil {

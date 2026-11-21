@@ -1,5 +1,7 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
+-- The backfill and the identity trigger below read a table whose writers must not interleave.
+LOCK TABLE run_env_vars IN ACCESS EXCLUSIVE MODE;
 
 -- PRD #4416 M2: delivery receipts, the never-reused variable identity, the version-2 AAD
 -- discriminator and the lead-lane predicate.
@@ -38,6 +40,8 @@ CREATE TABLE run_env_var_ids (
     scope   text NOT NULL CHECK (scope IN ('repo', 'user')),
     name    text NOT NULL
 );
+-- The sweeper's orphan-identity scan and the user cascade read by owner.
+CREATE INDEX run_env_var_ids_user_idx ON run_env_var_ids (user_id);
 
 -- The backfill below keeps one identity per var_id, so a var_id that already names more than one
 -- (user, repo, name) cannot be bound to a single identity. Refuse the migration loudly rather than
@@ -127,6 +131,30 @@ RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
 $$;
 -- +goose StatementEnd
 
+-- fn_run_env_run_held: whether a run is still held, so a secret receipt of it keeps the version it
+-- names sealed. Held is: not terminal, or terminal for less than 24 hours, or holding recovery
+-- custody in any form (an open custody hold, a live capture, a live held-work publication, a
+-- terminal preservation that may own a ref, pending or promoted salvage, a prerequisite closure
+-- that may own a pin, an active publication-resume enrollment, a checkpoint retention that still
+-- owes a delete, or a checkpoint push whose outcome is not accounted for). The retired-version
+-- sweeper and the history-full answer both read this one definition.
+-- +goose StatementBegin
+CREATE FUNCTION fn_run_env_run_held(p_run_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM runs r WHERE r.id = p_run_id
+                     AND (r.status NOT IN ('completed', 'failed', 'cancelled')
+                          OR COALESCE(r.finished_at, r.updated_at) > now() - interval '24 hours'))
+        OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = p_run_id AND h.state = 'open')
+        OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = p_run_id AND c.state NOT IN ('expired', 'discarded'))
+        OR EXISTS (SELECT 1 FROM run_held_publications p WHERE p.run_id = p_run_id AND p.state NOT IN ('refused', 'deleted', 'abandoned'))
+        OR EXISTS (SELECT 1 FROM run_terminal_preservations t WHERE t.run_id = p_run_id AND t.state IN ('bound', 'publishing', 'live', 'retiring'))
+        OR EXISTS (SELECT 1 FROM run_salvage sv WHERE sv.run_id = p_run_id AND sv.state IN ('pending', 'promoted'))
+        OR EXISTS (SELECT 1 FROM recovery_prerequisite_closures pc WHERE pc.run_id = p_run_id AND pc.state NOT IN ('refused', 'foreign', 'lost', 'deleted'))
+        OR EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = p_run_id AND pr.state = 'active')
+        OR EXISTS (SELECT 1 FROM checkpoint_retentions cr WHERE cr.run_id = p_run_id AND cr.state IN ('retained', 'superseding', 'superseded', 'settling'))
+        OR EXISTS (SELECT 1 FROM checkpoint_publish_attempts a WHERE a.run_id = p_run_id)
+$$;
+-- +goose StatementEnd
+
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 -- Version-2 rows and receipts have no version-1 representation: dropping aad_version would leave
@@ -141,6 +169,7 @@ BEGIN
 END
 $$;
 -- +goose StatementEnd
+DROP FUNCTION fn_run_env_run_held(uuid);
 DROP FUNCTION fn_run_env_lane(text, uuid, uuid);
 DROP INDEX run_env_vars_sweep_idx;
 ALTER TABLE run_env_vars
@@ -148,5 +177,6 @@ ALTER TABLE run_env_vars
     DROP COLUMN aad_version;
 DROP TRIGGER run_env_vars_identity_guard ON run_env_vars;
 DROP FUNCTION run_env_vars_identity_guard();
+DROP INDEX run_env_var_ids_user_idx;
 DROP TABLE run_env_var_ids;
 DROP TABLE run_env_receipts;

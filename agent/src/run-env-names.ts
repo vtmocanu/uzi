@@ -163,6 +163,7 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "SYSTEMROOT", invariant: "managed_dirs", note: "system directory selection" },
   { value: "USERPROFILE", invariant: "managed_dirs", note: "profile directory the worker manages" },
   { value: "HUB_CONFIG", invariant: "git_authority", note: "hub CLI configuration and credentials" },
+  { value: "DEBUG", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
   { value: "DEBUG_SDK", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
   { value: "DEBUG_CLAUDE_AGENT_SDK", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
   { value: "FORCE_VCR", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },

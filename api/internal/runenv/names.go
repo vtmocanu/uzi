@@ -156,6 +156,7 @@ var deniedNames = []deniedRule{
 	{"SYSTEMROOT", "managed_dirs", "system directory selection"},
 	{"USERPROFILE", "managed_dirs", "profile directory the worker manages"},
 	{"HUB_CONFIG", "git_authority", "hub CLI configuration and credentials"},
+	{"DEBUG", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
 	{"DEBUG_SDK", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
 	{"DEBUG_CLAUDE_AGENT_SDK", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
 	{"FORCE_VCR", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
