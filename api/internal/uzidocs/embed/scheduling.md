@@ -777,11 +777,18 @@ exceed `max_issues` once backfill walks past a skip), which ones
 - `description_too_large` — the composed run instruction (issue body
   plus any [guidance](#guidance)) exceeds the size limit.
 - `consumer_gate_busy`: a sweep had already started work before a candidate's
-  repository gate was busy. The partial fire stops and is consumed. A one-time
-  sweep does not retry it automatically; start that issue manually or explicitly
-  re-fire the sweep as a new fire. If nothing had started, the schedule stays
-  armed and retries instead. Durable partial-fire progress is deferred to
-  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
+  repository gate was busy. A **recurring** sweep records the skip, stops and
+  advances; the issue is considered again at the next fire. A **one-time**
+  sweep fired by the scheduler is not advanced: it stays active and due and the
+  next tick resumes the same fire. Each run the fire starts is recorded in a
+  durable per-fire ledger, so the retry never re-starts an issue the fire
+  already started (even if that run finished, was deleted, or the issue left the
+  selector) and never exceeds the fire's original cap; it only fills the
+  remaining slots. `last_fire` shows the progress while it waits.
+  `run-now` is a distinct manual fire: it records no progress and
+  never advances. If nothing had started, the schedule stays armed and retries
+  as before. See [ADR-4007](../adr/4007-terminal-preservation.md)
+  (T3a, [#4512](https://github.com/vtmocanu/uzi/issues/4512)).
 - `fetch_failed` — a transient forge or database error while checking
   a sweep candidate. The same underlying error is handled differently
   by target: on a **pinned issue**, it's transient and the fire retries
@@ -826,7 +833,8 @@ exceed `max_issues` once backfill walks past a skip), which ones
   with a disabled stored pin/override is **held** before any start: due,
   un-advanced, with the skip recorded as its last fire, until re-enable or
   a changed stored choice. A disable after a partial one-time sweep start
-  stops the scan and advances instead. A one-time single issue whose label
+  stops the scan; the fire stays due and resumes its remaining slots from the
+  per-fire ledger once re-enabled or the stored choice is changed. A one-time single issue whose label
   selects a disabled harness holds like a pin. On an unpinned label-selected
   sweep, harness disable is a per-candidate skip and scanning continues
   within the caps; stored-pin/override rules still apply. Missing credentials
@@ -950,7 +958,11 @@ last fire without advancing, so it can show a `last_fire` while still due. A
 `run-now` fire reports its own outcome in the response without
 touching `last_fire` at all, since a manual fire must not disturb the
 cadence. A schedule that has never fired and was never held that way
-reads `last_fire: null`.
+reads `last_fire: null`. A scheduled one-time sweep interrupted partway
+(a busy repository gate, a crash, a failed advance, a shutdown, a capacity or
+credential hold) also keeps `last_fire` as a progress summary while it stays
+due; it names the runs the fire has started so far, and a named run may have
+since been deleted (the ledger keeps its run id, title and URL).
 
 ### Recent fires
 
@@ -968,6 +980,15 @@ panel note), not an examined-0 one. The parked and transient paths write nothing
 either field, and `run-now` records nothing in either. A one-time schedule
 held on a disabled credential appends its hold once, not once per tick,
 because the hold only writes when the stored summary differs.
+
+A partially completed one-time sweep fire does not append to `recent_fires`
+while it waits to resume; the entry is appended once, when the fire completes.
+Editing a pending one-time schedule (a change requires a future `run_at`)
+starts a new occurrence with the full cap; that is the owner's explicit
+re-fire. Rollback limitation: an older scheduler binary ignores the per-fire
+ledger, so while it runs it can exceed the cap when resuming a partial one-time
+fire and advance normally. There is no end-to-end (compose) coverage of the
+scheduled one-time retry; it is covered by LiveDB and unit tests.
 
 Skips count, so a schedule-wide skip also takes a slot: the `schedules_paused`
 skip recorded on every tick while all schedules are paused, or a persistent

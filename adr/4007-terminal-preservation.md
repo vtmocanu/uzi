@@ -238,23 +238,23 @@ kinds are disjoint, and review and then-fix are mutually exclusive).
 `ErrTerminalConsumerGateBusy`: HTTP admissions answer 503
 with `Retry-After: 1`, the pollers and the scheduler leave the trigger
 unrecorded (CI autofix never maps it to the errors that record a pipeline), and
-a schedule that has started nothing in that fire is not advanced. A sweep fire
-that already started runs records the busy candidate as a visible
-`consumer_gate_busy` skip,
-stops and advances (holding it would re-fire the whole sweep), so a one-time
-sweep does not retry that candidate.
+a schedule that has started nothing in that fire is not advanced. A recurring
+sweep fire that already started runs records the busy candidate as a visible
+`consumer_gate_busy` skip, stops and advances (holding it would re-fire the
+whole sweep); it is considered again at the next fire. A scheduled one-time
+sweep that already started runs is not advanced: it retries its remaining slots
+from the durable per-fire ledger (T3a below), without replay or cap overshoot.
 
 Delivery scope was narrowed for #4488: preserving the original cap and avoiding
-replay across partial-fire retries needs durable per-fire candidate progress.
-That design is deferred to #4512, with design review before implementation. The owner
-can start the skipped issue manually or explicitly re-fire the sweep as a new
-fire. The active-run/open-MR guards are not per-fire idempotency after a run ends.
-Unattempted candidates after the busy one are not claimed as individually skipped.
-The final partial-outcome write uses a cancellation-detached five-second context,
-so the canceled gate wait does not itself discard that outcome. Creation and
-advancement remain separate commits: a crash or failed advance can still leave
-the schedule due and replay partial work. No restart-safe per-fire guarantee is
-claimed until the follow-up supplies durable progress.
+replay across partial-fire retries needs durable per-fire candidate progress, so
+that fire was first delivered as record, stop and advance for every sweep. The
+durable progress was delivered by #4512 (T3a), which restored the one-time
+retry; recurring sweeps keep the narrowed behaviour. The active-run/open-MR
+guards are not per-fire idempotency after a run ends; the ledger is. Unattempted
+candidates after the busy one are not claimed as individually skipped. The final
+partial-outcome write uses a cancellation-detached five-second context, so the
+canceled gate wait does not itself discard that outcome. Run-now stays a
+distinct manual fire with no progress recorded, and never advances.
 
 **Residual limits.** A fire-once hook or `ReconcileRunMR` still drops its work
 on a genuine database fault, as every other database error there already does;
@@ -271,9 +271,9 @@ admission, as every other database error there does.
 
 ### T3a: durable per-fire progress for one-time sweeps (#4512)
 
-Once implemented, this supersedes the narrowed partial-fire paragraph under
-"Caller semantics" in T3 above ("a one-time sweep does not retry that
-candidate", and the deferral to #4512).
+This supersedes the narrowed partial-fire paragraph under "Caller semantics" in
+T3 above, which recorded the busy candidate and advanced a one-time sweep
+instead of retrying it (narrowed for #4488, delivered here by #4512).
 
 **Problem.** A scheduled one-time sweep that started some runs and then met a
 busy consumer gate recorded a `consumer_gate_busy` skip and advanced to
