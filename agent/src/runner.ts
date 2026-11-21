@@ -1,4 +1,5 @@
 import { runEnvRedactionForms } from "./run-env-forms.js";
+import { leadLaneRunEnv } from "./run-env-lane.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
@@ -17278,7 +17279,8 @@ export class RunRunner {
       oauthToken: claim.secrets.anthropic_oauth_token,
       ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
       // PRD #4416 M2: the run's user variables, for the lead lane's env builders.
-      ...(claim.secrets.run_env && claim.secrets.run_env.length > 0 ? { runEnv: claim.secrets.run_env } : {}),
+      // Only a lead-lane run (leadLaneRunEnv mirrors the api's LeadLane); redaction forms are registered for every kind.
+      ...(leadLaneRunEnv(claim, claim.secrets.run_env) ? { runEnv: leadLaneRunEnv(claim, claim.secrets.run_env)! } : {}),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
@@ -18031,7 +18033,7 @@ export class RunRunner {
         if (semanticGate) {
           try {
             if (!barePath) throw new Error("semantic candidate: bare source unavailable");
-            semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
+            semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog, flight.redactText);
             if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
             semanticSources = await captureSemanticSources(this.git, {
               barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
@@ -18186,7 +18188,7 @@ export class RunRunner {
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
-              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
+              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog, flight.redactText);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -18786,7 +18788,8 @@ export class RunRunner {
               if (!barePath) return "";
               const read = await readRepoInstructionsAtCommit(this.git, barePath, instructionsCommit, { timeoutMs: 15_000, signal });
               if (!("text" in read)) runLog.warn("code cross-check repository instructions not read", { reason: read.dropped });
-              return "text" in read ? read.text : "";
+              // PRD #4416 M2: repository text leaves the worker redacted with the run's own secret set.
+              return "text" in read ? flight.redactText(read.text) : "";
             },
             snapshot: async () => {
               if (!barePath || (executor.safety && (steering.lifecycleSignal().aborted || this.shuttingDownGlobal))) {
@@ -32270,6 +32273,9 @@ export class RunRunner {
    *  autopilot short-circuit is unchanged and never returns a revise. */
   private async captureCheckedPlanningDiff(
     clonePath: string, baseCommit: string, barePath: string | undefined, signal: AbortSignal, runLog: Logger,
+    // PRD #4416 M2: the run's redactor. The gitleaks scan below cannot know a run variable's value, so the
+    // diff that leaves the worker is passed through it after the scan.
+    redactText?: (text: string) => string,
   ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string }> {
     if (!/^[a-f0-9]{40}$/.test(baseCommit)) {
       runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "base_invalid" });
@@ -32302,7 +32308,7 @@ export class RunRunner {
         signal.throwIfAborted();
         if (!scan.trusted || ownerSignal.aborted) return { refusal: "scan_failed", diagnostic: "scan_untrusted" };
         if (scan.findings.length) return { refusal: "secret_detected", diagnostic: "secret_detected" };
-        return { diff };
+        return { diff: redactText ? redactText(diff) : diff };
       });
     } finally {
       clearTimeout(timer);

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
 import { buildCommandEnv, withCommandGitTrust } from "../src/codex/codex-executor.js";
-import { runEnvDropText } from "../src/run-env-inject.js";
+import { foldRunEnv, runEnvDropText } from "../src/run-env-inject.js";
 import { runEnvRedactionForms, secretForms } from "../src/run-env-forms.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { RUN_ENV_DENIED_NAMES, RUN_ENV_DENIED_PREFIXES } from "../src/run-env-names.js";
@@ -127,6 +127,17 @@ describe("buildCommandEnv with run variables", () => {
   });
 });
 
+describe("foldRunEnv protected predicate", () => {
+  it("drops an otherwise allowed name the builder protects, and reports it", () => {
+    const env: Record<string, string | undefined> = {};
+    const { drops, onDrop } = collector();
+    foldRunEnv(env, { vars: [v("MY_FLAG"), v("OTHER_FLAG")], onDrop }, (k) => k === "MY_FLAG");
+    assert.ok(!Object.hasOwn(env, "MY_FLAG"));
+    assert.equal(env.OTHER_FLAG, "dummy-value-other_flag");
+    assert.deepEqual(drops, [["MY_FLAG", "protected worker key"]]);
+  });
+});
+
 describe("dropped-name event text", () => {
   it("sanitizes the name and never carries a value", () => {
     const text = runEnvDropText("BAD\u001b[31mNAME\u0000", "must match the name shape");
@@ -142,7 +153,8 @@ describe("only the lead lane receives run variables", () => {
   // The files that may mention the run env at all: the seam, the claim path, the lead-lane builders and executors.
   const ALLOWED_FILES = new Set([
     "client.ts", "executor.ts", "protocol.ts", "runner.ts", "sdk-env.ts", "sdk-executor.ts", "worker.ts",
-    "run-env-claim.ts", "run-env-forms.ts", "run-env-inject.ts", "run-env-names.ts",
+    "run-env-claim.ts", "run-env-forms.ts", "run-env-inject.ts", "run-env-lane.ts", "run-env-names.ts", "run-env-prompt.ts",
+    "prompt.ts", "agents.ts", path.join("codex", "render.ts"),
     path.join("codex", "codex-executor.ts"),
   ]);
 
@@ -221,5 +233,28 @@ describe("registered forms of secret variables", () => {
     for (const f of runEnvRedactionForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], [])) assert.ok(f.length >= 8);
     const forms = runEnvRedactionForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []);
     assert.equal(new Set(forms).size, forms.length);
+  });
+});
+
+describe("the executors pass the run variables to the env builders", () => {
+  // A deleted runEnv argument at the spawn site would leave the built env without the variable. The
+  // executor sources are scanned for the call shape, and the builders are exercised with the same
+  // injection object the executors build from RunContext.runEnv.
+  const srcDir = new URL("../src/", import.meta.url).pathname;
+  const lead = [v("DB_PASSWORD", "dummy-secret-run-value-000000", true), v("REGION")];
+
+  it("buildSdkEnv and buildCommandEnv carry a lead-lane run's variables", () => {
+    const sdk = buildSdkEnv({ kind: "oauth", token: "dummy-oauth-token-do-not-scan-0000" }, "/h", {}, undefined, undefined, undefined, undefined, { vars: lead });
+    assert.equal(sdk.DB_PASSWORD, "dummy-secret-run-value-000000");
+    assert.equal(sdk.REGION, "dummy-value-region");
+    const cmd = buildCommandEnv("/private/tmp", {}, undefined, false, { vars: lead });
+    assert.equal(cmd.DB_PASSWORD, "dummy-secret-run-value-000000");
+  });
+
+  it("the spawn sites of both executors pass ctx.runEnv", () => {
+    const sdkSrc = fs.readFileSync(path.join(srcDir, "sdk-executor.ts"), "utf8");
+    assert.match(sdkSrc, /buildSdkEnv\(credential,[^;]*ctx\.runEnv && ctx\.runEnv\.length > 0\s*\?\s*\{ vars: ctx\.runEnv/s);
+    const codexSrc = fs.readFileSync(path.join(srcDir, "codex", "codex-executor.ts"), "utf8");
+    assert.match(codexSrc, /buildCommandEnv\([\s\S]{0,900}?ctx\.runEnv && ctx\.runEnv\.length > 0\s*\?\s*\{ vars: ctx\.runEnv/s);
   });
 });

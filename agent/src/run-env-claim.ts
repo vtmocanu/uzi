@@ -34,7 +34,7 @@ const NAME_RE = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 /** A claim's run-env payload violated the contract. The message never carries a value. */
-export class RunEnvClaimError extends Error {
+class RunEnvClaimError extends Error {
   constructor(message: string) {
     super(`run_env claim: ${message}`);
     this.name = "RunEnvClaimError";

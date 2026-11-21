@@ -378,9 +378,10 @@ function resolveRoleModel(
  *  command-lifetime guidance, and the worker-owned safety block last. Only that STATIC block:
  *  the run's operator constraints (follow-ups) are attached per dispatch by the Claude Agent
  *  guard (guardrails.ts buildAgentGuardHook) and do NOT reach Codex subagents yet (#1660). */
-function renderSubagentPrompt(agent: HarnessAgent, childTurnBudgetMs?: number): string {
+function renderSubagentPrompt(agent: HarnessAgent, childTurnBudgetMs?: number, runEnvAppend = ""): string {
+  const runEnv = runEnvAppend === "" ? "" : `${runEnvAppend}\n\n`;
   const budget = childTurnBudgetMs === undefined ? "" : `${codexChildBudgetAppend(childTurnBudgetMs)}\n\n`;
-  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${budget}${SUBAGENT_SAFETY_APPEND}`;
+  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${runEnv}${budget}${SUBAGENT_SAFETY_APPEND}`;
 }
 
 /** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's
@@ -393,7 +394,7 @@ const MAX_DIAGNOSTIC_NAME_CHARS = 120;
  *  separators, bidi embeddings/overrides/isolates, word joiner, BOM). MIRRORS
  *  broker.ts `isUnsafeIdentifierChar`. A code-point scan on purpose: oxlint's
  *  `no-control-regex` is denied, so a control-char regex is not an option. */
-function isUnsafeNameChar(cp: number): boolean {
+export function isUnsafeNameChar(cp: number): boolean {
   if (cp <= 0x1f) return true; // C0 controls incl. TAB/LF/CR/ESC
   if (cp === 0x7f) return true; // DEL
   if (cp >= 0x80 && cp <= 0x9f) return true; // C1 controls
@@ -507,7 +508,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
       allowedSkills: buildAllowedSkills(agent.skills, role, diagnostics),
       isRoot: false,
     });
-    perRolePrompts.set(role, renderSubagentPrompt(agent, request.childTurnBudgetMs));
+    perRolePrompts.set(role, renderSubagentPrompt(agent, request.childTurnBudgetMs, request.runEnvAppend));
   }
 
   return {
