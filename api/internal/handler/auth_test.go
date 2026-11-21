@@ -536,13 +536,17 @@ func TestSessionPayloadSidebarMotion(t *testing.T) {
 	ctx := context.Background()
 
 	unset := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{}))
-	if unset.Appearance.SidebarMotion || unset.Appearance.Defaults.SidebarMotion || unset.Appearance.Overrides.SidebarMotion != nil {
-		t.Errorf("NULL user: %+v, want resolved false, default false, override null", unset.Appearance)
+	if !unset.Appearance.SidebarMotion || !unset.Appearance.Defaults.SidebarMotion || unset.Appearance.Overrides.SidebarMotion != nil {
+		t.Errorf("NULL user: %+v, want resolved true, default true, override null", unset.Appearance)
 	}
 
 	on := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{SidebarMotion: pgtype.Bool{Bool: true, Valid: true}}))
 	if !on.Appearance.SidebarMotion || on.Appearance.Overrides.SidebarMotion == nil || !*on.Appearance.Overrides.SidebarMotion {
 		t.Errorf("explicit true: %+v, want resolved true, override true", on.Appearance)
+	}
+	off := decodeSessionMotion(t, h.sessionPayload(ctx, store.User{SidebarMotion: pgtype.Bool{Bool: false, Valid: true}}))
+	if off.Appearance.SidebarMotion || off.Appearance.Overrides.SidebarMotion == nil || *off.Appearance.Overrides.SidebarMotion {
+		t.Errorf("explicit false: %+v, want resolved false, override false", off.Appearance)
 	}
 }
 

@@ -23,6 +23,7 @@ import {
   isDarkTheme,
   DEFAULT_LIGHT_THEME,
   DEFAULT_DARK_THEME,
+  DEFAULT_SIDEBAR_MOTION,
 } from "../lib/theme";
 
 // Compiled-in default for the single run-eligibility label (PRD #764). The SPA
@@ -52,7 +53,7 @@ function fallbackAppearance(
     light_theme: DEFAULT_LIGHT_THEME,
     dark_theme: dark,
     typeface: "system",
-    sidebar_motion: false,
+    sidebar_motion: DEFAULT_SIDEBAR_MOTION,
     overrides: {
       mode: null,
       light_theme: null,
@@ -65,7 +66,7 @@ function fallbackAppearance(
       light_theme: DEFAULT_LIGHT_THEME,
       dark_theme: defaultDark,
       typeface: "system",
-      sidebar_motion: false,
+      sidebar_motion: DEFAULT_SIDEBAR_MOTION,
     },
   };
 }
@@ -188,7 +189,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       light: nextAppearance.light_theme,
       dark: nextAppearance.dark_theme,
       typeface: nextAppearance.typeface,
-      sidebarMotion: nextAppearance.sidebar_motion === true,
+      sidebarMotion: nextAppearance.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION,
     });
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultMetadataPending(false);
