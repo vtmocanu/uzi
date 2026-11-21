@@ -197,6 +197,11 @@ CLI or `evaluate()` path.
   (tag, label, profile path, devbox lock, narhash), `toolchain-mount-writable`,
   `no-go-bearing-image-verified`. Go must be observed with `observed_in: "image-fs"`
   and a provenance kind in `signed-output-metadata` or `reproducible-build-attestation`.
+  The index digest, platform digest and image Id are well-formed sha256 values and the
+  platform digest is required. `image_id_kind` is `index` (the Id equals the index digest, as
+  under the containerd snapshotter) or `config` (the Id differs from both other digests); the
+  platform digest differs from the index digest unless `single_platform` is true. Any other
+  shape is `binding-source-unbound`.
 - threshold: `owner-input-not-supplied`, `effective-value-unestablished` (an API value
   alone), `threshold-stale` (over 300 s old or in the future), `threshold-contradictory`,
   `margin-js-parse-unsupported`. The effective value must be a `soft-threshold-log` or
@@ -237,7 +242,13 @@ CLI or `evaluate()` path.
   sizeLimit, ephemeral-storage limit, quota monitoring, PVC request, fs capacity,
   watchdog, sampled du/statfs, broker counters, eviction, cooperative writer caps,
   json-file max-size, rlimit fsize, cacheprog object count, and storage-opt size unless
-  backend-support evidence is present), `new-mount-possible` (needs CapBnd 0, NoNewPrivs 1
+  backend-support evidence is present; even then it covers bytes of `container_writable_layer`
+  only, needs the same removability checks as mount claims, and needs a collector-observed
+  applied `writable_layer_quota_bytes` above zero, else `quota-not-applied-observed`; any
+  other sink is `boundary-sink-out-of-scope`), `outer-sink-unbounded` (each outer sink needs a
+  runtime fact `outer_ops_excluded` naming it as having no incrementing operation in the
+  permitted workload; a declaration or backing headroom does not cover it, and a file-sourced
+  fact is FIXTURE-CONSISTENT at most), `new-mount-possible` (needs CapBnd 0, NoNewPrivs 1
   and seccomp mode 2 default profile or max_user_namespaces 0),
   `daemon-capability-unsupported` (MemoryLimit, SwapLimit or PidsLimit false, or
   rootless with the cgroupfs driver; rootless with a null CgroupDriver is
@@ -273,12 +284,18 @@ CLI or `evaluate()` path.
   on one superblock claim different backing domains; a child charged inside its parent
   counts once.
 - envelope: `envelope-drift` unless limits equal preflight.LIMITS exactly;
-  `inode-ceiling-unapproved` unless `owner_approved` is true.
+  `inode-ceiling-unapproved` unless `owner_approved` is true;
+  `enforced-capacity-exceeds-envelope` (NEGATIVE) when observed enforced byte capacities
+  summed over all enforcing superblocks exceed the aggregate, enforced inode capacities exceed
+  the approved ceiling, or the applied memory max exceeds the memory limit or differs from the
+  swap max.
 - backing: `backing_check` reuses `preflight.project_domains`. Codes
   `backing-link-cited-only`, `backing-capacity-unknown`, `backing-sample-stale` (over
   60 s), `backing-concurrency-unknown`, `backing-mapping-unknown`,
   `backing-aggregate-exceeds-soft` (projected use must stay strictly below soft times
-  capacity for bytes and inodes), `backing-soft-unknown`.
+  capacity for bytes and inodes), `backing-soft-unknown`. Each enforcing tmpfs or exclusive
+  superblock projects the larger of its declared sink charges and its observed enforced
+  capacity; the leg needs mount facts.
 - canary: always UNVERIFIED `canary-collector-not-implemented` in M1, whatever any caller
   attaches (`CollectorEvidence` has no canary attribute). `classify_canary` is tested
   with fixtures: readonly-rootfs needs EROFS and the read-only flag

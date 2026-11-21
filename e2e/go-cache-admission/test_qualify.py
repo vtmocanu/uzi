@@ -122,7 +122,8 @@ def run(claims, mounts, sinks, fact=None, **kw):
 
 def good_binding():
     return dict(repo_revision="a"*40, scaffold_revision="b"*40, index_digest=sha("1"),
-                platform_digest=sha("2"), image_id=sha("3"), running_container_image_id=sha("3"),
+                platform_digest=sha("2"), image_id=sha("3"), image_id_kind="config",
+                running_container_image_id=sha("3"),
                 go_declared=True,
                 go=dict(sha256="4"*64, version="go1.25.0", source_sha256="5"*64,
                         observed_in="image-fs", provenance=dict(kind="signed-output-metadata")),
@@ -166,10 +167,11 @@ def full_artifact():
         mountinfo=dict(source="collector", mounts=mounts, fds=[dict(mount_id=10, writable=True)],
                        realpaths=realpaths),
         runtime=dict(source="collector", new_mount=facts()["new_mount"],
-                     container=facts()["container"], applied=facts()["applied"]),
+                     container=facts()["container"], applied=facts()["applied"],
+                     outer_ops_excluded=list(OUTER)),
         daemon=dict(source="collector", **facts()["daemon"]),
         claims=claims,
-        envelope=dict(limits=dict(p.LIMITS), inode_ceiling=dict(value=1000, owner_approved=True)),
+        envelope=dict(limits=dict(p.LIMITS), inode_ceiling=dict(value=10000, owner_approved=True)),
         backing=dict(source="collector", domains=dict({"outer-A": dict(observed=dict(
             capacity_bytes=10**12, capacity_inodes=10**9, used_bytes=0, used_inodes=0,
             concurrent_bytes=0, concurrent_inodes=0, sampled_at=NOW-1))})))
@@ -213,6 +215,40 @@ class BindingTests(Base):
             value = good_binding()
             del value[key]
             self.assertIn("binding-source-unbound", q.check_binding(value, "a"*40), key)
+
+    def test_digest_meaning_index_kind_image_id_is_the_index_digest(self):
+        value = good_binding()
+        value.update(image_id_kind="index", image_id=sha("1"), running_container_image_id=sha("1"))
+        self.assertEqual(q.check_binding(value), [])
+        value["image_id"] = value["running_container_image_id"] = sha("3")
+        self.assertIn("binding-source-unbound", q.check_binding(value))
+
+    def test_digest_meaning_config_kind_must_differ_from_both(self):
+        for same in ("index_digest", "platform_digest"):
+            value = good_binding()
+            value["image_id"] = value["running_container_image_id"] = value[same]
+            with self.subTest(same=same):
+                self.assertIn("binding-source-unbound", q.check_binding(value))
+
+    def test_digest_meaning_platform_digest_is_required_and_distinct(self):
+        value = good_binding()
+        del value["platform_digest"]
+        self.assertIn("binding-source-unbound", q.check_binding(value))
+        value = good_binding()
+        value["platform_digest"] = value["index_digest"]
+        self.assertIn("binding-source-unbound", q.check_binding(value))
+        value["single_platform"] = True
+        self.assertEqual(q.check_binding(value), [])
+        value["single_platform"] = "yes"
+        self.assertIn("binding-source-unbound", q.check_binding(value))
+
+    def test_digest_meaning_kind_is_required_and_digests_well_formed(self):
+        for key, bad in (("image_id_kind", None), ("image_id_kind", "other"), ("image_id", "sha256:xyz"),
+                         ("index_digest", "abc")):
+            value = good_binding()
+            value[key] = bad
+            with self.subTest(key=key, bad=bad):
+                self.assertIn("binding-source-unbound", q.check_binding(value))
 
     def test_running_image_must_equal_installed_image(self):
         value = good_binding()
@@ -890,10 +926,47 @@ class EnforcementTests(Base):
         sinks = {"container_writable_layer": sink("container_writable_layer", "/", 1, "sb-root")}
         claim = cl("storage-opt-size", "bytes", ["container_writable_layer"])
         self.assertIn("boundary-not-allocation-enforcement", run([claim], [], sinks)["reasons"])
-        got = run([claim], [], sinks, facts(backend_support=True))
+        applied = dict(facts()["applied"], writable_layer_quota_bytes=GIB)
+        got = run([claim], [], sinks, facts(backend_support=True, applied=applied))
         self.assertNotIn("boundary-not-allocation-enforcement", got["reasons"])
+        self.assertNotIn("quota-not-applied-observed", got["reasons"])
         self.assertIn("sink-inodes-uncovered", got["reasons"])
         self.assertNotIn("container_writable_layer", got["uncovered"]["bytes"])
+
+    def storage_opt(self, names, **over):
+        sinks = {n: sink(n, "/t/"+n, 16, "sb-t") for n in names}
+        applied = dict(facts()["applied"], writable_layer_quota_bytes=GIB)
+        f = facts(backend_support=True, applied=applied)
+        f.update(over)
+        return run([cl("storage-opt-size", "bytes", names)], [], sinks, f)
+
+    def test_storage_opt_size_is_scoped_to_the_writable_layer(self):
+        for names in (["home"], ["volumes"], ["container_writable_layer", "home"], []):
+            with self.subTest(names=names):
+                got = self.storage_opt(names)
+                self.assertIn("boundary-sink-out-of-scope", got["reasons"])
+                for name in names:
+                    self.assertNotIn(name, [n for n, c in got["coverage"].items() if c["bytes"]])
+
+    def test_storage_opt_size_needs_an_applied_quota_value(self):
+        for applied in (facts()["applied"], dict(facts()["applied"], writable_layer_quota_bytes=0),
+                        dict(facts()["applied"], writable_layer_quota_bytes="1g")):
+            with self.subTest(applied=applied):
+                got = self.storage_opt(["container_writable_layer"], applied=applied)
+                self.assertIn("quota-not-applied-observed", got["reasons"])
+                self.assertIn("container_writable_layer", got["uncovered"]["bytes"])
+        got = self.storage_opt(["container_writable_layer"])
+        self.assertNotIn("quota-not-applied-observed", got["reasons"])
+        self.assertEqual(got["coverage"]["container_writable_layer"], dict(bytes=True, inodes=False))
+
+    def test_storage_opt_size_removable_boundary(self):
+        for container in (dict(privileged=True, caps=[], cgroupfs_writable=False, cgroupns=True),
+                          dict(privileged=False, caps=["CAP_SYS_ADMIN"], cgroupfs_writable=False, cgroupns=True),
+                          dict(privileged=False, caps=None, cgroupfs_writable=False, cgroupns=True)):
+            with self.subTest(container=container):
+                got = self.storage_opt(["container_writable_layer"], container=container)
+                self.assertIn("boundary-removable", got["reasons"])
+                self.assertIn("container_writable_layer", got["uncovered"]["bytes"])
 
     def test_resource_missing_unknown_and_wrong_pairing(self):
         claims, mounts, sinks = tmpfs_env()
@@ -1108,6 +1181,105 @@ class EvaluateTests(Base):
         self.assertEqual(got["verdict"], "NO-QUALIFIED-ENVIRONMENT")
         self.assertIn("canary-collector-not-implemented", reasons(got["legs"]["canary"]))
         self.assertEqual(len(got["collector"]["daemon_id_hash"]), 64)
+
+    def sized(self, size=MIB, domain_bytes=40*MIB):
+        """Fixture whose tmpfs capacities equal the declared sink charges (1 MiB each)."""
+        art = full_artifact()
+        for m in art["mountinfo"]["mounts"]:
+            if m["fstype"] == "tmpfs":
+                m["options"]["size"] = size
+        art["backing"]["domains"]["outer-A"]["observed"]["capacity_bytes"] = domain_bytes
+        return art
+
+    def test_backing_projects_the_enforced_capacity_when_it_exceeds_the_declarations(self):
+        art = self.sized()
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]
+        self.assertEqual(reasons(got["backing"]), [])
+        self.assertEqual(got["backing"]["status"], "FIXTURE-CONSISTENT")
+        # Declarations are unchanged; only the enforced tmpfs size grows past them.
+        art["mountinfo"]["mounts"][-1]["options"]["size"] = 20*MIB
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]
+        self.assertIn("backing-aggregate-exceeds-soft", reasons(got["backing"]))
+        self.assertEqual(got["backing"]["status"], "NEGATIVE")
+
+    def test_backing_projection_uses_the_larger_of_declared_and_enforced(self):
+        art = self.sized()
+        for m in art["mountinfo"]["mounts"]:
+            if m["fstype"] == "tmpfs":
+                m["options"]["size"] = 1
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]
+        self.assertEqual(reasons(got["backing"]), [])
+
+    def test_backing_without_mount_facts_is_not_proven(self):
+        art = self.sized()
+        ce = q.collect(StubObserver(art, tuple(n for n in ALL_SECTIONS if n != "mountinfo")))
+        got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]["backing"]
+        self.assertNotEqual(got["status"], "PROVEN")
+
+    def test_enforced_byte_capacities_must_fit_the_aggregate(self):
+        art = self.sized()
+        self.assertEqual(reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]), [])
+        tmpfs_mounts = [m for m in art["mountinfo"]["mounts"] if m["fstype"] == "tmpfs"]
+        for m in tmpfs_mounts[:2]:
+            m["options"]["size"] = 1536*MIB
+        leg = q.evaluate(art, now=NOW)["legs"]["envelope"]
+        self.assertEqual(leg["status"], "NEGATIVE")
+        self.assertIn("enforced-capacity-exceeds-envelope", reasons(leg))
+
+    def test_enforced_inode_capacities_must_fit_the_approved_ceiling(self):
+        art = self.sized()
+        art["envelope"]["inode_ceiling"]["value"] = 22*100
+        self.assertIn("enforced-capacity-exceeds-envelope", reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]))
+        art["envelope"]["inode_ceiling"]["value"] = 23*100
+        self.assertEqual(reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]), [])
+        art["envelope"]["inode_ceiling"]["value"] = 1
+        art["envelope"]["inode_ceiling"]["owner_approved"] = False
+        got = reasons(q.evaluate(art, now=NOW)["legs"]["envelope"])
+        self.assertEqual(got, ["inode-ceiling-unapproved"])
+
+    def test_applied_memory_limit_must_fit_the_envelope(self):
+        art = self.sized()
+        art["runtime"]["applied"].update(memory_max=2*GIB, memory_swap_max=2*GIB)
+        leg = q.evaluate(art, now=NOW)["legs"]["envelope"]
+        self.assertEqual(leg["status"], "NEGATIVE")
+        self.assertIn("enforced-capacity-exceeds-envelope", reasons(leg))
+        art["runtime"]["applied"].update(memory_max=p.LIMITS["memory"], memory_swap_max=p.LIMITS["memory"]+1)
+        self.assertIn("enforced-capacity-exceeds-envelope", reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]))
+        art["runtime"]["applied"].update(memory_max=p.LIMITS["memory"], memory_swap_max=p.LIMITS["memory"])
+        self.assertEqual(reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]), [])
+
+    def collector_enforcement(self, **runtime):
+        art = self.sized()
+        art["runtime"].update(runtime)
+        ce = q.collect(StubObserver(art, ALL_SECTIONS))
+        return q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]
+
+    def test_outer_sinks_need_an_excluded_operations_fact(self):
+        got = self.collector_enforcement()["enforcement"]
+        self.assertEqual((got["status"], reasons(got)), ("PROVEN", []))
+        missing = self.collector_enforcement(outer_ops_excluded=[])["enforcement"]
+        self.assertEqual(missing["status"], "UNVERIFIED")
+        self.assertEqual(reasons(missing), ["outer-sink-unbounded"])
+        # Backing headroom alone never covers it.
+        self.assertEqual(reasons(self.collector_enforcement(outer_ops_excluded=[])["backing"]), [])
+        partial = self.collector_enforcement(outer_ops_excluded=list(OUTER[:2]))["enforcement"]
+        self.assertEqual(partial["status"], "UNVERIFIED")
+        self.assertEqual(reasons(partial), ["outer-sink-unbounded"])
+        absent = self.sized()
+        del absent["runtime"]["outer_ops_excluded"]
+        ce = q.collect(StubObserver(absent, ALL_SECTIONS))
+        got = q.evaluate(absent, collector=ce, now=NOW, head_revision="a"*40)["legs"]["enforcement"]
+        self.assertEqual(reasons(got), ["outer-sink-unbounded"])
+
+    def test_declared_outer_exclusion_in_the_file_is_fixture_consistent_at_most(self):
+        art = self.sized()
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]["enforcement"]
+        self.assertEqual(got["status"], "FIXTURE-CONSISTENT")
+        # An exclusion declared among the claims is not the runtime fact.
+        art["runtime"]["outer_ops_excluded"] = []
+        art["claims"].append(dict(kind="outer-ops-excluded", resource="bytes", sinks=list(OUTER)))
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]["enforcement"]
+        self.assertIn("outer-sink-unbounded", reasons(got))
 
     def test_backing_needs_the_collector_to_supply_the_threshold(self):
         for names in (tuple(n for n in COLLECTOR_SECTIONS if n != "threshold"),

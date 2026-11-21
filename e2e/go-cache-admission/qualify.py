@@ -74,7 +74,7 @@ NEGATIVE = frozenset((
     "boundary-not-allocation-enforcement", "boundary-resource-mismatch", "boundary-resource-unknown",
     "boundary-sink-out-of-scope", "unaccounted-writable-mount", "unaccounted-writable-fd",
     "write-deny-not-erofs", "canary-kill-only", "canary-errno-unexpected",
-    "backing-aggregate-exceeds-soft", "sink-pseudo-forbidden"))
+    "backing-aggregate-exceeds-soft", "sink-pseudo-forbidden", "enforced-capacity-exceeds-envelope"))
 
 
 class JsParseUnsupported(ValueError):
@@ -163,6 +163,23 @@ def _is_num(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def _digests_meaningful(binding):
+    """The three digests are well-formed and mean what they name. Under the containerd snapshotter
+    the installed image Id is the index digest (image_id_kind "index"); otherwise it is the config
+    digest and differs from both. The platform digest differs from the index digest unless the
+    image is explicitly single-platform."""
+    index, platform, image_id = (binding.get(k) for k in ("index_digest", "platform_digest", "image_id"))
+    if any(type(d) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", d) for d in (index, platform, image_id)):
+        return False
+    kind = binding.get("image_id_kind")
+    if kind == "index":
+        kind_ok = image_id == index
+    else:
+        kind_ok = kind == "config" and image_id not in (index, platform)
+    single = binding.get("single_platform")
+    return kind_ok and (platform != index or single is True) and single in (None, True, False)
+
+
 def check_binding(binding, head_revision=None):
     reasons = []
     if not isinstance(binding, dict):
@@ -173,9 +190,7 @@ def check_binding(binding, head_revision=None):
             _add(reasons, "binding-source-unbound")
     if head_revision is not None and binding.get("repo_revision") != head_revision:
         _add(reasons, "binding-source-unbound")
-    digests = [binding.get(k) for k in ("index_digest", "platform_digest", "image_id")]
-    if any(type(d) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", d) for d in digests) \
-            or len(set(digests)) != 3:
+    if not _digests_meaningful(binding):
         _add(reasons, "binding-source-unbound")
     if binding.get("running_container_image_id") != binding.get("image_id"):
         _add(reasons, "binding-image-mismatch")
@@ -255,6 +270,24 @@ def check_envelope(envelope):
     ceiling = envelope.get("inode_ceiling") if isinstance(envelope, dict) else None
     if not (isinstance(ceiling, dict) and ceiling.get("owner_approved") is True and _is_int(ceiling.get("value"), 1)):
         _add(reasons, "inode-ceiling-unapproved")
+    return reasons
+
+
+def check_enforced(envelope, mounts, applied):
+    """Observed enforced capacities against the approved envelope: byte capacities across all
+    enforcing superblocks fit the aggregate, inode capacities fit the approved ceiling, and the
+    applied memory limit fits the memory limit with swap equal to it."""
+    reasons = []
+    caps = superblock_limits(mounts).values()
+    if sum(b for b, _ in caps if b) > p.LIMITS["aggregate"]:
+        _add(reasons, "enforced-capacity-exceeds-envelope")
+    ceiling = envelope.get("inode_ceiling") if isinstance(envelope, dict) else None
+    if (isinstance(ceiling, dict) and ceiling.get("owner_approved") is True and _is_int(ceiling.get("value"), 1)
+            and sum(n for _, n in caps if n) > ceiling["value"]):
+        _add(reasons, "enforced-capacity-exceeds-envelope")
+    memory, swap = applied.get("memory_max"), applied.get("memory_swap_max")
+    if _is_int(memory) and (memory > p.LIMITS["memory"] or (_is_int(swap) and swap != memory)):
+        _add(reasons, "enforced-capacity-exceeds-envelope")
     return reasons
 
 
@@ -400,6 +433,27 @@ def superblock_limits(mounts):
     return limits
 
 
+def enforced_excess(sinks, mounts):
+    """Charges for the enforced capacity of each superblock beyond the sum of its declared sink
+    charges, so a superblock projects max(declared, enforced) to the backing leg."""
+    limits = superblock_limits(mounts)
+    declared = {}
+    for name, s in sinks.items():
+        if "parent" in s or outer_exempt(name, s):
+            continue
+        d = declared.setdefault(s["superblock"], dict(bytes=0, inodes=0, domains=set()))
+        d["bytes"] += s["bytes"]
+        d["inodes"] += s["inodes"]
+        d["domains"].add(s["backing_domain"])
+    out = {}
+    for sb, d in declared.items():
+        cap = limits.get(sb, [None, None])
+        extra = dict(bytes=max(0, (cap[0] or 0)-d["bytes"]), inodes=max(0, (cap[1] or 0)-d["inodes"]))
+        if extra["bytes"] or extra["inodes"]:
+            out["enforced:"+sb] = dict(extra, domain=sorted(d["domains"])[0])
+    return out
+
+
 def _path_superblocks(mounts, real, paths):
     """(superblocks, unresolved): the superblocks of every path that has a recorded realpath, by
     longest mountpoint prefix (None when no path resolved), and whether any listed path lacks one."""
@@ -493,6 +547,10 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
     real = facts.get("realpaths") if isinstance(facts.get("realpaths"), dict) else {}
     cov = {name: dict(bytes=False, inodes=False) for name in sinks}
     cov_sb, excl, domain_cov = {}, {}, set()
+    # Daemon-side sinks carry no container superblock; only a runtime fact that the permitted
+    # workload has no incrementing operation on one (no pull, build or commit) bounds it.
+    excluded = facts.get("outer_ops_excluded")
+    excluded = set(n for n in excluded if type(n) is str) if type(excluded) is list else set()
 
     def trusted(*sections):
         return not require_collector or all(tier.get(s) == "collector" for s in sections)
@@ -560,12 +618,25 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
                 _add(reasons, "claim-evidence-not-collector")
                 continue
         if backend:
+            if names != ["container_writable_layer"]:
+                _add(reasons, "boundary-sink-out-of-scope")
+                continue
+            if not isinstance(container, dict):
+                _add(reasons, "container-facts-missing")
+                continue
+            caps = container.get("caps")
+            if (container.get("privileged") is not False or type(caps) is not list
+                    or any(c in ("CAP_SYS_ADMIN", "SYS_ADMIN") for c in caps)):
+                _add(reasons, "boundary-removable")
+                continue
             if not trusted("runtime"):
                 _add(reasons, "claim-evidence-not-collector")
                 continue
-            for name in names:
-                if name in sinks:
-                    cov[name]["bytes"] = True
+            if not _is_int(applied.get("writable_layer_quota_bytes"), 1):
+                _add(reasons, "quota-not-applied-observed")
+                continue
+            if names[0] in sinks:
+                cov[names[0]]["bytes"] = True
         elif kind in ("tmpfs-size", "tmpfs-nr_inodes", "exclusive-finite-fs"):
             sb = claim.get("superblock")
             if type(sb) is not str or not in_sb(names, sb):
@@ -635,7 +706,10 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
             key, code = domain_need.get(name, ("logs", "sink-logs-uncovered"))
             if key not in domain_cov:
                 _add(reasons, code)
-        elif name not in OUTER_SINKS and s.get("pseudo") is None:
+        elif name in OUTER_SINKS:
+            if name not in excluded:
+                _add(reasons, "outer-sink-unbounded")
+        elif s.get("pseudo") is None:
             for resource in ("bytes", "inodes"):
                 if not cov[name][resource]:
                     uncovered[resource].append(name)
@@ -822,7 +896,8 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
             facts = dict(tier={k: tiers.get(k, "file") for k in ("mountinfo", "runtime", "daemon")},
                          new_mount=runtime.get("new_mount"), container=runtime.get("container"),
                          applied=runtime.get("applied"), daemon=daemon,
-                         realpaths=info.get("realpaths"), backend_support=runtime.get("backend_support"))
+                         realpaths=info.get("realpaths"), backend_support=runtime.get("backend_support"),
+                         outer_ops_excluded=runtime.get("outer_ops_excluded"))
             domain_sinks = dict(sinks, process_tree=dict(pseudo="process_tree"), memory=dict(pseudo="memory"))
             # require_collector stays False here: evaluate() grades file evidence by tier
             # (FIXTURE-CONSISTENT at most) instead of refusing the claims outright.
@@ -843,17 +918,29 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
                 return grade(["sink-pseudo-forbidden"], ("charge_map",), tiers)
             if threshold.get("soft") is None:
                 return grade(["backing-soft-unknown"], ("backing", "threshold", "charge_map"), tiers)
+            if not mount_facts:
+                return grade(["no-container-mount-facts"], ("backing", "threshold", "charge_map", "mountinfo"), tiers)
             charges = {n: dict(bytes=s["bytes"], inodes=s["inodes"], domain=s["backing_domain"])
                        for n, s in sinks.items() if "parent" not in s}
+            charges.update(enforced_excess(sinks, info["mounts"]))
             return grade(backing_check(charges, sections["backing"]["domains"], threshold["soft"], now),
-                         ("backing", "threshold", "charge_map"), tiers)
+                         ("backing", "threshold", "charge_map", "mountinfo"), tiers)
 
         run("binding", binding)
         run("threshold", thresh)
         run("charge_map", charge_map)
         run("enforcement", enforcement)
         run("aliasing", aliasing)
-        run("envelope", lambda: grade(check_envelope(sections.get("envelope")), (), tiers))
+        def envelope():
+            got = check_envelope(sections.get("envelope"))
+            if mount_facts:
+                runtime = sections.get("runtime")
+                applied = runtime.get("applied") if isinstance(runtime, dict) else None
+                got += [r for r in check_enforced(sections.get("envelope"), info["mounts"],
+                                                  applied if isinstance(applied, dict) else {}) if r not in got]
+            return grade(got, (), tiers)
+
+        run("envelope", envelope)
         run("backing", backing)
         # M1 has no canary producer: the leg is unverified whatever any caller attaches.
         legs["canary"] = grade(["canary-collector-not-implemented"], (), tiers)

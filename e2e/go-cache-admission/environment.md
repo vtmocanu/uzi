@@ -78,7 +78,10 @@ not an observation.
   Memory, Swap and Pids limit support all true, not rootless.
 - **Images listed** (observed): `postgres` and `hello-world`, by index digest with `id_kind`
   `index`. Under the containerd snapshotter the image Id is the index digest; no platform digest
-  was collected, so the binding leg stays `binding-source-unbound`.
+  was collected, so the binding leg stays `binding-source-unbound`. The binding rule checks
+  meaning, not just distinctness: `image_id_kind` `index` requires the Id to equal the index
+  digest, `config` requires it to differ from both, and the platform digest must differ from the
+  index digest unless `single_platform` is true.
 - **No Go-bearing image verified** (observed): only image names and metadata were listed; no
   image filesystem was inspected. Neither image declares Go (`go-not-declared`, which is not
   `go-absent-verified`).
@@ -154,8 +157,12 @@ Claims are resource- and sink-specific triples `{kind, resource, sinks}`:
 - The candidate/proposed canary relies only on a read-only root mount plus bounded tmpfs for
   storage; it offers neither of the following. The verifier's general schema also accepts
   `exclusive-finite-fs` (both a bytes and an inodes triple, with collector-observed capacity and
-  exclusivity) and `storage-opt-size` only with backend-support evidence. Write-deny evidence is
-  EROFS only.
+  exclusivity) and `storage-opt-size` only with backend-support evidence, scoped to bytes of
+  `container_writable_layer` with an observed applied quota value and the usual removability
+  checks. Write-deny evidence is EROFS only.
+- **Outer sinks** (daemon image store, build cache, metadata and snapshots) need a runtime fact
+  `outer_ops_excluded` (no pull, build or commit in the permitted workload), else enforcement
+  reports `outer-sink-unbounded`; backing headroom does not replace it.
 - Reason codes in play: `new-mount-possible` (CapBnd 0 and NoNewPrivs 1 are always required, plus
   either the default seccomp profile or `max_user_namespaces` 0), `boundary-not-allocation-enforcement` (refused
   kinds such as emptyDir `sizeLimit`, ephemeral-storage limits, monitoring, PVC requests,
@@ -194,7 +201,11 @@ A fixture proves only that fixture.
 - The roughly 64 MiB kernel-memory figure (about 1 KiB per inode) is an **unverified estimate**,
   not a worst-case guarantee. Measure it inside the 1 GiB limit before any live allocation.
 - Backing check: projected use must stay strictly below soft times capacity for bytes and inodes,
-  from a fresh capacity sample (`backing-*` codes). No backing capacity was collected.
+  from a fresh capacity sample (`backing-*` codes). No backing capacity was collected. Each
+  enforcing superblock projects the larger of its declared charges and its observed capacity.
+- Enforced capacities are tied to the envelope: summed enforced byte capacities must fit the
+  2 GiB aggregate, enforced inodes the approved ceiling, and the applied memory max the 1 GiB
+  memory limit with swap equal (`enforced-capacity-exceeds-envelope`, NEGATIVE).
 - The 269 MiB and 576 MiB heavy race archives stay resource-incompatible with body and staging
   limits. That is not an A failure.
 
