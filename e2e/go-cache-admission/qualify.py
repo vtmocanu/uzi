@@ -466,11 +466,13 @@ def _longest_prefix(mounts, real):
 
 def daemon_capability(daemon):
     """Reasons from the daemon's own capability report; needs no container or mount facts."""
-    if (any(daemon.get(k) is not True for k in ("MemoryLimit", "SwapLimit", "PidsLimit"))
+    limits = [daemon.get(k) for k in ("MemoryLimit", "SwapLimit", "PidsLimit")]
+    # An explicit False contradicts the claim; an absent or non-boolean report is only missing.
+    if (any(v is False for v in limits)
             or (daemon.get("rootless") is True and daemon.get("CgroupDriver") == "cgroupfs")
             or daemon.get("rootless") not in (True, False)):
         return ["daemon-capability-unsupported"]
-    return []
+    return ["daemon-info-missing"] if any(v is not True for v in limits) else []
 
 
 def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
@@ -727,7 +729,7 @@ class CollectorEvidence:
 
 
 def collect(observer):
-    """Collector code path for a later milestone. `observer.observe()` returns the sections
+    """The collector code path; observe.py is the collector. `observer.observe()` returns the sections
     (binding, threshold, mountinfo, runtime, daemon, backing, charge_map, claims) read from the
     live environment and `observer.daemon_id()` a daemon identity string, which is stored only
     as a hash salted per invocation. A leg reaches PROVEN only when the collector supplied every
@@ -805,12 +807,14 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
                 # The daemon's capability report stands on its own: a rootless cgroupfs daemon is
                 # a contradiction whether or not any container mount was observed.
                 got = ["no-container-mount-facts"]
+                evidence = ("mountinfo",)
                 if isinstance(sections.get("daemon"), dict):
                     got += daemon_capability(sections["daemon"])
-                return grade(got, ("mountinfo",), tiers)
+                    evidence = ("mountinfo", "daemon")
+                return grade(got, evidence, tiers)
             if pseudo_sink:
                 return grade(["sink-pseudo-forbidden"], ("charge_map",), tiers)
-            runtime =sections.get("runtime") if isinstance(sections.get("runtime"), dict) else {}
+            runtime = sections.get("runtime") if isinstance(sections.get("runtime"), dict) else {}
             daemon = sections.get("daemon")
             daemon = {k: v for k, v in daemon.items() if k != "source"} if isinstance(daemon, dict) else None
             facts = dict(tier={k: tiers.get(k, "file") for k in ("mountinfo", "runtime", "daemon")},

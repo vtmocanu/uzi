@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -195,6 +196,50 @@ TCP_ENDPOINT = re.compile(r"tcp://(?:(127\.0\.0\.1)|\[(::1)\]):([1-9][0-9]{0,4})
 DOCKER_ROUTES = ("/version", "/info", "/images/json")
 
 
+class _DeadlineReader(io.RawIOBase):
+    """Raw reader for the response: every recv is bounded by min(2, time left to the absolute
+    deadline), and the status line plus headers by LIMITS["header"] bytes in total."""
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline, self.seen, self.tail, self.in_head = sock, deadline, 0, b"", True
+
+    def readable(self):
+        return True
+
+    def close(self):
+        # The reader owns a duplicate descriptor, so the connection may close its own socket first.
+        try:
+            self.sock.close()
+        finally:
+            super().close()
+
+    def readinto(self, buf):
+        remaining = self.deadline-time.monotonic()
+        require(remaining > 0)
+        self.sock.settimeout(min(2, remaining))
+        n = self.sock.recv_into(buf)
+        if self.in_head and n:
+            data = self.tail+bytes(buf[:n])
+            end = data.find(b"\r\n\r\n")
+            if end >= 0:
+                self.in_head = False
+                require(self.seen+end+4-len(self.tail) <= LIMITS["header"])
+            else:
+                self.seen += n
+                self.tail = data[-3:]
+                require(self.seen <= LIMITS["header"])
+        return n
+
+
+class _DeadlineSocket:
+    """Hands http.client a deadline-bounded reader instead of a plain socket file."""
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def makefile(self, mode="rb", *args, **kwargs):
+        require(mode == "rb")
+        return io.BufferedReader(_DeadlineReader(self.sock.dup(), self.deadline), 4096)
+
+
 def docker_get(endpoint, route):
     # Fixed GET routes; no CLI, context, config, inherited env or process inspection.
     require(route in DOCKER_ROUTES or re.fullmatch("/images/sha256:[0-9a-f]{64}/json", route))
@@ -210,17 +255,16 @@ def docker_get(endpoint, route):
     else:
         require(Path(endpoint).is_absolute() and stat.S_ISSOCK(Path(endpoint).stat().st_mode))
         conn = UnixHTTP(endpoint, timeout=2)
+    # One absolute deadline for connect, request, headers and body.
+    deadline = time.monotonic()+5
+    conn.response_class = lambda sock, **kwargs: http.client.HTTPResponse(_DeadlineSocket(sock, deadline), **kwargs)
     try:
         conn.request("GET", route)
         response = conn.getresponse()
         require(response.status == 200)
-        deadline = time.monotonic()+5
         chunks, size = [], 0
         while True:
-            remaining = deadline-time.monotonic()
-            require(remaining > 0)
-            if conn.sock is not None:
-                conn.sock.settimeout(min(2, remaining))
+            require(deadline-time.monotonic() > 0)
             chunk = response.read1(min(65536, MAX_JSON+1-size))
             if not chunk:
                 break

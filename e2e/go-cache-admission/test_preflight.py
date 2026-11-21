@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import threading
+import time
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -203,6 +204,67 @@ class PreflightTests(unittest.TestCase):
         for request, route in zip(requests, ("/version", "/images/sha256:"+"a"*64+"/json")):
             self.assertTrue(request.startswith(("GET "+route+" HTTP/1.1").encode()))
             self.assertIn(b"Host: localhost\r\n", request)
+
+    def hostile_header_server(self, send):
+        """Loopback TCP stub that answers one request through `send(conn, stop)`; bounded to 20 s."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(2)
+        server.settimeout(0.2)
+        stop = threading.Event()
+
+        def serve():
+            end = time.monotonic()+20
+            while not stop.is_set() and time.monotonic() < end:
+                try:
+                    conn = server.accept()[0]
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        data = b""
+                        while b"\r\n\r\n" not in data and len(data) < 8192:
+                            data += conn.recv(1024)
+                        send(conn, stop, end)
+                    except OSError:
+                        pass
+                return
+        thread = threading.Thread(target=serve)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join(5)
+        self.addCleanup(finish)
+        return "tcp://127.0.0.1:%d" % server.getsockname()[1]
+
+    def test_slow_header_phase_is_bounded_by_the_absolute_deadline(self):
+        def trickle(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nX-Pad: ")
+            while not stop.is_set() and time.monotonic() < end:
+                conn.sendall(b"a")
+                time.sleep(0.3)
+        endpoint = self.hostile_header_server(trickle)
+        started = time.monotonic()
+        with self.assertRaises((ValueError, OSError)):
+            p.docker_get(endpoint, "/version")
+        self.assertLess(time.monotonic()-started, 8)
+
+    def test_oversized_header_block_is_refused(self):
+        def flood(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: " + b"a"*(p.LIMITS["header"]*2)
+                         + b"\r\n\r\n{}")
+        endpoint = self.hostile_header_server(flood)
+        with self.assertRaises(ValueError):
+            p.docker_get(endpoint, "/version")
+        def modest(conn, stop, end):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: " + b"a"*1024 + b"\r\n\r\n{}")
+        endpoint = self.hostile_header_server(modest)
+        self.assertEqual(p.docker_get(endpoint, "/version"), {})
 
     def test_unix_socket_setup_failure_closes_resources(self):
         # A bind failure (here: missing parent) must still close the socket that was opened.

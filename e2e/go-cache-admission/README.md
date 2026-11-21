@@ -324,15 +324,26 @@ python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
 - Requests are GET only, on `/version`, `/info`, `/images/json` and
   `/images/sha256:<id>/json` for IDs from that listing. Never `/containers/*`, never a POST.
   More than 64 listed images is a refusal; `--image` may only narrow to an ID in the listing.
-  The collection has a 90 second budget on top of the per-request 64 KiB / 5 s caps.
+  The daemon collection has a 90 second budget on top of the per-request caps: 64 KiB of body,
+  16 KiB of status line and headers, and one absolute 5 s deadline covering connect, request,
+  headers and body (a trickling header phase is refused). The optional host-side hashing and
+  inventory (`--go-root`, `--go-binary`) runs outside that 90 second budget and has its own bounds
+  (binary at most 512 MiB and 60 s, inventory at most 256 MiB, 20000 entries and 10 s).
 - Daemon fields kept: ServerVersion, Os, Arch, KernelVersion, Driver, DriverType (the
   `driver-type` DriverStatus value), CgroupVersion, CgroupDriver, MemoryLimit, SwapLimit,
   PidsLimit, LoggingDriver, DefaultRuntime, RuncVersion (Runtimes annotations, when present),
   `rootless` and `seccomp` (booleans from SecurityOptions). Each string must match a short fixed
-  pattern or is dropped to null. Name, ID, DockerRootDir, hostnames, labels, proxy settings and
+  pattern or is dropped to null. ServerVersion and RuncVersion must be exactly `N.N.N`
+  (else null); KernelVersion keeps its numeric prefix `N.N.N[-N]` plus an optional `.elN` and
+  `.x86_64`/`.aarch64` suffix and nothing after it; any daemon string containing `uzi-` or
+  `.internal` is null. Reduced or dropped version strings are counted in
+  `dropped_daemon_strings`. MemoryLimit, SwapLimit and PidsLimit are true or false as reported
+  and null when the daemon did not report a boolean; null is missing evidence
+  (`daemon-info-missing`, UNVERIFIED), never a negative `daemon-capability-unsupported`. Name, ID, DockerRootDir, hostnames, labels, proxy settings and
   paths are never copied. The daemon ID feeds only the salted hash in `collector.daemon_id_hash`
   (a fresh 16-byte salt per run, so two runs against one daemon differ).
-- Per image: Id, Architecture, Os, `digests` (`sha256:<64 hex>` split from RepoDigests),
+- Per image: Id, `id_kind` (`index` when the daemon DriverType is
+  `io.containerd.snapshotter.v1`, else `config`), Architecture, Os, `digests` (`sha256:<64 hex>` split from RepoDigests),
   `repos` and `go_declared` (Env, PATH, Cmd or Entrypoint mention `/usr/local/go`, `/go/bin`,
   GOROOT or GOPATH; metadata only). Repository names are kept only for the official
   `postgres` and `hello-world` (optionally prefixed `docker.io/library/`); any other name becomes
@@ -341,7 +352,8 @@ python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
   Tags and environment values are never emitted. `go_absent` is never claimed: an image whose
   metadata names no Go is `go-not-declared`, and no image is Go-bearing verified
   (`no-go-bearing-image-verified`: only image names and metadata listed; no image filesystem
-  inspected).
+  inspected). Under the containerd snapshotter the image Id is the index digest and no platform
+  digest is collected, so the binding leg stays `binding-source-unbound`.
 - Optional host-only Go coordinates, each labelled `host_only` and never `PROVEN`: the first line of
   `--toolchain-profile` when it is a `/nix/store/<32 chars>-<name>` path (else dropped), the
   sha256 and size of `--go-binary` (regular file, at most 512 MiB, path not recorded) and
@@ -358,10 +370,14 @@ python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
 
 Output lifecycle (the order is part of the contract):
 
-1. The `--out-dir` (default `.uzi/scratch/go-cache-env`; it must be beneath `.uzi/scratch`, not
-   `.uzi/scratch` itself, without symlink components or `..`, and an existing path must be a
-   directory) is validated, then deleted and recreated before anything else. It is the only
-   directory the tool deletes.
+1. The `--out-dir` (default `.uzi/scratch/go-cache-env`) is pinned: its parent must be exactly
+   `.uzi/scratch` and its name `go-cache-env` or `go-cache-env-<1-32 of [a-z0-9-]>`, without
+   symlink components or `..`; any other name is refused. It is validated, then deleted and
+   recreated before anything else, through descriptors walked from the filesystem root with
+   `O_NOFOLLOW|O_DIRECTORY`. An existing out-dir is deleted only when it holds nothing but
+   regular files named `run.log`, `artifact.json` and `verdict.json`; any other entry (a
+   directory, a symlink, a foreign name) is an `out-dir-invalid` refusal that deletes nothing.
+   Directories with those names under `.uzi/scratch` are the only directories the tool deletes.
 2. `run.log` is then created (`O_CREAT|O_EXCL|O_NOFOLLOW`) and duplicated over fds 1 and 2. run.log
    is the charged output sink: stdout is capped at 256 bytes (one summary line:
    verdict, exit, reason, `statvfs` f_frsize/f_bsize and apparent/allocated bytes of the three
@@ -384,9 +400,11 @@ occur in this issue), 3 refusal or failure (usage, `out-dir-invalid`, `docker-un
 
 Evidence copy step (done by the lead after a live run, not by the tool): copy exactly
 `artifact.json` and `verdict.json` from the out-dir to `e2e/go-cache-admission/evidence/`, then remove
-the scratch out-dir. `test_observe.py` pins that directory: when it exists it holds exactly those
-two files, each at most 64 KiB, with the sanitized key sets, a NO-QUALIFIED-ENVIRONMENT verdict
-and none of the forbidden strings.
+the scratch out-dir. `test_observe.py` pins that directory: it must exist and hold exactly those
+two files, each at most 64 KiB, with the sanitized key sets, a NO-QUALIFIED-ENVIRONMENT verdict,
+none of the forbidden strings and official-or-`repo-<12 hex>` repository names; the artifact is
+also re-evaluated through `qualify.evaluate` (no collector) and must stay unqualified with no
+PROVEN leg.
 
 `test_observe.py` runs the collector in subprocesses (it redirects fds 1 and 2) against owned
 loopback TCP and AF_UNIX stub daemons; no real Docker endpoint, container, image pull or Go run.

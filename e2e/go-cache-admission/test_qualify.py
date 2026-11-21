@@ -478,6 +478,38 @@ class ChargeMapTests(Base):
         self.assertEqual(leg["status"], "UNVERIFIED")
         self.assertEqual(reasons(leg), ["no-container-mount-facts"])
 
+    def test_no_mount_facts_tier_reports_the_daemon_evidence(self):
+        art = full_artifact()
+        del art["mountinfo"]
+        art["daemon"].update(rootless=True, CgroupDriver="cgroupfs")
+        collector = q.collect(StubObserver(art, names=("daemon",)))
+        leg = q.evaluate(art, collector=collector, now=NOW)["legs"]["enforcement"]
+        self.assertEqual(leg["reason"], "daemon-capability-unsupported")
+        self.assertEqual(leg["tier"], ["collector", "file"])
+        del art["daemon"]
+        leg = q.evaluate(art, now=NOW)["legs"]["enforcement"]
+        self.assertEqual((leg["tier"], reasons(leg)), (["file"], ["no-container-mount-facts"]))
+
+    def test_absent_daemon_limit_is_missing_not_unsupported(self):
+        base = dict(MemoryLimit=True, SwapLimit=True, PidsLimit=True, CgroupDriver="systemd", rootless=False)
+        self.assertEqual(q.daemon_capability(base), [])
+        for key in ("MemoryLimit", "SwapLimit", "PidsLimit"):
+            with self.subTest(key=key):
+                self.assertEqual(q.daemon_capability(dict(base, **{key: None})), ["daemon-info-missing"])
+                self.assertEqual(q.daemon_capability({k: v for k, v in base.items() if k != key}),
+                                 ["daemon-info-missing"])
+                self.assertEqual(q.daemon_capability(dict(base, **{key: False})), ["daemon-capability-unsupported"])
+        # An explicit False wins over a missing sibling.
+        self.assertEqual(q.daemon_capability(dict(base, MemoryLimit=None, SwapLimit=False)),
+                         ["daemon-capability-unsupported"])
+        art = full_artifact()
+        del art["mountinfo"]
+        art["daemon"]["PidsLimit"] = None
+        leg = q.evaluate(art, now=NOW)["legs"]["enforcement"]
+        self.assertEqual((leg["status"], leg["reason"]), ("UNVERIFIED", "no-container-mount-facts"))
+        self.assertIn("daemon-info-missing", reasons(leg))
+        self.assertNotIn("daemon-capability-unsupported", reasons(leg))
+
     def test_no_collector_mount_facts(self):
         art = full_artifact()
         del art["mountinfo"]

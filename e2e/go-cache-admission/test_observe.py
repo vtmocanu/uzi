@@ -146,7 +146,13 @@ class Base(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="observe-", dir=p.SCRATCH)
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
-        self.out = self.root/"out"
+        self.out = self.outdir()
+
+    def outdir(self):
+        """A fresh, valid out-dir name directly under SCRATCH; removed with the test."""
+        path = p.SCRATCH/("go-cache-env-t"+os.urandom(6).hex())
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
 
     def stub(self, images, **kw):
         daemon = StubDaemon(routes_for(images, **kw))
@@ -319,6 +325,70 @@ class SanitizationTests(Base):
         for secret in SECRETS:
             self.assertNotIn(secret, blob)
 
+    def test_daemon_version_strings_reduce_to_numeric_forms(self):
+        def runtimes(version):
+            return {"runc": {"status": {"org.opencontainers.runtime-spec.features": json.dumps(
+                {"annotations": {"org.opencontainers.runc.version": version}})}}}
+
+        def ds(**over):
+            return o.daemon_section(VERSION, info(**over))
+        real = ds(ServerVersion="29.8.0", KernelVersion="6.12.0-243.el10.x86_64", Runtimes=runtimes("1.5.1"))
+        self.assertEqual((real["ServerVersion"], real["KernelVersion"], real["RuncVersion"]),
+                         ("29.8.0", "6.12.0-243.el10.x86_64", "1.5.1"))
+        for kernel in ("6.12.0", "6.12.0-243", "5.14.0-503.el9_4.aarch64", "6.12.0-243.el10"):
+            self.assertEqual(ds(KernelVersion=kernel)["KernelVersion"], kernel, kernel)
+        for bad in ("29.8.0+uzi-hw-abc123", "29.8.0-rc.1", "29.8", "v29.8.0", "29.8.0 ", "29.8.0\n"):
+            with self.subTest(server=bad):
+                self.assertIsNone(ds(ServerVersion=bad)["ServerVersion"])
+        for bad in ("1.5.1-uzi-hw-x", "1.5", "1.5.1+abc", "1.5.1.internal"):
+            with self.subTest(runc=bad):
+                self.assertIsNone(ds(Runtimes=runtimes(bad))["RuncVersion"])
+        for raw, want in (("6.12.0-uzi-hw-worker7-prod.internal", None), ("6.12.0-243.uzi-host", None),
+                          ("6.12.0-243.host.internal", None), ("6.1.0-test", "6.1.0"),
+                          ("6.12.0-243.el10.x86_64.worker7", "6.12.0-243"), ("6.12.0-243.worker7", "6.12.0-243"),
+                          ("x"*200, None), ("6.12", None)):
+            with self.subTest(kernel=raw):
+                self.assertEqual(ds(KernelVersion=raw)["KernelVersion"], want)
+        for key in ("Driver", "DefaultRuntime", "LoggingDriver"):
+            self.assertIsNone(ds(**{key: "runc-uzi-hw-x"})[key])
+        # The /version fallback is held to the same rules.
+        i = info()
+        del i["ServerVersion"]
+        self.assertIsNone(o.daemon_section(dict(VERSION, Version="29.8.0+uzi-hw-abc123"), i)["ServerVersion"])
+
+    def test_hyphenated_hostile_versions_never_reach_the_reports_and_are_counted(self):
+        hostile = info(ServerVersion="29.8.0+uzi-hw-abc123", KernelVersion="6.12.0-uzi-hw-worker7-prod.internal",
+                       Runtimes={"runc": {"status": {"org.opencontainers.runtime-spec.features": json.dumps(
+                           {"annotations": {"org.opencontainers.runc.version": "1.5.1-uzi-hw-x"}})}}})
+        daemon, r = self.go([image("1")], daemon_info=hostile)
+        self.assertEqual(r.returncode, 2, r)
+        artifact, verdict = self.docs()
+        for key in ("ServerVersion", "KernelVersion", "RuncVersion"):
+            self.assertIsNone(artifact["daemon"][key], key)
+        blob = "".join(self.texts().values())
+        for leaked in ("uzi-hw", "abc123", "worker7", ".internal"):
+            self.assertNotIn(leaked, blob)
+        self.assertEqual(artifact["binding"]["dropped_daemon_strings"], 3)
+        self.assertEqual(verdict["observation"]["dropped_daemon_strings"], 3)
+        daemon, r = self.go([image("1")], daemon_info=info(KernelVersion="6.12.0-243.el10.x86_64"))
+        self.assertEqual(self.docs()[0]["binding"]["dropped_daemon_strings"], 0)
+
+    def test_absent_limit_facts_are_null_not_false(self):
+        i = info()
+        for key in ("MemoryLimit", "SwapLimit", "PidsLimit"):
+            del i[key]
+        section = o.daemon_section(VERSION, i)
+        for key in ("MemoryLimit", "SwapLimit", "PidsLimit"):
+            self.assertIsNone(section[key], key)
+        self.assertIs(o.daemon_section(VERSION, info(SwapLimit=False))["SwapLimit"], False)
+        self.assertIs(o.daemon_section(VERSION, info(SwapLimit="yes"))["SwapLimit"], None)
+        daemon, r = self.go([image("1")], daemon_info=i)
+        self.assertEqual(r.returncode, 2, r)
+        leg = self.leg("enforcement")
+        self.assertEqual(leg["status"], "UNVERIFIED")
+        self.assertIn("daemon-info-missing", leg["reasons"])
+        self.assertNotIn("daemon-capability-unsupported", leg["reasons"])
+
     def test_missing_daemon_id_is_refused(self):
         bad = info()
         del bad["ID"]
@@ -350,6 +420,19 @@ class BindingTests(Base):
         self.assertNotIn("go-absent-verified", blob)
         self.assertEqual(artifact["binding"]["note"], NOTE)
         self.assertEqual(verdict["observation"]["note"], NOTE)
+
+    def test_image_id_kind_follows_the_snapshotter(self):
+        daemon, r = self.go([image("1"), image("2")])
+        self.assertEqual(r.returncode, 2, r)
+        self.assertEqual({rec["id_kind"] for rec in self.docs()[0]["binding"]["images"]}, {"index"})
+        overlay = info(DriverStatus=[["Backing Filesystem", "extfs"], ["driver-type", "io.containerd.overlayfs"]])
+        daemon, r = self.go([image("1")], daemon_info=overlay)
+        self.assertEqual(r.returncode, 2, r)
+        self.assertEqual([rec["id_kind"] for rec in self.docs()[0]["binding"]["images"]], ["config"])
+        legacy = info(DriverStatus=[["Backing Filesystem", "extfs"]])
+        daemon, r = self.go([image("1")], daemon_info=legacy)
+        self.assertEqual([rec["id_kind"] for rec in self.docs()[0]["binding"]["images"]], ["config"])
+        self.assertIn("binding-source-unbound", self.leg("binding")["reasons"])
 
     def test_no_declared_go_is_go_not_declared_never_absent(self):
         daemon, r = self.go([image("1", tags=["postgres:16"])])
@@ -570,12 +653,10 @@ class LifecycleTests(Base):
         for name in ("artifact.json", "verdict.json"):
             self.assertLessEqual((self.out/name).stat().st_size, MAX_DOC)
 
-    def test_stale_run_log_and_extra_entries_are_removed(self):
+    def test_stale_tool_entries_are_removed(self):
         self.out.mkdir()
-        (self.out/"run.log").write_text("STALE")
-        (self.out/"stale.txt").write_text("x")
-        (self.out/"sub").mkdir()
-        (self.out/"sub/deep").write_text("y")
+        for name in ("run.log", "artifact.json", "verdict.json"):
+            (self.out/name).write_text("STALE")
         # Holding the stale file open keeps its inode allocated, so a reused inode number cannot mask it.
         held = os.open(self.out/"run.log", os.O_RDONLY)
         self.addCleanup(os.close, held)
@@ -588,14 +669,63 @@ class LifecycleTests(Base):
         self.assertEqual(os.fstat(held).st_nlink, 0)
         self.assertNotIn("STALE", self.log())
 
+    def test_foreign_entries_cause_refusal_and_nothing_is_deleted(self):
+        self.out.mkdir()
+        (self.out/"run.log").write_text("keep")
+        (self.out/"stale.txt").write_text("x")
+        (self.out/"sub").mkdir()
+        (self.out/"sub/deep").write_text("y")
+        daemon = self.stub([image("1")])
+        r = self.observe(daemon.endpoint)
+        self.assertEqual(r.returncode, 3, r)
+        self.assertIn(b"reason=out-dir-invalid", r.stdout)
+        self.assertEqual(sorted(os.listdir(self.out)), ["run.log", "stale.txt", "sub"])
+        self.assertEqual((self.out/"run.log").read_text(), "keep")
+        self.assertEqual((self.out/"sub/deep").read_text(), "y")
+        # A tool-named entry that is not a regular file is foreign too.
+        (self.out/"stale.txt").unlink()
+        shutil.rmtree(self.out/"sub")
+        (self.out/"verdict.json").mkdir()
+        self.assertEqual(self.observe(daemon.endpoint).returncode, 3)
+        self.assertEqual(sorted(os.listdir(self.out)), ["run.log", "verdict.json"])
+        self.assertEqual(daemon.requests, [])
+
+    def test_out_dir_name_is_pinned_under_scratch(self):
+        victims = [p.SCRATCH/("uzi-cmd-x"+os.urandom(4).hex()), p.SCRATCH/("snap-"+os.urandom(4).hex()),
+                   p.SCRATCH/"go-cache-env-UPPER", p.SCRATCH/("go-cache-env-"+"a"*33),
+                   p.SCRATCH/"go-cache-env-", p.SCRATCH/"go-cache-envx"]
+        daemon = self.stub([image("1")])
+        for victim in victims:
+            victim.mkdir()
+            self.addCleanup(shutil.rmtree, victim, True)
+            (victim/"precious").write_text("keep")
+            with self.subTest(victim=victim.name):
+                r = self.observe(daemon.endpoint, out=victim)
+                self.assertEqual(r.returncode, 3, r)
+                self.assertIn(b"reason=out-dir-invalid", r.stdout)
+                self.assertEqual(sorted(os.listdir(victim)), ["precious"])
+        nested = self.root/"go-cache-env-nested"
+        self.assertEqual(self.observe(daemon.endpoint, out=nested).returncode, 3)
+        self.assertFalse(nested.exists())
+        a_file = p.SCRATCH/("go-cache-env-f"+os.urandom(4).hex())
+        a_file.write_text("keep")
+        self.addCleanup(a_file.unlink)
+        self.assertEqual(self.observe(daemon.endpoint, out=a_file).returncode, 3)
+        self.assertEqual(a_file.read_text(), "keep")
+        self.assertEqual(daemon.requests, [])
+
+    def test_default_out_dir_is_the_pinned_name(self):
+        self.assertEqual(o.DEFAULT_OUT, p.SCRATCH/"go-cache-env")
+        self.assertEqual(o.validate_out_dir(str(o.DEFAULT_OUT)), o.DEFAULT_OUT)
+
     def test_symlinked_out_dir_and_symlink_components_are_refused(self):
         real = self.root/"real"
         real.mkdir()
         (real/"sentinel").write_text("keep")
-        link = self.root/"link"
+        link = self.outdir()
         link.symlink_to(real)
         daemon = self.stub([image("1")])
-        for target in (link, link/"sub"):
+        for target in (link, link/"go-cache-env-sub"):
             with self.subTest(target=str(target)):
                 r = self.observe(daemon.endpoint, out=target)
                 self.assertEqual(r.returncode, 3, r)
@@ -654,7 +784,7 @@ class LifecycleTests(Base):
         self.assertEqual(sorted(os.listdir(self.out)), ["run.log"])
 
     def test_out_dir_api_refuses_a_fourth_entry_and_oversize_documents(self):
-        api = self.root/"api"
+        api = self.outdir()
         od = o.OutDir.reset(api)
         self.addCleanup(os.close, od.dfd)
         od.write_doc("artifact.json", {"a": 1})
@@ -680,7 +810,7 @@ class LifecycleTests(Base):
             od.open_log()
 
     def test_out_dir_api_run_log_identity_check(self):
-        od = o.OutDir.reset(self.root/"api")
+        od = o.OutDir.reset(self.outdir())
         self.addCleanup(os.close, od.dfd)
         log_fd = od.open_log()
         self.addCleanup(os.close, log_fd)
@@ -710,10 +840,8 @@ class EvidenceTests(Base):
         check_report_shape(self, *self.docs())
 
     def test_committed_evidence_directory_invariant(self):
-        # Before the live run the directory is absent; after it, exactly the two sanitized documents.
-        if not EVIDENCE.exists():
-            self.assertFalse(EVIDENCE.exists())
-            return
+        # The live run is done: the directory must exist and hold exactly the two sanitized documents.
+        self.assertTrue(EVIDENCE.is_dir(), "evidence directory is missing")
         self.assertEqual(sorted(os.listdir(EVIDENCE)), ["artifact.json", "verdict.json"])
         artifact, verdict = read_doc(EVIDENCE/"artifact.json"), read_doc(EVIDENCE/"verdict.json")
         check_report_shape(self, artifact, verdict)
@@ -721,10 +849,20 @@ class EvidenceTests(Base):
             text = (EVIDENCE/name).read_text()
             for forbidden in ("uzi-hw-", "/data/runner", "/home/", "DockerRootDir", "RepoTags", "RepoDigests"):
                 self.assertNotIn(forbidden, text, name)
+        self.assertTrue(artifact["binding"]["images"])
         for rec in artifact["binding"]["images"]:
+            self.assertTrue(rec["repos"])
             for name in rec["repos"]:
                 self.assertTrue(re.fullmatch(r"repo-[0-9a-f]{12}|postgres|hello-world|docker\.io/library/(postgres|hello-world)",
                                              name), name)
+
+    def test_committed_evidence_artifact_reevaluates_to_no_qualified_environment(self):
+        artifact = read_doc(EVIDENCE/"artifact.json")
+        again = q.evaluate(artifact, now=artifact["observed_at"])
+        self.assertEqual(again["verdict"], "NO-QUALIFIED-ENVIRONMENT")
+        self.assertIs(again["qualified"], False)
+        self.assertEqual(set(again["legs"]), set(q.LEGS))
+        self.assertNotIn("PROVEN", {leg["status"] for leg in again["legs"].values()})
 
 
 if __name__ == "__main__":

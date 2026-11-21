@@ -11,7 +11,9 @@ preflight.docker_get, reads no environment variable, and creates no container. W
 artifact (charge map, claims, envelope) is a declared proposal that stays file-tier. It collects no
 mount, fd or runtime facts, so the verdict is NO-QUALIFIED-ENVIRONMENT.
 
-Output lifecycle: the out-dir is deleted and recreated first; then run.log is opened and dup2'd over
+Output lifecycle: the out-dir (exactly `go-cache-env`, or `go-cache-env-<[a-z0-9-]{1,32}>`, directly under
+.uzi/scratch) is deleted and recreated first, and only when it holds nothing but run.log, artifact.json and
+verdict.json (regular files); any other content is a refusal that deletes nothing; then run.log is opened and dup2'd over
 fds 1 and 2, so the original stdio carries nothing (the caller should point it at /dev/null).
 stdout is capped at 256 bytes (one summary line), stderr at 4 KiB; excess is dropped and counted.
 Exit codes: 2 not qualified (the normal result), 0 never in this issue, 3 refusal or failure,
@@ -30,7 +32,6 @@ import hashlib
 import http.client
 import json
 import re
-import shutil
 import stat
 import time
 import traceback
@@ -50,6 +51,7 @@ ENTRY_CAP = 3
 MAX_IMAGES = 64
 MAX_BINARY = 512*p.MIB
 COLLECT_SECONDS = 90
+OUT_NAME = re.compile(r"go-cache-env(?:-[a-z0-9-]{1,32})?")
 DEFAULT_OUT = p.SCRATCH/"go-cache-env"
 OFFICIAL = frozenset(("postgres", "hello-world"))
 OFFICIAL_PREFIX = "docker.io/library/"
@@ -63,8 +65,11 @@ TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 IMAGE_ID_RE = DIGEST_RE
 NIX_RE = re.compile(r"/nix/store/[a-z0-9]{32}-[A-Za-z0-9+._?=-]+")
-VER_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+~_-]{0,63}")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
+KERNEL_RE = re.compile(r"(\d+\.\d+\.\d+(?:-\d+)?)((?:\.el\d+(?:_\d+)?)?(?:\.x86_64|\.aarch64)?)")
+KERNEL_PREFIX_RE = re.compile(r"\d+\.\d+\.\d+(?:-\d+)?")
+HOST_MARKS = ("uzi-", ".internal")
 TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+-]{0,63}")
 GO_PATH_RE = re.compile(r"(?<![\w.-])/usr/local/go(?![\w.-])|(?<![\w.-])/go/bin(?![\w.-])")
 
@@ -101,14 +106,30 @@ class BoundedSink:
 
 
 def validate_out_dir(raw):
+    """The out-dir is pinned: its basename matches OUT_NAME and its parent is exactly .uzi/scratch."""
     try:
         path = Path(raw)
         if not path.is_absolute():
             path = p.ROOT/path
-        p.require(path != p.SCRATCH)
+        p.require(path.parent == p.SCRATCH and OUT_NAME.fullmatch(path.name))
         return p.scratch_path(str(path))
     except (ValueError, OSError, TypeError):
         raise Refusal("out-dir-invalid") from None
+
+
+def _open_scratch():
+    """A descriptor of .uzi/scratch walked component by component from the filesystem root with
+    O_NOFOLLOW, so a symlink swapped in anywhere below the root is refused rather than followed."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in p.SCRATCH.parts[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 class OutDir:
@@ -118,18 +139,43 @@ class OutDir:
 
     @classmethod
     def reset(cls, raw):
-        """Validate, delete and recreate the directory. rmtree refuses a symlink at the top, and
-        the returned descriptor is opened with O_NOFOLLOW, so later writes stay inside it."""
+        """Validate, delete and recreate the directory, all relative to a no-follow descriptor of
+        .uzi/scratch. An existing directory is removed only when every entry is a regular file the
+        tool writes (run.log, artifact.json, verdict.json); anything else is a refusal that deletes
+        nothing."""
         path = validate_out_dir(raw)
+        name = path.name
         try:
-            if os.path.lexists(path):
-                if path.is_symlink() or not path.is_dir():
-                    raise Refusal("out-dir-invalid")
-                shutil.rmtree(path)
-            path.mkdir(parents=True, mode=0o700)
-            dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            sfd = _open_scratch()
         except OSError:
             raise Refusal("out-dir-invalid") from None
+        try:
+            try:
+                try:
+                    st = os.stat(name, dir_fd=sfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    st = None
+                if st is not None:
+                    if not stat.S_ISDIR(st.st_mode):
+                        raise Refusal("out-dir-invalid")
+                    old = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sfd)
+                    try:
+                        entries = os.listdir(old)
+                        for entry in entries:
+                            kind = os.stat(entry, dir_fd=old, follow_symlinks=False).st_mode
+                            if entry not in (LOG_NAME,)+DOC_NAMES or not stat.S_ISREG(kind):
+                                raise Refusal("out-dir-invalid")
+                        for entry in entries:
+                            os.unlink(entry, dir_fd=old)
+                    finally:
+                        os.close(old)
+                    os.rmdir(name, dir_fd=sfd)
+                os.mkdir(name, 0o700, dir_fd=sfd)
+                dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sfd)
+            except OSError:
+                raise Refusal("out-dir-invalid") from None
+        finally:
+            os.close(sfd)
         return cls(path, dfd)
 
     def _create(self, name):
@@ -262,6 +308,27 @@ def go_declared(config):
     return any(GO_PATH_RE.search(t) for t in texts)
 
 
+def host_free(value):
+    """A daemon string that names an uzi host or an internal domain is refused outright."""
+    return not (type(value) is str and any(mark in value.lower() for mark in HOST_MARKS))
+
+
+def dsafe(value, pattern):
+    return safe(value, pattern) if host_free(value) else None
+
+
+def kernel_version(raw):
+    """Numeric kernel release; an optional .elN and architecture suffix survive, anything else after
+    the numeric prefix is dropped."""
+    if type(raw) is not str or len(raw) > 128 or not host_free(raw):
+        return None
+    whole = KERNEL_RE.fullmatch(raw)
+    if whole:
+        return raw
+    prefix = KERNEL_PREFIX_RE.match(raw)
+    return prefix.group(0) if prefix else None
+
+
 def runc_version(info):
     runtimes = info.get("Runtimes")
     runc = runtimes.get("runc") if isinstance(runtimes, dict) else None
@@ -280,11 +347,17 @@ def runc_version(info):
         annotations = doc.get("annotations") if isinstance(doc, dict) else None
     if not isinstance(annotations, dict):
         return None
-    return safe(annotations.get("org.opencontainers.runc.version"), VER_RE)
+    return annotations.get("org.opencontainers.runc.version")
 
 
-def daemon_section(version, info):
-    """Allowlisted daemon fields only; Name, ID, DockerRootDir, labels and paths are never copied."""
+def tri(value):
+    """True or False as reported; None when the daemon did not report a boolean at all."""
+    return value if type(value) is bool else None
+
+
+def daemon_section(version, info, counts=None):
+    """Allowlisted daemon fields only; Name, ID, DockerRootDir, labels and paths are never copied.
+    A version string that is reduced or dropped is counted in counts["daemon"] when given."""
     v = version if isinstance(version, dict) else {}
     i = info if isinstance(info, dict) else {}
     options = i.get("SecurityOptions")
@@ -294,19 +367,28 @@ def daemon_section(version, info):
     status = i.get("DriverStatus")
     for pair in (status[:32] if type(status) is list else []):
         if type(pair) is list and len(pair) == 2 and pair[0] == "driver-type":
-            driver_type = safe(pair[1], TYPE_RE)
+            driver_type = dsafe(pair[1], TYPE_RE)
             break
+    server_raw = i.get("ServerVersion") or v.get("Version")
+    kernel_raw = i.get("KernelVersion") or v.get("KernelVersion")
+    runc_raw = runc_version(i)
+    server = dsafe(server_raw, SEMVER_RE)
+    kernel = kernel_version(kernel_raw)
+    runc = dsafe(runc_raw, SEMVER_RE)
+    if counts is not None:
+        counts["daemon"] += sum(1 for raw, got in ((server_raw, server), (kernel_raw, kernel), (runc_raw, runc))
+                                if raw is not None and raw != got)
     return dict(
-        ServerVersion=safe(i.get("ServerVersion") or v.get("Version"), VER_RE),
-        Os=safe(v.get("Os"), TOKEN_RE), Arch=safe(v.get("Arch"), TOKEN_RE),
-        KernelVersion=safe(i.get("KernelVersion") or v.get("KernelVersion"), VER_RE),
-        Driver=safe(i.get("Driver"), TOKEN_RE), DriverType=driver_type,
-        CgroupVersion=safe(i.get("CgroupVersion"), re.compile(r"[12]")),
-        CgroupDriver=safe(i.get("CgroupDriver"), TOKEN_RE),
-        MemoryLimit=i.get("MemoryLimit") is True, SwapLimit=i.get("SwapLimit") is True,
-        PidsLimit=i.get("PidsLimit") is True,
-        LoggingDriver=safe(i.get("LoggingDriver"), TOKEN_RE),
-        DefaultRuntime=safe(i.get("DefaultRuntime"), TOKEN_RE), RuncVersion=runc_version(i),
+        ServerVersion=server,
+        Os=dsafe(v.get("Os"), TOKEN_RE), Arch=dsafe(v.get("Arch"), TOKEN_RE),
+        KernelVersion=kernel,
+        Driver=dsafe(i.get("Driver"), TOKEN_RE), DriverType=driver_type,
+        CgroupVersion=dsafe(i.get("CgroupVersion"), re.compile(r"[12]")),
+        CgroupDriver=dsafe(i.get("CgroupDriver"), TOKEN_RE),
+        MemoryLimit=tri(i.get("MemoryLimit")), SwapLimit=tri(i.get("SwapLimit")),
+        PidsLimit=tri(i.get("PidsLimit")),
+        LoggingDriver=dsafe(i.get("LoggingDriver"), TOKEN_RE),
+        DefaultRuntime=dsafe(i.get("DefaultRuntime"), TOKEN_RE), RuncVersion=runc,
         rootless="name=rootless" in names, seccomp="name=seccomp" in names)
 
 
@@ -394,7 +476,7 @@ class LiveObserver:
         except FETCH_ERRORS:
             raise Refusal("docker-unavailable") from None
 
-    def _record(self, image_id, meta, counts):
+    def _record(self, image_id, meta, counts, id_kind):
         refs = [(ref, True) for ref in (meta.get("RepoDigests") if type(meta.get("RepoDigests")) is list else [])[:32]]
         refs += [(ref, False) for ref in (meta.get("RepoTags") if type(meta.get("RepoTags")) is list else [])[:32]]
         repos, digests = set(), set()
@@ -409,23 +491,26 @@ class LiveObserver:
             if got[1]:
                 digests.add(got[1])
         config = meta.get("Config")
-        return dict(id=image_id, architecture=safe(meta.get("Architecture"), TOKEN_RE),
+        return dict(id=image_id, id_kind=id_kind, architecture=safe(meta.get("Architecture"), TOKEN_RE),
                     os=safe(meta.get("Os"), TOKEN_RE), digests=sorted(digests)[:8], repos=sorted(repos)[:8],
                     go_declared=go_declared(config))
 
     def observe(self):
         deadline = self.monotonic()+COLLECT_SECONDS
+        counts = dict(refs=0, ids=0, daemon=0)
         version, info = self._get("/version"), self._get("/info")
         ident = info.get("ID") if isinstance(info, dict) else None
         if type(ident) is not str or not 0 < len(ident) <= 256:
             raise Refusal("daemon-id-missing")
         self._id = ident
+        daemon = daemon_section(version, info, counts)
+        # Under the containerd snapshotter the image Id is the index digest, else the config digest.
+        id_kind = "index" if daemon["DriverType"] == "io.containerd.snapshotter.v1" else "config"
         listing = self._get("/images/json")
         if type(listing) is not list:
             raise Refusal("docker-unavailable")
         if len(listing) > MAX_IMAGES:
             raise Refusal("too-many-images")
-        counts = dict(refs=0, ids=0)
         ids = []
         for item in listing:
             image_id = item.get("Id") if isinstance(item, dict) else None
@@ -446,13 +531,13 @@ class LiveObserver:
             if not isinstance(meta, dict) or meta.get("Id") != image_id:
                 counts["ids"] += 1
                 continue
-            records.append(self._record(image_id, meta, counts))
+            records.append(self._record(image_id, meta, counts, id_kind))
         binding = dict(self.revisions)
         binding.update(go_declared=any(r["go_declared"] for r in records), images=records, note=NOTE,
-                       dropped_repo_refs=counts["refs"], dropped_image_ids=counts["ids"])
+                       dropped_repo_refs=counts["refs"], dropped_image_ids=counts["ids"], dropped_daemon_strings=counts["daemon"])
         if self.host is not None:
             binding["go"] = dict(self.host)
-        sections = dict(daemon=daemon_section(version, info), binding=binding)
+        sections = dict(daemon=daemon, binding=binding)
         self.sections = copy.deepcopy(sections)
         return sections
 
@@ -536,7 +621,8 @@ def build_reports(args, clock):
     binding = artifact["binding"]
     verdict["observation"] = dict(
         images=len(binding["images"]), dropped_repo_refs=binding["dropped_repo_refs"],
-        dropped_image_ids=binding["dropped_image_ids"], host_only_go=host is not None, note=NOTE)
+        dropped_image_ids=binding["dropped_image_ids"],
+        dropped_daemon_strings=binding["dropped_daemon_strings"], host_only_go=host is not None, note=NOTE)
     return artifact, verdict
 
 
