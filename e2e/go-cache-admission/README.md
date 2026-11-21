@@ -30,7 +30,10 @@ All inputs are optional so unavailable prerequisites can be inspected:
   /var/run/docker.sock), or a loopback TCP endpoint written exactly
   `tcp://127.0.0.1:<port>` or `tcp://[::1]:<port>` (port 1-65535). The address is a
   literal: no hostname resolution, no `DOCKER_HOST` or other environment read, and
-  `tcp://localhost:...` or any other address is refused. Only GET /version,
+  `tcp://localhost:...` or any other address is refused. There is no peer-identity
+  check on the loopback transport: any local process listening on that port could
+  answer, so the evidence binds only to what the endpoint reports (the daemon
+  identity, kept as a per-invocation salted hash), not to a verified peer. Only GET /version,
   GET /info, GET /images/json and GET /images/sha256:<64 hex>/json; any non-200
   status, redirects included, is refused.
 - `--docker-version`: exact expected daemon version.
@@ -150,11 +153,14 @@ subprocess, and it qualifies no environment: the canary leg has no collector, so
 is claimed; every test fixture is synthetic and labelled fixture-only.
 
 ```sh
-python3 -B e2e/go-cache-admission/qualify.py --artifact <abs path under .uzi/scratch> [--experimental]
+python3 -B e2e/go-cache-admission/qualify.py --artifact <abs path under .uzi/scratch> \
+    [--head-revision <40 lowercase hex>] [--experimental]
 ```
 
 Exit 2 unless qualified (never, in this issue); `--experimental` exits 0 and never sets
-`qualified`. The artifact is read by `preflight.read_json` (64 KiB, duplicate keys
+`qualified`. `--head-revision` is the repo revision the artifact's `repo_revision` must
+equal (`binding-source-unbound` otherwise). Without it the CLI does not detect a stale
+`repo_revision`; it only checks that the field is a 40-hex string. The artifact is read by `preflight.read_json` (64 KiB, duplicate keys
 rejected, scratch-only path, schema `uzi-go-cache-env/1`); an unreadable or wrong-schema
 artifact reports every leg UNVERIFIED `schema-unsupported`. Output is the `encode()`d
 JSON: `qualified`, `verdict`, `producer_launched=false`, `production_authorized=false`
@@ -172,9 +178,17 @@ can construct (a module-private token; it also stores the daemon identity as a h
 salted per invocation). The CLI never builds one. A later collector calls
 `evaluate(artifact, collector=collect(observer), now=...)`, where
 `observer.observe()` returns the sections binding, threshold, mountinfo, runtime,
-daemon and backing and `observer.daemon_id()` a string; collector sections replace the
-file's. The envelope leg is declared-only and cannot exceed FIXTURE-CONSISTENT.
-Defects are reported whatever the tier.
+daemon, backing, charge_map and claims (`claims` is a list, the rest are dicts) and
+`observer.daemon_id()` a string; collector sections replace the file's. A leg is PROVEN
+only when the collector supplied every section it reads: charge_map reads mountinfo and
+charge_map; enforcement reads mountinfo, runtime, daemon, charge_map and claims;
+aliasing reads mountinfo and charge_map; backing reads backing, threshold and charge_map.
+A charge map or claims list that came from the file therefore caps those legs at
+FIXTURE-CONSISTENT. The envelope leg is declared-only and cannot exceed
+FIXTURE-CONSISTENT. Defects are reported whatever the tier. `evaluate()` grades file
+evidence by tier rather than refusing it, so `claim-evidence-not-collector` is raised only
+by a direct `evaluate_claims(..., require_collector=True)` call (the default), never on the
+CLI or `evaluate()` path.
 
 ### Legs and reason codes
 
@@ -192,11 +206,16 @@ Defects are reported whatever the tier.
   input outside the emulated grammar raises instead of guessing.
 - charge_map: `sink-missing` (CHARGE_SINKS is the preflight SINKS plus the container,
   daemon and export sinks), `no-container-mount-facts`, `unaccounted-writable-mount`,
-  `unaccounted-writable-fd`. Read-only mounts need no storage coverage. Writable proc
+  `unaccounted-writable-fd`, `sink-malformed` (an incremental sink needs at least one
+  inode), `sink-parent-cycle`, `sink-pseudo-forbidden` (an artifact sink may not set
+  `pseudo`; only the evaluator injects process_tree and memory). Read-only mounts need
+  no storage coverage. Writable proc
   and devpts are listed with a reason as non-storage. Writable mqueue, sysfs, cgroup,
   cgroup2, network binds (/etc/hosts, /etc/hostname, /etc/resolv.conf), bind or volume
   mounts and any other fstype are unaccounted. Writable tmpfs needs `size` and
-  `nr_inodes` coverage. A writable fd must map to an accounted mount.
+  `nr_inodes` coverage. A writable fd must map to an accounted writable mount: with a
+  `mount_id` it matches on that id alone (an unknown id is unaccounted), otherwise on
+  `target_superblock`; a writable fd on a read-only mount is unaccounted too.
 - Kernel memory: every enumerated mount, read-only and non-storage ones included, stays
   in the leg's `kernel_memory` list charged to the memory domain (tmpfs pages, dentry
   and inode slab). It is never dropped because a mount is not a storage sink.
@@ -231,7 +250,15 @@ Defects are reported whatever the tier.
   `owner`, `mode`, `acl`) is UNVERIFIED `dac-ownership-mode-unverified` and covers
   nothing: ownership checks cannot establish zero allocation (CHOWN/SETUID-class
   capabilities may remain and pre-existing writable fds are unaccounted).
-- aliasing: the domain key is the superblock; `mount_id` only maps paths. `domain-overcommitted`
+- aliasing: the domain key is the superblock, and a sink's declared superblock is not
+  trusted. It must appear in mountinfo, agree with the mount its `mount_id` names, and
+  agree with the mount its realpaths resolve to by longest mountpoint prefix (the same
+  resolution readonly-rootfs uses); a container sink with neither a `mount_id` nor
+  resolvable paths, or any disagreement, is `sink-mapping-mismatch`. Daemon-side sinks
+  (`daemon_image_store`, `daemon_build_cache`, `daemon_metadata_snapshots`) and
+  `container_logs` live in an outer domain: they carry an explicit `outer_domain: true`
+  and no superblock or `mount_id` (a made-up one is `sink-malformed`) and are charged only
+  through the backing leg. The flag exempts nothing else. `domain-overcommitted`
   when sink ceilings on one superblock exceed its limit, `domain-alias-split` when sinks
   on one superblock claim different backing domains; a child charged inside its parent
   counts once.
@@ -242,8 +269,8 @@ Defects are reported whatever the tier.
   60 s), `backing-concurrency-unknown`, `backing-mapping-unknown`,
   `backing-aggregate-exceeds-soft` (projected use must stay strictly below soft times
   capacity for bytes and inodes), `backing-soft-unknown`.
-- canary: evaluated only when the other legs are PROVEN and a canary-collector result
-  exists; none does, so `canary-collector-not-implemented`. `classify_canary` is tested
+- canary: always UNVERIFIED `canary-collector-not-implemented` in M1, whatever any caller
+  attaches (`CollectorEvidence` has no canary attribute). `classify_canary` is tested
   with fixtures: readonly-rootfs needs EROFS and the read-only flag
   (`write-deny-not-erofs`), tmpfs needs ENOSPC, EDQUOT only for an accepted quota kind
   (`canary-errno-unexpected`), a kill without an errno is `canary-kill-only`.

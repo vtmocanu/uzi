@@ -87,6 +87,39 @@ class PreflightTests(unittest.TestCase):
                                  f_files=100, f_favail=100)
         self.assertTrue(p.headroom(charges, 0.8, lambda _: sample))
 
+    def test_headroom_keeps_last_sample_per_device(self):
+        # Every sink is on one real device; the statfs sample differs per sink path. The last
+        # sample taken for the device (staging, the last of SINKS) is the one judged.
+        other = self.root/"last"
+        other.mkdir()
+        charges = self.charges()
+        charges["staging"]["path"] = str(other)
+        roomy = SimpleNamespace(f_blocks=10**12, f_bavail=10**12, f_frsize=1, f_files=100, f_favail=100)
+        full = SimpleNamespace(f_blocks=10**12, f_bavail=0, f_frsize=1, f_files=100, f_favail=100)
+        sampled = lambda path: full if Path(path) == other else roomy
+        self.assertFalse(p.headroom(charges, 0.8, sampled))
+        got = p.project_domains(charges, statfs=sampled, names=p.SINKS)
+        self.assertEqual(len(got), 1)
+        self.assertIs(next(iter(got.values()))[0], full)
+        self.assertTrue(p.headroom(charges, 0.8, lambda _: roomy))
+
+    def test_headroom_domain_is_the_real_device_not_the_path(self):
+        # Two distinct real subdirectories of one device: only the per-device sum exceeds soft.
+        a, b = self.root/"a", self.root/"b"
+        a.mkdir()
+        b.mkdir()
+        charges = self.charges()
+        for name in p.SINKS:
+            charges[name]["path"] = str(a if name == "retained" else b)
+        capacity = 2560*p.MIB
+        sample = SimpleNamespace(f_blocks=capacity, f_bavail=capacity, f_frsize=1,
+                                 f_files=10**9, f_favail=10**9)
+        domains = p.project_domains(charges, statfs=lambda _: sample, names=p.SINKS)
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(next(iter(domains.values()))[1], p.LIMITS["aggregate"])
+        self.assertFalse(p.headroom(charges, 0.8, lambda _: sample))
+        self.assertTrue(p.headroom(charges, 0.9, lambda _: sample))
+
     def test_missing_expectations_before_probes(self):
         args = argparse.Namespace(manifest=None, endpoint="/fixture", docker_version=None,
             image=None, repo_digest=None, go_root="/fixture", source_sha256=None, experimental=True)

@@ -127,8 +127,9 @@ def project_domains(charges, samples=None, statfs=os.statvfs, names=None):
 
     A charge names its domain explicitly ("domain": key, resolved in `samples`) or,
     without that key, by the superblock device of its scratch "path" (st_dev), sampled
-    with `statfs`. Returns {domain: (sample, bytes, inodes)}; the sample of the first
-    charge in a domain is kept. Fails closed on any malformed charge or sample.
+    with `statfs`. Returns {domain: (sample, bytes, inodes)}; the sample of the last
+    charge in a domain is kept (the most recent observation). Fails closed on any
+    malformed charge or sample.
     """
     devices = {}
     for name in (charges if names is None else names):
@@ -144,7 +145,7 @@ def project_domains(charges, samples=None, statfs=os.statvfs, names=None):
             dev = path.stat().st_dev
         require(s.f_blocks > 0 and s.f_files > 0 and s.f_frsize > 0)
         old = devices.get(dev, (s, 0, 0))
-        devices[dev] = (old[0], old[1]+b, old[2]+i)
+        devices[dev] = (s, old[1]+b, old[2]+i)
     return devices
 
 

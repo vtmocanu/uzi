@@ -144,8 +144,9 @@ def full_artifact():
     mid = 10
     for name in p.SINKS + EXTRA:
         if name in OUTER or name == "container_logs":
-            sinks[name] = sink(name, "", None, "outer-"+name)
-            sinks[name]["paths"] = []
+            sinks[name] = sink(name, "", None, None)
+            sinks[name].update(paths=[], outer_domain=True)
+            del sinks[name]["superblock"]
         elif name == "temp_extraction":
             sinks[name] = dict(identity=name, parent="tmp")
         else:
@@ -175,12 +176,13 @@ def full_artifact():
 
 
 COLLECTOR_SECTIONS = ("binding", "threshold", "mountinfo", "runtime", "daemon", "backing")
+ALL_SECTIONS = COLLECTOR_SECTIONS + ("charge_map", "claims")
 
 
 class StubObserver:
     """Owned collector stub (fixture only): returns canned sections, never touches a host."""
-    def __init__(self, artifact):
-        self.sections_ = {k: copy.deepcopy(artifact[k]) for k in COLLECTOR_SECTIONS}
+    def __init__(self, artifact, names=COLLECTOR_SECTIONS):
+        self.sections_ = {k: copy.deepcopy(artifact[k]) for k in names}
 
     def observe(self):
         return copy.deepcopy(self.sections_)
@@ -271,6 +273,19 @@ class ThresholdTests(Base):
         self.assertIn("effective-value-unestablished", q.check_threshold(value, NOW)["reasons"])
         value["effective"] = dict(kind="api-response", incarnation="inc-1", observed_at=NOW-1, value=0.8)
         self.assertIn("effective-value-unestablished", q.check_threshold(value, NOW)["reasons"])
+
+    def test_missing_effective_yields_reason_without_exception(self):
+        for effective in (None, "x", [], {}):
+            value = dict(good_threshold(), effective=effective)
+            with self.subTest(effective=effective):
+                got = q.check_threshold(value, NOW)
+                self.assertIn("effective-value-unestablished", got["reasons"])
+                self.assertIsNone(got["soft"])
+        art = full_artifact()
+        art["threshold"]["effective"] = None
+        leg = q.evaluate(art, now=NOW)["legs"]["threshold"]
+        self.assertIn("effective-value-unestablished", reasons(leg))
+        self.assertNotIn("malformed-section", reasons(leg))
 
     def test_stale_and_future(self):
         for patch_ in (dict(api_observed_at=NOW-301), dict(api_observed_at=NOW+5)):
@@ -406,6 +421,50 @@ class ChargeMapTests(Base):
         by_sb = dict(target_superblock=mounts[0]["superblock"], writable=True)
         self.assertNotIn("unaccounted-writable-fd", q.check_mounts(mounts, [by_sb])["reasons"])
 
+    def test_writable_fd_with_mount_id_matches_on_that_id_alone(self):
+        mounts = [mnt(1, "/", "overlay", True, sb="sb-root")]
+        fd = dict(writable=True, mount_id=999, target_superblock="sb-root")
+        self.assertIn("unaccounted-writable-fd", q.check_mounts(mounts, [fd])["reasons"])
+        # A writable fd whose own mount is read-only is unaccounted too.
+        ro_fd = dict(writable=True, mount_id=1)
+        self.assertIn("unaccounted-writable-fd", q.check_mounts(mounts, [ro_fd])["reasons"])
+        # A good mount_id is not rescued or broken by a stray superblock hint.
+        ok = [tmpfs(10, "/t", sb="sb-t"), mnt(1, "/", "overlay", True, sb="sb-root")]
+        self.assertNotIn("unaccounted-writable-fd", q.check_mounts(
+            ok, [dict(writable=True, mount_id=10)])["reasons"])
+        self.assertNotIn("unaccounted-writable-fd", q.check_mounts(
+            ok, [dict(writable=True, mount_id=10, target_superblock="sb-root")])["reasons"])
+
+    def test_artifact_sink_cannot_be_pseudo(self):
+        sinks = full_artifact()["charge_map"]["sinks"]
+        sinks["work"]["pseudo"] = "work"
+        self.assertIn("sink-pseudo-forbidden", q.check_sinks(sinks))
+        art = full_artifact()
+        art["charge_map"]["sinks"]["work"]["pseudo"] = "work"
+        ce = q.collect(StubObserver(art))
+        got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]
+        for name in ("charge_map", "enforcement", "aliasing"):
+            with self.subTest(leg=name):
+                self.assertEqual(got[name]["status"], "NEGATIVE")
+                self.assertIn("sink-pseudo-forbidden", reasons(got[name]))
+        for name in ("charge_map", "enforcement", "aliasing", "backing"):
+            self.assertNotEqual(got[name]["status"], "PROVEN", name)
+
+    def test_incremental_sink_needs_inodes_and_no_parent_cycle(self):
+        sinks = full_artifact()["charge_map"]["sinks"]
+        self.assertEqual(q.check_sinks(sinks), [])
+        sinks["work"]["inodes"] = 0
+        self.assertIn("sink-malformed", q.check_sinks(sinks))
+        art = full_artifact()
+        art["charge_map"]["sinks"]["work"]["inodes"] = 0
+        self.assertIn("sink-malformed", reasons(q.evaluate(art, now=NOW)["legs"]["charge_map"]))
+        sinks = full_artifact()["charge_map"]["sinks"]
+        sinks["tmp"] = dict(identity="tmp", parent="temp_extraction")
+        self.assertIn("sink-parent-cycle", q.check_sinks(sinks))
+        sinks["tmp"] = dict(identity="tmp", parent="tmp2")
+        sinks["tmp2"] = dict(identity="tmp2", parent="tmp")
+        self.assertIn("sink-parent-cycle", q.check_sinks(sinks))
+
     def test_no_collector_mount_facts(self):
         art = full_artifact()
         del art["mountinfo"]
@@ -443,8 +502,44 @@ class AliasingTests(Base):
     def test_parent_and_child_charged_once(self):
         mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]
         sinks = {"tmp": sink("tmp", "/t", 10, "sb-shared", b=3*MIB),
-                 "temp_extraction": dict(identity="temp_extraction", parent="tmp")}
+                 "temp_extraction": dict(identity="temp_extraction", parent="tmp",
+                                         bytes=3*MIB, inodes=10)}
         self.assertEqual(q.check_aliasing(sinks, mounts), [])
+
+    def test_declared_superblock_is_checked_against_mountinfo(self):
+        mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]
+        real = {"/t/w": "/t/w", "/t/o": "/t/o"}
+        def pair(**over):
+            out = sink("output", "/t/o", None, "sb-bogus", b=3*MIB)
+            out.update(over)
+            return {"work": sink("work", "/t/w", 10, "sb-shared", b=3*MIB), "output": out}
+        for realpaths in (real, None):
+            with self.subTest(realpaths=realpaths):
+                got = q.check_aliasing(pair(), mounts, realpaths)
+                self.assertTrue({"sink-mapping-mismatch", "domain-overcommitted"} & set(got), got)
+        # Declared superblock absent from mountinfo, mount_id naming a real mount, or unknown id.
+        for over in (dict(mount_id=10), dict(mount_id=999)):
+            with self.subTest(over=over):
+                self.assertIn("sink-mapping-mismatch", q.check_aliasing(pair(**over), mounts, real))
+        # Declared equal to what the path resolves to: no mismatch, and the sum still overcommits.
+        got = q.check_aliasing(pair(superblock="sb-shared"), mounts, real)
+        self.assertNotIn("sink-mapping-mismatch", got)
+        self.assertIn("domain-overcommitted", got)
+        # Nothing to resolve a container sink with: no mount_id and no resolvable path.
+        self.assertIn("sink-mapping-mismatch",
+                      q.check_aliasing(pair(superblock="sb-shared"), mounts, None))
+
+    def test_outer_domain_sinks_are_exempt_only_when_flagged(self):
+        mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]
+        outer = dict(identity="daemon_image_store", paths=[], mount_id=None, bytes=3*MIB, inodes=10,
+                     backing_domain="outer-A", outer_domain=True)
+        sinks = {"work": sink("work", "/t/w", 10, "sb-shared", b=MIB), "daemon_image_store": outer}
+        self.assertEqual(q.check_aliasing(sinks, mounts, {}), [])
+        # The flag does not exempt an ordinary container sink.
+        flagged = sink("output", "/t/o", None, "sb-bogus")
+        flagged["outer_domain"] = True
+        self.assertIn("sink-mapping-mismatch", q.check_aliasing(
+            {"work": sinks["work"], "output": flagged}, mounts, {"/t/o": "/t/o"}))
 
 
 class EnvelopeTests(Base):
@@ -541,6 +636,16 @@ class EnforcementTests(Base):
         for resource in ("write-deny", "pids"):
             bad = [cl("exclusive-finite-fs", resource, ["work"], superblock="sb-fin")]
             self.assertIn("boundary-resource-mismatch", run(bad, mounts, sinks)["reasons"])
+
+    def test_bytes_only_exclusive_claim_leaves_mount_uncovered_for_inodes(self):
+        ex = mnt(30, "/fin", "ext4", False, sb="sb-fin", exclusive=True,
+                 capacity_bytes=8*MIB, capacity_inodes=1000)
+        got = run([cl("exclusive-finite-fs", "bytes", [], superblock="sb-fin")], [ex], {})
+        self.assertIn("sink-inodes-uncovered", got["reasons"])
+        self.assertEqual(got["uncovered"]["mounts"]["inodes"], [30])
+        self.assertEqual(got["uncovered"]["mounts"]["bytes"], [30])
+        got = run([cl("exclusive-finite-fs", "inodes", [], superblock="sb-fin")], [ex], {})
+        self.assertEqual(got["uncovered"]["mounts"]["bytes"], [30])
 
     def test_readonly_rootfs_resource_mismatch(self):
         mounts, sinks, fact = ro_env()
@@ -753,6 +858,20 @@ class CanaryTests(Base):
         self.assertIn("canary-collector-not-implemented", reasons(got["legs"]["canary"]))
         self.assertFalse(got["qualified"])
 
+    def test_canary_attribute_never_changes_the_leg(self):
+        for names in (COLLECTOR_SECTIONS, ALL_SECTIONS):
+            art = full_artifact()
+            ce = q.collect(StubObserver(art, names))
+            try:
+                ce.canary = {"sinks": []}
+            except AttributeError:
+                pass
+            got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)
+            with self.subTest(names=len(names)):
+                self.assertEqual(got["legs"]["canary"]["status"], "UNVERIFIED")
+                self.assertEqual(got["legs"]["canary"]["reason"], "canary-collector-not-implemented")
+                self.assertFalse(got["qualified"])
+
 
 class BackingTests(Base):
     def link(self, **over):
@@ -850,10 +969,23 @@ class EvaluateTests(Base):
         self.assertNotIn("PROVEN", [leg["status"] for leg in got["legs"].values()])
         self.assertIn("canary-collector-not-implemented", reasons(got["legs"]["canary"]))
 
-    def test_collector_path_proves_covered_legs_but_never_qualifies(self):
+    def test_legs_are_proven_only_when_the_collector_supplied_every_input(self):
         art = full_artifact()
         ce = q.collect(StubObserver(art))
         stripped = {k: v for k, v in art.items() if k not in COLLECTOR_SECTIONS}
+        got = q.evaluate(stripped, collector=ce, now=NOW, head_revision="a"*40)
+        for name in ("binding", "threshold"):
+            self.assertEqual(got["legs"][name]["status"], "PROVEN", got["legs"][name])
+        # The charge map and the claims came from the file, so the legs that use them stay capped.
+        for name in ("charge_map", "enforcement", "aliasing", "backing"):
+            with self.subTest(leg=name):
+                self.assertEqual(got["legs"][name]["status"], "FIXTURE-CONSISTENT", got["legs"][name])
+        self.assertIn("file", got["legs"]["enforcement"]["tier"])
+
+    def test_collector_path_proves_covered_legs_but_never_qualifies(self):
+        art = full_artifact()
+        ce = q.collect(StubObserver(art, ALL_SECTIONS))
+        stripped = {k: v for k, v in art.items() if k not in ALL_SECTIONS}
         got = q.evaluate(stripped, collector=ce, now=NOW, head_revision="a"*40)
         for name in ("binding", "threshold", "charge_map", "enforcement", "aliasing", "backing"):
             with self.subTest(leg=name):
@@ -863,6 +995,17 @@ class EvaluateTests(Base):
         self.assertEqual(got["verdict"], "NO-QUALIFIED-ENVIRONMENT")
         self.assertIn("canary-collector-not-implemented", reasons(got["legs"]["canary"]))
         self.assertEqual(len(got["collector"]["daemon_id_hash"]), 64)
+
+    def test_backing_needs_the_collector_to_supply_the_threshold(self):
+        for names in (tuple(n for n in COLLECTOR_SECTIONS if n != "threshold"),
+                      tuple(n for n in ALL_SECTIONS if n != "threshold")):
+            art = full_artifact()
+            ce = q.collect(StubObserver(art, names))
+            got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]
+            with self.subTest(names=len(names)):
+                self.assertEqual(got["threshold"]["status"], "FIXTURE-CONSISTENT")
+                self.assertNotEqual(got["backing"]["status"], "PROVEN", got["backing"])
+                self.assertIn("file", got["backing"]["tier"])
 
     def test_collector_evidence_cannot_be_forged(self):
         art = full_artifact()
@@ -882,7 +1025,7 @@ class EvaluateTests(Base):
 
     def test_collector_sections_override_file_values(self):
         art = full_artifact()
-        ce = q.collect(StubObserver(art))
+        ce = q.collect(StubObserver(art, ALL_SECTIONS))
         art["mountinfo"]["mounts"].append(mnt(99, "/dev/mqueue", "mqueue", False))
         got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)
         self.assertEqual(got["legs"]["charge_map"]["status"], "PROVEN")
@@ -909,6 +1052,9 @@ class EvaluateTests(Base):
         art["claims"] = "x"
         got = q.evaluate(art, now=NOW)
         self.assertFalse(got["qualified"])
+        self.assertIn("malformed-section", reasons(got["legs"]["charge_map"]))
+        self.assertIn("malformed-section", reasons(got["legs"]["enforcement"]))
+        self.assertEqual(got["legs"]["charge_map"]["status"], "UNVERIFIED")
 
 
 class CliTests(Base):
@@ -933,6 +1079,20 @@ class CliTests(Base):
         self.assertEqual(verdict["verdict"], "NO-QUALIFIED-ENVIRONMENT")
         self.assertIs(verdict["producer_launched"], False)
         self.assertIs(verdict["production_authorized"], False)
+
+    def test_head_revision_flag_detects_a_stale_repo_revision(self):
+        code, verdict = self.call(["--artifact", self.artifact(), "--experimental"])
+        self.assertEqual(verdict["legs"]["binding"]["status"], "FIXTURE-CONSISTENT")
+        code, verdict = self.call(["--artifact", self.artifact(), "--experimental",
+                                   "--head-revision", "a"*40])
+        self.assertEqual(verdict["legs"]["binding"]["status"], "FIXTURE-CONSISTENT")
+        code, verdict = self.call(["--artifact", self.artifact(), "--experimental",
+                                   "--head-revision", "c"*40])
+        self.assertIn("binding-source-unbound", reasons(verdict["legs"]["binding"]))
+        for bad in ("c"*39, "C"*40, "zz"):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                q.main(["--artifact", self.artifact(), "--head-revision", bad])
 
     def test_unreadable_artifact(self):
         for argv in (["--artifact", "/tmp/outside-scratch.json"], ["--artifact", str(self.root/"missing.json")]):
