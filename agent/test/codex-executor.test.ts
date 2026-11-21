@@ -22251,6 +22251,21 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     rig.deps = { ...rig.deps, transientBackoffBaseMs: 1, ...extra };
   }
 
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`resumed implementation retries after ${info} without a stale stop fence`, async () => {
+    const rig = makeRig({ responder: failingThenDone(1, info) });
+    tinyBackoff(rig);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1" });
+    await assert.doesNotReject(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000,
+      "resumed transient retry").then(result => {
+      assert.equal(result.phaseSwitchHeld, undefined);
+    }), "a proved same-thread retry must not reuse the preceding terminal stop bit");
+    assert.equal(rig.transport.turnStartCount, 2);
+    assert.equal(rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), false);
+    assert.deepEqual(rig.transport.requests.filter(r => r.method === "turn/start").map(r => rec(r.params).threadId), ["th-1", "th-1"]);
+    assert.equal(retryNotices(emitted).length, 1);
+  });
+
   for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(a) ${info} once then success: the run completes in the SAME thread with one retry notice [${info}]`, async () => {
     const rig = makeRig({ responder: failingThenDone(1, info) });
     tinyBackoff(rig);
@@ -22488,6 +22503,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
           if (c.method === "turn/start") {
             const turnId = `tn-resumed-${c.turnStartCount}`;
             c.transport.push(threadStarted(parkedId));
+            // Cold approval needs the provider's live-turn boundary before completion.
+            c.transport.push({ kind: "turn_started", method: "turn/started", threadId: parkedId, turnId,
+              params: { threadId: parkedId, turn: { id: turnId } } });
             if (planning && c.turnStartCount === 1) {
               c.transport.push(toolCall(1701, "submit_plan", { plan_md: resumedPlan }, parkedId, turnId, "resumed-plan"));
             } else {

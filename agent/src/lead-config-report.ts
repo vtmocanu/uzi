@@ -18,6 +18,8 @@ export type LeadPhase = "plan" | "implement";
 
 /** PRD #3252: advertised by every worker that resolves a claim's `plan_phase` for the Claude lead. */
 export const CLAUDE_PHASE_MODELS_CAPABILITY = "claude_phase_models_v1";
+/** Codex cold approval epochs verify the implementation model and cut usage at replay completion. */
+export const CODEX_PHASE_MODELS_CAPABILITY = "codex_phase_models_v1";
 
 // ── Resolver ─────────────────────────────────────────────────────────────────
 

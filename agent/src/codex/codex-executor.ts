@@ -6480,7 +6480,8 @@ export class CodexExecutor implements Executor {
         try {
           if (phase === "implement" && resumeId) {
             checkDispatch();
-            await harness.prepareRootAndThread(request, { verifyPhaseModel: true });
+            if (harness.rootThreadId !== undefined) harness.verifyPreparedPhaseModel(request);
+            else await harness.prepareRootAndThread(request, { verifyPhaseModel: true });
             checkDispatch();
           }
           turn = harness.startTurn(request);
