@@ -677,7 +677,6 @@ describe("#3253 phase transition harness seam", () => {
         .push(turnStarted()).push(turnStarted())
         .push(tokenUsage(final, implLast)).push(turnCompleted("completed"));
       const events = await collect(impl.harness.startTurn(request()).events);
-      assert.deepEqual(order, ["replay", "cut", "live"]);
       assert.equal(phaseTransition.current!.pending, false);
       const usage = entries(accountant)!;
       assert.equal(usage[planModel]!.costStatus, "unreported", "missed final plan response is not repriced");
@@ -693,6 +692,7 @@ describe("#3253 phase transition harness seam", () => {
         assert.equal(usage[implModel]![key], expectedImpl[key], key);
         assert.equal(usage[planModel]![key] + usage[implModel]![key], expectedTotal[key], key);
       }
+      assert.deepEqual(order, ["replay", "cut", "live"]);
       assert.deepEqual(events.filter(e => e.kind === "usage_record").map(e => e.model), [implModel]);
     } finally { await impl.harness.close(); }
   });
@@ -767,7 +767,7 @@ describe("#3253 phase transition harness seam", () => {
     const cut = t.mock.method(accountant, "beginModelSegment");
     const old = makeHarness({ accountant, phaseTransition, transport: resumeTransport() });
     await old.harness.prepareRootAndThread(request(), { verifyPhaseModel: true });
-    assert.equal(phaseTransition.current!.verifiedHarness, old.harness);
+    assert.equal(phaseTransition.current!.verifiedHarness === old.harness, true);
     await old.harness.close();
     assert.equal(phaseTransition.current!.pending, true);
     assert.equal(phaseTransition.current!.verifiedHarness, undefined);
@@ -786,12 +786,12 @@ describe("#3253 phase transition harness seam", () => {
       await collect(next.harness.startTurn(request()).events);
       assert.equal(cut.mock.callCount(), 1);
       assert.equal(phaseTransition.current!.pending, false);
-      assert.equal(phaseTransition.current!.verifiedHarness, next.harness);
+      assert.equal(phaseTransition.current!.verifiedHarness === next.harness, true);
       assert.equal(childSeen, true);
     } finally { await next.harness.close(); }
   });
 
-  it("completion without start preserves pending intent and quarantines an unproved resume", async t => {
+  it("completion without start refuses continuation and quarantines an unproved resume", async t => {
     const accountant = new CodexUsageAccountant();
     const phaseTransition = cell();
     const cut = t.mock.method(accountant, "beginModelSegment");
@@ -799,7 +799,10 @@ describe("#3253 phase transition harness seam", () => {
     const { harness } = makeHarness({ accountant, phaseTransition, transport });
     try {
       transport.push(turnCompleted("completed"));
-      await collect(harness.startTurn(request()).events);
+      await assert.rejects(collect(harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+      await assert.rejects(collect(harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+      assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+      assert.equal(phaseTransition.current!.boundaryUncertain, true);
       assert.equal(cut.mock.callCount(), 0);
       assert.equal(phaseTransition.current!.pending, true);
       assert.equal(accountant.usageIncomplete, true);
@@ -821,13 +824,16 @@ describe("#3253 phase transition harness seam", () => {
     const { harness } = makeHarness({ accountant, phaseTransition, transport,
       onTokenUsageIncomplete: () => { notices++; } });
     const take = t.mock.method(accountant, "takeIncompleteNotice");
+    const registered = t.mock.method(accountant, "registerThread");
     const running = collect(harness.startTurn(request()).events);
     await withTimeout(sent.promise, 2000, "resume dispatched");
     await harness.close();
     const afterClose = entries(accountant);
     assert.equal(accountant.usageIncomplete, true, "close quarantines before closing accounting admission");
     assert.equal(accountant.hasBaseline("th-1"), false);
+    const registrations = registered.mock.callCount();
     harness.recordChildThreadModel("late-child", planModel);
+    assert.equal(registered.mock.callCount(), registrations, "late child cannot register an empty usage lane");
     reply.resolve({ turn: { id: "tn-1" } });
     transport.push(turnStarted()).push(tokenUsage(totals(30, 0, 0, 5, 0), totals(30, 0, 0, 5, 0)));
     await withTimeout(running, 2000, "late finalizer");
@@ -836,8 +842,122 @@ describe("#3253 phase transition harness seam", () => {
     assert.equal(notices, 0);
     assert.equal(take.mock.callCount(), 0);
     // The next live harness owns the diagnostic; a closed finalizer cannot spend its latch.
-    assert.equal(accountant.takeIncompleteNotice(), true);
+    const next = makeHarness({ accountant, phaseTransition, transport: resumeTransport(),
+      onTokenUsageIncomplete: () => { notices++; } });
+    try {
+      await assert.rejects(collect(next.harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+      assert.equal(notices, 1);
+      await assert.rejects(collect(next.harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+      assert.equal(notices, 1, "the shared incomplete notice is delivered once");
+      assert.equal(next.transport.requests.length, 0);
+    } finally { await next.harness.close(); }
   });
+
+  for (const missingStart of ["completion", "close with acknowledgement pending"] as const) {
+    it(`holds uncertain implementation with proved planning usage: ${missingStart}`, async t => {
+      const accountant = new CodexUsageAccountant();
+      const plan = makeHarness({ accountant, authMode: "api_key" });
+      const hundred = totals(100, 0, 0, 0, 0);
+      plan.transport.push(turnStarted()).push(tokenUsage(hundred, hundred)).push(turnCompleted("completed"));
+      await collect(plan.harness.startTurn(makeRequest({ phase: "plan" })).events);
+      await plan.harness.close();
+      assert.equal(entries(accountant)![planModel]!.inputTokens, 100);
+      const phaseTransition = cell();
+      const sent = deferred<void>();
+      const reply = deferred<unknown>();
+      const transport = new FakeTransport(method => {
+        if (method === "thread/resume") return { thread: { id: "th-1" }, model: implModel };
+        if (method === "turn/start") {
+          sent.resolve();
+          return missingStart === "completion" ? { turn: { id: "tn-1" } } : reply.promise;
+        }
+        return defaultResponder(method);
+      });
+      const cut = t.mock.method(accountant, "beginModelSegment");
+      const recorded = t.mock.method(accountant, "record");
+      const old = makeHarness({ accountant, phaseTransition, transport });
+      if (missingStart === "completion") transport.push(turnCompleted("completed"));
+      const running = collect(old.harness.startTurn(request()).events);
+      const settled: Promise<unknown> = missingStart === "completion"
+        ? assert.rejects(running, PhaseSwitchUnverifiedError) : running;
+      try {
+        await withTimeout(sent.promise, 2000, "implementation dispatched");
+        if (missingStart === "completion") {
+          await withTimeout(settled, 2000, "completion without start");
+          await assert.rejects(collect(old.harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+        }
+        await old.harness.close();
+        // Closure must latch uncertainty synchronously, before the outstanding RPC settles.
+        assert.equal(phaseTransition.current!.boundaryUncertain, true);
+        assert.equal(phaseTransition.current!.pending, true);
+        assert.equal(phaseTransition.current!.verifiedHarness, undefined);
+        assert.equal(accountant.hasBaseline("th-1"), true);
+        assert.equal(accountant.usageIncomplete, true);
+        reply.resolve({ turn: { id: "tn-1" } });
+        await withTimeout(settled, 2000, "retired implementation");
+        assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+        const nextTransport = resumeTransport();
+        nextTransport.push(tokenUsage(totals(150, 0, 0, 0, 0), totals(50, 0, 0, 0, 0), "th-1", "history"))
+          .push(turnStarted()).push(tokenUsage(totals(160, 0, 0, 0, 0), totals(10, 0, 0, 0, 0)))
+          .push(turnCompleted("completed")).end();
+        const notifications = t.mock.method(nextTransport, "notifications");
+        const next = makeHarness({ accountant, phaseTransition, transport: nextTransport });
+        try {
+          await assert.rejects(next.harness.prepareRootAndThread(request(), { verifyPhaseModel: true }),
+            error => error instanceof PhaseSwitchUnverifiedError && error.cause === "malformed");
+          await assert.rejects(collect(next.harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+          assert.equal(nextTransport.requests.length, 0, "replacement must refuse before provider admission");
+          assert.equal(notifications.mock.callCount(), 0, "unknown implementation history is never read");
+          assert.equal(recorded.mock.callCount(), 0, "unknown implementation work cannot advance planning");
+          assert.equal(cut.mock.callCount(), 0);
+          const usage = entries(accountant)!;
+          assert.equal(usage[planModel]!.inputTokens, 100);
+          assert.equal(usage[planModel]!.costStatus, "unreported");
+          assert.equal(usage[implModel], undefined);
+          assert.equal(phaseTransition.current!.pending, true);
+          assert.equal(phaseTransition.current!.boundaryUncertain, true);
+        } finally { await next.harness.close(); }
+      } finally {
+        await old.harness.close();
+        reply.resolve({ turn: { id: "tn-1" } });
+        await settled;
+      }
+    });
+  }
+
+  for (const field of ["effort", "provenance"] as const) {
+    for (const matches of [true, false]) {
+      it(`checks saved ${field} ${matches ? "match" : "mismatch"} before dispatch`, async t => {
+        const accountant = new CodexUsageAccountant();
+        const phaseTransition = cell();
+        const settings = field === "effort" ? { effort: "high" as const } : { modelSource: "worker_default" as const };
+        phaseTransition.current = { ...phaseTransition.current!, ...settings };
+        const saved = makeRequest({ ...request(), ...settings });
+        const transport = resumeTransport();
+        const { harness } = makeHarness({ accountant, phaseTransition, transport });
+        const cut = t.mock.method(accountant, "beginModelSegment");
+        try {
+          await harness.prepareRootAndThread(saved, { verifyPhaseModel: true });
+          assert.equal(phaseTransition.current!.verifiedHarness === harness, true);
+          transport.push(turnStarted()).push(turnCompleted("completed")).end();
+          if (matches) {
+            await collect(harness.startTurn(saved).events);
+            assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+            assert.equal(cut.mock.callCount(), 1);
+            assert.equal(phaseTransition.current!.pending, false);
+          } else {
+            const mismatch = { ...saved, ...(field === "effort" ? { effort: "low" as const } : { modelSource: undefined }) };
+            await assert.rejects(collect(harness.startTurn(mismatch).events), PhaseSwitchUnverifiedError);
+            assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+            assert.equal(cut.mock.callCount(), 0);
+            assert.equal(phaseTransition.current!.pending, true);
+            assert.equal(phaseTransition.current!.verifiedHarness, undefined);
+            assert.equal(phaseTransition.current!.boundaryUncertain, undefined, "unsent work permits recreation");
+          }
+        } finally { await harness.close(); }
+      });
+    }
+  }
 
   it("a proved existing baseline cuts at root start even with no replay snapshot", async t => {
     const accountant = new CodexUsageAccountant();
@@ -6264,6 +6384,58 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
     assert.equal((await registry.disposeTools(1000)).kind, "incomplete");
     assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
+  });
+
+  it("a launch resolving after close retains rejected custody without installing transport", async t => {
+    const launched = deferred<CodexLaunchRootResult>();
+    const entered = deferred<void>();
+    const reapEntered = deferred<void>();
+    const reaping = deferred<{ ok: true }>();
+    let disposals = 0;
+    const root: RegisteredRoot = {
+      kind: "provider",
+      reap: () => { reapEntered.resolve(); return reaping.promise; },
+      dispose: async () => { disposals++; },
+    };
+    const { harness, registry, transport } = makeHarness({
+      launchRoot: () => { entered.resolve(); return launched.promise; },
+    });
+    const registered = t.mock.method(registry, "registerRoot");
+    const retained = t.mock.method(registry, "retainRejectedRoot");
+    const cleanup = t.mock.method(registry, "retainCleanup");
+    const notifications = t.mock.method(transport, "notifications");
+    const turn = collect(harness.startTurn(makeRequest()).events);
+    const rejected = assert.rejects(turn, /codex harness is closed/);
+    let settled = false;
+    void turn.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await withTimeout(entered.promise, 2000, "launch in flight");
+      await harness.close();
+      assert.equal(registry.pendingLaunchCount(), 1);
+      launched.resolve({ root, transport, supervisorPid: 4321 });
+      await withTimeout(reapEntered.promise, 2000, "late root reaping");
+      assert.equal(registered.mock.callCount(), 0, "closed harness cannot register model work");
+      assert.equal(retained.mock.callCount(), 1);
+      assert.equal(retained.mock.calls[0]!.arguments[1] === root, true);
+      assert.equal(registry.rootCount(), 1, "late root remains in cleanup custody");
+      assert.equal(registry.pendingLaunchCount(), 0);
+      assert.equal(transport.closes, 1);
+      assert.equal(notifications.mock.callCount(), 0, "late transport is never installed for reads");
+      assert.equal(transport.requests.length, 0, "no thread or turn can start");
+      assert.equal(disposals, 0, "disposal waits for reaping");
+      assert.equal(settled, false, "setup owns cleanup until the root is reaped");
+      assert.ok(cleanup.mock.callCount() >= 2, "close and late cleanup are tracked");
+    } finally {
+      launched.resolve({ root, transport, supervisorPid: 4321 });
+      reaping.resolve({ ok: true });
+      await withTimeout(rejected, 2000, "late launch cleaned up");
+      await harness.close();
+    }
+    assert.equal(disposals, 1);
+    assert.equal(registered.mock.callCount(), 0);
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete",
+      "late cleanup does not invent aggregate closure proof");
+    assert.equal((await registry.disposeTools(1000)).kind, "incomplete");
   });
 
   it("an unknown launch failure settles its reservation but retains uncertainty and the setup error", async () => {

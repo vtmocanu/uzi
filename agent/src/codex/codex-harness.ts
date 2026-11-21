@@ -221,6 +221,8 @@ export interface CodexPhaseTransition {
   readonly effort?: RunTurnRequest["effort"];
   readonly modelSource?: RunTurnRequest["modelSource"];
   pending: boolean;
+  /** A dispatched implementation attempt ended without a proved inbound root start. */
+  boundaryUncertain?: boolean;
   verifiedHarness?: CodexHarness;
 }
 
@@ -585,7 +587,12 @@ export class CodexHarness implements RunHarness {
   private currentModel?: string;
   private readonly phaseTransition?: CodexPhaseTransitionCell;
   private verifiedTransition?: CodexPhaseTransition;
-  private attemptedResumedRoot?: { threadId: string; ordinal: number };
+  private attemptedResumedRoot?: { threadId: string; ordinal: number; transition?: CodexPhaseTransition };
+
+  private assertPhaseBoundaryCertain(): void {
+    if (this.phaseTransition?.current?.boundaryUncertain)
+      throw new PhaseSwitchUnverifiedError("malformed", {}, {});
+  }
 
   private assertOpen(): void {
     if (this.closed)
@@ -602,6 +609,7 @@ export class CodexHarness implements RunHarness {
   /** Recheck saved thread response after credential coordination, without consuming notes. */
   verifyPreparedPhaseModel(request: RunTurnRequest): void {
     this.assertOpen();
+    this.assertPhaseBoundaryCertain();
     request.signal.throwIfAborted();
     const rendered = this.render(request);
     this.latchModel(rendered);
@@ -635,7 +643,12 @@ export class CodexHarness implements RunHarness {
   private settleResumeAttempt(ordinal?: number): void {
     const attempt = this.attemptedResumedRoot;
     if (this.closed || attempt === undefined || (ordinal !== undefined && attempt.ordinal !== ordinal)) return;
-    if (!this.accountant.hasBaseline(attempt.threadId))
+    if (attempt.transition?.pending) {
+      this.accountant.markIncomplete(attempt.threadId, "missing_replay_boundary");
+      attempt.transition.boundaryUncertain = true;
+      attempt.transition.verifiedHarness = undefined;
+      this.verifiedTransition = undefined;
+    } else if (!this.accountant.hasBaseline(attempt.threadId))
       this.accountant.markIncomplete(attempt.threadId, "attempted_resume_without_baseline");
     this.attemptedResumedRoot = undefined;
   }
@@ -1216,6 +1229,7 @@ export class CodexHarness implements RunHarness {
 
   private async prepareThread(request: RunTurnRequest, rendered: RenderedCodexRun): Promise<boolean> {
     this.assertOpen();
+    this.assertPhaseBoundaryCertain();
     this.latchModel(rendered);
     if (request.signal.aborted || this.stopRequested) return false;
     // 1. Ensure the provider root + transport (launched once, reused after).
@@ -1518,7 +1532,9 @@ export class CodexHarness implements RunHarness {
         () => {
           this.assertOpen();
           if (this.phaseTransition?.current?.pending) this.verifyPreparedPhaseModel(request);
-          if (this.resumedRoot) this.attemptedResumedRoot = { threadId, ordinal };
+          if (this.resumedRoot) this.attemptedResumedRoot = {
+            threadId, ordinal, transition: this.verifiedTransition?.pending ? this.verifiedTransition : undefined,
+          };
         });
       // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
       // that was cancelled or refused before dispatch.
@@ -1802,6 +1818,7 @@ export class CodexHarness implements RunHarness {
       // pinned auth owner so its poison state remains the explicit failure, and never
       // proceed merely because a transport object exists.
       await this.appServerAuth?.authenticate(this.transport, signal);
+      this.assertOpen();
       if (!this.notes) this.notes = this.transport.notifications();
       return;
     }
@@ -1826,8 +1843,10 @@ export class CodexHarness implements RunHarness {
       this.registry.cancelReservation(reservation.reservation);
       throw error;
     }
-    const admission = this.registry.registerRoot(reservation.reservation, launched.root);
-    if (!admission.ok) {
+    // No await may separate the retirement fence from work registration. A late root
+    // still belongs to this registry, but only through rejected-root cleanup custody.
+    const admission = !this.closed && this.registry.registerRoot(reservation.reservation, launched.root);
+    if (!admission || !admission.ok) {
       this.registry.retainRejectedRoot(reservation.reservation, launched.root);
       const deadlineAt = Date.now() + REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS;
       const remaining = () => Math.max(0, deadlineAt - Date.now());
@@ -1838,12 +1857,15 @@ export class CodexHarness implements RunHarness {
         if (remaining() <= 0) this.registry.markLaunchCleanupUnconfirmed();
       };
       // Three attempts share one deadline; a failed channel does not skip root settlement.
-      await bounded(launched.transport.close());
-      const reaped = await this.registry.reapRoot(launched.root, remaining()).catch(() => undefined);
-      if (!reaped?.ok) this.registry.markLaunchCleanupUnconfirmed();
-      await bounded(this.registry.disposeTools(remaining()).then(outcome => {
-        if (outcome.kind !== "disposed") this.registry.markLaunchCleanupUnconfirmed();
-      }));
+      await this.registry.retainCleanup((async () => {
+        await bounded(launched.transport.close());
+        const reaped = await this.registry.reapRoot(launched.root, remaining()).catch(() => undefined);
+        if (!reaped?.ok) this.registry.markLaunchCleanupUnconfirmed();
+        await bounded(this.registry.disposeTools(remaining()).then(outcome => {
+          if (outcome.kind !== "disposed") this.registry.markLaunchCleanupUnconfirmed();
+        }));
+      })());
+      this.assertOpen();
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
     const raw = launched.transport;
@@ -1871,6 +1893,7 @@ export class CodexHarness implements RunHarness {
     // The pinned initialize/initialized/login sequence completes before any thread/model
     // work. The auth owner has no reference to the model callback broker.
     await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal) ?? Promise.resolve());
+    this.assertOpen();
     // Single-consumer: obtain the notifications iterator exactly once for the root.
     this.notes = this.transport.notifications();
     this.log.debug("codex provider root launched", { supervisorPid: launched.supervisorPid });
@@ -2579,12 +2602,17 @@ export class CodexHarness implements RunHarness {
   /** Observe usage in inbound order. Outbound turn/start is not a replay boundary. */
   private recordUsageNote(note: CodexNotification): void {
     if (this.closed) return;
+    this.assertPhaseBoundaryCertain();
     const root = noteThreadId(note) === this.threadId;
     if (this.resumedRoot && root &&
         ((note.kind === "turn_started" && note.turnId === this.activeTurnId) ||
          (note.kind === "turn_completed" && note.turnId === this.activeTurnId))) {
       if (!this.resumeBoundarySeen) {
         // A matching completion without a start cannot prove the historical boundary.
+        if (note.kind === "turn_completed" && this.attemptedResumedRoot?.transition?.pending) {
+          this.settleResumeAttempt();
+          this.assertPhaseBoundaryCertain();
+        }
         if (note.kind === "turn_started" && this.resumeReplay)
           this.accountant.record(this.threadId!, this.resumeReplay, true);
         else if (!this.accountant.hasBaseline(this.threadId!))
