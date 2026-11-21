@@ -371,14 +371,48 @@ class ThresholdTests(Base):
 
     def test_config_ts_hash_matches_and_drift_is_red(self):
         self.assertTrue(q.golden_matches())
+        original = (p.ROOT/"agent/src/config.ts").read_bytes()
         drifted = self.root/"config.ts"
-        drifted.write_bytes((p.ROOT/"agent/src/config.ts").read_bytes() + b"\n// drift\n")
-        self.assertFalse(q.golden_matches(config_ts=drifted))
+        drifted.write_bytes(original.replace(b"n < 1 ? n : fallback", b"n <= 1 ? n : fallback", 1))
+        self.assertFalse(q.golden_matches(config_ts=drifted), "margin implementation drift must be refused")
         value = good_threshold()
         self.assertIn("margin-js-parse-unsupported",
                       q.check_threshold(value, NOW, config_ts=drifted)["reasons"])
-        recorded = json.loads(Path(q.GOLDEN_PATH).read_text())["config_ts_sha256"]
-        self.assertEqual(recorded, hashlib.sha256((p.ROOT/"agent/src/config.ts").read_bytes()).hexdigest())
+
+    def test_unrelated_config_edits_do_not_stale_the_margin_golden(self):
+        changed = self.root/"config.ts"
+        original = (p.ROOT/"agent/src/config.ts").read_bytes()
+        changed.write_bytes(original.replace(b"DEFAULT_RUN_CACHE_CAP_MAX_BYTES = 16106127360",
+                                            b"DEFAULT_RUN_CACHE_CAP_MAX_BYTES = 17179869184") + b"\n// unrelated knob\n")
+        self.assertTrue(q.golden_matches(config_ts=changed), "unrelated configuration changes must not stale the parser proof")
+        self.assertEqual(q.check_threshold(good_threshold(), NOW, config_ts=changed)["reasons"], [])
+
+    def test_soft_margin_binding_drift_is_refused(self):
+        original = (p.ROOT/"agent/src/config.ts").read_bytes()
+        for replacement in (b'diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.2),',
+                            b'diskSoftMargin: 0.1,'):
+            changed = self.root/"config.ts"
+            changed.write_bytes(original.replace(b'diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),', replacement))
+            with self.subTest(binding=replacement):
+                self.assertFalse(q.golden_matches(config_ts=changed), "soft-margin binding drift must be refused")
+                self.assertIn("margin-js-parse-unsupported", q.check_threshold(good_threshold(), NOW, config_ts=changed)["reasons"])
+
+    def test_missing_duplicate_or_indirect_margin_source_is_refused(self):
+        original = (p.ROOT/"agent/src/config.ts").read_bytes()
+        for changed_source in (original.replace(b"function marginFraction(", b"function renamedMargin("),
+                               original + b"\nfunction marginFraction() {}\n",
+                               original.replace(b"const n = Number(raw);\n  return Number.isFinite(n) && n >= 0 && n < 1",
+                                                b"const n = anotherParser(raw);\n  return Number.isFinite(n) && n >= 0 && n < 1")):
+            changed = self.root/"config.ts"
+            changed.write_bytes(changed_source)
+            self.assertFalse(q.golden_matches(config_ts=changed), "unsupported parser structure must be refused")
+
+    def test_legacy_wrong_scope_or_malformed_golden_is_refused(self):
+        current = json.loads(Path(q.GOLDEN_PATH).read_text())
+        for value in ([], {"config_ts_sha256": "0"*64}, dict(current, source_scope="different/1")):
+            golden = self.root/"golden.json"
+            golden.write_text(json.dumps(value))
+            self.assertFalse(q.golden_matches(golden=golden))
 
 
 class ChargeMapTests(Base):

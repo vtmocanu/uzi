@@ -29,6 +29,17 @@ OUTPUT_SCHEMA = "uzi-go-cache-qualify/1"
 GOLDEN_PATH = Path(__file__).with_name("margin-golden.json")
 CONFIG_TS = p.ROOT / "agent/src/config.ts"
 FALLBACK_MARGIN = 0.1
+MARGIN_SOURCE_SCOPE = "marginFraction+diskSoftMargin/1"
+# This primitive has no module helpers: only JS trim/Number and the supplied fallback.
+# Refactoring it into dependencies requires a reviewed extraction contract, not a wider regex
+# that silently leaves those dependencies unpinned.
+SUPPORTED_MARGIN_FUNCTION = '''function marginFraction(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n < 1 ? n : fallback;
+}'''
+SOFT_MARGIN_BINDING = '    diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),'
 
 OUTER_SINKS = ("daemon_image_store", "daemon_build_cache", "daemon_metadata_snapshots")
 LOG_SINKS = ("container_logs",)
@@ -139,11 +150,28 @@ def config_margin(raw):
     return FALLBACK_MARGIN, True
 
 
+def margin_source(config_ts=None):
+    """Recognize the closed primitive and direct soft-margin binding; unrelated knobs are excluded.
+
+    Missing, duplicate or unsupported source shapes fail closed. This is deliberately not a
+    general TypeScript parser: helper-based implementations need an explicit contract update.
+    """
+    source = Path(config_ts or CONFIG_TS).read_text()
+    require(len(re.findall(r"^(?:export )?function marginFraction\(", source, re.M)) == 1)
+    require(len(re.findall(r"^    diskSoftMargin:", source, re.M)) == 1)
+    functions = re.findall("^" + re.escape(SUPPORTED_MARGIN_FUNCTION) + r"(?=\n|$)", source, re.M)
+    bindings = re.findall("^" + re.escape(SOFT_MARGIN_BINDING) + "$", source, re.M)
+    require(len(functions) == len(bindings) == 1)
+    return (MARGIN_SOURCE_SCOPE + "\0" + functions[0] + "\0" + bindings[0]).encode()
+
+
 def golden_matches(config_ts=None, golden=None):
-    """True when the config.ts the golden table was generated from is the one on disk."""
+    """True only for the supported margin implementation/binding and its regenerated golden."""
     try:
-        recorded = json.loads(Path(golden or GOLDEN_PATH).read_bytes())["config_ts_sha256"]
-        return recorded == hashlib.sha256(Path(config_ts or CONFIG_TS).read_bytes()).hexdigest()
+        recorded = json.loads(Path(golden or GOLDEN_PATH).read_bytes())
+        require(isinstance(recorded, dict))
+        return (recorded.get("source_scope") == MARGIN_SOURCE_SCOPE
+                and recorded["margin_source_sha256"] == hashlib.sha256(margin_source(config_ts)).hexdigest())
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
@@ -249,7 +277,7 @@ def check_threshold(value, now, config_ts=None):
         require(state in ("set", "unset") and (raw is None) == (state == "unset"))
         margin, _ = config_margin(raw)
         if not golden_matches(config_ts):
-            raise JsParseUnsupported("config.ts differs from the golden table")
+            raise JsParseUnsupported("supported margin source differs from the golden table")
         soft = api-margin if api-margin > 0 else api
     except ValueError:
         _add(reasons, "margin-js-parse-unsupported")

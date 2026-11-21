@@ -337,16 +337,39 @@ CLI or `evaluate()` path.
 
 ### Margin golden table
 
-`margin-golden.json` records the output of the real `loadConfig(...).diskSoftMargin` from
-agent/src/config.ts at revision f99e8a84d9111dea0f0431485295d2411ec5e971, with the
-sha256 of that file. Tests check every row and that the file still hashes to the recorded
-value, so a config.ts change turns them (and the threshold leg) red until the table is
-regenerated. Regenerate the rows with this command (it passes only the required
-variables plus `UZI_DISK_SOFT_MARGIN`), then update `config_ts_sha256` and `revision`:
+`margin-golden.json` records the output of the real `loadConfig(...).diskSoftMargin` at its
+recorded revision. `source_scope` and `margin_source_sha256` pin only the recognized,
+self-contained `marginFraction` function and its direct `diskSoftMargin` binding (including
+the environment key and fallback). Unrelated config fields, helpers and comments outside
+those fragments do not stale this proof. The source hash includes a versioned scope prefix.
+
+Missing, duplicate, indirect or unsupported parser/binding forms fail closed; a helper-based
+refactor requires reviewing the dependency contract rather than silently omitting its helper.
+Parser or binding drift still fails its dedicated test and makes the evaluated threshold
+UNVERIFIED. There is no stale-golden skip and no production qualification bypass. This is
+margin-emulation evidence, not proof of an effective live worker threshold.
+
+Regenerate rows through the real loader (only the required variables plus
+`UZI_DISK_SOFT_MARGIN`), compare all values, then update the scoped hash and revision:
 
 ```sh
 cd agent && node --import tsx -e 'import("./src/config.ts").then(({ loadConfig }) => { const rows = [null, "", "   ", " ", "\u3000 0.2 ", "0.1", "0.25", "1e-1", ".5", "5.", "0x0", "0b0", "-0.1", "1", "1.5", "abc", "NaN", "Infinity", "1_0", "0.5abc", "+0.3", " 0.3\n"]; console.log(JSON.stringify(rows.map((input) => { const explicit = { UZI_API_URL: "http://x", UZI_WORKER_TOKEN: "t" }; if (input !== null) explicit.UZI_DISK_SOFT_MARGIN = input; return { input, expected: loadConfig(explicit).diskSoftMargin }; }))); })'
 ```
+
+From the repository root, print the supported source coordinates with:
+
+```sh
+python3 -B - <<'PY'
+import hashlib, json, sys
+sys.path.insert(0, "e2e/go-cache-admission")
+import qualify
+print(json.dumps({"source_scope": qualify.MARGIN_SOURCE_SCOPE,
+                  "margin_source_sha256": hashlib.sha256(qualify.margin_source()).hexdigest()}))
+PY
+```
+
+An unsupported shape must be reviewed together with the Python emulation before regeneration;
+do not change the hash alone to silence a genuine parser-drift failure.
 
 The new tests are `test_qualify.py`: synthetic fixtures only, including an owned
 loopback TCP stub for `docker_get`. They validate code paths, not an environment.

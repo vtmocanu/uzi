@@ -1,5 +1,6 @@
 {
- "config_ts_sha256": "477b87e6628b832e28ca830971ef7963baa247226085171adf4bc6dbc9ac9023",
+ "source_scope": "marginFraction+diskSoftMargin/1",
+ "margin_source_sha256": "7a6bb34c088abdb5c2768f2cfeed80e0a00378d245cc6bb9ecad56b08e25022f",
  "revision": "157fb0366fbb10a94584a83530d27f250ee2835a",
  "rows": [
   {
