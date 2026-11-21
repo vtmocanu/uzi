@@ -964,7 +964,9 @@ cadence. A schedule that has never fired and was never held that way
 reads `last_fire: null`. A scheduled one-time sweep held partway (a busy
 repository gate, a capacity or credential hold) also writes `last_fire` as a
 progress summary while it stays due; after a crash, a failed advance or a
-shutdown nothing is written until the next tick's write. The summary names
+shutdown outside the repository-gate wait nothing is written until the next
+tick's write (a shutdown during that wait counts as a busy gate and writes the
+summary). The summary names
 the runs the fire has started so far, and a named run may have since been
 deleted (the ledger keeps its run id, title and URL).
 
