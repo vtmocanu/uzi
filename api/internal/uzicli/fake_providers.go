@@ -53,6 +53,18 @@ func (f *FakeClient) TestProvider(_ context.Context, id string) (*apitypes.Provi
 }
 
 func (f *FakeClient) SetClaudeProviderSource(_ context.Context, id *string) (*string, error) {
+	f.LastProviderSourceEngine = "claude"
+	f.ProviderSourceCalls++
+	f.ProviderSourceSet = true
+	f.LastProviderSource = id
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return id, nil
+}
+
+func (f *FakeClient) SetCodexProviderSource(_ context.Context, id *string) (*string, error) {
+	f.LastProviderSourceEngine = "codex"
 	f.ProviderSourceCalls++
 	f.ProviderSourceSet = true
 	f.LastProviderSource = id
