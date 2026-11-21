@@ -271,8 +271,8 @@ A few worth knowing:
   window (default `lifetime`).** The factory summary and per-user rows use
   the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
   self_improve) with recorded usage. Finished, failed and the failure rate
-  count terminal primary work runs, including runs without usage; failure rate
-  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  count every terminal run except chat (helper runs included), including runs
+  without usage; failure rate is failed runs divided by finished runs. Tokens and API-equivalent cost also
   include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
   excluded. Cost shows `$0.00` for metered zero and discloses runs without a
   cost estimate and unreported runs. Incomplete totals include recorded partial
@@ -291,8 +291,9 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, rejected plans and `base_diverged` required-base
-  rejections do not count as failures. Required-base rejections remain in the
+  as Overview: chat, rejected plans and `base_diverged` required-base
+  rejections do not count as failures; failed helper runs (judge,
+  cross_check, mr_rework, ci_fix) do. Required-base rejections remain in the
   finished-run denominator and have a separate numeric `base_diverged` count
   in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
   for the partition identity and the web bar's combined **rejected** segment.

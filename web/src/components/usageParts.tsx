@@ -12,10 +12,15 @@ import type { UsageWindow } from "../lib/usageByUser";
 
 // Presentation pieces for the Overview's OverviewUsageCard.
 
-// Issue #4209: run counts and failure rates cover primary work; tokens and cost also include
+// Issues #4209 and #4577: the Runs count covers primary work; tokens and cost also include
 // helper runs. One literal for both Usage cards, rendered under the KPI grid.
 export const USAGE_SCOPE_NOTE =
-  "Runs and failure rates count primary work: issues, tasks, prompts, jobs and self-improve. Cost and tokens also include helper runs (judge, cross-check, PR rework, CI fix).";
+  "Runs count primary work: issues, tasks, prompts, jobs and self-improve. Cost and tokens also include helper runs (judge, cross-check, PR rework, CI fix).";
+
+// Issue #4577: outcomes count every non-chat run kind, unlike the primary-only Runs count.
+// Run history does not list judge or cross_check runs, so their failures are explained here.
+export const OUTCOME_SCOPE_NOTE =
+  "Runs counts primary work with recorded usage. Outcomes also include reworks, CI fixes, cross-checks and judge runs. Judge and cross-check failures show on their parent run.";
 
 // Issue #4209: run_count counts only primary work runs, so a helper-only user has
 // run_count 0 yet real spend. "Nothing recorded" is true only when tokens, cost, the
@@ -103,6 +108,7 @@ export function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes;
           </li>
         ))}
       </ul>
+      <p className="text-[11px] leading-relaxed text-muted">{OUTCOME_SCOPE_NOTE}</p>
     </div>
   );
 }

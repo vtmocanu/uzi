@@ -10,7 +10,7 @@ import { OverviewUsageCard } from "./OverviewUsageCard";
 import type { UsageWindow } from "../lib/usageByUser";
 import type { AdminUsage, SelfUsage } from "../lib/api";
 import { mockApi } from "../mocks/mockApi";
-import { USAGE_SCOPE_NOTE } from "./usageParts";
+import { OUTCOME_SCOPE_NOTE, USAGE_SCOPE_NOTE } from "./usageParts";
 
 afterEach(cleanup);
 
@@ -97,6 +97,14 @@ function expectNoteInsideCard(note: HTMLElement) {
 it.each([1280, 400])("keeps the scope note visible and inside its card at %ipx", async (width) => {
   await mount(width);
   const note = screen.getByText(USAGE_SCOPE_NOTE);
+  expect(note.getBoundingClientRect().width).toBeGreaterThan(0);
+  expectNoteInsideCard(note);
+});
+
+// Issue #4577: the outcomes caption sits in the outcomes block and must also stay inside its card.
+it.each([1280, 400])("keeps the outcome scope note visible and inside its card at %ipx", async (width) => {
+  await mount(width);
+  const note = screen.getByText(OUTCOME_SCOPE_NOTE);
   expect(note.getBoundingClientRect().width).toBeGreaterThan(0);
   expectNoteInsideCard(note);
 });
