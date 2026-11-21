@@ -100,8 +100,10 @@ type UserSettingsDTO struct {
 	// PUT /api/me/settings.
 	PlanningClaudeModel  *string `json:"planning_claude_model"`
 	PlanningClaudeEffort *string `json:"planning_claude_effort"`
+	PlanningCodexModel   *string `json:"planning_codex_model"`
+	PlanningCodexEffort  *string `json:"planning_codex_effort"`
 	// PlanningModels and PlanningEfforts are read-only (never sent on a PUT): the resolved view of
-	// the Claude planning pair, one claude cell each.
+	// the planning pairs, ordered claude then codex.
 	PlanningModels  []ModelSettingCellDTO  `json:"planning_models"`
 	PlanningEfforts []EffortSettingCellDTO `json:"planning_efforts"`
 	// WeeklyReservePct and WeeklyReservePauseRunning mirror the weekly usage reserve (PRD

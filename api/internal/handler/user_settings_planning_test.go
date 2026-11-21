@@ -45,19 +45,26 @@ func decodePlanningSettings(t *testing.T, rec *httptest.ResponseRecorder) apityp
 func ptr(s string) *string { return &s }
 
 type planningFixtureCase struct {
-	ID   string `json:"id"`
-	Seed struct {
-		Model  *string `json:"planning_claude_model"`
-		Effort *string `json:"planning_claude_effort"`
-		Shared *string `json:"default_effort"`
+	ID      string `json:"id"`
+	Harness string `json:"harness"`
+	Seed    struct {
+		Model              *string `json:"planning_claude_model"`
+		Effort             *string `json:"planning_claude_effort"`
+		Shared             *string `json:"default_effort"`
+		CodexModel         *string `json:"planning_codex_model"`
+		CodexEffort        *string `json:"planning_codex_effort"`
+		CodexDefaultEffort *string `json:"default_codex_effort"`
 	} `json:"seed"`
 	Body   json.RawMessage `json:"body"`
 	Expect struct {
-		Status        int     `json:"status"`
-		Model         *string `json:"planning_claude_model"`
-		Effort        *string `json:"planning_claude_effort"`
-		DefaultEffort *string `json:"default_effort"`
-		ErrorContains string  `json:"error_contains"`
+		Status             int     `json:"status"`
+		Model              *string `json:"planning_claude_model"`
+		Effort             *string `json:"planning_claude_effort"`
+		DefaultEffort      *string `json:"default_effort"`
+		ErrorContains      string  `json:"error_contains"`
+		CodexModel         *string `json:"planning_codex_model"`
+		CodexEffort        *string `json:"planning_codex_effort"`
+		CodexDefaultEffort *string `json:"default_codex_effort"`
 	} `json:"expect"`
 }
 
@@ -82,7 +89,11 @@ func TestPlanningDefaultsFixture(t *testing.T) {
 	var ids []string
 	for _, c := range f.Cases {
 		ids = append(ids, c.ID)
-		db := &fakeSettingsDB{planningModel: textOf(c.Seed.Model), planningEffort: textOf(c.Seed.Effort), effort: textOf(c.Seed.Shared)}
+		db := &fakeSettingsDB{planningModel: textOf(c.Seed.Model), planningEffort: textOf(c.Seed.Effort), effort: textOf(c.Seed.Shared),
+			planningCodexModel: textOf(c.Seed.CodexModel), planningCodexEffort: textOf(c.Seed.CodexEffort), codexEffort: textOf(c.Seed.CodexDefaultEffort)}
+		if c.Harness == "codex" {
+			c.Expect.Model, c.Expect.Effort, c.Expect.DefaultEffort = c.Expect.CodexModel, c.Expect.CodexEffort, c.Expect.CodexDefaultEffort
+		}
 		h := &Handler{q: store.New(db)}
 		rec := putPlanning(t, h, string(c.Body))
 		if rec.Code != c.Expect.Status {
@@ -91,14 +102,21 @@ func TestPlanningDefaultsFixture(t *testing.T) {
 		if c.Expect.ErrorContains != "" && !strings.Contains(rec.Body.String(), c.Expect.ErrorContains) {
 			t.Errorf("%s: body %s does not name %q", c.ID, rec.Body, c.Expect.ErrorContains)
 		}
-		if db.planningModel != textOf(c.Expect.Model) || db.planningEffort != textOf(c.Expect.Effort) {
-			t.Errorf("%s: stored pair = %+v/%+v, want %v/%v", c.ID, db.planningModel, db.planningEffort, c.Expect.Model, c.Expect.Effort)
+		model, effort, ordinary := db.planningModel, db.planningEffort, db.effort
+		if c.Harness == "codex" {
+			model, effort, ordinary = db.planningCodexModel, db.planningCodexEffort, db.codexEffort
 		}
-		if c.Expect.DefaultEffort != nil && db.effort != textOf(c.Expect.DefaultEffort) {
+		if model != textOf(c.Expect.Model) || effort != textOf(c.Expect.Effort) {
+			t.Errorf("%s: stored pair = %+v/%+v, want %v/%v", c.ID, model, effort, c.Expect.Model, c.Expect.Effort)
+		}
+		if c.Expect.DefaultEffort != nil && ordinary != textOf(c.Expect.DefaultEffort) {
 			t.Errorf("%s: default_effort = %+v, want %s", c.ID, db.effort, *c.Expect.DefaultEffort)
 		}
 		if c.Expect.Status == 200 {
 			got := decodePlanningSettings(t, rec)
+			if c.Harness == "codex" {
+				got.PlanningClaudeModel, got.PlanningClaudeEffort = got.PlanningCodexModel, got.PlanningCodexEffort
+			}
 			if (got.PlanningClaudeModel == nil) != (c.Expect.Model == nil) || (got.PlanningClaudeModel != nil && *got.PlanningClaudeModel != *c.Expect.Model) {
 				t.Errorf("%s: response model = %v, want %v", c.ID, got.PlanningClaudeModel, c.Expect.Model)
 			}
@@ -216,8 +234,8 @@ func TestPlanningCellsResolution(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
 			got := decodePlanningSettings(t, rec)
-			if len(got.PlanningModels) != 1 || len(got.PlanningEfforts) != 1 {
-				t.Fatalf("cells = %d models, %d efforts, want one each: %s", len(got.PlanningModels), len(got.PlanningEfforts), rec.Body)
+			if len(got.PlanningModels) != 2 || len(got.PlanningEfforts) != 2 {
+				t.Fatalf("cells = %d models, %d efforts, want two each: %s", len(got.PlanningModels), len(got.PlanningEfforts), rec.Body)
 			}
 			m, e := got.PlanningModels[0], got.PlanningEfforts[0]
 			if m.Harness != "claude" || e.Harness != "claude" {
@@ -234,6 +252,35 @@ func TestPlanningCellsResolution(t *testing.T) {
 			}
 			if (e.ResolvedEffort == nil) != (tc.wantEffResolved == nil) || (e.ResolvedEffort != nil && *e.ResolvedEffort != *tc.wantEffResolved) {
 				t.Errorf("effort resolved = %v, want %v", e.ResolvedEffort, tc.wantEffResolved)
+			}
+		})
+	}
+}
+
+// TestCodexPlanningRuntimeSaveOrders exercises real successive PUTs, including the
+// ordinary Codex effort setter, rather than relying only on seeded fixture state.
+func TestCodexPlanningRuntimeSaveOrders(t *testing.T) {
+	for _, planningFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "planning first", false: "runtime first"}[planningFirst], func(t *testing.T) {
+			h := &Handler{q: store.New(&fakeSettingsDB{})}
+			bodies := []string{`{"planning_codex_model":"custom-plan","planning_codex_effort":"high"}`, `{"default_codex_effort":"runtime"}`}
+			if !planningFirst {
+				bodies[0], bodies[1] = bodies[1], bodies[0]
+			}
+			var got apitypes.UserSettingsDTO
+			for _, body := range bodies {
+				rec := putPlanning(t, h, body)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("PUT %s: %d %s", body, rec.Code, rec.Body)
+				}
+				got = decodePlanningSettings(t, rec)
+			}
+			if got.PlanningCodexModel == nil || *got.PlanningCodexModel != "custom-plan" || got.PlanningCodexEffort == nil || *got.PlanningCodexEffort != "high" || got.DefaultCodexEffort == nil || *got.DefaultCodexEffort != "runtime" {
+				t.Fatalf("saved pair/default = %+v", got)
+			}
+			m, e := got.PlanningModels[1], got.PlanningEfforts[1]
+			if m.Harness != "codex" || m.ResolvedModel != "custom-plan" || m.Source != "user_planning_default" || e.Harness != "codex" || e.DefaultEffort != "runtime" || e.ResolvedEffort == nil || *e.ResolvedEffort != "high" || e.Source != "user_planning_default" {
+				t.Fatalf("Codex cells = %+v / %+v", m, e)
 			}
 		})
 	}

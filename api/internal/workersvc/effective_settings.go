@@ -395,16 +395,12 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 	tClaude, tCodex := textPtr(row.TemplateModel), textPtr(row.TemplateCodexModel)
 
 	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort}
-	// PRD #3252: the claim reads the owner's Claude planning pair for a Claude lead-lane run, so the
-	// prediction reads the same two columns (GetUserPlanningClaude) and resolveLeadSettings returns
-	// the plan pair the claim would ship.
-	if harness == HarnessClaude {
-		planning, perr := s.q.GetUserPlanningClaude(ctx, userID)
-		if perr != nil {
-			return LeadPrediction{}, fmt.Errorf("lead predict: read planning defaults: %w", perr)
-		}
-		in.PlanningModel, in.PlanningEffort = planning.PlanningClaudeModel, planning.PlanningClaudeEffort
+	// Read the same harness-specific planning columns as claim assembly.
+	planningModel, planningEffort, perr := s.readPlanningDefaults(ctx, userID, harness)
+	if perr != nil {
+		return LeadPrediction{}, fmt.Errorf("lead predict: read planning defaults: %w", perr)
 	}
+	in.PlanningModel, in.PlanningEffort = planningModel, planningEffort
 	choice.apply(&in)
 	settings := resolveLeadSettings(in)
 	if settings.Unhonorable != nil {
@@ -478,4 +474,16 @@ func (s *Service) predictSubagents(ctx context.Context, q leadPredictStore, user
 	}
 	out.Pinned = pins
 	return out, nil
+}
+
+func (s *Service) readPlanningDefaults(ctx context.Context, userID uuid.UUID, harness Harness) (pgtype.Text, pgtype.Text, error) {
+	if harness == HarnessCodex {
+		row, err := s.q.GetUserPlanningCodex(ctx, userID)
+		return row.PlanningCodexModel, row.PlanningCodexEffort, err
+	}
+	if harness == HarnessClaude {
+		row, err := s.q.GetUserPlanningClaude(ctx, userID)
+		return row.PlanningClaudeModel, row.PlanningClaudeEffort, err
+	}
+	return pgtype.Text{}, pgtype.Text{}, nil
 }

@@ -120,29 +120,32 @@ func TestSetRunPhaseSwitchHoldStatementLiveDB(t *testing.T) {
 			HoldCapturedHead: pgtype.Text{String: "h", Valid: true}, ID: id, WorkerID: w, ClaimGeneration: gen})
 	}
 
-	for _, kind := range []string{"issue", "ci_fix", "self_improve", "prompt", "mr_rework", "task"} {
-		for _, interactive := range []bool{false, true} {
-			for _, status := range []string{"running", "awaiting_approval"} {
-				t.Run(fmt.Sprintf("%s/interactive=%v/%s", kind, interactive, status), func(t *testing.T) {
-					id := seed(wpRun{kind: kind, interactive: interactive, status: status}, "")
-					// self_improve and ci_fix allow one active run each: free the slot for the next case.
-					t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM runs WHERE id = $1`, id) })
-					run, err := hold(id, wid, 3)
-					if err != nil {
-						t.Fatalf("hold: %v", err)
-					}
-					if run.Status != "paused" || run.HoldReason.String != phaseSwitchReason || run.HoldCapturedHead.String != "h" {
-						t.Fatalf("held = (%q, %q, %q)", run.Status, run.HoldReason.String, run.HoldCapturedHead.String)
-					}
-					if run.OpenQuestionID.Valid || run.Health != "ok" || run.HealthReason.Valid || run.HealthSince.Valid {
-						t.Fatalf("question/health not reset: %v %q", run.OpenQuestionID, run.Health)
-					}
-					if run.WorkerID.Bytes != worker || run.ClaimGeneration != 3 || run.ClaimReleasedAt.Valid {
-						t.Fatal("the hold keeps the worker and the live claim")
-					}
-				})
+	for _, harness := range []string{"claude", "codex"} {
+		for _, kind := range []string{"issue", "ci_fix", "self_improve", "prompt", "mr_rework", "task"} {
+			for _, interactive := range []bool{false, true} {
+				for _, status := range []string{"running", "awaiting_approval"} {
+					t.Run(fmt.Sprintf("%s/%s/interactive=%v/%s", harness, kind, interactive, status), func(t *testing.T) {
+						id := seed(wpRun{kind: kind, harness: harness, interactive: interactive, status: status}, "")
+						// self_improve and ci_fix allow one active run each: free the slot for the next case.
+						t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM runs WHERE id = $1`, id) })
+						run, err := hold(id, wid, 3)
+						if err != nil {
+							t.Fatalf("hold: %v", err)
+						}
+						if run.Status != "paused" || run.HoldReason.String != phaseSwitchReason || run.HoldCapturedHead.String != "h" {
+							t.Fatalf("held = (%q, %q, %q)", run.Status, run.HoldReason.String, run.HoldCapturedHead.String)
+						}
+						if run.OpenQuestionID.Valid || run.Health != "ok" || run.HealthReason.Valid || run.HealthSince.Valid {
+							t.Fatalf("question/health not reset: %v %q", run.OpenQuestionID, run.Health)
+						}
+						if run.WorkerID.Bytes != worker || run.ClaimGeneration != 3 || run.ClaimReleasedAt.Valid {
+							t.Fatal("the hold keeps the worker and the live claim")
+						}
+					})
+				}
 			}
 		}
+
 	}
 
 	refused := map[string]func() uuid.UUID{
@@ -150,7 +153,6 @@ func TestSetRunPhaseSwitchHoldStatementLiveDB(t *testing.T) {
 		"released claim":   func() uuid.UUID { return seed(wpRun{}, "claim_released_at = now()") },
 		"awaiting_input":   func() uuid.UUID { return seed(wpRun{status: "awaiting_input"}, "") },
 		"queued":           func() uuid.UUID { return seed(wpRun{status: "queued"}, "") },
-		"codex harness":    func() uuid.UUID { return seed(wpRun{harness: "codex"}, "") },
 		// Kind is the setter's allowlist: a chat or cross_check run is never parked into this hold.
 		"chat kind": func() uuid.UUID {
 			return seed(wpRun{}, "kind = 'chat', repo_id = NULL, issue_iid = NULL, branch = NULL")

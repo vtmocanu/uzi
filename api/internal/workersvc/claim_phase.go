@@ -31,14 +31,15 @@ type ClaimPhaseSettings struct {
 // a frozen run value (a run_override or schedule_pin model, a run_override effort) wins in both
 // phases, so the plan value is the implement value; otherwise a set planning value applies to the
 // plan phase; otherwise the plan value equals the implement value. A planning model that is a
-// Codex role id, or a planning effort outside agenttmpl.EffortLevels (the preference-only `runtime`
-// token, junk), is treated as unset (the same guards the Claude lane has). The planning model is
+// known foreign-harness token (or an invalid Codex model), or a planning effort outside
+// agenttmpl.EffortLevels (the preference-only `runtime`
+// token, junk), is treated as unset. Safe custom Codex model IDs are accepted. The planning model is
 // always shipped when selected, even when the implement side has no default_model.
 //
-// It returns nil when the harness is not Claude, the run override is unhonorable, or no plan
+// It returns nil when the harness is unknown, the run override is unhonorable, or no plan
 // value came from the planning lane.
 func resolvePlanPhase(in LeadSettingsInput, implement LeadSettings) *ClaimPhaseSettings {
-	if in.Harness != HarnessClaude || implement.Unhonorable != nil {
+	if (in.Harness != HarnessClaude && in.Harness != HarnessCodex) || implement.Unhonorable != nil {
 		return nil
 	}
 	plan := &ClaimPhaseSettings{}
@@ -46,8 +47,13 @@ func resolvePlanPhase(in LeadSettingsInput, implement LeadSettings) *ClaimPhaseS
 
 	frozenModel := implement.ModelSource == leadcfg.ModelSourceRunOverride || implement.ModelSource == leadcfg.ModelSourceSchedulePin
 	planModel := strings.TrimSpace(in.PlanningModel.String)
+	validModel := !agenttmpl.CodexRoleModels[planModel]
+	if in.Harness == HarnessCodex {
+		m, err := agenttmpl.ValidateModel(planModel)
+		validModel = err == nil && m != "" && !agenttmpl.KnownClaudeAliases[m]
+	}
 	switch {
-	case !frozenModel && in.PlanningModel.Valid && planModel != "" && !agenttmpl.CodexRoleModels[planModel]:
+	case !frozenModel && in.PlanningModel.Valid && planModel != "" && validModel:
 		plan.Model = &planModel
 		plan.ModelSource = string(leadcfg.ModelSourceUserPlanningDefault)
 		fromPlanning = true

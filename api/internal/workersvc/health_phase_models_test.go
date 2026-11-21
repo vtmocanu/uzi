@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -47,15 +48,19 @@ func TestHealthPhaseModelsCrossCheckSameWorker(t *testing.T) {
 	}
 }
 
-// phaseHealthStore answers CountOnlineWorkersSatisfyingPhaseModels from a canned count.
+// phaseHealthStore captures the phase/custom count inputs; unrelated Codex rungs default to available.
 type phaseHealthStore struct {
 	*healthFakeStore
-	count int64
-	calls int
+	count        int64
+	calls        int
+	phaseParams  []store.CountOnlineWorkersSatisfyingPhaseModelsParams
+	customParams []store.CountOnlineWorkersSatisfyingCustomCodexParams
+	customCount  *int64
 }
 
-func (f *phaseHealthStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, uuid.UUID) (int64, error) {
+func (f *phaseHealthStore) CountOnlineWorkersSatisfyingPhaseModels(_ context.Context, arg store.CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error) {
 	f.calls++
+	f.phaseParams = append(f.phaseParams, arg)
 	return f.count, nil
 }
 
@@ -95,5 +100,160 @@ func TestHealthQueuedReasonNoPhaseModelsCapableWorker(t *testing.T) {
 	}
 	if reasonNoPhaseModelsCapableWorker != "no worker supporting separate planning settings is online" {
 		t.Fatalf("reason text drifted: %q", reasonNoPhaseModelsCapableWorker)
+	}
+}
+
+func (f *phaseHealthStore) CountOnlineWorkersSatisfyingCodexHarness(context.Context, uuid.UUID) (int64, error) {
+	return 1, nil
+}
+
+func (f *phaseHealthStore) CountOnlineWorkersSatisfyingCodexRuntime(context.Context, uuid.UUID) (int64, error) {
+	return 1, nil
+}
+
+func (f *phaseHealthStore) CountOnlineWorkersSatisfyingCustomCodex(_ context.Context, arg store.CountOnlineWorkersSatisfyingCustomCodexParams) (int64, error) {
+	f.customParams = append(f.customParams, arg)
+	if f.customCount != nil {
+		return *f.customCount, nil
+	}
+	return 1, nil
+}
+
+func TestHealthCodexPlanningCountParameters(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		custom                  bool
+		phaseCount, customCount int64
+		want                    string
+	}{
+		{"phase unavailable", false, 0, 1, reasonNoPhaseModelsCapableWorker},
+		{"phase available", false, 1, 1, reasonWaitingWorker},
+		{"custom and phase combined unavailable", true, 1, 0, reasonNoCustomCodexCapableWorker},
+		{"custom and phase combined available", true, 1, 1, reasonWaitingWorker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.Kind, r.Harness = "issue", "codex"
+			r.StatusSince = ago(15 * time.Minute)
+			r.PhaseModelsRequired, r.CodexCustomRoot = true, tc.custom
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1, freeSlotWorkers: 1}
+			q := &phaseHealthStore{healthFakeStore: fs, count: tc.phaseCount, customCount: &tc.customCount}
+			svc := healthSvc(fs, defaultHealthSettings())
+			svc.q = q
+			svc.detectRunHealth(context.Background(), t0)
+			got := lastWrite(t, fs, r.ID)
+			if got.Health != healthWaitingWorker || got.HealthReason.String != tc.want {
+				t.Fatalf("health=%s reason=%q want %q", got.Health, got.HealthReason.String, tc.want)
+			}
+			if tc.custom {
+				if len(q.customParams) != 1 || q.customParams[0].UserID != r.UserID || !q.customParams[0].PhaseModelsRequired {
+					t.Fatalf("custom count params=%v, want owner with PhaseModelsRequired=true", q.customParams)
+				}
+			} else if len(q.customParams) != 0 {
+				t.Fatalf("non-custom run issued custom count: %v", q.customParams)
+			}
+			if tc.custom && tc.customCount == 0 {
+				if q.calls != 0 {
+					t.Fatalf("custom failure should short circuit phase rung: calls=%d", q.calls)
+				}
+			} else if len(q.phaseParams) != 1 || q.phaseParams[0].Harness != "codex" || q.phaseParams[0].UserID != r.UserID {
+				t.Fatalf("phase params=%v, want owner with Harness=codex", q.phaseParams)
+			}
+		})
+	}
+	if reasonNoCustomCodexCapableWorker != "no worker supporting custom Codex models is online" {
+		t.Fatalf("custom reason text drifted: %q", reasonNoCustomCodexCapableWorker)
+	}
+}
+
+func TestHealthCodexPlanningCrossCheckSameWorker(t *testing.T) {
+	worker := func(caps ...string) store.ListWorkersByUserRow {
+		return store.ListWorkersByUserRow{Status: "online", ProtocolCapabilities: codexPlanningCaps(caps...)}
+	}
+	all := worker(capability.CrossCheckV1, capability.CodexPhaseModelsV1, capability.CodexCustomModelV1)
+	for _, tc := range []struct {
+		name    string
+		custom  bool
+		workers []store.ListWorkersByUserRow
+		want    string
+	}{
+		{"Codex phase accepted", false, []store.ListWorkersByUserRow{worker(capability.CrossCheckV1, capability.CodexPhaseModelsV1)}, reasonWaitingWorker},
+		{"Claude phase rejected", false, []store.ListWorkersByUserRow{worker(capability.CrossCheckV1, capability.ClaudePhaseModelsV1)}, reasonNoCrossCheckCapableWorker},
+		{"phase cross-check split", false, []store.ListWorkersByUserRow{worker(capability.CrossCheckV1), worker(capability.CodexPhaseModelsV1)}, reasonNoCrossCheckCapableWorker},
+		{"three way split", true, []store.ListWorkersByUserRow{worker(capability.CrossCheckV1), worker(capability.CodexPhaseModelsV1), worker(capability.CodexCustomModelV1)}, reasonNoCrossCheckCapableWorker},
+		{"custom phase together without cross-check", true, []store.ListWorkersByUserRow{worker(capability.CodexPhaseModelsV1, capability.CodexCustomModelV1), worker(capability.CrossCheckV1)}, reasonNoCrossCheckCapableWorker},
+		{"cross-check custom with Claude phase", true, []store.ListWorkersByUserRow{worker(capability.CrossCheckV1, capability.CodexCustomModelV1, capability.ClaudePhaseModelsV1)}, reasonNoCrossCheckCapableWorker},
+		{"all on one worker", true, []store.ListWorkersByUserRow{all}, reasonWaitingWorker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.Kind, r.Harness = "issue", "codex"
+			r.StatusSince = ago(15 * time.Minute)
+			r.PhaseModelsRequired, r.CodexCustomRoot = true, tc.custom
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1, freeSlotWorkers: 1,
+				crossCheckRun:     store.Run{ID: r.ID, Kind: "issue", Harness: "codex", PlanCrossCheckRequired: true},
+				crossCheckWorkers: tc.workers}
+			// Both count rungs succeed, forcing the detector to inspect each worker.
+			q := &phaseHealthStore{healthFakeStore: fs, count: 1}
+			svc := healthSvc(fs, defaultHealthSettings())
+			svc.q = q
+			svc.detectRunHealth(context.Background(), t0)
+
+			got := lastWrite(t, fs, r.ID)
+			if got.HealthReason.String != tc.want {
+				t.Fatalf("reason=%q want %q", got.HealthReason.String, tc.want)
+			}
+			if len(fs.crossCheckWorkerCalls) != 1 {
+				t.Fatalf("worker fleet reads=%v, want one", fs.crossCheckWorkerCalls)
+			}
+		})
+	}
+}
+
+func TestHealthCodexPlanningDockerProbeSameWorker(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		workers    [][]string
+		wantDocker bool
+	}{
+		{"Codex phase", [][]string{{capability.CrossCheckV1, capability.CodexPhaseModelsV1, capability.CodexCustomModelV1}}, true},
+		{"Claude phase", [][]string{{capability.CrossCheckV1, capability.ClaudePhaseModelsV1, capability.CodexCustomModelV1}}, false},
+		{"split fleet", [][]string{{capability.CrossCheckV1}, {capability.CodexPhaseModelsV1}, {capability.CodexCustomModelV1}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runRow("queued")
+			r.Kind, r.Harness = "issue", "codex"
+			r.StatusSince = ago(time.Minute) // young enough to use the gated Docker probe
+			r.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			r.PhaseModelsRequired, r.CodexCustomRoot = true, true
+			workers := make([]store.ListWorkersByUserRow, 0, len(tc.workers))
+			for _, caps := range tc.workers {
+				workers = append(workers, store.ListWorkersByUserRow{Status: "online", ProtocolCapabilities: codexPlanningCaps(caps...)})
+			}
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1,
+				crossCheckRun:     store.Run{ID: r.ID, Kind: "issue", Harness: "codex", PlanCrossCheckRequired: true},
+				crossCheckWorkers: workers}
+			q := &phaseHealthStore{healthFakeStore: fs, count: 1}
+			svc := healthSvc(fs, defaultHealthSettings())
+			svc.q = q
+			svc.SetDockerAllowlist(fakeAllowlistReader{})
+			svc.detectRunHealth(context.Background(), t0)
+			if tc.wantDocker {
+				got := lastWrite(t, fs, r.ID)
+				if got.Health != healthWaitingWorker || got.HealthReason.String != reasonRepoNotDockerAllowedMember {
+					t.Fatalf("health=%s reason=%q, want Docker allowlist reason", got.Health, got.HealthReason.String)
+				}
+			} else {
+				for _, got := range fs.writes {
+					if got.ID == r.ID && got.Health != healthOK {
+						t.Fatalf("incapable fleet reached Docker reason: health=%s reason=%q", got.Health, got.HealthReason.String)
+					}
+				}
+			}
+			if len(q.phaseParams) != 1 || q.phaseParams[0].Harness != "codex" ||
+				len(q.customParams) != 1 || !q.customParams[0].PhaseModelsRequired || len(fs.crossCheckWorkerCalls) != 1 {
+				t.Fatalf("probe did not check Codex planning conjunction: phase=%v custom=%v fleet=%v", q.phaseParams, q.customParams, fs.crossCheckWorkerCalls)
+			}
+		})
 	}
 }

@@ -36,6 +36,10 @@ func TestEffectiveSettingsSchedulePinClaimEquivalenceLiveDB(t *testing.T) {
 			leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "user_default", claimModel: "gpt-6-sol", claimSource: "user_default", effort: "medium", effortSource: "builtin"}, true},
 		{"codex pin on codex", &codex, "gpt-6-astra", true,
 			leadWant{harness: HarnessCodex, model: "gpt-6-astra", modelSource: "schedule_pin", claimModel: "gpt-6-astra", claimSource: "schedule_pin", effort: "medium", effortSource: "builtin"}, false},
+
+		{"codex pin with a planning pair", &codex, "gpt-6-astra", false,
+			leadWant{harness: HarnessCodex, model: "gpt-6-astra", modelSource: "schedule_pin", claimModel: "gpt-6-astra", claimSource: "schedule_pin", effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Model: strp("gpt-6-astra"), Effort: strp("high"), ModelSource: "schedule_pin", EffortSource: "user_planning_default"}}, false},
 		{"codex role pin on claude is ignored", &claude, "gpt-6-luna", false,
 			leadWant{harness: HarnessClaude, model: "opus", modelSource: "template", effort: "medium", effortSource: "builtin"}, true},
 	} {
@@ -46,8 +50,13 @@ func TestEffectiveSettingsSchedulePinClaimEquivalenceLiveDB(t *testing.T) {
 			fx.template(effLeadName, "opus", "gpt-6-astra")
 			fx.lane("default_codex_model", "gpt-6-sol")
 			if c.want.plan != nil {
-				fx.lane("planning_claude_model", "opus")
-				fx.lane("planning_claude_effort", "high")
+				if c.want.harness == HarnessCodex {
+					fx.lane("planning_codex_model", "custom-plan")
+					fx.lane("planning_codex_effort", "high")
+				} else {
+					fx.lane("planning_claude_model", "opus")
+					fx.lane("planning_claude_effort", "high")
+				}
 			}
 			fx.iid++
 			seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
