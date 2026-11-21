@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -98,7 +99,7 @@ describe("terminal preservation gate (#4007 slice B, production-dark)", () => {
         assert.equal(coordOf(runner).terminalPreservationEnabled(), false);
         assert.equal(coordOf(withOverride).terminalPreservationEnabled(), true);
       }
-      const coord = new RecoveryCoordinator({
+      const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
         client: new FakeRecoveryClient(),
         git: new FakeRecoveryGit(),
         log: nullLogger(),
@@ -106,7 +107,7 @@ describe("terminal preservation gate (#4007 slice B, production-dark)", () => {
         workerToken: "gate-test-worker-join-token-0123456789",
       });
       assert.equal(coord.terminalPreservationEnabled(), false);
-      const on = new RecoveryCoordinator({
+      const on = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
         client: new FakeRecoveryClient(),
         git: new FakeRecoveryGit(),
         log: nullLogger(),

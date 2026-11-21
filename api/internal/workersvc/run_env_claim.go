@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runenv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -58,10 +59,14 @@ type runEnvSnapshot struct {
 // gate predicate holds on a worker without run_env_v1, and errRunEnvHistoryUnavailable (park)
 // when a receipted version is missing, swapped or cannot be opened.
 func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.Run, payload *ClaimPayload) error {
-	if !RunEnvDelivered(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+	governing, leadLane := runEnvGoverningRun(run)
+	if governing == uuid.Nil {
 		return nil
 	}
 	capable := slices.Contains(wkr.ProtocolCapabilities, capability.RunEnvV1)
+	if !leadLane {
+		return s.attachCrossCheckRedact(ctx, run, governing, capable, payload)
+	}
 	eff, err := s.q.ListRunEnvEffectiveForRun(ctx, run.ID)
 	if err != nil {
 		return fmt.Errorf("run env effective: %w", err)
@@ -132,6 +137,62 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 	return nil
 }
 
+// runEnvGoverningRun answers which run's receipts govern what this run's output must mask: a
+// lead-lane run is governed by itself (leadLane true), a cross-check child by the lead it checks
+// (its target_run_id), and every other run by none (uuid.Nil). A cross-check child is never given
+// run_env and writes no receipts of its own: its checker reads the lead's code and output, so it
+// must mask what the lead was given without being given a value itself.
+func runEnvGoverningRun(run store.Run) (governing uuid.UUID, leadLane bool) {
+	switch {
+	case RunEnvDelivered(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid):
+		return run.ID, true
+	case run.Kind == runkind.CrossCheck && run.TargetRunID.Valid:
+		return uuid.UUID(run.TargetRunID.Bytes), false
+	}
+	return uuid.Nil, false
+}
+
+// errCheckerRunEnvUnavailable ends a cross-check child as checker_unavailable (a non-pass that
+// forces a human gate) when the lead's secret history cannot be masked in the checker's output:
+// the claiming worker lacks run_env_v1, or a receipted version is missing or cannot be opened.
+// It wraps errCheckerPinUnavailable so the claim finish decides the check lead-first; it
+// deliberately does not wrap errRunEnvHistoryUnavailable, which would park the child instead.
+var errCheckerRunEnvUnavailable = fmt.Errorf("%w: the lead's run environment cannot be masked", errCheckerPinUnavailable)
+
+// attachCrossCheckRedact fills payload.Secrets.RunEnvRedact for a cross-check child with every
+// secret version the target (lead) run holds a receipt for, and nothing else: never run_env, and
+// no snapshot, so the finish records no receipts for the child. A locked vault is the claim
+// lane's transient requeue (errVaultLocked).
+func (s *Service) attachCrossCheckRedact(ctx context.Context, run store.Run, target uuid.UUID, capable bool, payload *ClaimPayload) error {
+	rows, err := s.q.ListRunEnvSecretReceiptVersionsForRun(ctx, target)
+	if err != nil {
+		return fmt.Errorf("run env redact receipts: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	if !capable {
+		return errCheckerRunEnvUnavailable
+	}
+	for _, row := range rows {
+		plain, err := s.openRunEnvRedact(run.UserID, runEnvRedactRow{
+			VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
+			SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
+			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName,
+		})
+		switch {
+		case errors.Is(err, errVaultLocked):
+			return err
+		case err != nil:
+			return errCheckerRunEnvUnavailable
+		}
+		payload.Secrets.RunEnvRedact = append(payload.Secrets.RunEnvRedact, ClaimRunEnvRedact{
+			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
+		})
+	}
+	return nil
+}
+
 // runEnvRedactRow is a receipt with the owner's stored row, as both redact reads return it.
 // The row columns are NULL (invalid) when no row of the run's owner holds the version.
 type runEnvRedactRow struct {
@@ -186,33 +247,41 @@ var (
 	ErrRunEnvHistoryUnavailable = errors.New("run environment redact: history unavailable")
 )
 
-type runEnvRedactReader interface {
-	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
-	ListRunEnvSecretReceiptVersionsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvSecretReceiptVersionsForRunRow, error)
-}
-
 // RunEnvRedact answers the redact maintenance route (PRD #4416 M2): every secret version the
-// run was ever delivered, opened for the run's owner, so a worker can mask the run's output
+// governing run (runEnvGoverningRun: the run itself in the lead lane, the lead for a cross-check
+// child) was ever delivered, opened for the run's owner, so a worker can mask the run's output
 // after the claim that delivered them. Protected is false, with no versions, when the run has no
-// secret receipt. The run must be the worker's user's and one this worker holds or last held
-// (runs.worker_id); anything else is ErrRunNotOwned. The result carries plaintext secrets: the
-// caller must never log or cache it.
+// governing run or the governing run has no secret receipt. The run must be the worker's user's
+// and one this worker holds or last held (runs.worker_id), or one whose open recovery custody
+// hold this worker took (the worker recovering a run another claim has since moved); anything
+// else is ErrRunNotOwned. The route is read-only, so there is no generation or repo check. The
+// result carries plaintext secrets: the caller must never log or cache it.
 func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid.UUID) (RunEnvRedactResponse, error) {
-	rr, ok := s.q.(runEnvRedactReader)
-	if !ok {
-		return RunEnvRedactResponse{}, errors.New("run env redact: queries are not wired")
-	}
-	run, err := rr.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RunEnvRedactResponse{}, ErrRunNotOwned
 	}
 	if err != nil {
 		return RunEnvRedactResponse{}, fmt.Errorf("run env redact run: %w", err)
 	}
-	if run.WorkerID != pgconv.UUID(wkr.ID) || !RunEnvDelivered(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		return RunEnvRedactResponse{}, ErrRunNotOwned
+	if run.WorkerID != pgconv.UUID(wkr.ID) {
+		// An open custody hold the worker took on this run also authorizes it; an
+		// inventory-guarded hold additionally requires the worker still to be its live holder.
+		held, err := s.q.WorkerHoldsOpenCustodyForRun(ctx, store.WorkerHoldsOpenCustodyForRunParams{
+			RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID,
+		})
+		if err != nil {
+			return RunEnvRedactResponse{}, fmt.Errorf("run env redact custody: %w", err)
+		}
+		if !held {
+			return RunEnvRedactResponse{}, ErrRunNotOwned
+		}
 	}
-	rows, err := rr.ListRunEnvSecretReceiptVersionsForRun(ctx, runID)
+	governing, _ := runEnvGoverningRun(run)
+	if governing == uuid.Nil {
+		return RunEnvRedactResponse{Protected: false}, nil
+	}
+	rows, err := s.q.ListRunEnvSecretReceiptVersionsForRun(ctx, governing)
 	if err != nil {
 		return RunEnvRedactResponse{}, fmt.Errorf("run env redact receipts: %w", err)
 	}

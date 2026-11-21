@@ -269,7 +269,7 @@ export function RepoEnvPanel({
         <p>
           The agent can read every value, secret or not. uzi only sets these variables in the run&rsquo;s environment; any login
           or tool configuration is done by the agent or the repo&rsquo;s scripts. Variables are set in the environment of every
-          command a run executes. Secret values are redacted from run output and checked before anything is pushed.
+          command the repo&rsquo;s agent runs execute (not review or isolated runs). Secret values are redacted from run output and checked before anything is pushed.
         </p>
         <p>Disabling or deleting a variable does not revoke the credential; revoke it at the provider.</p>
       </div>
@@ -280,18 +280,23 @@ export function RepoEnvPanel({
       )}
       {notice && <Alert tone="success" message={notice} />}
       {rowError && <Alert message={rowError} />}
-      {heldByRuns && heldByRuns.length > 0 && (
+      {heldByRuns && (
         <div className="space-y-1 text-xs text-muted">
-          <p>These runs keep retired secret versions sealed. Finish or cancel them, then try again:</p>
-          <ul className="flex flex-wrap gap-x-3 gap-y-1">
-            {heldByRuns.map((id) => (
-              <li key={id}>
-                <Link to={`/runs/${encodeURIComponent(id)}`} className="font-mono underline">
-                  {id}
-                </Link>
-              </li>
-            ))}
-          </ul>
+          <p>
+            Retired secret versions are kept until the runs holding them end and their retained work is released (up to 24 hours after
+            a run ends). Until then you can still Disable or Delete a variable.
+          </p>
+          {heldByRuns.length > 0 ? (
+            <ul className="flex flex-wrap gap-x-3 gap-y-1">
+              {heldByRuns.map((id) => (
+                <li key={id}>
+                  <Link to={`/runs/${encodeURIComponent(id)}`} className="font-mono underline">
+                    {id}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          ) : null}
         </div>
       )}
 

@@ -121,9 +121,9 @@ func TestHoldRowRunEnvHistoryUnavailable(t *testing.T) {
 
 func TestRenderRunDetailInjectedEnv(t *testing.T) {
 	r := apitypes.RunDTO{ID: "run-1", Kind: "issue", Status: "completed", Health: "ok",
-		InjectedEnv: []apitypes.InjectedEnvVarDTO{{Name: "API_URL", Scope: "repo"}, {Name: "TOKEN\x1b[31m", Scope: "global", Secret: true}}}
+		InjectedEnv: []apitypes.InjectedEnvVarDTO{{Name: "API_URL", Scope: "repo"}, {Name: "TOKEN\x1b[31m", Scope: "user", Secret: true}}}
 	out := renderDetail(t, r)
-	if !strings.Contains(out, "INJECTED_ENV") || !strings.Contains(out, "API_URL (repo)") || !strings.Contains(out, "(global, secret)") {
+	if !strings.Contains(out, "INJECTED_ENV") || !strings.Contains(out, "API_URL (repo)") || !strings.Contains(out, "(user, secret)") {
 		t.Errorf("INJECTED_ENV row missing or wrong:\n%s", out)
 	}
 	if strings.Contains(out, "\x1b") {

@@ -195,6 +195,11 @@ describe("run-env redact response rules", () => {
     assert.throws(() => decodeRunEnvRedactResponse({ protected: false, versions: [redact(1, "longenough")] }), /empty when protected is false/);
   });
 
+  it("protected:true with no versions fails closed", () => {
+    assert.throws(() => decodeRunEnvRedactResponse({ protected: true }), /non-empty when protected is true/);
+    assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: [] }), /non-empty when protected is true/);
+  });
+
   it("applies the per-entry rules", () => {
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: [redact(1, "short")] }), /at least 8 characters/);
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: [redact(1, "longenough"), redact(1, "longenough")] }), /duplicate/);

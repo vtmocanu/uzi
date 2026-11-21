@@ -10,7 +10,7 @@ export function InjectedEnvSection({ vars }: { vars: RunInjectedEnvVar[] | undef
   return (
     <section aria-label="Variables injected" className="rounded-xl border border-edge bg-surface p-4">
       <h2 className="mb-2 text-sm font-semibold text-fg">Variables injected</h2>
-      <p className="mb-2 text-xs text-muted">Set in the environment of every command this run executed. Values are never shown here.</p>
+      <p className="mb-2 text-xs text-muted">Set for this run&rsquo;s current attempt. Values are never shown here.</p>
       <ul className="space-y-1 text-xs">
         {vars.map(v => (
           <li key={`${v.scope}:${v.name}`} className="flex flex-wrap items-center gap-2">

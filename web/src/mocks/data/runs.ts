@@ -1037,7 +1037,7 @@ export const mockRuns: Run[] = [
     // PRD #4416 M2: the variables its claim delivered (names, scope and the secret flag; never a value).
     injected_env: [
       { name: "DATABASE_URL", scope: "repo", secret: true },
-      { name: "LOG_LEVEL", scope: "global", secret: false },
+      { name: "LOG_LEVEL", scope: "user", secret: false },
     ],
     repo_id: "repo-uzi",
     issue_iid: 18,
