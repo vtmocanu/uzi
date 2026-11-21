@@ -70,8 +70,14 @@ func TestCreateIssueReadBackMustBeTheCreatedIssueInTheBoundProject(t *testing.T)
 				}
 				writeRaw(w, readBack)
 			})
-			if _, err := y.CreateIssue(context.Background(), 1, "t", "d", nil); err == nil {
+			_, err := y.CreateIssue(context.Background(), 1, "t", "d", nil)
+			if err == nil {
 				t.Fatal("CreateIssue returned an issue that failed the read-back check")
+			}
+			// Only an issue outside the bound project reads as gone; another id
+			// is a protocol anomaly of an issue that exists.
+			if got := isNotFound(err); got != (name == "other project") {
+				t.Errorf("isNotFound = %v for %v", got, err)
 			}
 		})
 	}

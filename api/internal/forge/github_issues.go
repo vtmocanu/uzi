@@ -134,6 +134,11 @@ func (g *github) UpdateIssueDescription(ctx context.Context, projectID, issueIID
 	return nil
 }
 
+// MoveToColumn moves the issue to a board column through its labels.
+func (g *github) MoveToColumn(ctx context.Context, projectID, issueIID int64, move ColumnMove) error {
+	return MoveByLabels(ctx, g, projectID, issueIID, move)
+}
+
 // SetIssueState closes or reopens an issue. go-github's UpdateIssueRequest
 // leaves Title/Body nil (unchanged) and Labels/Assignees omitzero (unchanged)
 // when only State and StateReason are set, so this sends the state ALONE and

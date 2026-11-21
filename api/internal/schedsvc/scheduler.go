@@ -899,15 +899,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 				for i := range res.Started {
 					res.Started[i].SelectorLabel = selectorLabel
 				}
-				uziLabel := settings.DefaultUziLabel
-				var removeErr error
-				if e.settings != nil {
-					var live string
-					live, removeErr = e.settings.UziLabel(ctx)
-					if strings.TrimSpace(live) != "" {
-						uziLabel = live
-					}
-				}
+				uziLabel, removeErr := e.dispatchEligibilityLabel(ctx, repo)
 				if removeErr != nil || selectorLabel != uziLabel {
 					if removeErr == nil {
 						var cached store.Issue
@@ -1372,6 +1364,26 @@ func (e *Scheduler) resolveSweepLabels(stored []byte, defaultLabel string) ([]by
 		return nil, fmt.Errorf("marshal sweep labels: %w", err)
 	}
 	return out, nil
+}
+
+// dispatchEligibilityLabel is the label remove-label-on-dispatch must never remove: the
+// stored eligibility tag name on a repo linked to an issue tracker (PRD #4173 D14), so a
+// selector equal to it is kept; the live configured uzi label otherwise, falling back to
+// settings.DefaultUziLabel when it is blank. A failed settings read is returned alongside
+// the label, as before, so the caller records the removal as failed.
+func (e *Scheduler) dispatchEligibilityLabel(ctx context.Context, repo store.GetRepoForUserRow) (string, error) {
+	if repo.IssueTrackerConnectionID.Valid {
+		return e.eligibilityLabel(ctx, repo)
+	}
+	uziLabel := settings.DefaultUziLabel
+	if e.settings == nil {
+		return uziLabel, nil
+	}
+	live, err := e.settings.UziLabel(ctx)
+	if strings.TrimSpace(live) != "" {
+		uziLabel = live
+	}
+	return uziLabel, err
 }
 
 // eligibilityLabel is the label a sweep treats as run eligibility for repo: the link's

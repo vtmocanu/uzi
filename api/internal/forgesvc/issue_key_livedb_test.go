@@ -134,21 +134,21 @@ func TestLinkedSyncWritesOnlyChangedRowsLiveDB(t *testing.T) {
 	}
 	is := issueAt(5, recordedMarkBase)
 	is.Title = "first"
-	if err := svc.upsertIssues(ctx, repoID, []forge.Issue{is}, "ABC"); err != nil {
+	if err := svc.upsertIssues(ctx, repoID, []forge.Issue{is}, "ABC", nil); err != nil {
 		t.Fatal(err)
 	}
 	title, key, first := read()
 	if title != "first" || key != "ABC-5" {
 		t.Fatalf("inserted row = %q, %q; want first, ABC-5", title, key)
 	}
-	if err := svc.upsertIssues(ctx, repoID, []forge.Issue{is}, "ABC"); err != nil {
+	if err := svc.upsertIssues(ctx, repoID, []forge.Issue{is}, "ABC", nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, again := read(); !again.Equal(first) {
 		t.Fatalf("synced_at moved from %v to %v on an unchanged linked sync", first, again)
 	}
 	is.Title = "second"
-	if err := svc.upsertIssues(ctx, repoID, []forge.Issue{is}, "ABC"); err != nil {
+	if err := svc.upsertIssues(ctx, repoID, []forge.Issue{is}, "ABC", nil); err != nil {
 		t.Fatal(err)
 	}
 	if title, _, changed := read(); title != "second" || !changed.After(first) {

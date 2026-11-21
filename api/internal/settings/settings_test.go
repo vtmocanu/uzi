@@ -90,6 +90,41 @@ func TestFindingLabelAccessor(t *testing.T) {
 	}
 }
 
+// switchingStore serves a different, internally consistent set of rows on every read.
+type switchingStore struct {
+	reads int
+	sets  [][]store.AppSetting
+}
+
+func (s *switchingStore) ListAppSettings(context.Context) ([]store.AppSetting, error) {
+	set := s.sets[min(s.reads, len(s.sets)-1)]
+	s.reads++
+	return set, nil
+}
+
+// TestFilingLabelsReadOneSnapshot pins that the three names come from a single read of the
+// settings: with a zero TTL every read reloads, so three separate accessor calls would mix
+// the marker of one settings with the uzi label of the next (PRD #4173 M5 review).
+func TestFilingLabelsReadOneSnapshot(t *testing.T) {
+	st := &switchingStore{sets: [][]store.AppSetting{
+		{row(KeyFindingLabel, "agent-found"), row(KeyUziLabel, "uzi")},
+		{row(KeyFindingLabel, "reported"), row(KeyUziLabel, "agent-found")},
+	}}
+	got, err := New(st, 0).FilingLabels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := FilingLabels{Finding: "agent-found", Uzi: "uzi", Autopilot: DefaultAutopilotLabel}
+	if got != want || st.reads != 1 {
+		t.Fatalf("FilingLabels = %+v after %d reads, want %+v after 1", got, st.reads, want)
+	}
+	// Empty table: the three defaults.
+	got, err = New(&fakeStore{}, time.Minute).FilingLabels(context.Background())
+	if err != nil || got != (FilingLabels{Finding: DefaultFindingLabel, Uzi: DefaultUziLabel, Autopilot: DefaultAutopilotLabel}) {
+		t.Fatalf("FilingLabels on an empty table = %+v, %v; want the defaults", got, err)
+	}
+}
+
 // TestFindingLabelValidationAndShape pins that finding_label is a KNOWN key that goes
 // through All/defaults and that its write validation is the single-label rule the other
 // label keys use (Validate's default branch → ValidateLabel): non-empty, ≤64 bytes, no comma.

@@ -1,15 +1,15 @@
 # ADR-4173: The issue tracker seam
 
-**Status**: Accepted (PRD #4173, M4 landed; M5–M6 pending)
-**Date**: 2026-11-11 (updated 2026-11-17)
+**Status**: Accepted (PRD #4173, M5 landed; M6 pending)
+**Date**: 2026-11-11 (updated 2026-11-18)
 **Deciders**: the maintainer + agent team
-**PRD**: [prds/4173-external-issue-trackers.md](../prds/4173-external-issue-trackers.md) — the PRD carries the milestones and the Decision Log; this ADR carries the durable shape of what M3 and M4 built and the invariants a later change must keep.
+**PRD**: [prds/4173-external-issue-trackers.md](../prds/4173-external-issue-trackers.md) — the PRD carries the milestones and the Decision Log; this ADR carries the durable shape of what M3 to M5 built and the invariants a later change must keep.
 
 ## Decision (summary)
 
 Issue trackers other than the repo's forge sit behind a `Driver` in their own package, `api/internal/issuetracker`. A driver is `forge.IssueTracker` plus four connection operations. Connections live apart from forge connections (`issuetrackersvc`, table `issue_tracker_connections`) with their own base URL allowlist. The YouTrack driver adapts YouTrack's string ids inside itself, is built for exactly one project, and treats tags as user-owned objects chosen by id. From M4 a repo created after the M4 migration can link to one before its first enable (D13); a repo with no link behaves as before.
 
-Shipped in M4: the repo link and `IssueTrackerForRepo` returning the linked issue tracker, with intake and runs from YouTrack issues. Not shipped yet: issue writes and board moves on YouTrack (M5), the web and CLI settings surfaces, docs and the live pass against a real YouTrack (M6). On a linked repo every issue write is refused with `ErrIssueWriteNotOffered`.
+Shipped in M4: the repo link and `IssueTrackerForRepo` returning the linked issue tracker, with intake and runs from YouTrack issues. Shipped in M5: the board and issue writes on YouTrack. A card move goes through `MoveToColumn` and writes the issue's YouTrack State, through a per-repo column-to-State mapping set with `GET` and `PUT /api/repos/{id}/issue-tracker-link/states` (session-only, no UI); an unmapped column is never guessed (`ErrColumnNotMapped`, a 409 on a board drag). Close and reopen write the stored closed, open or mapped column States, and never land on a won't-fix State: closability is an allowlist of done-style names, checked when the mapping is saved and again against the live bundle before every State write. A column move refuses an issue YouTrack already shows as resolved unless it is the explicit reopen of a closed card (`ColumnMove.Reopen`), so an automatic move or a board drag never reopens an issue a person resolved there. A linked card's board column is read from its State and cached in `issues.issue_tracker_column`. Issues uzi creates on a linked repo are created in the linked project and carry the eligibility tag where the forge path would carry the uzi label. Comments and the PRD link patch reach the issue. The one issue write still refused is removing the eligibility tag (`ErrIssueWriteNotOffered`); `EnsureRepoLabels` is refused with a 409 before any request. Not shipped yet: the web and CLI settings surfaces (the mapping has no UI), docs, the live pass against a real YouTrack, and the issue detail page's column (all M6). There is no close-on-merge: a linked MR body is non-closing, so the issue stays in its column after the merge until a person closes it.
 
 ## Context
 
@@ -59,12 +59,23 @@ Port note (2026-11-17): M4 was rebased onto the final M3. Of the M3 review chang
 - **S3. Credentials follow the forge rules.** Sealed token with AAD and no reveal path, https-only base URL on the separate empty-by-default allowlist re-checked in `DriverFor`, redirects refused, errors redacted. The redirect, oversized-body and token-in-error cases each have a test in `api/internal/issuetracker`.
 - **S4. Issue tracker text is untrusted input.** The driver bounds what it reads (response bytes, listing pages and items, nested items, label name length). YouTrack titles, descriptions and comments go through the same `issueinput` fencing as forge text; an oversized description is refused and an oversized comment by the connection's own account is cut to the same bound as on a forge, while an unmapped author's comment is withheld; M4 tests each.
 - **S5. The worker never holds an issue tracker token.** The allowlist does not feed worker egress, and the token is opened only inside `DriverFor` in the API. The worker read routes go through the API's resolver, so the worker never holds the token.
+- **S6. Every YouTrack State write re-checks the live bundle.** The open state and every column state must be unresolved and not archived, the closed state must pass `issuetracker.ClosableState` (an allowlist on the State's `name` alone, never `localizedName`), and all mapped states must be distinct. All of this runs when the mapping is saved (a 400); before every write the target State is checked again in its role, failing with `ErrStateNotAllowed`; an unmapped column fails with `ErrColumnNotMapped` before any request. Do not turn the allowlist into a denylist.
+- **S7. The eligibility tag is never stripped.** The write guard refuses any label write on a linked repo that removes the link's eligibility name, and remove-label-on-dispatch compares the selector with the eligibility label. Every other issue write is lifted one operation at a time and passes through `markNotFound`, so a moved-away issue stays skippable.
+- **S8. `issues.issue_tracker_column` has three writers.** The linked `UpsertIssueIfChanged`, `SetIssueTrackerColumn` (after a successful move) and `ClearIssueTrackerColumnsNotIn` (a linked `ConfigureColumns`, in the transaction that prunes the mapping). Every reader goes through `board.CardColumnLabels`, keyed on the repo being linked, which leaves an unlinked repo's labels unchanged.
+- **S9. `forge.MoveByLabels` keeps the forge label calls identical.** `EnsureLabels` only when `Ensure` is non-empty, then one `UpdateIssueLabels` with the slices passed through. `forgetest.Recorder` logs `MoveToColumn` in a separate `Moves()` log so the `Calls()` goldens do not change. The YouTrack driver ignores the label fields, because columns are not tags.
+- **S10. A linked run's MR-state moves happen in the board-free MR-watch lane.** It moves cards only on the close and reopen edges and only for the issue's latest issue-lane run; the board lane excludes linked repos so the two stay disjoint.
 
 ## Open questions for M6's live pass
 
 - Whether YouTrack accepts `readSharingSettings` and `tagSharingSettings` in the tag-create body. The fake accepts them; no real server has been asked.
 - Whether an authenticated token receives `usersCount` on a tag's sharing groups (the anonymous recording has none).
 - Whether the id-scoped listing `GET /api/tags/{id}/issues` behaves on a real instance as the fake and YouTrack's documented shape say. The earlier question, whether `tag: {name}` resolves every tag of that name, is settled: intake sends no tag name in a search query (PRD Decision Log 2026-11-12). If the listing proves unusable, the documented fallback walks the whole project and filters by stored id, bounded by the same listing ceilings.
+- Whether the real YouTrack State write (the custom field update on an issue) behaves as the fake and the documented shape say.
+- Whether the bounded `State` custom field read with each issue behaves on a real instance, including the cap that fails a listing when the field list is over it.
+- Whether the done-name allowlist matches real bundles. A done state named only in another language is refused, so a real project may need its State renamed or the list extended.
+- Whether a non-admin token can read `admin/projects/{id}/customFields`, which the live bundle check uses before every State write.
+- The window between the bundle check and the State write (as in D10): a bundle edited inside it can still be landed on.
+- The duplicate-on-retry risk of a create: YouTrack's create has no rollback, so if the POST lands but attaching the tag or the read-back fails, the untagged issue stays in YouTrack and a retry can file a duplicate.
 
 ## Consequences
 

@@ -101,9 +101,11 @@ type activity struct {
 }
 
 type stateValue struct {
-	id, name string
-	resolved bool
-	ordinal  int
+	id, name      string
+	localizedName string
+	resolved      bool
+	archived      bool
+	ordinal       int
 }
 
 type issue struct {
@@ -116,6 +118,7 @@ type issue struct {
 	updated     int64
 	resolved    *int64
 	reporter    string
+	stateID     string   // id of the issue's State value; empty reads as the first state
 	tags        []string // tag ids, oldest first
 	comments    []*comment
 	activities  []*activity
@@ -303,6 +306,15 @@ func (m *model) removeTag(i *issue, t *tag, author string) {
 	i.activities = append(i.activities, &activity{id: m.nextID(3), category: catTags, timestamp: ts, author: author, removed: []string{t.id}})
 }
 
+func (m *model) stateByID(id string) *stateValue {
+	for k := range m.states {
+		if m.states[k].id == id {
+			return &m.states[k]
+		}
+	}
+	return nil
+}
+
 func (m *model) stateByName(name string) *stateValue {
 	for k := range m.states {
 		if m.states[k].name == name {
@@ -326,6 +338,7 @@ func (m *model) issueJSON(i *issue) map[string]any {
 		resolved = *i.resolved
 	}
 	return map[string]any{
+		"customFields":    m.customFieldsJSON(i),
 		"$type":           "Issue",
 		"id":              i.id,
 		"idReadable":      i.readable(),
@@ -339,6 +352,29 @@ func (m *model) issueJSON(i *issue) map[string]any {
 		"tags":            tags,
 		"project":         map[string]any{"id": i.project.id, "shortName": i.project.shortName, "$type": "Project"},
 	}
+}
+
+// customFieldsJSON is the issue's custom fields: its State, under the current
+// name of the State field and of the State value, as YouTrack lists it.
+func (m *model) customFieldsJSON(i *issue) []map[string]any {
+	v := m.stateByID(i.stateID)
+	if v == nil && i.resolved != nil {
+		// A resolved issue with no recorded State value reads as the first
+		// resolved one, so it never reads as open.
+		for k := range m.states {
+			if m.states[k].resolved && !m.states[k].archived {
+				v = &m.states[k]
+				break
+			}
+		}
+	} else if v == nil && len(m.states) > 0 {
+		v = &m.states[0]
+	}
+	var value any
+	if v != nil {
+		value = map[string]any{"$type": "StateBundleElement", "name": v.name}
+	}
+	return []map[string]any{{"$type": "StateIssueCustomField", "name": m.stateField, "value": value}}
 }
 
 // userJSON is the wire user for a login. A login the fake does not know is

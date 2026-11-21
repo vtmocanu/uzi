@@ -67,7 +67,8 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	// best-effort — a cold settings read yields the compiled-in default ("uzi"),
 	// never an empty label.
 	uziLabel, _ := h.settings.UziLabel(r.Context())
-	created, err := tr.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{uziLabel})
+	// On a linked repo the label is the link's stored eligibility name (PRD #4173 D14).
+	created, err := tr.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, h.createLabelsFor(r.Context(), repo, []string{uziLabel}))
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		if writeIssueWriteNotOffered(w, err) {
@@ -132,7 +133,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)})
 }
 
 // issueDetailDTO is the in-app issue view payload (PRD #12 §3): the board card

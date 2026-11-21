@@ -160,7 +160,7 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, labels)
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, h.createLabelsFor(ctx, repo, labels))
 	if err != nil {
 		// Forge rejected the write (mock state E): the claim reverts, nothing is
 		// persisted, the draft stays open. err is already PAT-redacted by the driver.

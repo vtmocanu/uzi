@@ -27,7 +27,6 @@ type findingSendCase struct {
 	storeErr       error
 	ensureFail     bool
 	wantStatus     int
-	groupStatus    int
 	filed, ensured []string
 }
 
@@ -72,10 +71,12 @@ func findingSendCases() []findingSendCase {
 		{name: "sanitization and cap", body: `{"send_to_uzi":true,"labels":` + string(labels) + "}",
 			filed: append(slices.Clone(capped), "uzi", "autopilot"), ensured: defaults},
 		{name: "ensure failure", body: `{"send_to_uzi":true}`, ensureFail: true, wantStatus: http.StatusBadGateway, ensured: []string{marker}},
+		// A settings read that fails refuses the filing on both routes before any write
+		// (PRD #4173 M5 review): the default names cannot stand in for the saved ones.
 		{name: "cold settings error", body: `{"send_to_uzi":true}`, storeErr: errors.New("settings unavailable"),
-			groupStatus: http.StatusInternalServerError, filed: defaults, ensured: defaults},
+			wantStatus: http.StatusInternalServerError},
 		{name: "false cold settings error", body: `{"send_to_uzi":false}`, storeErr: errors.New("settings unavailable"),
-			groupStatus: http.StatusInternalServerError, filed: []string{marker}, ensured: []string{marker}},
+			wantStatus: http.StatusInternalServerError},
 	}
 }
 
@@ -106,9 +107,9 @@ func TestFileFindingSendToUziLiveDB(t *testing.T) {
 			if !slices.Equal(ensured, tc.ensured) {
 				t.Errorf("ensured=%v want=%v", ensured, tc.ensured)
 			}
-			if tc.ensureFail {
+			if tc.ensureFail || tc.storeErr != nil {
 				if len(creates) != 0 {
-					t.Fatal("ensure failure reached CreateIssue")
+					t.Fatal("a refused filing reached CreateIssue")
 				}
 				if status, _ := dispositionStatus(context.Background(), t, pool, f.owner.ID, f.repoID, f.location); status != "open" {
 					t.Fatalf("claim not reverted: %s", status)
@@ -152,9 +153,6 @@ func TestFileFindingGroupSendToUziLiveDB(t *testing.T) {
 			if want == 0 {
 				want = http.StatusCreated
 			}
-			if tc.groupStatus != 0 {
-				want = tc.groupStatus
-			}
 			if rr.Code != want {
 				t.Fatalf("status=%d want=%d body=%s", rr.Code, want, rr.Body.String())
 			}
@@ -165,9 +163,6 @@ func TestFileFindingGroupSendToUziLiveDB(t *testing.T) {
 			wantEnsured := tc.ensured
 			if tc.ensureFail {
 				wantEnsured = []string{findingTestMarker, "uzi", "autopilot"}
-			}
-			if tc.groupStatus != 0 {
-				wantEnsured = nil
 			}
 			if !slices.Equal(ensured, wantEnsured) {
 				t.Errorf("ensured=%v want=%v", ensured, wantEnsured)

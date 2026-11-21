@@ -492,3 +492,103 @@ func TestRealShapedActivityIsAccepted(t *testing.T) {
 		t.Fatalf("decoded %d activities, want 3 with %d tags each way", len(got), maxNestedItems)
 	}
 }
+
+// TestCustomFieldBombAllocatesLittle: an issue whose "customFields" array holds
+// as many empty objects as the object cap allows is refused by the byte scan
+// before any element is decoded.
+func TestCustomFieldBombAllocatesLittle(t *testing.T) {
+	prefix := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `}`) + `,"customFields":`
+	n := int(objectBytes-int64(len(prefix))-8) / 3
+	body := []byte(prefix + emptyObjects(n) + "}")
+	if int64(len(body)) > objectBytes {
+		t.Fatalf("fixture is %d bytes, over the object cap", len(body))
+	}
+	y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) })
+	var err error
+	got := totalAlloc(func() { _, err = y.GetIssue(context.Background(), 1, 1) })
+	if err == nil {
+		t.Fatal("GetIssue accepted a custom field bomb")
+	}
+	if got > allocBound {
+		t.Errorf("allocated %d MiB for a %d MiB issue, want under %d MiB", got>>20, len(body)>>20, allocBound>>20)
+	}
+}
+
+// TestDuplicateCustomFieldsKeysAllocateLittle is TestDuplicateTagsKeysAllocateLittle
+// for ytCustomFields: the fixtures sit just under the budgets, so every
+// repeated "customFields" key reaches UnmarshalJSON. Measured on 2026-11-17,
+// without and with -race: the page allocates about 25 and 78 MiB, the issue
+// about 457 and 927 KiB, the same per-call cost as the tags fixtures (about 300
+// bytes a call, from encoding/json itself, with no Decoder built per call).
+// Re-measured the same day, the tags fixtures after objectValueBudget grew by
+// 10*maxCustomFields: the page about 21 and 84 MiB, the issue about 358 and 778
+// KiB, so their bounds stand.
+func TestDuplicateCustomFieldsKeysAllocateLittle(t *testing.T) {
+	const bound = 112 << 20
+	const issueBound = 1200 << 10
+	issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `}`) + `,`
+	dup := `"customFields":[{}],`
+	t.Run("page", func(t *testing.T) {
+		// Each repetition is 3 values and 20 bytes. At the item budget a page of
+		// pageSize issues would pass the page cap, so the repetitions are the
+		// fewer of the two limits.
+		keys := min((itemValueBudget-64)/3, (int(listPageBytes)/pageSize-len(issue)-64)/len(dup))
+		elem := issue + strings.Repeat(dup, keys) + `"customFields":[]}`
+		body := "[" + strings.TrimSuffix(strings.Repeat(elem+",", pageSize), ",") + "]"
+		if int64(len(body)) > listPageBytes {
+			t.Fatalf("fixture is %d bytes, over the page cap", len(body))
+		}
+		y, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("$skip") != "0" {
+				writeRaw(w, "[]")
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		})
+		var err error
+		got := totalAlloc(func() { _, err = y.ListIssues(context.Background(), 1, forge.ListIssuesOptions{}) })
+		if err != nil {
+			t.Errorf("ListIssues: %v", err)
+		}
+		if got > bound {
+			t.Errorf("allocated %d KiB for a %d KiB page, want under %d KiB", got>>10, len(body)>>10, bound>>10)
+		}
+	})
+	t.Run("issue", func(t *testing.T) {
+		body := []byte(issue + strings.Repeat(dup, (objectValueBudget-64)/3) + `"customFields":[]}`)
+		if int64(len(body)) > objectBytes {
+			t.Fatalf("fixture is %d bytes, over the object cap", len(body))
+		}
+		y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) })
+		got := totalAlloc(func() { _, _ = y.GetIssue(context.Background(), 1, 1) })
+		if got > issueBound {
+			t.Errorf("allocated %d KiB for a %d KiB issue, want under %d KiB", got>>10, len(body)>>10, issueBound>>10)
+		}
+	})
+}
+
+// TestRealShapedIssueWithCustomFieldsIsAccepted: an issue at both nested
+// ceilings, 1000 tags and maxCustomFields custom fields, each shaped like
+// YouTrack's own output ($type on every entity, a multi-value field among
+// them), still sits under the object budget.
+func TestRealShapedIssueWithCustomFieldsIsAccepted(t *testing.T) {
+	tag := `{"$type":"Tag","id":"6-1","name":"x","owner":{"$type":"User","id":"` + rawMeID + `"},"color":null}`
+	state := `{"$type":"StateIssueCustomField","name":"State","value":{"$type":"StateBundleElement","name":"Open"}}`
+	multi := `{"$type":"MultiEnumIssueCustomField","name":"m","value":[{"$type":"EnumBundleElement","name":"a"},{"$type":"EnumBundleElement","name":"b"}]}`
+	fields := []string{state}
+	for len(fields) < maxCustomFields {
+		fields = append(fields, multi)
+	}
+	issue := `{"$type":"Issue","id":"2-1","idReadable":"UZI-1","numberInProject":1,"summary":"s","created":1,"updated":2000,` +
+		`"project":{"$type":"Project","id":"0-1","shortName":"UZI"},` +
+		`"customFields":[` + strings.Join(fields, ",") + `],` +
+		`"tags":[` + strings.TrimSuffix(strings.Repeat(tag+",", maxNestedItems), ",") + `]}`
+	if n := valueCount([]byte(issue)); n > objectValueBudget || n <= 8*maxNestedItems+256 {
+		t.Fatalf("fixture holds %d values, want more than %d without exceeding the %d budget", n, 8*maxNestedItems+256, objectValueBudget)
+	}
+	y, _ := loggedDriver(t, withRawMe(func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, issue) }))
+	got, err := y.GetIssue(context.Background(), 1, 1)
+	if err != nil || len(got.Labels) != maxNestedItems {
+		t.Fatalf("%d labels, %v; want %d labels", len(got.Labels), err, maxNestedItems)
+	}
+}
