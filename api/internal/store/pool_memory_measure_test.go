@@ -13,7 +13,18 @@ package store_test
 // UZI_POOL_MEMORY_LIFETIME (45s) and UZI_POOL_MEMORY_JITTER (10s) for the recycling
 // candidates, UZI_POOL_MEMORY_MAX_RECYCLE_WAIT (12m) cap on one recycling candidate's run,
 // UZI_POOL_MEMORY_DISCOVER=1 (run only the breadth table once and write each entry's
-// observed outcome, used to re-pin the table after a schema change).
+// observed outcome, used to re-pin the table after a schema change), UZI_POOL_MEMORY_REPS (2)
+// memory repetitions per candidate, and UZI_POOL_MEMORY_PHASES (all) a comma list of
+// memory,latency,cold,wide,stress to run only those phases, so one run can be split into
+// several go test invocations.
+//
+// Isolation: the schema and fixture are seeded ONCE into database pm_template on the server
+// named by UZI_TEST_DATABASE_URL (which is also where the throwaway marker is checked and
+// where CREATE/DROP DATABASE run), then nothing connects to the template again. Every memory
+// candidate repetition, every latency round, the cold phase and every wide-read run gets its
+// own CREATE DATABASE ... TEMPLATE clone and its own observer connection, dropped afterwards,
+// so no run inherits another's rolled-back dead tuples. UZI_TEST_DATABASE_URL must be a
+// postgres:// URL.
 //
 // The server must be a disposable container whose postgres superuser may pg_read_file
 // /proc/<pid>/smaps_rollup and the cgroup files: all memory numbers are read that way, from
@@ -37,9 +48,10 @@ package store_test
 //     memory.stat anon/file. These are SEPARATE fields and are never summed together.
 //     PostgreSQL-side context totals come from pg_backend_memory_contexts read through the
 //     measured connection with the simple protocol (so the probe prepares nothing).
-//   - Supplemental envelope: every sqlc query text, executed once per PG parameter (all
-//     NULL) inside BEGIN READ ONLY, under auto and force_generic_plan. It is an upper
-//     envelope of plan-cache memory, NOT the decision basis.
+//   - Supplemental lower-bound wide-read sample: every sqlc query text, executed once per PG
+//     parameter (all NULL) inside BEGIN READ ONLY, under auto and force_generic_plan. Writes
+//     are refused after planning and never retained, and NULL arguments plan small, so this
+//     is NOT an upper bound of plan-cache memory and NOT the decision basis.
 //
 // It fails closed: any unexpected error or row count is t.Fatal before a result is recorded.
 import (
@@ -51,11 +63,13 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,7 +94,7 @@ const (
 	pmMinIdentities   = 160 // working-set gate: distinct statements executed per backend
 	pmWarmups         = 10
 	pmLatencyN        = 500
-	pmLatencyRounds   = 3
+	pmLatencyRounds   = 5 // == candidate count, so every candidate leads exactly one round
 	pmHotReps         = 20
 	pmSampleInterval  = 100 * time.Millisecond
 	pmStressBreadthK  = 40 // supplemental stress: breadth calls per iteration (> B32 cap)
@@ -290,6 +304,7 @@ type pmCtxKey int
 const (
 	pmSkipKey pmCtxKey = iota + 1
 	pmSQLKey
+	pmViaQueryKey
 )
 
 // pmSkip marks a call as measurement plumbing: the tracer neither counts it as a served
@@ -297,7 +312,7 @@ const (
 func pmSkip(ctx context.Context) context.Context { return context.WithValue(ctx, pmSkipKey, true) }
 
 type pmPID struct {
-	PID           int32
+	PID           uint32
 	ConnectedAt   time.Time
 	ClosedAt      time.Time
 	Executions    int64
@@ -326,7 +341,7 @@ func (tr pmTracer) TraceQueryEnd(ctx context.Context, c *pgx.Conn, d pgx.TraceQu
 	if sql == "" {
 		return
 	}
-	tr.env.recordExec(int32(c.PgConn().PID()), sql, d.Err == nil)
+	tr.env.recordExec(c.PgConn().PID(), sql, d.Err == nil, ctx.Value(pmViaQueryKey) != nil)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -338,12 +353,15 @@ type pmObserver struct {
 }
 
 type pmMem struct {
-	PrivateCleanKB int64  `json:"private_clean_kb"`
-	PrivateDirtyKB int64  `json:"private_dirty_kb"`
-	PrivateKB      int64  `json:"private_kb"` // Private_Clean + Private_Dirty
-	AnonymousKB    int64  `json:"anonymous_kb"`
-	RssKB          int64  `json:"rss_kb"`
-	PssKB          int64  `json:"pss_kb"`
+	PrivateCleanKB int64 `json:"private_clean_kb"`
+	PrivateDirtyKB int64 `json:"private_dirty_kb"`
+	PrivateKB      int64 `json:"private_kb"` // Private_Clean + Private_Dirty
+	AnonymousKB    int64 `json:"anonymous_kb"`
+	RssKB          int64 `json:"rss_kb"`
+	PssKB          int64 `json:"pss_kb"`
+	// PssShmemKB is smaps_rollup's Pss_Shmem when the kernel reports it. It includes
+	// shared_buffers shmem pages that only this backend has mapped, so it is not a heap metric.
+	PssShmemKB     *int64 `json:"pss_shmem_kb_includes_shmem_pages_only_this_backend_mapped,omitempty"`
 	VmHWMKB        int64  `json:"vmhwm_kb_includes_shared"`
 	VmRSSKB        int64  `json:"vmrss_kb"`
 	CgroupCurrentB *int64 `json:"cgroup_memory_current_bytes"`
@@ -427,11 +445,14 @@ func pmParseMem(smaps, status string) (pmMem, error) {
 	m.PrivateKB = m.PrivateCleanKB + m.PrivateDirtyKB
 	m.AnonymousKB, m.RssKB, m.PssKB = sm["Anonymous"], sm["Rss"], sm["Pss"]
 	m.VmHWMKB, m.VmRSSKB = st["VmHWM"], st["VmRSS"]
+	if v, ok := sm["Pss_Shmem"]; ok && units["Pss_Shmem"] == "kB" {
+		m.PssShmemKB = &v
+	}
 	return m, nil
 }
 
 // read samples one backend. raw, when non-nil, receives the three raw file bodies.
-func (o *pmObserver) read(ctx context.Context, pid int32, raw *[3]string) (pmMem, error) {
+func (o *pmObserver) read(ctx context.Context, pid uint32, raw *[3]string) (pmMem, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	var smaps, status string
@@ -494,10 +515,11 @@ type pmCtxTotals struct {
 
 type pmSample struct {
 	Cand       string       `json:"cand"`
+	Rep        int          `json:"rep,omitempty"`
 	Kind       string       `json:"sample_kind"`
 	Round      int          `json:"round"`
 	TMs        int64        `json:"t_ms"`
-	PID        int32        `json:"pid"`
+	PID        uint32       `json:"pid"`
 	ConnAgeS   float64      `json:"conn_age_s"`
 	Executions int64        `json:"executions_served"`
 	Identities int          `json:"identities_cumulative"`
@@ -514,36 +536,41 @@ type pmSample struct {
 // Per-candidate environment
 
 type pmEnv struct {
-	t     *testing.T
-	out   *pmOut
-	dsn   string
-	cand  pmCand
-	fx    *pmFixture
-	obs   *pmObserver
-	start time.Time
+	t    *testing.T
+	out  *pmOut
+	dsn  string
+	cand pmCand
+	rep  int // memory repetition (1-based); 0 outside the memory phase
+	// dbName is the clone database this environment's pool and observer are connected to.
+	dbName string
+	fx     *pmFixture
+	obs    *pmObserver
+	start  time.Time
 
 	pool *pgxpool.Pool
 	q    *store.Queries
 
-	curPID atomic.Int32
+	curPID atomic.Uint32
 	mu     sync.Mutex
-	pids   map[int32]*pmPID
-	order  []int32
+	pids   map[uint32]*pmPID
+	order  []uint32
 
 	cursor  int // breadth cursor, continues across rounds
 	rawDir  string
 	rawOnce sync.Once
-	// execIdent logs the order in which distinct statement texts were first executed
-	// successfully, across the whole candidate (for the eviction demo and the table).
-	allIdents map[string]struct{}
+
+	// openTx are the transactions begin() handed out and rollback() has not yet ended;
+	// closePool rolls them back so a failing test never blocks in pool.Close.
+	txMu   sync.Mutex
+	openTx []pgx.Tx
 }
 
 func newPMEnv(t *testing.T, out *pmOut, dsn string, cand pmCand, fx *pmFixture, obs *pmObserver, rawDir string) *pmEnv {
 	return &pmEnv{t: t, out: out, dsn: dsn, cand: cand, fx: fx, obs: obs, start: time.Now(), rawDir: rawDir,
-		pids: map[int32]*pmPID{}, allIdents: map[string]struct{}{}}
+		pids: map[uint32]*pmPID{}}
 }
 
-func (e *pmEnv) pidRec(pid int32) *pmPID {
+func (e *pmEnv) pidRec(pid uint32) *pmPID {
 	p := e.pids[pid]
 	if p == nil {
 		p = &pmPID{PID: pid, ConnectedAt: time.Now(), Idents: map[string]struct{}{}}
@@ -553,25 +580,27 @@ func (e *pmEnv) pidRec(pid int32) *pmPID {
 	return p
 }
 
-func (e *pmEnv) recordExec(pid int32, sql string, ok bool) {
+// recordExec counts one served execution and, when it succeeded and pgx prepares it, the
+// statement identity. viaQuery marks a call made with Conn.Query, which prepares even a
+// zero-argument text (only a zero-argument Exec is sent on the simple protocol).
+func (e *pmEnv) recordExec(pid uint32, sql string, ok, viaQuery bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := e.pidRec(pid)
 	p.Executions++
-	if ok {
+	if ok && (viaQuery || !pmNotPrepared(sql)) {
 		p.Idents[sql] = struct{}{}
-		e.allIdents[sql] = struct{}{}
 	}
 }
 
-func (e *pmEnv) pidStats(pid int32) (age float64, execs int64, idents int) {
+func (e *pmEnv) pidStats(pid uint32) (age float64, execs int64, idents int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := e.pidRec(pid)
 	return time.Since(p.ConnectedAt).Seconds(), p.Executions, len(p.Idents)
 }
 
-func (e *pmEnv) pidGone(pid int32) bool {
+func (e *pmEnv) pidGone(pid uint32) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := e.pids[pid]
@@ -603,7 +632,7 @@ func (e *pmEnv) openPool(ctx context.Context) {
 		if err := c.QueryRow(ctx, `SHOW plan_cache_mode`, pgx.QueryExecModeSimpleProtocol).Scan(&mode); err != nil {
 			return err
 		}
-		pid := int32(c.PgConn().PID())
+		pid := c.PgConn().PID()
 		e.mu.Lock()
 		p := e.pidRec(pid)
 		p.ConnectedAt = time.Now()
@@ -614,7 +643,7 @@ func (e *pmEnv) openPool(ctx context.Context) {
 		return nil
 	}
 	cfg.BeforeClose = func(c *pgx.Conn) {
-		pid := int32(c.PgConn().PID())
+		pid := c.PgConn().PID()
 		e.mu.Lock()
 		e.pidRec(pid).ClosedAt = time.Now()
 		e.mu.Unlock()
@@ -677,7 +706,7 @@ func pmRunEntry(ctx context.Context, q *store.Queries, f *pmFixture, en pmEntry)
 	return nil
 }
 
-// pmSavepoint runs fn between SAVEPOINT and ROLLBACK TO SAVEPOINT on tx. The savepoint
+// pmSavepoint runs fn between SAVEPOINT and ROLLBACK TO SAVEPOINT + RELEASE on tx. The savepoint
 // statements use the simple protocol so they are never cached as prepared statements.
 func pmSavepoint(ctx context.Context, tx pgx.Tx, fn func() error) error {
 	sctx := pmSkip(ctx)
@@ -690,21 +719,64 @@ func pmSavepoint(ctx context.Context, tx pgx.Tx, fn func() error) error {
 	if _, err := tx.Exec(sctx, "ROLLBACK TO SAVEPOINT pm", pgx.QueryExecModeSimpleProtocol); err != nil {
 		return fmt.Errorf("rollback to savepoint: %w", err)
 	}
+	// ROLLBACK TO keeps the savepoint alive; RELEASE drops it so nesting stays at one level.
+	if _, err := tx.Exec(sctx, "RELEASE SAVEPOINT pm", pgx.QueryExecModeSimpleProtocol); err != nil {
+		return fmt.Errorf("release savepoint: %w", err)
+	}
 	return nil
 }
 
+// begin starts a transaction on the pool and registers it, so closePool can roll it back
+// if the test fails (t.Fatalf) before rollback is reached.
 func (e *pmEnv) begin(ctx context.Context) pgx.Tx {
 	tx, err := e.pool.Begin(pmSkip(ctx))
 	if err != nil {
 		e.t.Fatalf("%s: begin: %v", e.cand.Name, err)
 	}
+	e.track(tx)
 	return tx
 }
 
+func (e *pmEnv) track(tx pgx.Tx) {
+	e.txMu.Lock()
+	e.openTx = append(e.openTx, tx)
+	e.txMu.Unlock()
+}
+
+func (e *pmEnv) untrack(tx pgx.Tx) {
+	e.txMu.Lock()
+	defer e.txMu.Unlock()
+	for i, x := range e.openTx {
+		if x == tx {
+			e.openTx = append(e.openTx[:i], e.openTx[i+1:]...)
+			return
+		}
+	}
+}
+
 func (e *pmEnv) rollback(ctx context.Context, tx pgx.Tx) {
+	e.untrack(tx)
 	if err := tx.Rollback(pmSkip(ctx)); err != nil {
 		e.t.Fatalf("%s: rollback: %v", e.cand.Name, err)
 	}
+}
+
+// closePool ends every transaction still open (bounded to 10 s in total, errors ignored) and
+// then closes the pool. pgxpool.Close waits for every acquired connection to be released,
+// so a transaction left open by a failing test would otherwise hang until the test timeout.
+func (e *pmEnv) closePool() {
+	e.txMu.Lock()
+	open := e.openTx
+	e.openTx = nil
+	e.txMu.Unlock()
+	if len(open) > 0 {
+		rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		for _, tx := range open {
+			_ = tx.Rollback(rctx)
+		}
+		cancel()
+	}
+	e.pool.Close()
 }
 
 // breadthPass runs every breadth entry once, in tx, each under its own savepoint.
@@ -899,8 +971,8 @@ func (e *pmEnv) ctxTotals(ctx context.Context, c *pgx.Conn) (pmCtxTotals, error)
 // then the kernel memory read on the observer connection while the connection is still held.
 func (e *pmEnv) sampleHeld(ctx context.Context, c *pgxpool.Conn, kind string, round int) pmSample {
 	t := e.t
-	pid := int32(c.Conn().PgConn().PID())
-	s := pmSample{Cand: e.cand.Name, Kind: kind, Round: round, PID: pid}
+	pid := c.Conn().PgConn().PID()
+	s := pmSample{Cand: e.cand.Name, Rep: e.rep, Kind: kind, Round: round, PID: pid}
 	first, err := e.ctxTotals(ctx, c.Conn())
 	if err != nil {
 		t.Fatalf("%s: context totals: %v", e.cand.Name, err)
@@ -952,8 +1024,12 @@ func (e *pmEnv) sampleHeld(ctx context.Context, c *pgxpool.Conn, kind string, ro
 func (e *pmEnv) saveRaw(raw [3]string) {
 	e.rawOnce.Do(func() {
 		for i, name := range []string{"smaps_rollup", "status", "cgroup"} {
-			p := filepath.Join(e.rawDir, fmt.Sprintf("raw-%s-%s.txt", e.cand.Name, name))
-			if err := os.WriteFile(p, []byte(raw[i]), 0o600); err != nil {
+			tag := e.cand.Name
+			if e.rep > 0 {
+				tag = fmt.Sprintf("%s-r%d", tag, e.rep)
+			}
+			p := filepath.Join(e.rawDir, fmt.Sprintf("raw-%s-%s.txt", tag, name))
+			if err := os.WriteFile(filepath.Clean(p), []byte(raw[i]), 0o600); err != nil { //nolint:gosec // G703: operator-supplied measurement output dir under opt-in env, fixed file names
 				e.t.Fatalf("save raw capture: %v", err)
 			}
 		}
@@ -970,17 +1046,17 @@ func (e *pmEnv) postRoundSample(ctx context.Context, kind string, round int) pmS
 }
 
 type pmSamplerResult struct {
-	N          int       `json:"samples"`
-	Errors     int       `json:"errors"`
-	Dropped    int       `json:"dropped_for_recycled_pid"`
-	FirstError string    `json:"first_error,omitempty"`
-	MeanMs     float64   `json:"achieved_interval_mean_ms"`
-	P95Ms      float64   `json:"achieved_interval_p95_ms"`
-	MaxMs      float64   `json:"achieved_interval_max_ms"`
-	PeakKB     int64     `json:"peak_private_kb"`
-	PeakPID    int32     `json:"peak_pid"`
-	PeakAgeS   float64   `json:"peak_conn_age_s"`
-	Peak       *pmSample `json:"-"`
+	N          int     `json:"samples"`
+	Errors     int     `json:"errors"`
+	Dropped    int     `json:"dropped_for_recycled_pid"`
+	FirstError string  `json:"first_error,omitempty"`
+	MeanMs     float64 `json:"achieved_interval_mean_ms"`
+	P95Ms      float64 `json:"achieved_interval_p95_ms"`
+	MaxMs      float64 `json:"achieved_interval_max_ms"`
+	PeakKB     int64   `json:"peak_private_kb"`
+	PeakAnonKB int64   `json:"peak_anonymous_kb"`
+	PeakPID    uint32  `json:"peak_pid"`
+	PeakAgeS   float64 `json:"peak_conn_age_s"`
 }
 
 type pmSampler struct {
@@ -1036,12 +1112,13 @@ func (e *pmEnv) startSampler(ctx context.Context) *pmSampler {
 			e.mu.Unlock()
 			if mem.PrivateKB > s.res.PeakKB {
 				s.res.PeakKB, s.res.PeakPID, s.res.PeakAgeS = mem.PrivateKB, pid, age
-				cp := smp
-				s.res.Peak = &cp
 			}
-			e.out.emit("sampler", map[string]any{"cand": e.cand.Name, "t_ms": smp.TMs, "pid": pid, "conn_age_s": age,
+			if mem.AnonymousKB > s.res.PeakAnonKB {
+				s.res.PeakAnonKB = mem.AnonymousKB
+			}
+			e.out.emit("sampler", map[string]any{"cand": e.cand.Name, "rep": e.rep, "t_ms": smp.TMs, "pid": pid, "conn_age_s": age,
 				"executions_served": execs, "identities_cumulative": idents, "private_kb": mem.PrivateKB,
-				"anonymous_kb": mem.AnonymousKB, "rss_kb": mem.RssKB, "pss_kb": mem.PssKB,
+				"private_clean_kb": mem.PrivateCleanKB, "private_dirty_kb": mem.PrivateDirtyKB, "anonymous_kb": mem.AnonymousKB, "rss_kb": mem.RssKB, "pss_kb": mem.PssKB,
 				"vmhwm_kb_includes_shared": mem.VmHWMKB, "cgroup_memory_current_bytes": mem.CgroupCurrentB})
 		}
 	}()
@@ -1188,8 +1265,8 @@ func mustGetwd() string { d, _ := os.Getwd(); return d }
 // pmBreadth is the curated breadth table: distinct sqlc Queries methods, each with a
 // production-shaped binding against the seeded fixture and a pinned expected outcome
 // (some = rows or a value, empty = no rows, norows = pgx.ErrNoRows). Generated once from the
-// signatures in the *.sql.go files, filtered to single-argument reads and getters keyed by
-// the fixture ids, then pinned from a discovery run (UZI_POOL_MEMORY_DISCOVER=1).
+// signatures in the *.sql.go files, filtered to methods whose arguments are a fixture id
+// (reads, getters, locks and deletes, some of them writes) plus zero-argument calls, then pinned from a discovery run (UZI_POOL_MEMORY_DISCOVER=1).
 var pmBreadth = []pmEntry{
 	{"DeleteAllCodexProviderAccountsForOwner", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.DeleteAllCodexProviderAccountsForOwner(ctx, f.User)
@@ -2104,20 +2181,67 @@ var pmBreadth = []pmEntry{
 	{"ListWorkerSizes", pmEmpty, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) { return q.ListWorkerSizes(ctx) }},
 }
 
-// pmSQL maps each sqlc method name to its query text, the exact string pgx prepares.
-var pmSQL = func() map[string]string {
-	m, _, err := pmSQLConstants()
+var (
+	pmSQLOnce sync.Once
+	pmSQLMap  map[string]string
+	pmSQLErr  error
+	pmSimple  map[string]struct{}
+)
+
+// pmSimpleExecNames are the sqlc :exec methods with no parameters. pgx sends a zero-argument
+// Exec over the simple protocol, so it is never prepared and never occupies a statement
+// cache slot: such statements are not counted as identities.
+var pmSimpleExecNames = []string{
+	"DeleteAgentSourceStaged", "DeleteSharedTemplateAllocations", "OptInCheckpointCoordinates",
+	"DeleteExpiredCLIAuthRequests", "EnsureInstanceIntakePauseRow", "DeleteExpiredOAuthAuthorizeRequests",
+	"OptInPublicationResume", "OptInRunFences",
+}
+
+// pmSQLLoad parses the generated sqlc files once, on first use inside the opt-in test (never
+// at package init, so no other store test binary pays for or can panic on the parse).
+func pmSQLLoad() (map[string]string, error) {
+	pmSQLOnce.Do(func() {
+		pmSQLMap, _, pmSQLErr = pmSQLConstants()
+		if pmSQLErr != nil {
+			return
+		}
+		pmSimple = map[string]struct{}{}
+		for _, n := range pmSimpleExecNames {
+			txt, ok := pmSQLMap[n]
+			if !ok {
+				pmSQLErr = fmt.Errorf("zero-argument exec %s has no sqlc query text", n)
+				return
+			}
+			pmSimple[txt] = struct{}{}
+		}
+	})
+	return pmSQLMap, pmSQLErr
+}
+
+// pmSQLTexts maps each sqlc method name to its query text, the exact string pgx prepares.
+// The test checks pmSQLLoad's error before any use, so a failure here is a harness bug.
+func pmSQLTexts() map[string]string {
+	m, err := pmSQLLoad()
 	if err != nil {
 		panic(err)
 	}
 	return m
-}()
+}
+
+// pmNotPrepared reports whether sql is a zero-argument sqlc Exec text, which pgx runs on the
+// simple protocol without preparing it.
+func pmNotPrepared(sql string) bool {
+	pmSQLTexts()
+	_, ok := pmSimple[sql]
+	return ok
+}
 
 // ---------------------------------------------------------------------------------------
 // Eviction then re-prepare
 
 type pmEviction struct {
 	Cand             string `json:"cand"`
+	Rep              int    `json:"rep"`
 	Capacity         int    `json:"capacity"`
 	Entry            string `json:"early_statement_method"`
 	DistinctExecuted int    `json:"distinct_statements_executed"`
@@ -2138,7 +2262,7 @@ func (e *pmEnv) evictionDemo(ctx context.Context) pmEviction {
 	t := e.t
 	capacity := e.cand.capacity()
 	first := pmBreadth[0]
-	text, ok := pmSQL[first.Name]
+	text, ok := pmSQLTexts()[first.Name]
 	if !ok {
 		t.Fatalf("%s: no sqlc text for %s", e.cand.Name, first.Name)
 	}
@@ -2186,6 +2310,7 @@ func (e *pmEnv) evictionDemo(ctx context.Context) pmEviction {
 	case ev.RetainedAfter > capacity || (ev.Exceeded && ev.RetainedAfter != capacity):
 		t.Fatalf("%s: retained %d after filling, capacity %d", e.cand.Name, ev.RetainedAfter, capacity)
 	}
+	ev.Rep = e.rep
 	e.out.emit("eviction", ev)
 	return ev
 }
@@ -2195,6 +2320,7 @@ func (e *pmEnv) evictionDemo(ctx context.Context) pmEviction {
 
 type pmRoundRec struct {
 	Cand          string  `json:"cand"`
+	Rep           int     `json:"rep"`
 	Round         int     `json:"round"`
 	DurationS     float64 `json:"duration_s"`
 	ClaimMeanUS   float64 `json:"claim_run_mean_us"`
@@ -2205,6 +2331,8 @@ type pmRoundRec struct {
 
 type pmMemSummary struct {
 	Cand               string           `json:"cand"`
+	Rep                int              `json:"rep"`
+	Database           string           `json:"clone_database"`
 	Desc               string           `json:"desc"`
 	Rounds             int              `json:"rounds"`
 	DurationS          float64          `json:"duration_s"`
@@ -2216,6 +2344,12 @@ type pmMemSummary struct {
 	SteadyPrivateMin   int64            `json:"steady_private_kb_min"`
 	SteadyPrivateMax   int64            `json:"steady_private_kb_max"`
 	SteadyAnonymousKB  int64            `json:"steady_anonymous_kb"`
+	SteadyAnonMinKB    int64            `json:"steady_anonymous_kb_min"`
+	SteadyAnonMaxKB    int64            `json:"steady_anonymous_kb_max"`
+	SampledPeakAnonKB  int64            `json:"sampled_peak_anonymous_kb"`
+	SteadyPrivCleanKB  int64            `json:"steady_private_clean_kb"`
+	SteadyPrivDirtyKB  int64            `json:"steady_private_dirty_kb"`
+	SteadyPssShmemKB   *int64           `json:"steady_pss_shmem_kb_includes_shmem_pages_only_this_backend_mapped,omitempty"`
 	SteadyRssKB        int64            `json:"steady_rss_kb"`
 	SteadyPssKB        int64            `json:"steady_pss_kb"`
 	SteadyCgroupB      *int64           `json:"steady_cgroup_memory_current_bytes"`
@@ -2248,7 +2382,7 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 	t := e.t
 	name := e.cand.Name
 	e.openPool(ctx)
-	defer e.pool.Close()
+	defer e.closePool()
 	candStart := time.Now()
 	e.start = candStart
 	base := e.postRoundSample(ctx, "baseline_empty_cache", 0)
@@ -2270,7 +2404,7 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 		e.mu.Lock()
 		npids := len(e.order)
 		e.mu.Unlock()
-		e.out.emit("round", pmRoundRec{Cand: name, Round: r, DurationS: time.Since(t0).Seconds(),
+		e.out.emit("round", pmRoundRec{Cand: name, Rep: e.rep, Round: r, DurationS: time.Since(t0).Seconds(),
 			ClaimMeanUS: pmMean(lat.ClaimUS), InsertMeanUS: pmMean(lat.InsertUS), PIDsSoFar: npids, BreadthCursor: e.cursor})
 		enoughRounds := r >= minRounds
 		if !e.cand.Recycle {
@@ -2292,7 +2426,7 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 	}
 
 	e.mu.Lock()
-	sum := pmMemSummary{Cand: name, Desc: e.cand.Desc, Rounds: rounds, DurationS: time.Since(candStart).Seconds(),
+	sum := pmMemSummary{Cand: name, Rep: e.rep, Database: e.dbName, Desc: e.cand.Desc, Rounds: rounds, DurationS: time.Since(candStart).Seconds(),
 		BackendPIDs: len(e.order), Sampler: sres, SampledPeakKB: sres.PeakKB}
 	var pidRecs []pmPID
 	for _, pid := range e.order {
@@ -2316,7 +2450,7 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 		if !p.ClosedAt.IsZero() {
 			life = p.ClosedAt.Sub(p.ConnectedAt)
 		}
-		e.out.emit("pid", map[string]any{"cand": name, "pid": p.PID, "connected_at": p.ConnectedAt, "closed_at": p.ClosedAt,
+		e.out.emit("pid", map[string]any{"cand": name, "rep": e.rep, "pid": p.PID, "connected_at": p.ConnectedAt, "closed_at": p.ClosedAt,
 			"lifetime_s": life.Seconds(), "executions_served": p.Executions, "identities": len(e.pids[p.PID].Idents),
 			"peak_sampled_private_kb": p.PeakPrivateKB, "peak_at_conn_age_s": p.PeakSampleAge, "vmhwm_kb_includes_shared": p.HWMKB,
 			"statement_cache_capacity": p.StmtCapacity, "plan_cache_mode": p.PlanCacheMode})
@@ -2356,6 +2490,23 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 		}
 	}
 	sum.SteadyAnonymousKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.AnonymousKB })
+	sum.SteadyAnonMinKB, sum.SteadyAnonMaxKB = steady[0].Mem.AnonymousKB, steady[0].Mem.AnonymousKB
+	for _, s := range steady {
+		sum.SteadyAnonMinKB = min(sum.SteadyAnonMinKB, s.Mem.AnonymousKB)
+		sum.SteadyAnonMaxKB = max(sum.SteadyAnonMaxKB, s.Mem.AnonymousKB)
+	}
+	sum.SampledPeakAnonKB = sres.PeakAnonKB
+	sum.SteadyPrivCleanKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateCleanKB })
+	sum.SteadyPrivDirtyKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateDirtyKB })
+	if steady[0].Mem.PssShmemKB != nil {
+		v := pmMedianOf(steady, func(s pmSample) int64 {
+			if s.Mem.PssShmemKB == nil {
+				return 0
+			}
+			return *s.Mem.PssShmemKB
+		})
+		sum.SteadyPssShmemKB = &v
+	}
 	sum.SteadyRssKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.RssKB })
 	sum.SteadyPssKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PssKB })
 	if steady[0].Mem.CgroupCurrentB != nil {
@@ -2430,31 +2581,40 @@ type pmLatSummary struct {
 	InsP95US        float64   `json:"insert_run_message_pooled_p95_us"`
 }
 
-// runLatency runs pmLatencyRounds rounds; each round measures every candidate on a fresh
-// pool in an order rotated by the round number (alternating who goes first).
-func pmRunLatency(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pmFixture, obs *pmObserver, rawDir string,
-	cands []pmCand, variant string, n, k int) {
+// pmRunLatency runs pmLatencyRounds rounds; each round measures every candidate on a fresh
+// pool in an order rotated by the round number, so with pmLatencyRounds equal to the number
+// of candidates each candidate goes first in exactly one round and last in exactly one.
+// The headline is the median round's per-execution mean.
+//
+// Every round runs on its own fresh clone of the seeded template, so no round inherits the
+// dead tuples the previous round's rolled-back writes left behind; the candidates inside one
+// round share that round's clone and the rotation balances their position in it.
+func pmRunLatency(ctx context.Context, lab *pmLab, cands []pmCand, variant string, n, k int) {
+	t, out := lab.t, lab.out
 	pooledClaim := map[string][]float64{}
 	pooledIns := map[string][]float64{}
 	roundClaim := map[string][]float64{}
 	roundIns := map[string][]float64{}
 	for r := 0; r < pmLatencyRounds; r++ {
-		for i := range cands {
-			c := cands[(i+r)%len(cands)]
-			e := newPMEnv(t, out, dsn, c, fx, obs, rawDir)
-			e.openPool(ctx)
-			lat := e.latencyLoop(ctx, n, k, true)
-			e.verifyFixture(ctx)
-			e.pool.Close()
-			rec := pmLatRound{Cand: c.Name, Variant: variant, Round: r + 1, Order: i + 1, N: n, BreadthPerIt: k,
-				ClaimMeanUS: pmMean(lat.ClaimUS), ClaimP50US: pmQuantile(lat.ClaimUS, 0.5), ClaimP95US: pmQuantile(lat.ClaimUS, 0.95),
-				InsMeanUS: pmMean(lat.InsertUS), InsP50US: pmQuantile(lat.InsertUS, 0.5), InsP95US: pmQuantile(lat.InsertUS, 0.95)}
-			out.emit("latency_round", rec)
-			pooledClaim[c.Name] = append(pooledClaim[c.Name], lat.ClaimUS...)
-			pooledIns[c.Name] = append(pooledIns[c.Name], lat.InsertUS...)
-			roundClaim[c.Name] = append(roundClaim[c.Name], rec.ClaimMeanUS)
-			roundIns[c.Name] = append(roundIns[c.Name], rec.InsMeanUS)
-		}
+		lab.withClone(ctx, fmt.Sprintf("lat_%s_r%d", variant, r+1), func(dsn string, obs *pmObserver) {
+			for i := range cands {
+				c := cands[(i+r)%len(cands)]
+				e := newPMEnv(t, out, dsn, c, lab.fx, obs, lab.rawDir)
+				e.openPool(ctx)
+				t.Cleanup(e.closePool) // a t.Fatalf inside latencyLoop still rolls back and closes
+				lat := e.latencyLoop(ctx, n, k, true)
+				e.verifyFixture(ctx)
+				e.closePool()
+				rec := pmLatRound{Cand: c.Name, Variant: variant, Round: r + 1, Order: i + 1, N: n, BreadthPerIt: k,
+					ClaimMeanUS: pmMean(lat.ClaimUS), ClaimP50US: pmQuantile(lat.ClaimUS, 0.5), ClaimP95US: pmQuantile(lat.ClaimUS, 0.95),
+					InsMeanUS: pmMean(lat.InsertUS), InsP50US: pmQuantile(lat.InsertUS, 0.5), InsP95US: pmQuantile(lat.InsertUS, 0.95)}
+				out.emit("latency_round", rec)
+				pooledClaim[c.Name] = append(pooledClaim[c.Name], lat.ClaimUS...)
+				pooledIns[c.Name] = append(pooledIns[c.Name], lat.InsertUS...)
+				roundClaim[c.Name] = append(roundClaim[c.Name], rec.ClaimMeanUS)
+				roundIns[c.Name] = append(roundIns[c.Name], rec.InsMeanUS)
+			}
+		})
 	}
 	for _, c := range cands {
 		out.emit("latency_summary", pmLatSummary{Cand: c.Name, Variant: variant,
@@ -2475,10 +2635,12 @@ func pmRunCold(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pm
 			e := newPMEnv(t, out, dsn, c, fx, obs, rawDir)
 			t0 := time.Now()
 			e.openPool(ctx)
+			t.Cleanup(e.closePool)
 			conn, err := e.pool.Acquire(pmSkip(ctx))
 			if err != nil {
 				t.Fatalf("%s: cold acquire: %v", c.Name, err)
 			}
+			t.Cleanup(conn.Release) // runs before closePool; releasing a conn in a tx destroys it
 			tConn := time.Since(t0)
 			tx, err := conn.Begin(pmSkip(ctx))
 			if err != nil {
@@ -2509,7 +2671,7 @@ func pmRunCold(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pm
 				t.Fatalf("%s: cold rollback: %v", c.Name, err)
 			}
 			conn.Release()
-			e.pool.Close()
+			e.closePool()
 			connMs = append(connMs, float64(tConn.Microseconds())/1e3)
 			firstMs = append(firstMs, float64(first.Microseconds())/1e3)
 			warmMs = append(warmMs, float64(warm.Microseconds())/1e3)
@@ -2533,9 +2695,9 @@ func addSlices(a, b []float64) []float64 {
 }
 
 // ---------------------------------------------------------------------------------------
-// Supplemental envelope
+// Supplemental lower-bound wide-read sample
 
-type pmEnvelopeRec struct {
+type pmWideRec struct {
 	Mode            string          `json:"plan_cache_mode"`
 	Config          string          `json:"config"`
 	Capacity        int             `json:"statement_cache_capacity"`
@@ -2557,23 +2719,23 @@ type pmEnvelopeRec struct {
 	Note            string          `json:"note"`
 }
 
-// pmRunEnvelope executes every sqlc query text, once per PG parameter with NULL, twice each,
+// pmRunWide executes every sqlc query text, once per PG parameter with NULL, twice each,
 // on ONE held connection inside BEGIN READ ONLY with a SAVEPOINT per statement. The
 // session setting (force_generic_plan) and the advisory-lock cleanup are deferred so they
 // run even when the test fails.
-func pmRunEnvelope(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pmFixture, obs *pmObserver, rawDir string,
+func pmRunWide(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pmFixture, obs *pmObserver, rawDir string,
 	cand pmCand, forceGeneric bool, order []string) {
 	mode := "auto"
 	if forceGeneric {
 		mode = "force_generic_plan"
 	}
-	cand.Name = "ENV-" + cand.Name
+	cand.Name = "WIDE-" + cand.Name
 	e := newPMEnv(t, out, dsn, cand, fx, obs, rawDir)
 	e.openPool(ctx)
-	defer e.pool.Close()
+	defer e.closePool()
 	conn, err := e.pool.Acquire(pmSkip(ctx))
 	if err != nil {
-		t.Fatalf("envelope acquire: %v", err)
+		t.Fatalf("wide-read sample acquire: %v", err)
 	}
 	defer conn.Release()
 	cleanup := func(sql string) {
@@ -2584,7 +2746,7 @@ func pmRunEnvelope(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx
 	simple := func(sql string) {
 		t.Helper()
 		if _, err := conn.Conn().Exec(pmSkip(ctx), sql, pgx.QueryExecModeSimpleProtocol); err != nil {
-			t.Fatalf("envelope %q: %v", sql, err)
+			t.Fatalf("wide-read sample %q: %v", sql, err)
 		}
 	}
 	defer cleanup("SELECT pg_advisory_unlock_all()")
@@ -2593,14 +2755,14 @@ func pmRunEnvelope(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx
 		defer cleanup("RESET plan_cache_mode")
 	}
 	e.start = time.Now()
-	base := e.sampleHeld(ctx, conn, "envelope_baseline", 0)
+	base := e.sampleHeld(ctx, conn, "wide_baseline", 0)
 	sampler := e.startSampler(ctx)
-	rec := pmEnvelopeRec{Mode: mode, Config: cand.Desc, Capacity: cand.capacity(), QueryTexts: len(order), Baseline: base,
-		Note: "NULL for every parameter inside BEGIN READ ONLY: reads build and cache their plans, writes are refused after planning; statements pgx saw fail are invalidated and deallocated, so retained counts only statements that executed. Upper envelope, not the decision basis."}
+	rec := pmWideRec{Mode: mode, Config: cand.Desc, Capacity: cand.capacity(), QueryTexts: len(order), Baseline: base,
+		Note: "NULL for every parameter inside BEGIN READ ONLY: reads build and cache their plans, writes are refused after planning; statements pgx saw fail are invalidated and deallocated, so retained counts only statements that executed. Lower-bound wide-read sample (writes are refused and never retained, NULL arguments plan small); not an upper bound and not the decision basis."}
 	simple("BEGIN READ ONLY")
 	defer cleanup("ROLLBACK")
 	for _, name := range order {
-		sql := pmSQL[name]
+		sql := pmSQLTexts()[name]
 		simple("SAVEPOINT env")
 		sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		sd, perr := conn.Conn().Prepare(pmSkip(sctx), "", sql)
@@ -2612,13 +2774,13 @@ func pmRunEnvelope(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx
 					rec.ParseFailSample = append(rec.ParseFailSample, fmt.Sprintf("%s: %s %s", name, pe.Code, pe.Message))
 				}
 			} else {
-				t.Fatalf("envelope %s: prepare transport error: %v", name, perr)
+				t.Fatalf("wide-read sample %s: prepare transport error: %v", name, perr)
 			}
 		} else {
 			args := make([]any, len(sd.ParamOIDs))
 			for rep := 0; rep < 2; rep++ {
 				rec.Runs++
-				rows, qerr := conn.Conn().Query(sctx, sql, args...)
+				rows, qerr := conn.Conn().Query(context.WithValue(sctx, pmViaQueryKey, true), sql, args...)
 				if qerr == nil {
 					for rows.Next() {
 					}
@@ -2646,7 +2808,7 @@ func pmRunEnvelope(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx
 					}
 				default:
 					cancel()
-					t.Fatalf("envelope %s: non-database error: %v", name, qerr)
+					t.Fatalf("wide-read sample %s: non-database error: %v", name, qerr)
 				}
 				// A failed statement aborted the transaction: recover to the savepoint.
 				simple("ROLLBACK TO SAVEPOINT env")
@@ -2658,25 +2820,142 @@ func pmRunEnvelope(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx
 	}
 	simple("ROLLBACK")
 	if rec.ExecutedOK+rec.ReadOnlyBlocked+rec.OtherErrors+rec.ParseFailures != len(order) {
-		t.Fatalf("envelope accounting: %d ok + %d read-only + %d other + %d parse != %d texts",
+		t.Fatalf("wide-read sample accounting: %d ok + %d read-only + %d other + %d parse != %d texts",
 			rec.ExecutedOK, rec.ReadOnlyBlocked, rec.OtherErrors, rec.ParseFailures, len(order))
 	}
 	rec.Sampler = sampler.Stop()
 	if rec.Sampler.Errors > 0 {
-		t.Fatalf("envelope sampler errors: %s", rec.Sampler.FirstError)
+		t.Fatalf("wide-read sample sampler errors: %s", rec.Sampler.FirstError)
 	}
-	fin := e.sampleHeld(ctx, conn, "envelope_final", 1)
+	fin := e.sampleHeld(ctx, conn, "wide_final", 1)
 	rec.Final = fin
 	rec.Retained, rec.Identities = *fin.Retained, fin.Identities
 	rec.VmHWMKB = fin.Mem.VmHWMKB
 	if rec.Retained > 0 {
 		rec.BytesPerStmt = float64(fin.Ctx.TotalBytes-base.Ctx.TotalBytes) / float64(rec.Retained)
 	}
-	out.emit("envelope", rec)
+	out.emit("wide_read_sample", rec)
 }
 
 // ---------------------------------------------------------------------------------------
 // Orchestration
+
+// pmRequireThrowawayDB refuses to run against a database that lacks the throwaway marker
+// seeded by e2e/test-database-marker.sql, so the harness (which seeds rows and reads /proc
+// through pg_read_file) never touches a retained database.
+func pmRequireThrowawayDB(ctx context.Context, t *testing.T, dsn string) {
+	t.Helper()
+	c, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("marker check connect: %v", err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	var n int
+	if err := c.QueryRow(ctx,
+		`SELECT count(*)::int FROM uzi_test_harness.database_marker WHERE marker = 'recovery-reset-v1'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("refusing to run: uzi_test_harness.database_marker lacks recovery-reset-v1 (count %d, err %v); "+
+			"initialise a throwaway database with e2e/test-database-marker.sql", n, err)
+	}
+}
+
+// pmTemplateDB is the database seeded once and never connected to afterwards; every
+// measurement runs on a throwaway clone of it (CREATE DATABASE ... TEMPLATE), so every
+// candidate, repetition and latency round starts from byte-identical data and bloat.
+const pmTemplateDB = "pm_template"
+
+// pmLab owns the cloning of the seeded template. adminDSN is the maintenance database the
+// marker was checked on; CREATE and DROP DATABASE run there on a superuser connection.
+type pmLab struct {
+	t        *testing.T
+	out      *pmOut
+	adminDSN string
+	fx       *pmFixture
+	rawDir   string
+}
+
+// pmDSNForDB returns dsn with its database name replaced. Only URL-form DSNs are supported.
+func pmDSNForDB(t *testing.T, dsn, db string) string {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		t.Fatalf("UZI_TEST_DATABASE_URL must be a postgres:// URL to derive per-clone DSNs (err %v)", err)
+	}
+	u.Path, u.RawPath = "/"+db, ""
+	return u.String()
+}
+
+// pmAdminExec runs one statement (simple protocol, so CREATE/DROP DATABASE are legal) on a
+// short-lived superuser connection to the maintenance database.
+func pmAdminExec(ctx context.Context, adminDSN, sql string) error {
+	c, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		return fmt.Errorf("admin connect: %w", err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	if _, err := c.Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol); err != nil {
+		return fmt.Errorf("admin exec %.80q: %w", sql, err)
+	}
+	return nil
+}
+
+func pmDropDB(adminDSN, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return pmAdminExec(ctx, adminDSN, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+}
+
+// withClone creates database pm_<label> from the template, hands fn a DSN for it plus an
+// observer connection to the same clone, then closes the observer and drops the clone.
+func (l *pmLab) withClone(ctx context.Context, label string, fn func(dsn string, obs *pmObserver)) {
+	t := l.t
+	t.Helper()
+	name := "pm_" + strings.ToLower(label)
+	if len(name) > 60 {
+		t.Fatalf("clone name %q too long", name)
+	}
+	if err := pmDropDB(l.adminDSN, name); err != nil {
+		t.Fatalf("drop stale clone %s: %v", name, err)
+	}
+	if err := pmAdminExec(ctx, l.adminDSN, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{pmTemplateDB}.Sanitize()); err != nil {
+		t.Fatalf("create clone %s: %v", name, err)
+	}
+	defer func() {
+		if err := pmDropDB(l.adminDSN, name); err != nil {
+			t.Errorf("drop clone %s: %v", name, err)
+		}
+	}()
+	dsn := pmDSNForDB(t, l.adminDSN, name)
+	oc, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("observer connect to clone %s: %v", name, err)
+	}
+	defer func() { _ = oc.Close(ctx) }()
+	l.out.emit("clone", map[string]any{"database": name, "label": label, "created_at": time.Now().UTC()})
+	fn(dsn, &pmObserver{conn: oc})
+}
+
+// pmPhaseSet parses UZI_POOL_MEMORY_PHASES, a comma list of memory,latency,cold,wide,stress
+// (default: all), so one run can be split into several go test invocations.
+func pmPhaseSet(t *testing.T) map[string]bool {
+	t.Helper()
+	known := []string{"memory", "latency", "cold", "wide", "stress"}
+	set := map[string]bool{}
+	raw := strings.TrimSpace(os.Getenv("UZI_POOL_MEMORY_PHASES"))
+	if raw == "" {
+		for _, k := range known {
+			set[k] = true
+		}
+		return set
+	}
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if !slices.Contains(known, p) {
+			t.Fatalf("UZI_POOL_MEMORY_PHASES: unknown phase %q (known: %s)", p, strings.Join(known, ","))
+		}
+		set[p] = true
+	}
+	return set
+}
 
 func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	if os.Getenv("UZI_POOL_MEMORY_MEASURE") != "1" {
@@ -2690,6 +2969,9 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	if outPath == "" {
 		t.Fatal("UZI_POOL_MEMORY_OUT must name the JSON-lines output file")
 	}
+	if _, err := pmSQLLoad(); err != nil {
+		t.Fatalf("parse sqlc query texts: %v", err)
+	}
 	if len(pmBreadth) < pmMinIdentities {
 		t.Fatalf("breadth table has %d entries, need >= %d", len(pmBreadth), pmMinIdentities)
 	}
@@ -2699,32 +2981,50 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 			t.Fatalf("duplicate breadth entry %s", en.Name)
 		}
 		seen[en.Name] = true
-		if _, ok := pmSQL[en.Name]; !ok {
+		if _, ok := pmSQLTexts()[en.Name]; !ok {
 			t.Fatalf("breadth entry %s has no sqlc query text", en.Name)
 		}
 	}
 	ctx := context.Background()
-	f, err := os.Create(outPath)
+	pmRequireThrowawayDB(ctx, t, dsn)
+	outPath = filepath.Clean(outPath)
+	f, err := os.Create(outPath) //nolint:gosec // G304: path is the operator-supplied measurement output under opt-in env
 	if err != nil {
 		t.Fatalf("create output: %v", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close output: %v", err)
+		}
+	}()
 	out := &pmOut{f: f}
 	rawDir := filepath.Dir(outPath)
 
-	if err := store.Migrate(ctx, dsn); err != nil {
+	phases := pmPhaseSet(t)
+
+	// Seed ONCE into the template database, then stop connecting to it: every measurement
+	// below runs on a fresh clone. The marker was checked on the maintenance database above;
+	// a marker there is the evidence that this instance is a throwaway.
+	adminDSN := dsn
+	if err := pmDropDB(adminDSN, pmTemplateDB); err != nil {
+		t.Fatalf("drop stale template: %v", err)
+	}
+	if err := pmAdminExec(ctx, adminDSN, "CREATE DATABASE "+pgx.Identifier{pmTemplateDB}.Sanitize()); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := pmDropDB(adminDSN, pmTemplateDB); err != nil {
+			t.Errorf("drop template: %v", err)
+		}
+	})
+	tdsn := pmDSNForDB(t, adminDSN, pmTemplateDB)
+	if err := store.Migrate(ctx, tdsn); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	fx := pmSeed(ctx, t, dsn)
-	oc, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("observer connect: %v", err)
-	}
-	defer func() { _ = oc.Close(ctx) }()
-	obs := &pmObserver{conn: oc}
+	fx := pmSeed(ctx, t, tdsn)
 
-	// Validate the fixture's read shapes once through a plain pool.
-	vp, err := store.OpenPool(ctx, dsn)
+	// Validate the fixture's read shapes once through a plain pool (before the first clone).
+	vp, err := store.OpenPool(ctx, tdsn)
 	if err != nil {
 		t.Fatalf("open validation pool: %v", err)
 	}
@@ -2749,56 +3049,93 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	vp.Close()
 
 	if os.Getenv("UZI_POOL_MEMORY_DISCOVER") == "1" {
-		pmDiscover(ctx, t, out, dsn, fx)
+		pmDiscover(ctx, t, out, tdsn, fx)
 		return
 	}
 
-	var ver, sb, maxConn, cgMax string
+	var ver, sb, maxConn, autovac, cgMax string
+	mc, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("meta connect: %v", err)
+	}
 	for _, x := range []struct {
 		sql string
 		dst *string
-	}{{"SHOW server_version", &ver}, {"SHOW shared_buffers", &sb}, {"SHOW max_connections", &maxConn}} {
-		if err := obs.queryRow(ctx, x.sql, nil, x.dst); err != nil {
+	}{{"SHOW server_version", &ver}, {"SHOW shared_buffers", &sb}, {"SHOW max_connections", &maxConn}, {"SHOW autovacuum", &autovac}} {
+		if err := mc.QueryRow(ctx, x.sql, pgx.QueryExecModeSimpleProtocol).Scan(x.dst); err != nil {
 			t.Fatalf("%s: %v", x.sql, err)
 		}
 	}
-	if err := obs.queryRow(ctx, `SELECT pg_read_file('/sys/fs/cgroup/memory.max')`, nil, &cgMax); err != nil {
+	if err := mc.QueryRow(ctx, `SELECT pg_read_file('/sys/fs/cgroup/memory.max')`, pgx.QueryExecModeSimpleProtocol).Scan(&cgMax); err != nil {
 		cgMax = "unavailable: " + err.Error()
 	}
+	_ = mc.Close(ctx)
+	lab := &pmLab{t: t, out: out, adminDSN: adminDSN, fx: fx, rawDir: rawDir}
+	reps := pmEnvInt("UZI_POOL_MEMORY_REPS", 2)
 	cands := pmCandidates()
-	var candMeta []pmCand
-	candMeta = append(candMeta, cands...)
+	if len(cands) != pmLatencyRounds {
+		t.Fatalf("%d candidates but pmLatencyRounds %d: latency rotation would not lead each candidate once", len(cands), pmLatencyRounds)
+	}
 	out.emit("meta", map[string]any{
 		"started_at": time.Now().UTC(), "server_version": ver, "shared_buffers": sb, "max_connections": maxConn,
+		"autovacuum": autovac, "phases": phases, "memory_reps": reps, "template_database": pmTemplateDB,
 		"cgroup_memory_max": strings.TrimSpace(cgMax), "go_version": runtime.Version(), "num_cpu": runtime.NumCPU(),
-		"breadth_entries": len(pmBreadth), "sqlc_query_texts": len(pmSQL), "candidates": candMeta,
+		"breadth_entries": len(pmBreadth), "sqlc_query_texts": len(pmSQLTexts()), "candidates": cands,
 		"latency_n": pmLatencyN, "latency_rounds": pmLatencyRounds, "hot_reps_per_round": pmHotReps,
 		"sampler_interval_target_ms": pmSampleInterval.Milliseconds(),
 		"fixture": map[string]any{"page_rows": pmWantPage, "totals_rows": fx.WantTotals, "self_usage_run_count": pmWantRunCount,
 			"run_messages": pmWantMessages, "base_messages": fx.BaseMessages},
 	})
 
-	// Phase 1: memory, one candidate at a time.
-	for _, c := range cands {
-		e := newPMEnv(t, out, dsn, c, fx, obs, rawDir)
-		e.runMemory(ctx)
+	// Phase 1: memory. Each candidate and repetition runs alone on its own fresh clone with
+	// its own observer. Odd repetitions run in candidate order, even ones in reverse, so
+	// position in the sequence cannot masquerade as a candidate effect.
+	if phases["memory"] {
+		for rep := 1; rep <= reps; rep++ {
+			order := slices.Clone(cands)
+			if rep%2 == 0 {
+				slices.Reverse(order)
+			}
+			for _, c := range order {
+				lab.withClone(ctx, fmt.Sprintf("mem_%s_r%d", c.Name, rep), func(cdsn string, obs *pmObserver) {
+					e := newPMEnv(t, out, cdsn, c, fx, obs, rawDir)
+					e.rep = rep
+					e.dbName = "pm_" + strings.ToLower(fmt.Sprintf("mem_%s_r%d", c.Name, rep))
+					e.runMemory(ctx)
+				})
+			}
+		}
 	}
-	// Phase 2: latency comparison, then the supplemental stress variant.
-	pmRunLatency(ctx, t, out, dsn, fx, obs, rawDir, cands, "headline_k1", pmLatencyN, 1)
-	pmRunLatency(ctx, t, out, dsn, fx, obs, rawDir, cands, "supplemental_stress", pmStressN, pmStressBreadthK)
-	// Phase 3: cold reconnect.
-	pmRunCold(ctx, t, out, dsn, fx, obs, rawDir, cands, 7)
-	// Phase 4: supplemental envelope.
-	_, order, err := pmSQLConstants()
-	if err != nil {
-		t.Fatalf("enumerate sqlc constants: %v", err)
+	// Phase 2: latency comparison (each round on a fresh clone), then the supplemental
+	// stress variant.
+	if phases["latency"] {
+		pmRunLatency(ctx, lab, cands, "headline_k1", pmLatencyN, 1)
 	}
-	for _, c := range []pmCand{
-		{Name: "cap4096", Desc: "statement cache 4096 (holds every sqlc statement)", StmtCap: 4096},
-		{Name: "default512", Desc: "pgx default statement cache 512"},
-	} {
-		pmRunEnvelope(ctx, t, out, dsn, fx, obs, rawDir, c, false, order)
-		pmRunEnvelope(ctx, t, out, dsn, fx, obs, rawDir, c, true, order)
+	if phases["stress"] {
+		pmRunLatency(ctx, lab, cands, "supplemental_stress", pmStressN, pmStressBreadthK)
+	}
+	// Phase 3: cold reconnect, on one fresh clone.
+	if phases["cold"] {
+		lab.withClone(ctx, "cold", func(cdsn string, obs *pmObserver) {
+			pmRunCold(ctx, t, out, cdsn, fx, obs, rawDir, cands, 7)
+		})
+	}
+	// Phase 4: supplemental lower-bound wide-read sample, each run on a fresh clone.
+	if phases["wide"] {
+		_, order, err := pmSQLConstants()
+		if err != nil {
+			t.Fatalf("enumerate sqlc constants: %v", err)
+		}
+		for _, c := range []pmCand{
+			{Name: "cap4096", Desc: "statement cache 4096 (holds every sqlc statement)", StmtCap: 4096},
+			{Name: "default512", Desc: "pgx default statement cache 512"},
+		} {
+			for _, generic := range []bool{false, true} {
+				lab.withClone(ctx, fmt.Sprintf("wide_%s_%t", c.Name, generic), func(cdsn string, obs *pmObserver) {
+					pmRunWide(ctx, t, out, cdsn, fx, obs, rawDir, c, generic, order)
+				})
+			}
+		}
 	}
 	out.emit("done", map[string]any{"finished_at": time.Now().UTC()})
 }
