@@ -30,9 +30,15 @@ package store_test
 // contains "llvm", and the first round it did). Run once with UZI_POOL_MEMORY_JIT=default and
 // once with off to separate the JIT confound.
 //
-// Isolation: the schema and fixture are seeded ONCE into database pm_template on the server
-// named by UZI_TEST_DATABASE_URL (which is also where the throwaway marker is checked and
-// where CREATE/DROP DATABASE run). Measurements run on CREATE DATABASE ... TEMPLATE clones,
+// Isolation: the schema and fixture are seeded ONCE into a template database named
+// pm_<32 hex>_tpl on the server named by UZI_TEST_DATABASE_URL (which is also where the
+// throwaway marker is checked and where CREATE/DROP DATABASE run). The 32 hex chars are a fresh
+// UUID per invocation, and clones are pm_<same 32 hex>_<label>, so a run never touches a
+// database that existed before it. Every CREATE/ALTER/DROP DATABASE goes through pmAdminExec,
+// which rechecks the marker on its own connection and runs nothing without it. A database is
+// dropped only if this run's CREATE of it succeeded; an ambiguous CREATE outcome preserves the
+// database and reports the manual DROP. There is no startup cleanup: a crashed run's leftovers
+// are swept by hand (see pmLab). Measurements run on CREATE DATABASE ... TEMPLATE clones,
 // each with its own observer connection, dropped afterwards. The isolation differs per phase:
 //   - Memory: one clone per candidate x repetition.
 //   - Latency and stress: one clone per round, shared by every candidate in that round (see
@@ -2801,7 +2807,7 @@ func pmRunLatency(ctx context.Context, lab *pmLab, cands []pmCand, variant strin
 	roundClaim := map[string][]float64{}
 	roundIns := map[string][]float64{}
 	for r := 0; r < pmLatencyRounds; r++ {
-		lab.withClone(ctx, fmt.Sprintf("lat_%s_r%d", variant, r+1), func(dsn string, obs *pmObserver) {
+		lab.withClone(ctx, fmt.Sprintf("lat_%s_r%d", variant, r+1), func(_, dsn string, obs *pmObserver) {
 			for i := range cands {
 				c := cands[(i+r)%len(cands)]
 				e := newPMEnv(t, out, dsn, c, lab.fx, obs, lab.rawDir)
@@ -3095,7 +3101,7 @@ func pmRunExplain(ctx context.Context, lab *pmLab, rep int) {
 	if sqlText == "" {
 		t.Fatalf("no sqlc text for ClaimRun")
 	}
-	lab.withClone(ctx, fmt.Sprintf("expl_%s_r%d", lab.jit, rep), func(dsn string, obs *pmObserver) {
+	lab.withClone(ctx, fmt.Sprintf("expl_%s_r%d", lab.jit, rep), func(_, dsn string, obs *pmObserver) {
 		// 1. Capture ClaimRun's real bindings on a throwaway connection.
 		var args []any
 		ccfg, err := pgx.ParseConfig(dsn)
@@ -3240,22 +3246,36 @@ func pmRequireThrowawayDB(ctx context.Context, t *testing.T, dsn string) {
 		t.Fatalf("marker check connect: %v", err)
 	}
 	defer func() { _ = c.Close(ctx) }()
-	var n int
-	if err := c.QueryRow(ctx,
-		`SELECT count(*)::int FROM uzi_test_harness.database_marker WHERE marker = 'recovery-reset-v1'`).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("refusing to run: uzi_test_harness.database_marker lacks recovery-reset-v1 (count %d, err %v); "+
-			"initialise a throwaway database with e2e/test-database-marker.sql", n, err)
+	if err := pmCheckMarker(ctx, c); err != nil {
+		t.Fatalf("refusing to run: %v; initialise a throwaway database with e2e/test-database-marker.sql", err)
 	}
 }
 
-// pmTemplateDB is the database the fixture is seeded into once. Measurements run on throwaway
-// clones of it (CREATE DATABASE ... TEMPLATE), but the validation pool and discover mode still
-// connect to it after seeding, and clones are per phase as described in the file header (latency,
-// stress and cold candidates share a clone), so not every candidate starts from identical bloat.
-const pmTemplateDB = "pm_template"
+// pmCheckMarker errors unless the connected database carries exactly one throwaway marker row.
+func pmCheckMarker(ctx context.Context, c *pgx.Conn) error {
+	var n int
+	if err := c.QueryRow(ctx,
+		`SELECT count(*)::int FROM uzi_test_harness.database_marker WHERE marker = 'recovery-reset-v1'`).Scan(&n); err != nil {
+		return fmt.Errorf("uzi_test_harness.database_marker unreadable: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("uzi_test_harness.database_marker lacks recovery-reset-v1 (count %d)", n)
+	}
+	return nil
+}
 
 // pmLab owns the cloning of the seeded template. adminDSN is the maintenance database the
 // marker was checked on; CREATE and DROP DATABASE run there on a superuser connection.
+//
+// Every invocation names its databases from its own random prefix (template prefix+"_tpl",
+// clones prefix+"_"+label) and drops only databases whose CREATE it saw succeed, so it can
+// never drop a database it did not create. There is no startup cleanup. After a crashed run,
+// leftovers can be listed and dropped by hand (never automatically):
+//
+//	SELECT datname FROM pg_database WHERE datname ~ '^pm_[0-9a-f]{32}_'
+//
+// The template is NOT untouched after seeding: the validation pool and discover mode still
+// connect to it, and clones are per phase as described in the file header.
 type pmLab struct {
 	t        *testing.T
 	out      *pmOut
@@ -3265,6 +3285,78 @@ type pmLab struct {
 	// jit is "default" (clones keep the server's jit setting) or "off" (every clone gets
 	// ALTER DATABASE ... SET jit = off before anything connects to it).
 	jit string
+	// prefix is "pm_" plus 32 hex chars, unique per invocation; templateName is the owned
+	// template database name.
+	prefix       string
+	templateName string
+	// exec runs one admin statement; nil means pmAdminExec. It is a plain func value so a copy
+	// of the lab (el := *lab) stays safe.
+	exec func(ctx context.Context, adminDSN, sql string) error
+}
+
+func (l *pmLab) run(ctx context.Context, sql string) error {
+	if l.exec != nil {
+		return l.exec(ctx, l.adminDSN, sql)
+	}
+	return pmAdminExec(ctx, l.adminDSN, sql)
+}
+
+// drop issues DROP DATABASE IF EXISTS ... WITH (FORCE) through the lab's exec seam.
+func (l *pmLab) drop(name string) error {
+	return pmDropDBWith(l.run, name)
+}
+
+// create runs a CREATE DATABASE statement for name and reports whether this call owns the
+// database. An ambiguous outcome (the statement may have been applied) preserves the database
+// and returns an error naming the manual drop; a definite failure drops nothing.
+func (l *pmLab) create(ctx context.Context, name, sql string) (bool, error) {
+	err := l.run(ctx, sql)
+	created, ambiguous := pmCreateOutcome(err)
+	switch {
+	case created:
+		return true, nil
+	case ambiguous:
+		return false, fmt.Errorf("creation outcome ambiguous; %s preserved, not dropped; if it exists and is unwanted run: DROP DATABASE %s WITH (FORCE): %w",
+			name, pgx.Identifier{name}.Sanitize(), err)
+	default:
+		return false, fmt.Errorf("create database %s: %w", name, err)
+	}
+}
+
+// pmDBName joins prefix and suffix, lowercasing the suffix. It rejects characters outside
+// [a-z0-9_] and any name over PostgreSQL's 63-byte identifier limit (never truncates).
+func pmDBName(prefix, suffix string) (string, error) {
+	suffix = strings.ToLower(suffix)
+	for _, r := range suffix {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+			return "", fmt.Errorf("database name suffix %q has invalid character %q (allowed [a-z0-9_])", suffix, r)
+		}
+	}
+	name := prefix + suffix
+	if len(name) > 63 {
+		return "", fmt.Errorf("database name %q is %d bytes, over the 63-byte limit", name, len(name))
+	}
+	return name, nil
+}
+
+// pmCreateOutcome decides ownership after a CREATE DATABASE attempt. nil means created. A
+// connect- or marker-stage pmAdminErr means nothing ran. At exec stage (or for any error that is
+// not a pmAdminErr), a PgError with unlocalized severity ERROR means the statement was rejected
+// and nothing was created; anything else (FATAL, PANIC, a lost connection, a context error) is
+// ambiguous: the server may have applied it.
+func pmCreateOutcome(err error) (created, ambiguous bool) {
+	if err == nil {
+		return true, false
+	}
+	var ae *pmAdminErr
+	if errors.As(err, &ae) && (ae.Stage == pmStageConnect || ae.Stage == pmStageMarker) {
+		return false, false
+	}
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.SeverityUnlocalized == "ERROR" {
+		return false, false
+	}
+	return false, true
 }
 
 // pmDSNForDB returns dsn with its database name replaced. Only URL-form DSNs are supported.
@@ -3287,57 +3379,91 @@ func pmDSNForDB(t *testing.T, dsn, db string) string {
 
 // pmAdminExec runs one statement (simple protocol, so CREATE/DROP DATABASE are legal) on a
 // short-lived superuser connection to the maintenance database.
+const (
+	pmStageConnect = "connect"
+	pmStageMarker  = "marker"
+	pmStageExec    = "exec"
+)
+
+// pmAdminErr is the error pmAdminExec returns, carrying the stage that failed so callers can
+// tell "nothing ran" (connect, marker) from "the statement may have run" (exec).
+type pmAdminErr struct {
+	Stage string
+	Err   error
+}
+
+func (e *pmAdminErr) Error() string { return "admin " + e.Stage + ": " + e.Err.Error() }
+func (e *pmAdminErr) Unwrap() error { return e.Err }
+
+// pmAdminExec runs one statement (simple protocol, so CREATE/DROP DATABASE are legal) on a
+// short-lived superuser connection to the maintenance database. It rechecks the throwaway
+// marker on that same connection first and runs nothing if the marker is missing.
 func pmAdminExec(ctx context.Context, adminDSN, sql string) error {
 	c, err := pgx.Connect(ctx, adminDSN)
 	if err != nil {
-		return fmt.Errorf("admin connect: %w", err)
+		return &pmAdminErr{Stage: pmStageConnect, Err: err}
 	}
 	defer func() { _ = c.Close(ctx) }()
+	if err := pmCheckMarker(ctx, c); err != nil {
+		return &pmAdminErr{Stage: pmStageMarker, Err: err}
+	}
 	if _, err := c.Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol); err != nil {
-		return fmt.Errorf("admin exec %.80q: %w", sql, err)
+		return &pmAdminErr{Stage: pmStageExec, Err: fmt.Errorf("%.80q: %w", sql, err)}
 	}
 	return nil
 }
 
 func pmDropDB(adminDSN, name string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	return pmAdminExec(ctx, adminDSN, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	return pmDropDBWith(func(ctx context.Context, sql string) error { return pmAdminExec(ctx, adminDSN, sql) }, name)
 }
 
-// withClone creates database pm_<label> from the template, hands fn a DSN for it plus an
-// observer connection to the same clone, then closes the observer and drops the clone.
-func (l *pmLab) withClone(ctx context.Context, label string, fn func(dsn string, obs *pmObserver)) {
-	t := l.t
-	t.Helper()
-	name := "pm_" + strings.ToLower(label)
-	if len(name) > 60 {
-		t.Fatalf("clone name %q too long", name)
+func pmDropDBWith(run func(ctx context.Context, sql string) error, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return run(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+}
+
+// withClone is clone with any error turned into t.Fatalf.
+func (l *pmLab) withClone(ctx context.Context, label string, fn func(name, dsn string, obs *pmObserver)) {
+	l.t.Helper()
+	if err := l.clone(ctx, label, fn); err != nil {
+		l.t.Fatalf("%v", err)
 	}
-	if err := pmDropDB(l.adminDSN, name); err != nil {
-		t.Fatalf("drop stale clone %s: %v", name, err)
+}
+
+// clone creates database <prefix>_<label> from the lab's template, hands fn its real name, a DSN
+// plus an observer connection to the same clone, then closes the observer and drops the clone.
+// The drop is registered only when this call's CREATE is known to have succeeded.
+func (l *pmLab) clone(ctx context.Context, label string, fn func(name, dsn string, obs *pmObserver)) error {
+	name, err := pmDBName(l.prefix, "_"+label)
+	if err != nil {
+		return fmt.Errorf("clone name: %w", err)
 	}
-	if err := pmAdminExec(ctx, l.adminDSN, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{pmTemplateDB}.Sanitize()); err != nil {
-		t.Fatalf("create clone %s: %v", name, err)
+	created, err := l.create(ctx, name, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{l.templateName}.Sanitize())
+	if err != nil {
+		return err
 	}
-	defer func() {
-		if err := pmDropDB(l.adminDSN, name); err != nil {
-			t.Errorf("drop clone %s: %v", name, err)
-		}
-	}()
+	if created {
+		defer func() {
+			if err := l.drop(name); err != nil {
+				l.t.Errorf("drop clone %s: %v", name, err)
+			}
+		}()
+	}
 	if l.jit == "off" {
-		if err := pmAdminExec(ctx, l.adminDSN, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" SET jit = off"); err != nil {
-			t.Fatalf("disable jit on clone %s: %v", name, err)
+		if err := l.run(ctx, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" SET jit = off"); err != nil {
+			return fmt.Errorf("disable jit on clone %s: %w", name, err)
 		}
 	}
-	dsn := pmDSNForDB(t, l.adminDSN, name)
+	dsn := pmDSNForDB(l.t, l.adminDSN, name)
 	oc, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		t.Fatalf("observer connect to clone %s: %v", name, err)
+		return fmt.Errorf("observer connect to clone %s: %w", name, err)
 	}
 	defer func() { _ = oc.Close(ctx) }()
 	l.out.emit("clone", map[string]any{"database": name, "label": label, "created_at": time.Now().UTC(), "jit": l.jit})
-	fn(dsn, &pmObserver{conn: oc})
+	fn(name, dsn, &pmObserver{conn: oc})
+	return nil
 }
 
 // pmPhaseSet parses UZI_POOL_MEMORY_PHASES, a comma list of memory,latency,cold,wide,stress,
@@ -3413,18 +3539,27 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	// mode still connect to the template. The marker was checked on the maintenance database above;
 	// a marker there is the evidence that this instance is a throwaway.
 	adminDSN := dsn
-	if err := pmDropDB(adminDSN, pmTemplateDB); err != nil {
-		t.Fatalf("drop stale template: %v", err)
+	lab := &pmLab{t: t, out: out, adminDSN: adminDSN, rawDir: rawDir, jit: pmJITSetting(t),
+		prefix: "pm_" + strings.ReplaceAll(uuid.New().String(), "-", ""), exec: pmAdminExec}
+	tplName, err := pmDBName(lab.prefix, "_tpl")
+	if err != nil {
+		t.Fatalf("template name: %v", err)
 	}
-	if err := pmAdminExec(ctx, adminDSN, "CREATE DATABASE "+pgx.Identifier{pmTemplateDB}.Sanitize()); err != nil {
+	lab.templateName = tplName
+	// The template and every clone are named from this invocation's own prefix, so no existing
+	// database can collide with them and nothing is dropped unless this run created it.
+	created, err := lab.create(ctx, tplName, "CREATE DATABASE "+pgx.Identifier{tplName}.Sanitize())
+	if err != nil {
 		t.Fatalf("create template: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := pmDropDB(adminDSN, pmTemplateDB); err != nil {
-			t.Errorf("drop template: %v", err)
-		}
-	})
-	tdsn := pmDSNForDB(t, adminDSN, pmTemplateDB)
+	if created {
+		t.Cleanup(func() {
+			if err := lab.drop(tplName); err != nil {
+				t.Errorf("drop template: %v", err)
+			}
+		})
+	}
+	tdsn := pmDSNForDB(t, adminDSN, tplName)
 	if err := store.Migrate(ctx, tdsn); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -3497,7 +3632,7 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 		t.Fatalf("pg_jit_available: %v", err)
 	}
 	_ = jc.Close(ctx)
-	lab := &pmLab{t: t, out: out, adminDSN: adminDSN, fx: fx, rawDir: rawDir, jit: pmJITSetting(t)}
+	lab.fx = fx
 	reps := pmEnvMinInt(t, "UZI_POOL_MEMORY_REPS", 2, 1)
 	cands := pmCandidates()
 	if len(cands) != pmLatencyRounds {
@@ -3505,7 +3640,7 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	}
 	out.emit("meta", map[string]any{
 		"started_at": time.Now().UTC(), "server_version": ver, "shared_buffers": sb, "max_connections": maxConn,
-		"autovacuum": autovac, "phases": phases, "memory_reps": reps, "template_database": pmTemplateDB,
+		"autovacuum": autovac, "phases": phases, "memory_reps": reps, "template_database": lab.templateName, "database_prefix": lab.prefix,
 		"jit_requested": lab.jit, "server_show_jit": jitSrv, "server_pg_jit_available": jitAvail, "server_jit_above_cost": jitAbove,
 		"server_jit_inline_above_cost": jitInlineAbove, "server_jit_optimize_above_cost": jitOptAbove,
 		"cgroup_memory_max": strings.TrimSpace(cgMax), "go_version": runtime.Version(), "num_cpu": runtime.NumCPU(),
@@ -3526,10 +3661,10 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 				slices.Reverse(order)
 			}
 			for _, c := range order {
-				lab.withClone(ctx, fmt.Sprintf("mem_%s_r%d", c.Name, rep), func(cdsn string, obs *pmObserver) {
+				lab.withClone(ctx, fmt.Sprintf("mem_%s_r%d", c.Name, rep), func(name, cdsn string, obs *pmObserver) {
 					e := newPMEnv(t, out, cdsn, c, fx, obs, rawDir)
 					e.rep = rep
-					e.dbName = "pm_" + strings.ToLower(fmt.Sprintf("mem_%s_r%d", c.Name, rep))
+					e.dbName = name
 					e.runMemory(ctx)
 				})
 			}
@@ -3545,7 +3680,7 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	}
 	// Phase 3: cold reconnect, on one fresh clone.
 	if phases["cold"] {
-		lab.withClone(ctx, "cold", func(cdsn string, obs *pmObserver) {
+		lab.withClone(ctx, "cold", func(_, cdsn string, obs *pmObserver) {
 			pmRunCold(ctx, t, out, cdsn, fx, obs, rawDir, cands, 7)
 		})
 	}
@@ -3560,7 +3695,7 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 			{Name: "default512", Desc: "pgx default statement cache 512"},
 		} {
 			for _, generic := range []bool{false, true} {
-				lab.withClone(ctx, fmt.Sprintf("wide_%s_%t", c.Name, generic), func(cdsn string, obs *pmObserver) {
+				lab.withClone(ctx, fmt.Sprintf("wide_%s_%t", c.Name, generic), func(_, cdsn string, obs *pmObserver) {
 					pmRunWide(ctx, t, out, cdsn, fx, obs, rawDir, c, generic, order)
 				})
 			}
