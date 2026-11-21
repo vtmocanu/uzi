@@ -105,8 +105,8 @@ can be edited and reset but never removed.
 
 - **Adding.** The table holds up to 16 sizes. A name is lowercase letters, digits and
   hyphens, starts with a letter and is at most 16 characters. A new size is validated
-  against the same chart ceilings as an edit. If another admin adds the same name
-  first, your add is refused as a name conflict rather than overwriting theirs, and the
+  against the same chart ceilings as an edit. If the name was added after your table
+  loaded (for example by another admin), your add is refused as a name conflict rather than overwriting theirs, and the
   form keeps the values you entered. Admin-added sizes appear in the
   provision form, in the `SIZE` column of `uzi worker list` and `uzi worker get`, and
   in the TUI. They can also be chosen as the
