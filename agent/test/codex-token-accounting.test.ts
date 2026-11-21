@@ -894,7 +894,8 @@ describe("#4580 randomized conservation across cuts", () => {
   }
   const MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6.1-sol"];
 
-  function runFamily(family: "well-formed" | "malformed", baseSeed: number, stats = { multiModel: 0 }): string | undefined {
+  function runFamily(family: "well-formed" | "malformed", baseSeed: number,
+    stats = { multiModel: 0, malformedNotes: 0, incomplete: 0 }): string | undefined {
     for (let k = 0; k < 200; k++) {
       const seed = baseSeed + k;
       const rnd = mulberry32(seed);
@@ -907,6 +908,7 @@ describe("#4580 randomized conservation across cuts", () => {
       const history: CodexThreadTokenUsage[] = [];
       const steps = 3 + int(9);
       let cuts = 0;
+      let malformedPhase = true;
       for (let i = 0; i < steps; i++) {
         const kind = int(9);
         if (kind <= 3 && cuts < 4) {
@@ -923,19 +925,29 @@ describe("#4580 randomized conservation across cuts", () => {
           continue;
         }
         const inInc = int(50);
+        const outInc = int(50);
+        // Raw uncached input before this step; negative while the cache split is malformed.
+        const rawBefore = s.inputTokens - s.cachedInputTokens - s.cacheWriteInputTokens;
         s.inputTokens += inInc;
-        s.outputTokens += int(50);
+        s.outputTokens += outInc;
         s.reasoningOutputTokens = Math.min(s.reasoningOutputTokens + int(20), s.outputTokens);
-        if (family === "well-formed") {
+        if (family === "malformed" && malformedPhase) {
+          // Malformed prefix: cached exceeds input, so the clamped uncached input stays 0.
+          s.cachedInputTokens = Math.max(s.cachedInputTokens, s.inputTokens + 1 + int(5));
+          s.cacheWriteInputTokens += int(10);
+          stats.malformedNotes++;
+          if (rnd() < 0.3) malformedPhase = false; // once well-formed, the split stays well-formed
+        } else if (rawBefore < 0) {
+          // Leaving a malformed split: the clamped uncached input is 0 before, so any raw
+          // growth keeps it non-decreasing.
+          s.cachedInputTokens += int(10);
+          s.cacheWriteInputTokens += int(5);
+        } else {
           // Bound the cache increments by this step's input increment so the clamped uncached
-          // input never decreases: the family is monotone in all gated columns.
+          // input never decreases: every generated note is monotone in all seven gated columns.
           const c = int(inInc);
           s.cachedInputTokens += c;
           s.cacheWriteInputTokens += int(inInc - c);
-        } else {
-          if (i === 0 || rnd() < 0.5) s.cachedInputTokens = Math.max(s.cachedInputTokens, s.inputTokens + int(5));
-          else s.cachedInputTokens += int(60);
-          s.cacheWriteInputTokens += int(10);
         }
         const note: CodexThreadTokenUsage = {
           total: { ...s, totalTokens: s.inputTokens + s.outputTokens },
@@ -943,6 +955,9 @@ describe("#4580 randomized conservation across cuts", () => {
         };
         history.push(note);
         const r = acct.record("t", note);
+        // Every generated note is monotone, so one that advances the magnitude must be adopted;
+        // regression refusals are covered by the deterministic gate tests, not here.
+        if (inInc + outInc > 0 && r === undefined) return `seed ${seed} (${family}): a monotone advancing note was refused`;
         if (r !== undefined) {
           accepted = { ...s };
           if (r.model !== cur) return `seed ${seed}: adopted model ${r.model} expected ${cur}`;
@@ -950,6 +965,7 @@ describe("#4580 randomized conservation across cuts", () => {
         if (int(5) === 0) acct.record("t", note); // an immediate duplicate must not move anything
       }
       if (family === "well-formed" && acct.usageIncomplete) return `seed ${seed}: a well-formed sequence ended incomplete`;
+      if (acct.usageIncomplete) stats.incomplete++;
       const agg = acct.aggregateByModel() ?? {};
       const withTokens = Object.values(agg).filter(e =>
         e.inputTokens + e.outputTokens + e.cacheReadInputTokens + e.cacheCreationInputTokens > 0).length;
@@ -971,14 +987,20 @@ describe("#4580 randomized conservation across cuts", () => {
   }
 
   it("well-formed notes: 200 seeded sequences conserve every emitted column", () => {
-    const stats = { multiModel: 0 };
+    const stats = { multiModel: 0, malformedNotes: 0, incomplete: 0 };
     const mismatch = runFamily("well-formed", 1000, stats);
     assert.equal(mismatch, undefined, mismatch ?? "");
     assert.ok(stats.multiModel >= 100, `only ${stats.multiModel} of 200 sequences carried tokens on 2+ models`);
   });
 
   it("malformed cache splits: 200 seeded sequences conserve every emitted column", () => {
-    const mismatch = runFamily("malformed", 5000);
+    // Raw columns and the clamped uncached input stay monotone, so every advancing note is
+    // adopted: a malformed prefix (cached above input) is followed by a well-formed tail.
+    const stats = { multiModel: 0, malformedNotes: 0, incomplete: 0 };
+    const mismatch = runFamily("malformed", 5000, stats);
     assert.equal(mismatch, undefined, mismatch ?? "");
+    assert.ok(stats.malformedNotes >= 200, `only ${stats.malformedNotes} malformed notes generated`);
+    assert.ok(stats.multiModel >= 50, `only ${stats.multiModel} of 200 sequences carried tokens on 2+ models`);
+    assert.ok(stats.incomplete >= 20, `only ${stats.incomplete} of 200 sequences hit the D6 boundary check`);
   });
 });
