@@ -58,7 +58,7 @@ func TestRunEnvDTOWithholdsWhenVaultLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD,
+	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD, AadVersion: runenv.AADVersion1,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
 	// Control: unlocked, the same row opens, so only the vaultLocked branch withholds it.
 	if dto, _ := h.runEnvDTO(userID, repoID, row, false); dto.Value == nil || *dto.Value != "stale-plain" {
@@ -88,7 +88,7 @@ func TestRunEnvWriteDTOWithholdsWhenVaultLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD,
+	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD, AadVersion: runenv.AADVersion1,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
 	if dto, _ := h.runEnvDTO(userID, repoID, row, false); dto.Value == nil {
 		t.Fatalf("control: the row must open when not reported locked: %+v", dto)

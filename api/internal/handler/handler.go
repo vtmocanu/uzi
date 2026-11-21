@@ -88,7 +88,7 @@ type Handler struct {
 	secretBeginTx func(ctx context.Context) (pgx.Tx, error)
 	// runEnvHasReceipt, when non-nil, replaces store.RunEnvVersionHasReceipt as the answer to
 	// "does any run hold a delivery receipt for this variable version" (PRD #4416), so a
-	// test can reach the retire and pending-deletion paths before M2 adds receipts. nil in
+	// test can reach the retire and pending-deletion paths without a run. nil in
 	// production.
 	runEnvHasReceipt func(ctx context.Context, varID uuid.UUID, rev int32) (bool, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset

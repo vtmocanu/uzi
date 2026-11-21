@@ -49,7 +49,7 @@ func (q *Queries) DeleteRunEnvVarVersion(ctx context.Context, arg DeleteRunEnvVa
 
 const getLiveRunEnvVarByName = `-- name: GetLiveRunEnvVarByName :one
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
-       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND name = $3
   AND retired_at IS NULL AND pending_delete_at IS NULL
@@ -83,13 +83,14 @@ func (q *Queries) GetLiveRunEnvVarByName(ctx context.Context, arg GetLiveRunEnvV
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }
 
 const getLiveRunEnvVarByNameForUpdate = `-- name: GetLiveRunEnvVarByNameForUpdate :one
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
-       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND name = $3
   AND retired_at IS NULL AND pending_delete_at IS NULL
@@ -123,6 +124,7 @@ func (q *Queries) GetLiveRunEnvVarByNameForUpdate(ctx context.Context, arg GetLi
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }
@@ -184,11 +186,11 @@ func (q *Queries) GetRunEnvScopeUsage(ctx context.Context, arg GetRunEnvScopeUsa
 
 const insertRunEnvVar = `-- name: InsertRunEnvVar :one
 INSERT INTO run_env_vars (var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with,
-                          value_bytes, rev, disabled_at)
+                          value_bytes, rev, disabled_at, aad_version)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-        $9, $10, $11)
+        $9, $10, $11, $12)
 RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-          disabled_at, pending_delete_at, created_at, updated_at
+          disabled_at, pending_delete_at, created_at, updated_at, aad_version
 `
 
 type InsertRunEnvVarParams struct {
@@ -203,6 +205,7 @@ type InsertRunEnvVarParams struct {
 	ValueBytes  int32              `json:"value_bytes"`
 	Rev         int32              `json:"rev"`
 	DisabledAt  pgtype.Timestamptz `json:"disabled_at"`
+	AadVersion  int16              `json:"aad_version"`
 }
 
 type InsertRunEnvVarRow struct {
@@ -219,6 +222,7 @@ type InsertRunEnvVarRow struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
 }
 
 func (q *Queries) InsertRunEnvVar(ctx context.Context, arg InsertRunEnvVarParams) (InsertRunEnvVarRow, error) {
@@ -234,6 +238,7 @@ func (q *Queries) InsertRunEnvVar(ctx context.Context, arg InsertRunEnvVarParams
 		arg.ValueBytes,
 		arg.Rev,
 		arg.DisabledAt,
+		arg.AadVersion,
 	)
 	var i InsertRunEnvVarRow
 	err := row.Scan(
@@ -250,6 +255,7 @@ func (q *Queries) InsertRunEnvVar(ctx context.Context, arg InsertRunEnvVarParams
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }
@@ -292,7 +298,7 @@ func (q *Queries) ListRunEnvVarCountsForUser(ctx context.Context, userID uuid.UU
 const listRunEnvVarsForRepo = `-- name: ListRunEnvVarsForRepo :many
 
 SELECT id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-       disabled_at, pending_delete_at, created_at, updated_at
+       disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND retired_at IS NULL
 ORDER BY name, (pending_delete_at IS NOT NULL), rev DESC
@@ -317,6 +323,7 @@ type ListRunEnvVarsForRepoRow struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
 }
 
 // PRD #4416 M1: run environment variables. Every write runs inside a transaction that
@@ -347,6 +354,7 @@ func (q *Queries) ListRunEnvVarsForRepo(ctx context.Context, arg ListRunEnvVarsF
 			&i.PendingDeleteAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.AadVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -415,7 +423,7 @@ SET disabled_at = CASE WHEN $1::boolean THEN coalesce(disabled_at, now()) ELSE N
     updated_at = now()
 WHERE id = $2 AND user_id = $3
 RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-          disabled_at, pending_delete_at, created_at, updated_at
+          disabled_at, pending_delete_at, created_at, updated_at, aad_version
 `
 
 type SetRunEnvVarDisabledParams struct {
@@ -438,6 +446,7 @@ type SetRunEnvVarDisabledRow struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
 }
 
 // Disable and Enable are metadata-only on the live version.
@@ -458,6 +467,7 @@ func (q *Queries) SetRunEnvVarDisabled(ctx context.Context, arg SetRunEnvVarDisa
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }
@@ -466,7 +476,7 @@ const updateRunEnvVarDescription = `-- name: UpdateRunEnvVarDescription :one
 UPDATE run_env_vars SET description = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
 RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-          disabled_at, pending_delete_at, created_at, updated_at
+          disabled_at, pending_delete_at, created_at, updated_at, aad_version
 `
 
 type UpdateRunEnvVarDescriptionParams struct {
@@ -489,6 +499,7 @@ type UpdateRunEnvVarDescriptionRow struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
 }
 
 // A description-only save changes the live row in place: no new version.
@@ -509,6 +520,7 @@ func (q *Queries) UpdateRunEnvVarDescription(ctx context.Context, arg UpdateRunE
 		&i.PendingDeleteAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AadVersion,
 	)
 	return i, err
 }

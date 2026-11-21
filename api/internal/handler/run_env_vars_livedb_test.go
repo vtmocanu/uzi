@@ -322,10 +322,20 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	}
 	var sealed []byte
 	var marker string
-	if err := f.pool.QueryRow(context.Background(), `SELECT ciphertext, sealed_with FROM run_env_vars WHERE name='PAYMENTS_SANDBOX_KEY' AND repo_id=$1`, f.repo).Scan(&sealed, &marker); err != nil {
+	var sealedVar uuid.UUID
+	var sealedRev int32
+	var sealedAAD int16
+	if err := f.pool.QueryRow(context.Background(), `SELECT ciphertext, sealed_with, var_id, rev, aad_version FROM run_env_vars WHERE name='PAYMENTS_SANDBOX_KEY' AND repo_id=$1`, f.repo).Scan(&sealed, &marker, &sealedVar, &sealedRev, &sealedAAD); err != nil {
 		t.Fatal(err)
 	}
-	opened, err := f.h.vault.Open(f.owner, runenv.AADKind(runenv.ScopeRepo, &f.repo, true, "PAYMENTS_SANDBOX_KEY"), marker, sealed)
+	if sealedAAD != runenv.AADVersion2 {
+		t.Fatalf("a version written by the handler has aad_version %d, want 2", sealedAAD)
+	}
+	sealedKind, err := runenv.AADFor(sealedAAD, f.owner, runenv.ScopeRepo, &f.repo, true, "PAYMENTS_SANDBOX_KEY", sealedVar, sealedRev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := f.h.vault.Open(f.owner, sealedKind, marker, sealed)
 	if err != nil || string(opened) != "now-a-plain-value" {
 		t.Fatalf("resealed value = %q, %v", opened, err)
 	}
@@ -758,9 +768,11 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 		rev    int
 		ct     []byte
 		marker string
+		varID  uuid.UUID
+		aadVer int16
 	}
 	load := func() []rowInfo {
-		rows, err := pool.Query(context.Background(), `SELECT id, repo_id, name, secret, rev, ciphertext, sealed_with FROM run_env_vars WHERE user_id=$1 ORDER BY id`, owner)
+		rows, err := pool.Query(context.Background(), `SELECT id, repo_id, name, secret, rev, ciphertext, sealed_with, var_id, aad_version FROM run_env_vars WHERE user_id=$1 ORDER BY id`, owner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -768,7 +780,7 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 		var out []rowInfo
 		for rows.Next() {
 			var r rowInfo
-			if err := rows.Scan(&r.id, &r.repo, &r.name, &r.secret, &r.rev, &r.ct, &r.marker); err != nil {
+			if err := rows.Scan(&r.id, &r.repo, &r.name, &r.secret, &r.rev, &r.ct, &r.marker, &r.varID, &r.aadVer); err != nil {
 				t.Fatal(err)
 			}
 			out = append(out, r)
@@ -800,7 +812,11 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 			if r.repo != nil {
 				scope = runenv.ScopeRepo
 			}
-			pt, err := h.vault.Open(owner, runenv.AADKind(scope, r.repo, r.secret, r.name), r.marker, r.ct)
+			kind, err := runenv.AADFor(r.aadVer, owner, scope, r.repo, r.secret, r.name, r.varID, int32(r.rev)) //nolint:gosec // G115: test revs are tiny.
+			if err != nil {
+				t.Fatal(err)
+			}
+			pt, err := h.vault.Open(owner, kind, r.marker, r.ct)
 			if err != nil {
 				t.Fatalf("%s does not open: %v", r.name, err)
 			}

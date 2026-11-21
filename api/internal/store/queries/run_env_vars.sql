@@ -6,7 +6,7 @@
 -- Retired versions are history and never listed. The ciphertext is returned so the
 -- handler can open plain values; secret values are never opened for a response.
 SELECT id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-       disabled_at, pending_delete_at, created_at, updated_at
+       disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = @user_id AND repo_id = @repo_id AND retired_at IS NULL
 ORDER BY name, (pending_delete_at IS NOT NULL), rev DESC;
@@ -15,7 +15,7 @@ ORDER BY name, (pending_delete_at IS NOT NULL), rev DESC;
 -- The live row of a repo-scope name. A plain read: the handler's planning read runs
 -- outside any transaction.
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
-       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = @user_id AND repo_id = @repo_id AND name = @name
   AND retired_at IS NULL AND pending_delete_at IS NULL;
@@ -23,7 +23,7 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND name = @name
 -- name: GetLiveRunEnvVarByNameForUpdate :one
 -- The same row, locked for the write that follows inside the secret-mutation transaction.
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
-       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at, aad_version
 FROM run_env_vars
 WHERE user_id = @user_id AND repo_id = @repo_id AND name = @name
   AND retired_at IS NULL AND pending_delete_at IS NULL
@@ -54,18 +54,18 @@ WHERE user_id = @user_id AND retired_at IS NOT NULL;
 
 -- name: InsertRunEnvVar :one
 INSERT INTO run_env_vars (var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with,
-                          value_bytes, rev, disabled_at)
+                          value_bytes, rev, disabled_at, aad_version)
 VALUES (@var_id, @user_id, sqlc.narg('repo_id'), @name, @secret, @description, @ciphertext, @sealed_with,
-        @value_bytes, @rev, sqlc.narg('disabled_at'))
+        @value_bytes, @rev, sqlc.narg('disabled_at'), @aad_version)
 RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-          disabled_at, pending_delete_at, created_at, updated_at;
+          disabled_at, pending_delete_at, created_at, updated_at, aad_version;
 
 -- name: UpdateRunEnvVarDescription :one
 -- A description-only save changes the live row in place: no new version.
 UPDATE run_env_vars SET description = @description, updated_at = now()
 WHERE id = @id AND user_id = @user_id
 RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-          disabled_at, pending_delete_at, created_at, updated_at;
+          disabled_at, pending_delete_at, created_at, updated_at, aad_version;
 
 -- name: SetRunEnvVarDisabled :one
 -- Disable and Enable are metadata-only on the live version.
@@ -74,7 +74,7 @@ SET disabled_at = CASE WHEN @disabled::boolean THEN coalesce(disabled_at, now())
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
 RETURNING id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-          disabled_at, pending_delete_at, created_at, updated_at;
+          disabled_at, pending_delete_at, created_at, updated_at, aad_version;
 
 -- name: RetireRunEnvVarVersion :execrows
 -- Keep a secret version a run still holds a receipt for: sealed, never injected or shown.

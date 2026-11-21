@@ -205,7 +205,12 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 		dto.ValueWithheld = true
 		return dto, false
 	}
-	kind := runenv.AADKind(runenv.ScopeRepo, &repoID, row.Secret, row.Name)
+	kind, err := runenv.AADFor(row.AadVersion, userID, runenv.ScopeRepo, &repoID, row.Secret, row.Name, row.VarID, row.Rev)
+	if err != nil {
+		slog.Error("run env aad", "name", row.Name, "error", err)
+		dto.ValueWithheld = true
+		return dto, false
+	}
 	plain, err := h.vault.Open(userID, kind, row.SealedWith, row.Ciphertext)
 	if err != nil {
 		dto.ValueWithheld = true
@@ -284,9 +289,9 @@ type putRunEnvRequest struct {
 	Description *string `json:"description"`
 }
 
-// receiptHeld asks whether any run holds a delivery receipt for one version. M1 has
-// no receipts (store.RunEnvVersionHasReceipt answers false); tests replace the seam to
-// reach the retire and pending-deletion paths.
+// receiptHeld asks whether any run holds a secret delivery receipt for one version
+// (store.RunEnvVersionHasReceipt); tests replace the seam to reach the retire and
+// pending-deletion paths without a run.
 func (h *Handler) receiptHeld(ctx context.Context, q *store.Queries, varID uuid.UUID, rev int32) (bool, error) {
 	if h.runEnvHasReceipt != nil {
 		return h.runEnvHasReceipt(ctx, varID, rev)
@@ -389,7 +394,13 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		old, openErr := h.vault.Open(userID, runenv.AADKind(runenv.ScopeRepo, &repoID, cur.Secret, name), cur.SealedWith, cur.Ciphertext)
+		oldKind, kindErr := runenv.AADFor(cur.AadVersion, userID, runenv.ScopeRepo, &repoID, cur.Secret, name, cur.VarID, cur.Rev)
+		if kindErr != nil {
+			slog.Error("run env aad", "name", name, "error", kindErr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		old, openErr := h.vault.Open(userID, oldKind, cur.SealedWith, cur.Ciphertext)
 		if openErr != nil {
 			if h.writeVaultLocked(w, openErr) {
 				return
@@ -409,7 +420,20 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	material, err := h.vault.Seal(ctx, userID, runenv.AADKind(runenv.ScopeRepo, &repoID, secret, name), value, vault.SealForUse)
+	// The version-2 context binds var_id and rev, so both are fixed before the seal: a new
+	// variable mints its id now, a new version of an existing one is cur.Rev+1 (the
+	// transaction below refuses to write it unless the live row is still cur).
+	newVarID, newRev := uuid.New(), int32(1)
+	if exists {
+		newVarID, newRev = cur.VarID, cur.Rev+1
+	}
+	sealKind, err := runenv.AADFor(runenv.AADVersion2, userID, runenv.ScopeRepo, &repoID, secret, name, newVarID, newRev)
+	if err != nil {
+		slog.Error("run env aad", "name", name, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	material, err := h.vault.Seal(ctx, userID, sealKind, value, vault.SealForUse)
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -455,6 +479,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		params := store.InsertRunEnvVarParams{
 			UserID: userID, RepoID: repo, Name: name, Secret: secret, Description: description,
 			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith, ValueBytes: int32(newBytes), //nolint:gosec // G115: bounded to 65536 by ValidateValue.
+			VarID: newVarID, Rev: newRev, AadVersion: runenv.AADVersion2,
 		}
 		if !exists {
 			if usage.LiveCount+usage.PendingCount >= runenv.MaxVarsPerScope {
@@ -466,7 +491,6 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
 				return runEnvHeadroomConflict(runEnvCodeLimitReached, err)
 			}
-			params.VarID, params.Rev = uuid.New(), 1
 		} else {
 			if usage.ValueBytes-int64(live.ValueBytes)+newBytes > runenv.MaxScopeValueBytes {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("the variables of this repo may hold at most %d bytes of values", runenv.MaxScopeValueBytes)}
@@ -508,7 +532,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 			}
-			params.VarID, params.Rev, params.DisabledAt = live.VarID, live.Rev+1, live.DisabledAt
+			params.DisabledAt = live.DisabledAt
 		}
 		inserted, err := q.InsertRunEnvVar(ctx, params)
 		if err != nil {
@@ -537,6 +561,7 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 		ID: cur.ID, VarID: cur.VarID, Name: cur.Name, Secret: cur.Secret, Description: cur.Description,
 		Ciphertext: cur.Ciphertext, SealedWith: cur.SealedWith, ValueBytes: cur.ValueBytes, Rev: cur.Rev,
 		DisabledAt: cur.DisabledAt, PendingDeleteAt: cur.PendingDeleteAt, CreatedAt: cur.CreatedAt, UpdatedAt: cur.UpdatedAt,
+		AadVersion: cur.AadVersion,
 	}
 	if description != cur.Description {
 		var err error
