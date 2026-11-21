@@ -394,7 +394,7 @@ The default was to land only if a cap bounded backend memory without moving the 
   (67.4 steady, 72.7 sampled peak Anonymous, 71.7 Private_Dirty). One replica at 20
   connections is about 1.2 GiB with JIT off and about 1.5 GiB with JIT on. Add what is
   counted once (`shared_buffers`, the shared LLVM library page cache, PostgreSQL background
-  processes), headroom for non-api connections (one-off `uzi setup` runs, admin `psql` sessions, migrations
+  processes), headroom for non-api connections (one-off `/server setup` runs, admin `psql` sessions, migrations
   (`store.Migrate` opens its own connection), CNPG's own connections), concurrent
   query memory (up to `work_mem` per sort or hash plan node) and other PostgreSQL and
   container overhead. It assumes every pool connection has been opened and used; pgxpool

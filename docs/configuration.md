@@ -1296,7 +1296,7 @@ connections is about 1.2 GiB (JIT off) or 1.5 GiB (JIT on). Add:
 
 - what is counted once: `shared_buffers`, the shared LLVM library page cache, and the
   PostgreSQL background processes;
-- headroom for non-api connections (one-off `uzi setup` runs, admin `psql` sessions, migrations, CNPG's own connections);
+- headroom for non-api connections (one-off `/server setup` runs, admin `psql` sessions, migrations, CNPG's own connections);
 - concurrent query memory (up to `work_mem` per sort or hash plan node);
 - other PostgreSQL and container overhead.
 
