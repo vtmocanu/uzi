@@ -3,7 +3,7 @@
 **Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slice B is partially built and dark: the worker producer exists behind a compile-time-off gate and runs nowhere in production, slices C to E and the retirement switch are deferred, see below)
 **Date**: 2026-11-13
 **Issue**: [vtmocanu/uzi#4007](https://github.com/vtmocanu/uzi/issues/4007)
-**Refs**: #4007, #2545, #1810, #1867, #2507, #1296
+**Refs**: #4007, #2545, #1810, #1867, #2507, #1296, #4488, #4512
 
 ## Context
 
@@ -279,8 +279,8 @@ candidate", and the deferral to #4512).
 busy consumer gate recorded a `consumer_gate_busy` skip and advanced to
 `fired`, so the remaining slots were lost. Holding it instead would replay the
 whole sweep: no record links a run to its fire. Scheduled issue runs carry no
-`schedule_id`, `HasActiveRunForIssue` and the open-MR dedup stop guarding once
-a run ends, and `last_fire` is a diagnostic summary that `AdvanceSchedule` and
+`schedule_id`; `HasActiveRunForIssue` stops guarding once a run ends and the
+open-MR dedup once there is no open MR; and `last_fire` is a diagnostic summary that `AdvanceSchedule` and
 `RecordScheduleHeldFire` overwrite. Run creation and the schedule advance also
 commit separately, so a crash between them leaves the row due. T3a adds a
 durable record of each fire's admissions with these properties:
@@ -343,7 +343,9 @@ not fire it, so a new row starts at epoch 0.
   `RepoStoresIssueNumber` EXISTS list. This is the same rule as every other
   table that stores an issue number for a repository: without it a repository
   still awaiting its first enable could acquire issue numbers through the
-  ledger, which the issue-tracker link guard assumes cannot happen.
+  ledger, which the issue-tracker link guard assumes cannot happen. The `runs` guard already fires first on the same
+  transaction's `CreateRun`, so the ledger guard is defence in depth and keeps
+  `RepoStoresIssueNumber` in step with the trigger list.
 - The second migration owns both triggers and the immutability function. Its
   Down drops the triggers, then the function, then the tables.
 
@@ -360,14 +362,17 @@ DELETE; exhaustive for direct SQL):
 | `CoalesceScheduleSiblingGroup`, `ClearSingletonSiblingGroup` | none | sibling-group bookkeeping |
 | `AdvanceSchedule` (recurring arm; becomes the guarded advance below) | none | `run_at` unchanged; `active` stays `active` |
 | once advance (becomes `AdvanceOnceScheduleGuarded`) | none | active to fired, `run_at` unchanged |
-| `SetRunScheduleStatus` | none in the fire path | its only callers are `park`'s, inside `advance`; replaced by `ParkScheduleGuarded` |
+| `SetRunScheduleStatus` | would bump on a once revival | no caller remains once `park` moves to `ParkScheduleGuarded`; its only callers today are `park`'s, inside `advance` |
 | `ParkScheduleGuarded` (new) | none | active to error, `run_at` unchanged |
 | `RecordScheduleHeldFire`, `RecordOnceFirePartial` (new) | none | `last_fire` (and, for the held write, `recent_fires`) only |
 | `DeleteRunSchedule` | n/a | cascades the header and ledger |
 | FK side effects: secret delete `SET NULL` (00233), repo delete cascade (00103) | none / n/a | `credential_override_secret_id` is not in the predicate; a repo delete removes the row |
 
-The no-bump arms of a config edit (one that keeps `run_at`) are reachable only
-by direct SQL, because a one-time PATCH must carry a future `run_at` (below).
+The no-bump arms of a config edit (one that keeps `run_at`) are reachable
+through PATCH only while the row is not yet due, because a one-time PATCH must
+carry a future `run_at` (below). Such an epoch has no ledger rows yet, since only
+a scheduled fire of a due row writes them. For a due, partially admitted fire
+they are reachable only by direct SQL.
 
 **Admission: lock order inside the create transaction.** The scheduler passes an
 optional `OnceFireProgress` (schedule, user, repo, epoch, issue, title, URL,
@@ -379,7 +384,7 @@ pass. Non-nil progress without a transaction beginner, or on a store that is not
 
 1. The consumer gate, shared, first (T3).
 2. The D11 resolve reads.
-3. `LockSecretMutationShared`, when the creation is lock-eligible (unchanged).
+3. `LockSecretMutationShared`, when the creation is lock-eligible or pool-selected (unchanged).
 4. `LockRunBranch` (advisory).
 5. The pinned secret `FOR SHARE` (`lockPinnedOverrideEnabled`).
 6. **New:** the repo row `FOR SHARE` (`LockRepoForCIWatch` or an equivalent
@@ -388,10 +393,12 @@ pass. Non-nil progress without a transaction beginner, or on a store that is not
    is `ErrOnceFireStale`.
 8. **New:** recheck the locked row: `timing = 'once'`, `target = 'sweep'`,
    `status = 'active'`, `fire_epoch` equal to the claimed epoch; otherwise
-   `ErrOnceFireStale`. Identity binding: the progress user, repo and issue must
-   equal the actual create arguments, and the locked row's `user_id` and
-   `repo_id` must agree; any mismatch is `ErrOnceFireIdentity` before anything
-   is inserted.
+   `ErrOnceFireStale`. Identity binding: the progress user, repo and issue are
+   compared with the actual create arguments before any lock is taken, and the
+   locked row's `repo_id` must agree; any mismatch is `ErrOnceFireIdentity`
+   before anything is inserted. The locked row's `user_id` agrees by
+   construction, because step 7 locks only the owner's row, so a schedule whose
+   owner changed reports as stale.
 9. **New:** insert the header `ON CONFLICT DO NOTHING` with the passed cap, then
    read the stored cap, the admitted count and whether this issue is already
    recorded. Already recorded is `ErrOnceFireCandidateRecorded`; a non-NULL
@@ -435,9 +442,11 @@ is logged as a benign stale fire. Outside the helper:
   targets, with the added epoch guard.
 
 **Lock-order proof.** Admission locks, in order: advisory gate, advisory secret
-mutation (shared, when eligible), advisory run branch, pinned secret row
-(share), repo row (share), schedule row (exclusive), then its own new rows. Each
-concurrent writer either takes a prefix of that order or holds a single lock:
+mutation (shared, when eligible or pool-selected), advisory run branch, pinned
+secret row (share), repo row (share), schedule row (exclusive), then its own new
+rows. Each concurrent writer takes the locks it shares with admission in
+admission's order (a subsequence), holds only locks admission never needs, or
+holds a single row:
 
 - **Repo delete** (`DeleteRepoForUser`, `queries/forge.sql`). It locks the
   repository's existing runs, deletes the repo row, then cascades to its
@@ -455,12 +464,16 @@ concurrent writer either takes a prefix of that order or holds a single lock:
   `LockSecretMutation` exclusive, then the credential row). A lock-eligible
   admission holds the shared mutation lock, so the two exclude each other
   outright. Otherwise a pinned admission holds the secret row `FOR SHARE`
-  (step 5), which conflicts with the delete and the disable
-  (`lockPinnedOverrideEnabled`, `workersvc/credential_disabled.go`), so the
-  writer waits; if the writer is first, admission waits at step 5 before it
-  holds the schedule. An unpinned admission inserts no secret FK; the delete's
-  `SET NULL` on the schedule row then waits for admission to commit, with no
-  lock admission needs. The disable writes no `run_schedules` row.
+  (step 5, `lockPinnedOverrideEnabled` in `workersvc/credential_disabled.go`),
+  which conflicts with the delete's and the disable's row writes, so the writer
+  waits; if the writer is first, admission waits at step 5 before it holds the
+  schedule. An unpinned schedule row carries no secret id, so the delete's
+  `SET NULL` never reaches it. The admission's own FK checks
+  (`credential_override_secret_id` at step 10 for a pinned run,
+  `codex_secret_id` at the step-12 freeze) take `KEY SHARE` on the secret;
+  against a concurrent delete of that secret they wait and then fail with
+  nothing written, because the delete holds nothing the admission already
+  holds. The disable writes no `run_schedules` row.
 - **Schedule config edits.** A PATCH that involves ci_watch (including a
   conversion from or to a once sweep) runs in one transaction whose first
   statement is the schedule row lock (`lockScheduleForConfig`,
@@ -496,9 +509,17 @@ concurrent writer either takes a prefix of that order or holds a single lock:
   transient warning, no advance, a partial summary that omits the volatile
   in-flight and room numbers, and a retry next tick. With no rows, the cap and
   room-needed check are unchanged.
-- Recorded candidates are skipped before the active-run check and the forge
-  fetch and add no skip; prior starts are folded into Started; the cap break
-  counts prior plus new starts. `Matched` stays `len(Started)+len(Skips)`.
+- A continuation's scan limit is the stored cap plus the backfill headroom,
+  whatever today's room. Recorded candidates are skipped before the active-run
+  check and the forge fetch and add no skip; prior starts are folded into
+  Started from the ledger's stored title, URL and `run_uuid` (so an issue that
+  has since left the selector still counts); the cap break counts prior plus new
+  starts. `Matched` stays `len(Started)+len(Skips)`.
+- The admission sentinels: `ErrOnceFireStale` stops the fire without
+  advancing; `ErrOnceFireCandidateRecorded` and `ErrOnceFireCapSpent` mean the
+  slot is already spent and add no skip, and `ErrOnceFireCapSpent` takes the cap
+  break; `ErrOnceFireIdentity` is a bug guard, logged and treated as transient,
+  with nothing created.
 - Gate contention after partial progress now returns the error, so the fire is
   not advanced and retries next tick, the same as contention with nothing
   started. A best-effort partial summary is written first. The partial summary
@@ -508,9 +529,16 @@ concurrent writer either takes a prefix of that order or holds a single lock:
 - The mid-fire credential-disabled and stored-override arms judge this attempt's
   starts: with none, they hold or return as with no starts at all; otherwise
   they record the skip, stop and advance as today.
-- Before the advance, Started is rebuilt from the ledger, so a lost-ack start
-  that surfaced as `fetch_failed` appears exactly once. If that read fails, the
-  fire does not advance.
+- Before the advance, Started is rebuilt from the ledger under the summary
+  lock, so a lost-ack start that surfaced as `fetch_failed` appears exactly once,
+  and the skips of recorded issues are dropped so `Matched` stays exact. If that
+  read fails, the fire does not advance.
+- Once-sweep summary writes use a detached 5-second context inside
+  `WriteOnceFireSummary`; `advance`'s existing 5-second detach becomes
+  recurring-only. `errOnceFireHeld` has its own branch in `process`, after the
+  credential-hold check and before `advance`. A held write's dedupe compares
+  against the row read under the lock, a failed ledger read skips the held
+  write, and after re-enable the fire resumes with only its remaining slots.
 
 **Accepted boundaries.**
 
@@ -520,6 +548,11 @@ concurrent writer either takes a prefix of that order or holds a single lock:
   occurrence with the full cap. That is the owner's explicit new fire, and it
   may start a finished candidate again. A partial fire parked at `error` is
   revived only by such an edit, with the same result.
+- The mid-fire credential-disabled and stored-override arms still record the
+  skip and advance once this attempt has started runs, dropping the remaining
+  slots. That is today's behaviour, kept to bound this change to gate
+  contention; the ledger would allow holding instead, which a later change may
+  adopt.
 - `process`'s owner-pause and credential pre-checks still run first, so even a
   cap-spent continuation waits for those holds to clear before it advances.
   Nothing is lost.
@@ -540,14 +573,17 @@ second migration's Down destroys the ledger and every recorded `run_uuid`; a
 later Up recreates empty tables.
 
 **Retention.** Header and ledger rows of earlier epochs persist until the
-schedule is deleted, bounded by roughly cap x re-arms per schedule. No sweeper
-is added.
+schedule is deleted: at most one header and min(cap, matching open issues)
+ledger rows per admitted epoch (with no cap, the matching open issues), and one
+epoch per owner re-arm. No sweeper is added.
 
 **Not claimed.** There is no e2e coverage of the scheduled retry, the guarded
 advance and park, or the serialized summaries: every e2e schedule phase fires
 through `schedule run-now`, which this change leaves alone. The evidence is the
-PostgreSQL 17 and unit suites. No power-loss durability is claimed, and no cap
-protection while an old binary runs.
+PostgreSQL 17 and unit suites. No power-loss durability is claimed. There is no
+cap or per-issue dedup protection for runs an old scheduler binary started,
+whether during its run or after roll-forward, and none after a Down of the
+second migration.
 
 ### Reopen semantics (narrowed)
 
