@@ -317,6 +317,45 @@ func TestOnceFireRetry_CancelMidSweepDoesNotConsumePartialFire(t *testing.T) {
 	}
 }
 
+// cancelOnLastActiveStore cancels the run context from inside the active-run check of one
+// candidate and fails that check, so a cancellation lands AFTER the loop-top check of the last
+// candidate: only the post-loop check can see it.
+type cancelOnLastActiveStore struct {
+	*fakeStore
+	cancel context.CancelFunc
+	last   int64
+}
+
+func (s cancelOnLastActiveStore) HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error) {
+	if arg.IssueIid.Int64 == s.last {
+		s.cancel()
+		return false, ctx.Err()
+	}
+	return s.fakeStore.HasActiveRunForIssue(ctx, arg)
+}
+
+// A cancellation during the LAST candidate ends the loop with no next iteration to notice it:
+// the candidate would be a fetch_failed skip and the completing advance would spend the unused
+// slot. The post-loop check returns the context error instead; the ledger keeps only 96.
+func TestOnceFireRetry_CancelDuringLastCandidateDoesNotConsumePartialFire(t *testing.T) {
+	h := newHarness()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.sched.store = cancelOnLastActiveStore{fakeStore: h.st, cancel: cancel, last: 97}
+	h.st.sweepRows = sweepRows(96, 97)
+	s := onceSweep(h, 3)
+	out, err := h.sched.fireOne(ctx, s, true)
+	if !errors.Is(err, context.Canceled) || len(out.Started) != 0 || len(out.Skips) != 0 {
+		t.Fatalf("fireOne = %+v, %v, want the context error and no outcome", out, err)
+	}
+	if len(h.st.advanceCalls) != 0 || len(h.st.statusCalls) != 0 || len(h.st.partialCalls) != 0 {
+		t.Fatalf("a cancelled once fire advanced, parked or wrote: advances=%+v parks=%d", h.st.advanceCalls, len(h.st.statusCalls))
+	}
+	if rows := h.runs.ledger.rows(s.ID, 7); len(rows) != 1 || rows[0].IssueIid != 96 {
+		t.Fatalf("ledger = %+v, want only 96", rows)
+	}
+}
+
 // (l) unit: a lost acknowledgement (committed create, errored call) is in Started exactly once,
 // consumes its slot, and leaves no fetch_failed skip.
 func TestOnceFireRetry_L_LostAckStartedOnce(t *testing.T) {
