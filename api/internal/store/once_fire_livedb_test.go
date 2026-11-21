@@ -199,7 +199,7 @@ func TestOnceFireEpochTriggerMatrixLiveDB(t *testing.T) {
 	// revival: the status arm fires only on a real transition into active.
 	revival := func(state string) bool { return state != "active" }
 	// All four guarded writers (queries/once_fire.sql, credential_disabled.sql) require
-	// status='active' on a once row at the claimed epoch 0, so the write lands (1 row) only on
+	// status='active' on the row at the claimed epoch 0 (every matrix row is a once row), so the write lands (1 row) only on
 	// an active row and an error/fired row is skipped (0 rows): "no bump" is then not vacuous.
 	wantGuardedRows := func(t *testing.T, name string, s store.RunSchedule, got int64) {
 		t.Helper()
