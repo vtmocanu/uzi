@@ -65,6 +65,11 @@ Only the pin for the run's harness is considered. A worker that predates
 template effort never receives the pins and shows a run-feed notice; see
 [Older workers](./agent-templates.md#reasoning-effort-pins).
 
+Two limits apply on Claude. The SDK may silently downgrade a level the model
+does not support, so a pin is a request, not a guarantee. And the lead model
+can pass its own `effort` when it calls the Agent tool, which the SDK may
+honour over the template's pin or the inherited level.
+
 ## The lead template's effort
 
 The lead's effort for a harness resolves in this order:

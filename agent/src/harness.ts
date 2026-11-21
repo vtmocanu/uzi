@@ -355,6 +355,8 @@ export interface HarnessAgent {
   description: string;
   prompt: string;
   model?: string;
+  /** The template's per-agent effort pin; absent = follow the run's effort. */
+  effort?: HarnessEffort;
   tools: HarnessToolSet;
   deniedTools: readonly string[];
   toolServers: readonly string[];

@@ -187,7 +187,10 @@ export type RepoAgentNoteReason =
   | "unsafe_path"
   /** A Codex agent declares a restriction (`features`, `skills`, `sandbox_mode`,
    *  `tools`) uzi cannot honour yet, so it is skipped rather than run unrestricted. */
-  | "restriction_unsupported";
+  | "restriction_unsupported"
+  /** Kept, with an invalid `model_reasoning_effort` ignored (the agent follows the
+   *  run's effort). The value is never echoed. */
+  | "effort_ignored";
 
 export interface RepoAgentNote {
   /** The agent (or file) the note is about. Sanitized: it reaches a run message.
@@ -204,6 +207,9 @@ export interface RepoAgentNote {
   restrictions?: string[];
   /** For a folder-level "unsafe_path" (empty `name`): the folder that was refused. */
   folder?: RepoAgentFolder;
+  /** For "effort_ignored": the agent file's basename without its extension. Present only
+   *  when it passes the agent-name regex and length cap (it reaches a run message). */
+  file?: string;
 }
 
 export interface DetectedRepoAgents {
@@ -265,6 +271,8 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
         : `repo agent file "${note.name}" was skipped: its location could not be verified inside the agents folder`;
     case "restriction_unsupported":
       return `repo agent "${note.name}" was skipped: it declares a Codex restriction (${(note.restrictions ?? []).join(", ")}) uzi cannot honour yet`;
+    case "effort_ignored":
+      return `repo agent "${note.name}"${note.file ? ` (file "${note.file}")` : ""} declared an invalid effort; it follows the run's effort`;
   }
 }
 
@@ -442,7 +450,12 @@ async function loadFolder(spec: FolderSpec, source: FolderFiles): Promise<Detect
     }
     seen.add(parsed.template.name);
     agents.push(parsed.template);
-    notes.push(...parsed.notes);
+    // The file's basename (without extension) joins an effort note only when it passes the
+    // same name regex and length cap as an agent name; otherwise the note names the agent alone.
+    const stem = file.slice(0, -spec.ext.length);
+    for (const note of parsed.notes) {
+      notes.push(note.reason === "effort_ignored" && isValidAgentName(stem) ? { ...note, file: stem } : note);
+    }
   }
 
   agents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -491,7 +504,15 @@ export async function detectRepoAgents(
 }
 
 function projectForHarness(harness: RepoAgentHarness, detected: DetectedRepoAgents): DetectedRepoAgents {
-  detected.agents = detected.agents.map((template) => filterRepoAgentModel(template, harness));
+  // An effort belongs to its folder's family (.codex/agents = Codex levels, .claude/agents =
+  // Claude levels): drop it when the folder's family differs from the run's harness, so a
+  // `.codex` effort never reaches a Claude run and a `.claude` one never reaches a Codex run.
+  const dropEffort = (detected.folder === ".codex/agents") !== (harness === "codex");
+  detected.agents = detected.agents.map((template) => {
+    const projected = filterRepoAgentModel(template, harness);
+    if (dropEffort) delete projected.effort;
+    return projected;
+  });
   return detected;
 }
 

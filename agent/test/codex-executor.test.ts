@@ -6784,6 +6784,75 @@ describe("CodexExecutor: no default_effort on the claim leaves the effort key of
   });
 });
 
+// Issue #3258: a template's effort pin reaches the delegated child's turn/start `effort`.
+describe("CodexExecutor: template effort pins on delegated children (issue #3258)", () => {
+  const delegate = async (agents: AgentTemplate[], config: Record<string, unknown>) => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+    const { ctx, emitted } = makeCtx({ agents, config: config as never });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 3000, "effort delegation run");
+    const turns = rig.transport.requests.filter((request) => request.method === "turn/start");
+    assert.equal(turns.length, 2, "one root turn and one child turn");
+    return { turns, emitted };
+  };
+  const lead: AgentTemplate = { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] };
+  const coder = (effort?: string | null): AgentTemplate =>
+    ({ name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [], ...(effort !== undefined ? { effort } : {}) });
+  const noticesFor = (emitted: EmittedMessage[]) =>
+    emitted.filter((m) => m.kind === "status" && /declares a reasoning effort outside/.test(String((m.payload as { text?: unknown }).text)));
+
+  it("a pinned child's turn effort differs from the root's", async () => {
+    const { turns } = await delegate([lead, coder("high")], { default_effort: "medium" });
+    assert.equal(rec(turns[0]!.params).effort, "medium", "the root runs on the claim effort");
+    assert.equal(rec(turns[1]!.params).effort, "high", "the pinned child runs on its own pin");
+  });
+
+  it("an unpinned child inherits the claim effort", async () => {
+    const { turns } = await delegate([lead, coder()], { default_effort: "medium" });
+    assert.equal(rec(turns[1]!.params).effort, "medium");
+  });
+
+  it("an unpinned child under the Runtime default omits the effort key", async () => {
+    const { turns } = await delegate([lead, coder()], { default_model: "gpt-6.1-sol" });
+    assert.equal(Object.hasOwn(rec(turns[1]!.params), "effort"), false);
+  });
+
+  it("a pinned child under the Runtime default carries its pin while the root sends none", async () => {
+    const { turns } = await delegate([lead, coder("low")], { default_model: "gpt-6.1-sol" });
+    assert.equal(Object.hasOwn(rec(turns[0]!.params), "effort"), false);
+    assert.equal(rec(turns[1]!.params).effort, "low");
+  });
+
+  it("an out-of-contract pin is ignored: the child inherits and one notice per role names the role, not the value", async () => {
+    const { turns, emitted } = await delegate([lead, coder("ultra-secret")], { default_effort: "medium" });
+    assert.equal(rec(turns[1]!.params).effort, "medium");
+    const notices = noticesFor(emitted);
+    assert.equal(notices.length, 1, "one notice per role per run, however many phase brokers are built");
+    const text = String((notices[0]!.payload as { text?: unknown }).text);
+    assert.ok(text.includes("coder"));
+    assert.ok(!text.includes("ultra-secret"), "the raw value is never echoed");
+  });
+
+  it("a valid pin or no pin emits no notice", async () => {
+    for (const pin of ["high", undefined] as const) {
+      const { emitted } = await delegate([lead, coder(pin)], { default_effort: "medium" });
+      assert.equal(noticesFor(emitted).length, 0);
+    }
+  });
+});
+
 // PRD #3247 M2: Codex catalog probe + unsupported-level policy through the executor.
 describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", () => {
   const opt = (reasoningEffort: string) => ({ reasoningEffort, description: "d" });

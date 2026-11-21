@@ -211,8 +211,14 @@ Each TOML file becomes one subagent:
   does not echo the model value. On Claude runs the pin is omitted, so the
   subagent follows the resolved lead model.
 - **Model override and effort:** the schedule's "Use the run's resolved model
-  for subagents too" toggle (`override_subagent_model`) overrides the TOML pin. Reasoning effort
-  still comes from the existing run settings; `model_reasoning_effort` is ignored.
+  for subagents too" toggle (`override_subagent_model`) overrides the TOML pin; it
+  never touches effort. `model_reasoning_effort` is read as the agent's Codex
+  effort when it is exactly `low`, `medium`, `high`, `xhigh` or `max`; an agent
+  without one follows the run's effort. An invalid value is dropped and the
+  agent still runs, with a run-feed note naming the agent and its file (the value
+  itself is never shown). A `.codex/agents` effort applies only on a Codex run and
+  never reaches a Claude run. An `effort:` in a Markdown `.claude/agents` file is
+  not read yet.
 - **Default tools:** a TOML agent runs with the run's full default tool set,
   which can include `Bash`, subject to the guards below.
   `nickname_candidates`, `config_file`, `includes`, and other unrecognised keys

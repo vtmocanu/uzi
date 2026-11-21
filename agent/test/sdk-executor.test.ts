@@ -3359,6 +3359,70 @@ describe("SdkExecutor reasoning effort on baseOptions (PRD #617)", () => {
   });
 });
 
+describe("SdkExecutor template effort on subagents (issue #3258)", () => {
+  const pinnedReviewer: AgentTemplate = { ...reviewer, effort: "high" };
+  const pinnedRepoAuditor: AgentTemplate = { ...repoAuditor, effort: "low" };
+
+  async function runTurns(overrides: Partial<RunContext>, verdict?: PlanVerdict) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = verdict === undefined ? makeCtx(overrides) : makeCtx(overrides, verdict);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return turns;
+  }
+
+  it("own roster: a pinned subagent keeps its pin and an unpinned one follows the run effort, on BOTH turns", async () => {
+    const turns = await runTurns(
+      { agents: [lead, coder, pinnedReviewer], config: { default_effort: "medium" } },
+      approveWith("own"),
+    );
+    for (const o of [turns[0]!.options, turns[1]!.options]) {
+      assert.strictEqual(o.agents!.reviewer!.effort, "high");
+      assert.strictEqual(o.agents!.coder!.effort, "medium");
+    }
+  });
+
+  it("own roster under the Runtime default: the pin survives and an unpinned subagent carries no effort key", async () => {
+    const turns = await runTurns(
+      { agents: [lead, coder, pinnedReviewer], config: { default_model: "sonnet" } },
+      approveWith("own"),
+    );
+    for (const o of [turns[0]!.options, turns[1]!.options]) {
+      assert.strictEqual(o.agents!.reviewer!.effort, "high");
+      assert.ok(!("effort" in o.agents!.coder!), "no effort key is added under the Runtime default");
+    }
+  });
+
+  it("repo roster: an unpinned repo agent follows the run effort and a pinned one keeps its pin", async () => {
+    const turns = await runTurns({
+      agents: [lead, coder, reviewer],
+      repoAgents: [repoCoder, pinnedRepoAuditor],
+      config: { default_effort: "medium" },
+    });
+    const impl = turns[1]!.options;
+    assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(impl.agents!.coder!.effort, "medium");
+    assert.strictEqual(impl.agents!.auditor!.effort, "low");
+  });
+
+  it("the schedule model override leaves each subagent's effort as is", async () => {
+    const turns = await runTurns(
+      {
+        agents: [lead, coder, pinnedReviewer],
+        config: { default_model: "fable", default_effort: "medium", override_subagent_model: true },
+      },
+      approveWith("own"),
+    );
+    for (const o of [turns[0]!.options, turns[1]!.options]) {
+      assert.strictEqual(o.agents!.reviewer!.model, "fable");
+      assert.strictEqual(o.agents!.reviewer!.effort, "high");
+      assert.strictEqual(o.agents!.coder!.effort, "medium");
+    }
+  });
+});
+
 describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
   const revise: PlanVerdict = { kind: "revise", feedback: "tighten it" };
@@ -3459,7 +3523,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 16, "all Claude request cases loaded");
+    assert.equal(cases.length, 19, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3505,7 +3569,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 16);
+    assert.equal(visited.length, 19);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */

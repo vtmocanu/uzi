@@ -59,6 +59,7 @@ import {
 } from "./js-deps.js";
 import {
   applySubagentModelOverride,
+  fillSubagentEffort,
   assembleAgents,
   planTurnSubagents,
   selectSubagents,
@@ -1852,7 +1853,11 @@ export class SdkExecutor implements Executor {
     // keys feed the Agent guard's allow set and the delegation lines below.
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
-    const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
+    // Template effort (N2/N5): an unpinned subagent runs at the lead's resolved effort. The fill
+    // builds NEW definitions, so `assembled.subagents` stays untouched, and the model override
+    // below keeps effort as is. The lead effort is passed per call site so a per-phase value can
+    // replace `leadRequest.effort` for the plan roster later.
+    const planAgents = fillSubagentEffort(planShaped ? planShaped.agents : planTurn.subagents, leadRequest.effort);
     if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
       applySubagentModelOverride(planAgents, leadModel);
     }
@@ -3065,13 +3070,18 @@ export class SdkExecutor implements Executor {
       // full survivor set, since a repo roster has no template rows to allocate
       // against. survivorNames is the filter in both cases, so a skill dropped by
       // the cap or a collision is unreachable either way.
-      const selectedSubagents = selectSubagents(
-        selection.source,
-        assembled.subagents,
-        ctx.repoAgents ?? [],
-        selection.exclusions,
-        survivorNames,
-        prepared.repoSurvivorNames,
+      // Template effort (N2/N5): fill from the lead's resolved effort on a copy; the
+      // `assembled.subagents` entries selectSubagents may return by reference stay untouched.
+      const selectedSubagents = fillSubagentEffort(
+        selectSubagents(
+          selection.source,
+          assembled.subagents,
+          ctx.repoAgents ?? [],
+          selection.exclusions,
+          survivorNames,
+          prepared.repoSurvivorNames,
+        ),
+        state.leadRequest.effort,
       );
       // PRD #305: repo-source defs are freshly built from repo files here and were NOT
       // touched by the own-roster override above; apply it so the flag covers the repo
