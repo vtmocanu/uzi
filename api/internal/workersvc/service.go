@@ -620,6 +620,9 @@ type Store interface {
 	GetRunForgeConnForWorker(ctx context.Context, arg store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
+	// Run environment variables (PRD #4416 M2): the claim-time reads assembleClaim opens.
+	ListRunEnvEffectiveForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvEffectiveForRunRow, error)
+	ListRunEnvRedactForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvRedactForRunRow, error)
 
 	// Durable run recovery (PRD #1296 M1): the custody/archive store contract M2
 	// (upload/owner API), M3 (worker capture/retry) and M5 (owner UX) consume. Frozen
@@ -4011,6 +4014,23 @@ var errRunRepoOwnerMismatch = errors.New("the run's repository is not owned by t
 // queued for a capable worker rather than failing or silently running Astra. Its message carries
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
+
+// errRunEnvCapabilityMissing marks a claim that would deliver run environment variables
+// (PRD #4416 M2) to a worker that does not advertise run_env_v1. Like
+// errCustomModelCapabilityMissing it is transient: the run returns to queued for a capable
+// worker and nothing is delivered. Its message carries no secret bytes.
+var errRunEnvCapabilityMissing = errors.New("worker lacks run_env_v1 for a run with environment variables")
+
+// errRunEnvStale marks a claim whose run environment lists changed between assembly and the
+// finish transaction (a create, rotation, delete, disable or enable). Transient: the run
+// returns to queued and nothing is delivered.
+var errRunEnvStale = errors.New("run environment variables changed during the claim")
+
+// errRunEnvHistoryUnavailable marks a claim whose receipted secret history cannot be masked
+// completely (a receipted version is missing, was swapped, or cannot be opened). The run is
+// parked with hold reason run_env_history_unavailable and neither resumes nor publishes until
+// the owner acts. Its message carries no secret bytes.
+var errRunEnvHistoryUnavailable = errors.New("run environment history is unavailable")
 
 // errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
 // the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the

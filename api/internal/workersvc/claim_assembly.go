@@ -1075,6 +1075,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// so a run's credential history is complete for both harnesses.
 	}
 
+	// PRD #4416 M2: the run environment variables of a lead-lane run. Isolated runs are excluded
+	// (RunEnvDelivered), and stripForIsolation clears both lists as a backstop. The snapshot of
+	// what was delivered rides unexported on the payload for finishRunClaimTx's re-check.
+	// A Codex claim has minted its capability by now, so the failure carries the minted identity
+	// (the cross-check lane's crossCheckAssemblyError idiom) for finishRunClaimTx to settle.
+	if err := s.attachRunEnv(ctx, wkr, run, payload); err != nil {
+		return nil, crossCheckAssemblyError(payload, err)
+	}
+
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
 	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
 	// Skipped for a profile-bound run (it has no PR, and stripForIsolation clears it anyway).
