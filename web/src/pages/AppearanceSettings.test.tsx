@@ -544,6 +544,7 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
   });
 
   it("carries the confirmed motion value into a later typeface save when the re-read stayed stale", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: false }));
     mockApi.putMySettings.mockResolvedValueOnce({
       settings: { sidebar_motion: true, effective_sidebar_motion: true } as never,
     });
