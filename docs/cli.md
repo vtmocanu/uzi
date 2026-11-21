@@ -3614,6 +3614,7 @@ setting prints once. The rows, in order:
 | `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
 | `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
 | `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `planning model`, `planning effort` | `claude` | The optional [Claude planning settings](./worker-model.md#planning-model-and-effort), shown only for Claude. `STORED` is `-` when unset, and `RESOLVED` then reads the run's own value (`Same as the run`). Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
 | `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
 | `task review effort` | `claude`, `codex` | `not sent` for both. |
@@ -4361,6 +4362,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
   if the choice has become available on that harness; otherwise cancel the run
   (`uzi run cancel <id>`) and start a new run with a different choice.
+  A `paused` run can also be **held because the switch from its planning
+  model and effort to its own could not be verified**
+  (`hold_reason: phase_switch_unavailable`): `run get` prints a `HOLD` row
+  reading `planning switch unavailable`, and `run wait` and `run logs --follow`
+  print a notice naming the hold. `uzi run resume <id>` retries on a new
+  claim, which verifies the switch again; `uzi run cancel <id>` ends the run.
+  See [Planning model and effort](./worker-model.md#planning-model-and-effort).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -4713,8 +4721,8 @@ except a default wait also stops at `recovery_wait` with cause
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
 owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
 Anthropic API spend-limit or exhausted-credit hold, Resume, Switch token or Cancel), and at a `paused` run held on
-`base_attestation_missing`, `run_override_unavailable` or a credential-switch
-hold, for an owner decision:
+`base_attestation_missing`, `run_override_unavailable`, `phase_switch_unavailable`
+or a credential-switch hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

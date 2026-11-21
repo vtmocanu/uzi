@@ -388,6 +388,12 @@ The Anthropic token's default option reads `Default · worker's token (worker
 binding)`, and the auto-rework inherit option reads `Default · on (your
 setting)` or `Default · off (your setting)`.
 
+A model a schedule pins also applies while a Claude run plans: it wins over
+your [planning model](./worker-model.md#planning-model-and-effort) in both the
+planning and implementation phases, so a pinned schedule never switches models
+at plan approval. A schedule left on **Default** uses your planning setting
+for the plan phase and your worker model afterwards.
+
 Schedule rows and job catalog cards show a model chip: `model: default`, or
 `model: <value> · pinned` when the schedule pins a model. Rows add `+ agents`
 when the subagent toggle is on. Your own schedule rows with no model pin also

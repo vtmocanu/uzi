@@ -450,6 +450,8 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
 | Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
 
+For a Claude lead-lane run, a preview may show the planning-phase and implementation-phase model and effort as a pair, because the lead plans on your [planning settings](./worker-model.md#planning-model-and-effort) and implements on its own. A model or effort chosen for the run or pinned by a schedule applies to both.
+
 Subagent pins and repository-defined agents are not part of the account view or the start-preview; the [schedule preview](./scheduling.md#settings-preview) predicts your own subagents' pins, and not repository-defined agents.
 
 ### When a value is fixed

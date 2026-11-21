@@ -360,6 +360,41 @@ or re-registration, never on elapsed time. A worker without in-place switching
 keeps the release-and-reclaim path and does not produce this pause.
 Design: [ADR-4201](../adr/4201-in-place-credential-switch.md).
 
+## Held when the planning to implementation switch cannot be verified
+
+A Claude run that uses a [planning model or effort](./worker-model.md#planning-model-and-effort)
+switches to its own model and effort when you approve the plan. Before it
+sends the first implementation prompt, the worker checks what the runtime
+applied. If it cannot confirm the switch (the runtime kept the planning model,
+reported a different one, did not answer, or the configuration cannot be
+checked), the run parks `paused` with `hold_reason: phase_switch_unavailable`
+and does no implementation work. It never continues on the planning model.
+
+The run feed shows a line such as "Paused: the runtime kept the planning model
+X instead of switching to Y. Resume retries on a new claim; Cancel ends the
+run." The run page shows a **Planning switch unavailable: waiting for owner**
+panel with **Resume** and **Cancel**, the board shows an owner-hold badge, and
+the CLI prints a notice and a `HOLD` row (see [the CLI
+reference](./cli.md#waiting-for-a-state-uzi-run-wait)). `uzi run wait` stops on
+it by default. Nothing resumes this hold on a timer.
+
+- **Resume** (`uzi run resume <id>` or the run page) queues the run for a new
+  claim. The next claim is already approved, goes straight to implementation and
+  verifies the switch again, so it holds again if the cause is still there.
+  Change the cause first: set a supported worker model, or clear the planning
+  setting.
+- **Cancel** ends the run as usual. If you cancel while the worker has not yet
+  heard that the hold was recorded, the run still reports cancelled.
+- **The session and work are kept.** The approved plan, the session and the
+  retained work stay with the run for the resume; this is not a failure.
+- **A worker crash before the hold is recorded** is not this hold. It follows the
+  ordinary worker-lost route: the run is requeued within its budget, otherwise it
+  ends in `recovery_wait` or `failed`, as described in [Run
+  recovery](./run-recovery.md).
+
+If the worker cannot reach the server while parking, it retries for up to 30
+minutes. After that the server's usual stale-worker handling applies.
+
 ## Not the same as a completion hold
 
 A `paused` run is not always a pause **you** asked for. A run with the
