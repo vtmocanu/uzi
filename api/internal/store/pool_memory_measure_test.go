@@ -32,11 +32,36 @@ package store_test
 //
 // Isolation: the schema and fixture are seeded ONCE into database pm_template on the server
 // named by UZI_TEST_DATABASE_URL (which is also where the throwaway marker is checked and
-// where CREATE/DROP DATABASE run), then nothing connects to the template again. Every memory
-// candidate repetition, every latency round, the cold phase and every wide-read run gets its
-// own CREATE DATABASE ... TEMPLATE clone and its own observer connection, dropped afterwards,
-// so no run inherits another's rolled-back dead tuples. UZI_TEST_DATABASE_URL must be a
-// postgres:// URL.
+// where CREATE/DROP DATABASE run). Measurements run on CREATE DATABASE ... TEMPLATE clones,
+// each with its own observer connection, dropped afterwards. The isolation differs per phase:
+//   - Memory: one clone per candidate x repetition.
+//   - Latency and stress: one clone per round, shared by every candidate in that round (see
+//     pmRunLatency). Later candidates in a round inherit dead tuples left by earlier
+//     candidates' rolled-back writes and the heartbeat UPDATE that verifyFixture commits
+//     after each candidate.
+//   - Cold: a single clone shared by all candidates and repetitions.
+//   - Wide: one clone per statement cache size x plan cache mode.
+//   - Explain: one clone per jit mode x repetition; a capture connection runs ClaimRun on
+//     the clone before the measured connection does (see pmRunExplain).
+//
+// The template is NOT untouched after seeding: the validation pool (store.OpenPool on the
+// template DSN) reads it before the first clone, and discover mode runs the breadth table on
+// it. All clones share one server, so shared_buffers, the OS page cache and the LLVM JIT
+// library text are shared between them. UZI_TEST_DATABASE_URL must be a postgres:// URL.
+//
+// Known limits: this harness is not a production measurement.
+//   - Breadth checks verify only each entry's result class (some / empty / ErrNoRows), not
+//     row contents.
+//   - Hot-mix and fixture checks are field-level (specific ids, flags, counts, status), not
+//     full-row, and do not verify that write effects were applied as intended.
+//   - Latency, stress and cold share clones as described above.
+//   - The validation pool and discover mode reuse the template.
+//   - Wide-phase database errors are tolerated and recorded (OtherErrors, ParseFailures)
+//     instead of failing the run.
+//   - Headline latency is measured under whatever UZI_POOL_MEMORY_JIT the run used (the
+//     ADR's latency run used jit=off).
+//   - One PostgreSQL version and one server per run.
+//   - The fixture is small and synthetic, so results are synthetic observations.
 //
 // The server must be a disposable container whose postgres superuser may pg_read_file
 // /proc/<pid>/smaps_rollup and the cgroup files: all memory numbers are read that way, from
@@ -45,8 +70,9 @@ package store_test
 //
 // Design (see the ADR this feeds for the interpretation):
 //   - One api-style pool per candidate (MaxConns 1), built from pgxpool.ParseConfig (not
-//     OpenPool, so candidate A is raw pgx defaults; since #4591 the api's OpenPool default
-//     corresponds to candidate B128) with the candidate's StatementCacheCapacity / MaxConnLifetime / jitter set directly, plus an
+//     OpenPool; candidate A is raw pgx defaults and corresponds to the api's unchanged
+//     OpenPool baseline, and B128 is a candidate only, #4591 changed no default) with the
+//     candidate's StatementCacheCapacity / MaxConnLifetime / jitter set directly, plus an
 //     AfterConnect hook and pgx QueryTracer that record the backend PID, connect time,
 //     executions served and the distinct statement texts executed successfully per PID.
 //   - Primary workload, default plan_cache_mode=auto, through the real sqlc methods: a hot
@@ -66,7 +92,18 @@ package store_test
 //     are refused after planning and never retained, and NULL arguments plan small, so this
 //     is NOT an upper bound of plan-cache memory and NOT the decision basis.
 //
-// It fails closed: any unexpected error or row count is t.Fatal before a result is recorded.
+// Assertions it makes (t.Fatal on a mismatch):
+//   - ClaimRun returns the expected run id with status "claimed".
+//   - InsertRunMessage returns inserted and generation_live both true.
+//   - ListRunsForUser and ListRunUsageTotalsForRuns row counts, SelfUsage run_count, Ping,
+//     SchemaVersionStatus at head, and HeartbeatWorker's returned id.
+//   - Each breadth entry matches its pinned result class only (pmClassify / pmRunEntry).
+//   - verifyFixture's selected aggregates: queued-run status, message counts, custody holds
+//     and claim_generation.
+//
+// It does NOT verify complete row values or write effects. The wide phase records other
+// database errors (OtherErrors / ParseFailures) rather than failing, and cleanup errors
+// (rollbacks in closePool, advisory-lock and plan_cache_mode resets) are ignored.
 import (
 	"context"
 	"encoding/json"
@@ -3046,7 +3083,8 @@ type pmExplainExec struct {
 
 // pmRunExplain runs ClaimRun's exact SQL text, with the bindings the sqlc method sends,
 // under EXPLAIN (ANALYZE, SUMMARY ON, FORMAT JSON) EXECUTE of a server-side PREPARE six times
-// on one fresh connection of a fresh clone (execution 1 = first use of the backend, 2-6 =
+// on one fresh connection of a fresh clone (a capture connection first runs ClaimRun on the
+// same clone, so "fresh" applies to the measured connection only; execution 1 = first use of the backend, 2-6 =
 // the same connection again; EXECUTE follows the same custom-then-generic plan cache logic
 // as a pgx-prepared statement). Each execution is its own transaction, rolled back. The
 // clone's jit follows lab.jit. The bindings are replayed on the simple protocol so each is
@@ -3369,8 +3407,9 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 
 	phases := pmPhaseSet(t)
 
-	// Seed ONCE into the template database, then stop connecting to it: every measurement
-	// below runs on a fresh clone. The marker was checked on the maintenance database above;
+	// Seed ONCE into the template database. Measurements below run on clones (shared per
+	// phase as described in the header), but the validation pool just below and discover
+	// mode still connect to the template. The marker was checked on the maintenance database above;
 	// a marker there is the evidence that this instance is a throwaway.
 	adminDSN := dsn
 	if err := pmDropDB(adminDSN, pmTemplateDB); err != nil {

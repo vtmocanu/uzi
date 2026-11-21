@@ -1,40 +1,49 @@
-# ADR-4591: cap the api pool's per-connection statement cache at 128
+# ADR-4591: api pool backend memory — no default change; measurement inconclusive
 
-**Status**: Accepted (issue #4591). The api pool now caps pgx's per-connection statement cache at 128 unless `DATABASE_URL` sets `statement_cache_capacity`. Connection recycling (jitter, shorter lifetimes) was measured and **not adopted**.
+**Status**: Accepted: no default change; measurement inconclusive (issue #4591). `OpenPool` keeps pgx's defaults.
 **Date**: 2026-11-21
-**Deciders**: lead (plan), coder (measurement and implementation), reviewer, dba, fact-checker.
+**Deciders**: lead (plan), coder (measurement), reviewer, dba, fact-checker; owner (review decision to keep the current defaults).
 **Related**: [ADR-1620](1620-custom-plan-cache-mode.md) keeps `plan_cache_mode = auto` on the same pool and supplies the latency method reused here; this ADR does not change it.
-**PRD**: none. The spec lived in the issue body; this ADR records the measurement behind the decision.
+**PRD**: none. The spec lived in the issue body; this ADR records the measurement and why it did not change a default.
 
 ## Decision (summary)
 
-`OpenPool` now sets pgx's `StatementCacheCapacity` to **128** (pgx's own default is 512)
-whenever the DSN does not set `statement_cache_capacity` itself. Every `OpenPool` caller gets
-it, the api server included. Lifetime (1h), idle time (30m) and jitter (0) stay at pgx's
-defaults, and so does `plan_cache_mode` ([ADR-1620](1620-custom-plan-cache-mode.md)).
+`OpenPool` keeps pgx's defaults: `statement_cache_capacity` 512, connection lifetime 1h, idle
+time 30m, lifetime jitter 0. `plan_cache_mode` stays as decided in
+[ADR-1620](1620-custom-plan-cache-mode.md). No default changes.
 
-- **What it bounds.** Each cached statement keeps its plan state in the PostgreSQL backend.
-  Measured: about 154 KiB of backend memory contexts, and about 62 KiB of resident anonymous
-  memory, per cached statement (this fixture's average marginal cost; the wide-read sample
-  showed about 115-192 KiB per statement). The cap bounds the statement count, not bytes: it
-  caps the cached statements at 128 per connection, which in the harness was about
-  128 x 154 KiB of memory contexts.
-- **What it saved, in this harness.** Steady backend heap (Anonymous) fell 16.7% with JIT off
-  (68.6 to 57.1 MiB) and 3.8% with the server's default JIT on (70.0 to 67.4 MiB). The
-  production saving is **unmeasured**: these two figures are observations on one synthetic
-  workload, not bounds, and the effect on a real install could be smaller, including none.
-- **What it cost.** Headline latency is flat: `ClaimRun` about 7.1-7.3 ms and
-  `InsertRunMessage` about 240 us for every candidate.
-- **What was rejected.** A cap of 32 thrashes (a connection running more distinct statements
-  than the cap re-prepares them every pass). Recycling connections on a shorter lifetime with
-  jitter (candidates C and D) adds no saving and pays about 350 ms of planning per reconnect.
-  No jitter was added.
-- **It is a reversible default.** `statement_cache_capacity=512` in `DATABASE_URL` restores
-  pgx's default. Never set it to `0`: with pgx's default exec mode it makes every
-  query fail except an argument-less `Exec` (see [the description-cache finding](#the-description-cache-does-not-apply-here)).
+The measurement below is **inconclusive for a global default change** (see
+[Why the measurement is inconclusive](#why-the-measurement-is-inconclusive)). That is not a
+finding that the candidates are ineffective. Three candidates are **not adopted from this
+evidence**:
+
+- a statement cache capacity of 128;
+- a statement cache capacity of 32;
+- shorter connection lifetimes with jitter (candidates C and D).
+
+The observations the harness produced are kept below as **synthetic observations under the
+confounds listed**, not as conclusions:
+
+- With JIT off, steady backend heap (Anonymous) was 68.6 MiB at pgx's defaults and 57.1 MiB at
+  a 128 cache (-16.7%). With the server's default JIT on, 70.0 vs 67.4 MiB (-3.8%), on this
+  synthetic workload, with one rep; production effect unmeasured.
+- A cache of 32 showed a stress `ClaimRun` of about 68 ms against about 7 ms for the others.
+- Re-planning `ClaimRun` costs about 350 ms of planning per reconnect or re-prepare in this
+  harness.
+
+Never set `statement_cache_capacity` to `0`: with pgx's default exec mode it makes every
+query fail except an argument-less `Exec` (see
+[the description-cache finding](#the-description-cache-does-not-apply-here)). `0` is only
+valid together with a different `default_query_exec_mode`.
 
 The incident-scale figure that motivated the issue, 110-160Mi per backend, was **not
 reproduced or attributed** here (see [Limits](#limits)).
+
+## History
+
+An earlier revision of this MR implemented a 128 fallback in `OpenPool`, applied when the DSN
+did not set `statement_cache_capacity`. On owner review it was reverted: the measurement is
+inconclusive for a global default change. `OpenPool` is unchanged relative to the base.
 
 ## Context
 
@@ -63,7 +72,7 @@ reproducible.
 ### How the method evolved
 
 Four runs were made. The first three were superseded; they are recorded because the
-differences explain why the numbers below are trustworthy and why the earlier ones are not.
+differences explain why the earlier numbers were set aside. The later numbers are still synthetic observations under the confounds in [Why the measurement is inconclusive](#why-the-measurement-is-inconclusive).
 
 1. **Run 1.** Savepoints taken per execution were never `RELEASE`d, so each `SAVEPOINT` nested inside
    the previous one, so subtransaction depth grew by one per call within each transaction (one
@@ -219,8 +228,9 @@ rotated, the median round's per-execution mean. The columns are that mean in mic
 | C | 7251 | 239 | 7333 | 240 | 102.7 / 66.1 |
 | D | 7226 | 238 | 7535 | 244 | 103.9 / 67.4 |
 
-- **Headline latency is flat**: the differences sit inside the round-to-round spread
-  (A's five round means span 7107-7241 us). The same held in run 3 with default JIT
+- **Headline latency**: in this harness the differences between candidates sat inside the
+  round-to-round spread (A's five round means span 7107-7241 us), under jit off and a clone
+  shared by all candidates in a round, so this is an observation and not a cost conclusion. The same held in run 3 with default JIT
   (`ClaimRun` 6999-7051, `InsertRunMessage` 229-231).
 - **Stress variant** (40 distinct breadth calls between hot uses, N = 200): B32's `ClaimRun`
   is about 68 ms against 7.3-7.5 ms for the others, and `InsertRunMessage` about 0.98 ms against
@@ -235,7 +245,7 @@ executions 2 to 5, about 60-65 ms on the sixth (when PostgreSQL builds the gener
 execution about 19 ms, then about 8 ms. Planning dominates. The six executions sum to about
 350 ms of planning (348-358 ms across the four runs). **A re-prepare after an eviction or a
 reconnect therefore costs about 350 ms of planning once per statement, for `ClaimRun`.**
-Recycling connections (C, D) pays that on every reconnect and saved nothing over A and B128.
+Recycling connections (C, D) pays that on every reconnect and showed no saving over A and B128 in this harness.
 
 ### Wide-read sample (a lower bound, not an envelope)
 
@@ -343,42 +353,75 @@ func (c *Conn) deallocateInvalidatedCachedStatements(ctx context.Context) error 
 `pool_max_conn_lifetime_jitter` unset means 0, and a connection past its lifetime is
 destroyed on release.
 
+## Why the measurement is inconclusive
+
+- **Breadth checks pin only a result class.** `pmClassify` / `pmRunEntry` assert that each
+  entry returned some rows, no rows or `ErrNoRows`. They do not check exact rows, values or
+  write effects.
+- **Hot-mix and fixture checks assert only specific fields.** `ClaimRun` id and status
+  `claimed`; `InsertRunMessage` inserted and `generation_live`; `ListRunsForUser` and
+  `ListRunUsageTotalsForRuns` row counts; `SelfUsage` `run_count`; `Ping`;
+  `SchemaVersionStatus` at head; `HeartbeatWorker` id; and `verifyFixture`'s selected
+  aggregates (queued-run status, message counts, custody holds, `claim_generation`). Complete
+  row values and write effects are not verified.
+- **Isolation differs by phase.**
+  - Memory: one clone per candidate and rep.
+  - Latency and stress: one clone per round, shared by all candidates in that round. Later
+    candidates inherit bloat from rolled-back writes and from `verifyFixture`'s heartbeat
+    `UPDATE`.
+  - Cold: one clone shared by all candidates and reps.
+  - Wide: one clone per cache size and plan mode.
+  - Explain: one clone per jit mode and rep; a capture connection runs a real `ClaimRun` on
+    it before the measured connection.
+  - The template `pm_template` is still read by the validation pool, and discover mode runs
+    on it. All clones share one server.
+- **The wide phase records other errors rather than failing**, so a wide run can complete
+  with unexplained error rows.
+- **JIT confounds the memory comparison.** The headline latency run (c) ran with `jit = off`,
+  while the normal-JIT memory run (b) showed extra Anonymous memory. The normal-JIT 128 vs A
+  difference was 3.8% (70.0 to 67.4 MiB) on this synthetic workload, with one rep;
+  production effect unmeasured.
+- **Candidates are confounded with each other.** C and D change lifetime together with, or
+  against, the cache cap, and the JIT effect varies by candidate, so no preference among the
+  candidates is justified by this evidence.
+
 ## Decision and rationale
 
-The default was to land only if a cap bounded backend memory without moving the hot paths.
+The default would have changed only if a lower cache cap or shorter lifetime clearly bounded
+backend memory without moving the hot paths. The evidence does not establish that for a
+global default, so `OpenPool` keeps pgx's defaults.
 
-- **128 clears that bar.** It cuts about 154 KiB of memory contexts per
-  statement it no longer holds (this fixture's average), leaves headline latency flat, and in the harness cut steady
-  heap by 16.7% with JIT off. With JIT on the measured saving is only 3.8%, because
-  evicting and re-planning on the bloated clone is the leading hypothesis for what triggered JIT, which maps about 51 MiB of
-  shared library text and about 8.5-14 MiB of Anonymous. The production saving is
-  unmeasured. It depends on how many distinct statements a connection runs, which the
-  harness fixes at 317, and on whether any re-planned statement crosses `jit_above_cost`.
-- **32 is rejected.** It saves more heap (51.3 MiB) but thrashes: its stress `ClaimRun` is
-  about 68 ms against about 7 ms.
-- **C and D are rejected.** Recycling on a compressed lifetime with jitter saved nothing
-  over A (C) or over B128 (D), and every reconnect re-pays about 350 ms of planning per hot
-  statement. No jitter was added to the pool.
-- **The mechanism is the DSN key.** `poolConfig` reads `pgconn.ParseConfig(dsn)`'s
-  `RuntimeParams["statement_cache_capacity"]` and sets the default only when it is absent,
-  because pgx deletes the key from the parsed config and a value of 512 is indistinguishable
-  from pgx's own default. This honours the URL, keyword/value and service-file forms (tests:
-  `TestPoolConfigDefaults`, `TestPoolConfigDSNOverridesStatementCache`,
-  `TestPoolConfigServiceFileOverridesStatementCache` in
-  `api/internal/store/pool_config_test.go`; the plan named `pool_test.go`, which is a minor
-  deviation). Red/green was observed: removing the apply block fails the default tests with
-  "StatementCacheCapacity = 512, want 128", and ignoring the DSN fails the override tests.
+- **128, 32 and lifetime/jitter (C, D) are candidates not adopted from this evidence.** They
+  are not rejected or disproven; a measurement without the confounds above could change the
+  picture.
+- **Synthetic observations, under the confounds.**
+  - 128 cut about 154 KiB of memory contexts per statement it no longer holds (this fixture's
+    average) and steady heap by 16.7% with JIT off; with JIT on the difference was 3.8%
+    (see above). The JIT effect appears on backends that re-plan, which maps about 51 MiB of
+    shared library text and about 8.5-14 MiB of Anonymous; which statement crosses
+    `jit_above_cost` was not identified.
+  - 32 saved more heap (51.3 MiB) and its stress `ClaimRun` was about 68 ms against about
+    7 ms.
+  - Recycling on a compressed lifetime with jitter showed no saving over its cache-size
+    counterpart (C over A, D over B128), and each reconnect re-pays about 350 ms of planning
+    for `ClaimRun` in this harness.
+- **The statement count is a fixture parameter.** The harness retains 317 statements; the
+  effect of any cap in production depends on how many distinct statements a connection runs
+  and whether any re-planned statement crosses `jit_above_cost`, neither of which is
+  measured in production.
 
 ## Consequences
 
-- **Production working-set risk.** The hot path survives while fewer than about 126 other
-  distinct statements run on a connection between two of its uses. Beyond that the LRU
-  evicts it and each use re-prepares, and the thrash signature is `ClaimRun` p50 rising from
-  about 7 ms toward 60+ ms. The remedy is to raise `statement_cache_capacity` in
-  `DATABASE_URL`. To watch for it, compare `ClaimRun` latency after deploy; or, with the
-  infrastructure owner's agreement, compare `pg_stat_statements` plans to calls with
+- **No runtime change.** Operators who want to trade memory against re-prepares can set
+  `statement_cache_capacity` in `DATABASE_URL`. Observation of what lowering the cache would
+  trade: once a connection runs more distinct statements than the cap between two uses of a
+  hot statement, the LRU can evict it and each such use re-prepares. In the harness at a cap of 32 under stress that showed as `ClaimRun`
+  p50 rising from about 7 ms toward 60+ ms. To watch for it, compare `ClaimRun` latency, or,
+  with the infrastructure owner's agreement, compare `pg_stat_statements` plans to calls with
   `track_planning` on.
-- **JIT is the larger lever when it engages.** The operator levers, by reach:
+- **JIT is a lever that may matter when it engages.** Whether it is the larger lever is
+  open (see [Open investigation questions](#open-investigation-questions)). The operator
+  levers, by reach:
   - `ALTER ROLE <app-role> SET jit = off;` takes effect for **new sessions only**, so
     existing pool connections keep JIT until they recycle (up to 1h) or the api restarts.
   - `jit=off` as a key in the `DATABASE_URL` query: pgx passes unknown keys through as
@@ -394,23 +437,30 @@ The default was to land only if a cap bounded backend memory without moving the 
 - **Sizing is an estimate, not a hard bound:**
   **api replicas × per-api DB_MAX_CONNS × per-backend memory**, where api replicas means
   the number of api pools connected to the same primary (CNPG standby instances are not part
-  of the multiplier). Use about 60 MiB per backend with JIT off at the default cap of 128
-  (57.1 MiB steady Anonymous, 60.0-60.6 MiB Private_Dirty) and about 75 MiB when JIT engages
-  (67.4 steady, 72.7 sampled peak Anonymous, 71.7 Private_Dirty). One replica at 20
-  connections is about 1.2 GiB with JIT off and about 1.5 GiB with JIT on. Add what is
-  counted once (`shared_buffers`, the shared LLVM library page cache, PostgreSQL background
-  processes), headroom for non-api connections (one-off `/server setup` runs, admin `psql` sessions, migrations
-  (`store.Migrate` opens its own connection), CNPG's own connections), concurrent
-  query memory (up to `work_mem` per sort or hash plan node) and other PostgreSQL and
-  container overhead. It assumes every pool connection has been opened and used; pgxpool
-  opens connections lazily and reaps idle ones after 30m. The chart's api Deployment uses
-  `Recreate` (`deploy/chart/templates/api-deployment.yaml`), so there is no rolling-update
-  overlap term. Measured on PostgreSQL 17.12 with a small synthetic fixture and 100 ms
-  sampling; CNPG deployments may run a different major version.
+  of the multiplier). The per-backend figures measured here, about 60 MiB with JIT off
+  (57.1 steady Anonymous, 60.0-60.6 Private_Dirty) and about 75 MiB with JIT on (67.4 steady,
+  72.7 sampled peak Anonymous, 71.7 Private_Dirty), were measured at the 128 candidate on the
+  synthetic fixture. They illustrate the arithmetic only (one replica at 20 connections is
+  about 1.2 GiB with JIT off and about 1.5 GiB with JIT on) and are not recommendations.
+  Add what is counted once (`shared_buffers`, the shared LLVM library page cache, PostgreSQL
+  background processes), headroom for non-api connections (one-off `/server setup` runs,
+  admin `psql` sessions, migrations (`store.Migrate` opens its own connection), CNPG's own
+  connections), concurrent query memory (up to `work_mem` per sort or hash plan node) and
+  other PostgreSQL and container overhead. It assumes every pool connection has been opened
+  and used; pgxpool opens connections lazily and reaps idle ones after 30m. The chart's api
+  Deployment uses `Recreate` (`deploy/chart/templates/api-deployment.yaml`), so there is no
+  rolling-update overlap term. Measured on PostgreSQL 17.12 with a small synthetic fixture and
+  100 ms sampling; CNPG deployments may run a different major version.
 - **Operator documentation** is
   [Database connection memory and sizing](../docs/configuration.md#database-connection-memory-and-sizing-issue-4591).
-- **Not scheduled.** A production measurement of the saving, and an identified JIT-triggering
-  statement, would establish what the cap saves in production. Neither was done.
+
+## Open investigation questions
+
+- Which statements trigger JIT on a re-planning backend, and is JIT the larger memory lever
+  than the statement cache?
+- What produced the unreproduced 110-160Mi per-backend incident figure?
+
+Any JIT investigation is separate work, not done here.
 
 ## Limits
 
@@ -440,6 +490,19 @@ The default was to land only if a cap bounded backend memory without moving the 
   cache and every backend, so they are not per-backend numbers either. The limit is that
   total container memory under each candidate is unverified; the ranking rests on per-backend
   Anonymous.
+- **Harness checks are narrow.** Breadth checks pin only the result class (some rows, no
+  rows, `ErrNoRows`); hot-mix and fixture checks assert only specific fields (ClaimRun id and
+  status, InsertRunMessage inserted and `generation_live`, row counts, `SelfUsage`
+  `run_count`, `Ping`, schema at head, heartbeat id, `verifyFixture`'s selected aggregates).
+  Complete row values and write effects are not verified.
+- **Clones are shared in some phases.** Memory uses one clone per candidate and rep, but
+  latency and stress share one clone per round across candidates (later candidates inherit
+  rolled-back-write and heartbeat-`UPDATE` bloat), cold shares one clone across all
+  candidates and reps, and `pm_template` is still read by the validation pool and discover
+  mode. All clones share one server. The wide phase records other errors rather than failing.
+- **JIT mismatch between runs.** The headline latency run ran with `jit = off`; the
+  normal-JIT memory run showed extra Anonymous memory. The 3.8% normal-JIT difference is on
+  this synthetic workload; production effect unmeasured.
 - **The `SAVEPOINT` caveat.** [ADR-1620](1620-custom-plan-cache-mode.md)'s harness did not
   `RELEASE` its savepoints, so its absolute memory and latency carry the nesting growth run 1
   here showed.

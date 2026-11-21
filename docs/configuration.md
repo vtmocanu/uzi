@@ -1238,15 +1238,15 @@ with that DSN.
 
 Each api pool connection is one PostgreSQL backend process. pgx caches every parameterised
 statement it sends as a server-side prepared statement, and the backend keeps each one's plan
-in memory until the connection closes. The api now caps that per-connection cache at **128**
-statements (pgx's own default is 512), which caps the cached statements at 128 per connection; in the
-harness that was about 128 × 154 KiB of memory contexts. See [ADR-4591](../adr/4591-api-pool-backend-memory.md) for the
-measurement.
+in memory until the connection closes. The api uses pgx's default per-connection cache of
+**512** statements, unchanged. [ADR-4591](../adr/4591-api-pool-backend-memory.md) measured
+lower caps and shorter connection lifetimes on a synthetic fixture; that measurement was
+inconclusive and changed no default.
 
-**Release notes for operators.** The cap needs no configuration. In the measurement harness
-it cut steady backend heap by 16.7% with JIT off and 3.8% with PostgreSQL's default JIT on;
-these are observations on one synthetic workload, not bounds: the production saving is
-unmeasured and could be smaller, including none. Headline latency is flat.
+**Release notes for operators.** No default changed. The synthetic measurement in ADR-4591
+was inconclusive for a global default change, so the api keeps pgx's defaults. The overrides
+below remain available if you want to trade backend memory against re-prepares for your own
+workload.
 
 **Overrides**, as keys in the `DATABASE_URL` query (or the keyword/value or service-file
 form). pgx reads them and does not forward them to PostgreSQL:
@@ -1257,21 +1257,21 @@ postgres://app:<password>@example.com:5432/uzi?statement_cache_capacity=256
 
 | Key | Default | Notes |
 |---|---|---|
-| `statement_cache_capacity` | `128` | Per-connection prepared-statement cache. `512` restores pgx's default. **Never set `0`**: with pgx's default exec mode it makes every query fail except an argument-less `Exec` ("cannot use QueryExecModeCacheStatement with disabled statement cache"); `0` is only valid together with a different `default_query_exec_mode`. |
-| `description_cache_capacity` | pgx's `512` | No effect on the api: it is read only under `cache_describe` mode, and the api uses the default cached-statement mode. |
+| `statement_cache_capacity` | `512` (pgx's default, unchanged) | Per-connection prepared-statement cache. **Never set `0`**: with pgx's default exec mode it makes every query fail except an argument-less `Exec` ("cannot use QueryExecModeCacheStatement with disabled statement cache"); `0` is only valid together with a different `default_query_exec_mode`. |
+| `description_cache_capacity` | pgx's `512` | No effect under the default cached-statement exec mode (`default_query_exec_mode` unset): pgx reads it only under `cache_describe`. |
 | `pool_max_conn_lifetime` | `1h` | Unchanged pgx default. |
-| `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default; no jitter is added. Recycling connections sooner saved no memory in the measurement and pays about 350 ms of planning per reconnect. |
+| `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default. In the synthetic harness, recycling connections sooner pays about 350 ms of planning per reconnect for `ClaimRun` (a harness observation, not a production figure). |
 | `pool_max_conn_idle_time` | `30m` | Unchanged pgx default. |
 
-**When 128 is too small.** The hot path (worker claim, message append) stays cached while
-fewer than about 126 other distinct statements run on a connection between two of its uses.
-Past that, each use re-prepares: the signature is the `ClaimRun` p50 latency rising from about
-7 ms toward 60+ ms. Raise `statement_cache_capacity` in `DATABASE_URL`. To check after a
-deploy, compare `ClaimRun` latency, or, with the database owner's agreement, compare
-`pg_stat_statements` plans to calls with `track_planning` on.
+**Lowering the statement cache.** Lowering `statement_cache_capacity` in `DATABASE_URL`
+trades backend memory for re-prepares once a connection runs more distinct statements than the
+cap between two uses of a hot statement (worker claim, message append). In the synthetic
+harness that showed as `ClaimRun` p50 rising from about 7 ms toward 60+ ms at a cap of 32
+under stress. To check after a change, compare `ClaimRun` latency, or, with the database
+owner's agreement, compare `pg_stat_statements` plans to calls with `track_planning` on.
 
-**JIT can add memory.** With PostgreSQL's default `jit = on`, re-planned statements may cross
-`jit_above_cost` and load LLVM; in the measurement that added about 8.5-14 MiB of heap to a
+**JIT can add memory.** With PostgreSQL's default `jit = on`, statements whose plans cross
+`jit_above_cost` may load LLVM; in the measurement that added about 8.5-14 MiB of heap to a
 backend plus about 51 MiB of shared library text (counted once per instance). If you want it
 off:
 
@@ -1291,9 +1291,14 @@ before tuning any cost threshold; no `jit_above_cost` value is recommended here.
 **Sizing estimate.** Peak backend memory across the pools is roughly
 **api replicas × per-api DB_MAX_CONNS × per-backend memory**, where api replicas is the
 number of api pools connected to the same primary (CNPG standby instances are not part of the
-multiplier). This is an estimate, not a hard bound. Per backend, use about 60 MiB with JIT off
-at the default cap of 128, and about 75 MiB when JIT engages. One replica at the default 20
-connections is about 1.2 GiB (JIT off) or 1.5 GiB (JIT on). Add:
+multiplier). This is an estimate, not a hard bound.
+
+Choose per-backend input from representative measurements of your own workload, including connection age, cold/reprepare and concurrent query peaks. The synthetic fixture below illustrates the arithmetic only; its 60/75 MiB values are not production sizing recommendations and do not supersede the reported incident measurements.
+
+Synthetic illustration (arithmetic only): the harness measured about 60 MiB per backend with
+JIT off and about 75 MiB with JIT on, at a 128-statement cache candidate (not the api's 512
+default). One replica × 20
+connections would then be about 1.2 GiB (JIT off) or 1.5 GiB (JIT on). Add:
 
 - what is counted once: `shared_buffers`, the shared LLVM library page cache, and the
   PostgreSQL background processes;
