@@ -483,8 +483,7 @@ func (d agentSourceDTO) stagedRole(t *testing.T, name string) agentSourceRoleDTO
 func TestAgentSourceEffortApplyLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newAgentSourceFixture(ctx, t)
-	var roles []byte
-	roles = []byte(`[` +
+	roles := []byte(`[` +
 		`{"name":"effort-role","ok":true,"description":"effort desc","effort":"high","prompt_body":"effort body\n"},` +
 		`{"name":"effort-legacy","ok":true,"description":"legacy desc","prompt_body":"legacy body\n"},` +
 		`{"name":"effort-bad","ok":true,"description":"bad desc","prompt_body":"bad body\n","notes":["effort_ignored"]}]`)
@@ -541,7 +540,7 @@ func TestAgentSourceEffortApplyLiveDB(t *testing.T) {
 	// An EXISTING synced row with a stale Claude effort and a locally set Codex effort: the sync
 	// replaces the Claude effort with the source's and clears the Codex effort (the source has
 	// none), like codex_model, on the real UPDATE path.
-	_ = f.seedTemplate(ctx, t, "effort-existing", "global", "synced", false, "existing desc", "existing body\n")
+	existingID := f.seedTemplate(ctx, t, "effort-existing", "global", "synced", false, "existing desc", "existing body\n")
 	mustExecT(ctx, t, f.pool, `UPDATE agent_templates SET effort = 'low', codex_effort = 'max' WHERE name = 'effort-existing' AND scope = 'global'`)
 	roles = []byte(`[` +
 		`{"name":"effort-role","ok":true,"description":"effort desc","effort":"high","prompt_body":"effort body\n"},` +
@@ -555,5 +554,9 @@ func TestAgentSourceEffortApplyLiveDB(t *testing.T) {
 	}
 	if e, ce := effortOf("effort-existing"); !e.Valid || e.String != "high" || ce.Valid {
 		t.Fatalf("effort-existing stored effort=%+v codex_effort=%+v, want high/NULL", e, ce)
+	}
+	var afterID uuid.UUID
+	if err := f.pool.QueryRow(ctx, `SELECT id FROM agent_templates WHERE name = 'effort-existing' AND scope = 'global'`).Scan(&afterID); err != nil || afterID != existingID {
+		t.Fatalf("effort-existing was not updated in place: id %v -> %v (%v)", existingID, afterID, err)
 	}
 }

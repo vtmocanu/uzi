@@ -155,7 +155,7 @@ describe("isLeadTemplateName", () => {
   });
 });
 
-// Issue #3258 N8: the live preview mirrors the server Render, which emits the Claude
+// Issue #3258 (M3 review): the live preview mirrors the server Render, which emits the Claude
 // effort after model and never a Codex pin.
 describe("renderSubagent effort", () => {
   const base = { name: "coder", description: "d", model: "sonnet", tools: ["Read"], prompt_body: "Body.\n" };

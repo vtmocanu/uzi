@@ -141,6 +141,20 @@ describe("AgentTemplateEditor pin validation", () => {
     expect(preview).not.toContain("gpt-6-sol");
   });
 
+  it("live preview carries the Claude effort as it changes and never the Codex effort (#3258)", () => {
+    const { container } = render(<AgentTemplateEditor
+      initial={{ name: "coder", description: "d", model: null, effort: "high", codex_effort: "low", tools: null, prompt_body: "b" }}
+      nameEditable={false} submitLabel="Save" busy={false} error="" onSubmit={vi.fn()}
+    />);
+    const preview = () => container.querySelector("pre")!.textContent!;
+    expect(preview()).toContain("effort: high");
+    expect(preview()).not.toContain("low");
+    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
+    expect(preview()).toContain("effort: max");
+    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "" } });
+    expect(preview()).not.toContain("effort");
+  });
+
   it.each([
     { description: "bad\nvalue", tools: null },
     { description: "d", tools: ["bad,tool"] },

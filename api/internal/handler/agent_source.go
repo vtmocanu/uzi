@@ -387,9 +387,10 @@ func stagedToDTO(staged store.AgentSourceStaged, lastAppliedSHA string) *agentSo
 			Model:       termsafe.CellText(role.Model),
 			ClaudeModel: termsafe.CellText(def.Model),
 			CodexModel:  termsafe.CellText(def.CodexModel),
-			// Effort is closed-set at parse time (one of the five levels or ""); projecting
-			// through the closed set keeps a tampered snapshot value off the panel.
-			Effort:     agenttmpl.EffortForHarness("claude", def.Effort, ""),
+			// Effort is closed-set at parse time (one of the five levels or ""). The panel
+			// projects it through the same ValidateEffort apply uses (storeColumns), so a
+			// tampered snapshot shows exactly what Approve would store, never other text.
+			Effort:     panelEffort(def.Effort),
 			Tools:      role.Tools,
 			PromptBody: sanitizedBody,
 			// body_sanitized: true only when sanitization changed the body, i.e. the raw
@@ -432,4 +433,15 @@ func parseSyncCounts(raw string) (agentSourceCountsDTO, bool) {
 		return agentSourceCountsDTO{}, false
 	}
 	return agentSourceCountsDTO{Staged: m["staged"], Changed: m["changed"], Failed: m["failed"]}, true
+}
+
+// panelEffort is what the staged review shows for a role's Claude effort: the value
+// agentsource's storeColumns would write (ValidateEffort trims, then requires an exact
+// level), or "" when it would refuse it (Apply then fails the whole snapshot closed).
+func panelEffort(raw string) string {
+	e, err := agenttmpl.ValidateEffort(raw)
+	if err != nil {
+		return ""
+	}
+	return e
 }

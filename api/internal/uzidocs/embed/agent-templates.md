@@ -266,7 +266,7 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
    effort**) so a subagent follows the lead on that harness. **Use the run's resolved model for subagents too** on a schedule overrides
    these model pins; effort pins are kept.
 4. The live Markdown preview exports the Claude definition, including its
-   Claude pin. The Codex pin is saved separately.
+   Claude model and effort pins. The Codex pins are saved separately.
 
 ![Creating an agent template with both harness pins and the Claude Markdown preview](img/agent-templates-editor.png)
 
