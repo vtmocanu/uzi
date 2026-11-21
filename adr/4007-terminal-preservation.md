@@ -507,9 +507,11 @@ holds a single row:
   and goes straight to the guarded advance. Otherwise the `capacity_room_needed`
   admission check is skipped (the fire was already admitted), today's room bounds
   only the new starts, and a room of 0 is a quiet hold (`errOnceFireHeld`): no
-  transient warning, no advance, a partial summary that omits the volatile
-  in-flight and room numbers, and a retry next tick. With no rows, the cap and
-  room-needed check are unchanged.
+  transient warning, no advance, a partial summary that records the observed
+  capacity, and a retry next tick. The summary's dedupe ignores the volatile
+  in-flight and room numbers, so a long hold writes once and its stored numbers
+  are those of the first held tick (the "Last run" view may show a stale
+  in-flight count). With no rows, the cap and room-needed check are unchanged.
 - A continuation's scan limit is the stored cap plus the backfill headroom,
   whatever today's room. Recorded candidates are skipped before the active-run
   check and the forge fetch and add no skip; prior starts are folded into
@@ -527,6 +529,11 @@ holds a single row:
   is `last_fire` only and never appended to `recent_fires`; it is skipped when
   equal to the stored one; its failure never blocks the retry. The row staying
   `active` and due is the visible retrying state.
+- A scheduled one-time sweep whose context is cancelled mid-fire (shutdown,
+  rollout) returns the context error, checked before each candidate and after
+  the loop, so the row stays due and is not advanced; the next tick resumes from
+  the ledger. It logs the transient warning and writes no partial summary, so
+  `last_fire` shows this attempt's starts only after the next write.
 - The mid-fire credential-disabled and stored-override arms judge this attempt's
   starts: with none, they hold or return as with no starts at all; otherwise
   they record the skip, stop and advance as today.

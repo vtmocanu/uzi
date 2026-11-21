@@ -454,7 +454,8 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 	if errors.Is(fireErr, errOnceFireHeld) {
 		// Issue #4512: a continuation of a partially admitted once sweep whose owner capacity has
 		// no room. Quiet: no transient warning, no advance; the row stays due and retries next
-		// tick. A summary of the progress so far (stable fields only) says why it waits.
+		// tick. A summary of the progress so far, with the observed capacity, says why it waits;
+		// its dedupe ignores the volatile in-flight and room numbers.
 		e.logger.Debug("scheduler: once sweep continuation held, no capacity room", "schedule", sched.ID.String())
 		e.writeOnceSweepSummary(ctx, sched, out, onceSummaryPartial)
 		return
