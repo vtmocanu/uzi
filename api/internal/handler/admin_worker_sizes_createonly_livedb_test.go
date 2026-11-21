@@ -104,14 +104,14 @@ func TestAdminWorkerSizesCreateOnlyRaceLiveDB(t *testing.T) {
 	}
 
 	type result struct {
-		idx int
-		rec *httptest.ResponseRecorder
+		body string
+		rec  *httptest.ResponseRecorder
 	}
 	bodies := []string{sizeBody(500, 2000, 1024, 2048, 10, 10), sizeBody(750, 3000, 2048, 4096, 12, 8)}
 	done := make(chan result, 2)
-	for i, b := range bodies {
+	for _, b := range bodies {
 		serve := cookiePutPrepared(t, f, coRace, b, map[string]string{"If-None-Match": "*"})
-		go func() { done <- result{i, serve()} }()
+		go func() { done <- result{b, serve()} }()
 	}
 	waitBlockedByCount(t, f, pid, 2)
 	var unlocked bool
@@ -119,13 +119,13 @@ func TestAdminWorkerSizesCreateOnlyRaceLiveDB(t *testing.T) {
 		t.Fatalf("advisory unlock = %v, %v", unlocked, err)
 	}
 
-	winner, created, refused := -1, 0, 0
+	winnerBody, created, refused := "", 0, 0
 	for range bodies {
 		r := awaitResult(t, done, "a create-only PUT")
 		switch r.rec.Code {
 		case http.StatusCreated:
 			created++
-			winner = r.idx
+			winnerBody = r.body
 		case http.StatusPreconditionFailed:
 			refused++
 			if _, reason := errReason(t, r.rec); reason != "size_exists" {
@@ -140,7 +140,7 @@ func TestAdminWorkerSizesCreateOnlyRaceLiveDB(t *testing.T) {
 	}
 	// The stored row holds the 201 request's six values, and exactly one row was added.
 	var wantReq map[string]int64
-	if err := json.Unmarshal([]byte(bodies[winner]), &wantReq); err != nil {
+	if err := json.Unmarshal([]byte(winnerBody), &wantReq); err != nil {
 		t.Fatal(err)
 	}
 	row := f.size(t, coRace)
@@ -154,7 +154,7 @@ func TestAdminWorkerSizesCreateOnlyRaceLiveDB(t *testing.T) {
 	}
 	for k, v := range wantReq {
 		if got[k] != v {
-			t.Fatalf("stored %s = %d, want %d (winner body %s)", k, got[k], v, bodies[winner])
+			t.Fatalf("stored %s = %d, want %d (winner body %s)", k, got[k], v, winnerBody)
 		}
 	}
 	if !row.UpdatedBy.Valid || row.UpdatedBy.Bytes != f.admin {
@@ -218,6 +218,16 @@ func TestAdminWorkerSizesCreateOnlyPrecedenceLiveDB(t *testing.T) {
 	rec := f.putIfNoneMatch(t, coExtra, `{"cpu_request_millicores":500}`, "*")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("existing + missing fields = %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	// A complete body whose values fail workersize.Validate (cpu request above the limit) on an
+	// existing name is still 412: the values are not validated before the existence refusal.
+	fpExtra := f.fingerprint(t, coExtra)
+	rec = f.putIfNoneMatch(t, coExtra, sizeBody(5000, 2000, 1024, 2048, 10, 10), "*")
+	if _, reason := errReason(t, rec); rec.Code != http.StatusPreconditionFailed || reason != "size_exists" {
+		t.Fatalf("existing + invalid values = %d %s, want 412 size_exists", rec.Code, rec.Body.String())
+	}
+	if f.fingerprint(t, coExtra) != fpExtra {
+		t.Fatal("a refused create-only with invalid values changed the row")
 	}
 	// A malformed name: 400.
 	if rec := f.putIfNoneMatch(t, "Bad_Name", sizeBody(500, 2000, 1024, 2048, 10, 10), "*"); rec.Code != http.StatusBadRequest {

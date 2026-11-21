@@ -336,8 +336,10 @@ func (h *Handler) beginSizeTx(ctx context.Context) (pgx.Tx, error) {
 // create the size when no row has that name (201). A name that is not a well-formed size name
 // is a 400, since nothing could ever be stored under it.
 //
-// A request whose first If-None-Match value is exactly "*" is create-only: when the name
-// already exists the answer is 412 with reason size_exists and nothing is validated or written.
+// A request whose If-None-Match field (r.Header.Get, trimmed) is exactly "*" is create-only:
+// once the body is well-formed and complete (malformed or missing fields are still 400), an
+// existing name is answered 412 with reason size_exists; the values are not validated and
+// nothing is written.
 // No ETags are issued, so any other If-None-Match value cannot match a current representation
 // (RFC 9110) and the request stays unconditional, including list forms such as `*, W/x`. The
 // existence check and the write are serialized by the advisory lock plus the READ COMMITTED
