@@ -3,8 +3,13 @@
 Reads one bounded "uzi-go-cache-env/1" artifact (or an in-process collector result) and
 reports, per leg, PROVEN / NEGATIVE / UNVERIFIED / FIXTURE-CONSISTENT with a named reason.
 Values that came from the artifact file reach at most FIXTURE-CONSISTENT; PROVEN needs
-evidence built in this invocation by the collector code path (collect()). No collector
-exists in this issue, and the canary leg has no producer, so `qualified` is always false.
+evidence built in this invocation by the collector code path (collect()). The only collector,
+observe.py, supplies the daemon and binding sections and no mount, fd or runtime facts, and the
+canary leg has no producer, so `qualified` is always false.
+
+Outer sinks (daemon_image_store, daemon_build_cache, daemon_metadata_snapshots, container_logs) live
+outside every container superblock, so a collector must not record realpaths for their paths: a
+recorded realpath resolves under "/" and makes the sink sink-malformed.
 """
 import argparse
 import hashlib
@@ -292,6 +297,9 @@ def check_sinks(sinks):
             # Only the evaluator injects pseudo sinks (process_tree, memory); an artifact cannot.
             _add(reasons, "sink-pseudo-forbidden")
             continue
+        # outer_domain is meaningful on the exempt names only; a child sink may not carry it either.
+        if "outer_domain" in s and name not in OUTER_EXEMPT:
+            _add(reasons, "sink-malformed")
         if "parent" in s:
             require(type(s["parent"]) is str and s["parent"] != name)
             if s["parent"] not in sinks:
@@ -301,8 +309,6 @@ def check_sinks(sinks):
             elif name not in OUTER_EXEMPT and _outer_ancestor(sinks, name):
                 _add(reasons, "sink-malformed")
             continue
-        if "outer_domain" in s and name not in OUTER_EXEMPT:
-            _add(reasons, "sink-malformed")
         require(type(s.get("paths")) is list and all(type(x) is str for x in s["paths"]))
         require(type(s.get("backing_domain")) is str)
         require(s.get("mount_id") is None or _is_int(s["mount_id"]))
@@ -458,6 +464,15 @@ def _longest_prefix(mounts, real):
     return best
 
 
+def daemon_capability(daemon):
+    """Reasons from the daemon's own capability report; needs no container or mount facts."""
+    if (any(daemon.get(k) is not True for k in ("MemoryLimit", "SwapLimit", "PidsLimit"))
+            or (daemon.get("rootless") is True and daemon.get("CgroupDriver") == "cgroupfs")
+            or daemon.get("rootless") not in (True, False)):
+        return ["daemon-capability-unsupported"]
+    return []
+
+
 def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
     """Judge boundary claims {kind, resource, sinks[, superblock]} against observed mounts.
 
@@ -602,10 +617,8 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
                     for name in names:
                         cov[name][resource] = True
     if isinstance(daemon, dict):
-        if (any(daemon.get(k) is not True for k in ("MemoryLimit", "SwapLimit", "PidsLimit"))
-                or (daemon.get("rootless") is True and daemon.get("CgroupDriver") == "cgroupfs")
-                or daemon.get("rootless") not in (True, False)):
-            _add(reasons, "daemon-capability-unsupported")
+        for code in daemon_capability(daemon):
+            _add(reasons, code)
     elif any(c.get("kind") in CGROUP_KINDS for c in claims):
         _add(reasons, "daemon-info-missing")
     for name, s in sinks.items():
@@ -789,10 +802,15 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
 
         def enforcement():
             if not mount_facts:
-                return grade(["no-container-mount-facts"], ("mountinfo",), tiers)
+                # The daemon's capability report stands on its own: a rootless cgroupfs daemon is
+                # a contradiction whether or not any container mount was observed.
+                got = ["no-container-mount-facts"]
+                if isinstance(sections.get("daemon"), dict):
+                    got += daemon_capability(sections["daemon"])
+                return grade(got, ("mountinfo",), tiers)
             if pseudo_sink:
                 return grade(["sink-pseudo-forbidden"], ("charge_map",), tiers)
-            runtime = sections.get("runtime") if isinstance(sections.get("runtime"), dict) else {}
+            runtime =sections.get("runtime") if isinstance(sections.get("runtime"), dict) else {}
             daemon = sections.get("daemon")
             daemon = {k: v for k, v in daemon.items() if k != "source"} if isinstance(daemon, dict) else None
             facts = dict(tier={k: tiers.get(k, "file") for k in ("mountinfo", "runtime", "daemon")},

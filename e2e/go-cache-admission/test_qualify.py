@@ -465,6 +465,19 @@ class ChargeMapTests(Base):
         sinks["tmp2"] = dict(identity="tmp2", parent="tmp")
         self.assertIn("sink-parent-cycle", q.check_sinks(sinks))
 
+    def test_daemon_capability_is_judged_without_container_mount_facts(self):
+        art = full_artifact()
+        del art["mountinfo"]
+        art["daemon"].update(rootless=True, CgroupDriver="cgroupfs")
+        leg = q.evaluate(art, now=NOW)["legs"]["enforcement"]
+        self.assertEqual(leg["status"], "NEGATIVE")
+        self.assertEqual(leg["reason"], "daemon-capability-unsupported")
+        self.assertIn("no-container-mount-facts", reasons(leg))
+        art["daemon"].update(rootless=False, CgroupDriver="systemd")
+        leg = q.evaluate(art, now=NOW)["legs"]["enforcement"]
+        self.assertEqual(leg["status"], "UNVERIFIED")
+        self.assertEqual(reasons(leg), ["no-container-mount-facts"])
+
     def test_no_collector_mount_facts(self):
         art = full_artifact()
         del art["mountinfo"]
@@ -569,6 +582,23 @@ class AliasingTests(Base):
         flagged["outer_domain"] = True
         self.assertIn("sink-malformed", q.check_sinks({"work": flagged}))
         self.assertNotIn("sink-malformed", q.check_sinks({"work": sink("work", "/t/w", 10, "sb-t")}))
+
+    def test_child_sink_may_not_carry_outer_domain(self):
+        sinks = {"tmp": sink("tmp", "/t", 10, "sb-t"),
+                 "work": dict(identity="work", parent="tmp", outer_domain=True)}
+        self.assertIn("sink-malformed", q.check_sinks(sinks))
+        del sinks["work"]["outer_domain"]
+        self.assertNotIn("sink-malformed", q.check_sinks(sinks))
+
+    def test_grandchild_of_an_outer_sink_is_malformed(self):
+        outer = dict(identity="daemon_build_cache", paths=[], mount_id=None, bytes=MIB, inodes=10,
+                     backing_domain="outer-A", outer_domain=True)
+        # An exempt name may be a child of an outer sink; a container sink below it may not.
+        mid = dict(identity="daemon_image_store", parent="daemon_build_cache")
+        sinks = {"daemon_build_cache": outer, "daemon_image_store": mid}
+        self.assertNotIn("sink-malformed", q.check_sinks(sinks))
+        sinks["tmp"] = dict(identity="tmp", parent="daemon_image_store")
+        self.assertIn("sink-malformed", q.check_sinks(sinks))
 
     def test_outer_domain_sinks_are_exempt_only_when_flagged(self):
         mounts = [tmpfs(10, "/t", sb="sb-shared", size=4*MIB)]

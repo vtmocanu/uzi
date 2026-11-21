@@ -240,7 +240,9 @@ CLI or `evaluate()` path.
   backend-support evidence is present), `new-mount-possible` (needs CapBnd 0, NoNewPrivs 1
   and seccomp mode 2 default profile or max_user_namespaces 0),
   `daemon-capability-unsupported` (MemoryLimit, SwapLimit or PidsLimit false, or
-  rootless with the cgroupfs driver), `limits-not-applied-observed`,
+  rootless with the cgroupfs driver; judged from the daemon section alone, so it also
+  turns the enforcement leg NEGATIVE when no container mount facts exist),
+  `limits-not-applied-observed`,
   `claim-evidence-not-collector`, and per-sink coverage codes `sink-bytes-uncovered`,
   `sink-inodes-uncovered`, `sink-pids-uncovered`, `sink-logs-uncovered`,
   `sink-memory-swap-uncovered`. Every incremental-allocation sink and writable storage
@@ -261,8 +263,11 @@ CLI or `evaluate()` path.
   `container_logs` live in an outer domain: they carry an explicit `outer_domain: true`
   and no superblock or `mount_id` (a made-up one is `sink-malformed`) and are charged only
   through the backing leg. An outer sink whose paths resolve into a container mount, a
-  non-outer sink whose parent chain reaches an outer sink, and `outer_domain` on any other
-  sink name are `sink-malformed`. `domain-overcommitted`
+  non-outer sink whose parent chain reaches an outer sink (a child or a grandchild), and
+  `outer_domain` on any other sink name, a child sink included, are `sink-malformed`.
+  Collectors must not record realpaths for an outer sink's paths: a recorded realpath resolves
+  under `/` (always a container mount) and makes the outer sink `sink-malformed`.
+  `domain-overcommitted`
   when sink ceilings on one superblock exceed its limit, `domain-alias-split` when sinks
   on one superblock claim different backing domains; a child charged inside its parent
   counts once.
@@ -296,3 +301,93 @@ cd agent && node --import tsx -e 'import("./src/config.ts").then(({ loadConfig }
 
 The new tests are `test_qualify.py`: synthetic fixtures only, including an owned
 loopback TCP stub for `docker_get`. They validate code paths, not an environment.
+
+## observe.py: bounded, sanitized, read-only collector (issue 4575, M2)
+
+`observe.py` is the first collector behind `qualify.collect()`. It reads a Docker daemon's own
+reports and writes a sanitized artifact and verdict. It creates no container, pulls no image,
+inspects no image filesystem and runs no Go. It collects no mountinfo, fd or runtime fact, so the
+verdict is always NO-QUALIFIED-ENVIRONMENT; nothing here qualifies an environment.
+
+```sh
+python3 -B -I e2e/go-cache-admission/observe.py --endpoint tcp://127.0.0.1:PORT >/dev/null 2>&1
+python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
+    [--image sha256:<id>] [--go-root <abs>] [--go-binary <abs>] [--toolchain-profile <abs file>] \
+    [--repo-revision <40hex>] [--scaffold-revision <40hex>] [--head-revision <40hex>] \
+    [--out-dir .uzi/scratch/go-cache-env] >/dev/null 2>&1
+```
+
+- `--endpoint` is required and explicit: a Unix socket path or `tcp://127.0.0.1:<port>` /
+  `tcp://[::1]:<port>` (see `preflight.docker_get`). No environment variable is read, so
+  `DOCKER_HOST` and Docker contexts are ignored. `-I` keeps `PYTHON*` variables and the user site
+  out of the interpreter.
+- Requests are GET only, on `/version`, `/info`, `/images/json` and
+  `/images/sha256:<id>/json` for IDs from that listing. Never `/containers/*`, never a POST.
+  More than 64 listed images is a refusal; `--image` may only narrow to an ID in the listing.
+  The collection has a 90 second budget on top of the per-request 64 KiB / 5 s caps.
+- Daemon fields kept: ServerVersion, Os, Arch, KernelVersion, Driver, DriverType (the
+  `driver-type` DriverStatus value), CgroupVersion, CgroupDriver, MemoryLimit, SwapLimit,
+  PidsLimit, LoggingDriver, DefaultRuntime, RuncVersion (Runtimes annotations, when present),
+  `rootless` and `seccomp` (booleans from SecurityOptions). Each string must match a short fixed
+  pattern or is dropped to null. Name, ID, DockerRootDir, hostnames, labels, proxy settings and
+  paths are never copied. The daemon ID feeds only the salted hash in `collector.daemon_id_hash`
+  (a fresh 16-byte salt per run, so two runs against one daemon differ).
+- Per image: Id, Architecture, Os, `digests` (`sha256:<64 hex>` split from RepoDigests),
+  `repos` and `go_declared` (Env, PATH, Cmd or Entrypoint mention `/usr/local/go`, `/go/bin`,
+  GOROOT or GOPATH; metadata only). Repository names are kept only for the official
+  `postgres` and `hello-world` (optionally prefixed `docker.io/library/`); any other name becomes
+  a per-run salted pseudonym `repo-<12 hex>`. A ref that fails the OCI name grammar, carries a
+  control character or exceeds 256 characters is dropped and counted in `dropped_repo_refs`.
+  Tags and environment values are never emitted. `go_absent` is never claimed: an image whose
+  metadata names no Go is `go-not-declared`, and no image is Go-bearing verified
+  (`no-go-bearing-image-verified`: only image names and metadata listed; no image filesystem
+  inspected).
+- Optional host-only Go coordinates, each labelled `host_only` and never `PROVEN`: the first line of
+  `--toolchain-profile` when it is a `/nix/store/<32 chars>-<name>` path (else dropped), the
+  sha256 and size of `--go-binary` (regular file, at most 512 MiB, path not recorded) and
+  the `--go-root` VERSION and source inventory via `preflight.inventory`. An input that was given
+  and cannot be read is a refusal (exit 3).
+- The artifact (`uzi-go-cache-env/1`) holds the observed daemon and binding sections plus a
+  declared proposal: a candidate charge map and claims for a read-only rootfs, a `/w` tmpfs
+  (`size=4m`, `nr_inodes=256`), `/dev` and `/dev/shm` tmpfs without `nr_inodes`, a writable
+  `/dev/mqueue`, pids-max, log-driver none and memcg max equal to swap max, and the inode
+  ceiling proposal (total 65536 = retained 8192 + staging 1024 + work 56320, `owner_approved`
+  false). Those parts are file tier and describe a proposal, not an observation. The threshold
+  section is absent (`owner-input-not-supplied`). Kernel memory (tmpfs pages, dentry and inode
+  slab) stays charged for every mount, non-storage and read-only ones included.
+
+Output lifecycle (the order is part of the contract):
+
+1. The `--out-dir` (default `.uzi/scratch/go-cache-env`; it must be beneath `.uzi/scratch`, not
+   `.uzi/scratch` itself, without symlink components or `..`, and an existing path must be a
+   directory) is validated, then deleted and recreated before anything else. It is the only
+   directory the tool deletes.
+2. `run.log` is then created (`O_CREAT|O_EXCL|O_NOFOLLOW`) and duplicated over fds 1 and 2. run.log
+   is the charged output sink: stdout is capped at 256 bytes (one summary line:
+   verdict, exit, reason, `statvfs` f_frsize/f_bsize and apparent/allocated bytes of the three
+   files, dropped stderr bytes) and stderr at 4 KiB (fixed reason codes and, on an unexpected
+   error, the exception type and innermost frames, never the message). Excess is dropped and
+   counted. Output before this step (a usage error) goes to the original stdio.
+3. The caller redirects the original stdio to `/dev/null` (`>/dev/null 2>&1`), so nothing
+   but run.log carries output.
+4. `artifact.json` and `verdict.json` are written with `preflight.encode` (at most 64 KiB each
+   including the newline) and `O_CREAT|O_EXCL|O_NOFOLLOW`; a fourth directory entry or an
+   oversize document is refused. The verdict also records the out-dir `statvfs` block sizes and
+   the artifact's apparent and allocated bytes.
+5. Before exit, fds 1 and 2 must still be the (linked) `run.log` of the out-dir (same device and
+   inode, `st_nlink` at least 1), else exit 4.
+
+Exit codes: 2 NO-QUALIFIED-ENVIRONMENT (the normal result; 0 would mean qualified and does not
+occur in this issue), 3 refusal or failure (usage, `out-dir-invalid`, `docker-unavailable`,
+`too-many-images`, `image-not-in-listing`, `daemon-id-missing`, `host-input-invalid`,
+`report-limit`, `internal-error`), 4 `run-log-mismatch`.
+
+Evidence copy step (done by the lead after a live run, not by the tool): copy exactly
+`artifact.json` and `verdict.json` from the out-dir to `e2e/go-cache-admission/evidence/`, then remove
+the scratch out-dir. `test_observe.py` pins that directory: when it exists it holds exactly those
+two files, each at most 64 KiB, with the sanitized key sets, a NO-QUALIFIED-ENVIRONMENT verdict
+and none of the forbidden strings.
+
+`test_observe.py` runs the collector in subprocesses (it redirects fds 1 and 2) against owned
+loopback TCP and AF_UNIX stub daemons; no real Docker endpoint, container, image pull or Go run.
+Its stubs prove sanitization, routes, lifecycle and caps, not any environment.
