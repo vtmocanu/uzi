@@ -129,13 +129,13 @@ type RunCreator interface {
 	// CreateScheduledRun is the non-auto-approve scheduled path: like the manual create but the
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun inherits owner defaults (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
 	// CreateCIRepairRun is the ci_watch fire's guarded prompt-run insert (PRD #2865): the repo,
 	// schedule and episode locks, the configuration and episode rechecks, the run INSERT and the
@@ -457,7 +457,7 @@ func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.
 		e.logger.Error("scheduler: marshal held last_fire", "schedule", sched.ID.String(), "error", err)
 		return
 	}
-	if _, err := e.store.RecordScheduleHeldFire(ctx, store.RecordScheduleHeldFireParams{ID: sched.ID, LastFire: lastFireJSON}); err != nil {
+	if _, err := e.store.RecordScheduleHeldFire(ctx, store.RecordScheduleHeldFireParams{ID: sched.ID, LastFire: lastFireJSON, FireEpoch: sched.FireEpoch}); err != nil {
 		e.logger.Error("scheduler: record held last_fire", "schedule", sched.ID.String(), "error", err)
 	}
 }
@@ -1117,7 +1117,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// PRD #1247 M6: the schedule's stored credential override is threaded here
 		// (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), selection.Explicit)
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), selection.Explicit, nil /*progress: M3 wires the once-sweep ledger*/)
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -1129,7 +1129,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// trailing seed=nil (no seeded plan for a scheduled issue run); PRD #1247 M6 threads
 		// the schedule's stored credential override (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), selection.Explicit)
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), selection.Explicit, nil /*progress: M3 wires the once-sweep ledger*/)
 	}
 
 	if err == nil {

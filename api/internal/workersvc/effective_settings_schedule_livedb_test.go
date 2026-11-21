@@ -43,7 +43,7 @@ func TestEffectiveSettingsSchedulePinClaimEquivalenceLiveDB(t *testing.T) {
 			fx.iid++
 			seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
 			pin := c.pin
-			created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, &pin, c.toggle, nil, nil, c.explicit)
+			created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, &pin, c.toggle, nil, nil, c.explicit, nil)
 			if err != nil {
 				t.Fatalf("CreateScheduledRun: %v", err)
 			}
@@ -86,7 +86,7 @@ func TestEffectiveSettingsScheduleSubagentModesLiveDB(t *testing.T) {
 				fx.template("eff-tester", "", "")
 				fx.iid++
 				seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
-				created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, nil, toggle, nil, nil, &h)
+				created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, nil, toggle, nil, nil, &h, nil)
 				if err != nil {
 					t.Fatalf("CreateScheduledRun: %v", err)
 				}
