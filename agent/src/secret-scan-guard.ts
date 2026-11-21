@@ -16,6 +16,9 @@ export interface SecretFinding {
   startLine: number;
   commit: string;
   ruleId: string;
+  /** The run-env variable whose value the exact-value scan found ({@link RUN_ENV_RULE_ID}); its NAME only,
+   *  never a value. Absent for a gitleaks or provider-key finding. */
+  variable?: string;
 }
 
 /** Cap on the findings parseGitleaksReport materialises from one report. The pre-push decision
@@ -209,6 +212,11 @@ export function gitleaksStdinArgs(opts: { configPath: string; reportPath: string
 /** The `ruleId` of a finding produced by the exact-key push scan (see GitCache.scanObjectsForLiterals).
  *  A finding carries no matched bytes: only this id, a commit and a path that never contains a key form. */
 export const PROVIDER_KEY_RULE_ID = "uzi-provider-key";
+
+/** The `ruleId` of a finding produced by the run-env exact-value scan (agent/src/run-env-scan.ts): a
+ *  registered form of a secret repo/user variable occurs in the scanned objects. The finding names the
+ *  variable (`SecretFinding.variable`), never the value. */
+export const RUN_ENV_RULE_ID = "uzi-run-env";
 
 /** Incremental exact-literal matcher over a byte stream; see {@link literalMatcher}. */
 export interface LiteralMatcher {

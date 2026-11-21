@@ -15,7 +15,8 @@ import type { PublicationIntentRequest, PublicationIntentResult } from "./public
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
-import { decodeRunEnvSecrets } from "./run-env-claim.js";
+import { decodeRunEnvRedactResponse, decodeRunEnvSecrets, RunEnvClaimError } from "./run-env-claim.js";
+import type { ClaimRunEnvRedact } from "./protocol.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -1422,6 +1423,9 @@ function validMaintenanceHoldRow(value: unknown, runId: string, worker: string):
 }
 
 const COMPLETION_HOLDS_MAX_BYTES = 1024 * 1024;
+/** Cap on the run-env redact response (PRD #4416): both scopes' redact lists at their byte limits, with
+ *  worst-case JSON escaping (six bytes per value byte) and metadata. A larger body is malformed. */
+const RUN_ENV_REDACT_MAX_BYTES = 32 * 1024 * 1024;
 const COMPLETION_HOLDS_MAX_ITEMS = 1024;
 const COMPLETION_BINDINGS_MAX = 4096;
 const COMPLETION_OBSERVATIONS_MAX = 2048;
@@ -4380,6 +4384,30 @@ export class WorkerClient {
       reservation.tickets.delete(ticket);
       if (!reservation.live && reservation.tickets.size === 0) this.completionReservations.delete(key);
     }
+  }
+
+  /**
+   * PRD #4416 M2: the secret run-env versions the run holds a receipt for, opened, for a worker with no
+   * live claim (a restart sweep, a terminal pack) to scan and redact an old value. The body carries secret
+   * values: the request asks for `no-store`, nothing is logged or persisted, and the decode is fail-closed
+   * (`RunEnvClaimError` names the field and rule, never a value). Resolves `protected: false` only for a
+   * 200 the server sent for a run with no secret receipt; every other status, a transport failure, an
+   * oversized body and a malformed body THROW, and the caller must withhold (it must never read a throw as
+   * "unprotected").
+   */
+  async getRunEnvRedact(runId: string, signal?: AbortSignal): Promise<{ protected: boolean; versions: ClaimRunEnvRedact[] }> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/run-env-redact`;
+    const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal, { "Cache-Control": "no-store" });
+    if (res.status >= 400) throw await this.toError("GET", path, res);
+    if (res.status !== 200) {
+      void res.body?.cancel().catch(() => undefined);
+      throw new RunEnvClaimError("response: unexpected status");
+    }
+    let body: unknown;
+    try { body = JSON.parse(await readBoundedText(res, RUN_ENV_REDACT_MAX_BYTES, true, signal)); }
+    catch { MaintenanceBudget.current()?.check(); throw new RunEnvClaimError("response: not readable JSON within the size cap"); }
+    MaintenanceBudget.current()?.check();
+    return decodeRunEnvRedactResponse(body);
   }
 
   /** Observe one exact hold against the caller's local identity. This never updates

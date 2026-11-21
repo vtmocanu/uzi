@@ -76,10 +76,12 @@ import {
   literalMatcher,
   parseGitleaksReport,
   PROVIDER_KEY_RULE_ID,
+  RUN_ENV_RULE_ID,
   scanIsTrustworthy,
   stripAnsiSgr,
   type SecretFinding,
 } from "./secret-scan-guard.js";
+import type { RunEnvNamedForms } from "./run-env-forms.js";
 import { lookupAttributes, type PathAttributes } from "./pr-size.js";
 
 // Capture acquisition and request issuance share GitCache canonical policy ownership.
@@ -1242,7 +1244,9 @@ export type CheckpointScanUntrustedReason =
   | "merge_diff_too_large"
   | "scan_untrusted"
   /** The exact-key scan ({@link GitCache.scanObjectsForLiterals}) could not prove the range free of the run's provider key. */
-  | "provider_key_scan_untrusted";
+  | "provider_key_scan_untrusted"
+  /** The run-env exact-value scan ({@link GitCache.scanObjectsForRunEnv}) could not prove the range free of the run's variable values. */
+  | "run_env_scan_untrusted";
 
 /** issue #1597 M2: the result of {@link GitCache.secretScanCheckpointRange}. */
 export interface CheckpointScanResult {
@@ -19774,7 +19778,7 @@ export class GitCache {
     range: CheckpointRange,
     /** `literals` is REQUIRED: the encoded forms of the run's bound provider key, `[]` for a vendor run
      *  (no extra git work). A caller that has no claim passes `[]` only under a policy that fails closed. */
-    opts: { deadlineMs?: number; literals: readonly string[] },
+    opts: { deadlineMs?: number; literals: readonly string[]; runEnv?: RunEnvNamedForms },
   ): Promise<CheckpointScanResult> {
     const label = "checkpoint secret scan";
     const untrusted = (reason: CheckpointScanUntrustedReason, fields: Record<string, unknown> = {}): CheckpointScanResult => {
@@ -19805,6 +19809,16 @@ export class GitCache {
       );
       if (!key.trusted) return untrusted("provider_key_scan_untrusted", { why: key.reason });
       if (key.findings.length > 0) return { trusted: true, findings: key.findings };
+    }
+    // 0b. The run-env exact-value scan (PRD #4416), same objects, before the same early returns: a
+    // variable's value in an empty commit's message, a filename or a binary blob has no gitleaks hunk.
+    // Fails closed like the key scan: an untrustworthy run is not clean.
+    if (opts.runEnv && opts.runEnv.length > 0) {
+      const env = await this.scanObjectsForRunEnv(
+        barePath, { tip: range.tipSha, excludes: range.packExcludeShas ?? [range.excludeSha] }, opts.runEnv, { deadlineMs: remaining() },
+      );
+      if (!env.trusted) return untrusted("run_env_scan_untrusted", { why: env.reason });
+      if (env.findings.length > 0) return { trusted: true, findings: env.findings };
     }
 
     // 1. Size pre-check (bounded buffers; any failure is untrusted).
@@ -19894,32 +19908,179 @@ export class GitCache {
     literals: readonly string[],
     opts: { deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number } } = {},
   ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
-    const usable = literals.filter((l) => l.length > 0);
-    if (usable.length === 0) return { trusted: true, findings: [] };
+    return this.scanObjectsCore(barePath, { range }, [{ forms: literals }], {
+      ruleId: PROVIDER_KEY_RULE_ID, label: "provider key scan", ...opts,
+    });
+  }
+
+  /**
+   * The run-env exact-value scan (PRD #4416, "Exact-value scan"): the same object walk as
+   * {@link scanObjectsForLiterals} (every commit, tree and blob of `tip --not excludes`, so messages,
+   * filenames, binary files and merge results are covered; a hit may straddle stream chunks), with one
+   * group of registered forms per variable so a finding names the variable
+   * (`SecretFinding.variable`, ruleId {@link RUN_ENV_RULE_ID}). `maxBytes` caps BOTH the size pre-check and
+   * the bytes actually streamed from `cat-file --batch`; passing either, or the deadline, is
+   * `trusted: false`. An unresolved ref or any git error is `trusted: false`. Never returns a matched byte.
+   */
+  async scanObjectsForRunEnv(
+    barePath: string,
+    range: { tip: string; excludes: readonly string[]; excludeRemoteTracking?: boolean },
+    vars: RunEnvNamedForms,
+    opts: { deadlineMs?: number; maxBytes?: number } = {},
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
+    return this.scanObjectsCore(barePath, { range }, vars.map((v) => ({ name: v.name, forms: v.forms })), {
+      ruleId: RUN_ENV_RULE_ID, label: "run env scan", deadlineMs: opts.deadlineMs,
+      ...(opts.maxBytes === undefined ? {} : { caps: { maxTotalBytes: opts.maxBytes }, maxStreamBytes: opts.maxBytes }),
+    });
+  }
+
+  /**
+   * Scan a recovery bundle FILE for the run-env forms (PRD #4416: "recovery capture: scan the bundle's
+   * objects; unscannable withholds; bound to the manifest checksum"). The bytes are streamed once: their
+   * SHA-256 must equal `expectedSha256` (the manifest checksum the upload will present, so the server
+   * accepts exactly the bytes scanned), the pack after the bundle header is indexed into a throwaway bare
+   * repository whose object store borrows `alternateObjectDirs` (a thin pack's bases), and every object of
+   * that pack is read through the same exact-value reader. A bundle that cannot be indexed (missing bases,
+   * corrupt pack), is over `maxBytes`, or mismatches the checksum is `trusted: false`.
+   */
+  async scanBundleForRunEnv(
+    bundlePath: string,
+    vars: RunEnvNamedForms,
+    opts: { expectedSha256: string; deadlineMs?: number; maxBytes: number; alternateObjectDirs?: readonly string[] },
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
     const untrusted = (reason: string): { trusted: false; reason: string } => {
-      this.log.warn("provider key scan: untrusted, not publishing", { barePath, reason });
+      this.log.warn("run env bundle scan: untrusted, not uploading", { reason });
       return { trusted: false, reason };
     };
-    if (!SHA40_RE.test(range.tip) || range.excludes.some((x) => !SHA40_RE.test(x))) return untrusted("range_invalid");
+    if (vars.every((v) => v.forms.every((f) => f.length === 0))) return { trusted: true, findings: [] };
+    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => deadlineAt - Date.now();
+    let scratch: string | undefined;
+    try {
+      this.checkCheckpointCooperation();
+      const stat = await fs.stat(bundlePath);
+      if (!stat.isFile() || stat.size > opts.maxBytes) return untrusted("scan_too_large");
+      // Read the file once: hash every byte, keep the pack that follows the header (first blank line).
+      const hash = createHash("sha256");
+      const chunks: Buffer[] = [];
+      let seen = 0;
+      let headerTail = Buffer.alloc(0);
+      let headerDone = false;
+      for await (const raw of createReadStream(bundlePath)) {
+        this.checkCheckpointCooperation();
+        if (remaining() <= 0) return untrusted("deadline");
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+        seen += chunk.length;
+        if (seen > opts.maxBytes) return untrusted("scan_too_large");
+        hash.update(chunk);
+        if (headerDone) { chunks.push(chunk); continue; }
+        const joined = Buffer.concat([headerTail, chunk]);
+        const end = joined.indexOf("\n\n");
+        if (end < 0) {
+          // The header is a few short lines; refuse an endless one.
+          if (joined.length > 1024 * 1024) return untrusted("bundle_header_invalid");
+          headerTail = joined;
+          continue;
+        }
+        headerDone = true;
+        chunks.push(joined.subarray(end + 2));
+      }
+      if (!headerDone) return untrusted("bundle_header_invalid");
+      if (hash.digest("hex") !== opts.expectedSha256) return untrusted("checksum_mismatch");
+      const pack = Buffer.concat(chunks);
+      if (pack.length === 0) return { trusted: true, findings: [] };
+
+      scratch = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-run-env-bundle-"));
+      const repo = path.join(scratch, "r.git");
+      await this.execScoped("git", ["init", "--bare", "-q", repo], { env: gitEnv(), timeout: Math.max(1, remaining()) });
+      if (opts.alternateObjectDirs && opts.alternateObjectDirs.length > 0) {
+        await fs.writeFile(path.join(repo, "objects", "info", "alternates"), opts.alternateObjectDirs.join("\n") + "\n", "utf8");
+      }
+      // The pack comes from outside the worker's own writes: index it into the throwaway repo only.
+      const indexed = await this.spawnGit(repo, ["--no-replace-objects", "index-pack", "--stdin", "--fix-thin"], pack, {
+        timeoutMs: Math.max(1, remaining()), stdoutCategory: "artifactBytes", stderrMaxBytes: 4096, cancelOnAbandon: true,
+      });
+      let status = "";
+      for await (const raw of indexed.stdout) status += Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+      if (await indexed.exited !== 0) return untrusted("index_failed");
+      const packId = /^pack\t([0-9a-f]{40,64})$/m.exec(status)?.[1];
+      if (!packId) return untrusted("index_failed");
+      const idx = path.join(repo, "objects", "pack", `pack-${packId}.idx`);
+      const listing = await this.execScoped("git", withDir(repo, ["--no-replace-objects", "verify-pack", "-v", idx]), {
+        env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: GIT_MAX_BUFFER,
+      });
+      const oids: string[] = [];
+      for (const line of listing.stdout.split("\n")) {
+        const m = /^([0-9a-f]{40}) (?:blob|tree|commit|tag) /.exec(line);
+        if (m) oids.push(m[1]!);
+      }
+      return await this.scanObjectsCore(repo, { oids }, vars.map((v) => ({ name: v.name, forms: v.forms })), {
+        ruleId: RUN_ENV_RULE_ID, label: "run env bundle scan", deadlineMs: Math.max(1, remaining()),
+        caps: { maxTotalBytes: opts.maxBytes }, maxStreamBytes: opts.maxBytes,
+      });
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
+      return untrusted("scan_failed");
+    } finally {
+      if (scratch) await this.removeBestEffort(scratch, "run-env-bundle-scratch");
+    }
+  }
+
+  /**
+   * The shared exact-literal object reader. `groups` are searched independently (a group with no non-empty
+   * form is ignored; with no usable group nothing is read and the result is clean); a hit carries the
+   * group's `name` as `SecretFinding.variable`. `source` is either a revision range (walked with
+   * `rev-list --objects`, hits attributed to a commit) or an explicit object list already present in
+   * `barePath` (a bundle's pack; hits name the commit itself or no commit).
+   */
+  private async scanObjectsCore(
+    barePath: string,
+    source: { range: { tip: string; excludes: readonly string[]; excludeRemoteTracking?: boolean } } | { oids: string[] },
+    groups: ReadonlyArray<{ name?: string; forms: readonly string[] }>,
+    cfg: {
+      ruleId: string; label: string; deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number };
+      /** Fail once this many bytes have been streamed from `cat-file --batch` (counts the bytes read, not a size estimate). */
+      maxStreamBytes?: number;
+    },
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
+    const usableGroups = groups
+      .map((g) => ({ name: g.name, forms: g.forms.filter((l) => l.length > 0) }))
+      .filter((g) => g.forms.length > 0);
+    if (usableGroups.length === 0) return { trusted: true, findings: [] };
+    const opts = cfg;
+    const untrusted = (reason: string): { trusted: false; reason: string } => {
+      this.log.warn(`${cfg.label}: untrusted, not publishing`, { barePath, reason });
+      return { trusted: false, reason };
+    };
+    const range = "range" in source ? source.range : undefined;
+    if (range && (!SHA40_RE.test(range.tip) || range.excludes.some((x) => !SHA40_RE.test(x)))) return untrusted("range_invalid");
     const maxObjects = opts.caps?.maxObjects ?? CHECKPOINT_SCAN_MAX_OBJECTS;
     const maxTotal = opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES;
     const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
     const remaining = (): number => deadlineAt - Date.now();
-    const hasKeyForm = (s: string): boolean => usable.some((l) => s.includes(l));
+    const hasKeyForm = (s: string): boolean => usableGroups.some((g) => g.forms.some((l) => s.includes(l)));
     let producer: { stdout: Readable; exited: Promise<number>; cancel: () => void } | undefined;
     try {
       this.checkCheckpointCooperation();
-      const revs = [range.tip, "--not", ...range.excludes, ...(range.excludeRemoteTracking ? ["--remotes=origin"] : []), "--"];
-      const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--objects", ...revs]), {
-        env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (maxObjects + 1) * 4096,
-      });
-      const oids: string[] = [];
+      const revs = range
+        ? [range.tip, "--not", ...range.excludes, ...(range.excludeRemoteTracking ? ["--remotes=origin"] : []), "--"]
+        : [];
+      let oids: string[] = [];
       const paths = new Map<string, string>();
-      for (const line of listing.stdout.split("\n")) {
-        const m = /^([0-9a-f]{40})(?: (.*))?$/.exec(line);
-        if (!m) continue; // a path containing a newline leaves a non-oid tail: never an object id
-        oids.push(m[1]!);
-        if (m[2]) paths.set(m[1]!, m[2]);
+      if (range) {
+        const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--objects", ...revs]), {
+          env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (maxObjects + 1) * 4096,
+        });
+        for (const line of listing.stdout.split("\n")) {
+          const m = /^([0-9a-f]{40})(?: (.*))?$/.exec(line);
+          if (!m) continue; // a path containing a newline leaves a non-oid tail: never an object id
+          oids.push(m[1]!);
+          if (m[2]) paths.set(m[1]!, m[2]);
+        }
+      } else {
+        oids = "oids" in source ? source.oids : [];
       }
       if (oids.length > maxObjects) return untrusted("too_many_objects");
       if (oids.length === 0) return { trusted: true, findings: [] };
@@ -19944,18 +20105,24 @@ export class GitCache {
         timeoutMs: Math.max(1, remaining()), stdoutCategory: "artifactBytes", stderrMaxBytes: 4096, cancelOnAbandon: true,
       });
       producer = spawned;
-      const matcher = literalMatcher(usable);
-      const hits: Array<{ oid: string; type: string }> = [];
+      const matchers = usableGroups.map((g) => literalMatcher(g.forms));
+      const hits: Array<{ oid: string; type: string; group: number }> = [];
       // Frame parser for `cat-file --batch`: "<oid> <type> <size>\n" + <size> bytes + "\n", per object.
       let mode: "header" | "body" | "lf" = "header";
       let header = Buffer.alloc(0);
-      let pending: { oid: string; type: string; left: number; hit: boolean } | undefined;
+      let pending: { oid: string; type: string; left: number; hit: boolean[] } | undefined;
       let sawObjects = 0;
       let garbled = false;
+      let streamed = 0;
       scan: for await (const raw of spawned.stdout) {
         this.checkCheckpointCooperation();
         if (remaining() <= 0) { producer.cancel(); producer.stdout.destroy(); await producer.exited; return untrusted("deadline"); }
         let chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+        streamed += chunk.length;
+        if (opts.maxStreamBytes !== undefined && streamed > opts.maxStreamBytes) {
+          producer.cancel(); producer.stdout.destroy(); await producer.exited;
+          return untrusted("scan_overflow");
+        }
         while (chunk.length > 0) {
           if (mode === "header") {
             const nl = chunk.indexOf(0x0a);
@@ -19969,20 +20136,22 @@ export class GitCache {
             const m = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(header.toString("latin1"));
             header = Buffer.alloc(0);
             if (!m || m[1] !== oids[sawObjects]) { garbled = true; break scan; }
-            pending = { oid: m[1]!, type: m[2]!, left: Number(m[3]), hit: false };
-            matcher.reset();
+            pending = { oid: m[1]!, type: m[2]!, left: Number(m[3]), hit: matchers.map(() => false) };
+            for (const matcher of matchers) matcher.reset();
             sawObjects++;
             mode = pending.left > 0 ? "body" : "lf";
           } else if (mode === "body") {
             const body = chunk.subarray(0, Math.min(pending!.left, chunk.length));
-            if (!pending!.hit && matcher.push(body)) pending!.hit = true;
+            for (let g = 0; g < matchers.length; g++) {
+              if (!pending!.hit[g] && matchers[g]!.push(body)) pending!.hit[g] = true;
+            }
             pending!.left -= body.length;
             chunk = chunk.subarray(body.length);
             if (pending!.left === 0) mode = "lf";
           } else {
             if (chunk[0] !== 0x0a) { garbled = true; break scan; }
             chunk = chunk.subarray(1);
-            if (pending!.hit) hits.push({ oid: pending!.oid, type: pending!.type });
+            pending!.hit.forEach((hit, group) => { if (hit) hits.push({ oid: pending!.oid, type: pending!.type, group }); });
             pending = undefined;
             mode = "header";
           }
@@ -20001,10 +20170,11 @@ export class GitCache {
 
       const findings: SecretFinding[] = [];
       for (const hit of hits) {
-        let commit = hit.type === "commit" ? hit.oid : range.tip;
+        // A bundle scan has no range: a non-commit hit is attributed to no commit (an empty commit field).
+        let commit = hit.type === "commit" ? hit.oid : range?.tip ?? "";
         // Attribution is best effort and bounded by the scan deadline: once it is spent the finding names the tip.
         const attributionLeftMs = remaining();
-        if (hit.type !== "commit" && attributionLeftMs > 0) {
+        if (range && hit.type !== "commit" && attributionLeftMs > 0) {
           try {
             const log = await this.execScoped("git", withDir(barePath, [
               "--no-replace-objects", "log", "-m", "--reverse", "--format=%H", `--find-object=${hit.oid}`, ...revs,
@@ -20017,8 +20187,10 @@ export class GitCache {
           }
         }
         const path = paths.get(hit.oid) ?? "";
+        const name = usableGroups[hit.group]!.name;
         findings.push({
-          file: hasKeyForm(path) ? "[path withheld]" : path, startLine: 0, commit, ruleId: PROVIDER_KEY_RULE_ID,
+          file: hasKeyForm(path) ? "[path withheld]" : path, startLine: 0, commit, ruleId: cfg.ruleId,
+          ...(name === undefined ? {} : { variable: name }),
         });
       }
       return { trusted: true, findings };

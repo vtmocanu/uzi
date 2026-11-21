@@ -31,6 +31,38 @@ export function runEnvSecretForms(secrets: string[]): string[] {
   return [...forms];
 }
 
+/** The registered forms of one variable name (every version of it the run holds), for the exact-value
+ *  scan, which names the variable on a hit. Carries a value-derived form, so it never leaves the worker. */
+export interface RunEnvVarForms {
+  readonly name: string;
+  readonly forms: readonly string[];
+}
+export type RunEnvNamedForms = readonly RunEnvVarForms[];
+
+/** Groups secret values by variable name into scan forms; a name with no scannable form is dropped. */
+export function runEnvNamedForms(entries: ReadonlyArray<{ name: string; value: string }>): RunEnvNamedForms {
+  const byName = new Map<string, string[]>();
+  for (const e of entries) {
+    const list = byName.get(e.name) ?? [];
+    list.push(e.value);
+    byName.set(e.name, list);
+  }
+  const out: RunEnvVarForms[] = [];
+  for (const [name, values] of byName) {
+    const forms = runEnvSecretForms(values);
+    if (forms.length > 0) out.push({ name, forms });
+  }
+  return out;
+}
+
+/** {@link claimRunEnvSecretForms} grouped by variable name, for the exact-value scan. */
+export function claimRunEnvNamedForms(secrets: Pick<ClaimSecrets, "run_env" | "run_env_redact">): RunEnvNamedForms {
+  const entries: Array<{ name: string; value: string }> = [];
+  for (const v of secrets.run_env ?? []) if ((v as ClaimRunEnvVar).secret) entries.push(v);
+  for (const v of secrets.run_env_redact ?? []) entries.push(v);
+  return runEnvNamedForms(entries);
+}
+
 /** The forms to register for a claim: every `secret: true` live entry plus every redact-only entry.
  *  Plain values are never registered. */
 export function claimRunEnvSecretForms(secrets: Pick<ClaimSecrets, "run_env" | "run_env_redact">): string[] {

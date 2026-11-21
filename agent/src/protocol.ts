@@ -1220,7 +1220,8 @@ export interface ClaimRunEnvRedact {
 }
 
 /** Body of the run-env redact maintenance response (api/internal/workersvc RunEnvRedactResponse).
- *  `protected: false` means historical protection is unavailable and `versions` is absent. */
+ *  `protected: false` means the run holds no secret receipt (nothing to redact or scan) and `versions`
+ *  is absent; an unavailable history is a 409 `run_env_history_unavailable`, never `protected: false`. */
 export interface RunEnvRedactResponse {
   protected: boolean;
   versions?: ClaimRunEnvRedact[];
