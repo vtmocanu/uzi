@@ -287,7 +287,7 @@ func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error)
 		httpx.Error(w, http.StatusConflict, "this run's lane does not support a credential override")
 	case errors.Is(err, workersvc.ErrCredentialOverrideProviderSource):
 		// PRD #4320 D8: checked before the codex wording below, which it wraps.
-		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported while your Claude source is a model provider")
+		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported while your source is a model provider")
 	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
 		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness")
 	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret):

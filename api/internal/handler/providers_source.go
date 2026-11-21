@@ -24,8 +24,8 @@ const (
 	reasonProviderBindingStale          = "provider_binding_stale"
 	reasonProviderDestinationNotAllowed = "provider_destination_not_allowed"
 
-	claudeSourceUnusableMessagePrefix    = "the provider cannot be the source: "
-	claudeSourceUnusableRunMessagePrefix = "your source is a model provider that cannot serve a run: "
+	providerSourceUnusableMessagePrefix    = "the provider cannot be the source: "
+	providerSourceUnusableRunMessagePrefix = "your source is a model provider that cannot serve a run: "
 )
 
 // providerSourceReasonText names a ProviderSourceUnusableError reason for the user.
@@ -55,12 +55,12 @@ func writeProviderCreateRefusal(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.As(err, &unusable):
 		httpx.ErrorReason(w, http.StatusConflict,
-			claudeSourceUnusableRunMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
+			providerSourceUnusableRunMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
 	case errors.Is(err, workersvc.ErrProviderSourceUnusable):
-		httpx.ErrorReason(w, http.StatusConflict, "your Claude source is a model provider that cannot serve a run", reasonProviderSourceUnusable)
+		httpx.ErrorReason(w, http.StatusConflict, "your source is a model provider that cannot serve a run", reasonProviderSourceUnusable)
 	case errors.Is(err, workersvc.ErrProviderLaneUnsupported):
 		httpx.ErrorReason(w, http.StatusConflict,
-			"this run type does not support a model-provider Claude source yet", reasonProviderLaneUnsupported)
+			"this run type does not support a model-provider source yet", reasonProviderLaneUnsupported)
 	case errors.As(err, &unmapped):
 		httpx.ErrorReason(w, http.StatusConflict,
 			"the provider's model map does not map "+quoteModel(unmapped.Model)+" ("+unmapped.Source+"); map it or change the model", reasonProviderModelUnmapped)
@@ -156,10 +156,10 @@ func (h *Handler) setMyProviderSource(w http.ResponseWriter, r *http.Request, en
 		switch {
 		case errors.As(err, &unusable):
 			httpx.ErrorReason(w, http.StatusConflict,
-				claudeSourceUnusableMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
+				providerSourceUnusableMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
 		case writeProviderError(w, err):
 		default:
-			internalProviderError(w, "set claude provider source", err)
+			internalProviderError(w, "set provider source", err)
 		}
 		return
 	}

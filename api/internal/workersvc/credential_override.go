@@ -76,11 +76,11 @@ var (
 	ErrCredentialOverrideHarnessUnsupported = errors.New("credential override unsupported on codex harness")
 	ErrCredentialOverridePinnedNeedsSecret  = errors.New("credential override pinned mode requires a token")
 	ErrCredentialOverrideInvalidMode        = errors.New("invalid credential override mode")
-	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the owner's Claude source is a model
+	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the run's source is a model
 	// provider, whose run uses the provider key, so a vendor credential override is refused. It
 	// wraps ErrCredentialOverrideHarnessUnsupported, so every consumer that already refuses that
 	// keeps refusing; the handler adds the provider wording.
-	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the Claude source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
+	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
 )
 
 // refuseOverrideForProviderOwner refuses a vendor credential override when the owner selected a

@@ -415,9 +415,19 @@ func TestModelProviderNameUniquePerOwnerLiveDB(t *testing.T) {
 	if code, c := pgCodeC(err); code != "23505" || c != "model_providers_owner_name_lower_key" {
 		t.Fatalf("case-variant name = %v (%s %s)", err, code, c)
 	}
-	_, err = q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "other", Engine: "codex"})
+	if _, err := q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "other", Engine: "codex"}); err != nil {
+		t.Fatalf("valid codex provider = %v, want accepted", err)
+	}
+	// Names are unique per owner across engines, including case variants.
+	for _, name := range []string{"same", "SAME"} {
+		_, err = q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: name, Engine: "codex"})
+		if code, c := pgCodeC(err); code != "23505" || c != "model_providers_owner_name_lower_key" {
+			t.Fatalf("cross-engine duplicate %q = %v (%s %s)", name, err, code, c)
+		}
+	}
+	_, err = q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "unknown-engine", Engine: "unknown"})
 	if code, _ := pgCodeC(err); code != "23514" {
-		t.Fatalf("engine codex = %v, want a CHECK violation until PRD #4323 widens it", err)
+		t.Fatalf("unknown engine = %v, want a CHECK violation", err)
 	}
 }
 
