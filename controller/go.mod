@@ -22,7 +22,7 @@ go 1.26.4
 
 // The patched toolchain below carries stdlib fixes govulncheck gates on. Go
 // auto-downloads it; Renovate keeps it current while `go` remains the floor.
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0
