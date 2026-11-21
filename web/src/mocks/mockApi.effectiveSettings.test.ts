@@ -182,6 +182,30 @@ describe("getEffectiveSettings", () => {
     }
   });
 
+  it("planning effort inherits the lead template unless the planning setting is pinned", async () => {
+    const template = {
+      ...templates[0]!, id: "b-lead-planning-effort", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: "low", codex_effort: null,
+    };
+    templates.push(template);
+    try {
+      await mockApi.setTemplateAllocations({ my_overrides: [{ template_id: template.id, enabled: true }] });
+      const inherited = await mockApi.getEffectiveSettings();
+      expect(inherited.efforts.find(c => c.setting === "planning_effort")).toMatchObject({
+        default_effort: "low", default_source: "template", resolved_effort: "low", source: "template",
+      });
+      await mockApi.putMySettings({ planning_claude_effort: "high" });
+      const pinned = await mockApi.getEffectiveSettings();
+      expect(pinned.efforts.find(c => c.setting === "planning_effort")).toMatchObject({
+        default_effort: "low", default_source: "template", resolved_effort: "high", source: "user_planning_default",
+      });
+    } finally {
+      await mockApi.putMySettings({ planning_claude_effort: null });
+      await mockApi.setTemplateAllocations({ my_overrides: [] });
+      templates.splice(templates.indexOf(template), 1);
+    }
+  });
+
   it("returns a copy, so a caller cannot change the recording", async () => {
     const first = await mockApi.getEffectiveSettings();
     first.harnesses.length = 0;
