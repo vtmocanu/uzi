@@ -210,7 +210,7 @@ a running one.
   per claim generation. The lead template's
   effort is not projected as a pin: it is a tier of the lead's own effort
   (run override, then the user's preference, then the lead template, then
-  medium). See [PRD #3258](prds/3258-per-harness-template-effort.md).
+  medium). See [PRD #3258](prds/done/3258-per-harness-template-effort.md).
 - **The `lead` is the main thread, not a subagent.** The worker
   (`agent/src/agents.ts`) selects the first delivered own template matching
   `lead`/`orchestrator` case-insensitively and routes its body and delivered

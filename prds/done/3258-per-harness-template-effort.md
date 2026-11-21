@@ -2,7 +2,7 @@
 
 **Issue:** #3258  
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r2 2026-11-21, buddy-approved (child N of #1703), against main `f99e8a84d9111dea0f0431485295d2411ec5e971`.  
+**Status:** Implemented 2026-11-21 (issue #3258, M1-M4 delivered on the run branch). Drafted as r2 2026-11-21, buddy-approved (child N of #1703), against main `f99e8a84d9111dea0f0431485295d2411ec5e971`.
 **Priority:** Normal.  
 **Parent:** #1703.  
 **Blocked by:** none for implementation. G (#3249) is implemented on main by PR #3884 (`codex_model` column, per-family pins, harness-filtered claim projection); only its hosted acceptance is open, which is not a code dependency. O's agent-template CLI (#3264, PR in `prds/done/3264-cli-model-settings.md`) and P's run-start model and effort (#3250, `prds/done/3250-run-start-model-effort.md`) are on main.  
@@ -90,18 +90,21 @@ Cross-harness execution; changing P/Q lead precedence; schedule effort pins; new
 - N1 migration and queries; N3 lead-template tier in `lead_settings.go` plus effective-settings/start-preview/CLI parity; N4 projection helper and `ClaimAgent.effort`; N6 capability constant and the api-side withholding plus run-feed notice; N7 API and CLI; drift contract (Go side) and API contract fixture; web `AgentTemplate` type.
 - Docs: `docs/agent-templates.md` (the two effort fields, Default meaning, the lead-template tier (N3), builtin customization), `docs/cli.md`, `docs/worker-effort.md` (subagent effort precedence, N2), `ARCHITECTURE.md` "Agent templates"; `task docs:sync`.
 - Acceptance: regressions (d) and (e); migration and reconcile LiveDB green; CLI tests green.
+- Delivered: migration 00498 (renumber on landing), the nine template statements plus the lead lateral, `EffortForHarness`, `template_effort_v1` with the withheld-pin `status` notice (`template_effort_omitted`), the N3 tier with effective-settings parity (start preview through the effective cell), cookie and CLI pin routes, `uzi agent-template set --effort` / `reset --effort`, drift and label contracts, docs.
 
 ### M2. Both runtimes honor template effort
 
 - N5 Claude and Codex; worker self-reports `template_effort_v1`; repo-agent parsing (N9).
 - Docs: `docs/repo-agents.md`.
 - Acceptance: regressions (a), (b), (c) watched red/green; `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`, touched test files with `--test-timeout=120000`, and `task test:codex-m4`; full agent suite pending CI.
+- Delivered: Claude `toDefinition` pin plus `fillSubagentEffort` on the plan and implement rosters; Codex per-role effort through `renderCodexRun` with a once-per-role `unknown_effort` notice; `.codex/agents` TOML `model_reasoning_effort` with `effort_ignored` notes; family-by-folder projection; the capability advertised unconditionally. The Markdown half of N9 moved to M3 (it shares the agent-source parser golden).
 
 ### M3. Builtins and agent-source
 
 - N8 parser key, pristine refresh, reset, agent-source preview/apply and the admin card.
 - Docs: `docs/agent-source.md`.
 - Acceptance: agent-source and boot-reconcile tests green.
+- Delivered: builtin `effort:` (parse error when invalid) and `Render` emitting it; agent-source and `.claude/agents` Markdown `effort:` (Claude family) with `effort_ignored`; staged snapshots, preview, diff, apply and the admin card carry it; the shared parity golden gains valid, invalid and block-scalar cases; `docs/agent-source.md`, `docs/repo-agents.md`.
 
 ### M4. Interim editor, list and detail
 
@@ -109,6 +112,7 @@ Cross-harness execution; changing P/Q lead precedence; schedule effort pins; new
 - `specs/human.md` under the template-pin and precedence entries (~81-82, ~204-205, ~2000-2001): terse entries tagged `(AI-synced YYYY-MM-DD)`.
 - Changelog: one new `changelog.d/<uuid v4>.md` fragment (category Added) citing #3258.
 - Acceptance: web tests green; `task check:web`; mock mode shows a template with a Codex effort pin.
+- Delivered: both effort selects with the lead help, list/detail labels, the shipped-vs-stored diff, mock data (`migration-writer` pinned Codex `high`) and a mock effective-settings transform that serves a delivered lead template's effort as source `template`. The focused browser case is committed but pending exact-head CI (owner decision: no browser Vitest in-run). `specs/human.md` and the changelog fragment were landed as integration edits.
 
 ## Risks
 
@@ -123,3 +127,4 @@ Cross-harness execution; changing P/Q lead precedence; schedule effort pins; new
 - N3 mirrors the model chain: the lead template applies only when the user has no per-harness default.
 - r2 (buddy REVISE 3 on r1, digest `9f4350ef`): N3 reuses the existing `template` source token instead of a new one, preserves an explicit `runtime` preference, keeps non-lead lanes unchanged, and adds effective-settings/preview parity; N5 keeps the Codex catalog advisory lead-only (no per-child probe); N8/N9 extend the shared parser differential golden and the render round trip.
 - N6 chosen over a placement gate: the notice makes the omission visible with no new scheduler predicate; the work still runs at today's behavior.
+- 2026-11-21 (implementation, issue #3258 run): migration `00498_agent_template_effort.sql` (draft number; renumber on the landing rebase). The Markdown half of N9 moved from M2 to M3 so the `.claude/agents` parser and the agent-source parser change together under the shared parity golden. Invalid repo or source effort uses one new note token, `effort_ignored`, shared by Go and TypeScript; on repo agents it carries the file basename only when that basename passes the agent-name regex and length cap, and the value is never echoed. The N6 withheld-pin notice and the Codex out-of-contract notice are `status` run messages. Start-preview parity needs no API change: a run-start effort is `run_override`, and otherwise the web preview composes the effective-settings cell, which now carries the template tier. Deferred: the Claude lead model can still pass its own `effort` on an Agent call, and an out-of-contract Claude pin is dropped without a notice (the api CHECK makes it unreachable).
