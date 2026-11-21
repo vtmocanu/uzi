@@ -229,7 +229,7 @@ RETURNING claude_provider_id;
 
 -- name: GetUserProviderSource :one
 SELECT u.claude_provider_id AS provider_id,
-       p.engine, p.current_revision, p.retired_at,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
        r.base_url, r.auth_style, r.model_map,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
@@ -240,7 +240,7 @@ LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind
 WHERE u.id = @id AND @engine::text = 'claude'
 UNION ALL
 SELECT u.codex_provider_id AS provider_id,
-       p.engine, p.current_revision, p.retired_at,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
        r.base_url, r.auth_style, r.model_map,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev

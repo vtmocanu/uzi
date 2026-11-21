@@ -88,3 +88,7 @@ func TestCheckStoredCredentialOverrideEnabled(t *testing.T) {
 		})
 	}
 }
+
+func (s *storedOverrideMetaStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}

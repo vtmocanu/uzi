@@ -6468,3 +6468,7 @@ func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
 		})
 	}
 }
+
+func (f *fakeStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}

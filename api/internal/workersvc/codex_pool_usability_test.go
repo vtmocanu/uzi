@@ -318,3 +318,7 @@ func TestCodexUsabilityMatrix(t *testing.T) {
 		})
 	}
 }
+
+func (f *poolFakeStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}

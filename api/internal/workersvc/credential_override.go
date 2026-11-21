@@ -88,11 +88,11 @@ var (
 // a vendor run carrying an override. q is asserted for the source read; a surface that cannot read
 // the source fails closed (an error, never nil), so an override never rides an unchecked owner.
 func refuseOverrideForProviderOwner(ctx context.Context, q any, userID uuid.UUID) error {
-	r, ok := q.(providerSourceReader)
+	r, ok := q.(engineProviderSourceReader)
 	if !ok {
 		return errors.New("credential override: the query surface cannot read the provider source")
 	}
-	row, err := r.GetUserClaudeProviderSource(ctx, userID)
+	row, err := r.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: userID, Engine: "claude"})
 	if err != nil {
 		return fmt.Errorf("credential override: provider source: %w", err)
 	}

@@ -358,7 +358,7 @@ func (q *Queries) GetUserProviderLaneSources(ctx context.Context, id uuid.UUID) 
 
 const getUserProviderSource = `-- name: GetUserProviderSource :one
 SELECT u.claude_provider_id AS provider_id,
-       p.engine, p.current_revision, p.retired_at,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
        r.base_url, r.auth_style, r.model_map,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
@@ -369,7 +369,7 @@ LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind
 WHERE u.id = $2 AND $1::text = 'claude'
 UNION ALL
 SELECT u.codex_provider_id AS provider_id,
-       p.engine, p.current_revision, p.retired_at,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
        r.base_url, r.auth_style, r.model_map,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
@@ -388,6 +388,7 @@ type GetUserProviderSourceParams struct {
 type GetUserProviderSourceRow struct {
 	ProviderID       pgtype.UUID        `json:"provider_id"`
 	Engine           pgtype.Text        `json:"engine"`
+	Protocol         pgtype.Text        `json:"protocol"`
 	CurrentRevision  pgtype.Int4        `json:"current_revision"`
 	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
 	BaseUrl          pgtype.Text        `json:"base_url"`
@@ -406,6 +407,7 @@ func (q *Queries) GetUserProviderSource(ctx context.Context, arg GetUserProvider
 	err := row.Scan(
 		&i.ProviderID,
 		&i.Engine,
+		&i.Protocol,
 		&i.CurrentRevision,
 		&i.RetiredAt,
 		&i.BaseUrl,

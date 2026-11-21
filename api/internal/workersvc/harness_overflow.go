@@ -256,8 +256,8 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 		// The overflow toggle is irrelevant here: an unset default has no preferred harness.
 		return s.evaluateAutomaticHarness(ctx, q, userID, res)
 	}
-	if res.ClaudeSourceSet {
-		// A set Claude provider source (usable or not, PRD #4320 D13): unknown provider usage is
+	if res.ClaudeSourceSet || res.CodexSourceSet {
+		// A set provider source (usable or not, PRD #4320 D13): unknown provider usage is
 		// never compared with vendor readings, and the run never moves to the other engine's vendor
 		// credential. Exits before the other-side resolution, in either direction.
 		d.Reason = harnessReasonExcluded
