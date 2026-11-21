@@ -148,7 +148,7 @@ Formal partial delivery (2026-11-12) retains M4 and defers incomplete M1 and uns
 
 ## Follow-up 2026-11-21: #4575 environment verification
 
-Issue #4575 evaluated one candidate environment read-only: this run's own DinD daemon, through GET requests only. No container, pull, mount, privilege or configuration change occurred. The verdict is **NO-QUALIFIED-ENVIRONMENT**. The full record, with each assertion labelled observed, cited, inferred or UNVERIFIED and bound to a revision, is [environment.md](../e2e/go-cache-admission/environment.md).
+Issue #4575 evaluated one candidate environment read-only: this run's own DinD daemon, through GET requests only. No container, pull, mount, privilege or configuration change occurred. The verdict is **NO-QUALIFIED-ENVIRONMENT**. The full record, whose assertions are labelled observed, cited, inferred or UNVERIFIED (unlabelled items are cited or declared as stated there) with a per-requirement source, instrument and binding table, is [environment.md](../e2e/go-cache-admission/environment.md).
 
 The daemon facts were observed. The prerequisites remain UNVERIFIED, each with its missing mechanism named there:
 
@@ -159,4 +159,4 @@ The daemon facts were observed. The prerequisites remain UNVERIFIED, each with i
 
 Owner requests, none granted: (a) threshold inputs; (b) a digest-pinned Go-toolchain image already on the run's daemon with trusted output provenance (acquisition needs separate approval); (c) the inode ceiling 65,536 with its split; (d) a later bounded canary on that image.
 
-Producer admission stays closed. #4203 and #2013 remain open. The historical proof above is not rewritten, and M1-M3 of #4203 remain deferred. Closing the prerequisite issue does not authorize producers.
+Producer admission stays closed. #4203 and #2013 remain open. The historical report above is not rewritten, and M1-M3 of #4203 remain deferred. Closing the prerequisite issue does not authorize producers.

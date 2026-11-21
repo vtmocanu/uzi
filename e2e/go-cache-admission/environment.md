@@ -4,7 +4,9 @@
 closed; #4203 and #2013 remain open; nothing here is an A/B verdict or production
 authorization.**
 
-Each assertion carries a label and its source:
+Labelled assertions use these labels; the unlabelled items (section 5 carry-forward, section 8
+notes and the R5 and R7 "declared" lists) are cited or declared as stated where they appear, and
+section 2's source table names the instrument and binding per requirement:
 
 - **observed**: read from the daemon or host by the collector, bound to the collector-run revision.
 - **cited**: read from source or docs at the stated revision; it describes code, not a live setting.
@@ -17,31 +19,50 @@ See [README.md](README.md) for the verifier (`qualify.py`) and collector (`obser
 
 - **Candidate** (observed): one disposable container's worth of environment on this run's own
   DinD endpoint, a loopback TCP daemon (rendered at `controller/internal/kube/render_dind.go`
-  `:219` and `:248`, cited at HEAD 58fce7a0d). The collector made GET requests only: no
+  `:219` and `:248`, cited at acbed9921). The collector made GET requests only: no
   container was created, no image pulled, no mount, privilege or configuration changed.
 - **Collector-run repository revision**: 6e02e276f24418c2ccd750932931f79a9e5dcdc3. **Scaffold
-  revision**: d75ab6f0d5b3d5d94326bb454dc109f4e5d63f92 (the #4214 merge).
+  revision**: d75ab6f0d5b3d5d94326bb454dc109f4e5d63f92 (the #4214 merge of the scaffold whose
+  branch repair revision was 6d521c57a, per [PRD 4203](../../prds/4203-go-cache-admission-proof.md)).
 - **Evidence files**: [evidence/artifact.json](evidence/artifact.json) and
   [evidence/verdict.json](evidence/verdict.json). Later commits only tightened daemon-field
-  allowlists; a unittest (`test_observe.py`) confirms the evidence is reproduced by the current
-  collector. Daemon identity appears only as a per-run salted hash.
+  allowlists and, after the evidence run, also added image Arch/Os allowlists, response close in
+  `docker_get` and a rootless missing-`CgroupDriver` rule; none changes the evidence. A unittest
+  (`test_observe.py`) checks that each committed daemon string passes the current `daemon_section`
+  unchanged and that the artifact still re-evaluates to NO-QUALIFIED-ENVIRONMENT; the images,
+  binding and verdict were not re-collected. Daemon identity appears only as a per-run salted hash.
 
 ## 2. Requirements R1-R8
 
-PROVEN = observed with the stated boundary. NEGATIVE = contradicted. UNVERIFIED = missing evidence.
+PROVEN = observed by the collector with the stated boundary. NEGATIVE = contradicted.
+UNVERIFIED = missing evidence. Preserved (cited) = a carried-forward decision read from source,
+not an observation.
+
+**Source / instrument / binding** per requirement:
+
+| # | Source | Instrument | Binding |
+| --- | --- | --- | --- |
+| R1 | PRD 2013 and 4203 Decision Logs | cited text | the PRD files at HEAD |
+| R2 | daemon GET responses | `observe.py` collector; `qualify.py` binding leg | collector revision 6e02e276f |
+| R3 | owner inputs; agent code | issue text for the owner inputs (none supplied); code citations | acbed9921 |
+| R4 | `qualify.py` rules; kernel memcg docs | code citations; no mount facts collected | acbed9921 |
+| R5 | `qualify.py` rules; daemon support flags | `qualify.py` enforcement leg; collector support flags | acbed9921 and 6e02e276f |
+| R6 | render and compose source; issue text | code citations; none observed | acbed9921 (anchor revision for the cited lines) |
+| R7 | issue text, PRD envelope | declared values; `qualify.py` envelope leg | acbed9921 |
+| R8 | issue text | none (canary not run) | not applicable |
 
 | # | Requirement | Verdict | Evidence and what is missing |
 | --- | --- | --- | --- |
-| R1 | Preserved decisions | PROVEN (cited) | See R1 below. |
+| R1 | Preserved decisions | Preserved (cited) | See R1 below. |
 | R2 | Daemon and image binding | Daemon PROVEN (observed); image binding UNVERIFIED | See R2 below. |
 | R3 | Live soft threshold | UNVERIFIED | See R3 below. |
 | R4 | All-sink, all-mount charge map | UNVERIFIED | See R4 below. |
 | R5 | Enforcement | UNVERIFIED | See R5 below. |
 | R6 | Lane topology | UNVERIFIED (not applied) | See R6 below. |
-| R7 | Frozen envelope | Declared only; ceiling unapproved | See R7 below. |
+| R7 | Frozen envelope | UNVERIFIED (declared only; inode-ceiling-unapproved) | See R7 below. |
 | R8 | Canary | UNVERIFIED, not run | See R8 below. |
 
-### R1 Preserved decisions (cited)
+### R1 Preserved decisions (Preserved, cited)
 
 - The boundary-only HOME trim policy and the Docker-wired owner answer are unchanged
   ([parent Decision Log](../../prds/2013-run-cache-growth-mid-turn.md#decision-log), D1-D20 and the
@@ -80,24 +101,31 @@ Owner threshold inputs were not supplied at the plan gate. Provenance is not imp
 4. the effective value, from that incarnation's `soft_threshold` log line or another
    owner-authorized observation.
 
-Cited mechanics at HEAD 58fce7a0d: the soft value is the threshold minus the margin, or the
+Cited mechanics at acbed9921: the soft value is the threshold minus the margin, or the
 threshold itself when that is not positive (`agent/src/disk-reclaim.ts:948-951`). The
 `soft_threshold` field is logged only with admission on and only on a transition
-(`:1001-1003`), and on the unknown-sample transition (`:984`). The heartbeat-accepted value
+(`:1001-1003`), on the unknown-sample transition (`:984`), and once per over-stretch when the
+admission wait expires, admission on only (`:1015-1018`). Those are the places to read the
+effective value. The heartbeat-accepted value
 (`agent/src/client.ts:2618-2621`) is held in memory and never logged; a rejected value keeps
 the last good one. The margin is parsed by `marginFraction` (`agent/src/config.ts:461-466`,
 read at `:659`); `margin-golden.json` is generated from the real `loadConfig`.
 
 ### R4 Charge map, all sinks and all mounts (UNVERIFIED; no container mount facts collected)
 
-The verifier's `CHARGE_SINKS` is the preflight sinks plus the container, daemon and export sinks.
+The verifier's `CHARGE_SINKS` (`qualify.py`) is the preflight `SINKS` (`home`, `gopath`, `modules`,
+`cache`, `gotmp`, `tmp`, `work`, `output`, `logs`, `retained`, `staging`) plus `toolchain_download`,
+`cache_init`, `fuzz`, `exported_archives`, `linked_executables`, `stdout_stderr`, `harness_reports`,
+`setup_cleanup`, `container_writable_layer`, `container_network_binds`, `shm`, `daemon_image_store`,
+`daemon_build_cache`, `daemon_metadata_snapshots`, `volumes`, `container_logs` and `temp_extraction`.
 
 | Surface | Rule in `qualify.py` |
 | --- | --- |
 | Read-only mount | No storage coverage needed. |
 | Writable `proc`, `devpts` | Non-storage, listed with a reason. |
-| Writable `mqueue`, `sysfs`, `cgroup`, `cgroup2`, network binds, bind or volume mounts, any other fstype | `unaccounted-writable-mount`. |
-| Writable `tmpfs` | Needs `size` and `nr_inodes` coverage. Docker default `/dev` and `/dev/shm` lack `nr_inodes`. |
+| Writable `mqueue`, `sysfs`, `cgroup`, `cgroup2`, network binds, bind or volume mounts | `unaccounted-writable-mount`. |
+| Any other writable fstype | `unaccounted-writable-mount`, except a writable overlay root (storage, needs coverage) or an exclusive finite-capacity mount (storage). |
+| Writable `tmpfs` | Storage; needs `size` and `nr_inodes` coverage. Docker default `/dev` and `/dev/shm` lack `nr_inodes`. |
 | `daemon_*` sinks and `container_logs` | Outer-domain sinks, charged only through the backing leg. |
 | Writable fd | Must map to an accounted writable mount (`mount_id` alone when present, else superblock). |
 
@@ -123,10 +151,13 @@ Claims are resource- and sink-specific triples `{kind, resource, sinks}`:
 - **DAC claims are UNVERIFIED** (`dac-ownership-mode-unverified`): CHOWN/SETUID-class
   capabilities may remain and pre-existing writable fds are unaccounted. Non-root `--user` is
   defence in depth, not enforcement.
-- Storage enforcement relies only on a read-only root mount plus bounded tmpfs. Write-deny
-  evidence is EROFS only.
-- Reason codes in play: `new-mount-possible` (needs CapBnd 0, NoNewPrivs 1 and the default
-  seccomp profile, or `max_user_namespaces` 0), `boundary-not-allocation-enforcement` (refused
+- The candidate/proposed canary relies only on a read-only root mount plus bounded tmpfs for
+  storage; it offers neither of the following. The verifier's general schema also accepts
+  `exclusive-finite-fs` (both a bytes and an inodes triple, with collector-observed capacity and
+  exclusivity) and `storage-opt-size` only with backend-support evidence. Write-deny evidence is
+  EROFS only.
+- Reason codes in play: `new-mount-possible` (CapBnd 0 and NoNewPrivs 1 are always required, plus
+  either the default seccomp profile or `max_user_namespaces` 0), `boundary-not-allocation-enforcement` (refused
   kinds such as emptyDir `sizeLimit`, ephemeral-storage limits, monitoring, PVC requests,
   watchdogs, sampled `du`/`statfs`, json-file max-size), `boundary-removable`,
   `daemon-capability-unsupported` and `limits-not-applied-observed`.
@@ -137,16 +168,24 @@ Claims are resource- and sink-specific triples `{kind, resource, sinks}`:
 
 Nothing below is observed for a container; "rendered" means cited from source.
 
-| Lane | Rendered (cited) | Observed |
-| --- | --- | --- |
-| Hosted k8s without Docker | Worker data PVC shared by runs. No `limits.ephemeral-storage` by design (`controller/internal/kube/render.go`, comment near line 250); that decision is unchanged. emptyDir `sizeLimit` and ephemeral-storage are eviction-only ([Kubernetes ephemeral storage](https://kubernetes.io/docs/concepts/storage/ephemeral-storage/)). A memory-backed tmpfs needs a new mount: an owner decision. | None. |
-| Hosted Docker-wired | `dind-data` daemon volume (`render_dind.go:43`, mounted at `:357`). The `runner-shared` subPath at `/data/runner` is shared by worker and dind (`:73-74`, `:82-83`): excluded as shared and not quota'd. DinD memory default 2Gi (`:121`; the chart default was not observed). `--storage-opt size` is unproven on overlayfs with the containerd snapshotter ([dockerd reference](https://docs.docker.com/reference/cli/dockerd/)). | Only the loopback daemon facts in R2. |
-| Compose | `agentdata:/data`, `agentnix:/nix` (persistent, seeded from the image) and `pgdata`; `mem_limit` only (`docker-compose.yml:20`, `:362`, `:421-438`). The dev stack was not touched. | None. |
+| Lane | Verdict | Rendered (cited) | Observed | Missing mechanism | Owner decision |
+| --- | --- | --- | --- | --- | --- |
+| Hosted k8s without Docker | UNVERIFIED | Worker data PVC shared by runs. No `limits.ephemeral-storage` by design (`controller/internal/kube/render.go`, comment near line 250); that decision is unchanged. emptyDir `sizeLimit` and ephemeral-storage are eviction-only ([Kubernetes ephemeral storage](https://kubernetes.io/docs/concepts/storage/ephemeral-storage/)). A memory-backed tmpfs needs a new mount. | None. | No per-experiment synchronous byte or inode bound inside the shared data PVC; ephemeral limits are eviction-only; a memory-backed emptyDir would be a new mount. | Whether to add a memory-backed mount (a new rendered volume). |
+| Hosted Docker-wired | UNVERIFIED | `dind-data` daemon volume (`render_dind.go:43`, mounted at `:357`). The `runner-shared` subPath at `/data/runner` is shared by worker and dind (`:73-74`, `:82-83`): excluded as shared and not quota'd. DinD memory default 2Gi (`:121`; the chart default was not observed). `--storage-opt size` is unproven on overlayfs with the containerd snapshotter ([dockerd reference](https://docs.docker.com/reference/cli/dockerd/)). | Only the loopback daemon facts in R2. | No Go-bearing image verified; threshold inputs not supplied; no applied-limit or mount facts. | Section 4 requests (a)-(d). |
+| Compose | UNVERIFIED | `agentdata:/data`, `agentnix:/nix` (persistent, seeded from the image) and `pgdata`; `mem_limit` only (`docker-compose.yml:20`, `:362`, `:421-438`). The dev stack was not touched. | None. | Not observed; named volumes have no per-experiment ceiling and `/nix` is persistent. | A disposable compose fixture, only if ever wanted. |
+
+A Kubernetes memory-backed emptyDir's `sizeLimit` does size the tmpfs ([Kubernetes volumes](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)); disk-backed emptyDir and ephemeral-storage limits stay eviction-only.
 
 A fixture proves only that fixture.
 
 ### R7 Frozen envelope (declared, not enforced)
 
+- **Memory accounting.** tmpfs and `/dev/shm` pages charge to the container's memory cgroup
+  (cited: kernel memcg docs; inferred for this layout). That cgroup sits inside the DinD
+  container's memory limit, rendered default 2Gi at `render_dind.go:121` (cited at acbed9921, not
+  observed). The 1 GiB memory envelope and the tmpfs byte ceilings are upper bounds, not a
+  requirement to fill tmpfs and anonymous memory simultaneously, and a shared charge is counted
+  once (inferred).
 - Unchanged: 2 GiB = 768 + 128 + 1152 MiB; memory 1 GiB; clients 2; writers 1; body 64 MiB;
   objects 4096; records 8192; tiny 16 MiB / 30 s. Metadata, rounding and reports are charged in
   the work share.
@@ -187,11 +226,11 @@ Each is a request; none is granted.
 
 - **(a) Threshold inputs.** Supply: the API threshold value and observation time; whether
   `UZI_DISK_SOFT_MARGIN` is set or unset on the worker (and its value); the image, pod and
-  process incarnation; and the effective `soft_threshold` observation or another
-  owner-authorized one. Blast radius: read-only; no change.
+  process incarnation; and the effective `soft_threshold` observation (a transition, unknown-sample
+  or `disk-reclaim.ts:1015-1018` admission-wait-expiry log line) or another owner-authorized one. Blast radius: read-only; no change.
 - **(b) Digest-pinned Go-toolchain image** already present on the run's daemon, with trusted Go
   output provenance (`signed-output-metadata` or `reproducible-build-attestation`). Acquiring one
-  needs separate approval: there is no hosted pull (#225). Blast radius: none until acquired.
+  needs separate approval: there is no hosted pull (#225, as stated by the issue; not independently checked). Blast radius: none until acquired.
 - **(c) Inode ceiling 65,536** with the split in R7. Blast radius: changes only the declared
   envelope; nothing is applied.
 - **(d) Later canary on the (b) image**, in one disposable container:
@@ -214,8 +253,8 @@ Each is a request; none is granted.
 ## 5. Parent-gate carry-forward
 
 - Parent M2 stays blocked unless the selected environment can exercise the unchanged
-  `measureRunCaches`, the Go-unit helpers and `trimRunCaches` (`agent/src/run-caches.ts`,
-  `agent/src/cache-cap.ts`) under the real runner/UID layout; otherwise it needs a separate
+  `measureRunCaches` and the Go-unit helpers (defined in `agent/src/rmtree.ts`, imported by
+  `agent/src/cache-cap.ts`) and `trimRunCaches` (`agent/src/run-caches.ts`) under the real runner/UID layout; otherwise it needs a separate
   qualification and a justification of any transferred evidence.
 - Parent M3 needs an explicit owner resource/scope decision, including narrowing of the
   representative set and limits on conclusions. A production decision is separate.
@@ -227,12 +266,15 @@ Each is a request; none is granted.
 
 Reported by the dispatch unless marked otherwise; none of it is an environment result.
 
-- `test:go-cache-preflight`: 18 tests in about 0.06 s at base f99e8a84d; 179 tests in about
-  22 s at HEAD 58fce7a0d (5 of 5 runs green). The growth is about 45 subprocess launches of the
-  collector, with no sleeps. The CI `gate:repo` impact is about +22 s as measured locally; the
+- `test:go-cache-preflight`: at base f99e8a84d, 18 tests in about 0.063 s (validator-reported).
+  At acbed9921 the fact-checker measured 179 tests in about 22.7 s: `test_observe` 48 tests in
+  about 17.8 s (collector subprocesses), `test_preflight` 26 tests in about 5.4 s (including one
+  deadline-bound slow-header test that trickles with `time.sleep(0.3)` until its 5 s deadline,
+  about 5.1 s) and `test_qualify` 105 tests in about 0.1 s. Earlier, validator-reported: 5 of 5
+  runs green at 58fce7a0d. The CI `gate:repo` impact is about +22 s as measured locally; the
   CI-runner delta is unmeasured.
 - `check-docs:web`, `check:token-literals`, `check:changelog-entry` and `git diff --check` exited
-  0 at 58fce7a0d. The margin golden table was regenerated from the real `loadConfig` and
+  0 at 58fce7a0d (validator-reported). The margin golden table was regenerated from the real `loadConfig` and
   reproduced byte-equal by the reviewer.
 - Mutation record:
   - M1: round 1 killed 24 of 26 mutants and every survivor was fixed (headroom `st_dev`
