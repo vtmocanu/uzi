@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -123,7 +124,40 @@ func TestOnceFireSummaryBlocksAdmissionUntilCommitLiveDB(t *testing.T) {
 // An admission that has taken the lock and not yet committed makes a completing summary wait on
 // it, so the admission is in the completion's final last_fire.
 func TestOnceFireSummaryWaitsForCommittingAdmissionLiveDB(t *testing.T) {
+	testOnceFireSummaryWaitsForCommittingAdmission(t, false)
+}
+
+// A real pool's session default can be REPEATABLE READ (including through the database's
+// default_transaction_isolation). The helper must override it before its first snapshot.
+// Without the pin, an admission that commits during the lock wait is absent from the ledger read.
+func TestOnceFireSummaryPinsReadCommittedOverPoolDefaultLiveDB(t *testing.T) {
+	testOnceFireSummaryWaitsForCommittingAdmission(t, true)
+}
+
+func testOnceFireSummaryWaitsForCommittingAdmission(t *testing.T, repeatableReadDefault bool) {
+	t.Helper()
 	f := newOnceFx(t)
+	summaryService := f.svc
+	if repeatableReadDefault {
+		cfg := f.env.pool.Config()
+		params := make(map[string]string, len(cfg.ConnConfig.RuntimeParams)+1)
+		for key, value := range cfg.ConnConfig.RuntimeParams {
+			params[key] = value
+		}
+		params["default_transaction_isolation"] = "repeatable read"
+		cfg.ConnConfig.RuntimeParams = params
+		pool, err := pgxpool.NewWithConfig(f.env.ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		var isolation string
+		if err := pool.QueryRow(f.env.ctx, "SHOW default_transaction_isolation").Scan(&isolation); err != nil || isolation != "repeatable read" {
+			t.Fatalf("summary pool default isolation = %q, %v, want repeatable read", isolation, err)
+		}
+		summaryService = atomicSvc(f.env)
+		summaryService.txBeginner = pool // production also opens its own transaction through pool.Begin
+	}
 	a, b := f.issue(t), f.issue(t)
 	if _, err := f.admit(a, f.progress(a, onceCap(2))); err != nil {
 		t.Fatal(err)
@@ -147,7 +181,7 @@ func TestOnceFireSummaryWaitsForCommittingAdmissionLiveDB(t *testing.T) {
 	}
 	sumErr := make(chan error, 1)
 	go func() {
-		_, err := f.svc.WriteOnceFireSummary(f.env.ctx, f.sched.ID, f.user, 0, compose)
+		_, err := summaryService.WriteOnceFireSummary(f.env.ctx, f.sched.ID, f.user, 0, compose)
 		sumErr <- err
 	}()
 	waitBlocked(t, f.env, summaryLockWait)

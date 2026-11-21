@@ -834,7 +834,7 @@ type RecordScheduleHeldFireParams struct {
 }
 
 // A one-time schedule held on credential_disabled (PRD #1732 D2) records why it waits: only
-// last_fire is written. next_fire_at, status and last_fired_at are untouched, so the row stays
+// last_fire and its recent_fires entry are written. next_fire_at, status and last_fired_at are untouched, so the row stays
 // due and fires once the credential is enabled. Guarded to a still-active one-time row so a
 // concurrent edit, disable or fire is never overwritten with a stale hold; fire_epoch (issue #4512)
 // additionally refuses a hold from an occurrence a re-arm has since replaced.
