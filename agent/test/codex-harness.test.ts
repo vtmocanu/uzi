@@ -679,8 +679,6 @@ describe("#3253 phase transition harness seam", () => {
       const events = await collect(impl.harness.startTurn(request()).events);
       assert.equal(phaseTransition.current!.pending, false);
       const usage = entries(accountant)!;
-      assert.equal(usage[planModel]!.costStatus, "unreported", "missed final plan response is not repriced");
-      assert.equal(usage[implModel]!.costStatus, "metered");
       const expectedPlan = { inputTokens: 130, cacheReadInputTokens: 35,
         cacheCreationInputTokens: 15, outputTokens: 70, reasoningOutputTokens: 9 };
       const expectedImpl = { inputTokens: 40, cacheReadInputTokens: 5,
@@ -692,6 +690,8 @@ describe("#3253 phase transition harness seam", () => {
         assert.equal(usage[implModel]![key], expectedImpl[key], key);
         assert.equal(usage[planModel]![key] + usage[implModel]![key], expectedTotal[key], key);
       }
+      assert.equal(usage[planModel]!.costStatus, "unreported", "missed final plan response is not repriced");
+      assert.equal(usage[implModel]!.costStatus, "metered");
       assert.deepEqual(order, ["replay", "cut", "live"]);
       assert.deepEqual(events.filter(e => e.kind === "usage_record").map(e => e.model), [implModel]);
     } finally { await impl.harness.close(); }
@@ -798,10 +798,15 @@ describe("#3253 phase transition harness seam", () => {
     const phaseTransition = cell();
     const cut = t.mock.method(accountant, "beginModelSegment");
     const transport = resumeTransport();
-    const { harness } = makeHarness({ accountant, phaseTransition, transport });
+    const notices: string[] = [];
+    const { harness } = makeHarness({ accountant, phaseTransition, transport,
+      onTokenUsageIncomplete: text => { notices.push(text); } });
     try {
       transport.push(turnCompleted("completed"));
       await assert.rejects(collect(harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
+      assert.equal(notices.length, 1);
+      assert.match(notices[0]!, /Implementation is stopped/);
+      assert.doesNotMatch(notices[0]!, /Execution continues/);
       await assert.rejects(collect(harness.startTurn(request()).events), PhaseSwitchUnverifiedError);
       assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
       assert.equal(phaseTransition.current!.boundaryUncertain, true);
@@ -1090,7 +1095,10 @@ describe("#3253 phase transition harness seam", () => {
     const planTransport = new FakeTransport(method => method === "thread/resume"
       ? { thread: { id: "th-1" } } : defaultResponder(method));
     const plan = makeHarness({ accountant, transport: planTransport });
-    planTransport.push(turnCompleted("completed"));
+    plan.harness.recordChildThreadModel("proved-child", planModel);
+    const provedChild = totals(12, 2, 1, 4, 1);
+    planTransport.push(tokenUsage(provedChild, provedChild, "proved-child", "child-turn"))
+      .push(turnCompleted("completed"));
     await collect(plan.harness.startTurn(makeRequest({ phase: "plan", resumeSessionId: "th-1" })).events);
     await plan.harness.close();
     const phaseTransition = cell();
@@ -1106,8 +1114,12 @@ describe("#3253 phase transition harness seam", () => {
       assert.equal(accountant.hasBaseline("th-1"), false);
       assert.equal(accountant.usageIncomplete, true);
       for (const model of [planModel, implModel]) {
-        assert.equal(usage[model]!.inputTokens, 0);
-        assert.equal(usage[model]!.outputTokens, 0);
+        const retained = model === planModel;
+        assert.equal(usage[model]!.inputTokens, retained ? 9 : 0);
+        assert.equal(usage[model]!.cacheReadInputTokens, retained ? 2 : 0);
+        assert.equal(usage[model]!.cacheCreationInputTokens, retained ? 1 : 0);
+        assert.equal(usage[model]!.outputTokens, retained ? 4 : 0);
+        assert.equal(usage[model]!.reasoningOutputTokens, retained ? 1 : 0);
         assert.equal(usage[model]!.costStatus, "unreported");
       }
       assert.deepEqual(events.filter(e => e.kind === "usage_record"), []);
@@ -6415,8 +6427,9 @@ describe("CodexHarness: error precedence + lifecycle", () => {
       await harness.close();
       assert.equal(registry.pendingLaunchCount(), 1);
       launched.resolve({ root, transport, supervisorPid: 4321 });
-      await withTimeout(reapEntered.promise, 2000, "late root reaping");
+      await withTimeout(Promise.race([reapEntered.promise, rejected]), 2000, "late launch settles or enters cleanup");
       assert.equal(registered.mock.callCount(), 0, "closed harness cannot register model work");
+      await withTimeout(reapEntered.promise, 2000, "late root reaping");
       assert.equal(retained.mock.callCount(), 1);
       assert.equal(retained.mock.calls[0]!.arguments[1] === root, true);
       assert.equal(registry.rootCount(), 1, "late root remains in cleanup custody");

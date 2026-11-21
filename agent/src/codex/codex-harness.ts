@@ -1808,7 +1808,11 @@ export class CodexHarness implements RunHarness {
   private async deliverIncompleteNotice(): Promise<void> {
     if (this.closed || !this.onTokenUsageIncomplete || !this.accountant.takeIncompleteNotice()) return;
     // One attempt per shared claim. A rejected diagnostic is nonfatal, with no retry.
-    try { await this.onTokenUsageIncomplete(this.accountant.incompleteNoticeText!); } catch { /* execution continues */ }
+    const notice = this.accountant.incompleteNoticeText!;
+    const text = this.phaseTransition?.current?.boundaryUncertain
+      ? notice.replace("Execution continues.", "Implementation is stopped. Resume retries; Cancel ends the run.")
+      : notice;
+    try { await this.onTokenUsageIncomplete(text); } catch { /* diagnostic delivery is nonfatal */ }
   }
 
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
