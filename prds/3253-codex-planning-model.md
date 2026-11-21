@@ -5,7 +5,7 @@
 **Status:** Draft r4, refreshed 2026-11-21. Child Q-codex of epic #1703 (r1 was the single Q draft). Current baseline: origin/main `10876dee680859e4e468ae5f004475f44b31a80a`; Codex runtime pin `0.167.0`.
 **Priority:** `priority::normal`.
 **Parent:** #1703.
-**Blocked by:** #4580 ([accounting child](4580-codex-usage-model-segments.md)), whose merge supplies the tested segment interface. #3246 and #3252 are closed and their code is on this base. #3244's resolver/reporting seam merged in PR #3695; its remaining owner landing acceptance is not an unfinished-code dependency. #3245, #3247 and #3250 are already on base.
+**Blocked by:** #4580 ([accounting child](done/4580-codex-usage-model-segments.md)), whose merge supplies the tested segment interface. #3246 and #3252 are closed and their code is on this base. #3244's resolver/reporting seam merged in PR #3695; its remaining owner landing acceptance is not an unfinished-code dependency. #3245, #3247 and #3250 are already on base.
 
 **Related:**
 - P: a run choice wins in both phases.
@@ -266,5 +266,5 @@ F and the Claude planning extensions are on this base. Extend their files uncond
 - **D11. The cut follows the replay boundary (R2-5, buddy Q3).** Replay reconciles the plan's work, so its advance belongs to the plan segment. An unpriceable advance degrades only the plan model.
 - **D12. Extend the regression gate instead of clamping per segment (R2-6).** Monotone cumulatives make conservation exact by construction. A dip is malformed data and should fail closed. Rejected: clamping each segment delta, which over-counts across a dip.
 - **D13. The guard compares against the intended implementation model and fails closed on a missing or unrecognized response (buddy Q4, R2-9).** An echo makes the same-conversation mechanism not dispatchable.
-- **D14. Owner-approved split, 2026-11-21.** Extract the independent accounting outcome to [#4580](4580-codex-usage-model-segments.md), one run and PR first. Block this Codex planning PRD on that child's merge. #1703 indexes both outcomes. Rejected: one large PR combining the accounting change and end-to-end planning. This PRD owns production cut ordering, cold verification, settings/mirrors and hold integration.
+- **D14. Owner-approved split, 2026-11-21.** Extract the independent accounting outcome to [#4580](done/4580-codex-usage-model-segments.md), one run and PR first. Block this Codex planning PRD on that child's merge. #1703 indexes both outcomes. Rejected: one large PR combining the accounting change and end-to-end planning. This PRD owns production cut ordering, cold verification, settings/mirrors and hold integration.
 - **D15. Refresh to shipped Q-claude, 2026-11-21.** Extend the actual Claude-only resolution/hold gates and atomic setter rather than an imaginary locked combination-rule helper. Preserve budget banking and race fences. Keep the Codex-specific cold-resume guard; D18 is the Claude proof, not a portable app-server API.

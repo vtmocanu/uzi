@@ -2,7 +2,7 @@
 
 **Issue:** #4580 (number assigned after draft review).
 **Parent:** #1703; split from #3253.
-**Status:** Draft, 2026-11-21; baseline origin/main `10876dee680859e4e468ae5f004475f44b31a80a`.
+**Status:** Implemented, 2026-11-21 (M1 complete on branch `agent/issue-4580`; the landing obligations below remain for exact-head PR CI and landing). Draft baseline origin/main `10876dee680859e4e468ae5f004475f44b31a80a`.
 **Labels:** `enhancement`, `PRD`, `area::runtime`, `priority::normal`.
 **Blocked by:** none. The accountant and its tests already exist on this base. #3253 is a downstream consumer, not a prerequisite.
 **Delivery:** one implementation run, one PR. Accounting is a billing-integrity seam: include reviewer, tester and auditor. No implementation or validation writes under `.github/workflows/`.
@@ -62,10 +62,10 @@ The current segment is the last one. `registerThread` is unchanged: the first re
 - The adoption gate is unchanged apart from the two added columns.
 - An adopted note's `last` joins the current segment's responses.
 - `adopted.model` is the current segment's model, so ADR-2555 `usage_record` events carry the right model.
-- A note older than the cut has magnitude at or below the segment start, so it is never adopted into the new segment.
+- A note already recorded before the cut has magnitude at or below the segment start and is never adopted into the new segment. A note delivered after the cut that advances the max is attributed to the new segment, so the caller must record all earlier-segment notes before cutting (#3253; D7).
 
 **`aggregateByModel`, per segment:**
-- Charged usage is `segmentEnd - segmentStart`. The end is the next segment's `start`, or `maxTotal` for the last segment. Segment 0 starts at the baseline. With the monotone gate these differences are non-negative in every column without clamping.
+- Charged usage is `segmentEnd - segmentStart`. The end is the next segment's `start`, or `maxTotal` for the last segment. Segment 0 starts at the baseline. With the monotone gate these differences are non-negative in every column; the clamp at zero is only a defensive floor (D7).
 - Reconciliation (`responsesReconcileDelta`) and pricing (`priceCodexResponse(segment.model, …)`) run on each segment's own responses against its own delta.
 - Dominance per model is unchanged.
 - A thread's incompleteness, from any cause, taints every model it has a segment on. That keeps unattributable deltas conservative.
@@ -86,7 +86,7 @@ The caller must apply any historical replay to the previous segment before cutti
 
 ### ADR-2555 and release note
 
-Amend [ADR-2555](../adr/2555-run-usage-attribution.md): root response attribution uses the root thread's current segment model, and cuts occur only after the caller has recorded the historical replay boundary. State that this child has no production cut caller yet and #3253 supplies that integration. Preserve child lane/identity rules and the distinction between attribution evidence and billing. Add a lowercase UUID-v4 changelog fragment for the malformed-sequence correction and segment-capable accountant.
+Amend [ADR-2555](../../adr/2555-run-usage-attribution.md): root response attribution uses the root thread's current segment model, and cuts occur only after the caller has recorded the historical replay boundary. State that this child has no production cut caller yet and #3253 supplies that integration. Preserve child lane/identity rules and the distinction between attribution evidence and billing. Add a lowercase UUID-v4 changelog fragment for the malformed-sequence correction and segment-capable accountant.
 
 ## Testing decisions
 
@@ -128,3 +128,6 @@ Amend [ADR-2555](../adr/2555-run-usage-attribution.md): root response attributio
 - **D2. Segment rather than replace accountancy.** Preserve first-registration identity, replay baselines and claim-shared deduplication. A new accountant per epoch loses those guarantees; mutating the sole model retrospectively misattributes prior work.
 - **D3. Monotone seven-column admission rather than clamping segment deltas.** Refuse malformed dips and preserve proven tokens conservatively; clamping masks nonconservation.
 - **D4. Reconciliation and pricing belong to each segment.** Thread-level reconciliation mixes work from different models and incorrectly degrades split usage. Quarantine/incompleteness still taints every affected model.
+- **D5. Rebinding an incomplete thread keeps the replaced model as `unreported` (`taintModels`).** A quarantined thread has no cumulative total, so `beginModelSegment` can only rebind it, and the literal rebind rule would drop the replaced model from the output. `prds/3253-codex-planning-model.md` example 4 requires both models to be `unreported`, so a rebind on an already-incomplete thread records the replaced model in a deduplicated per-thread list that aggregation emits as a zero-token `unreported` entry. Healthy rebinds behave as the table says: the old model's key is absent.
+- **D6. Multi-segment threads take uncached input from clamped-cumulative differences, with a boundary check.** Arose from the automated plan check. Summing raw input, cached and cache-write deltas per segment and then clamping can attribute tokens to a later segment that the unsplit thread never had when a cache split is malformed (`cachedInputTokens + cacheWriteInputTokens > inputTokens`); the transport and the fresh/child harness paths do not reject such splits. Segments of a thread with two or more segments therefore contribute `U(end) - U(start)`, where `U` is the clamped uncached cumulative the admission gate already keeps non-decreasing, so per-thread uncached input telescopes exactly. Single-segment threads keep the raw-delta path and byte-identical output. A malformed split at the baseline, a cut or a newly adopted total of a multi-segment thread marks that thread incomplete through the existing `invalid_raw_usage` bucket-relationship cause (never quarantine): every segment model is `unreported` with tokens retained, and the note is still adopted. The conservation claim is per thread: a multi-segment thread does not absorb a single-segment sibling's negative raw uncached delta, so a per-model sum can exceed today's shared-clamp value only when a sibling carries a malformed split, whose response is already unpriceable. Known asymmetry, unreachable until #3253 adds a production cut: incompleteness also sets the claim-wide `usageIncomplete`, which drops the terminal frame's base-usage claim and emits the claim-wide notice; the same malformed data on an uncut thread produces neither.
+- **D7. Cut ordering is a caller contract; clamped segment difference restored as a floor; exact conservation is for safe integers.** The caller must record every usage note of the earlier segment (historical replay and live notes of earlier turns) before cutting; a note delivered after the cut that advances the running max is attributed to the new segment and its model. #3253 owns enforcing this (its PRD already requires that no late old-epoch note crosses the cut). Rejected: turn-binding of notes inside the accountant, and a protocol change; either can be taken up by #3253 if needed. Per-segment differences are clamped at zero again as a defensive floor against negative buckets from direct callers; for non-negative buckets under the monotone gate this is identical to the plain difference, and D3's no-clamping intent concerns masking non-conservation, which the gate prevents. Exact conservation is stated for non-negative safe-integer buckets.
