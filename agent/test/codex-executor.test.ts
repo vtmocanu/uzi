@@ -91,6 +91,8 @@ import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
 import { CodexHarness, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
+import { CodexUsageAccountant } from "../src/codex/token-accounting.js";
+import { PhaseSwitchUnverifiedError } from "../src/phase-switch-unverified.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
@@ -36729,7 +36731,34 @@ describe("Codex repeated actualRunner switching", () => {
 });
 
 describe("B2 cold approval model handoff", () => {
+  afterEach(() => { mock.restoreAll(); });
   const saved = "b2-saved-plan";
+  const observeUsage = () => {
+    const order: string[] = [];
+    const cuts: [string, string][] = [];
+    const record = CodexUsageAccountant.prototype.record;
+    mock.method(CodexUsageAccountant.prototype, "record", function (
+      this: CodexUsageAccountant, ...args: Parameters<typeof record>
+    ) {
+      if (args[0] === saved) order.push(`${args[2] ? "replay" : "live"}:${args[1].total.inputTokens}`);
+      return record.apply(this, args);
+    });
+    const cut = CodexUsageAccountant.prototype.beginModelSegment;
+    mock.method(CodexUsageAccountant.prototype, "beginModelSegment", function (
+      this: CodexUsageAccountant, ...args: Parameters<typeof cut>
+    ) {
+      if (args[0] === saved) { cuts.push(args); order.push("cut"); }
+      return cut.apply(this, args);
+    });
+    return { order, cuts };
+  };
+  const assertImplementationResume = (transport: FakeTransport) => {
+    const resumes = transport.requests.filter(r => r.method === "thread/resume");
+    assert.equal(resumes.length, 1);
+    assert.equal(rec(resumes[0]!.params).threadId, saved);
+    assert.equal(rec(resumes[0]!.params).model, "gpt-6.1-sol");
+    assert.equal(transport.requests.some(r => r.method === "thread/start"), false);
+  };
   const config: ClaimConfig = {
     default_model: "gpt-6.1-sol", default_model_source: "user_default",
     default_effort: "medium", default_effort_source: "user_default",
@@ -36866,9 +36895,220 @@ describe("B2 cold approval model handoff", () => {
     });
   }
 
+  for (const mode of ["mismatch", "missing", "unsafe"] as const) {
+    it(`pending resumed_B ${mode} holds only after coordinator commit`, async () => {
+      const observed = mode === "mismatch" ? "gpt-6-astra" : mode === "missing" ? null : "unsafe model value";
+      const accounting = observeUsage();
+      const rig = makeMultiEpochRig([plan(), implementation(), implementation(observed)]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let interrupt!: () => void;
+      let reports = 0, switches = 0;
+      let finished = false;
+      let oldSafety: CodexExecutor["safety"], bSafety: CodexExecutor["safety"];
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+        reportIteration: async () => { if (++reports === 1) interrupt(); },
+        attemptCodexCredentialSwitch: async () => {
+          switches++;
+          assert.equal((exec as unknown as { lastRootRequest?: RunTurnRequest }).lastRootRequest?.phase, "plan");
+          oldSafety = exec.safety;
+          assert.deepEqual(accounting.cuts, [], "approval preparation has not cut");
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          bSafety = exec.safety;
+          assert.deepEqual(accounting.cuts, [], "B preparation has not cut");
+          await lease.finishB(bounds);
+          finished = true;
+          return "resumed_B";
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, `B2 pending B ${mode}`);
+      assert.equal(finished, true, "the coordinator finishes before post-return model verification holds");
+      assert.equal(reports, 1);
+      assert.equal(switches, 1);
+      assert.equal(rig.providerLaunches(), 3);
+      assertImplementationResume(rig.epochs[1]!.transport);
+      assertImplementationResume(rig.epochs[2]!.transport);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
+      assert.equal(result.phaseSwitchHeld?.phase, "implement");
+      assert.equal(result.phaseSwitchHeld?.cause, mode === "mismatch" ? "model_mismatch" : "malformed");
+      assert.ok(bSafety);
+      assert.notStrictEqual(bSafety, oldSafety);
+      assert.strictEqual(exec.safety, bSafety, "published B remains cleanup owner");
+      assert.deepEqual(accounting.cuts, []);
+      assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+      assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+    });
+  }
+
+  it("pending resume refusal rejects explicit fresh lineage and B admission", async () => {
+    const accounting = observeUsage();
+    const rejected: Responder = c => {
+      if (c.method === "thread/resume") throw new CodexTransportError({
+        category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+      });
+      return implementation()(c);
+    };
+    const rig = makeMultiEpochRig([plan(), implementation(), rejected]);
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let interrupt!: () => void;
+    let reports = 0, switches = 0;
+    let freshError: unknown;
+    let admissionRefused = false;
+    let oldSafety: CodexExecutor["safety"], bSafety: CodexExecutor["safety"];
+    const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+      reportIteration: async () => { if (++reports === 1) interrupt(); },
+      attemptCodexCredentialSwitch: async () => {
+        switches++;
+        assert.equal(ctx.preserveConversation, undefined, "pending intent alone must refuse fresh lineage");
+        assert.equal((exec as unknown as { lastRootRequest?: RunTurnRequest }).lastRootRequest?.phase, "plan");
+        oldSafety = exec.safety;
+        const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+        const lease = await exec.suspendCodexEpoch(bounds);
+        assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+        assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+        assert.equal(await lease.teardown(bounds), true);
+        await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+        assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "confirmed_resume_refusal" });
+        bSafety = exec.safety;
+        try { await lease.startFreshLineage(bounds); }
+        catch (error) { freshError = error; }
+        assert.ok(freshError instanceof PhaseSwitchUnverifiedError);
+        assert.equal(freshError.cause, "malformed");
+        await assert.rejects(lease.finishB(bounds), /admission refused/);
+        admissionRefused = true;
+        throw freshError;
+      },
+    });
+    const result = await withTimeout(exec.run(ctx), 5000, "B2 pending resume refusal");
+    assert.equal(admissionRefused, true);
+    assert.equal(reports, 1);
+    assert.equal(switches, 1);
+    assert.equal(rig.providerLaunches(), 3);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assertImplementationResume(rig.epochs[2]!.transport);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
+    assert.equal(result.phaseSwitchHeld?.phase, "implement");
+    assert.equal(result.phaseSwitchHeld?.cause, "malformed");
+    assert.ok(bSafety);
+    assert.notStrictEqual(bSafety, oldSafety);
+    assert.strictEqual(exec.safety, bSafety, "failed B preparation remains cleanup owner");
+    assert.deepEqual(accounting.cuts, []);
+    assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+    assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+  });
+
+  it("pending continued_A rechecks immutable approval binding against changed claim effort", async () => {
+    const accounting = observeUsage();
+    const localConfig: ClaimConfig = { ...config, plan_phase: { ...config.plan_phase! } };
+    const rig = makeMultiEpochRig([plan(), implementation()]);
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let interrupt!: () => void;
+    let reports = 0, switches = 0;
+    let approvalSafety: CodexExecutor["safety"];
+    const { ctx, emitted } = makeCtx({ config: localConfig, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+      reportIteration: async () => { if (++reports === 1) interrupt(); },
+      attemptCodexCredentialSwitch: async () => {
+        switches++;
+        const stale = (exec as unknown as { lastRootRequest?: RunTurnRequest }).lastRootRequest;
+        assert.equal(stale?.phase, "plan");
+        assert.equal(stale?.model, "gpt-6-astra");
+        approvalSafety = exec.safety;
+        assert.deepEqual(accounting.cuts, []);
+        localConfig.default_effort = "high";
+        return "continued_A";
+      },
+    });
+    const result = await withTimeout(exec.run(ctx), 5000, "B2 continued A binding recheck");
+    assert.equal(result.phaseSwitchHeld?.phase, "implement");
+    assert.equal(result.phaseSwitchHeld?.cause, "model_mismatch", "existing binding mismatch cause");
+    assert.equal(reports, 1);
+    assert.equal(switches, 1);
+    assert.equal(rig.providerLaunches(), 2);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    assert.ok(approvalSafety);
+    assert.strictEqual(exec.safety, approvalSafety);
+    assert.deepEqual(accounting.cuts, []);
+    assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+    assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+  });
+
+  for (const mode of ["match", "mismatch", "missing", "unsafe"] as const) {
+    it(`pending declined pause recreation ${mode} retains approval intent before first turn`, async () => {
+      const observed = mode === "match" ? "gpt-6.1-sol" : mode === "mismatch" ? "gpt-6-astra"
+        : mode === "missing" ? null : "unsafe model value";
+      const accounting = observeUsage();
+      let replacementSafety: CodexExecutor["safety"];
+      const finalImplementation = implementation(observed, 130, 190);
+      const replacement: Responder = c => {
+        replacementSafety = exec.safety;
+        return finalImplementation(c);
+      };
+      const rig = makeMultiEpochRig([plan(), implementation(), replacement]);
+      const exec = makeExecutor(rig, bindingOf(API_KEY));
+      let reports = 0, parks = 0;
+      let approvalSafety: CodexExecutor["safety"];
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval,
+        reportIteration: async () => {
+          if (++reports === 1) {
+            approvalSafety = exec.safety;
+            assert.deepEqual(accounting.cuts, [], "approval preparation has not cut");
+            return { pauseRequested: true };
+          }
+        },
+        parkForPause: async () => {
+          parks++;
+          await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+          assert.deepEqual(accounting.cuts, [], "reaped approval candidate has no cut");
+          return false;
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, `B2 pending pause recreation ${mode}`);
+      assert.equal(parks, 1);
+      assert.equal(reports, 1);
+      assert.equal(rig.providerLaunches(), 3);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assertImplementationResume(rig.epochs[1]!.transport);
+      assertImplementationResume(rig.epochs[2]!.transport);
+      assert.ok(replacementSafety);
+      assert.notStrictEqual(replacementSafety, approvalSafety);
+      assert.strictEqual(exec.safety, replacementSafety, "replacement retains cleanup ownership");
+      assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+      if (mode === "match") {
+        assert.equal(result.phaseSwitchHeld, undefined);
+        assert.equal(rig.epochs[2]!.transport.turnStartCount, 1);
+        assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+        assert.deepEqual(accounting.order, ["live:100", "replay:130", "cut", "live:190"]);
+        const usage = lastResultModelUsage(emitted)!;
+        assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 130);
+        assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60);
+      } else {
+        assert.equal(result.phaseSwitchHeld?.phase, "implement");
+        assert.equal(result.phaseSwitchHeld?.cause, mode === "mismatch" ? "model_mismatch" : "malformed");
+        assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
+        assert.deepEqual(accounting.cuts, []);
+        assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+      }
+    });
+  }
+
   for (const replacement of [false, true]) {
     it(`pending intent supersedes stale planning request on ${replacement ? "resumed_B" : "continued_A"}`, async () => {
-      const rig = makeMultiEpochRig([plan(), implementation(), implementation()]);
+      const accounting = observeUsage();
+      const rig = makeMultiEpochRig([plan(), implementation(), implementation("gpt-6.1-sol", 130, 190)]);
       rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
       const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
       let interrupt!: () => void;
@@ -36883,6 +37123,8 @@ describe("B2 cold approval model handoff", () => {
           const state = exec as unknown as { lastRootRequest?: RunTurnRequest };
           assert.equal(state.lastRootRequest?.phase, "plan");
           assert.equal(state.lastRootRequest?.model, "gpt-6-astra");
+          assert.deepEqual(accounting.cuts, [], "prepared approval has no cut");
+          assert.deepEqual(accounting.order, ["live:100"], "preparation has not consumed replay");
           if (!replacement) return "continued_A";
           const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
           const lease = await exec.suspendCodexEpoch(bounds);
@@ -36891,6 +37133,8 @@ describe("B2 cold approval model handoff", () => {
           assert.equal(await lease.teardown(bounds), true);
           await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
           assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          assert.deepEqual(accounting.cuts, [], "replacement preparation has no cut");
+          assert.deepEqual(accounting.order, ["live:100"], "discarded approval replay has not been consumed");
           await lease.finishB(bounds);
           return "resumed_B";
         },
@@ -36898,15 +37142,21 @@ describe("B2 cold approval model handoff", () => {
       const result = await withTimeout(exec.run(ctx), 5000, "B2 pre-dispatch switch");
       assert.equal(result.phaseSwitchHeld, undefined);
       assert.equal(switches, 1);
+      assert.equal(reports, 1);
+      assert.equal(rig.providerLaunches(), replacement ? 3 : 2);
+      assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+      assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+      assert.deepEqual(accounting.order, replacement
+        ? ["live:100", "replay:130", "cut", "live:190"]
+        : ["live:100", "replay:100", "cut", "live:160"]);
       const active = rig.epochs[replacement ? 2 : 1]!.transport;
       if (replacement) assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
-      const resume = active.requests.find(r => r.method === "thread/resume")!;
-      assert.equal(rec(resume.params).threadId, saved);
-      assert.equal(rec(resume.params).model, "gpt-6.1-sol");
+      assertImplementationResume(active);
+      if (replacement) assertImplementationResume(rig.epochs[1]!.transport);
       assert.equal(active.turnStartCount, 1);
       assert.equal(active.requests.some(r => r.method === "thread/start"), false);
       const usage = lastResultModelUsage(emitted)!;
-      assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100);
+      assert.equal(rec(usage["gpt-6-astra"]).inputTokens, replacement ? 130 : 100);
       assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "one implementation segment after replacement");
     });
   }
