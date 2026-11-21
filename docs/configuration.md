@@ -1258,7 +1258,7 @@ postgres://app:<password>@example.com:5432/uzi?statement_cache_capacity=256
 | Key | Default | Notes |
 |---|---|---|
 | `statement_cache_capacity` | `512` (pgx's default, unchanged) | Per-connection prepared-statement cache. **Never set `0`**: with pgx's default exec mode it makes every query fail except an argument-less `Exec` ("cannot use QueryExecModeCacheStatement with disabled statement cache"); `0` is only valid together with a different `default_query_exec_mode`. |
-| `description_cache_capacity` | pgx's `512` | No effect under the default cached-statement exec mode (`default_query_exec_mode` unset): pgx reads it only under `cache_describe`. |
+| `description_cache_capacity` | pgx's `512` | No effect under the default cached-statement exec mode (`default_query_exec_mode` unset): pgx uses it only under `cache_describe`. |
 | `pool_max_conn_lifetime` | `1h` | Unchanged pgx default. |
 | `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default. In the synthetic harness, recycling connections sooner pays about 350 ms of planning per reconnect for `ClaimRun` (a harness observation, not a production figure). |
 | `pool_max_conn_idle_time` | `30m` | Unchanged pgx default. |
@@ -1266,12 +1266,12 @@ postgres://app:<password>@example.com:5432/uzi?statement_cache_capacity=256
 **Lowering the statement cache.** Lowering `statement_cache_capacity` in `DATABASE_URL`
 trades backend memory for re-prepares once a connection runs more distinct statements than the
 cap between two uses of a hot statement (worker claim, message append). In the synthetic
-harness that showed as `ClaimRun` p50 rising from about 7 ms toward 60+ ms at a cap of 32
-under stress. To check after a change, compare `ClaimRun` latency, or, with the database
+harness that showed as the `ClaimRun` per-execution mean rising from about 7 ms to about
+68 ms at a cap of 32 under stress. To check after a change, compare `ClaimRun` latency, or, with the database
 owner's agreement, compare `pg_stat_statements` plans to calls with `track_planning` on.
 
 **JIT can add memory.** With PostgreSQL's default `jit = on`, statements whose plans cross
-`jit_above_cost` may load LLVM; in the measurement that added about 8.5-14 MiB of heap to a
+`jit_above_cost` may load LLVM; in the synthetic measurement that added about 8.5-14 MiB of heap to a
 backend plus about 51 MiB of shared library text (counted once per instance). If you want it
 off:
 

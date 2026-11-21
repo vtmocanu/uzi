@@ -96,7 +96,7 @@ differences explain why the earlier numbers were set aside. The later numbers ar
    (`ALTER DATABASE <clone> SET jit = off`, measurement only, read back per backend with
    `SHOW jit`), a memory-map probe for LLVM, and an `EXPLAIN` split of `ClaimRun`. Run 4's
    JIT-off runs (a and c) are primary; run 4's jit-default run (b) shows the JIT effect.
-   The earlier 3.7-3.8% saving for B128 (run 3) was JIT-biased; without JIT it is 16.7%.
+   The earlier 3.7-3.8% saving for B128 (run 3) was JIT-biased; in run 4's jit-off run it was 16.7% (a synthetic observation).
 
 ### Why Anonymous is the ranking metric
 
@@ -138,7 +138,9 @@ includes shared pages and is labelled so. Neither is summed with anything.
   isolated per round, not per candidate: each round's clone is shared by all five candidates
   in a rotated order, so later candidates in a round see that round's rolled-back-write bloat.
   The rotation balances position across rounds but does not give each candidate an identical
-  starting state; latency differences between candidates stayed inside round-to-round noise.
+  starting state. Headline (k=1) latency differences between candidates were comparable to
+  the round-to-round spread; the supplemental stress variant did not stay flat (B32's stress
+  `ClaimRun` was about 68 ms against about 7 ms for the others).
 - **Steady state.** The median of the later half of post-round samples taken while the
   backend had at least 160 statement identities.
 
@@ -243,9 +245,11 @@ rotated, the median round's per-execution mean. The columns are that mean in mic
 two reps each), per execution: planning about 69-75 ms on the first, about 50-58 ms on
 executions 2 to 5, about 60-65 ms on the sixth (when PostgreSQL builds the generic plan);
 execution about 19 ms, then about 8 ms. Planning dominates. The six executions sum to about
-350 ms of planning (348-358 ms across the four runs). **A re-prepare after an eviction or a
-reconnect therefore costs about 350 ms of planning once per statement, for `ClaimRun`.**
-Recycling connections (C, D) pays that on every reconnect and showed no saving over A and B128 in this harness.
+350 ms of planning (348-358 ms across the four runs). **In this harness, a re-prepare after an eviction or a
+reconnect therefore cost about 350 ms of planning once per statement, for `ClaimRun`.**
+Recycling connections (C, D) pays that on every reconnect. C showed no steady-heap saving over A; D's two jit-off
+reps (56.6 and 53.9 MiB) were below B128's 57.1 MiB, within a 2.7 MiB rep-to-rep spread, and above it with JIT on
+(69.4 against 67.4 MiB). Neither difference is established by this evidence.
 
 ### Wide-read sample (a lower bound, not an envelope)
 
@@ -287,7 +291,7 @@ if s, ok := config.RuntimeParams["description_cache_capacity"]; ok {
 defaultQueryExecMode := QueryExecModeCacheStatement
 ```
 
-The description cache is only read under `QueryExecModeCacheDescribe`. In `exec()`:
+pgx builds the description cache from the key regardless, but uses it only under `QueryExecModeCacheDescribe`. In `exec()`:
 
 ```go
 switch mode {
@@ -319,7 +323,7 @@ case QueryExecModeCacheDescribe:
 the same split. The only mode-independent touch is `RemoveInvalidated()` on the description
 cache, a no-op when nothing was `Put` there. The api sets no `default_query_exec_mode`, so it
 runs `QueryExecModeCacheStatement`: **`description_cache_capacity` has no effect on the api
-pool and was not a candidate.**
+pool under the default cached-statement exec mode and was not a candidate.**
 
 The same excerpts give the `0` hazard. With `statement_cache_capacity=0` the statement cache
 is nil (`if c.config.StatementCacheCapacity > 0 { c.statementCache = ... }`), and the
@@ -402,9 +406,10 @@ global default, so `OpenPool` keeps pgx's defaults.
     `jit_above_cost` was not identified.
   - 32 saved more heap (51.3 MiB) and its stress `ClaimRun` was about 68 ms against about
     7 ms.
-  - Recycling on a compressed lifetime with jitter showed no saving over its cache-size
-    counterpart (C over A, D over B128), and each reconnect re-pays about 350 ms of planning
-    for `ClaimRun` in this harness.
+  - Recycling on a compressed lifetime with jitter: C showed no steady-heap saving over A;
+    D was slightly below B128 with JIT off (56.6 and 53.9 against 57.1 MiB, within its
+    2.7 MiB rep-to-rep spread) and above it with JIT on. Each reconnect re-pays about 350 ms
+    of planning for `ClaimRun` in this harness.
 - **The statement count is a fixture parameter.** The harness retains 317 statements; the
   effect of any cap in production depends on how many distinct statements a connection runs
   and whether any re-planned statement crosses `jit_above_cost`, neither of which is
@@ -416,7 +421,7 @@ global default, so `OpenPool` keeps pgx's defaults.
   `statement_cache_capacity` in `DATABASE_URL`. Observation of what lowering the cache would
   trade: once a connection runs more distinct statements than the cap between two uses of a
   hot statement, the LRU can evict it and each such use re-prepares. In the harness at a cap of 32 under stress that showed as `ClaimRun`
-  p50 rising from about 7 ms toward 60+ ms. To watch for it, compare `ClaimRun` latency, or,
+  per-execution mean rising from about 7 ms to about 68 ms. To watch for it, compare `ClaimRun` latency, or,
   with the infrastructure owner's agreement, compare `pg_stat_statements` plans to calls with
   `track_planning` on.
 - **JIT is a lever that may matter when it engages.** Whether it is the larger lever is

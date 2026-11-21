@@ -3248,9 +3248,10 @@ func pmRequireThrowawayDB(ctx context.Context, t *testing.T, dsn string) {
 	}
 }
 
-// pmTemplateDB is the database seeded once and never connected to afterwards; every
-// measurement runs on a throwaway clone of it (CREATE DATABASE ... TEMPLATE), so every
-// candidate, repetition and latency round starts from byte-identical data and bloat.
+// pmTemplateDB is the database the fixture is seeded into once. Measurements run on throwaway
+// clones of it (CREATE DATABASE ... TEMPLATE), but the validation pool and discover mode still
+// connect to it after seeding, and clones are per phase as described in the file header (latency,
+// stress and cold candidates share a clone), so not every candidate starts from identical bloat.
 const pmTemplateDB = "pm_template"
 
 // pmLab owns the cloning of the seeded template. adminDSN is the maintenance database the
