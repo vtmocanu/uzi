@@ -1245,7 +1245,8 @@ measurement.
 
 **Release notes for operators.** The cap needs no configuration. In the measurement harness
 it cut steady backend heap by 16.7% with JIT off and 3.8% with PostgreSQL's default JIT on;
-the production saving is unmeasured, and expected between those. Headline latency is flat.
+these are observations on one synthetic workload, not bounds: the production saving is
+unmeasured and could be smaller, including none. Headline latency is flat.
 
 **Overrides**, as keys in the `DATABASE_URL` query (or the keyword/value or service-file
 form). pgx reads them and does not forward them to PostgreSQL:

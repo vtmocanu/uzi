@@ -21,7 +21,8 @@ defaults, and so does `plan_cache_mode` ([ADR-1620](1620-custom-plan-cache-mode.
   128 x 154 KiB of memory contexts.
 - **What it saved, in this harness.** Steady backend heap (Anonymous) fell 16.7% with JIT off
   (68.6 to 57.1 MiB) and 3.8% with the server's default JIT on (70.0 to 67.4 MiB). The
-  production saving is **unmeasured** and expected to fall between those two.
+  production saving is **unmeasured**: these two figures are observations on one synthetic
+  workload, not bounds, and the effect on a real install could be smaller, including none.
 - **What it cost.** Headline latency is flat: `ClaimRun` about 7.1-7.3 ms and
   `InsertRunMessage` about 240 us for every candidate.
 - **What was rejected.** A cap of 32 thrashes (a connection running more distinct statements
@@ -123,8 +124,12 @@ includes shared pages and is labelled so. Neither is summed with anything.
   `statement_cache_capacity` 128 and 32, otherwise defaults. C: cache 512 with a compressed
   lifetime of 45 s plus up to 10 s jitter (production would use minutes), health check 5 s.
   D: cache 128 with the same compressed lifetime and jitter. C and D recycled 4 times each.
-- **Isolation.** Every candidate, rep, latency round and wide-read run got its own database
-  clone and its own observer connection, dropped afterwards.
+- **Isolation.** Every memory candidate and rep, and every wide-read run, got its own
+  database clone and its own observer connection, dropped afterwards. The latency phase is
+  isolated per round, not per candidate: each round's clone is shared by all five candidates
+  in a rotated order, so later candidates in a round see that round's rolled-back-write bloat.
+  The rotation balances position across rounds but does not give each candidate an identical
+  starting state; latency differences between candidates stayed inside round-to-round noise.
 - **Steady state.** The median of the later half of post-round samples taken while the
   backend had at least 160 statement identities.
 
@@ -405,13 +410,18 @@ The default was to land only if a cap bounded backend memory without moving the 
 - **Operator documentation** is
   [Database connection memory and sizing](../docs/configuration.md#database-connection-memory-and-sizing-issue-4591).
 - **Not scheduled.** A production measurement of the saving, and an identified JIT-triggering
-  statement, would sharpen the 3.8%-16.7% range. Neither was done.
+  statement, would establish what the cap saves in production. Neither was done.
 
 ## Limits
 
 - **Small synthetic fixture.** 2000 messages, 300 runs per measured user, 313 breadth methods
   and 317 retained statements against about 1691 named queries in the repository. Plan sizes
-  and result sizes are not production-shaped; many breadth entries return empty rows.
+  and result sizes are not production-shaped. The breadth set is not the fully seeded,
+  production-shaped working set the plan asked for: about 100 of its 313 entries return no
+  rows and 47 return `ErrNoRows` against the fixture, and its expected-result check only
+  pins rows / no rows / `ErrNoRows` per entry, not exact row counts or write effects. Every
+  entry is still parsed, planned and cached, which is what the cache-capacity comparison
+  measures, but plans and executor memory for those entries reflect near-empty results.
 - **The incident scale was not reproduced.** A's `VmHWM` reached 121.2-125.6 MiB in run 4,
   and the wide-read sample's `VmHWM` was 124.7-170.0 MiB across its settings (not candidate A), but `VmHWM` includes shared pages, so it is
   not the per-backend heap, and nothing here attributes the 110-160Mi reported.
