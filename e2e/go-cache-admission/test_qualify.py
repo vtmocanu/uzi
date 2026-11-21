@@ -1210,11 +1210,55 @@ class EvaluateTests(Base):
         got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]
         self.assertEqual(reasons(got["backing"]), [])
 
-    def test_backing_without_mount_facts_is_not_proven(self):
+    def test_backing_with_file_tier_mount_facts_is_not_proven(self):
         art = self.sized()
         ce = q.collect(StubObserver(art, tuple(n for n in ALL_SECTIONS if n != "mountinfo")))
         got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]["backing"]
         self.assertNotEqual(got["status"], "PROVEN")
+
+    def test_backing_with_no_mount_facts_at_all_is_refused(self):
+        art = self.sized()
+        del art["mountinfo"]
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]["backing"]
+        self.assertEqual(reasons(got), ["no-container-mount-facts"])
+        self.assertEqual(got["status"], "UNVERIFIED")
+
+    def test_sinkless_enforcing_superblock_is_projected_against_its_backing_domain(self):
+        art = self.sized()
+        art["mountinfo"]["mounts"].append(tmpfs(99, "/extra", sb="sb-extra", size=10**12, inodes=10))
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]["backing"]
+        self.assertEqual(reasons(got), ["backing-mapping-unknown"])
+        self.assertEqual(got["status"], "UNVERIFIED")
+        # Mapped to a domain, the full capacity is projected and exceeds the soft threshold.
+        art["mountinfo"]["mounts"][-1]["backing_domain"] = "outer-A"
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]["backing"]
+        self.assertIn("backing-aggregate-exceeds-soft", reasons(got))
+        self.assertEqual(got["status"], "NEGATIVE")
+        # A read-only exposure of a superblock allocates nothing and needs no mapping.
+        art["mountinfo"]["mounts"][-1].update(ro=True)
+        del art["mountinfo"]["mounts"][-1]["backing_domain"]
+        self.assertEqual(reasons(q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]["backing"]), [])
+
+    def test_untrusted_runtime_tier_does_not_exclude_outer_operations(self):
+        sinks = {name: dict(identity=name) for name in OUTER}
+        for tier, want in (("collector", []), ("file", ["outer-sink-unbounded"])):
+            with self.subTest(tier=tier):
+                fact = facts(tier=dict(mountinfo="collector", runtime=tier, daemon="collector"),
+                             outer_ops_excluded=list(OUTER))
+                got = run([], [], sinks, fact, require_collector=True)
+                self.assertEqual([r for r in got["reasons"] if r == "outer-sink-unbounded"], want)
+
+    def test_envelope_tier_reflects_the_sections_that_contributed(self):
+        art = self.sized()
+        ce = q.collect(StubObserver(art, ALL_SECTIONS))
+        got = q.evaluate(art, collector=ce, now=NOW, head_revision="a"*40)["legs"]["envelope"]
+        self.assertEqual(got["status"], "FIXTURE-CONSISTENT")
+        self.assertEqual(got["tier"], ["collector", "file"])
+        # Without the applied limits and mount facts only the file envelope contributed.
+        bare = self.sized()
+        del bare["mountinfo"]
+        del bare["runtime"]["applied"]
+        self.assertEqual(q.evaluate(bare, now=NOW)["legs"]["envelope"]["tier"], ["file"])
 
     def test_enforced_byte_capacities_must_fit_the_aggregate(self):
         art = self.sized()
@@ -1247,6 +1291,37 @@ class EvaluateTests(Base):
         self.assertIn("enforced-capacity-exceeds-envelope", reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]))
         art["runtime"]["applied"].update(memory_max=p.LIMITS["memory"], memory_swap_max=p.LIMITS["memory"])
         self.assertEqual(reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]), [])
+
+    def test_applied_memory_limit_is_checked_without_mount_facts(self):
+        art = self.sized()
+        del art["mountinfo"]
+        art["runtime"]["applied"].update(memory_max=4*GIB, memory_swap_max=4*GIB)
+        leg = q.evaluate(art, now=NOW)["legs"]["envelope"]
+        self.assertEqual(leg["status"], "NEGATIVE")
+        self.assertIn("enforced-capacity-exceeds-envelope", reasons(leg))
+
+    def test_unlimited_or_unpaired_applied_memory_exceeds_the_envelope(self):
+        for name, update in (("max", dict(memory_max="max", memory_swap_max="max")),
+                             ("non-integer", dict(memory_max="1g", memory_swap_max="1g")),
+                             ("swap-absent", dict(memory_swap_max=None)),
+                             ("swap-different", dict(memory_max=GIB, memory_swap_max=GIB+1))):
+            with self.subTest(case=name):
+                art = self.sized()
+                art["runtime"]["applied"].update(update)
+                leg = q.evaluate(art, now=NOW)["legs"]["envelope"]
+                self.assertEqual(leg["status"], "NEGATIVE")
+                self.assertIn("enforced-capacity-exceeds-envelope", reasons(leg))
+        art = self.sized()
+        del art["runtime"]["applied"]["memory_swap_max"]
+        self.assertIn("enforced-capacity-exceeds-envelope", reasons(q.evaluate(art, now=NOW)["legs"]["envelope"]))
+
+    def test_absent_applied_section_stays_unverified_not_negative(self):
+        art = self.sized()
+        del art["runtime"]["applied"]
+        got = q.evaluate(art, now=NOW)["legs"]
+        self.assertEqual(reasons(got["envelope"]), [])
+        self.assertIn("limits-not-applied-observed", reasons(got["enforcement"]))
+        self.assertEqual(got["enforcement"]["status"], "UNVERIFIED")
 
     def collector_enforcement(self, **runtime):
         art = self.sized()

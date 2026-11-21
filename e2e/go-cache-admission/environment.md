@@ -78,7 +78,11 @@ not an observation.
   Memory, Swap and Pids limit support all true, not rootless.
 - **Images listed** (observed): `postgres` and `hello-world`, by index digest with `id_kind`
   `index`. Under the containerd snapshotter the image Id is the index digest; no platform digest
-  was collected, so the binding leg stays `binding-source-unbound`. The binding rule checks
+  was collected, so the binding leg stays `binding-source-unbound`. No collector in this change
+  supplies `image_id_kind`, `platform_digest`, `single_platform`, `outer_ops_excluded` or
+  `writable_layer_quota_bytes`, so live runs stay `binding-source-unbound` and, with mount facts,
+  `outer-sink-unbounded`. `id_kind` is the per-image observed field; `image_id_kind` is the binding
+  input the verifier checks against the digests, and nothing maps one to the other. The binding rule checks
   meaning, not just distinctness: `image_id_kind` `index` requires the Id to equal the index
   digest, `config` requires it to differ from both, and the platform digest must differ from the
   index digest unless `single_platform` is true.
@@ -202,10 +206,14 @@ A fixture proves only that fixture.
   not a worst-case guarantee. Measure it inside the 1 GiB limit before any live allocation.
 - Backing check: projected use must stay strictly below soft times capacity for bytes and inodes,
   from a fresh capacity sample (`backing-*` codes). No backing capacity was collected. Each
-  enforcing superblock projects the larger of its declared charges and its observed capacity.
+  enforcing superblock projects the larger of its declared charges and its observed capacity; a
+  sink-less enforcing superblock projects its full capacity against the `backing_domain` named on
+  its mount, and without one the backing leg reports `backing-mapping-unknown`.
 - Enforced capacities are tied to the envelope: summed enforced byte capacities must fit the
-  2 GiB aggregate, enforced inodes the approved ceiling, and the applied memory max the 1 GiB
-  memory limit with swap equal (`enforced-capacity-exceeds-envelope`, NEGATIVE).
+  2 GiB aggregate, enforced inodes the approved ceiling, and, whenever applied limits are present,
+  the applied memory max must be a finite integer within the 1 GiB memory limit with swap equal;
+  `max`, a non-integer or a missing or different swap is `enforced-capacity-exceeds-envelope`
+  (NEGATIVE). An absent applied section stays UNVERIFIED.
 - The 269 MiB and 576 MiB heavy race archives stay resource-incompatible with body and staging
   limits. That is not an A failure.
 

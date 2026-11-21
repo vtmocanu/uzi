@@ -202,6 +202,12 @@ CLI or `evaluate()` path.
   under the containerd snapshotter) or `config` (the Id differs from both other digests); the
   platform digest differs from the index digest unless `single_platform` is true. Any other
   shape is `binding-source-unbound`.
+  No collector in this change supplies `image_id_kind`, `platform_digest`, `single_platform`,
+  `outer_ops_excluded` or `writable_layer_quota_bytes`, so live runs stay
+  `binding-source-unbound` and, once mount facts exist, `outer-sink-unbounded`.
+  `id_kind` (per image, observed by the collector from the daemon driver) and `image_id_kind`
+  (a binding input the verifier checks against the three digests) are different fields; nothing
+  copies one into the other.
 - threshold: `owner-input-not-supplied`, `effective-value-unestablished` (an API value
   alone), `threshold-stale` (over 300 s old or in the future), `threshold-contradictory`,
   `margin-js-parse-unsupported`. The effective value must be a `soft-threshold-log` or
@@ -287,15 +293,22 @@ CLI or `evaluate()` path.
   `inode-ceiling-unapproved` unless `owner_approved` is true;
   `enforced-capacity-exceeds-envelope` (NEGATIVE) when observed enforced byte capacities
   summed over all enforcing superblocks exceed the aggregate, enforced inode capacities exceed
-  the approved ceiling, or the applied memory max exceeds the memory limit or differs from the
-  swap max.
+  the approved ceiling, or the applied memory max is unlimited (`max`) or any non-integer, exceeds
+  the memory limit, or the applied swap max is absent or differs from it (memory must equal
+  memory-swap). The memory check runs whenever `runtime.applied` is present, with or without mount
+  facts; an absent applied section stays `limits-not-applied-observed` (UNVERIFIED) on enforcement.
+  The leg's evidence names the sections that contributed (envelope, plus mountinfo and runtime
+  when used), so its tier is mixed when a collector supplied those and the envelope came from the
+  file.
 - backing: `backing_check` reuses `preflight.project_domains`. Codes
   `backing-link-cited-only`, `backing-capacity-unknown`, `backing-sample-stale` (over
   60 s), `backing-concurrency-unknown`, `backing-mapping-unknown`,
   `backing-aggregate-exceeds-soft` (projected use must stay strictly below soft times
   capacity for bytes and inodes), `backing-soft-unknown`. Each enforcing tmpfs or exclusive
   superblock projects the larger of its declared sink charges and its observed enforced
-  capacity; the leg needs mount facts.
+  capacity, and a sink-less enforcing superblock (not read-only everywhere) projects its full
+  capacity against the `backing_domain` named on its mount, else `backing-mapping-unknown`; the
+  leg needs mount facts (`no-container-mount-facts`).
 - canary: always UNVERIFIED `canary-collector-not-implemented` in M1, whatever any caller
   attaches (`CollectorEvidence` has no canary attribute). `classify_canary` is tested
   with fixtures: readonly-rootfs needs EROFS and the read-only flag

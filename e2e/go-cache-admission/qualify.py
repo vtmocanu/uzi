@@ -285,9 +285,13 @@ def check_enforced(envelope, mounts, applied):
     if (isinstance(ceiling, dict) and ceiling.get("owner_approved") is True and _is_int(ceiling.get("value"), 1)
             and sum(n for _, n in caps if n) > ceiling["value"]):
         _add(reasons, "enforced-capacity-exceeds-envelope")
-    memory, swap = applied.get("memory_max"), applied.get("memory_swap_max")
-    if _is_int(memory) and (memory > p.LIMITS["memory"] or (_is_int(swap) and swap != memory)):
-        _add(reasons, "enforced-capacity-exceeds-envelope")
+    # applied is None when the runtime section carries no applied limits (limits-not-applied-observed
+    # is the enforcement leg's reason). Once present, memory must be a finite integer within the
+    # envelope and swap must equal it; "max", other non-integers and a missing swap are over-envelope.
+    if isinstance(applied, dict) and "memory_max" in applied:
+        memory, swap = applied["memory_max"], applied.get("memory_swap_max")
+        if not _is_int(memory) or memory > p.LIMITS["memory"] or not _is_int(swap) or swap != memory:
+            _add(reasons, "enforced-capacity-exceeds-envelope")
     return reasons
 
 
@@ -446,8 +450,22 @@ def enforced_excess(sinks, mounts):
         d["inodes"] += s["inodes"]
         d["domains"].add(s["backing_domain"])
     out = {}
-    for sb, d in declared.items():
-        cap = limits.get(sb, [None, None])
+    for sb, cap in limits.items():
+        if not (cap[0] or cap[1]):
+            continue
+        members = [m for m in mounts if m["superblock"] == sb]
+        d = declared.get(sb)
+        if d is None:
+            # A sink-less enforcing superblock still allocates up to its capacity. Its backing domain
+            # is the mount's own backing_domain; without one the domain stays None, which the backing
+            # check refuses as backing-mapping-unknown. A superblock only read-only mounts expose
+            # allocates nothing.
+            if all(m.get("ro") is True for m in members):
+                continue
+            named = {m.get("backing_domain") for m in members if type(m.get("backing_domain")) is str}
+            out["enforced:"+sb] = dict(bytes=cap[0] or 0, inodes=cap[1] or 0,
+                                       domain=next(iter(named)) if len(named) == 1 else None)
+            continue
         extra = dict(bytes=max(0, (cap[0] or 0)-d["bytes"]), inodes=max(0, (cap[1] or 0)-d["inodes"]))
         if extra["bytes"] or extra["inodes"]:
             out["enforced:"+sb] = dict(extra, domain=sorted(d["domains"])[0])
@@ -549,11 +567,12 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
     cov_sb, excl, domain_cov = {}, {}, set()
     # Daemon-side sinks carry no container superblock; only a runtime fact that the permitted
     # workload has no incrementing operation on one (no pull, build or commit) bounds it.
-    excluded = facts.get("outer_ops_excluded")
-    excluded = set(n for n in excluded if type(n) is str) if type(excluded) is list else set()
-
     def trusted(*sections):
         return not require_collector or all(tier.get(s) == "collector" for s in sections)
+
+    excluded = facts.get("outer_ops_excluded")
+    excluded = (set(n for n in excluded if type(n) is str)
+                if type(excluded) is list and trusted("runtime") else set())
 
     def new_mount_ok():
         nm = facts.get("new_mount")
@@ -933,12 +952,15 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
         run("aliasing", aliasing)
         def envelope():
             got = check_envelope(sections.get("envelope"))
-            if mount_facts:
-                runtime = sections.get("runtime")
-                applied = runtime.get("applied") if isinstance(runtime, dict) else None
-                got += [r for r in check_enforced(sections.get("envelope"), info["mounts"],
-                                                  applied if isinstance(applied, dict) else {}) if r not in got]
-            return grade(got, (), tiers)
+            runtime = sections.get("runtime")
+            applied = runtime.get("applied") if isinstance(runtime, dict) else None
+            applied = applied if isinstance(applied, dict) else None
+            # Evidence names the sections that contributed, so the tier reflects them.
+            evidence = ("envelope",) + (("mountinfo",) if mount_facts else ()) + (("runtime",) if applied is not None else ())
+            if mount_facts or applied is not None:
+                got += [r for r in check_enforced(sections.get("envelope"), info["mounts"] if mount_facts else [],
+                                                  applied) if r not in got]
+            return grade(got, evidence, tiers)
 
         run("envelope", envelope)
         run("backing", backing)
