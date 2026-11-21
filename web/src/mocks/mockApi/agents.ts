@@ -124,6 +124,22 @@ function inheritedClaudeModel(templates: AgentTemplate[], allocations: TemplateA
     .find(t => /^(lead|orchestrator)$/i.test(t.name))?.model ?? null;
 }
 
+// Issue #3258 N3: the delivered lead template's per-harness effort pins, picked by the same
+// first-delivered-lead rule as inheritedClaudeModel. Only one of the five levels counts.
+const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+export function mockLeadTemplateEfforts(): { claude: string | null; codex: string | null } {
+  const me = requireSession();
+  const allocs = templateAllocationView(me);
+  const sharedNames = new Set(templates.filter(t => t.scope !== "user").map(t => t.name));
+  const delivered = new Set(allocs.filter(t => t.effective).map(t => t.id));
+  const lead = templates.filter(t => delivered.has(t.id) &&
+    (t.scope !== "user" || (t.user_id === me.id && !sharedNames.has(t.name))))
+    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+    .find(t => LEAD_NAME_RE.test(t.name));
+  const valid = (v: string | null | undefined) => (v && EFFORT_LEVELS.has(v) ? v : null);
+  return { claude: valid(lead?.effort), codex: valid(lead?.codex_effort) };
+}
+
 export function mockDefaultClaudeModel(): string | null {
   const me = requireSession();
   return inheritedClaudeModel(templates, templateAllocationView(me), me.id);

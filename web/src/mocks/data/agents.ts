@@ -229,6 +229,8 @@ export const mockTemplates: AgentTemplate[] = [
     description: "Authors and reviews database migrations, keeping goose numbering strict and reversible.",
     model: null,
     codex_model: "gpt-6-luna",
+    effort: null,
+    codex_effort: "high",
     tools: ["Bash", "Read", "Grep", "Glob", "Edit"],
     prompt_body: builtinBody("migration-writer", "Authors and reviews database migrations."),
     is_builtin: false,

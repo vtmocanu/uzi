@@ -19,6 +19,7 @@ import {
   SYNCED_BADGE_LABEL,
   SYNCED_BADGE_TONE,
   templateModelsLabel,
+  templateEffortsLabel,
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import {
@@ -324,6 +325,12 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
           <dt className="text-faint">Model</dt>
           <dd className="text-fg">{templateModelsLabel(template)}</dd>
         </div>
+        {templateEffortsLabel(template) && (
+          <div>
+            <dt className="text-faint">Effort</dt>
+            <dd className="text-fg">{templateEffortsLabel(template)}</dd>
+          </div>
+        )}
         <div>
           <dt className="text-faint">Tools</dt>
           <dd className="text-fg">{summarizeTools(template)}</dd>

@@ -37,7 +37,7 @@ import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "..
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
-import { mockDefaultClaudeModel } from "./agents";
+import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
 
@@ -855,6 +855,27 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
   return view;
 }
 
+// Issue #3258 N3: the recordings carry no lead-template effort, so the delivered mock lead
+// template's effort is applied at response time, exactly as leadEffortSettingCell derives it: when
+// the owner's preference for the harness is NULL or blank, the worker_effort cell resolves to the
+// template's level with source template, and its default names the template. Without a template
+// effort (the shipped mock lead has none) the recording is served unchanged.
+function withLeadTemplateEffort(view: EffectiveSettings, efforts: { claude: string | null; codex: string | null }, prefs: { claude: unknown; codex: unknown }): EffectiveSettings {
+  view.efforts = view.efforts.map(c => {
+    if (c.setting !== "worker_effort") return c;
+    const h = c.harness as "claude" | "codex";
+    const level = efforts[h];
+    if (level === null) return c;
+    const next = { ...c, default_effort: level, default_source: "template" };
+    const pref = prefs[h];
+    if (c.effort === null && (pref === null || pref === undefined || (typeof pref === "string" && pref.trim() === ""))) {
+      return { ...next, resolved_effort: level, source: "template", mode: "explicit" as const };
+    }
+    return next;
+  });
+  return view;
+}
+
 // Absent and null request members mean the same choice, so key on the normalized five members.
 function previewRequestKey(r: StartPreviewRequest): string {
   const o = r.credential_override;
@@ -1590,7 +1611,9 @@ export const settingsApi = {
   // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
+    const view = withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on);
+    return delay(withLeadTemplateEffort(view, mockLeadTemplateEfforts(),
+      { claude: userSettings.default_effort, codex: userSettings.default_codex_effort }), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();

@@ -20,6 +20,7 @@ import {
   SYNCED_BADGE_TONE,
   TEMPLATE_SCOPE_LABEL,
   templateModelsLabel,
+  templateEffortsLabel,
   templateScopeBadgeTone,
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
@@ -319,7 +320,12 @@ function AgentRow({
         <Badge tone={templateScopeBadgeTone(t.scope)}>{TEMPLATE_SCOPE_LABEL[t.scope]}</Badge>
       </td>
       <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
-      <td className="px-4 py-3 text-muted">{templateModelsLabel(t)}</td>
+      <td className="px-4 py-3 text-muted">
+        {templateModelsLabel(t)}
+        {templateEffortsLabel(t) && (
+          <div className="text-xs text-faint">{templateEffortsLabel(t)}</div>
+        )}
+      </td>
       <td className="max-w-xs truncate px-4 py-3 font-mono text-xs text-muted">{summarizeTools(t)}</td>
       <td className="px-4 py-3 text-center">
         <input

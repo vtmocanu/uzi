@@ -149,7 +149,7 @@ describe("AgentDetail real editor model pins", () => {
 
     expect(await screen.findByText("Saved.")).toBeTruthy();
     expect(mockApi.updateAgentTemplate).toHaveBeenCalledExactlyOnceWith("t-coder", {
-      description: SHIPPED.description, model, codex_model: codexModel,
+      description: SHIPPED.description, model, codex_model: codexModel, effort: null, codex_effort: null,
       tools: SHIPPED.tools, prompt_body: SHIPPED.prompt_body,
     });
     expect((screen.getByRole("combobox", { name: "Claude model" }) as HTMLSelectElement).value).toBe(model === null ? "inherit" : "custom");
@@ -239,6 +239,58 @@ describe("AgentDetail read-only pin labels match the Agents list", () => {
     expect(screen.queryByRole("combobox")).toBeNull();
     expect(mockApi.getBuiltinAgentTemplate).not.toHaveBeenCalled();
     expect(mockApi.updateAgentTemplate).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentDetail effort pins (#3258)", () => {
+  it("shows stored effort pins in the editor, saves a changed one and clears the other", async () => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ effort: "high", codex_effort: "low" }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+    mockApi.updateAgentTemplate.mockResolvedValue({
+      template: row({ effort: "max", codex_effort: null, updated_at: "2026-01-03T00:00:00Z" }),
+    });
+    renderPage();
+    const claude = (await screen.findByRole("combobox", { name: "Claude effort" })) as HTMLSelectElement;
+    const codex = screen.getByRole("combobox", { name: "Codex effort" }) as HTMLSelectElement;
+    expect(claude.value).toBe("high");
+    expect(codex.value).toBe("low");
+    expect(within(claude).queryByRole("option", { name: "runtime" })).toBeNull();
+    fireEvent.change(claude, { target: { value: "max" } });
+    fireEvent.change(codex, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    expect(mockApi.updateAgentTemplate).toHaveBeenCalledExactlyOnceWith("t-coder", {
+      description: SHIPPED.description, model: null, codex_model: null, effort: "max", codex_effort: null,
+      tools: SHIPPED.tools, prompt_body: SHIPPED.prompt_body,
+    });
+  });
+
+  it("names effort in the shipped-vs-current diff", async () => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ codex_effort: "low", differs_from_builtin: true }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+    renderPage();
+    const diff = (await screen.findByText("Codex effort", { selector: "span" })).parentElement!;
+    expect(diff.textContent).toBe("Codex effortDefault → low");
+  });
+
+  it("shows read-only effort pins for a non-admin and nothing extra when unpinned", async () => {
+    mockUseAuth.mockReturnValue({ user: { ...ADMIN, is_admin: false } } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: row({ codex_effort: "high" }) });
+    renderPage();
+    expect(await screen.findByText("Claude effort: Default · Codex effort: high")).toBeTruthy();
+    cleanup();
+
+    mockApi.getAgentTemplate.mockResolvedValue({ template: row() });
+    renderPage();
+    expect(await screen.findByText("Claude: Default · lead's model · Codex: Default · lead's model")).toBeTruthy();
+    expect(screen.queryByText(/Claude effort:/)).toBeNull();
   });
 });
 
