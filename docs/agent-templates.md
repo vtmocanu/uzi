@@ -149,9 +149,10 @@ its own harness only; the other family's pin is never sent.
 
 - **Levels.** `low`, `medium`, `high`, `xhigh` or `max`. The editor's
   **Default · follows the run's effort** leaves the pin empty.
-  `runtime` (Runtime default) is not a template effort; the API, the CLI and
-  the editor reject it, and any other value, with HTTP 400 naming `effort` or
-  `codex_effort`.
+  `runtime` (Runtime default) is not a template effort. The API rejects it, and
+  any other value, with HTTP 400 naming `effort` or `codex_effort`; the CLI
+  refuses it before sending anything (exit 2), and the editor offers only the
+  five levels.
 - **Clearing.** JSON `null` or a blank string clears a pin. Omitting an effort
   field on update preserves the stored pin.
 - **Subagents.** A subagent with a pin for the run's harness uses it. An empty
@@ -166,7 +167,8 @@ its own harness only; the other family's pin is never sent.
   The shipped `lead` has no effort pin.
 - **Older workers.** A worker that predates template effort (it does not
   advertise `template_effort_v1`) is sent no effort pins, so those subagents run
-  at the run's effort. The run feed then shows one line per claim: "stored
+  at the run's effort. When at least one delivered subagent template pins an
+  effort for the run's harness, the run feed shows one line per claim: "stored
   subagent effort pins omitted: this worker predates template effort; those
   subagents use the run's effort". The lead template's effort still reaches it
   through the lead's default effort.

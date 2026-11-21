@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -397,12 +396,20 @@ type storedColumns struct {
 // agentsource-local twin of the handler's storeColumns (that one is not importable here).
 func storeColumns(def agenttmpl.Definition) (storedColumns, error) {
 	text := func(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }
-	// Efforts are trimmed like agenttmpl.ValidateEffort, so blank or whitespace is NULL and the
-	// CHECK on the column can never turn a sync into a 500.
-	effort := func(v string) pgtype.Text { return text(strings.TrimSpace(v)) }
+	// Efforts go through agenttmpl.ValidateEffort: blank or whitespace is NULL, and an
+	// out-of-contract value is a named error here rather than a CHECK violation inside the apply
+	// transaction. The parsers that fill Definition are expected to drop such values first.
+	effort, err := agenttmpl.ValidateEffort(def.Effort)
+	if err != nil {
+		return storedColumns{}, fmt.Errorf("effort: %w", err)
+	}
+	codexEffort, err := agenttmpl.ValidateEffort(def.CodexEffort)
+	if err != nil {
+		return storedColumns{}, fmt.Errorf("codex_effort: %w", err)
+	}
 	c := storedColumns{
 		model: text(def.Model), codexModel: text(def.CodexModel),
-		effort: effort(def.Effort), codexEffort: effort(def.CodexEffort),
+		effort: text(effort), codexEffort: text(codexEffort),
 	}
 	if len(def.Tools) > 0 {
 		b, err := json.Marshal(def.Tools)

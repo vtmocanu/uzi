@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -328,5 +329,61 @@ func TestTemplateEffortNonLeadLaneIgnoresTemplateLiveDB(t *testing.T) {
 	}
 	if p.Config.DefaultEffortSource != nil {
 		t.Errorf("non-lead claim default_effort_source = %q, want none", *p.Config.DefaultEffortSource)
+	}
+}
+
+// TestTemplateEffortJudgeLaneIgnoresTemplateLiveDB is the judge half of the lane control (PRD #3258
+// test (e)): an owner with no Claude effort preference whose lead template pins `high` still gets a
+// judge claim at the builtin medium with no source. The judge assembler has its own effort read and
+// loads no templates, so this pins the observable outcome against a future shared resolver.
+func TestTemplateEffortJudgeLaneIgnoresTemplateLiveDB(t *testing.T) {
+	fx := newEffFix(t)
+	fx.anthropic()
+	fx.templateEffort(effLeadName, "high", "high")
+
+	target := uuid.New()
+	fx.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+		VALUES ($1, $2, $3, 'issue', 950, 't', 'd', 'completed')`, target, fx.userID, fx.repoID)
+	id := uuid.New()
+	fx.env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, target_run_id, harness)
+		VALUES ($1, $2, 'judge', 't', 'd', 'queued', $3, 'claude')`, id, fx.userID, target)
+	fx.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, id, fx.workerID)
+	p, err := fx.svc.assembleJudgeClaim(fx.env.ctx, store.Worker{ID: fx.workerID, UserID: fx.userID, ProtocolCapabilities: newWorkerCaps}, mustRun(t, fx.env, id))
+	if err != nil {
+		t.Fatalf("assembleJudgeClaim: %v", err)
+	}
+	if got := derefOr(p.Config.DefaultEffort, ""); got != "medium" {
+		t.Errorf("judge claim default_effort = %q, want the builtin medium, not the lead template's high", got)
+	}
+	if p.Config.DefaultEffortSource != nil {
+		t.Errorf("judge claim default_effort_source = %q, want none", *p.Config.DefaultEffortSource)
+	}
+}
+
+// TestTemplateEffortCheckerLaneIgnoresTemplateLiveDB is the checker half of the lane control (PRD
+// #3258 test (e)): a Codex cross-check child of an owner with no Codex effort preference whose lead
+// template pins codex_effort `low` keeps its frozen cross-check default (high), never the template's.
+//
+// MUTATION: in claim_assembly.go set the checker arm's defaultEffort to
+// leadTemplateEffort(templates, harness) instead of the frozen checkerResolution.Effort; this test
+// then reads "low" and fails.
+func TestTemplateEffortCheckerLaneIgnoresTemplateLiveDB(t *testing.T) {
+	env, svc, w, lead, c := roundsPinsFixture(t)
+	env.exec("UPDATE users SET default_codex_effort = NULL, default_effort = NULL WHERE id = $1", w.UserID)
+	tid := uuid.New()
+	env.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id,effort,codex_effort)
+		VALUES($1,$2,'d','b','user',$3,'low','low')`, tid, effLeadName, w.UserID)
+	env.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled) VALUES($1,$2,true)`, tid, w.UserID)
+
+	cc := roundsPinsSubmit(t, env, svc, w, lead, c, 1)
+	p := roundsPinsClaim(t, env, svc, w, cc)
+	if got := derefOr(p.Config.DefaultEffort, ""); got != agenttmpl.CrossCheckDefaultEffort {
+		t.Errorf("checker claim default_effort = %q, want the cross-check default %q, not the lead template's low", got, agenttmpl.CrossCheckDefaultEffort)
+	}
+	if p.CrossCheck.EffortSource == nil || *p.CrossCheck.EffortSource != "cross-check default" {
+		t.Errorf("checker effort source = %v, want cross-check default", p.CrossCheck.EffortSource)
+	}
+	if p.Config.DefaultEffortSource != nil && *p.Config.DefaultEffortSource == "template" {
+		t.Errorf("checker claim default_effort_source = template")
 	}
 }

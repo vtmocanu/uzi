@@ -204,6 +204,12 @@ func TestStoreColumnsMapsEffortPinsAndBlankToNull(t *testing.T) {
 	if err != nil || cols.effort.Valid || cols.codexEffort.Valid || cols.codexModel.Valid {
 		t.Errorf("cols=%+v err=%v", cols, err)
 	}
+	// An out-of-contract effort is a named error here, never a CHECK violation inside the apply.
+	for _, d := range []agenttmpl.Definition{{Effort: "HIGH"}, {Effort: "runtime"}, {CodexEffort: "ultra"}} {
+		if _, err := storeColumns(d); err == nil {
+			t.Errorf("storeColumns(%+v) accepted an out-of-contract effort", d)
+		}
+	}
 }
 
 func TestRowToDefinitionCarriesEffortPins(t *testing.T) {

@@ -206,7 +206,8 @@ a running one.
 - **Effort pins are projected per family, behind a capability.** The claim
   carries a subagent's `effort` for the run's harness only, and only to a worker
   advertising `template_effort_v1`; for an older worker the api omits the pins
-  and writes one run-feed notice per claim generation. The lead template's
+  and, when at least one subagent pin was withheld, writes one run-feed notice
+  per claim generation. The lead template's
   effort is not projected as a pin: it is a tier of the lead's own effort
   (run override, then the user's preference, then the lead template, then
   medium). See [PRD #3258](prds/3258-per-harness-template-effort.md).

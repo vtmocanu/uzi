@@ -55,7 +55,7 @@ function shippedBuiltin(name: string): BuiltinDefinition | undefined {
   return mockShippedBuiltins.find((d) => d.name === name);
 }
 
-// sameContent mirrors the server's agenttmpl.SameContent over the five mutable
+// sameContent mirrors the server's agenttmpl.SameContent over the seven mutable
 // columns. It is a SECOND IMPLEMENTATION of that comparison and that is
 // deliberate: the mock has no server to ask, and a hard-coded flag would make
 // every drift the fixture claims unfalsifiable. The rules it must keep in step

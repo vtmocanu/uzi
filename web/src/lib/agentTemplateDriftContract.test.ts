@@ -153,6 +153,7 @@ describe("agent-template drift-predicate contract (issue #223 item 3)", () => {
       "codex-model-null-vs-empty-agree",
       "model-moved-between-harnesses",
       "effort-value-change",
+      "codex-effort-value-change",
       "effort-null-equals-null",
       "effort-moved-between-harnesses",
     ]) {

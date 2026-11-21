@@ -709,7 +709,7 @@ export interface AgentTemplate {
   user_id: string | null;
   updated_by: string | null;
   // differs_from_builtin is computed server-side per request (issue #201 M4a):
-  // whether this row's five mutable columns still match the definition the
+  // whether this row's mutable columns still match the definition the
   // running release ships under the same name. It is false for anything that has
   // no shipped counterpart — a global row, a user row that merely shares a
   // builtin's name, and a builtin this release no longer ships.

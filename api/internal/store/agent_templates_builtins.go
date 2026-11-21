@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -45,8 +44,15 @@ type builtinReconcilerQueries interface {
 // which ReconcileBuiltinSkills rejects — but callers should be failing on the
 // error anyway.
 func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) (TemplatesReconciled, error) {
+	return reconcileBuiltinDefinitions(ctx, q, agenttmpl.Builtins())
+}
+
+// reconcileBuiltinDefinitions is ReconcileBuiltinTemplates over an explicit definition list, the
+// seam that lets a unit test drive a shipped definition carrying pins no embedded builtin carries
+// (issue #3258: effort and codex_effort must reach both the insert and the pristine refresh).
+func reconcileBuiltinDefinitions(ctx context.Context, q builtinReconcilerQueries, defs []agenttmpl.Definition) (TemplatesReconciled, error) {
 	var inserted int
-	for _, def := range agenttmpl.Builtins() {
+	for _, def := range defs {
 		cols, err := builtinColumns(def)
 		if err != nil {
 			return TemplatesReconciled{}, fmt.Errorf("encode builtin %q: %w", def.Name, err)
@@ -114,7 +120,7 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 		}
 		inserted += int(n)
 	}
-	slog.Info("reconciled builtin agent templates", "builtins", len(agenttmpl.Builtins()), "inserted", inserted)
+	slog.Info("reconciled builtin agent templates", "builtins", len(defs), "inserted", inserted)
 	return TemplatesReconciled{done: true}, nil
 }
 
@@ -130,11 +136,21 @@ type builtinCols struct {
 // list is a JSON array.
 func builtinColumns(def agenttmpl.Definition) (builtinCols, error) {
 	text := func(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }
+	// Validated, not only trimmed: a shipped effort outside agenttmpl.EffortLevels fails the
+	// reconcile with a named error instead of tripping the column CHECK mid-boot.
+	effort, err := agenttmpl.ValidateEffort(def.Effort)
+	if err != nil {
+		return builtinCols{}, fmt.Errorf("effort: %w", err)
+	}
+	codexEffort, err := agenttmpl.ValidateEffort(def.CodexEffort)
+	if err != nil {
+		return builtinCols{}, fmt.Errorf("codex_effort: %w", err)
+	}
 	c := builtinCols{
 		model:       text(def.Model),
 		codexModel:  text(def.CodexModel),
-		effort:      text(strings.TrimSpace(def.Effort)),
-		codexEffort: text(strings.TrimSpace(def.CodexEffort)),
+		effort:      text(effort),
+		codexEffort: text(codexEffort),
 	}
 	if len(def.Tools) > 0 {
 		b, err := json.Marshal(def.Tools)
