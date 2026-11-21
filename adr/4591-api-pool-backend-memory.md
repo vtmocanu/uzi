@@ -28,8 +28,9 @@ confounds listed**, not as conclusions:
   a 128 cache (-16.7%). With the server's default JIT on, 70.0 vs 67.4 MiB (-3.8%), on this
   synthetic workload, with one rep; production effect unmeasured.
 - A cache of 32 showed a stress `ClaimRun` of about 68 ms against about 7 ms for the others.
-- Re-planning `ClaimRun` costs about 350 ms of planning per reconnect or re-prepare in this
-  harness.
+- `ClaimRun` planning in this harness: the first execution after a reconnect or re-prepare
+  spent about 69-75 ms planning, and the six prepared executions together about 348-358 ms
+  (see [Latency and reconnect](#latency-and-reconnect-jit-off)).
 
 Never set `statement_cache_capacity` to `0`: with pgx's default exec mode it makes every
 query fail except an argument-less `Exec` (see
@@ -88,11 +89,12 @@ differences explain why the earlier numbers were set aside. The later numbers ar
    metric. Order effects disappeared (A, B128 and B32 reproduced to 0.0 MiB across reps). A
    `Private_Clean` jump of about 51 MiB still appeared on every candidate that evicts or
    recycles, and was first read as shared-buffer pages.
-4. **Run 4 (the primary results).** Showed that jump is **LLVM JIT**: `llvmjit.so` and
-   `libLLVM.so.19.1` are mapped into a backend from round 8. The leading hypothesis,
-   consistent with the evidence (LLVM is mapped only on backends that re-plan, and `jit = off`
-   removes it), is that re-planned statements on the bloating clone cross `jit_above_cost`
-   (100000); the specific statement was not identified. It added a `jit = off` control
+4. **Run 4 (the primary results).** Observed that the jump coincides with LLVM being mapped:
+   `llvmjit.so` and `libLLVM.so.19.1` appear in a backend's memory map from round 8 in the
+   candidates that evict or recycle, and `jit = off` removes both the mapping and the jump. A
+   library mapping alone is not proof of a JIT compilation (see the `pg_jit_available()` probe
+   below). The hypothesis, not established, is that re-planned statements on the bloating clone
+   cross `jit_above_cost` (100000); the specific statement was not identified. It added a `jit = off` control
    (`ALTER DATABASE <clone> SET jit = off`, measurement only, read back per backend with
    `SHOW jit`), a memory-map probe for LLVM, and an `EXPLAIN` split of `ClaimRun`. Run 4's
    JIT-off runs (a and c) are primary; run 4's jit-default run (b) shows the JIT effect.
@@ -168,9 +170,17 @@ UZI_POOL_MEMORY_ROUNDS=24 UZI_POOL_MEMORY_REPS=1 UZI_POOL_MEMORY_JIT=default \
 # (c) jit=off, latency + cold reconnect + stress
 UZI_POOL_MEMORY_JIT=off UZI_POOL_MEMORY_PHASES=latency,cold,stress UZI_POOL_MEMORY_OUT=out-c.jsonl \
   go test -count=1 -timeout 58m -run '^TestPoolBackendMemoryMeasurement$' -v ./internal/store
+# (d) wide-read sample (run 3's wide section; see the provenance caveat below)
+UZI_POOL_MEMORY_PHASES=wide UZI_POOL_MEMORY_OUT=out-d.jsonl \
+  go test -count=1 -timeout 58m -run '^TestPoolBackendMemoryMeasurement$' -v ./internal/store
 ```
 
-The three runs took 1626 s, 814 s and 458 s on the same container.
+The three runs (a to c) took 1626 s, 814 s and 458 s on the same container.
+
+Each invocation now names its databases `pm_<32-hex uuid>_...` and drops only the databases it
+created. A crashed run can leave them behind; list them with
+`SELECT datname FROM pg_database WHERE datname ~ '^pm_[0-9a-f]{32}_'` and drop them manually.
+Nothing sweeps them automatically.
 
 ### Memory, JIT off (primary)
 
@@ -205,16 +215,19 @@ Run 4 (b), one rep. `Private_Clean` is the mapped LLVM library text.
 | C | 79.5 | 94.5 | 51.1 / 83.8 | 217.4 | 53.4 / 38.2 | yes (10) |
 | D | 69.4 | 75.1 | 51.1 / 73.6 | 188.0 | 25.0 / 18.4 | yes (8) |
 
-JIT added about 8.5-14 MiB of Anonymous to the candidates that evict or recycle (B128 +10.3,
-B32 +8.5, C +10.9, D +14.1 against the jit-off medians) and nothing material to A (70.0
-against 68.6): in the harness A never re-plans, because nothing invalidates its plans. The
-LLVM text (about 51 MiB) is shared file cache, counted once per PostgreSQL instance, not per
-backend. A fresh jit-default backend maps `llvmjit.so` and `libLLVM.so.19.1` after a single
-`pg_jit_available()` call, and a jit-off backend maps neither.
+Observations: the jit-default run's Anonymous exceeded the jit-off medians by about 8.5-14 MiB
+for the candidates that evict or recycle (B128 +10.3, B32 +8.5, C +10.9, D +14.1) and by 1.4
+MiB for A (70.0 against 68.6). LLVM was mapped in the first round shown above for B128, B32,
+C and D and not for A. The LLVM text (about 51 MiB) is shared file cache, counted once per
+PostgreSQL instance, not per backend. A fresh jit-default backend maps `llvmjit.so` and
+`libLLVM.so.19.1` after a single `pg_jit_available()` call, and a jit-off backend maps neither.
+So a library mapping alone is not proof of a JIT compilation: the probe maps LLVM without one.
 
-Which re-planned statement crosses `jit_above_cost` on the bloating clone was **not
-identified**. `ClaimRun` itself never JITs (its cost is about 2468 custom / 2502 generic, far
-below the threshold, and no execution showed a JIT block). Only the effect is measured.
+**Hypothesis, not established:** re-planned statements on the bloating clone cross
+`jit_above_cost`, which would explain why the effect appears on backends that evict or
+recycle. Which statement that would be was **not identified**. `ClaimRun` itself never JITs
+(its cost is about 2468 custom / 2502 generic, far below the threshold, and no execution
+showed a JIT block). Only the memory differences and the mappings are observed.
 
 ### Latency and reconnect (jit off)
 
@@ -244,20 +257,24 @@ rotated, the median round's per-execution mean. The columns are that mean in mic
 `EXPLAIN (ANALYZE, SUMMARY)` of `ClaimRun` on one connection, four runs (jit default and off,
 two reps each), per execution: planning about 69-75 ms on the first, about 50-58 ms on
 executions 2 to 5, about 60-65 ms on the sixth (when PostgreSQL builds the generic plan);
-execution about 19 ms, then about 8 ms. Planning dominates. The six executions sum to about
-350 ms of planning (348-358 ms across the four runs). **In this harness, a re-prepare after an eviction or a
-reconnect therefore cost about 350 ms of planning once per statement, for `ClaimRun`.**
-Recycling connections (C, D) pays that on every reconnect. C showed no steady-heap saving over A; D's two jit-off
+execution about 19 ms, then about 8 ms. Planning dominates. 348-358 ms (across the four runs)
+is the **sum** of planning over the six prepared executions, not a per-reconnect charge. In
+this harness, the first execution after a reconnect or re-prepare pays about 69-75 ms of
+planning; the further custom planning (executions 2 to 5, about 50-58 ms each) and the generic
+planning (the sixth, about 60-65 ms) follow on later executions, and a re-prepare restarts that
+sequence. These are distinct from the cold-reconnect latencies above (98.5-103.9 ms first,
+64-68 ms second `ClaimRun`). They are `ClaimRun` observations only. C showed no steady-heap saving over A; D's two jit-off
 reps (56.6 and 53.9 MiB) were below B128's 57.1 MiB, within a 2.7 MiB rep-to-rep spread, and above it with JIT on
 (69.4 against 67.4 MiB). Neither difference is established by this evidence.
 
 ### Wide-read sample (a lower bound, not an envelope)
 
-Run 3, server default JIT. Every sqlc text (1691) run once per parameter with NULL
-arguments inside `BEGIN READ ONLY`, with a savepoint per statement. 705 execute; 986 are
-writes the read-only transaction refuses after planning, and pgx then invalidates them, so
-they are never retained; NULL arguments plan small. It is therefore a **lower bound and not
-an upper bound**: it shows no worse case than what it ran, and a real wide workload could
+Run 3, server default JIT. Every sqlc text (1691) was prepared, and each successfully prepared
+text was then executed twice with NULL arguments (one per parameter) inside `BEGIN READ ONLY`,
+with a savepoint per statement. The outcome tallies count the first pass only: 705 execute;
+986 are writes the read-only transaction refuses after planning, and pgx then invalidates
+them, so they are never retained; NULL arguments plan small. It is therefore a **lower bound
+and not an upper bound**: it shows no worse case than what it ran, and a real wide workload could
 retain more or cost more per statement.
 
 | statement cache | plan mode | retained | Anonymous, MiB | VmHWM (incl. shared), MiB | context totals, MiB |
@@ -266,6 +283,10 @@ retain more or cost more per statement.
 | 4096 | `force_generic_plan` | 705 | 136.5 | 170.0 | 123.2 / 86.0 |
 | 512 (pgx default) | `auto` | 512 | 93.2 | 124.7 | 63.4 / 42.8 |
 | 512 | `force_generic_plan` | 512 | 124.6 | 156.2 | 97.4 / 67.6 |
+
+Every committed harness revision since commit 5f9b058a5 contains this two-pass loop, but the
+revision that produced run 3 is not recorded. Exact historical reproduction is therefore not
+established, and re-running command (d) is not expected to give identical numbers.
 
 ### The description cache does not apply here
 
@@ -354,8 +375,10 @@ func (c *Conn) deallocateInvalidatedCachedStatements(ctx context.Context) error 
 `deallocateInvalidatedCachedStatements` runs at the start of `Exec`, `Query` and
 `SendBatch`. The pool's lifetime settings are read the same way (`pgxpool/pool.go`):
 `defaultMaxConnLifetime = time.Hour`, `defaultMaxConnIdleTime = time.Minute * 30`,
-`pool_max_conn_lifetime_jitter` unset means 0, and a connection past its lifetime is
-destroyed on release.
+`pool_max_conn_lifetime_jitter` unset means 0. A connection past its lifetime leaves the pool
+by one of two paths: pgxpool's background health check closes idle connections that are past
+their lifetime, and a checked-out connection is not interrupted but is destroyed when it is
+released. So the time at which a given connection is replaced has no fixed deadline.
 
 ## Why the measurement is inconclusive
 
@@ -401,15 +424,17 @@ global default, so `OpenPool` keeps pgx's defaults.
 - **Synthetic observations, under the confounds.**
   - 128 cut about 154 KiB of memory contexts per statement it no longer holds (this fixture's
     average) and steady heap by 16.7% with JIT off; with JIT on the difference was 3.8%
-    (see above). The JIT effect appears on backends that re-plan, which maps about 51 MiB of
-    shared library text and about 8.5-14 MiB of Anonymous; which statement crosses
-    `jit_above_cost` was not identified.
+    (see above). In the jit-default run, the candidates that evict or recycle showed LLVM
+    mapped (about 51 MiB of shared library text) and about 8.5-14 MiB more Anonymous than their
+    jit-off runs. That these backends re-plan statements crossing `jit_above_cost` is a
+    hypothesis; which statement, if any, was not identified.
   - 32 saved more heap (51.3 MiB) and its stress `ClaimRun` was about 68 ms against about
     7 ms.
   - Recycling on a compressed lifetime with jitter: C showed no steady-heap saving over A;
     D was slightly below B128 with JIT off (56.6 and 53.9 against 57.1 MiB, within its
-    2.7 MiB rep-to-rep spread) and above it with JIT on. Each reconnect re-pays about 350 ms
-    of planning for `ClaimRun` in this harness.
+    2.7 MiB rep-to-rep spread) and above it with JIT on. For `ClaimRun` in this harness, the
+    first execution after a reconnect spent about 69-75 ms planning, and the six prepared
+    executions about 348-358 ms in total (see above).
 - **The statement count is a fixture parameter.** The harness retains 317 statements; the
   effect of any cap in production depends on how many distinct statements a connection runs
   and whether any re-planned statement crosses `jit_above_cost`, neither of which is
@@ -428,7 +453,10 @@ global default, so `OpenPool` keeps pgx's defaults.
   open (see [Open investigation questions](#open-investigation-questions)). The operator
   levers, by reach:
   - `ALTER ROLE <app-role> SET jit = off;` takes effect for **new sessions only**, so
-    existing pool connections keep JIT until they recycle (up to 1h) or the api restarts.
+    existing pool connections keep JIT until they are replaced. The change takes effect as
+    sessions are replaced, or after an API restart. pgxpool's background health check closes
+    idle connections that are past their lifetime, but a checked-out connection is not
+    interrupted and is destroyed only when it is released, so there is no fixed deadline.
   - `jit=off` as a key in the `DATABASE_URL` query: pgx passes unknown keys through as
     startup parameters. The chart ships no PgBouncer. A transaction-mode PgBouncer rejects a
     startup parameter it does not track, failing the connection, unless it is listed in
@@ -450,8 +478,12 @@ global default, so `OpenPool` keeps pgx's defaults.
   Add what is counted once (`shared_buffers`, the shared LLVM library page cache, PostgreSQL
   background processes), headroom for non-api connections (one-off `/server setup` runs,
   admin `psql` sessions, migrations (`store.Migrate` opens its own connection), CNPG's own
-  connections), concurrent query memory (up to `work_mem` per sort or hash plan node) and
-  other PostgreSQL and container overhead. It assumes every pool connection has been opened
+  connections), concurrent query memory and other PostgreSQL and container overhead. Query
+  memory is up to `work_mem` per sort node and `work_mem × hash_mem_multiplier` per hash
+  node (`hash_mem_multiplier` defaults to 2.0 since PostgreSQL 15; see the
+  [PostgreSQL 17 resource settings](https://www.postgresql.org/docs/17/runtime-config-resource.html)).
+  These multiply by the number of such nodes in a plan and by the number of concurrent
+  queries, so they need headroom. It assumes every pool connection has been opened
   and used; pgxpool opens connections lazily and reaps idle ones after 30m. The chart's api
   Deployment uses `Recreate` (`deploy/chart/templates/api-deployment.yaml`), so there is no
   rolling-update overlap term. Measured on PostgreSQL 17.12 with a small synthetic fixture and
@@ -461,8 +493,8 @@ global default, so `OpenPool` keeps pgx's defaults.
 
 ## Open investigation questions
 
-- Which statements trigger JIT on a re-planning backend, and is JIT the larger memory lever
-  than the statement cache?
+- Do any statements trigger JIT on the backends that evict or recycle (the `jit_above_cost`
+  hypothesis), and is JIT the larger memory lever than the statement cache?
 - What produced the unreproduced 110-160Mi per-backend incident figure?
 
 Any JIT investigation is separate work, not done here.
@@ -487,7 +519,11 @@ Any JIT investigation is separate work, not done here.
   in run 3; run 1 recorded maximum intervals of 102.9-105.0 ms; run 2 recorded 102.8-200.8 ms, because candidate D had one roughly 200 ms gap or dropped sample). A peak shorter than the
   interval can fall between samples, so the sampled peak is a lower bound on the true peak;
   `VmHWM` is the kernel's high-water mark but includes shared pages. No sampling errors
-  occurred in run 4.
+  occurred in run 4. The summary and per-PID "sampled peak" figures come from interval
+  sampler readings only, starting when the sampler starts; they exclude the empty-cache
+  baseline sample, the eviction demo and the post-round samples. Per-PID `VmHWM` mixes
+  sampler and held samples. The historical figures in this ADR are unchanged and are not
+  recomputed maxima.
 - **cgroup `memory.current` is unavailable for the primary runs.** Runs 3 and 4 recorded no
   cgroup column in their summaries and their raw cgroup files hold only the empty-cache
   baseline capture, so the container-wide figure cannot be tied to a candidate. The only
