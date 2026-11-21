@@ -3676,8 +3676,9 @@ Not credited:
 ### U20 plan and intent summaries (2026-11-21, #4573)
 
 Real Runner leaves in agent/test/codex-executor.test.ts, in the "M2 actualRunner
-credential replacement" describe, one set per publication name and both U20
-gated directions. Test names contain "plan summary" or "intent summary":
+credential replacement" describe, one set per publication name. The gated
+variants run in both U20 gated directions; the preserve-only variant runs once
+(api_key to subscription). Test names contain "plan summary" or "intent summary":
 - plan summary: gated-plan-summary, gated-plan-summary-late,
   gated-plan-summary-unacked;
 - intent summary: gated-intent-summary, gated-intent-summary-retained,
@@ -3699,11 +3700,16 @@ Fixture mechanisms:
   same executor.
 
 Tested revisions: product fix 5288bdce6, final tests c1b399b07, base 8be78a548
-(intermediate test commits a43bfe06b and 28222928c).
+(intermediate test commits a43bfe06b and 28222928c). Mutant revisions: plan
+mutants (M1-M8 and the P2 D rows) ran at a43bfe06b; intent J, F and G rows at
+28222928c; the I4 K1, K2 and K3' rows at c1b399b07. The 'plan summary' and
+'intent summary' 11/11 baselines include older matching leaves (plan: 6 new + 5
+older; intent: 7 new + 4 older).
 
 Commands. Focused: from `agent/`, `node --import tsx --test --test-timeout=120000
 --test-name-pattern='publication gates Now|plan summary|intent summary' test/codex-executor.test.ts`
-(24 leaves); the 'plan summary' and 'intent summary' sets also run alone with
+(24 leaves: 13 #4573 leaves, the 2 'publication gates Now' leaves and 9 older
+inline-summary leaves that the pattern also matches); the 'plan summary' and 'intent summary' sets also run alone with
 their pattern. Mutation: apply one edit in a scratch export of the exact
 candidate and run the single-file form above; nothing is mutated in the checkout.
 Gates: `npm run check:agent`, the full test/codex-executor.test.ts file,
@@ -3730,7 +3736,7 @@ the one removed line alone reddens a named assertion.
 | --- | --- | --- | --- | --- | --- | --- |
 | P1a plan join | C | pass | yes | M1: drop flights from the `suspendEpoch` allSettled | "A plan summary joins before suspension completes" | `.uzi/scratch/gate-log.hpxqYc` |
 | P1b plan post check | C | pass | yes | M2: delete `allowed()` before `postPlanSummary` | "late A plan result never posts as B" (1 vs 0) | `.uzi/scratch/gate-log.VhJTUx` |
-| P1b plan abort observation | C | pass | yes | reviewer mutant B: `signal: undefined` to `generatePlanSummary` | "late A plan result resolves only after the switch aborted it" (only failure in the late leaves) | reviewer-1 export run at a43bfe06b; log not kept |
+| P1b plan abort observation | C | pass | yes (observed by the reviewer; no retained log) | reviewer mutant B: `signal: undefined` to `generatePlanSummary` | "late A plan result resolves only after the switch aborted it" (only failure in the late leaves) | reviewer-1 export run at a43bfe06b; log not kept |
 | P1b plan late leaves, join | C | pass | yes | M1 | "the suspension is still pending when A plan work is released" | `.uzi/scratch/gate-log.hpxqYc` |
 | P2 plan pending-switch refusal | C | pass | NO (uncredited) | see matrix | see matrix | see matrix |
 | P3 retired A callback | R | pass | yes | M3: `authorityCurrent` replaced by `=> true` | "retired A plan callback never builds or posts with B" | `.uzi/scratch/gate-log.zZxuib` (base red W3wMAl) |
@@ -3820,15 +3826,17 @@ earns no credit. Recorded refusal messages: before-publish "codex credential
 authority retired"; later stages "summary credential authority changed". The
 preserve-only refusal is "codex epoch admission closed for capture"
 (`assertCaptureAdmission`, reviewer instrumentation). The "preserve-only
-re-armed lifecycle..." and "never acquires B after finishB" refusals were not
-reached by any diagnostic (uncredited).
+re-armed lifecycle..." and "never acquires B after finishB" test assertions
+were not reached by any diagnostic (uncredited).
 
 Rejected or derailing mutants:
 - M5 original (dropping the emitter swap) throws; replaced by the
   `summary_usage` bypass above.
 - K3 original (`?? 1` at runner.ts:17266) derails the A turn
   (`.uzi/scratch/gate-log.5c4qvi`); replaced by K3'.
-- First-round P1a timeout and first-round K1/K2 timeouts: fixtures then reworked
+- First-round P1a timeout (`.uzi/scratch/gate-log.zOBwCY`, at 5288bdce6) and
+  first-round K1/K2 timeouts (`.uzi/scratch/gate-log.u88o4c`,
+  `.uzi/scratch/gate-log.3dlSTY`, at 28222928c): fixtures then reworked
   (a43bfe06b, c1b399b07).
 
 Attribution:
@@ -3845,7 +3853,8 @@ Timing (not a finding; no wait change is established):
 - Base 'publication gates Now': 2 tests, 8.1 s total (describe 3.34 s,
   `.uzi/scratch/gate-log.QEGFlu`).
 - After: focused 'publication gates Now|plan summary|intent summary', 24 tests,
-  19.8 s (`.uzi/scratch/gate-log.FGj8Dj`) and 21.1 s (`.uzi/scratch/gate-log.af2F7W`).
+  19.8 s at c1b399b07 (`.uzi/scratch/gate-log.FGj8Dj`) and 21.1 s at 28222928c
+  (`.uzi/scratch/gate-log.af2F7W`).
 - Whole M2 describe 151.0 s, 109 tests at 28222928c (`.uzi/scratch/gate-log.LGBnDk`)
   against the 155.7 s, 88 tests at 3fdfe9127 above: different revisions, not a
   controlled comparison.
