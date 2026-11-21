@@ -211,7 +211,8 @@ A fixture proves only that fixture.
   its mount, and without one the backing leg reports `backing-mapping-unknown`.
 - Enforced capacities are tied to the envelope: summed enforced byte capacities must fit the
   2 GiB aggregate, enforced inodes the approved ceiling, and, whenever applied limits are present,
-  the applied memory max must be a finite integer within the 1 GiB memory limit with swap equal;
+  the applied memory max must be a positive finite integer within the 1 GiB memory limit with
+  Docker's normalized combined memory-plus-swap limit equal;
   `max`, a non-integer or a missing or different swap is `enforced-capacity-exceeds-envelope`
   (NEGATIVE). An absent applied section stays UNVERIFIED.
 - The 269 MiB and 576 MiB heavy race archives stay resource-incompatible with body and staging
@@ -316,8 +317,30 @@ no hostnames, worker IDs or daemon name; daemon identity appears only as a per-r
 ## 8. Deferred non-blocking review notes
 
 - The `conn.close` keep-alive path is untested.
-- Two test stubs lack an EOF break and could hang on a regression.
 - Rootless with a non-allowlisted `CgroupDriver` string in hand-built artifacts is treated as
   supported.
 - The image Arch allowlist nulls legitimate 386 and mips64le values.
 - Suite time could be trimmed by about 5 s with in-process argument tests.
+
+## 9. Maintainer regression corrections
+
+The review at `89254e50` found per-leg grading and report-lifecycle defects despite the
+overall qualification gate being closed. Corrections require nonempty mount inventories and
+valid threshold observations, resolve final ancestor coverage independent of JSON key order,
+separate synthetic capacity deltas from declared sink names, allow zero-inode deltas without
+weakening sink validation, and project accepted writable-layer quotas into both envelope and
+backing checks without double-counting a superblock. Non-positive memory limits are refused.
+
+The collector now owns a stable sibling report lock through final output, applies its remaining
+collection deadline to every request, rejects interim HTTP responses, refuses truncated profile
+coordinates, and preserves unknown security-option state when observations are incomplete.
+Report expansion beyond 64 KiB returns a bounded UNVERIFIED refusal instead of raising or
+silently truncating accounting. The EOF stubs and the vacuous declared-charge test are corrected.
+
+Independent local validation: 216 tests passed in 23.734 s, compared with 201 tests in 18.371 s
+before these corrections on the same host (single samples; noise is unmeasured). An earlier
+corrected run took 19.341 s, so these are measurements, not a CI runtime estimate. CI job and
+critical-path impact remain unmeasured. New behavioural regressions were observed red before
+their fixes and green afterward; the declared-charge test also kills a targeted dropped-charge
+mutant. No live endpoint, allocation canary or producer was exercised. The committed historical
+artifact and its verdict are unchanged, and qualification remains unreachable.

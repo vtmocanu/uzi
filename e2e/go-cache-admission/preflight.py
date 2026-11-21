@@ -123,20 +123,21 @@ def child_env(private, mode, toolchain_path=None, cacheprog=None):
     return env
 
 
-def project_domains(charges, samples=None, statfs=os.statvfs, names=None):
+def project_domains(charges, samples=None, statfs=os.statvfs, names=None, *, allow_zero_inodes=False):
     """Group charges by backing domain and sum bytes and inodes once per domain.
 
     A charge names its domain explicitly ("domain": key, resolved in `samples`) or,
     without that key, by the superblock device of its scratch "path" (st_dev), sampled
     with `statfs`. Returns {domain: (sample, bytes, inodes)}; the sample of the last
     charge in a domain is kept (the most recent observation). Fails closed on any
-    malformed charge or sample.
+    malformed charge or sample. allow_zero_inodes is only for separately validated synthetic
+    capacity deltas; declared sink charges must retain the default positive-inode rule.
     """
     devices = {}
     for name in (charges if names is None else names):
         entry = charges[name]
         b, i = entry["bytes"], entry["inodes"]
-        require(type(b) is int and b >= 0 and type(i) is int and i > 0)
+        require(type(b) is int and b >= 0 and type(i) is int and (i >= 0 if allow_zero_inodes else i > 0))
         if "domain" in entry:
             require(samples is not None and entry["domain"] in samples)
             dev, s = entry["domain"], samples[entry["domain"]]
@@ -175,7 +176,7 @@ class UnixHTTP(http.client.HTTPConnection):
 
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(2)
+        self.sock.settimeout(self.timeout)
         self.sock.connect(self.endpoint)
 
 
@@ -188,7 +189,7 @@ class LoopbackHTTP(http.client.HTTPConnection):
     def connect(self):
         family, address, port = self.target
         self.sock = socket.socket(family, socket.SOCK_STREAM)
-        self.sock.settimeout(2)
+        self.sock.settimeout(self.timeout)
         self.sock.connect((address, port))
 
 
@@ -240,10 +241,21 @@ class _DeadlineSocket:
         return io.BufferedReader(_DeadlineReader(self.sock.dup(), self.deadline), 4096)
 
 
-def docker_get(endpoint, route):
+class _FinalHTTPResponse(http.client.HTTPResponse):
+    """Docker GET metadata requires a final response, never interim header blocks."""
+    def _read_status(self):
+        version, status, reason = super()._read_status()
+        require(not 100 <= status < 200)
+        return version, status, reason
+
+
+def docker_get(endpoint, route, *, timeout=5):
     # Fixed GET routes; no CLI, context, config, inherited env or process inspection.
     require(route in DOCKER_ROUTES or re.fullmatch("/images/sha256:[0-9a-f]{64}/json", route))
     require(type(endpoint) is str)
+    require(type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0)
+    deadline = time.monotonic()+min(5, timeout)
+    socket_timeout = min(2, timeout)
     match = TCP_ENDPOINT.fullmatch(endpoint)
     if match:
         # Literal 127.0.0.1 or [::1] only: no name resolution and no environment read.
@@ -251,13 +263,12 @@ def docker_get(endpoint, route):
         require(1 <= port <= 65535)
         family, address = ((socket.AF_INET, match.group(1)) if match.group(1)
                            else (socket.AF_INET6, match.group(2)))
-        conn = LoopbackHTTP(family, address, port, timeout=2)
+        conn = LoopbackHTTP(family, address, port, timeout=socket_timeout)
     else:
         require(Path(endpoint).is_absolute() and stat.S_ISSOCK(Path(endpoint).stat().st_mode))
-        conn = UnixHTTP(endpoint, timeout=2)
+        conn = UnixHTTP(endpoint, timeout=socket_timeout)
     # One absolute deadline for connect, request, headers and body.
-    deadline = time.monotonic()+5
-    conn.response_class = lambda sock, **kwargs: http.client.HTTPResponse(_DeadlineSocket(sock, deadline), **kwargs)
+    conn.response_class = lambda sock, **kwargs: _FinalHTTPResponse(_DeadlineSocket(sock, deadline), **kwargs)
     response = None
     try:
         conn.request("GET", route)

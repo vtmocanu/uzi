@@ -273,12 +273,13 @@ def check_envelope(envelope):
     return reasons
 
 
-def check_enforced(envelope, mounts, applied):
+def check_enforced(envelope, mounts, applied, quota=None):
     """Observed enforced capacities against the approved envelope: byte capacities across all
     enforcing superblocks fit the aggregate, inode capacities fit the approved ceiling, and the
-    applied memory limit fits the memory limit with swap equal to it."""
+    applied memory limit fits the memory limit with Docker's combined memory-plus-swap
+    limit equal to it. memory_swap_max is normalized Docker semantics, not raw memory.swap.max."""
     reasons = []
-    caps = superblock_limits(mounts).values()
+    caps = superblock_limits(mounts, quota).values()
     if sum(b for b, _ in caps if b) > p.LIMITS["aggregate"]:
         _add(reasons, "enforced-capacity-exceeds-envelope")
     ceiling = envelope.get("inode_ceiling") if isinstance(envelope, dict) else None
@@ -290,7 +291,7 @@ def check_enforced(envelope, mounts, applied):
     # envelope and swap must equal it; "max", other non-integers and a missing swap are over-envelope.
     if isinstance(applied, dict) and "memory_max" in applied:
         memory, swap = applied["memory_max"], applied.get("memory_swap_max")
-        if not _is_int(memory) or memory > p.LIMITS["memory"] or not _is_int(swap) or swap != memory:
+        if not _is_int(memory, 1) or memory > p.LIMITS["memory"] or not _is_int(swap, 1) or swap != memory:
             _add(reasons, "enforced-capacity-exceeds-envelope")
     return reasons
 
@@ -417,12 +418,20 @@ def check_mounts(mounts, fds):
     return dict(reasons=reasons, accepted=accepted, kernel_memory=kernel_memory_accounting(mounts))
 
 
+def _sink_root(sinks, name):
+    seen = set()
+    while "parent" in sinks[name]:
+        require(name not in seen)
+        seen.add(name)
+        name = sinks[name]["parent"]
+    return name
+
+
 def _sink_sb(sinks, name):
-    s = sinks[name]
-    return _sink_sb(sinks, s["parent"]) if "parent" in s else s.get("superblock")
+    return sinks[_sink_root(sinks, name)].get("superblock")
 
 
-def superblock_limits(mounts):
+def superblock_limits(mounts, quota=None):
     limits = {}
     for m in mounts:
         opts = m.get("options") if isinstance(m.get("options"), dict) else {}
@@ -434,13 +443,19 @@ def superblock_limits(mounts):
         for n, v in enumerate((size, nodes)):
             if _is_int(v, 1) and (entry[n] is None or v < entry[n]):
                 entry[n] = v
+    if quota is not None:
+        # A writable-layer quota and a capacity on the same superblock describe one allocation.
+        # Project the larger ceiling conservatively, never their sum.
+        sb, size = quota
+        entry = limits.setdefault(sb, [None, None])
+        entry[0] = max(entry[0] or 0, size)
     return limits
 
 
-def enforced_excess(sinks, mounts):
+def enforced_excess(sinks, mounts, quota=None):
     """Charges for the enforced capacity of each superblock beyond the sum of its declared sink
     charges, so a superblock projects max(declared, enforced) to the backing leg."""
-    limits = superblock_limits(mounts)
+    limits = superblock_limits(mounts, quota)
     declared = {}
     for name, s in sinks.items():
         if "parent" in s or outer_exempt(name, s):
@@ -541,12 +556,12 @@ def daemon_capability(daemon):
     limits = [daemon.get(k) for k in ("MemoryLimit", "SwapLimit", "PidsLimit")]
     # An explicit False contradicts the claim; an absent or non-boolean report is only missing.
     if (any(v is False for v in limits)
-            or (daemon.get("rootless") is True and daemon.get("CgroupDriver") == "cgroupfs")
-            or daemon.get("rootless") not in (True, False)):
+            or (daemon.get("rootless") is True and daemon.get("CgroupDriver") == "cgroupfs")):
         return ["daemon-capability-unsupported"]
     # Rootless with an unreported cgroup driver cannot be judged either way: missing, not supported.
     rootless_unknown = daemon.get("rootless") is True and type(daemon.get("CgroupDriver")) is not str
-    return ["daemon-info-missing"] if rootless_unknown or any(v is not True for v in limits) else []
+    return ["daemon-info-missing"] if (type(daemon.get("rootless")) is not bool
+                                        or rootless_unknown or any(v is not True for v in limits)) else []
 
 
 def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
@@ -565,6 +580,7 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
     real = facts.get("realpaths") if isinstance(facts.get("realpaths"), dict) else {}
     cov = {name: dict(bytes=False, inodes=False) for name in sinks}
     cov_sb, excl, domain_cov = {}, {}, set()
+    accepted_quota = None
     # Daemon-side sinks carry no container superblock; only a runtime fact that the permitted
     # workload has no incrementing operation on one (no pull, build or commit) bounds it.
     def trusted(*sections):
@@ -656,6 +672,7 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
                 continue
             if names[0] in sinks:
                 cov[names[0]]["bytes"] = True
+                accepted_quota = (_sink_sb(sinks, names[0]), applied["writable_layer_quota_bytes"])
         elif kind in ("tmpfs-size", "tmpfs-nr_inodes", "exclusive-finite-fs"):
             sb = claim.get("superblock")
             if type(sb) is not str or not in_sb(names, sb):
@@ -717,7 +734,7 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
         _add(reasons, "daemon-info-missing")
     for name, s in sinks.items():
         if "parent" in s:
-            cov[name] = dict(cov[s["parent"]])
+            cov[name] = dict(cov[_sink_root(sinks, name)])
     uncovered = dict(bytes=[], inodes=[], mounts=dict(bytes=[], inodes=[]))
     domain_need = {"process_tree": ("pids", "sink-pids-uncovered"), "memory": ("memory-swap", "sink-memory-swap-uncovered")}
     for name, s in sinks.items():
@@ -740,14 +757,23 @@ def evaluate_claims(claims, mounts, sinks, facts, require_collector=True):
                 if not got.get(resource):
                     uncovered["mounts"][resource].append(m["mount_id"])
                     _add(reasons, "sink-%s-uncovered" % resource)
-    return dict(covered=not reasons, reasons=reasons, notes=notes, coverage=cov, uncovered=uncovered)
+    return dict(covered=not reasons, reasons=reasons, notes=notes, coverage=cov, uncovered=uncovered,
+                accepted_quota=accepted_quota)
 
 
-def backing_check(charges, domains, soft, now):
+def backing_check(charges, domains, soft, now, deltas=None):
     """Each domain link must be observed (not merely cited), fresh, with known capacity and
     concurrent use; charges are summed once per domain via preflight.project_domains and the
     projection must stay strictly below soft x capacity for bytes and inodes."""
     require(type(charges) is dict and type(domains) is dict and _is_num(soft) and 0 < soft <= 1)
+    for charge in charges.values():
+        require(_is_int(charge["bytes"], 0) and _is_int(charge["inodes"], 1))
+    deltas = {} if deltas is None else deltas
+    require(type(deltas) is dict)
+    for delta in deltas.values():
+        require(_is_int(delta["bytes"], 0) and _is_int(delta["inodes"], 0))
+    # JSON sink names cannot collide with the independently keyed synthetic capacity deltas.
+    charges = {("sink", n): c for n, c in charges.items()} | {("delta", n): c for n, c in deltas.items()}
     reasons, samples = [], {}
     for charge in charges.values():
         require("domain" in charge)
@@ -777,7 +803,7 @@ def backing_check(charges, domains, soft, now):
             f_files=obs["capacity_inodes"],
             f_favail=max(0, obs["capacity_inodes"]-obs["used_inodes"]-obs["concurrent_inodes"]))
     known = {n: c for n, c in charges.items() if c["domain"] in samples}
-    for s, b, i in p.project_domains(known, samples).values():
+    for s, b, i in p.project_domains(known, samples, allow_zero_inodes=True).values():
         if not ((s.f_blocks-s.f_bavail)*s.f_frsize+b < soft*s.f_blocks*s.f_frsize
                 and s.f_files-s.f_favail+i < soft*s.f_files):
             _add(reasons, "backing-aggregate-exceeds-soft")
@@ -872,10 +898,11 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
             except (ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError):
                 legs[name] = grade(["malformed-section"], (), tiers)
         info = sections.get("mountinfo")
-        mount_facts = isinstance(info, dict) and type(info.get("mounts")) is list and type(info.get("fds")) is list
+        mount_facts = (isinstance(info, dict) and type(info.get("mounts")) is list and bool(info["mounts"])
+                       and type(info.get("fds")) is list)
         raw_sinks = sections.get("charge_map")
         sinks = raw_sinks.get("sinks") if isinstance(raw_sinks, dict) else None
-        threshold = {}
+        threshold, allocation = {}, {}
         pseudo_sink = isinstance(sinks, dict) and any(isinstance(s, dict) and "pseudo" in s for s in sinks.values())
 
         def binding():
@@ -921,6 +948,7 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
             # require_collector stays False here: evaluate() grades file evidence by tier
             # (FIXTURE-CONSISTENT at most) instead of refusing the claims outright.
             got = evaluate_claims(sections.get("claims"), info["mounts"], domain_sinks, facts, require_collector=False)
+            allocation["quota"] = got["accepted_quota"]
             return grade(got["reasons"], ("mountinfo", "runtime", "daemon", "charge_map", "claims"), tiers,
                          notes=got["notes"], uncovered=got["uncovered"])
 
@@ -935,15 +963,18 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
         def backing():
             if pseudo_sink:
                 return grade(["sink-pseudo-forbidden"], ("charge_map",), tiers)
-            if threshold.get("soft") is None:
+            if threshold.get("soft") is None or threshold.get("reasons"):
                 return grade(["backing-soft-unknown"], ("backing", "threshold", "charge_map"), tiers)
             if not mount_facts:
                 return grade(["no-container-mount-facts"], ("backing", "threshold", "charge_map", "mountinfo"), tiers)
             charges = {n: dict(bytes=s["bytes"], inodes=s["inodes"], domain=s["backing_domain"])
                        for n, s in sinks.items() if "parent" not in s}
-            charges.update(enforced_excess(sinks, info["mounts"]))
-            return grade(backing_check(charges, sections["backing"]["domains"], threshold["soft"], now),
-                         ("backing", "threshold", "charge_map", "mountinfo"), tiers)
+            quota = allocation.get("quota")
+            evidence = ("backing", "threshold", "charge_map", "mountinfo")
+            if quota is not None:
+                evidence += ("claims", "runtime", "daemon")
+            return grade(backing_check(charges, sections["backing"]["domains"], threshold["soft"], now,
+                                       enforced_excess(sinks, info["mounts"], quota)), evidence, tiers)
 
         run("binding", binding)
         run("threshold", thresh)
@@ -959,7 +990,9 @@ def evaluate(artifact, collector=None, now=None, head_revision=None, config_ts=N
             evidence = ("envelope",) + (("mountinfo",) if mount_facts else ()) + (("runtime",) if applied is not None else ())
             if mount_facts or applied is not None:
                 got += [r for r in check_enforced(sections.get("envelope"), info["mounts"] if mount_facts else [],
-                                                  applied) if r not in got]
+                                                  applied, allocation.get("quota")) if r not in got]
+            if allocation.get("quota") is not None:
+                evidence += ("claims", "charge_map", "daemon")
             return grade(got, evidence, tiers)
 
         run("envelope", envelope)
@@ -993,7 +1026,16 @@ def main(argv=None):
         artifact, status = None, "unreadable"
     result = evaluate(artifact, now=time.time(), head_revision=args.head_revision)
     result["artifact"] = status
-    print(p.encode(result))
+    try:
+        encoded = p.encode(result)
+    except ValueError:
+        # Refuse the entire expanded report; never truncate accounting and retain positive grades.
+        result = dict(schema=OUTPUT_SCHEMA, scope="prerequisite-evidence", qualified=False,
+                      verdict="NO-QUALIFIED-ENVIRONMENT", producer_launched=False, production_authorized=False,
+                      legs={name: grade(["report-limit"], (), {}) for name in LEGS}, collector=None,
+                      artifact=status)
+        encoded = p.encode(result)
+    print(encoded)
     return 0 if args.experimental or result["qualified"] else 2
 
 

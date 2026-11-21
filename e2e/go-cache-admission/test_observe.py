@@ -152,6 +152,7 @@ class Base(unittest.TestCase):
         """A fresh, valid out-dir name directly under SCRATCH; removed with the test."""
         path = p.SCRATCH/("go-cache-env-t"+os.urandom(6).hex())
         self.addCleanup(shutil.rmtree, path, True)
+        self.addCleanup((path.parent/("."+path.name+".lock")).unlink, missing_ok=True)
         return path
 
     def stub(self, images, **kw):
@@ -744,8 +745,10 @@ class LifecycleTests(Base):
 
     def test_out_dir_name_is_pinned_under_scratch(self):
         victims = [p.SCRATCH/("uzi-cmd-x"+os.urandom(4).hex()), p.SCRATCH/("snap-"+os.urandom(4).hex()),
-                   p.SCRATCH/"go-cache-env-UPPER", p.SCRATCH/("go-cache-env-"+"a"*33),
-                   p.SCRATCH/"go-cache-env-", p.SCRATCH/"go-cache-envx"]
+                   p.SCRATCH/("go-cache-env-UPPER"+os.urandom(6).hex()),
+                   p.SCRATCH/("go-cache-env-"+"a"*33+os.urandom(6).hex()),
+                   p.SCRATCH/("go-cache-env"+os.urandom(6).hex()),
+                   p.SCRATCH/("invalid-go-cache-env-"+os.urandom(6).hex())]
         daemon = self.stub([image("1")])
         for victim in victims:
             victim.mkdir()
@@ -852,7 +855,7 @@ class LifecycleTests(Base):
     def test_out_dir_api_refuses_a_fourth_entry_and_oversize_documents(self):
         api = self.outdir()
         od = o.OutDir.reset(api)
-        self.addCleanup(os.close, od.dfd)
+        self.addCleanup(od.close)
         od.write_doc("artifact.json", {"a": 1})
         with self.assertRaises(o.Refusal):
             od.write_doc("artifact.json", {"a": 2})
@@ -862,7 +865,6 @@ class LifecycleTests(Base):
             od.write_doc("verdict.json", {"big": "x"*MAX_DOC})
         self.assertEqual(sorted(os.listdir(api)), ["artifact.json"])
         log_fd = od.open_log()
-        self.addCleanup(os.close, log_fd)
         # A stray entry makes the next document the fourth: refused, and nothing is created.
         (api/"stray").write_text("x")
         with self.assertRaises(o.Refusal):
@@ -877,9 +879,8 @@ class LifecycleTests(Base):
 
     def test_out_dir_api_run_log_identity_check(self):
         od = o.OutDir.reset(self.outdir())
-        self.addCleanup(os.close, od.dfd)
+        self.addCleanup(od.close)
         log_fd = od.open_log()
-        self.addCleanup(os.close, log_fd)
         self.assertTrue(od.verify_log((log_fd,)))
         other = os.open(self.root/"other", os.O_WRONLY | os.O_CREAT, 0o600)
         self.addCleanup(os.close, other)

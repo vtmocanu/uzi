@@ -28,6 +28,7 @@ if HERE not in sys.path:  # python -I leaves the script directory off sys.path
 
 import argparse
 import copy
+import fcntl
 import hashlib
 import http.client
 import json
@@ -133,8 +134,15 @@ def _open_scratch():
 
 class OutDir:
     """The report directory: run.log plus at most the two JSON documents, nothing else."""
-    def __init__(self, path, dfd):
-        self.path, self.dfd, self.log_fd = path, dfd, None
+    def __init__(self, path, dfd, lock_fd):
+        self.path, self.dfd, self.log_fd, self.lock_fd = path, dfd, None, lock_fd
+
+    def close(self):
+        for key in ("log_fd", "dfd", "lock_fd"):
+            fd = getattr(self, key)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, key, None)
 
     @classmethod
     def reset(cls, raw):
@@ -148,7 +156,20 @@ class OutDir:
             sfd = _open_scratch()
         except OSError:
             raise Refusal("out-dir-invalid") from None
+        lock_fd = None
         try:
+            # The stable sibling inode is never unlinked by a collector: unlinking a locked inode
+            # would let a third process acquire a replacement while the second still holds it.
+            lock_fd = os.open("."+name+".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                              0o600, dir_fd=sfd)
+            lock_stat = os.fstat(lock_fd)
+            if (not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1
+                    or lock_stat.st_uid != os.geteuid() or lock_stat.st_mode & 0o077):
+                raise Refusal("out-dir-invalid")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refusal("out-dir-busy") from None
             try:
                 try:
                     st = os.stat(name, dir_fd=sfd, follow_symlinks=False)
@@ -173,9 +194,13 @@ class OutDir:
                 dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sfd)
             except OSError:
                 raise Refusal("out-dir-invalid") from None
+        except BaseException:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            raise
         finally:
             os.close(sfd)
-        return cls(path, dfd)
+        return cls(path, dfd, lock_fd)
 
     def _create(self, name):
         if len(os.listdir(self.dfd)) >= ENTRY_CAP:
@@ -381,6 +406,8 @@ def daemon_section(version, info, counts=None):
     v = version if isinstance(version, dict) else {}
     i = info if isinstance(info, dict) else {}
     options = i.get("SecurityOptions")
+    options_complete = (type(options) is list and len(options) <= 32
+                        and all(type(option) is str and len(option) <= 256 for option in options))
     names = {o.split(",")[0] for o in (options[:32] if type(options) is list else [])
              if type(o) is str and len(o) <= 256}
     driver_raw = None
@@ -414,7 +441,8 @@ def daemon_section(version, info, counts=None):
         PidsLimit=tri(i.get("PidsLimit")),
         LoggingDriver=fields["LoggingDriver"][1],
         DefaultRuntime=fields["DefaultRuntime"][1], RuncVersion=runc,
-        rootless="name=rootless" in names, seccomp="name=seccomp" in names)
+        rootless=True if "name=rootless" in names else (False if options_complete else None),
+        seccomp=True if "name=seccomp" in names else (False if options_complete else None))
 
 
 # ---- host-only Go coordinates ---------------------------------------------------------------
@@ -456,7 +484,8 @@ def first_line(raw):
     finally:
         os.close(fd)
     try:
-        return data.split(b"\n", 1)[0].decode("ascii")
+        line, newline, _ = data.partition(b"\n")
+        return line.decode("ascii") if newline or len(data) <= 4096 else ""
     except UnicodeDecodeError:
         return ""
 
@@ -495,9 +524,13 @@ class LiveObserver:
         self.monotonic = monotonic
         self.sections, self._id = None, None
 
-    def _get(self, route):
+    def _get(self, route, deadline):
         try:
-            return p.docker_get(self.endpoint, route)
+            remaining = deadline-self.monotonic()
+            p.require(remaining > 0)
+            result = p.docker_get(self.endpoint, route, timeout=remaining)
+            p.require(self.monotonic() <= deadline)
+            return result
         except FETCH_ERRORS:
             raise Refusal("docker-unavailable") from None
 
@@ -529,7 +562,7 @@ class LiveObserver:
     def observe(self):
         deadline = self.monotonic()+COLLECT_SECONDS
         counts = dict(refs=0, ids=0, daemon=0)
-        version, info = self._get("/version"), self._get("/info")
+        version, info = self._get("/version", deadline), self._get("/info", deadline)
         ident = info.get("ID") if isinstance(info, dict) else None
         if type(ident) is not str or not 0 < len(ident) <= 256:
             raise Refusal("daemon-id-missing")
@@ -537,7 +570,7 @@ class LiveObserver:
         daemon = daemon_section(version, info, counts)
         # Under the containerd snapshotter the image Id is the index digest, else the config digest.
         id_kind = "index" if daemon["DriverType"] == "io.containerd.snapshotter.v1" else "config"
-        listing = self._get("/images/json")
+        listing = self._get("/images/json", deadline)
         if type(listing) is not list:
             raise Refusal("docker-unavailable")
         if len(listing) > MAX_IMAGES:
@@ -558,7 +591,7 @@ class LiveObserver:
         for image_id in ids:
             if self.monotonic() > deadline:
                 raise Refusal("docker-unavailable")
-            meta = self._get("/images/"+image_id+"/json")
+            meta = self._get("/images/"+image_id+"/json", deadline)
             if not isinstance(meta, dict) or meta.get("Id") != image_id:
                 counts["ids"] += 1
                 continue
@@ -742,12 +775,22 @@ def main(argv=None, *, clock=time.time, hook=None):
         validate_out_dir(args.out_dir)
     except Refusal as refusal:
         return refuse(out, err, refusal.code)
+    od = None
     try:
         od = OutDir.reset(args.out_dir)
         od.open_log()
         od.redirect()
     except (Refusal, OSError) as failure:
+        if od is not None:
+            od.close()
         return refuse(out, err, getattr(failure, "code", "out-dir-invalid"))
+    try:
+        return _finish(args, od, out, err, clock, hook)
+    finally:
+        od.close()
+
+
+def _finish(args, od, out, err, clock, hook):
     previous = sys.excepthook
     sys.excepthook = lambda kind, exc, tb: err.write(trace_text(exc))
     code, reason, verdict_name = EXIT_REFUSED, "internal-error", "none"

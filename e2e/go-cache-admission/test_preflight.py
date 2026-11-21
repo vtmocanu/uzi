@@ -16,6 +16,17 @@ from unittest.mock import patch
 import preflight as p
 
 
+def read_request_headers(conn):
+    """Bounded stub request read; EOF is a disconnect, never a completed request."""
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < 8192:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return None
+        data += chunk
+    return data if b"\r\n\r\n" in data else None
+
+
 class PreflightTests(unittest.TestCase):
     def setUp(self):
         p.SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -180,12 +191,9 @@ class PreflightTests(unittest.TestCase):
                 for _ in range(2):
                     with server.accept()[0] as conn:
                         conn.settimeout(2)
-                        data = b""
-                        while b"\r\n\r\n" not in data and len(data) < 8192:
-                            chunk = conn.recv(1024)
-                            if not chunk:
-                                break
-                            data += chunk
+                        data = read_request_headers(conn)
+                        if data is None:
+                            return
                         requests.append(data)
                         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
             except Exception as error:
@@ -226,9 +234,8 @@ class PreflightTests(unittest.TestCase):
                 with conn:
                     conn.settimeout(2)
                     try:
-                        data = b""
-                        while b"\r\n\r\n" not in data and len(data) < 8192:
-                            data += conn.recv(1024)
+                        if read_request_headers(conn) is None:
+                            return
                         send(conn, stop, end)
                     except OSError:
                         pass
@@ -329,9 +336,8 @@ class PreflightTests(unittest.TestCase):
                 with conn:
                     conn.settimeout(2)
                     try:
-                        data = b""
-                        while b"\r\n\r\n" not in data and len(data) < 8192:
-                            data += conn.recv(1024)
+                        if read_request_headers(conn) is None:
+                            return
                         conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n"
                                      b"Connection: close\r\n\r\nbody")
                     except OSError:

@@ -71,8 +71,9 @@ authenticated proof of live worker configuration. A wellformed manifest emits
 UNVERIFIED with shape_valid and calculated_soft facts; the label never proves
 live configuration. Never put secrets in inputs.
 
-The source digest starts with VERSION bytes, then sorted depth-first src file
-relative path, NUL, contents, NUL. Facts include file count, content bytes,
+The v2 source digest starts with a domain separator and length-prefixed VERSION
+bytes, followed by deterministic src-file paths and content digests, each length-prefixed.
+Facts include file count, content bytes,
 aggregate SHA256 and VERSION SHA256. Inventory caps: 20,000 directory/file
 entries checked during streaming directory enumeration before retaining names,
 256 MiB content, 1 KiB VERSION, 10 seconds checked between entries and reads.
@@ -80,8 +81,9 @@ Only small regular fixtures are unit tested. Concurrent replacement or special
 filesystem behavior is not an attested snapshot; no hostile-filesystem guarantee.
 Installed host source is not proof of the Go version/source inside an image.
 
-Docker body reads are capped at 64 KiB with two-second socket waits and a
-five-second body deadline; HTTP parsing also uses Python's finite header limits.
+Docker body reads are capped at 64 KiB with socket waits of at most two seconds and a
+five-second deadline across connect, request, headers and body. Interim 1xx responses
+are refused, so they cannot bypass the final-response header cap.
 Daemon version matching proves only endpoint identity observations.
 Image matching proves only local metadata, not runtime use or quotas.
 No arbitrary response fields are emitted. A bounded local AF_UNIX HTTP stub tests both fixed routes and Host: localhost;
@@ -170,6 +172,10 @@ backing, canary), each with `status`, `reason` and the full `reasons` list.
 Statuses: PROVEN, NEGATIVE (a contradiction), UNVERIFIED (missing or unproven evidence),
 FIXTURE-CONSISTENT (consistent, but only file-sourced evidence).
 
+If complete mount-accounting output would exceed 64 KiB, the CLI emits a small
+NO-QUALIFIED-ENVIRONMENT report with every leg UNVERIFIED `report-limit` instead.
+It does not truncate mount records and retain positive grades.
+
 ### Evidence tiers
 
 Whatever a file claims about its own provenance is ignored: file values reach at most
@@ -240,7 +246,7 @@ CLI or `evaluate()` path.
 | readonly-rootfs | write-deny | sink realpath resolves by longest prefix to the read-only root mount |
 | pids-max | pids | process tree only; limit observed applied |
 | log-driver-none | logs | container_logs only; driver observed `none` |
-| memcg-max-eq-swap | memory-swap | outer memory domain only; memory max equals swap max |
+| memcg-max-eq-swap | memory-swap | outer memory domain only; Docker's applied combined memory-plus-swap limit equals its positive memory limit |
 
   Codes: `boundary-resource-missing`, `-unknown`, `-mismatch`, `boundary-sink-out-of-scope`,
   `boundary-removable` (privileged, CAP_SYS_ADMIN for mount claims, writable cgroupfs or
@@ -289,13 +295,25 @@ CLI or `evaluate()` path.
   when sink ceilings on one superblock exceed its limit, `domain-alias-split` when sinks
   on one superblock claim different backing domains; a child charged inside its parent
   counts once.
+- Inventory and dependencies: an empty mount inventory is missing evidence, even with a
+  well-formed empty fd list. An empty fd list is valid when mounts were observed.
+  Child coverage resolves through the final root ancestor, independent of JSON key order.
+  Backing headroom uses a threshold only when it has no stale, contradictory or missing-evidence
+  reasons. Synthetic enforced-capacity deltas may have zero additional inodes; declared sinks
+  still require positive inode charges. Deltas and user-named sinks occupy separate key spaces.
+  An accepted writable-layer quota contributes to envelope and backing projection; a quota and
+  capacity record for the same superblock use the larger ceiling once, not their sum. The quota's
+  runtime, claim and mapping inputs participate in evidence grading.
 - envelope: `envelope-drift` unless limits equal preflight.LIMITS exactly;
   `inode-ceiling-unapproved` unless `owner_approved` is true;
   `enforced-capacity-exceeds-envelope` (NEGATIVE) when observed enforced byte capacities
   summed over all enforcing superblocks exceed the aggregate, enforced inode capacities exceed
   the approved ceiling, or the applied memory max is unlimited (`max`) or any non-integer, exceeds
-  the memory limit, or the applied swap max is absent or differs from it (memory must equal
-  memory-swap). The memory check runs whenever `runtime.applied` is present, with or without mount
+  the memory limit, or the applied swap max is absent or differs from it. Both must be positive.
+  `runtime.applied.memory_swap_max` is the Docker combined memory-plus-swap limit,
+  not the raw cgroup-v2 swap-only `memory.swap.max`: a future collector reading that
+  kernel file must verify zero swap and normalize the combined value before supplying it.
+  The memory check runs whenever `runtime.applied` is present, with or without mount
   facts; an absent applied section stays `limits-not-applied-observed` (UNVERIFIED) on enforcement.
   The leg's evidence names the sections that contributed (envelope, plus mountinfo and runtime
   when used), so its tier is mixed when a collector supplied those and the envelope came from the
@@ -355,15 +373,18 @@ python3 -B -I e2e/go-cache-admission/observe.py --endpoint /abs/docker.sock \
 - Requests are GET only, on `/version`, `/info`, `/images/json` and
   `/images/sha256:<id>/json` for IDs from that listing. Never `/containers/*`, never a POST.
   More than 64 listed images is a refusal; `--image` may only narrow to an ID in the listing.
-  The daemon collection has a 90 second budget on top of the per-request caps: 64 KiB of body,
+  The daemon collection has a 90 second total budget as well as the per-request caps: 64 KiB of body,
   16 KiB of status line and headers, and one absolute 5 s deadline covering connect, request,
-  headers and body (a trickling header phase is refused). The optional host-side hashing and
+  headers and body (a trickling header phase is refused). Every request, including the initial
+  routes, receives the remaining collection budget, and a result arriving after it is refused.
+  The optional host-side hashing and
   inventory (`--go-root`, `--go-binary`) runs outside that 90 second budget and has its own bounds
   (binary at most 512 MiB and 60 s, inventory at most 256 MiB, 20000 entries and 10 s).
 - Daemon fields kept: ServerVersion, Os, Arch, KernelVersion, Driver, DriverType (the
   `driver-type` DriverStatus value), CgroupVersion, CgroupDriver, MemoryLimit, SwapLimit,
   PidsLimit, LoggingDriver, DefaultRuntime, RuncVersion (Runtimes annotations, when present),
-  `rootless` and `seccomp` (booleans from SecurityOptions). Each string must match a short fixed
+  `rootless` and `seccomp` (booleans from SecurityOptions; an unobserved option is null when the list
+  is missing, malformed or truncated). Each string must match a short fixed
   pattern or allowlist, or is dropped to null. Os, Arch, Driver, DriverType, CgroupVersion,
   CgroupDriver, LoggingDriver and DefaultRuntime must equal an entry of an exact allowlist
   (for example CgroupDriver is `cgroupfs` or `systemd`, DriverType is
@@ -409,8 +430,14 @@ Output lifecycle (the order is part of the contract):
 1. The `--out-dir` (default `.uzi/scratch/go-cache-env`) is pinned: its parent must be exactly
    `.uzi/scratch` and its name `go-cache-env` or `go-cache-env-<1-32 of [a-z0-9-]>`, without
    symlink components or `..`; any other name is refused. `.uzi/scratch` must already exist
-   (the collector never creates it; a missing one is an `out-dir-invalid` refusal). It is validated, then deleted and
-   recreated before anything else, through descriptors walked from the filesystem root with
+   (the collector never creates it; a missing one is an `out-dir-invalid` refusal). After validation,
+   the collector takes a nonblocking exclusive lock on the stable sibling file
+   `.go-cache-env[-suffix].lock` before inspecting or resetting the report directory. A contender
+   refuses with `out-dir-busy` without altering the active report. The lock stays held through
+   final output and is released on exit. The empty lock file remains: unlinking a locked inode
+   would permit a competing replacement lock. It uses one setup/cleanup inode in approved scratch,
+   outside the three report files measured below; it is not allocation-enforcement evidence.
+   The directory is then deleted and recreated through descriptors walked from the filesystem root with
    `O_NOFOLLOW|O_DIRECTORY`. An existing out-dir is deleted only when it holds nothing but
    regular files named `run.log`, `artifact.json` and `verdict.json`; any other entry (a
    directory, a symlink, a foreign name) is an `out-dir-invalid` refusal that deletes nothing.
@@ -431,13 +458,18 @@ Output lifecycle (the order is part of the contract):
    inode, `st_nlink` at least 1), else exit 4.
 
 Exit codes: 2 NO-QUALIFIED-ENVIRONMENT (the normal result; 0 would mean qualified and does not
-occur in this issue), 3 refusal or failure (usage, `out-dir-invalid`, `docker-unavailable`,
+occur in this issue), 3 refusal or failure (usage, `out-dir-invalid`, `out-dir-busy`, `docker-unavailable`,
 `too-many-images`, `image-not-in-listing`, `daemon-id-missing`, `host-input-invalid`,
 `report-limit`, `internal-error`), 4 `run-log-mismatch`.
 
-Evidence copy step (done by the lead after a live run, not by the tool): copy exactly
-`artifact.json` and `verdict.json` from the out-dir to `e2e/go-cache-admission/evidence/`, then remove
-the scratch out-dir. `test_observe.py` pins that directory: it must exist and hold exactly those
+Evidence copy step (done by the lead after a live run, not by the tool): require exit 2 and
+both complete, parseable `artifact.json` and `verdict.json` from that same completed run.
+Validate the pair, including the binding, verdict, schema and sanitization, in a staging
+directory before replacing either committed file. On any failure keep the scratch output for
+diagnosis and leave both committed files unchanged. After validation copy exactly that pair
+to `e2e/go-cache-admission/evidence/`, then remove the scratch report directory. Keep its stable
+sibling lock inode; do not unlink it while another collector could be using the name.
+`test_observe.py` pins the evidence directory: it must exist and hold exactly those
 two files, each at most 64 KiB, with the sanitized key sets, a NO-QUALIFIED-ENVIRONMENT verdict,
 none of the forbidden strings and official-or-`repo-<12 hex>` repository names; the artifact is
 also re-evaluated through `qualify.evaluate` (no collector) and must stay unqualified with no

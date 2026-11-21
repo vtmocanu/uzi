@@ -1209,6 +1209,11 @@ class EvaluateTests(Base):
                 m["options"]["size"] = 1
         got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]
         self.assertEqual(reasons(got["backing"]), [])
+        declared = sum(s["bytes"] for s in art["charge_map"]["sinks"].values() if "parent" not in s)
+        # The enforced one-byte capacities fit, but the declared totals do not.
+        art["backing"]["domains"]["outer-A"]["observed"]["capacity_bytes"] = declared
+        got = q.evaluate(art, now=NOW, head_revision="a"*40)["legs"]
+        self.assertIn("backing-aggregate-exceeds-soft", reasons(got["backing"]))
 
     def test_backing_with_file_tier_mount_facts_is_not_proven(self):
         art = self.sized()
@@ -1302,6 +1307,8 @@ class EvaluateTests(Base):
 
     def test_unlimited_or_unpaired_applied_memory_exceeds_the_envelope(self):
         for name, update in (("max", dict(memory_max="max", memory_swap_max="max")),
+                             ("negative", dict(memory_max=-1, memory_swap_max=-1)),
+                             ("zero", dict(memory_max=0, memory_swap_max=0)),
                              ("non-integer", dict(memory_max="1g", memory_swap_max="1g")),
                              ("swap-absent", dict(memory_swap_max=None)),
                              ("swap-different", dict(memory_max=GIB, memory_swap_max=GIB+1))):
