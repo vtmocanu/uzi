@@ -2270,6 +2270,9 @@ type Service struct {
 	// right after it on the same transactional create paths: a non-nil error aborts the create
 	// before COMMIT, so the run and everything written with it roll back. Nil in production.
 	createBeforeCommitErrHook func(run store.Run) error
+	// onceFireSummaryAfterReadHook is a test-only seam in WriteOnceFireSummary: it runs with the
+	// schedule row lock held, after the ledger read and before the write. Nil in production.
+	onceFireSummaryAfterReadHook func()
 	// planCrossCheckAfterPreflightHook is a test-only seam in SubmitPlanCrossCheck: it runs right
 	// after the preflight transaction commits, before the checker child is created. Nil in production.
 	planCrossCheckAfterPreflightHook func()

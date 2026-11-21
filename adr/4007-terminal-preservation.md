@@ -418,7 +418,8 @@ The schedule row lock serializes concurrent admissions for one fire.
 **Summary writes.** Every once-sweep summary (the partial write, the held write
 and the completing advance) goes through one helper, `WriteOnceFireSummary`. It
 opens a short transaction with no forge I/O, sets `lock_timeout = '5s'` (a stuck
-admission yields a 55P03, treated as transient), takes the same
+admission ends the wait with a 55P03 or, as the helper's detached context is also
+5 seconds, with that context's deadline; both are treated as transient), takes the same
 `LockRunScheduleForUser FOR UPDATE` row lock as step 7, rechecks the epoch and
 `status = 'active'`, re-reads the ledger under that lock, composes Started from
 the ledger rows plus the caller's skips and capacity fields, and writes either
