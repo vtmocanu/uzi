@@ -413,8 +413,10 @@ func TestOnceFireConcurrentAdmissionsAtCapOneLiveDB(t *testing.T) {
 }
 
 // TestOnceFireConcurrentSameIssueLiveDB is a smoke test of concurrent same-issue creates: exactly one
-// run and one ledger row result. It cannot fail on the ledger: the pre-existing branch lock
-// serializes the creates (losers get ErrBranchInUse / ErrActiveRunExists) before the ledger is read.
+// run and one ledger row result. The branch lock serializes the creates and losers are normally
+// refused by the ledger read (ErrOnceFireCandidateRecorded); with that check removed the
+// one-active-run-per-issue gate (ErrActiveRunExists) still yields one run, so this test cannot
+// pin ledger dedupe.
 // Ledger dedupe is pinned by TestOnceFireAdmissionRecordsRunAndLedgerLiveDB (repeat of a recorded issue)
 // and TestOnceFireLedgerPkeyConflictMapsToRecordedLiveDB (the primary-key race).
 func TestOnceFireConcurrentSameIssueLiveDB(t *testing.T) {
