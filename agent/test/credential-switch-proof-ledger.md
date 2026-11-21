@@ -3725,8 +3725,8 @@ a summary with B after finishB.
 Fix (5288bdce6): `beginPlanSummary` captures the admitting authority
 (`admittedAuthority`) and `authorityCurrent()` refuses when it is no longer
 current, in the callback entry check and in the in-flight `allowed()`. Identity
-only: `summaryInputs` is unchanged. Changelog fragment
-changelog.d/29b991fd-650f-4bc3-92a9-7bf649a86988.md.
+only: `summaryInputs` is unchanged. The changelog fragment is in this
+PR (fragment id 29b991fd).
 
 Per-leaf results. Label: R = regression (red on base), C = characterization
 (passes on base behaviour or has no base-red record). "Individual fence" means
