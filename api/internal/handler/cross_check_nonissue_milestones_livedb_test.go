@@ -1,16 +1,19 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -138,29 +141,110 @@ func TestCrossCheckNonIssueMilestonesIssueRejectedLiveDB(t *testing.T) {
 	}
 }
 
-// H3: when the lead kind cannot be resolved (the workers service's database is gone) a
-// malformed non-issue candidate answers the 409 cross-check refusal, not a 400 and not a 503.
-// The worker-auth read goes through h.q on the healthy pool, so only the service's own pool is
-// closed.
-func TestCrossCheckNonIssueMilestonesKindLookupFaultLiveDB(t *testing.T) {
-	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
-	f := ccNIRouterFixture(t, "mr_rework")
-	sep, err := store.OpenPool(context.Background(), dsn)
-	if err != nil {
-		t.Fatal(err)
+// Only the lead-kind read fails; submission and worker authentication keep healthy stores.
+type ccNILeadKindFaultDB struct {
+	store.DBTX
+	reads atomic.Int32
+}
+
+func (s *ccNILeadKindFaultDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	if strings.HasPrefix(query, "-- name: GetRunOwnedByWorker :one\n") && s.reads.Add(1) == 1 {
+		return ccNILeadKindFaultRow{}
 	}
-	svc := workersvc.New(store.New(sep), f.h.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanCrossCheckMaxRevisions: 2})
+	return s.DBTX.QueryRow(ctx, query, args...)
+}
+
+type ccNILeadKindFaultRow struct{}
+
+func (ccNILeadKindFaultRow) Scan(...any) error {
+	return errors.New("injected lead-kind lookup failure")
+}
+
+// H3: a lead-kind lookup fault must stop before SubmitPlanCrossCheck's owned-run read.
+func TestCrossCheckNonIssueMilestonesKindLookupFaultLiveDB(t *testing.T) {
+	f := ccNIRouterFixture(t, "mr_rework")
+	fault := &ccNILeadKindFaultDB{DBTX: f.h.pool}
+	svc := workersvc.New(store.New(fault), f.h.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanCrossCheckMaxRevisions: 2})
 	svc.SetVault(f.h.vault)
-	svc.SetTxBeginner(sep)
+	svc.SetTxBeginner(f.h.pool)
 	f.h.wsvc = svc
-	sep.Close()
 	rec := f.submit(`[{"id":"","title":""}]`)
 	msg, reason := ccNIReason(t, rec)
 	if rec.Code != http.StatusConflict || msg != "cross-check refused" {
 		t.Fatalf("kind lookup fault: %d %s, want 409 cross-check refused", rec.Code, rec.Body.String())
 	}
+	if reads := fault.reads.Load(); reads != 1 {
+		t.Fatalf("owned-run reads=%d, want only the failed lead-kind read (no submit)", reads)
+	}
 	t.Logf("kind lookup fault answered %d %q reason=%q", rec.Code, msg, reason)
 	if rows, children, _ := f.cc(); rows != 0 || children != 0 {
 		t.Fatalf("faulted submit created rows=%d children=%d", rows, children)
+	}
+	// A second request proves submission was not disabled by the injected lookup failure.
+	if rec := f.submit(`[{"id":"","title":""}]`); rec.Code != http.StatusOK {
+		t.Fatalf("healthy submit after lookup fault: %d %s", rec.Code, rec.Body.String())
+	}
+	if rows, children, ms := f.cc(); rows != 1 || children != 1 || ms != "[]" {
+		t.Fatalf("healthy submit: rows=%d children=%d milestones=%s, want 1/1/[]", rows, children, ms)
+	}
+}
+
+func TestCrossCheckNonIssueMilestonesMalformedRetryDispositionLiveDB(t *testing.T) {
+	const legacy = `[{"id":"m1","title":"Legacy plan"}]`
+	for _, kind := range []string{"mr_rework", "task"} {
+		t.Run(kind, func(t *testing.T) {
+			f := ccNIRouterFixture(t, kind)
+			if rec := f.submit(legacy); rec.Code != http.StatusOK {
+				t.Fatalf("seed attempt: %d %s", rec.Code, rec.Body.String())
+			}
+			// Model the immutable attempt stored before non-issue candidates dropped milestones.
+			candidate := workersvc.PlanCrossCheckCandidate{PlanMd: "plan", Milestones: json.RawMessage(legacy),
+				RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s", BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff"}
+			for range 2 {
+				var err error
+				candidate, err = workersvc.NormalizePlanCrossCheckCandidate(candidate)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			digest, err := candidate.Digest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cliMustExec(t, f.h.pool, `UPDATE cross_checks SET milestones=$2::jsonb, candidate_digest=$3 WHERE lead_run_id=$1 AND round=1`, f.lead, string(candidate.Milestones), digest)
+			before, err := f.h.q.GetExactPlanCrossCheck(context.Background(), store.GetExactPlanCrossCheckParams{LeadRunID: f.lead, Round: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := f.submit(`[{"id":"m1"}]`)
+			if msg, reason := ccNIReason(t, rec); rec.Code != http.StatusBadRequest || msg != "invalid cross-check candidate" || reason != "candidate_invalid" {
+				t.Fatalf("malformed mismatching retry: %d %s, want 400 candidate_invalid", rec.Code, rec.Body.String())
+			}
+			if rec := f.submit(legacy); rec.Code != http.StatusOK {
+				t.Fatalf("matching legacy retry: %d %s", rec.Code, rec.Body.String())
+			}
+			after, err := f.h.q.GetExactPlanCrossCheck(context.Background(), store.GetExactPlanCrossCheckParams{LeadRunID: f.lead, Round: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before.Milestones, after.Milestones) || !bytes.Equal(before.CandidateDigest, after.CandidateDigest) {
+				t.Fatal("retry changed the immutable attempt identity")
+			}
+			if rows, children, _ := f.cc(); rows != 1 || children != 1 {
+				t.Fatalf("retries created rows=%d children=%d, want 1/1", rows, children)
+			}
+		})
+	}
+}
+
+func TestCrossCheckNonIssueMilestonesMalformedCanonicalRetryLiveDB(t *testing.T) {
+	f := ccNIRouterFixture(t, "mr_rework")
+	for range 2 {
+		if rec := f.submit(`[{"id":"m1"}]`); rec.Code != http.StatusOK {
+			t.Fatalf("canonical retry: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if rows, children, ms := f.cc(); rows != 1 || children != 1 || ms != "[]" {
+		t.Fatalf("canonical retries: rows=%d children=%d milestones=%s, want 1/1/[]", rows, children, ms)
 	}
 }

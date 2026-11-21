@@ -24,6 +24,7 @@ import (
 )
 
 var ErrCrossCheckRefused = errors.New("plan cross-check refused")
+var ErrCrossCheckCandidateInvalid = fmt.Errorf("%w: invalid candidate", ErrCrossCheckRefused)
 var ErrCrossCheckInterrupted = fmt.Errorf("%w: interrupted", ErrCrossCheckRefused)
 var ErrCrossCheckNoRow = fmt.Errorf("%w: no candidate", ErrCrossCheckRefused)
 var ErrCrossCheckRevisionsExhausted = fmt.Errorf("%w: revisions exhausted", ErrCrossCheckRefused)
@@ -145,10 +146,10 @@ func priorMatches(prior store.CrossCheck, generation int64, digest, legacyDigest
 }
 
 // priorMismatchError: a non-issue lead whose received milestones did not normalize was refused
-// before any lookup at base, so a non-matching prior keeps that refusal rather than "interrupted".
+// before any lookup at base, so a non-matching prior keeps its candidate-invalid disposition.
 func priorMismatchError(nonIssue, legacyOK bool) error {
 	if nonIssue && !legacyOK {
-		return ErrCrossCheckRefused
+		return ErrCrossCheckCandidateInvalid
 	}
 	return ErrCrossCheckInterrupted
 }

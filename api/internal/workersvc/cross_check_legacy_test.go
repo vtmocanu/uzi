@@ -70,8 +70,8 @@ func TestLegacyCrossCheckDigestAndPriorRules(t *testing.T) {
 	if !priorMatches(prior, 3, canonical, want) || priorMatches(prior, 4, canonical, want) || priorMatches(prior, 3, canonical, nil) {
 		t.Fatal("priorMatches: legacy digest accepted only with same generation and a legacy identity")
 	}
-	if !errors.Is(priorMismatchError(true, false), ErrCrossCheckRefused) || errors.Is(priorMismatchError(true, false), ErrCrossCheckInterrupted) {
-		t.Fatal("malformed non-issue mismatch must be a plain refusal")
+	if !errors.Is(priorMismatchError(true, false), ErrCrossCheckCandidateInvalid) || !errors.Is(priorMismatchError(true, false), ErrCrossCheckRefused) || errors.Is(priorMismatchError(true, false), ErrCrossCheckInterrupted) {
+		t.Fatal("malformed non-issue mismatch must preserve the candidate-invalid refusal")
 	}
 	if !errors.Is(priorMismatchError(true, true), ErrCrossCheckInterrupted) || !errors.Is(priorMismatchError(false, false), ErrCrossCheckInterrupted) {
 		t.Fatal("valid non-issue and issue mismatches stay interrupted")

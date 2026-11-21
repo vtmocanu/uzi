@@ -121,6 +121,10 @@ func (req *crossCheckVerdictRequest) UnmarshalJSON(raw []byte) error {
 }
 
 func crossCheckError(w http.ResponseWriter, err error) {
+	if errors.Is(err, workersvc.ErrCrossCheckCandidateInvalid) {
+		httpx.ErrorReason(w, http.StatusBadRequest, "invalid cross-check candidate", "candidate_invalid")
+		return
+	}
 	if errors.Is(err, workersvc.ErrCrossCheckRefused) {
 		reason := "cross_check_refused"
 		switch {
