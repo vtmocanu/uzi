@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -356,15 +357,25 @@ func TestOnceFireRetry_B_FinishedCandidateNeverRecreatedLiveDB(t *testing.T) {
 	fx.wantStarted(fx.lastFire(fx.row()), 96, 97)
 }
 
-// (c) 96 leaves the selector after its start (the label is removed through the cache path the
-// sweep reads) and a FRESH scheduler and service retry: 96's slot is still spent, so only 97
+// (c) 96 leaves the selector after its start (the label is removed through the normal forgesvc
+// path: forge first, then the cache the sweep reads) and a FRESH scheduler and service retry: 96's slot is still spent, so only 97
 // starts (not 97 and 98).
 func TestOnceFireRetry_C_SelectorRemovalKeepsSlotSpentLiveDB(t *testing.T) {
 	fx := newOnceRetryFx(t, 2)
 	fx.issues(96, 97, 98)
 	snap := fx.partialAt96(97)
-	if _, err := fx.q.RemoveCachedIssueLabel(fx.ctx, store.RemoveCachedIssueLabelParams{Label: "uzi", RepoID: fx.repo, ForgeIssueIid: 96}); err != nil {
+	// The normal label path: forgesvc removes the label on the forge first, then, only on forge
+	// success, from the cache the sweep reads.
+	issue96, err := fx.q.GetIssueByIID(fx.ctx, store.GetIssueByIIDParams{RepoID: fx.repo, ForgeIssueIid: 96})
+	if err != nil {
 		t.Fatal(err)
+	}
+	lf := &labelRemovalForge{}
+	if _, err := forgesvc.New(fx.q, nil, time.Second, nil).SetIssueLabel(fx.ctx, lf, 1, issue96, "uzi", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(lf.removed) != 1 || lf.removed[0] != 96 {
+		t.Fatalf("forge label removals = %v, want one for 96", lf.removed)
 	}
 	cands, err := fx.q.ListSweepCandidateIssues(fx.ctx, store.ListSweepCandidateIssuesParams{
 		RepoID: fx.repo, Selector: "label", Labels: []byte(`["uzi"]`), UziLabel: "uzi", MaxIssues: pgtype.Int4{Int32: 12, Valid: true},
@@ -770,4 +781,18 @@ func TestOnceFireRetry_Q_DeletedRunKeepsLedgerIdentityLiveDB(t *testing.T) {
 	if rows := fx.ledger(snap.FireEpoch); len(rows) != 2 {
 		t.Fatalf("ledger rows = %d, want 2", len(rows))
 	}
+}
+
+// labelRemovalForge is the forge half of regression (c): it records the label removals the
+// normal forgesvc path sends before it touches the cache.
+type labelRemovalForge struct {
+	forge.IssueTracker
+	removed []int64
+}
+
+func (f *labelRemovalForge) UpdateIssueLabels(_ context.Context, _ int64, iid int64, _, remove []string) error {
+	if len(remove) == 1 && remove[0] == "uzi" {
+		f.removed = append(f.removed, iid)
+	}
+	return nil
 }
