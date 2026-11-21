@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -155,7 +156,7 @@ function custodyRig(generation: number): CustodyRig {
   (client as unknown as { markInventoryGuardedClaimSettled: (r: string, g: number) => void })
     .markInventoryGuardedClaimSettled = (r, g) => { settled.push([r, g]); };
   const cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git: cache, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: "journal-key",
     unadoptedSettleRetryDelaysMs: [0, 0, 0],
   });

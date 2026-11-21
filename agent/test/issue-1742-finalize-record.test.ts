@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -96,7 +97,7 @@ it("rework-2464: authenticated legacy actual runner custody false still retains 
   const root = tmpRoot();
   const outbox = makeOutbox(root);
   await outbox.init();
-  const recovery = new RecoveryCoordinator({ recoveryRoot: root + "-recovery",
+  const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: root + "-recovery",
     workerToken: TOKEN, client, git, log: nullLogger() });
   roots.push(root + "-recovery");
   const pinned = await recovery.pin({ runId: RUN_A, sourceSha: "1".repeat(40),

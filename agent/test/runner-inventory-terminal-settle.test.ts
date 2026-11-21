@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -128,7 +129,7 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   };
   await git.fetchAgentBranch(bare, clone.path, branch, claim.run_id, { context });
   await git.markRecoveryCapture(bare, clone.path, branch, claim.run_id, attemptId);
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: token,
   });
   assert.ok(await coordinator.pin({
@@ -238,7 +239,7 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   const pinsBeforeFinal = generationPins();
   assert.notEqual(pinsBeforeFinal, "", "the uploaded generation has recovery pins");
   await freshRunner.resumePendingRecoveries(undefined, boot);
-  const inspector = new RecoveryCoordinator({
+  const inspector = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git: freshGit, log: nullLogger(), recoveryRoot: freshGit.recoveryRoot, workerToken: token,
   });
   const persisted = await inspector.inspect(claim.run_id);

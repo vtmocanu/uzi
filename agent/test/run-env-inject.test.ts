@@ -158,15 +158,26 @@ describe("only the lead lane receives run variables", () => {
     path.join("codex", "codex-executor.ts"),
   ]);
 
+  // Scan-needle consumers (PRD 4416 M2 exact-value scan): they search publishes for the registered forms of the
+  // secret values and never build an env. Allowed by name; the test below pins that none of them injects.
+  const NEEDLE_CONSUMERS = ["frozen-held.ts", "recovery.ts", "run-env-scan.ts", "terminal-preservation-lane.ts"];
+
   // runEnvProbe (env-probe.ts) is the unrelated environment probe, so match the variable names only.
   const RUN_ENV_MENTION = /\brunEnv\b|run_env|RunEnv(Claim|Var|Injection|Redact)|ClaimRunEnv|run-env-/;
 
   it("no other lane or launcher mentions run variables", () => {
     const offenders = walk(srcDir)
       .map((f) => path.relative(srcDir, f))
-      .filter((rel) => !ALLOWED_FILES.has(rel))
+      .filter((rel) => !ALLOWED_FILES.has(rel) && !NEEDLE_CONSUMERS.includes(rel))
       .filter((rel) => RUN_ENV_MENTION.test(fs.readFileSync(path.join(srcDir, rel), "utf8")));
     assert.deepEqual(offenders, []);
+  });
+
+  it("the scan-needle consumers never hand run variables to an env builder", () => {
+    for (const rel of NEEDLE_CONSUMERS) {
+      const text = fs.readFileSync(path.join(srcDir, rel), "utf8");
+      assert.doesNotMatch(text, /\b(buildSdkEnv|buildCommandEnv|foldRunEnv|RunEnvInjection)\b|\brunEnv\s*[:,)]/, rel);
+    }
   });
 
   it("the Codex app-server launch env and the chat, isolated and advice builders take no run variables", () => {

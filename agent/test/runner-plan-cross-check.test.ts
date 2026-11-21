@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -610,7 +611,7 @@ describe("U2 real runner checked gate", () => {
       };
       const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "checked-held-stop-"));
       const { log, warnings } = diagnosticLogger();
-      const recovery = new RecoveryCoordinator({ client: {
+      const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: {
         reserveRecoveryCapture: async () => { throw new Error("held stop must not capture"); },
         getRecoveryCaptureStatus: async () => { throw new Error("held stop must not query capture"); },
         uploadRecoveryBundle: async () => { throw new Error("held stop must not upload"); },
@@ -962,7 +963,7 @@ describe("U2 real runner checked gate", () => {
       releaseRecoveryCustody: async (id) => ({ run_id: id, released: true, holds_released: 1 }),
       listRecoveryHolds: async (id) => ({ run_id: id, holds: [] }),
     };
-    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+    const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git, log: nullLogger(),
       recoveryRoot: path.join(root, "recovery"), workerToken: "preparation-worker-fixture" });
     const held = holdGateAck(c.run_id, PLAN);
     const reserve = MessageBatcher.prototype.reserveCandidateTransport;

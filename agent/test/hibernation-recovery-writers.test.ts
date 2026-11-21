@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { RecoveryCoordinator } from "../src/recovery.js";
@@ -16,7 +17,7 @@ function coordinator(t: { after: (fn: () => void) => void; name: string }) {
   t.after(() => fx.cleanup());
   const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const client = new WorkerClient("http://127.0.0.1:1", "tok", "0.1.0-test", nullLogger());
-  return new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "tok" });
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "tok" });
 }
 
 it("a terminal recovery pass in flight when the latch lands is waited for by settle", async (t) => {

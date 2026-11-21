@@ -160,7 +160,7 @@ describe("Repos environment variables panel", () => {
     expect(within(panel).getByText("Sandbox base URL")).toBeTruthy();
     expect(within(panel).getByText("Pending deletion")).toBeTruthy();
     expect(panel.textContent).toContain("The agent can read every value, secret or not.");
-    expect(panel.textContent).toContain("Variables are set in the environment of every command a run executes.");
+    expect(panel.textContent).toContain("Variables are set in the environment of every command the repo’s agent runs execute (not review or isolated runs).");
     expect(panel.textContent).toContain("Secret values are redacted from run output and checked before anything is pushed.");
     expect(panel.textContent).not.toContain("not yet injected");
     expect(panel.textContent).toContain("does not revoke the credential; revoke it at the provider");
@@ -446,6 +446,9 @@ describe("Repos environment variables panel", () => {
     expect(await within(panel).findByText("secret version history is full")).toBeTruthy();
     expect(within(panel).getByRole("link", { name: "run-a" }).getAttribute("href")).toBe("/runs/run-a");
     expect(within(panel).getByRole("link", { name: "run-b" }).getAttribute("href")).toBe("/runs/run-b");
+    expect(panel.textContent).toContain("until the runs holding them end and their retained work is released (up to 24 hours after a run ends)");
+    expect(panel.textContent).toContain("you can still Disable or Delete a variable");
+    expect(panel.textContent).not.toContain("Finish or cancel them");
   });
 
   it("shows no run links when env_history_full names none", async () => {
@@ -457,6 +460,7 @@ describe("Repos environment variables panel", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
     expect(await within(panel).findByText("secret version history is full")).toBeTruthy();
     expect(within(panel).queryByRole("link")).toBeNull();
+    expect(panel.textContent).toContain("you can still Disable or Delete a variable");
   });
 
   it("shows the vault-locked message on a 409 vault_locked save", async () => {

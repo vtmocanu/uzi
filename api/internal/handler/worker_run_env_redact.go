@@ -32,8 +32,10 @@ func (h *Handler) runEnvRedactor() runEnvRedactor {
 
 // WorkerRunEnvRedact answers GET /api/worker/runs/{id}/run-env-redact (PRD #4416 M2). Worker
 // bearer authentication; the run must be the worker's user's and one this worker holds or last
-// held, else 404 (a deleted run is 404 too). {protected:false} when the run has no secret
-// receipt, otherwise every secret version it was delivered. 409 vault_locked when the owner's
+// held, or whose open recovery custody hold this worker took, else 404 (a deleted run is 404
+// too). {protected:false} when the run has no governing run (not a lead-lane run, not a
+// cross-check child) or its governing run has no secret receipt, otherwise every secret version
+// the governing run was delivered (a cross-check child: its lead's). 409 vault_locked when the owner's
 // vault is locked, 409 run_env_history_unavailable when a receipted version is missing or cannot
 // be opened. The body carries plaintext secrets: Cache-Control: no-store on every answer, and
 // nothing here logs it.

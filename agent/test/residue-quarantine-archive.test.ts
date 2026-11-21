@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
@@ -897,7 +898,7 @@ describe("a run that fails quarantined archives its committed work and releases 
 
   /** The harness leaves recovery disabled (no worker token); these tests need the real coordinator so a missing gate reaches the client. */
   function realRecovery(): RecoveryCoordinator {
-    return new RecoveryCoordinator({
+    return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client: client as unknown as RecoveryArchiveClient,
       git: harnessGit,
       log: nullLogger(),

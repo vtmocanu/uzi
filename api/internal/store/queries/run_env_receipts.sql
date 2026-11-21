@@ -54,6 +54,17 @@ LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_i
 WHERE rc.run_id = @run_id AND rc.secret
 ORDER BY rc.var_id, rc.rev;
 
+-- name: WorkerHoldsOpenCustodyForRun :one
+-- Whether the worker took an open recovery custody hold on the run (the redact maintenance route's
+-- second authorization, beside runs.worker_id). An inventory-guarded hold additionally requires
+-- the worker to still be its live holder on this run. Read-only; no generation or repo check.
+SELECT EXISTS (
+    SELECT 1 FROM recovery_custody_holds h
+    WHERE h.run_id = @run_id AND h.user_id = @user_id AND h.state = 'open'
+      AND h.original_worker_id = @worker_id
+      AND (NOT h.inventory_guarded OR (h.live_worker_id = @worker_id AND h.live_run_id = @run_id))
+)::boolean AS held;
+
 -- name: ListRunEnvRedactKeysForRun :many
 -- ListRunEnvRedactForRun without the ciphertext: the finish transaction's recompute.
 -- present is false when no row of the owner holds the version.
