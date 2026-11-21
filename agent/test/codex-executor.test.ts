@@ -36759,6 +36759,14 @@ describe("B2 cold approval model handoff", () => {
     assert.equal(rec(resumes[0]!.params).model, "gpt-6.1-sol");
     assert.equal(transport.requests.some(r => r.method === "thread/start"), false);
   };
+  const assertImplementationTurn = (transport: FakeTransport) => {
+    const turns = transport.requests.filter(r => r.method === "turn/start");
+    assert.equal(turns.length, 1, "only the implementation pair reaches turn/start");
+    const params = rec(turns[0]!.params);
+    assert.equal(params.threadId, saved);
+    assert.equal(params.model, "gpt-6.1-sol");
+    assert.equal(params.effort, "medium");
+  };
   const config: ClaimConfig = {
     default_model: "gpt-6.1-sol", default_model_source: "user_default",
     default_effort: "medium", default_effort_source: "user_default",
@@ -37090,6 +37098,7 @@ describe("B2 cold approval model handoff", () => {
       if (mode === "match") {
         assert.equal(result.phaseSwitchHeld, undefined);
         assert.equal(rig.epochs[2]!.transport.turnStartCount, 1);
+        assertImplementationTurn(rig.epochs[2]!.transport);
         assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
         assert.deepEqual(accounting.order, ["live:100", "replay:130", "cut", "live:190"]);
         const usage = lastResultModelUsage(emitted)!;
@@ -37154,6 +37163,7 @@ describe("B2 cold approval model handoff", () => {
       assertImplementationResume(active);
       if (replacement) assertImplementationResume(rig.epochs[1]!.transport);
       assert.equal(active.turnStartCount, 1);
+      assertImplementationTurn(active);
       assert.equal(active.requests.some(r => r.method === "thread/start"), false);
       const usage = lastResultModelUsage(emitted)!;
       assert.equal(rec(usage["gpt-6-astra"]).inputTokens, replacement ? 130 : 100);
