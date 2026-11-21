@@ -64,6 +64,9 @@ func newFleetFixture(t *testing.T) *fleetFixture {
 	connID := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		fx.userID, fmt.Sprintf("fleet-%s@e2e", fx.userID))
+	// Registered after pool.Close, so it runs first. Leftover queued runs and online workers are
+	// fleet-wide state that later LiveDB tests on the same database would otherwise see.
+	t.Cleanup(func() { dropFixtureUser(ctx, pool, fx.userID) })
 	mustExec(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, fx.userID, []byte{0x1})
@@ -433,5 +436,16 @@ func TestClaimRunConcurrentNoDoubleClaimLiveDB(t *testing.T) {
 		if n := fx.activeCount(w); n > 2 {
 			t.Fatalf("worker %s holds %d active runs, exceeding its cap of 2", w, n)
 		}
+	}
+}
+
+// dropFixtureUser removes everything a fixture user left behind (runs, workers, then the user and
+// its cascading connection and repo), best effort. The final UPDATE covers a user that could not be
+// deleted: it at least stops counting as ephemeral-opted-in.
+func dropFixtureUser(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID) {
+	_, _ = pool.Exec(ctx, `DELETE FROM runs WHERE user_id = $1`, userID)
+	_, _ = pool.Exec(ctx, `DELETE FROM workers WHERE user_id = $1`, userID)
+	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID); err != nil {
+		_, _ = pool.Exec(ctx, `UPDATE users SET ephemeral_workers_enabled = false WHERE id = $1`, userID)
 	}
 }
