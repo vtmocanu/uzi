@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -334,6 +335,14 @@ func (h *Handler) beginSizeTx(ctx context.Context) (pgx.Tx, error) {
 // AdminPutWorkerSize serves PUT /api/admin/worker-sizes/{name}: edit an existing size, or
 // create the size when no row has that name (201). A name that is not a well-formed size name
 // is a 400, since nothing could ever be stored under it.
+//
+// A request whose first If-None-Match value is exactly "*" is create-only: when the name
+// already exists the answer is 412 with reason size_exists and nothing is validated or written.
+// No ETags are issued, so any other If-None-Match value cannot match a current representation
+// (RFC 9110) and the request stays unconditional, including list forms such as `*, W/x`. The
+// existence check and the write are serialized by the advisory lock plus the READ COMMITTED
+// fresh snapshot of the row read taken after it, so two concurrent create-only PUTs for one
+// absent name yield one 201 and one 412.
 func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -384,6 +393,15 @@ func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("worker size read", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("If-None-Match")) == "*" {
+		// Create-only and the name exists: refuse before any validation or write.
+		slog.Info("worker size create-only refused", "size", name, "by_user_id", user.ID)
+		httpx.JSON(w, http.StatusPreconditionFailed, map[string]string{
+			"error":  "worker size " + name + " already exists",
+			"reason": "size_exists",
+		})
 		return
 	}
 	prev := rowSpec(row)
