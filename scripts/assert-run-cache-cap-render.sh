@@ -67,7 +67,7 @@ render() {
 # env_of <file> <name>: the controller container's env value, or "<absent>".
 env_of() {
   yq -r '.spec.template.spec.containers[] | select(.name == "controller") | .env
-    | map(select(.name == "'"$2"'")) | (if length == 0 then "<absent>" else .[0].value end)' "$1"
+    | map(select(.name == "'"$2"'")) | .[0].value // "<absent>"' "$1"
 }
 
 # expect <label> <file> <want-max> <want-frac>: exact values ("<absent>" for none).
