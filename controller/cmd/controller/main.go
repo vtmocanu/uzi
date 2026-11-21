@@ -148,6 +148,8 @@ func main() {
 		MemoryGuardMaxInterventions: cfg.WorkerMemoryGuardMaxInterventions,
 		GoBuildParallelism:          cfg.WorkerGoBuildParallelism,
 		GoMaxProcs:                  cfg.WorkerGoMaxProcs,
+		RunCacheCapMaxBytes:         cfg.WorkerRunCacheCapMaxBytes,
+		RunCacheCapFraction:         cfg.WorkerRunCacheCapFraction,
 		CrossCheckSlots:             cfg.WorkerCrossCheckSlots,
 		// The Codex uid-split worker profile (PRD #1493 M1): when on, the worker + seed-nix
 		// containers start as root with a short capability set so the image entrypoint can

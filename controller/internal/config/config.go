@@ -227,6 +227,14 @@ type Config struct {
 	WorkerGoBuildParallelism int
 	WorkerGoMaxProcs         int
 
+	// WorkerRunCacheCapMaxBytes / WorkerRunCacheCapFraction are the optional per-run cache
+	// cap settings (UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES / UZI_WORKER_RUN_CACHE_CAP_FRACTION),
+	// relayed byte-for-byte to the pod's UZI_RUN_CACHE_CAP_MAX_BYTES /
+	// UZI_RUN_CACHE_CAP_FRACTION. Unlike UZI_WORKER_MAX_CONCURRENT_RUNS there is no parse,
+	// trim or boot error: the worker parses them leniently. Empty means not rendered.
+	WorkerRunCacheCapMaxBytes string
+	WorkerRunCacheCapFraction string
+
 	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
 	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
 	// (UZI_WORKER_UID_SPLIT, default false). When on, the controller renders the
@@ -620,6 +628,10 @@ func loadWorkerSettings(cfg *Config) error {
 	if err := loadWorkerGoConcurrency(cfg); err != nil {
 		return err
 	}
+
+	// Per-run cache cap (#4576): relayed verbatim, no parsing here.
+	cfg.WorkerRunCacheCapMaxBytes = os.Getenv("UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES")
+	cfg.WorkerRunCacheCapFraction = os.Getenv("UZI_WORKER_RUN_CACHE_CAP_FRACTION")
 
 	cfg.WorkerMaxConcurrentRuns = 1
 	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_MAX_CONCURRENT_RUNS")); raw != "" {
