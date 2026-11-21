@@ -84,8 +84,8 @@ differences explain why the earlier numbers were set aside. The later numbers ar
    an order confound: the capped candidates read worse than A (B128's Anonymous rose from
    66.7 to 86.8 MiB between runs 1 and 2 while its contexts fell from 31.1 to 25.1 MiB). Its per-candidate
    `Private_Clean` also jumped to about 50 MiB, which was not understood yet.
-3. **Run 3.** Each candidate and rep ran on its own `CREATE DATABASE ... TEMPLATE` clone of the per-invocation template
-   clone (schema and fixture seeded once, `ANALYZE`d), two reps, Anonymous as the primary heap
+3. **Run 3.** Each candidate and rep ran on its own `CREATE DATABASE ... TEMPLATE` clone of the template
+   (then named `pm_template`; schema and fixture seeded once, `ANALYZE`d), two reps, Anonymous as the primary heap
    metric. Order effects disappeared (A, B128 and B32 reproduced to 0.0 MiB across reps). A
    `Private_Clean` jump of about 51 MiB still appeared on every candidate that evicts or
    recycles, and was first read as shared-buffer pages.
@@ -401,7 +401,8 @@ and `Pool.Acquire` destroys an expired idle connection instead of handing it out
   - Wide: one clone per cache size and plan mode.
   - Explain: one clone per jit mode and rep; a capture connection runs a real `ClaimRun` on
     it before the measured connection.
-  - The per-invocation template (`pm_<32-hex uuid>_tpl`) is still read by the validation pool,
+  - The template (`pm_template` in the recorded runs; `pm_<32-hex uuid>_tpl` per invocation in the
+    current harness) is still read by the validation pool,
     and discover mode runs on it. All clones share one server.
 - **The wide phase records other errors rather than failing**, so a wide run can complete
   with unexplained error rows.
@@ -541,7 +542,7 @@ Any JIT investigation is separate work, not done here.
 - **Clones are shared in some phases.** Memory uses one clone per candidate and rep, but
   latency and stress share one clone per round across candidates (later candidates inherit
   rolled-back-write and heartbeat-`UPDATE` bloat), cold shares one clone across all
-  candidates and reps, and the per-invocation template (`pm_<32-hex uuid>_tpl`) is still read by the validation pool
+  candidates and reps, and the template (`pm_template` in the recorded runs; `pm_<32-hex uuid>_tpl` per invocation now) is still read by the validation pool
   and discover mode. All clones share one server. The wide phase records other errors rather than failing.
 - **JIT mismatch between runs.** The headline latency run ran with `jit = off`; the
   normal-JIT memory run showed extra Anonymous memory. The 3.8% normal-JIT difference is on
