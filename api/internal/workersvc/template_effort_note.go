@@ -40,8 +40,10 @@ func hasWithheldTemplateEffort(rows []store.AgentTemplate, harness string) bool 
 // recordTemplateEffortOmittedNote appends the nonsecret status line to the run's feed and advances
 // runs.last_seq, returning the last_seq the claim payload must adopt. It follows
 // recordHarnessModelFallbackNote: best effort (any failure logs and returns startLastSeq), fenced on
-// the run's claim_generation so a stale re-assembly persists nothing, which is also what keeps it to
-// one line per claim generation.
+// the run's claim_generation so a stale re-assembly persists nothing. The fence rejects stale
+// generations only; it is not an idempotency key. One line per claim generation holds because the
+// only caller is assembleClaim, whose only caller (assembleAndFinishRunClaimRef) runs once per
+// ClaimRun commit, and ClaimRun advances claim_generation. A new caller must keep that property.
 func (s *Service) recordTemplateEffortOmittedNote(ctx context.Context, run store.Run, startLastSeq int32) int32 {
 	raw, err := json.Marshal(templateEffortOmittedPayload{
 		Event: templateEffortOmittedEvent,
