@@ -1971,8 +1971,18 @@ Design record: issue #4335 (epic #3873); target mock `prds/mockups/3873-overview
 Design record: issue #4209 (epic #3873).
 
 - Usage Runs counts only usage-bearing issue, task, prompt, job, and self_improve runs. Chat, judge, cross_check, mr_rework, and every ci_fix are excluded. Manual and automatic CI fixes remain indistinguishable without an immutable origin field. (AI-synced 2026-11-13)
+- Superseded by #4577: usage outcomes now count every terminal run kind except chat; Runs stays primary-only. (AI-synced 2026-11-21)
 - Usage outcomes count terminal primary work runs directly, including those without usage. Their failure details and both windows use the same primary-kind population. (AI-synced 2026-11-13)
-- Token and cost totals and subscription/unreported disclosure counts retain all non-chat helper spend. PR counts and cost per PR are unchanged. The API field names and JSON shape stay the same, and no stored run or usage values are rewritten. Both Overviews and the CLI explain the scope. (AI-synced 2026-11-13)
+- Token and cost totals and subscription/unreported disclosure counts retain all non-chat helper spend. PR counts and cost per PR are unchanged. The API field names and JSON shape stay the same, and no stored run or usage values are rewritten. The Overview card and the CLI explain the scope; the outcome bar carries its own caption. (AI-synced 2026-11-21)
+
+## Feature #4577: Outcomes count every run kind except chat
+
+Design record: issue #4577 (epic #3873, revises #4209 for outcomes).
+
+- Outcome figures (finished, completed, cancelled, plan rejected, base diverged, failed, fail origins, latest failure, completed since last failure, needs landing) count every terminal run kind except chat, via the SQL function `fn_outcome_kind`. Personal, factory and per-user, lifetime and last seven days. Chat runs are conversation sessions. (AI-synced 2026-11-21)
+- Numerator and denominator are the same population. Membership is by run status only; cross-check metadata (supersession, `approved_not_stored`, a negative verdict) never moves a run between buckets, and there is one row per run with no dedup against the parent run. Existing plan-rejected, base-diverged and cancelled exclusions are unchanged. (AI-synced 2026-11-21)
+- Runs (`run_count`) stays primary-only with recorded usage (#4209); cost and tokens are unchanged (all non-chat). (AI-synced 2026-11-21)
+- The Overview shows a caption under the outcome bar and a revised KPI note; `uzi admin usage --help` states that finished, failed and fail rate count every terminal run except chat. (AI-synced 2026-11-21)
 
 ## Feature #4345: Completion and cross-check states in the TUI
 

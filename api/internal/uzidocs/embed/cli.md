@@ -271,8 +271,8 @@ A few worth knowing:
   window (default `lifetime`).** The factory summary and per-user rows use
   the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
   self_improve) with recorded usage. Finished, failed and the failure rate
-  count terminal primary work runs, including runs without usage; failure rate
-  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  count every terminal run except chat (helper runs included), including runs
+  without usage; failure rate is failed runs divided by finished runs. Tokens and API-equivalent cost also
   include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
   excluded. Cost shows `$0.00` for metered zero and discloses runs without a
   cost estimate and unreported runs. Incomplete totals include recorded partial
