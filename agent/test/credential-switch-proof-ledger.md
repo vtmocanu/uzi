@@ -3849,23 +3849,85 @@ Attribution:
 - REST post bodies carry no epoch field (client.ts `postPlanSummary`,
   `postIntentSummary`): post-body attribution is UNCREDITED.
 
+Repair pass (459a299f3, 187208c46, after the cross-check):
+- Stage coverage. The P2 and I2 retained-consumer probes now also run at the
+  scope-assignment stages (before/after scope clear, and before/after scope
+  install when B is subscription) and at the Now publication stages
+  (before-Now-publish, after-Now-publish), besides executor publication
+  (before-publish, after-publish) and B preparation (before-prepare, login,
+  prepared). Observed stage lists: plan-unacked: scope stages, before-publish,
+  after-publish, before-Now-publish, after-Now-publish, before-prepare, login,
+  prepared; gated and retained intent: the same plus after-publishB and
+  after-finishB; preserve-only intent: scope stages, before-publish,
+  after-publish, before-Now-publish, after-Now-publish, before-prepare, login,
+  resume, policy-hold. Results are asserted at top level with the P2/I2
+  messages. The D6 diagnostic (both `summaryAllowed` flags removed and
+  `authorityCurrent` forced true) still reddens P2 first at after-publish
+  (inputs 1); the scope stages and before-publish stay refused under it (masked,
+  recorded), and the later stages, including the Now stages, are unobserved
+  because the assertion stops at the first failing stage.
+- The I4 follow-on execute is joined (bounded) in the fixture cleanup before
+  mocks are restored, and that join never replaces a failing test body's error.
+- Gates at 459a299f3: `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` EXIT 0
+  (`.uzi/scratch/gate-log.gNJ2af`); full test/codex-executor.test.ts 1979/1979,
+  671.1 s (`.uzi/scratch/gate-log.0pXZ4s`); `git diff --check` clean
+  (`.uzi/scratch/gate-log.zyBkM1`). At 187208c46 (cleanup-only test change): the
+  focused 'publication gates Now|plan summary|intent summary' selection 24/24
+  (`.uzi/scratch/gate-log.Di171j`), typecheck and lint clean.
+
+Not applicable (production-path reasons):
+- Plan production trigger at the barriers: the Runner is inside the switch, not
+  inside gatePlan, during publication; plan attempts use the retained callback.
+- Plan on the preserve-only path: that claim is pre-approved, so no plan gate or
+  plan summary runs (codex-executor.ts preApproved check).
+- Intent production trigger at the barriers: the intent launch runs once per
+  `runLeg`, before any in-place switch; intent attempts use the retained
+  unlaunched ownership.
+- Scope-install stages when B is api_key: production installs no operation
+  scope for an API-key B, so only the clear stages exist.
+
+Exact selections per row. Plan rows (P1a, P1b, P2, P3, P4) ran with
+`--test-name-pattern='plan summary'`; intent rows (I1a, I1b, I2, I3, I4) with
+`--test-name-pattern='intent summary'`, each in a scratch export of the named
+revision (`git archive <sha>`, `.uzi/scratch` created inside the export,
+agent/node_modules symlinked), from the export's `agent/`:
+`env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 --test-name-pattern=<pattern> test/codex-executor.test.ts`.
+The restored-green baselines for the same selections are
+`.uzi/scratch/gate-log.SbWMZY` (plan, a43bfe06b), `.uzi/scratch/gate-log.2VPhcS`
+(intent, 28222928c) and `.uzi/scratch/gate-log.24Um5g` (intent, c1b399b07).
+
 Timing (not a finding; no wait change is established):
-- Base 'publication gates Now': 2 tests, 8.1 s total (describe 3.34 s,
-  `.uzi/scratch/gate-log.QEGFlu`).
-- After: focused 'publication gates Now|plan summary|intent summary', 24 tests,
-  19.8 s at c1b399b07 (`.uzi/scratch/gate-log.FGj8Dj`) and 21.1 s at 28222928c
-  (`.uzi/scratch/gate-log.af2F7W`).
-- Whole M2 describe 151.0 s, 109 tests at 28222928c (`.uzi/scratch/gate-log.LGBnDk`)
-  against the 155.7 s, 88 tests at 3fdfe9127 above: different revisions, not a
-  controlled comparison.
-- Full file 1979 tests, 655 s at c1b399b07 (`.uzi/scratch/gate-log.W4dRoA`); no
-  pre-change full-file baseline was measured.
+- Matched selections, base 8be78a548 against 459a299f3, one sample each, node
+  v26.12.1, same worker:
+  - 'publication gates Now|plan summary|intent summary': base 11 tests, 6.65 s
+    (M2 suite 2.90 s, `.uzi/scratch/gate-log.OfniEz`); candidate 24 tests,
+    16.99 s (M2 suite 15.39 s, `.uzi/scratch/gate-log.eoDLII`).
+  - 'M2 actualRunner': base 96 tests, 124.6 s (suite 123.10 s,
+    `.uzi/scratch/gate-log.bmB3rE`); candidate 109 tests, 141.3 s (suite
+    139.74 s, `.uzi/scratch/gate-log.XFgV3M`), so about +16.6 s for 13 leaves.
+  - Single samples: noise is unmeasured.
+- Earlier, unmatched figures kept for the record: base 'publication gates Now'
+  alone 2 tests, 8.1 s (describe 3.34 s, `.uzi/scratch/gate-log.QEGFlu`); the
+  focused selection 19.8 s at c1b399b07 (`.uzi/scratch/gate-log.FGj8Dj`) and
+  21.1 s at 28222928c (`.uzi/scratch/gate-log.af2F7W`); M2 describe 151.0 s at
+  28222928c (`.uzi/scratch/gate-log.LGBnDk`).
+- Full file 1979 tests, 655 s at c1b399b07 (`.uzi/scratch/gate-log.W4dRoA`) and
+  671.1 s at 459a299f3; no pre-change full-file baseline was measured.
 - CI step/job time and critical path: unmeasured, landing evidence; queue, cache
   and rerun are not separated.
 
 Not credited or open:
-- Individual-fence proofs for P2, I2, I3 and I1b post isolation; post-body
-  attribution; I4 B-ordinal attribution.
+- Unmet acceptance clauses (individual targeted mutation proof): P2, I2 and I3
+  (fence matrix under the owner decision of 2026-11-21) and I1b post isolation
+  (outside that decision). The preserve-only and after-finishB intent
+  assertions were also not reached by any diagnostic. Combined removals are
+  diagnostic only and do not substitute for individual proof, so delivery is
+  partial and non-closing.
+- Post-body attribution (no epoch field on the REST summary posts) and I4
+  B-ordinal attribution (the follow-on frame characterizes a new Runner
+  flight's baseline; it does not prove delivered B attribution on the
+  transitioned claim).
+- Exact-head PR CI for the full agent suite is a landing obligation, not run here.
 - Reviewer N1: either half of the fix alone (entry check or in-flight
   `allowed()`) is unpinned; the post-await `allowed()` term is defence in depth.
 - Reviewer N4: a plan-gate ACK spanning a completed switch now drops that
