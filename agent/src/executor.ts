@@ -1065,8 +1065,8 @@ export interface ExecutorResult {
   walled?: { reason: string };
   /** PRD #3252 D8 (m4): phase verification failed before prompt release or a later init contradicted
    *  the admitted pair (a request may already have been admitted). The runner reads it in phasePublish to SKIP
-   *  finalization and enter the phase-switch worker hold (no push, no PR, no terminal report). Claude
-   *  lead lanes only; absent on every other result. */
+   *  finalization and enter the phase-switch worker hold (no push, no PR, no terminal report).
+   *  Codex also returns this for an unverified cold same-thread implementation handoff. */
   phaseSwitchHeld?: { cause: PhaseSwitchCause; requested: PhaseSettings; observed: PhaseSettings; phase: "plan" | "implement" };
   /** Disposition for every iteration sink outcome. The runner must skip finalization for either. */
   iterationParked?: { outcome: IterationParkOutcome };

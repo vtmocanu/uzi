@@ -138,7 +138,7 @@ import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, ClaimConfig, LeadConfigReportBody, MilestoneProgress } from "../src/protocol.js";
 import { LeadConfigReporter, leadConfigActive } from "../src/lead-config-report.js";
-import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
+import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit, type RunTurnRequest } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
@@ -464,8 +464,8 @@ class FakeTransport implements CodexTransport {
 
 // Default responder: root ids th-1 / tn-1, first child th-child / tn-child.
 function defaultResponder(c: ResponderCtx): unknown {
-  if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
-  if (c.method === "thread/resume") return { thread: { id: "resumed-1" } };
+  if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" }, model: rec(c.params).model };
+  if (c.method === "thread/resume") return { thread: { id: rec(c.params).threadId }, model: rec(c.params).model };
   if (c.method === "turn/start") return { turn: { id: c.turnStartCount === 1 ? "tn-1" : "tn-child" } };
   return {};
 }
@@ -1690,9 +1690,14 @@ function epochResponder(
   pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
 ): Responder {
   return (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") threadId = String(rec(c.params).threadId);
+      return { thread: { id: threadId }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       c.transport.push(threadStarted(threadId));
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId, turnId,
+        params: { threadId, turn: { id: turnId } } });
       pushFrames(c.transport, threadId, turnId);
       return { turn: { id: turnId } };
     }
@@ -1712,7 +1717,10 @@ function resumedEpochResponder(
   pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
 ): Responder {
   return (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") threadId = String(rec(c.params).threadId);
+      return { thread: { id: threadId }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       pushFrames(c.transport, threadId, turnId);
       return { turn: { id: turnId } };
@@ -30251,7 +30259,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
     }> };
     const cases = contract.request_cases.filter((c) => c.harness === "codex");
-    assert.equal(cases.length, 20, "all Codex request cases loaded");
+    assert.equal(cases.length, 24, "all Codex request cases loaded");
     const visited: string[] = [];
     const phases = new Set<string>();
     for (const c of cases) {
@@ -30272,7 +30280,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       const planPhase = c.phase === "plan";
       const rig = makeMultiEpochRig(planPhase ? [
         reporting(planEpoch, fields),
-        reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+        epochResponder("th-plan", "tn-impl", doneFrames),
       ] : [reporting(resumedEpochResponder("th-1", "tn-1", doneFrames), fields)]);
       const { ctx } = makeCtx({
         agents: leadRequestCaseAgents(c), config: c.config, leadConfig: reporter,
@@ -30309,7 +30317,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 20);
+    assert.equal(visited.length, 24);
     assert.deepEqual([...phases].sort(), ["implement", "plan"]);
   });
 
@@ -36610,4 +36618,124 @@ describe("Codex repeated actualRunner switching", () => {
     }
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
+});
+
+describe("B2 cold approval model handoff", () => {
+  const saved = "b2-saved-plan";
+  const config: ClaimConfig = {
+    default_model: "gpt-6.1-sol", default_model_source: "user_default",
+    default_effort: "medium", default_effort_source: "user_default",
+    plan_phase: { model: "gpt-6-astra", model_source: "user_planning_default",
+      effort: "high", effort_source: "user_planning_default" },
+  };
+  const plan = (): Responder => epochResponder(saved, "b2-plan", (t, th, tn) => {
+    t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+      .push(toolCall(1, "submit_plan", { plan_md: "bounded implementation" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn));
+  });
+  // Even a broken guard receives a bounded completion; failures must be assertions, not timeouts.
+  const implementation = (observed: unknown = "gpt-6.1-sol"): Responder => c => {
+    if (c.method === "thread/resume") {
+      c.transport.push(tokenUsageUpdated(saved, "b2-plan", { inputTokens: 100, totalTokens: 100 }));
+      return { thread: { id: rec(c.params).threadId }, ...(observed === null ? {} : { model: observed }) };
+    }
+    if (c.method === "turn/start") {
+      const tn = "b2-implement";
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId: saved, turnId: tn,
+        params: { threadId: saved, turn: { id: tn } } })
+        .push(tokenUsageUpdated(saved, tn, { inputTokens: 160, totalTokens: 160 },
+          { inputTokens: 60, totalTokens: 60 }))
+        .push(signalDone(saved, tn)).push(turnCompleted("completed", saved, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const approval = async () => ({ kind: "approve", selection: { status: "ok",
+    selection: { source: "own", exclusions: [] } } }) as never;
+
+  for (const mode of ["match", "mismatch", "missing", "unsafe"] as const) {
+    it(`approval ${mode}: verifies before iteration and attributes same-thread usage`, async () => {
+      const observed = mode === "match" ? "gpt-6.1-sol" : mode === "mismatch" ? "gpt-6-astra"
+        : mode === "unsafe" ? "unsafe model value" : null;
+      // Missing is explicit: do not let the faithful default responder supply model evidence.
+      const impl = implementation(observed);
+      const rig = makeMultiEpochRig([plan(), impl]);
+      let reports = 0;
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, reportIteration: async () => { reports++; } });
+      const exec = makeExecutor(rig, bindingOf(API_KEY));
+      const result = await withTimeout(exec.run(ctx), 5000, `B2 ${mode}`);
+      const first = rig.epochs[0]!.transport.requests.find(r => r.method === "turn/start")!;
+      assert.equal(rec(first.params).model, "gpt-6-astra");
+      assert.equal(rec(first.params).effort, "high");
+      const resumes = rig.epochs[1]!.transport.requests.filter(r => r.method === "thread/resume");
+      assert.equal(resumes.length, 1);
+      assert.equal(rec(resumes[0]!.params).threadId, saved);
+      assert.equal(rec(resumes[0]!.params).model, "gpt-6.1-sol");
+      assert.equal(rig.epochs[1]!.transport.requests.some(r => r.method === "thread/start"), false);
+      if (mode === "match") {
+        assert.equal(result.phaseSwitchHeld, undefined);
+        assert.equal(reports, 1);
+        const turns = rig.epochs[1]!.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(turns.length, 1);
+        assert.equal(rec(turns[0]!.params).model, "gpt-6.1-sol");
+        assert.equal(rec(turns[0]!.params).effort, "medium");
+        const usage = lastResultModelUsage(emitted)!;
+        assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100);
+        assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60);
+      } else {
+        assert.equal(result.phaseSwitchHeld?.phase, "implement");
+        assert.equal(result.phaseSwitchHeld?.cause, mode === "mismatch" ? "model_mismatch" : "malformed");
+        assert.equal(reports, 0);
+        assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+        assert.ok(exec.safety, "published candidate remains the safety owner");
+        assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined, "no implementation cut");
+      }
+    });
+  }
+
+  for (const replacement of [false, true]) {
+    it(`pending intent supersedes stale planning request on ${replacement ? "resumed_B" : "continued_A"}`, async () => {
+      const rig = makeMultiEpochRig([plan(), implementation(), implementation()]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let interrupt!: () => void;
+      let switches = 0;
+      let reports = 0;
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+        reportIteration: async () => { if (++reports === 1) interrupt(); },
+        attemptCodexCredentialSwitch: async () => {
+          switches++;
+          // The last dispatched request is deliberately still the planning request.
+          const state = exec as unknown as { lastRootRequest?: RunTurnRequest };
+          assert.equal(state.lastRootRequest?.phase, "plan");
+          assert.equal(state.lastRootRequest?.model, "gpt-6-astra");
+          if (!replacement) return "continued_A";
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          await lease.finishB(bounds);
+          return "resumed_B";
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, "B2 pre-dispatch switch");
+      assert.equal(result.phaseSwitchHeld, undefined);
+      assert.equal(switches, 1);
+      const active = rig.epochs[replacement ? 2 : 1]!.transport;
+      if (replacement) assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      const resume = active.requests.find(r => r.method === "thread/resume")!;
+      assert.equal(rec(resume.params).threadId, saved);
+      assert.equal(rec(resume.params).model, "gpt-6.1-sol");
+      assert.equal(active.turnStartCount, 1);
+      assert.equal(active.requests.some(r => r.method === "thread/start"), false);
+      const usage = lastResultModelUsage(emitted)!;
+      assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100);
+      assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "one implementation segment after replacement");
+    });
+  }
 });

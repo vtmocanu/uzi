@@ -23,8 +23,8 @@ export const CLAUDE_PHASE_MODELS_CAPABILITY = "claude_phase_models_v1";
 
 export interface LeadRequestInput {
   harness: "claude" | "codex";
-  /** Claude: phase "plan" with a claim `plan_phase` takes its model/effort key by key (a key the
-   *  claim omits keeps the implement result); otherwise, and for Codex, the phase is ignored. */
+  /** Phase "plan" takes claim `plan_phase` model/effort key by key; an omitted key
+   *  keeps the implement result, including its template/provider fallback. */
   phase: LeadPhase;
   config: ClaimConfig | null | undefined;
   /** The selected owner lead template's delivered model (assembleAgents' leadModel for Claude). */
@@ -60,9 +60,9 @@ export function resolveLeadRequest(input: LeadRequestInput): LeadRequest {
   }
   let effort = config?.default_effort as HarnessEffort | undefined;
   let effortSource: LeadEffortSource = config?.default_effort_source ?? "builtin";
-  // Planning phase (Claude only): each key is replaced by the claim's `plan_phase` value only when
+  // Planning phase: each key is replaced by the claim's `plan_phase` value only when
   // that key is present; an absent key keeps exactly the implement result above.
-  const planPhase = input.phase === "plan" && input.harness === "claude" ? config?.plan_phase : undefined;
+  const planPhase = input.phase === "plan" ? config?.plan_phase : undefined;
   if (planPhase?.model) {
     model = planPhase.model;
     // A claim that omits the source falls back to the implement source (what the claim declared

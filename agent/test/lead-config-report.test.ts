@@ -90,7 +90,7 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
         const ctx = { runId: "r", config: c.config, agents: templates,
           repoAgents: [{ name: "lead", description: "repo", prompt_body: "REPO ROOT MUST NOT WIN", model: "gpt-6-astra" }],
         } as unknown as RunContext;
-        for (const phase of ["plan", "implement"] as const) {
+        for (const phase of c.config.plan_phase ? [c.phase] : ["plan", "implement"] as const) {
           const selections = phase === "plan" ? [undefined] : [
             { source: "own" as const, exclusions: [] }, { source: "repo" as const, exclusions: [] },
           ];
@@ -100,7 +100,7 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
             }).buildRunRequest(ctx, phase, "p", "continuation", new AbortController().signal, selection);
             assert.equal(request.model, c.expect.model, `codex sent model ${c.id} ${phase}`);
             assert.equal(request.effort, c.expect.effort, `codex sent effort ${c.id} ${phase}`);
-            assert.equal(request.modelSource, c.config.default_model ? "worker_default" : undefined, c.id);
+            assert.equal(request.modelSource, (c.phase === "plan" && c.config.plan_phase?.model || c.config.default_model) ? "worker_default" : undefined, c.id);
             if (selected) assert.ok(request.systemPrompt.includes(selected.prompt_body), c.id);
             assert.ok(!request.systemPrompt.includes("REPO ROOT MUST NOT WIN"), c.id);
             assert.equal(request.resumeSessionId, "continuation", c.id);
@@ -128,8 +128,8 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
       visited.add(c.id);
     }
     assert.deepEqual([...visited].sort(), LEAD_REQUEST_CASES.map((c) => c.id).sort());
-    assert.equal(LEAD_REQUEST_CASES.length, 45);
-    assert.equal(visited.size, 45, "all shared request cases exercised");
+    assert.equal(LEAD_REQUEST_CASES.length, 49);
+    assert.equal(visited.size, 49, "all shared request cases exercised");
   });
 
   it("a plan_phase model without model_source falls back to the implement source, not builtin", () => {
@@ -142,18 +142,18 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
     assert.equal(r.modelSource, "user_default");
   });
 
-  it("a Codex config with plan_phase ignores it in the plan phase", () => {
+  it("a Codex config resolves the planning pair independently from implementation", () => {
     const config: ClaimConfig = {
       default_model: "gpt-6-astra", default_model_source: "user_default",
       default_effort: "low", default_effort_source: "user_default",
-      plan_phase: { model: "opus", effort: "high", model_source: "user_planning_default", effort_source: "user_planning_default" },
+      plan_phase: { model: "gpt-6.1-sol", effort: "high", model_source: "user_planning_default", effort_source: "user_planning_default" },
     };
     const base = { harness: "codex" as const, config, providerDefaultModel: "gpt-6.1-sol" };
     const plan = resolveLeadRequest({ ...base, phase: "plan" });
-    assert.deepEqual(plan, resolveLeadRequest({ ...base, phase: "implement" }));
-    assert.equal(plan.model, "gpt-6-astra");
-    assert.equal(plan.effort, "low");
-    assert.equal(plan.effortSource, "user_default");
+    assert.equal(resolveLeadRequest({ ...base, phase: "implement" }).model, "gpt-6-astra");
+    assert.equal(plan.model, "gpt-6.1-sol");
+    assert.equal(plan.effort, "high");
+    assert.equal(plan.effortSource, "user_planning_default");
   });
 
   it("a blank claim model falls back to the template (|| not ??), and nothing resolves to no model", () => {
