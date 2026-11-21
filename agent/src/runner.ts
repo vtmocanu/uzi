@@ -1,3 +1,4 @@
+import { runEnvRedactionForms } from "./run-env-forms.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
@@ -6338,6 +6339,9 @@ export class RunRunner {
     // this registration (with the redactors' below) is the only protection for it.
     // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
     if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
+    // PRD #4416 M2: the forms of every secret run variable (live and older versions), rebuilt from each
+    // claim and evicted with the other per-run secrets at terminal. Plain variables are not registered.
+    runScopedSecrets.push(...runEnvRedactionForms(claim.secrets.run_env, claim.secrets.run_env_redact));
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -13891,6 +13895,7 @@ export class RunRunner {
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
       ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []),
+      ...runEnvRedactionForms(claim.secrets.run_env, claim.secrets.run_env_redact),
       this.joinToken,
       gitBasic,
     ];
@@ -17272,6 +17277,8 @@ export class RunRunner {
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
       ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
+      // PRD #4416 M2: the run's user variables, for the lead lane's env builders.
+      ...(claim.secrets.run_env && claim.secrets.run_env.length > 0 ? { runEnv: claim.secrets.run_env } : {}),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips

@@ -33,6 +33,7 @@ import type {
   ReviewCommentsSnapshot,
   RunKind,
   ClaimProviderBinding,
+  ClaimRunEnvVar,
 } from "./protocol.js";
 import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
 import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
@@ -328,6 +329,9 @@ export interface RunContext {
   /** PRD #4320 module 5/6: the decoded provider binding of a provider-bound run (exclusive with
    *  `oauthToken`). Every Claude spawn of the run builds its env from it, never from an OAuth token. */
   provider?: ClaimProviderBinding;
+  /** PRD #4416 M2: the run's user environment variables (decoded claim `run_env`). Read by the lead
+   *  lane's env builders only; chat, cross-check, advice, job, judge and review lanes never see it. */
+  runEnv?: ClaimRunEnvVar[];
   /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
    *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
   credential?: () => Readonly<{ token: string; ordinal: number }>;

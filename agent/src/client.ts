@@ -15,6 +15,7 @@ import type { PublicationIntentRequest, PublicationIntentResult } from "./public
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
+import { decodeRunEnvClaim } from "./run-env-claim.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -2705,6 +2706,14 @@ export class WorkerClient {
         if (provider) {
           this.requireProviderCapability();
           claim.secrets.provider = provider;
+        }
+        // PRD #4416 M2: run_env / run_env_redact are decoded fail-closed and bounded (a malformed list
+        // throws a RunEnvClaimError naming the field and rule, never a value). Empty lists are removed,
+        // so a claim without variables keeps today's shape.
+        if (claim.secrets.run_env !== undefined || claim.secrets.run_env_redact !== undefined) {
+          const { runEnv, runEnvRedact } = decodeRunEnvClaim(claim.secrets);
+          if (runEnv.length > 0) claim.secrets.run_env = runEnv; else delete claim.secrets.run_env;
+          if (runEnvRedact.length > 0) claim.secrets.run_env_redact = runEnvRedact; else delete claim.secrets.run_env_redact;
         }
       }
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
