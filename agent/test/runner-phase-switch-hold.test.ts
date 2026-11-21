@@ -99,7 +99,8 @@ async function runHold(opts: HoldOptions) {
   } finally {
     (client as unknown as { requestPhaseSwitchHold: unknown }).requestPhaseSwitchHold = original;
   }
-  const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);  const cancelReports = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed" && s.body.failure_reason === "run cancelled").length;
+  const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+  const cancelReports = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed" && s.body.failure_reason === "run cancelled").length;
   const feed = api.messages(claim.run_id).map((m) => String((m.payload as { text?: unknown } | undefined)?.text ?? ""));
   return {
     runId: claim.run_id, order, posts, runs, cancelReports, ownershipReads: () => ownershipReads, states, feed, elapsedMs: Date.now() - t0,
@@ -238,16 +239,26 @@ describe("phase-switch hold (issue #3252 m4)", () => {
       assert.deepEqual(terminal(r.states), []);
       assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
       assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), "the Paused line was posted");
-      assert.ok(r.feed.includes("The pause could not be confirmed, so the run is not paused. This worker keeps the work."),
+      assert.ok(r.feed.includes("This worker no longer holds the run, so it did not pause it. This worker keeps its copy of the work."),
         `the feed corrects the Paused line: ${r.feed.join(" | ")}`);
     });
   }
+
+  it("an applied hold whose ACK and every ownership read are lost ends at the deadline without claiming the run is not paused", async () => {
+    const r = await runHold({ iid: 32575, post: [unknown], ownership: [{ status: 503 }] });
+    assert.deepEqual(terminal(r.states), [], "no terminal report");
+    assert.ok(r.elapsedMs >= 2_500, `waited for the hold deadline (${r.elapsedMs} ms)`);
+    assert.ok(r.feed.includes("The pause could not be confirmed; the run may not be paused. This worker keeps the work."),
+      `the feed hedges rather than asserting the run is not paused: ${r.feed.join(" | ")}`);
+    assert.ok(!r.feed.some((t) => t.includes("no longer holds the run")), "the definitive non-live line is not used for an unknown outcome");
+    assert.equal(r.cloneKept, true, "the work is kept");
+  });
 
   it("an owner Cancel queued during an unknown hold request reports cancelled and cleans up like any cancel", async () => {
     const r = await runHold({ iid: 32560, post: [unknown], cancelDuringPost: 1, ownership: [ownRow(1)] });
     assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
     assert.equal(r.cloneKept, false, "the normal cancelled cleanup removed the clone");
-    assert.ok(!r.feed.includes("The pause could not be confirmed, so the run is not paused. This worker keeps the work."));
+    assert.ok(!r.feed.some((t) => t.includes("could not be confirmed") || t.includes("no longer holds the run")));
     assert.ok(r.elapsedMs < 2_000, "returned well before the retry deadline");
   });
 

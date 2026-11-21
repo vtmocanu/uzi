@@ -162,6 +162,7 @@ test("Claude phase characterization: canonical ids and omitted-effort defaults m
     assert.equal(withEffort.hasGetSettings, true, `${alias}: getSettings answers while the prompt is withheld`);
     assert.equal(withEffort.arrivalsWhileWithheld, 0, `${alias}: no provider request while the prompt is withheld`);
     assert.equal(omitted.arrivalsWhileWithheld, 0, `${alias}: no provider request while the prompt is withheld (omitted effort)`);
+    assert.equal(typeof omitted.wireEffort, "string", "the omitted-effort wire request carries an effort");
     assert.equal(omitted.wireEffort, appliedOmitted?.effort,
       `${alias}: the first wire request's effort equals the applied omitted-effort default`);
     if (typeof applied?.model === "string" && withEffort.failure === undefined && applied.model === withEffort.wireModel

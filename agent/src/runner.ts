@@ -3384,10 +3384,14 @@ function phaseSwitchHoldText(
   return `Paused: this worker cannot verify a switch to ${target}. Choose a supported model (opus, sonnet, haiku, fable) or a full model id, or clear the Claude planning setting, then Resume; Cancel ends the run.`;
 }
 
-/** Issue #3252: follow-up feed line when a phase-switch hold ended without the server confirming it, so
- *  the earlier "Paused:" line is not left standing for a row that is still running. */
+/** Issue #3252: follow-up feed lines when a phase-switch hold ended without the server confirming it,
+ *  so the earlier "Paused:" line is not left standing. "nonlive" is a definitive ownership answer (this
+ *  claim is gone); "stopped" (deadline, shutdown) is not, since an applied hold whose ACK was lost
+ *  followed by failed reads is indistinguishable from an unapplied one, so it states only what is known. */
+const PHASE_SWITCH_NONLIVE_TEXT =
+  "This worker no longer holds the run, so it did not pause it. This worker keeps its copy of the work.";
 const PHASE_SWITCH_UNCONFIRMED_TEXT =
-  "The pause could not be confirmed, so the run is not paused. This worker keeps the work.";
+  "The pause could not be confirmed; the run may not be paused. This worker keeps the work.";
 
 function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | undefined {
   return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
@@ -26758,8 +26762,10 @@ export class RunRunner {
           run_id: runId, phase, cause, claim_generation: claim.claim_generation,
         });
       }
-      // The feed said "Paused:" but the row stays running: say so.
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: PHASE_SWITCH_UNCONFIRMED_TEXT } });
+      // The feed said "Paused:" but the hold was not confirmed: say what is known.
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: outcome === "nonlive" ? PHASE_SWITCH_NONLIVE_TEXT : PHASE_SWITCH_UNCONFIRMED_TEXT,
+      } });
     }
     await batcher.close().catch(() => undefined);
     return false;
