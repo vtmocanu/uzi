@@ -446,6 +446,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	var defaultModel pgtype.Text
 	var leadSettings LeadSettings
+	var leadInput LeadSettingsInput
 	leadResolved := false
 	if checkerResolution == nil && (harness != HarnessCodex || !isReviewRun) {
 		lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
@@ -463,14 +464,25 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// and a subagent template's own model: pin still wins. An INCOMPATIBLE frozen model
 		// records the existing visible fallback note and falls back to the lane, or the harness
 		// default when that lane is unset or dropped.
-		leadSettings = resolveLeadSettings(LeadSettingsInput{
+		leadInput = LeadSettingsInput{
 			Harness:         harness,
 			RunModel:        run.Model,
 			RunModelSource:  run.ModelSource,
 			RunEffort:       run.Effort,
 			RunEffortSource: run.EffortSource,
 			LaneModel:       laneModel,
-		})
+		}
+		// PRD #3252: the owner's Claude planning pair is read (strictly) only for a Claude lead-lane
+		// claim, so no other claim pays the read or can fail on it.
+		if harness == HarnessClaude && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+			planning, perr := s.q.GetUserPlanningClaude(ctx, run.UserID)
+			if perr != nil {
+				return nil, fmt.Errorf("planning defaults lookup: %w", perr)
+			}
+			leadInput.PlanningModel = planning.PlanningClaudeModel
+			leadInput.PlanningEffort = planning.PlanningClaudeEffort
+		}
+		leadSettings = resolveLeadSettings(leadInput)
 		// PRD #3250: a run_override model or effort the claim cannot honor parks the run (never a
 		// fallback). Checked before any fallback note, the custom-Codex capability re-check and the
 		// late effort read, so a held run writes no harness_model_fallback line.
@@ -544,6 +556,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
 		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
+		// PRD #3252: re-derive the plan pair over the same input with the late-read user effort; the
+		// precedence rule stays in resolvePlanPhase.
+		leadInput.UserEffort = defaultEffort
+		leadSettings.Plan = resolvePlanPhase(leadInput, leadSettings)
+		// A claim carrying a plan_phase needs the worker capability. The requeue is non-looping: the
+		// next ClaimRun pass excludes this worker once the owner's planning value is set.
+		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, capability.ClaudePhaseModelsV1) {
+			return nil, errPhaseModelsCapabilityMissing
+		}
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es
@@ -995,6 +1016,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			DefaultEffort:               shippedEffort,
 			DefaultModelSource:          defaultModelSource,
 			DefaultEffortSource:         defaultEffortSource,
+			PlanPhase:                   leadSettings.Plan,
 			CodexCatalogContext:         claimCodexCatalogContext(run),
 			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read

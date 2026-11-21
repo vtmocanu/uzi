@@ -946,6 +946,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
+	{"POST", "/api/worker/runs/{id}/phase-switch-hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/repo-agent-source-hold", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this

@@ -767,6 +767,10 @@ type ClaimConfig struct {
 	// run_override, user_default or builtin). PRD #3244: present on every lead-lane claim, which makes
 	// it the worker's activation signal for the lead-config reporter; absent otherwise.
 	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
+	// PlanPhase is the plan-phase model and effort (PRD #3252): set only on a Claude lead-lane
+	// claim whose owner has a planning value that applies; omitted otherwise so the wire is
+	// byte-identical. A claim carrying it requires the worker capability claude_phase_models_v1.
+	PlanPhase *ClaimPhaseSettings `json:"plan_phase,omitempty"`
 	// CodexCatalogContext is the opaque catalog context (issue #3251): lowercase hex SHA-256 of
 	// the credential revision this claim releases (user, secret id, auth mode, material revision,
 	// subscription account key). The worker echoes it verbatim when it reports the Codex catalog's

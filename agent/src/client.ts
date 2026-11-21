@@ -156,6 +156,8 @@ import {
   type RecoverySettleRequest,
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
+  type PhaseSwitchHoldOutcome,
+  PHASE_SWITCH_HOLD_REASON,
   type FollowupFinalizeResult,
   BASE_ATTESTATION_HOLD_REASON,
   REPO_AGENT_SOURCE_HOLD_REASON,
@@ -5307,6 +5309,49 @@ export class WorkerClient {
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
     return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  /** Issue #3252: ask the server to hold this flight's claim on the `phase_switch_unavailable` hold
+   *  (POST /worker/runs/:id/phase-switch-hold). The claim generation is mandatory. One attempt, never
+   *  throws: `held` only on a 200 naming paused + this hold (a repeat answers the same 200); `refused`
+   *  on a 409 (its body's status, hold reason and `reason`, e.g. plan_not_approved); everything else,
+   *  a 404 included, is `unknown`. */
+  async requestPhaseSwitchHold(
+    runId: string,
+    args: { head?: string; claimGeneration: number; phase: "plan" | "implement" },
+    signal?: AbortSignal,
+  ): Promise<PhaseSwitchHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/phase-switch-hold`;
+    const body = {
+      ...(args.head !== undefined && args.head !== "" ? { head: args.head } : {}),
+      claim_generation: args.claimGeneration,
+      phase: args.phase,
+    };
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+      if (res.status === 200) {
+        const fields = await readRunAck(res);
+        if (fields.status === "paused" && fields.holdReason === PHASE_SWITCH_HOLD_REASON) {
+          return { outcome: "held", status: fields.status };
+        }
+        return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
+      }
+      if (res.status === 409) {
+        const fields = await readRunAck(res);
+        return {
+          outcome: "refused",
+          status: fields.status ?? "",
+          holdReason: fields.holdReason ?? null,
+          ...(fields.reason !== undefined ? { reason: fields.reason } : {}),
+        };
+      }
+      return { outcome: "unknown", detail: `HTTP ${res.status}` };
+    } catch (err) {
+      return { outcome: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   async requestRepoAgentSourceHold(

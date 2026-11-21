@@ -298,9 +298,9 @@ export interface CatalogDefault {
  *  source_labels of fixtures/model-settings/contract.json. */
 type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
-  | "cross_check_pin" | "cross_check_worker_default" | "run_override";
+  | "cross_check_pin" | "cross_check_worker_default" | "run_override" | "user_planning_default";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override" | "user_planning_default";
 type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
@@ -311,8 +311,21 @@ type EffectiveRefusal =
   | "provider_lane_unsupported" | "provider_model_unmapped" | "provider_binding_stale"
   | "provider_destination_not_allowed" | "credential_override_provider_source";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
-type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
-type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+type EffectiveModelSetting = "worker_model" | "planning_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
+type EffectiveEffortSetting = "worker_effort" | "planning_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+
+/** PRD #3252: the lead model and effort of every turn before plan approval, exactly the claim's
+ *  `plan_phase`. Present on a preview only for a Claude run whose owner's Claude planning model or
+ *  effort applies; omitted otherwise. `model` / `effort` are omitted when the plan side ships none
+ *  (it then follows the implement side, the preview's own worker cells). The sources are the claim's
+ *  provenance tokens: `user_planning_default` for a planning value, else the implement value's
+ *  source (`run_override` or `schedule_pin` freeze the model in both phases). */
+export interface EffectivePlanPhase {
+  model?: string;
+  effort?: string;
+  model_source?: EffectiveModelSource;
+  effort_source?: EffectiveEffortSource;
+}
 
 /** PRD #3254: a supplied value that does not apply (a schedule's model pin on the other harness). */
 export interface EffectiveIgnored {
@@ -412,6 +425,8 @@ export interface StartPreviewAlternative {
   /** Present only when the request carried an effort (source run_override). There is no worker_model
    *  here: a request with a model never leaves the harness undecided (D22). */
   worker_effort?: EffortSettingCell;
+  /** PRD #3252: the Claude plan-phase pair; present only when the planning lane applies. */
+  plan_phase?: EffectivePlanPhase;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
@@ -430,6 +445,9 @@ export interface StartPreview {
    *  run_override, effort mode explicit); with an undecided harness each alternative carries its own. */
   worker_model?: ModelSettingCell;
   worker_effort?: EffortSettingCell;
+  /** PRD #3252: the Claude plan-phase pair; present only when the harness is decided as Claude and
+   *  the planning lane applies. */
+  plan_phase?: EffectivePlanPhase;
   alternatives?: StartPreviewAlternative[];
 }
 
@@ -484,6 +502,8 @@ export interface ScheduleAlternative {
   subagents: EffectiveSubagents | null;
   refusal: ScheduleRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
+  /** PRD #3252: the Claude plan-phase pair; omitted unless the planning lane applies. */
+  plan_phase?: EffectivePlanPhase;
 }
 
 /** The schedule-preview response: what firing the schedule now and claiming the run would use.
@@ -502,6 +522,9 @@ export interface ScheduleSettingsPreview {
   subagents: EffectiveSubagents | null;
   notes: string[];
   alternatives?: ScheduleAlternative[];
+  /** PRD #3252: the Claude plan-phase pair of a fire on Claude; omitted unless the planning lane
+   *  applies (carried per alternative when the harness is chosen at creation). */
+  plan_phase?: EffectivePlanPhase;
 }
 
 export interface UserSettings {
@@ -551,6 +574,13 @@ export interface UserSettings {
   /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   summary_models?: ModelSettingCell[];
+  /** Per-user Claude planning model and effort (PRD #3252); null inherits. Optional for
+   *  older servers. */
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
+  /** Read-only resolved planning cells (PRD #3252), one claude cell each (Q-codex adds the codex cells). Never sent on a PUT. */
+  planning_models?: ModelSettingCell[];
+  planning_efforts?: EffortSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;
@@ -561,9 +591,9 @@ export interface UserSettings {
   light_theme: string | null;
   dark_theme: string | null;
   typeface: string | null;
-  /** Raw per-user opt-in for animated sidebar icons; null = inherit the instance
-   *  default (off). Optional for older servers: absent reads as off, never as a
-   *  stored false. */
+  /** Raw per-user choice for animated sidebar icons; null = inherit the instance
+   *  default (on). Optional for older servers: absent follows the default, never
+   *  a stored false. */
   sidebar_motion?: boolean | null;
   /** Resolved sidebar-icon animation flag (override else the server default).
    *  Read-only; never sent on a PUT. Optional for older servers. */
@@ -628,6 +658,9 @@ export interface UserSettingsPatch {
   /** Per-user reasoning effort (PRD #617); present-null clears back to inherit. */
   default_effort?: string | null;
   default_codex_effort?: string | null;
+  /** Per-user Claude planning model and effort (PRD #3252); present-null clears to "Same as the run". */
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
   /** Per-user Codex judge model (PRD #3245); present-null clears back to inherit. */
@@ -1339,6 +1372,7 @@ export interface LatestRun {
   // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
   // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
   // 'run_override_unavailable' (issue #3250) reads "model choice unavailable: owner hold". The set of
+  // 'phase_switch_unavailable' (issue #3252) reads "planning switch unavailable: owner hold". The set of
   // these non-completion holds is NON_COMPLETION_HOLDS in lib/runBadge.ts.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
@@ -3454,8 +3488,16 @@ export interface AdminWorkerSizes {
   read_only_code: string | null;
   advisories: WorkerSizeAdvisory[];
   max_sizes: number;
-  /** Always an array on a current api; absent from an older one, which reads as none. */
+  /**
+   * At most three details per size and sixteen sizes. Always an array on a current api;
+   * absent from an older one, which reads as none.
+   */
   refusals?: WorkerSizeRefusal[];
+  /**
+   * Per size present in refusals, the true count of fresh refusals before the three-per-size
+   * cap. Always an object on a current api; absent from an older one.
+   */
+  refusal_totals?: Record<string, number>;
 }
 
 /** PUT /admin/worker-sizes/{name} and POST /admin/worker-sizes/{name}/reset. */
@@ -4652,7 +4694,9 @@ export interface Run {
    *  on that harness, otherwise Cancel and start a new run with a different choice.
    *  The non-completion holds (credential_disabled, credentials_reset, provider_unavailable,
    *  codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable, the two token-switch
-   *  holds, iteration_budget_exhausted and run_override_unavailable; NOT completion_blocked,
+   *  holds, iteration_budget_exhausted, run_override_unavailable and phase_switch_unavailable
+   *  (issue #3252: the runtime did not switch planning to implementation model or effort; owner
+   *  Resume retries on a new claim, otherwise Cancel); NOT completion_blocked,
    *  budget_exhausted or weekly_reserve) form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
    *  tone, label and owner-resumability (fixtures/hold-reasons/presentation.json).
    *  Render an unrecognised value honestly.

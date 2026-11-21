@@ -63,6 +63,13 @@ describe("modelSettingSourceLabel vs fixtures/model-settings/contract.json", () 
     expect(MODEL_SETTING_SOURCE_LABELS).toEqual(contract.source_labels);
   });
 
+  it("labels the planning provenance tokens (PRD #3252)", () => {
+    expect(modelSettingSourceLabel("planning_model", "user_planning_default")).toBe("your choice");
+    expect(modelSettingSourceLabel("planning_effort", "user_planning_default")).toBe("your choice");
+    expect(modelSettingSourceLabel("planning_model", "template")).toBe("lead template");
+    expect(modelSettingSourceLabel("planning_effort", "builtin")).toBe("built-in");
+  });
+
   it("renders an unknown (field, token) as unknown", () => {
     expect(modelSettingSourceLabel("model", "harness")).toBe("unknown");
     expect(modelSettingSourceLabel("effort", "bogus")).toBe("unknown");

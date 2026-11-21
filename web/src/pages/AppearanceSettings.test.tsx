@@ -53,14 +53,14 @@ const baseAppearance = (
   light_theme: "hall",
   dark_theme: "ember",
   typeface: "system",
-  sidebar_motion: false,
+  sidebar_motion: true,
   overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: null },
   defaults: {
     mode: "dark",
     light_theme: "hall",
     dark_theme: "ember",
     typeface: "system",
-    sidebar_motion: false,
+    sidebar_motion: true,
   },
   ...over,
 });
@@ -378,6 +378,13 @@ describe("AppearanceSettings — Demo mode card (PRD #886)", () => {
 
 describe("AppearanceSettings — sidebar icon animations toggle", () => {
   const motionSwitch = () => screen.getByRole("switch", { name: "Sidebar icon animations" });
+
+  it("shows the default-on state and label for a user with no choice", () => {
+    mockAuth(baseUser, baseAppearance());
+    renderPage();
+    expect(motionSwitch().getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByText(/Default: on\./)).toBeTruthy();
+  });
   const renderPage = () =>
     render(
       <MemoryRouter>
@@ -385,7 +392,11 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
       </MemoryRouter>,
     );
 
-  it("renders off for a user with no override", () => {
+  it("renders off when the instance default is off", () => {
+    mockAuth(baseUser, baseAppearance({
+      sidebar_motion: false,
+      defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system", sidebar_motion: false },
+    }));
     renderPage();
     expect(motionSwitch().getAttribute("aria-checked")).toBe("false");
   });
@@ -454,6 +465,7 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
   });
 
   it("flips on and stamps data-motion before the PUT resolves, then sends sidebar_motion:true", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: false }));
     let release!: (v: { settings: never }) => void;
     mockApi.putMySettings.mockReturnValueOnce(
       new Promise((resolve) => {
@@ -473,6 +485,7 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
   });
 
   it("rolls the toggle and attribute back and shows the error when the PUT fails", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: false }));
     mockApi.putMySettings.mockRejectedValueOnce(new ApiError(500, "boom"));
     // refresh re-applies the server truth (off), as the real provider does.
     refresh.mockImplementationOnce(async () => {
@@ -490,6 +503,7 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
   });
 
   it("rolls the attribute and pre-paint cache back locally when both the PUT and the session re-read fail", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: false }));
     mockApi.putMySettings.mockRejectedValueOnce(new ApiError(500, "boom"));
     // Outage: the session re-read fails too and re-applies nothing.
     refresh.mockRejectedValueOnce(new Error("network down"));
@@ -504,6 +518,7 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
   });
 
   it("keeps a confirmed save shown when the session re-read leaves the context stale, so the next click turns it off", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: false }));
     mockApi.putMySettings.mockResolvedValueOnce({
       settings: { sidebar_motion: true, effective_sidebar_motion: true } as never,
     });
@@ -529,6 +544,7 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
   });
 
   it("carries the confirmed motion value into a later typeface save when the re-read stayed stale", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: false }));
     mockApi.putMySettings.mockResolvedValueOnce({
       settings: { sidebar_motion: true, effective_sidebar_motion: true } as never,
     });

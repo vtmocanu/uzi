@@ -158,6 +158,11 @@ type fakeStore struct {
 	defaultEffort      pgtype.Text
 	defaultCodexEffort pgtype.Text
 	defaultEffortErr   error
+	// planningModel/planningEffort feed GetUserPlanningClaude (PRD #3252); planningErr forces the
+	// strict planning read to fail.
+	planningModel  pgtype.Text
+	planningEffort pgtype.Text
+	planningErr    error
 	// attributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// live at standard-claim assembly. The zero value is false; scheduleModelStore sets
 	// it to true so existing fixtures mirror a fresh user's default-on state, and a test
@@ -1068,6 +1073,12 @@ func (f *fakeStore) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (sto
 		DefaultClaudeModel: f.defaultModel,
 		DefaultCodexModel:  f.defaultCodexModel,
 	}, f.defaultModelErr
+}
+func (f *fakeStore) GetUserPlanningClaude(context.Context, uuid.UUID) (store.GetUserPlanningClaudeRow, error) {
+	return store.GetUserPlanningClaudeRow{PlanningClaudeModel: f.planningModel, PlanningClaudeEffort: f.planningEffort}, f.planningErr
+}
+func (f *fakeStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, uuid.UUID) (int64, error) {
+	return 1, nil
 }
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultEffort, f.defaultEffortErr

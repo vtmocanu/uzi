@@ -192,6 +192,9 @@ export const NON_COMPLETION_HOLDS = {
   // cannot be masked. RunEnvHistoryHoldPanel owns Resume (re-attempts the claim, parks again while the
   // version is still missing) and Cancel.
   run_env_history_unavailable: { tone: "warning", label: "variable history unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
+  // Issue #3252: the runtime did not switch between the planning and implementation model or effort.
+  // PhaseSwitchHoldPanel owns Resume (retries on a new claim) and Cancel.
+  phase_switch_unavailable: { tone: "warning", label: "planning switch unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
 } as const;
 
 type NonCompletionHold = keyof typeof NON_COMPLETION_HOLDS;
@@ -936,6 +939,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detai
     case "run_env_history_unavailable":
       return { kind: "badge", label: PARK_LABELS.run_env_history_unavailable, tone: "warning", pulse: false,
         title: "A secret variable version this run was given can no longer be read, so its output cannot be masked. Open the run to Resume once the variable history is restored, or Cancel." };
+    case "phase_switch_unavailable":
+      return { kind: "badge", label: PARK_LABELS.phase_switch_unavailable, tone: "warning", pulse: false,
+        title: "The runtime did not switch between the planning and implementation model or effort. The run waits for its owner; open the run to Resume and retry on a new claim, or Cancel." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };

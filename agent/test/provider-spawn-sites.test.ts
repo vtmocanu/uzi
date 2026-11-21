@@ -23,6 +23,7 @@ import { createLogger } from "../src/log.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
 import { secretRecordingLogger } from "./runner-harness.js";
+import { withAppliedSettings } from "./phase-settings-fake.js";
 
 // PRD #4320 module 6/7 (agent half): every converted spawn builder's env and model in provider mode,
 // the gateway-limit and switch refusals, and the second-layer lane refusals. The gateway key is
@@ -114,6 +115,25 @@ describe("SdkExecutor in provider mode (issue run lead and subagents)", () => {
     assertProviderEnv(turns[1]!.options.env, "implement turn");
     assert.equal(turns[0]!.options.model, "sonnet");
     assert.equal(turns[1]!.options.model, "sonnet");
+  });
+
+  it("PRD #3252: a planning pair resolves through the map per phase, the plan turn on the planning model and the implement turn on the implement model", async () => {
+    const fake = fakeTurns([[submitPlan("plan"), sessionResult()], [signalDone(), sessionResult()]]);
+    const { turns } = fake;
+    // The gateway map resolves the alias the CLI is given; the runtime reports the mapped ids.
+    const queryFn = withAppliedSettings(fake.queryFn, (o) => ({ model: o.model === "opus" ? "corp-opus" : o.model, effort: "medium" }));
+    const { ctx } = makeCtx({
+      config: {
+        default_model: "corp-sonnet", default_model_source: "user_default",
+        default_effort: "medium", default_effort_source: "user_default",
+        plan_phase: { model: "opus", model_source: "user_planning_default", effort: "medium", effort_source: "user_planning_default" },
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assertProviderEnv(turns[0]!.options.env, "plan turn");
+    assertProviderEnv(turns[1]!.options.env, "implement turn");
+    assert.equal(turns[0]!.options.model, "opus", "plan turn: the planning alias, mapped by the provider");
+    assert.equal(turns[1]!.options.model, "corp-sonnet", "implement turn: the implement model, not the planning one");
   });
 
   it("a vendor run is unchanged: OAuth token, no base URL, no explicit model", async () => {

@@ -130,6 +130,19 @@
     "owner_actions_link": true
   },
   {
+    "reason": "phase_switch_unavailable",
+    "non_completion": true,
+    "owner_resumable": true,
+    "tone": "warning",
+    "web_label": "planning switch unavailable: owner hold",
+    "cli_notice": "held, planning switch unavailable; the runtime did not switch between the planning and implementation model or effort; Resume retries on a new claim, otherwise Cancel to end the run; Resume: uzi run resume run-1; Cancel: uzi run cancel run-1",
+    "announces_entry": true,
+    "completion_panel_early_return": true,
+    "completion_panel_held_deny": "always",
+    "history_park_label": true,
+    "owner_actions_link": true
+  },
+  {
     "reason": "provider_destination_not_allowed",
     "non_completion": true,
     "owner_resumable": false,

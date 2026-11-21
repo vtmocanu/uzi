@@ -166,6 +166,114 @@ choice is stored on the run and shown with the source **this run**
 - Successor runs do not inherit the choice, and chat and Slack start cards
   carry no model or effort.
 
+## Planning model and effort
+
+Claude runs can plan on one model and effort, then implement on another, for
+example plan on `opus` at `high` and implement on `sonnet` at `medium`. Both
+settings are optional and per user. Left empty, they read **Same as the run**
+and the run uses one model and effort throughout, as before.
+
+- **Set them in the web app.** **Settings → Run defaults → Planning** has a
+  **Claude planning model** picker and a **Claude planning effort** picker; a
+  single **Save planning defaults** button saves whichever changed. The
+  intro on the card explains the two phases. The empty option reads like
+  `Same as the run · <model> (<where it comes from>)`.
+- **Or through the API.** `PUT /api/me/settings` takes a planning model and a
+  planning effort (absent leaves it unchanged, `null` clears it, a value sets
+  it). That endpoint is cookie-only; there is no CLI setter for these two
+  settings yet. `uzi settings get` shows them (see [the CLI
+  reference](./cli.md#effective-settings)).
+- **Planning effort** takes `low`, `medium`, `high`, `xhigh` or `max`, with no
+  runtime option; see [Reasoning effort](./worker-effort.md#planning-effort).
+
+### What counts as planning
+
+The planning pair applies to the lead's turns **before the plan is approved**:
+the first plan, clarification rounds, revisions, and a re-plan after a later
+claim (for example a resumed run that plans again). After approval the run
+switches to its own model and effort, in the same session and conversation,
+so the plan and everything said so far carry over. A re-plan switches back to
+the planning pair for the new claim; each claim fixes its pair when the worker
+claims the run, and a settings change takes effect at the next claim.
+
+It applies to Claude lead-lane runs: issue, CI-fix, self-improve, prompt,
+MR-rework and task runs. It does not apply to review, chat, judge,
+cross-check or job runs, or to runs bound to an egress profile, which have no
+plan phase in this sense, nor to Codex runs (planning stays on the run's
+harness; the Codex side is tracked separately, issue #3253).
+
+- **A model or effort chosen elsewhere wins in both phases.** A model or effort
+  chosen when starting the run, or pinned by a [schedule](./scheduling.md),
+  applies to planning and implementation alike; the planning setting does not
+  override it. Each of model and effort is decided separately.
+- **Task (handoff) runs plan first.** A [task run](./cli.md) started with
+  `uzi handoff` also has a plan turn before it implements, so with a planning
+  model set it spends that turn on the planning pair. That turn costs as
+  the planning model prices it, so a strong planning model makes each handoff
+  more expensive than the same handoff on your worker model alone.
+- **An empty worker-model lane uses the template model.** With no worker model
+  and the built-in `lead` template (`opus`), implementation uses the
+  template's model, so the switch is from your planning model to `opus`.
+
+### Unsupported configuration
+
+A planning model needs an implementation model to switch to. If you set a
+planning model but there is no worker model and no template model, the run is
+refused before any turn with "unsupported phase configuration": set a worker
+model or clear the planning model. The refusal applies to every start or
+resume, whether the run is new, already approved or resumed at its plan gate,
+even if you would simply approve. It does not apply to provider runs.
+
+### Which workers run it
+
+Only workers that advertise the `claude_phase_models_v1` capability claim a run
+that uses separate planning settings. Older workers leave it queued, and the run
+health reads **no worker supporting separate planning settings is online**;
+see [Hosted workers](./hosted-workers.md#my-run-says-no-worker-supporting-separate-planning-settings-is-online).
+A run that was queued on an incapable worker may stay with it for about two
+minutes before another capable worker can take it.
+
+### The switch is verified
+
+Before the first turn after approval, the worker withholds the prompt and asks
+the Claude runtime which model and effort it has applied, then compares them with
+a table characterized on the pinned CLI. Only a match sends the prompt.
+
+| Alias | Expected model | Effort when none is sent |
+| --- | --- | --- |
+| `opus` | `claude-opus-5-5` | `medium` |
+| `sonnet` | `claude-sonnet-5-5` | `medium` |
+| `haiku` | `claude-haiku-5-5` | `medium` |
+| `fable` | `claude-fable-5-1` | `high` |
+
+A full model id, or one mapped by a provider setting, is compared verbatim.
+Anything that cannot be verified holds the run (below); it never implements on
+the planning pair. The same check applies to a reclaim of an approved run and to
+a switch back to planning after a re-plan.
+
+Known limits:
+
+- A provider gateway that rewrites model ids can make a correct switch look
+  like a mismatch and hold the run.
+- The alias table was characterized with a dummy key; alias stability under
+  subscription auth is not separately proven.
+- With no implementation effort sent, the expected effort comes from the model
+  the runtime reports. A provider run holds unless its provider maps the alias
+  (`ANTHROPIC_DEFAULT_<ALIAS>_MODEL`, compared as given) to one of the four
+  characterized model ids.
+- The refusal of a planning model with no implementation model is skipped on
+  provider runs, because the provider map always yields an explicit model or
+  fails with `provider_model_unmapped`.
+
+### When the switch cannot be confirmed
+
+The run parks `paused` with hold `phase_switch_unavailable` (**planning switch
+unavailable**) and a feed line such as "Paused: the runtime kept the planning
+model X instead of switching to Y. Resume retries on a new claim; Cancel ends
+the run." **Resume** retries on a new claim, which verifies again; **Cancel**
+ends the run. See [Pausing and resuming a run](./run-pause.md#held-when-the-planning-to-implementation-switch-cannot-be-verified)
+and [the CLI reference](./cli.md#waiting-for-a-state-uzi-run-wait).
+
 ## Claude model guard and recovery
 
 Saving the Claude worker lane (`default_claude_model`, or legacy

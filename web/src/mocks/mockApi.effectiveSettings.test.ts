@@ -36,7 +36,7 @@ afterEach(() => window.localStorage.clear());
 describe("recorded effective-settings corpus", () => {
   it("the mock data is a verbatim copy of the Go-recorded corpus", () => {
     expect(RECORDED_EFFECTIVE_SCENARIOS).toEqual(behavior.scenarios);
-    expect(RECORDED_EFFECTIVE_SCENARIOS.map((s) => s.name)).toEqual(["default", "codexOnly", "overflowCodexDefault"]);
+    expect(RECORDED_EFFECTIVE_SCENARIOS.map((s) => s.name)).toEqual(["default", "codexOnly", "overflowCodexDefault", "planning"]);
   });
 
   it("every harness, credential and note token it serves has a settings-surface label", () => {
@@ -61,14 +61,39 @@ describe("recorded effective-settings corpus", () => {
 });
 
 describe("getEffectiveSettings", () => {
-  it("serves the default recording: both harnesses usable, 8 model cells, 4 effort cells", async () => {
+  it("serves the default recording: both harnesses usable, 9 model cells, 5 effort cells", async () => {
     const got = await mockApi.getEffectiveSettings();
     expect(got).toEqual(behavior.scenarios[0].get);
     expect(got.harnesses.map((h) => [h.harness, h.usable])).toEqual([["claude", true], ["codex", true]]);
-    expect(got.models).toHaveLength(8);
-    expect(got.efforts).toHaveLength(4);
+    expect(got.models).toHaveLength(9);
+    expect(got.efforts).toHaveLength(5);
     expect(got.cross_check.models).toHaveLength(4);
     expect(got.cross_check.efforts).toHaveLength(4);
+  });
+
+  it("shows the owner's stored planning pair on the planning cells, and the recording otherwise", async () => {
+    const before = await mockApi.getEffectiveSettings();
+    expect(before.models.find((c) => c.setting === "planning_model")).toMatchObject({ harness: "claude", model: null, source: before.models.find((c) => c.setting === "worker_model")?.source });
+    await mockApi.putMySettings({ planning_claude_model: "opus", planning_claude_effort: "xhigh" });
+    const got = await mockApi.getEffectiveSettings();
+    await mockApi.putMySettings({ planning_claude_model: null, planning_claude_effort: null });
+    expect(await mockApi.getEffectiveSettings()).toEqual(behavior.scenarios[0].get);
+    expect(got.models.find((c) => c.setting === "planning_model")).toMatchObject({ model: "opus", resolved_model: "opus", source: "user_planning_default" });
+    expect(got.efforts.find((c) => c.setting === "planning_effort")).toMatchObject({ effort: "xhigh", resolved_effort: "xhigh", source: "user_planning_default", mode: "explicit" });
+    expect(got.models.find((c) => c.setting === "worker_model")?.source).not.toBe("user_planning_default");
+  });
+
+  it("the recorded planning scenario carries plan_phase on Claude previews only", () => {
+    const planning = RECORDED_EFFECTIVE_SCENARIOS.find((s) => s.name === "planning");
+    expect(planning).toBeDefined();
+    const byName = (n: string) => planning!.start_previews.find((p) => p.name === n)!.response;
+    expect(byName("claude").plan_phase).toEqual({ model: "opus", effort: "high", model_source: "user_planning_default", effort_source: "user_planning_default" });
+    expect(byName("codex").plan_phase).toBeUndefined();
+    // Every non-planning recording predates the field and stays free of it.
+    for (const s of RECORDED_EFFECTIVE_SCENARIOS.filter((x) => x.name !== "planning")) {
+      expect(JSON.stringify(s.start_previews)).not.toContain("plan_phase");
+      expect(JSON.stringify(s.schedule_previews)).not.toContain("plan_phase");
+    }
   });
 
   it("serves the codexOnly recording under the codex-only scenario", async () => {
@@ -116,7 +141,7 @@ describe("getEffectiveSettings", () => {
 
 describe("previewStartSettings", () => {
   it("answers every recorded request with its recorded response, in each scenario", async () => {
-    const scenarios: Record<string, string> = { default: "", codexOnly: "codex-only", overflowCodexDefault: "overflow-codex-default" };
+    const scenarios: Record<string, string> = { default: "", codexOnly: "codex-only", overflowCodexDefault: "overflow-codex-default", planning: "planning-pair" };
     for (const s of behavior.scenarios) {
       setScenario(scenarios[s.name]);
       for (const p of s.start_previews) {
@@ -148,7 +173,7 @@ describe("previewStartSettings", () => {
 });
 
 describe("previewScheduleSettings", () => {
-  const scenarios: Record<string, string> = { default: "", codexOnly: "codex-only", overflowCodexDefault: "overflow-codex-default" };
+  const scenarios: Record<string, string> = { default: "", codexOnly: "codex-only", overflowCodexDefault: "overflow-codex-default", planning: "planning-pair" };
 
   it("answers every recorded request with its recorded response, in each scenario", async () => {
     for (const s of behavior.scenarios) {

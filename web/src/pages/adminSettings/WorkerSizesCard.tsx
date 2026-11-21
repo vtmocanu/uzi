@@ -110,9 +110,12 @@ const HEALTH_ROUTE = "/admin/health";
 
 // The workers the cluster would not run at this size: a danger badge in the row's badges,
 // then up to three workers, each linking to Admin health where its report lives.
-function SizeRefusals({ label, items }: { label: string; items: WorkerSizeRefusal[] }) {
+// total is the api's count before its per-size cap; without a usable one the remainder is
+// whatever details were sent (an older api), never an invented number.
+function SizeRefusals({ label, items, total }: { label: string; items: WorkerSizeRefusal[]; total?: number }) {
   const shown = items.slice(0, REFUSALS_SHOWN);
-  const more = items.length - shown.length;
+  const known = typeof total === "number" && Number.isInteger(total) && total >= 0 ? total : 0;
+  const more = Math.max(items.length, known) - shown.length;
   return (
     <ul aria-label={`Workers refused at size ${label}`} className="mt-2 w-[8rem] space-y-1.5 text-xs font-normal sm:w-auto sm:max-w-[16rem]">
       {shown.map((r, i) => {
@@ -301,7 +304,8 @@ export function WorkerSizesCard({
   loadError: string;
   /**
    * Re-read the list and lift it to the page; called after every successful write, on a
-   * read-only or max_sizes 409, on a 404 removal and by Retry. A removal refused as in use
+   * read-only or max_sizes 409, on a 412 size_exists refusal of an add (the form stays open),
+   * on a 404 removal and by Retry. A removal refused as in use
    * or builtin does not re-read.
    */
   onChanged: () => Promise<void>;
@@ -333,9 +337,11 @@ export function WorkerSizesCard({
   const firstInput = useRef<HTMLInputElement>(null);
   const confirmButton = useRef<HTMLButtonElement>(null);
   // Set alongside the state change that renders the target; focused once it is mounted.
-  // Add opens onto the name input, Cancel or Escape returns to the Add button, and a
-  // successful Add lands on the new row's Edit; a removal lands on its success message,
-  // since the row it came from is gone.
+  // Add opens onto the name input, Cancel or Escape returns to the Add button (to the
+  // "N of N sizes" note when the table is full, since Add is then not rendered), and a
+  // successful Add lands on the new row's Edit; a 412 size_exists refusal keeps the form
+  // open and refocuses its name input; a removal lands on its success message, since the
+  // row it came from is gone.
   const readOnlyBanner = useRef<HTMLDivElement>(null);
   const addButton = useRef<HTMLButtonElement>(null);
   const addNameInput = useRef<HTMLInputElement>(null);
@@ -453,7 +459,8 @@ export function WorkerSizesCard({
   const cancelAdd = () => {
     closeAdd();
     setError("");
-    setFocusTarget({ kind: "add", name: "" });
+    // At the cap the Add button is not rendered, so focus goes to the cap note instead.
+    setFocusTarget(atCap ? { kind: "cap", name: "" } : { kind: "add", name: "" });
   };
 
   const parsed = draft ? parseDraft(draft, ceilings) : null;
@@ -586,7 +593,15 @@ export function WorkerSizesCard({
       setFocusTarget({ kind: "edit", name });
       await onChanged();
     } catch (err) {
-      if (err instanceof ApiError && err.status === 400 && err.message.startsWith("invalid worker size name")) {
+      if (err instanceof ApiError && err.status === 412 && (err.body as { reason?: string } | null)?.reason === "size_exists") {
+        // Another admin added this name after the list was read. The form stays open with
+        // everything typed so the admin can pick another name; the re-read shows the row.
+        const msg = newSizeNameError(name, [name]) ?? `A size named ${name} already exists; edit it in the table instead`;
+        setFieldErrors({ name: msg });
+        setError(msg);
+        setFocusTarget({ kind: "field", name: "add-worker-size-name" });
+        void onChanged();
+      } else if (err instanceof ApiError && err.status === 400 && err.message.startsWith("invalid worker size name")) {
         setFieldErrors({ name: "Start with a lowercase letter, then use only lowercase letters, digits or hyphens (at most 16 characters)" });
       } else {
         handleWriteError(err, `Failed to add size ${sizeLabel(name)}`, true);
@@ -600,6 +615,7 @@ export function WorkerSizesCard({
     if (locked) return;
     const label = sizeLabel(row.name);
     setError("");
+    setFieldErrors({});
     setRowRefusal(null);
     setResult(null);
     setBusy(true);
@@ -636,7 +652,8 @@ export function WorkerSizesCard({
   const orphanAdvisories = data.advisories.filter((a) => !data.sizes.some((s) => s.name === a.size));
   if (orphanAdvisories.length > 0) advisoriesBySize.push({ size: "", items: orphanAdvisories });
 
-  // Refusals per size; an older api sends none, and one for a size no longer listed has no row.
+  // Refusals per size; an older api sends none (nor totals), and one for a size no longer listed has no row.
+  const refusalTotals = data.refusal_totals ?? {};
   const refusalsBySize = new Map<string, WorkerSizeRefusal[]>();
   for (const r of data.refusals ?? []) refusalsBySize.set(r.size, [...(refusalsBySize.get(r.size) ?? []), r]);
 
@@ -710,6 +727,9 @@ export function WorkerSizesCard({
                 const confirmAction = confirming?.name === row.name ? confirming.action : null;
                 const isConfirming = (confirmAction === "reset" && canReset) || (confirmAction === "remove" && canRemove);
                 const refused = refusalsBySize.get(row.name) ?? [];
+                const refusedTotal = Object.prototype.hasOwnProperty.call(refusalTotals, row.name)
+                  ? refusalTotals[row.name]
+                  : undefined;
                 const resetLowers =
                   !!row.shipped && (row.shipped.data_gib < row.data_gib || row.shipped.dind_data_gib < row.dind_data_gib);
                 return (
@@ -721,7 +741,7 @@ export function WorkerSizesCard({
                         {row.customized && <Badge tone="brand">Customized</Badge>}
                         {refused.length > 0 && <Badge tone="danger">Refused</Badge>}
                       </div>
-                      {refused.length > 0 && <SizeRefusals label={label} items={refused} />}
+                      {refused.length > 0 && <SizeRefusals label={label} items={refused} total={refusedTotal} />}
                       {canReset && (
                         <p className="mt-1 w-[8rem] text-xs font-normal text-faint sm:w-auto sm:max-w-[16rem]">
                           Shipped: {specSummary(row.shipped!)}
@@ -897,7 +917,7 @@ export function WorkerSizesCard({
           </p>
         </div>
       )}
-      {adding && !atCap && addParsed && (
+      {adding && addParsed && (
         <form
           onSubmit={add}
           onKeyDown={(e) => {
@@ -962,13 +982,18 @@ export function WorkerSizesCard({
             </p>
           )}
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" size="sm" disabled={locked}>
+            <Button type="submit" size="sm" disabled={locked || atCap}>
               {busy ? "Adding…" : addNameError ? "Add size" : `Add size ${sizeLabel(typedName)}`}
             </Button>
             <Button type="button" size="sm" variant="ghost" onClick={cancelAdd} disabled={busy}>
               Cancel
             </Button>
           </div>
+          {atCap && (
+            <p className="text-xs text-muted">
+              {data.sizes.length} of {maxSizes} sizes. At most {maxSizes} sizes: remove an added size to add another.
+            </p>
+          )}
         </form>
       )}
 

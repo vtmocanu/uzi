@@ -1729,6 +1729,24 @@ function RunEnvHistoryHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
   </Card>;
 }
 
+// Issue #3252: the runtime did not switch between the planning and implementation model or effort,
+// so the worker parked the run rather than implement on the wrong model. Resume retries on a new
+// claim; Cancel ends the run. This run does not resume automatically.
+function PhaseSwitchHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "phase_switch_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Planning switch unavailable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The runtime did not switch between the planning and implementation model or effort, so the run was parked.</p>
+    <p className="mt-1 text-xs text-muted">Resume retries on a new claim. Otherwise, Cancel to end the run. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
+  </Card>;
+}
+
 // The screen-reader sentence for a `publication:<mode>:<reason>` park key (parkAnnounce).
 function publicationAnnounce(parkKey: string): string {
   const [, mode, ...rest] = parkKey.split(":");
@@ -2621,6 +2639,8 @@ export function RunView() {
               ? "run_override_unavailable"
             : run?.status === "paused" && run.hold_reason === "run_env_history_unavailable"
               ? "run_env_history_unavailable"
+            : run?.status === "paused" && run.hold_reason === "phase_switch_unavailable"
+              ? "phase_switch_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2699,6 +2719,8 @@ export function RunView() {
               ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. Resume retries only if the choice has become available on that harness; otherwise Cancel and start a new run with a different choice."
             : parkKey === "run_env_history_unavailable"
               ? "Variable history unavailable. A secret variable version the run was given can no longer be read, so its output cannot be masked. Resume retries once the variable history is restored; otherwise Cancel the run."
+            : parkKey === "phase_switch_unavailable"
+              ? "Planning switch unavailable. The runtime did not switch between the planning and implementation model or effort. Resume retries on a new claim; otherwise Cancel to end the run."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -3317,6 +3339,12 @@ export function RunView() {
         }); }}
         onCancel={() => { void cancelRun(); }} />
       <RunEnvHistoryHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
+      <PhaseSwitchHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
         onResume={() => { void act(async (isCurrent) => {
           await api.resumeRun(run.id);
           if (isCurrent()) await refreshRun();

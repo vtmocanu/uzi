@@ -737,8 +737,9 @@ export const runsApi = {
       run_count: 23,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + base_diverged + failed, and sum(fail_origins) === failed. finished is a
-      // different population from run_count (D2) — infra failures spend no tokens, so it sits
-      // a little above the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
+      // different population from run_count (D2): finished counts every non-chat run kind
+      // (including reworks and CI fixes) and infra failures spend no tokens, so it need not
+      // track the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
       // needs_landing (issue #1418) is the sub-cut of failed whose committed work is
       // human-landable (here the workflow-scope + push-secret failures); needs_landing <= failed.
       outcomes: {

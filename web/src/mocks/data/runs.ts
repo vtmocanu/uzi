@@ -2294,6 +2294,8 @@ mockRuns.push(
     can_stop_at_provider_hold: true },
   // Issue #3194: a --require-base run held because its adopted work is not attested to the base.
   { ...pausedBase, id: "run-base-attestation-hold", hold_reason: "base_attestation_missing" },
+  // Issue #3252: the runtime did not switch between the planning and implementation model or effort.
+  { ...pausedBase, id: "run-phase-switch-hold", hold_reason: "phase_switch_unavailable" },
   { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },

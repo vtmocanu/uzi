@@ -113,8 +113,8 @@ const (
 	FallbackTypeface = TypefaceSystem // "system"
 
 	// FallbackSidebarMotion is the animated-sidebar-icons default for a user
-	// who has not chosen (users.sidebar_motion NULL): off.
-	FallbackSidebarMotion = false
+	// who has not chosen (users.sidebar_motion NULL): on, with a personal opt-out.
+	FallbackSidebarMotion = true
 )
 
 // ResolveSidebarMotion returns the user's explicit choice when set, else the

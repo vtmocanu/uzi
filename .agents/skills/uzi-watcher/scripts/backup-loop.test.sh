@@ -14,6 +14,11 @@ fail(){ echo "FAIL [$CASE]: $*" >&2; exit 1; }
 line_count(){ awk 'END {print NR+0}' "$1"; }
 contains(){ grep -Fq -- "$2" "$1" || fail "missing '$2' in $1"; }
 
+assert_backup_root(){
+  [ -n "$(find "$1" -maxdepth 0 \( -perm 700 -o -perm 2700 \))" ] ||
+    fail "backup root is not mode 0700"
+}
+
 make_stubs(){
   cat > "$CASE_DIR/kubectl" <<'STUB'
 #!/usr/bin/env bash
@@ -132,6 +137,26 @@ run_case(){
   CASE_DIR="$WORK/$CASE"
   mkdir -p "$CASE_DIR"
   export CASE CASE_DIR
+  if [ "$CASE" = root-permissions ]; then
+    mkdir "$CASE_DIR/out"
+    # macOS clears setgid if the directory's group is not one of our groups.
+    chgrp "$(id -gn)" "$CASE_DIR/out"
+    # Force the mode: Linux can inherit setgid, but macOS need not inherit it.
+    for mode in 700 2700; do
+      chmod "$mode" "$CASE_DIR/out"
+      [ -n "$(find "$CASE_DIR/out" -maxdepth 0 -perm "$mode")" ] ||
+        fail "fixture could not set mode $mode"
+      assert_backup_root "$CASE_DIR/out"
+      echo "PASS [$CASE]: mode $mode accepted"
+    done
+    chmod 750 "$CASE_DIR/out"
+    if (assert_backup_root "$CASE_DIR/out") > "$CASE_DIR/permission-error" 2>&1; then
+      fail "mode 0750 accepted"
+    fi
+    contains "$CASE_DIR/permission-error" "backup root is not mode 0700"
+    echo "PASS [$CASE]: mode 0750 rejected"
+    return
+  fi
   : > "$CASE_DIR/kubectl.calls"
   : > "$CASE_DIR/uzi.calls"
   : > "$CASE_DIR/backup.calls"
@@ -184,8 +209,7 @@ run_case(){
         baseline)
           assert_backups 2 run-a run-b
           # The root is persistent and holds unpushed work: owner-only despite umask 022.
-          [ -n "$(find "$CASE_DIR/out" -maxdepth 0 -perm 700)" ] ||
-            fail "backup root is not mode 0700"
+          assert_backup_root "$CASE_DIR/out"
           [ -n "$(find "$CASE_DIR/out/backup-loop.state" -maxdepth 0 -perm 600)" ] ||
             fail "backup-loop.state is not mode 0600"
           contains "$CASE_DIR/out/backup-loop.state" "context=test-ctx"
@@ -233,7 +257,7 @@ run_case(){
   echo "PASS [$CASE]"
 }
 
-CASES='baseline reject-unknown reject-prefix reject-multiline reject-kubectl-error reject-kubectl-error-matching context-known context-unset context-empty advisory-terminal advisory-empty advisory-failing advisory-unrecognized advisory-active advisory-failing-terminal retain-empty retain-failing retain-unrecognized'
+CASES='baseline root-permissions reject-unknown reject-prefix reject-multiline reject-kubectl-error reject-kubectl-error-matching context-known context-unset context-empty advisory-terminal advisory-empty advisory-failing advisory-unrecognized advisory-active advisory-failing-terminal retain-empty retain-failing retain-unrecognized'
 SELECTED="${1:-${TEST_CASE:-all}}"
 if [ "$SELECTED" != all ]; then
   case " $CASES " in

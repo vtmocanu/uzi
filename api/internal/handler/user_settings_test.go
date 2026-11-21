@@ -58,6 +58,10 @@ type fakeSettingsDB struct {
 	defaultHarness  pgtype.Text
 	claudeModel     pgtype.Text
 	codexModel      pgtype.Text
+	// planningModel and planningEffort are users.planning_claude_model / planning_claude_effort
+	// (PRD #3252), written by SetUserPlanningClaude.
+	planningModel  pgtype.Text
+	planningEffort pgtype.Text
 	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
 	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
 	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
@@ -124,6 +128,19 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if set, _ := args[6].(bool); set {
 			if v, ok := args[7].(pgtype.Text); ok {
 				f.model = v
+			}
+		}
+	case strings.Contains(sql, "SET planning_claude_model = CASE") && len(args) >= 5:
+		// SetUserPlanningClaude: $1=set_model, $2=planning_claude_model, $3=set_effort,
+		// $4=planning_claude_effort, $5=id. A field is written only when its set flag is true.
+		if set, _ := args[0].(bool); set {
+			if v, ok := args[1].(pgtype.Text); ok {
+				f.planningModel = v
+			}
+		}
+		if set, _ := args[2].(bool); set {
+			if v, ok := args[3].(pgtype.Text); ok {
+				f.planningEffort = v
 			}
 		}
 	case strings.Contains(sql, "UPDATE users SET default_codex_effort") && len(args) >= 1:
@@ -234,6 +251,8 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		defaultHarness:  f.defaultHarness,
 		claudeModel:     f.claudeModel,
 		codexModel:      f.codexModel,
+		planningModel:   f.planningModel,
+		planningEffort:  f.planningEffort,
 	}
 }
 
@@ -261,6 +280,8 @@ type fakeSettingsRow struct {
 	defaultHarness  pgtype.Text
 	claudeModel     pgtype.Text
 	codexModel      pgtype.Text
+	planningModel   pgtype.Text
+	planningEffort  pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -297,7 +318,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 24: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here)
+	case 26: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion and the planning pair (PRD #3252)
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -379,6 +400,13 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		// sidebar_motion (issue #4510) is the 24th column, after claude_provider_id.
 		if p, ok := dest[23].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
+		}
+		// planning_claude_model and planning_claude_effort (PRD #3252) are columns 25 and 26.
+		if p, ok := dest[24].(*pgtype.Text); ok {
+			*p = r.planningModel
+		}
+		if p, ok := dest[25].(*pgtype.Text); ok {
+			*p = r.planningEffort
 		}
 	}
 	return nil
@@ -1750,8 +1778,8 @@ func TestSidebarMotionNullUserResolvesToInstanceDefault(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 	}
 	raw, eff := decodeSidebarMotion(t, rec.Body.Bytes())
-	if raw != nil || eff {
-		t.Fatalf("NULL user: raw=%v effective=%v, want nil/false", raw, eff)
+	if raw != nil || !eff {
+		t.Fatalf("NULL user: raw=%v effective=%v, want nil/true", raw, eff)
 	}
 }
 
@@ -1785,9 +1813,9 @@ func TestSidebarMotionPutNullClears(t *testing.T) {
 	if db.sidebarMotion.Valid {
 		t.Fatalf("stored sidebar_motion should be NULL, got %+v", db.sidebarMotion)
 	}
-	raw, _ := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
-	if raw != nil {
-		t.Fatalf("raw after clear = %v, want nil", *raw)
+	raw, eff := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw != nil || !eff {
+		t.Fatalf("after clear: raw=%v effective=%v, want nil/true", raw, eff)
 	}
 }
 

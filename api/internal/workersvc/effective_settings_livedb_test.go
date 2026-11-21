@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func (fx *effFix) claim(run store.Run) *ClaimPayload {
 	fx.t.Helper()
 	fx.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, run.ID, fx.workerID)
 	w := store.Worker{ID: fx.workerID, UserID: fx.userID, ProtocolCapabilities: []string{
-		capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1,
+		capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1, capability.ClaudePhaseModelsV1,
 	}}
 	payload, err := fx.svc.assembleClaim(fx.env.ctx, w, mustRun(fx.t, fx.env, run.ID))
 	if err != nil {
@@ -151,10 +152,19 @@ type leadWant struct {
 	model, modelSource      string
 	claimModel, claimSource string
 	effort, effortSource    string
+	// plan is the plan_phase pair the claim ships and the prediction carries; nil when neither does.
+	plan *ClaimPhaseSettings
 }
 
 func (w leadWant) check(t *testing.T, lead LeadPrediction, payload *ClaimPayload) {
 	t.Helper()
+	// PRD #3252: the predicted plan pair is the claim's plan_phase, and both equal the literal table.
+	if !reflect.DeepEqual(lead.Plan, w.plan) {
+		t.Errorf("predicted plan = %+v, want %+v", lead.Plan, w.plan)
+	}
+	if !reflect.DeepEqual(payload.Config.PlanPhase, w.plan) {
+		t.Errorf("claim plan_phase = %+v, want %+v", payload.Config.PlanPhase, w.plan)
+	}
 	if lead.Model != w.model || lead.ModelSource != w.modelSource {
 		t.Errorf("predicted model = %q (%s), want %q (%s)", lead.Model, lead.ModelSource, w.model, w.modelSource)
 	}
@@ -242,6 +252,51 @@ func TestEffectiveSettingsLeadClaimEquivalenceLiveDB(t *testing.T) {
 			name:  "claude explicit effort",
 			setup: func(fx *effFix) { fx.anthropic(); fx.lane("default_effort", "high") },
 			want:  leadWant{harness: HarnessClaude, model: "", modelSource: "builtin", effort: "high", effortSource: "user_default"},
+		},
+		{
+			name: "claude planning model and effort split the plan pair from the implement pair",
+			setup: func(fx *effFix) {
+				fx.anthropic()
+				fx.lane("default_claude_model", "sonnet")
+				fx.lane("default_effort", "low")
+				fx.lane("planning_claude_model", "opus")
+				fx.lane("planning_claude_effort", "high")
+			},
+			want: leadWant{harness: HarnessClaude, model: "sonnet", modelSource: "user_default", claimModel: "sonnet", claimSource: "user_default",
+				effort: "low", effortSource: "user_default",
+				plan: &ClaimPhaseSettings{Model: strp("opus"), Effort: strp("high"),
+					ModelSource: "user_planning_default", EffortSource: "user_planning_default"}},
+		},
+		{
+			name:  "claude planning model alone inherits the implement effort",
+			setup: func(fx *effFix) { fx.anthropic(); fx.lane("planning_claude_model", "opus") },
+			want: leadWant{harness: HarnessClaude, model: "", modelSource: "builtin", effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Model: strp("opus"), Effort: strp("medium"),
+					ModelSource: "user_planning_default", EffortSource: "builtin"}},
+		},
+		{
+			name: "claude planning effort alone inherits the template model",
+			setup: func(fx *effFix) {
+				fx.anthropic()
+				fx.template(effLeadName, "opus", "")
+				fx.lane("planning_claude_effort", "max")
+			},
+			want: leadWant{harness: HarnessClaude, model: "opus", modelSource: "template", effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Effort: strp("max"), EffortSource: "user_planning_default"}},
+		},
+		{
+			name:  "a codex planning model on the claude column is ignored",
+			setup: func(fx *effFix) { fx.anthropic(); fx.lane("planning_claude_model", "gpt-6-luna") },
+			want:  leadWant{harness: HarnessClaude, model: "", modelSource: "builtin", effort: "medium", effortSource: "builtin"},
+		},
+		{
+			name: "planning columns never reach a codex run",
+			setup: func(fx *effFix) {
+				fx.codexDefault()
+				fx.lane("planning_claude_model", "opus")
+				fx.lane("planning_claude_effort", "high")
+			},
+			want: leadWant{harness: HarnessCodex, model: agenttmpl.DefaultCodexModel, modelSource: "builtin", effort: "medium", effortSource: "builtin"},
 		},
 		{
 			name:  "codex only, nothing configured",

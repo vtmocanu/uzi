@@ -7,7 +7,7 @@ import { OverviewUsageCard } from "./OverviewUsageCard";
 import type { UsageWindow } from "../lib/usageByUser";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
-import { USAGE_SCOPE_NOTE } from "./usageParts";
+import { OUTCOME_SCOPE_NOTE, USAGE_SCOPE_NOTE } from "./usageParts";
 
 const bundle = (input: number, cache: number, output: number, cost: number) => ({
   input_tokens: input, cache_read_tokens: cache, cache_creation_tokens: 0,
@@ -285,6 +285,24 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     it("divides the full cost, helper spend included, by the PR count", () => {
       const self = helperOnly(); self.lifetime_pr_count = 4;
       expect(mount({ self }).getByText("$308.64 per PR")).toBeTruthy();
+    });
+  });
+
+  describe("outcome scope caption (#4577)", () => {
+    it("renders in personal scope and after switching to All users", () => {
+      const { self, admin } = fixture();
+      const view = mount({ self, admin });
+      expect(view.getByText(OUTCOME_SCOPE_NOTE)).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "All users" }));
+      expect(view.getAllByText(OUTCOME_SCOPE_NOTE)).toHaveLength(1);
+    });
+
+    it("is not rendered when there are no finished runs", () => {
+      const { self } = fixture();
+      self.outcomes = { lifetime: outcomes({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {} }), last_7_days: self.outcomes.last_7_days };
+      const view = mount({ self });
+      expect(view.getByText("No finished runs in this period.")).toBeTruthy();
+      expect(view.queryByText(OUTCOME_SCOPE_NOTE)).toBeNull();
     });
   });
 

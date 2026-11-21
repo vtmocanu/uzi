@@ -421,7 +421,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; U20 executor switch admission (B preparation child, (d)); B refresh suspension (fail-closed downstream, timeout red) and Now/summary gating during publication not credited (Now's switchGate masked by an undetermined layer, most likely the Runner lifecycle abort, except on the preserve-only resume-refusal path; summaries untested); R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; U20 executor switch admission (B preparation child, (d)); B refresh suspension (fail-closed downstream, timeout red) and Now/summary gating during publication not credited (Now's switchGate masked by an undetermined layer, most likely the Runner lifecycle abort, except on the preserve-only resume-refusal path; plan and intent summary behaviour tested by the #4573 leaves with the fix at 5288bdce6, but their individual-fence proofs, post-body attribution and I4 B-ordinal attribution uncredited, see U20 plan and intent summaries); R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias and enablement (old/target) lock presence and NOWAIT keyword, the account lock and its NOWAIT against a reverse-order writer, the busy mapping, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
@@ -3669,9 +3669,313 @@ Not credited:
   Separating the copies needs a controller-level test
   (`NowSummaryController.suspendCodexSwitch` with an un-aborted lifecycle);
   none was added.
-- **Plan and intent summaries** are untested in the window (nothing starts one at the barriers); the `summaryAllowed` mutants are therefore not masked but unexercised.
+- **Plan and intent summaries** are untested in the window (nothing starts one at the barriers); the `summaryAllowed` mutants are therefore not masked but unexercised. Superseded for behaviour by "U20 plan and intent summaries (2026-11-21, #4573)" below.
 - **B's refresh suspension until finishB.** Its removal is caught by a
   downstream fail-closed retain, not by the deferred-refresh assertion.
+
+### U20 plan and intent summaries (2026-11-21, #4573)
+
+Real Runner leaves in agent/test/codex-executor.test.ts, in the "M2 actualRunner
+credential replacement" describe, one set per publication name. The gated
+variants run in both U20 gated directions; the preserve-only variant runs once
+(api_key to subscription). Test names contain "plan summary" or "intent summary":
+- plan summary: gated-plan-summary, gated-plan-summary-late,
+  gated-plan-summary-unacked;
+- intent summary: gated-intent-summary, gated-intent-summary-retained,
+  gated-intent-summary-late, and the preserve-only variant
+  resume-refuse-preserve-intent-summary.
+
+Fixture mechanisms:
+- The executor's own summary factory is used (`makeExecutor` home option), not a
+  stub.
+- An event-driven abort-then-release barrier runs after the sibling drain
+  operands plus one `setImmediate`.
+- Late result: a wrapper at the `summaryRunner` seam returns a synthesized
+  real-shaped result, because the model pass turns a post-abort completion into
+  null.
+- Retained uninvoked A plan callback: kept across the switch by an unapplied ACK.
+- Retained unlaunched A intent ownership: the A intent build keeps its ownership
+  and settles at the abort.
+- Follow-on (I4): a claim reaches a follow-on execute of the same run through the
+  same executor.
+
+Tested revisions: product fix 5288bdce6, final tests c1b399b07, base 8be78a548
+(intermediate test commits a43bfe06b and 28222928c). Mutant revisions: plan
+mutants (M1-M8 and the P2 D rows) ran at a43bfe06b; intent J, F and G rows at
+28222928c; the I4 K1, K2 and K3' rows at c1b399b07. The 'plan summary' and
+'intent summary' 11/11 baselines include older matching leaves (plan: 6 new + 5
+older; intent: 7 new + 4 older).
+
+Commands. Focused: from `agent/`, `node --import tsx --test --test-timeout=120000
+--test-name-pattern='publication gates Now|plan summary|intent summary' test/codex-executor.test.ts`
+(24 leaves: 13 #4573 leaves, the 2 'publication gates Now' leaves and 9 older
+inline-summary leaves that the pattern also matches); the 'plan summary' and 'intent summary' sets also run alone with
+their pattern. Mutation: apply one edit in a scratch export of the exact
+candidate and run the single-file form above; nothing is mutated in the checkout.
+Gates: `npm run check:agent`, the full test/codex-executor.test.ts file,
+`test:codex-m4` (at 5288bdce6), `git diff --check`.
+
+Base-red record (P3). Production at 8be78a548 with the new tests:
+`.uzi/scratch/gate-log.W3wMAl`, 9 pass and 2 fail, both uninvoked-A-plan-callback
+leaves, at "retired A plan callback never builds or posts with B": actual
+`{inputs:1,builds:2,posts:1}`, expected `{inputs:0,builds:1,posts:0}`. Taken
+before the product edit: the retained, uninvoked A plan callback built and posted
+a summary with B after finishB.
+
+Fix (5288bdce6): `beginPlanSummary` captures the admitting authority
+(`admittedAuthority`) and `authorityCurrent()` refuses when it is no longer
+current, in the callback entry check and in the in-flight `allowed()`. Identity
+only: `summaryInputs` is unchanged. The changelog fragment is in this
+PR (fragment id 29b991fd).
+
+Per-leaf results. Label: R = regression (red on base), C = characterization
+(passes on base behaviour or has no base-red record). "Individual fence" means
+the one removed line alone reddens a named assertion.
+
+| Leaf | Label | Behaviour tested/pass | Individual fence mutation-proven | Mutant (edit) | Named red | Log |
+| --- | --- | --- | --- | --- | --- | --- |
+| P1a plan join | C | pass | yes | M1: drop flights from the `suspendEpoch` allSettled | "A plan summary joins before suspension completes" | `.uzi/scratch/gate-log.hpxqYc` |
+| P1b plan post check | C | pass | yes | M2: delete `allowed()` before `postPlanSummary` | "late A plan result never posts as B" (1 vs 0) | `.uzi/scratch/gate-log.VhJTUx` |
+| P1b plan abort observation | C | pass | yes (observed by the reviewer; no retained log) | reviewer mutant B: `signal: undefined` to `generatePlanSummary` | "late A plan result resolves only after the switch aborted it" (only failure in the late leaves) | reviewer-1 export run at a43bfe06b; log not kept |
+| P1b plan late leaves, join | C | pass | yes | M1 | "the suspension is still pending when A plan work is released" | `.uzi/scratch/gate-log.hpxqYc` |
+| P2 plan pending-switch refusal | C | pass | NO (uncredited) | see matrix | see matrix | see matrix |
+| P3 retired A callback | R | pass | yes | M3: `authorityCurrent` replaced by `=> true` | "retired A plan callback never builds or posts with B" | `.uzi/scratch/gate-log.zZxuib` (base red W3wMAl) |
+| P4 binding | C | pass | yes | M4: `summaryInputs` `admitted.claim` replaced by `authority.claim` | "B plan summary build is admitted with B's credential" (0 vs 1) | `.uzi/scratch/gate-log.xL2MsF` |
+| P4 attribution | C | pass | yes | M5: bypass of the `summary_usage` ordinal stamp (runner.ts) | "B plan summary usage is delivered with B's credential_epoch_ordinal" (undefined vs 1) | `.uzi/scratch/gate-log.5ZcVEd` |
+| I1a intent join | C | pass | yes | J1: drop the join | "A intent summary joins before suspension completes" | `.uzi/scratch/gate-log.7gJ7V6` |
+| I1b intent join | C | pass | yes | J1 | "late A intent result settles before B publication" | `.uzi/scratch/gate-log.7gJ7V6` |
+| I1b intent abort | C | pass | yes | J2: `signal: undefined` | "late A intent result resolves only after the switch aborted it" (other leaves derail on teardown timeouts) | `.uzi/scratch/gate-log.10x27l` |
+| I1b intent post isolation | C | pass | NO (uncredited) | F1-F4, see matrix | green alone | see matrix |
+| I2 intent retained/launch guard, incl. preserve-only | C | pass | NO (uncredited) | G1-G5, see matrix | green alone | see matrix |
+| I3 retained ownership | C | pass | NO (uncredited) | see guard matrix | see guard matrix | see matrix |
+| I4 post | C | pass | yes | K1: skip the post | "exactly one B intent summary post" | `.uzi/scratch/gate-log.ds6IsD` |
+| I4 credential | C | pass | yes | K2: `run()` falls back to `opts.binding` | "B intent summary uses B's credential" | `.uzi/scratch/gate-log.9gnbr7` |
+| I4 follow-on baseline ordinal | C | pass | yes | K3': stamp ordinal 1 when 0 (runner.ts epochEmitter) | "follow-on intent summary usage carries the follow-on flight's baseline (no ordinal)", also the late leaves' "A intent usage carries no epoch ordinal" | `.uzi/scratch/gate-log.kGKbz9` |
+
+Baselines: plan 11/11 (`.uzi/scratch/gate-log.SbWMZY`), intent 11/11 (`.uzi/scratch/gate-log.2VPhcS`),
+I4 at c1b399b07 (`.uzi/scratch/gate-log.24Um5g`). Under M5 the existing
+'publication gates Now' leaves stay green at 5288bdce6 (`.uzi/scratch/gate-log.pnKNgh`).
+M1 at 5288bdce6 timed out the P1a join leaf (`.uzi/scratch/gate-log.zOBwCY`),
+which led to the rework at a43bfe06b.
+
+The individual-fence proofs below are UNCREDITED. Combined removals (D-rows) are
+diagnostic only because they remove more than one fence. I1b post isolation is
+outside the owner decision of 2026-11-21 and is reported as an unmet clause.
+
+P2 fence matrix (plan summary refused while a switch is pending; production
+fences `authorityCurrent`, `switchAdmissionClosed`, `summaryLifecycleClosed`, the
+first `assertCurrent`):
+
+| Row | Edit | Result | Log |
+| --- | --- | --- | --- |
+| M6 | remove `switchAdmissionClosed` | green (masked) | `.uzi/scratch/gate-log.5WdlmY` |
+| M7 | remove `summaryLifecycleClosed` | green (masked) | `.uzi/scratch/gate-log.g1Bvoj` |
+| M8 | remove the first `assertCurrent` | green (masked) | `.uzi/scratch/gate-log.WCKGVN` |
+| D1 | M6 + M3 | red only at callback-after-B | `.uzi/scratch/gate-log.eWjrh5` |
+| D2 | M7 + M3 | same as D1 | `.uzi/scratch/gate-log.QE9OHl` |
+| D3 | M6 + M7 | green | `.uzi/scratch/gate-log.D0Iky3` |
+| D4 | M6 + M7 + M3 + M8 | red P2 at after-publish (inputs 1) | `.uzi/scratch/gate-log.YKDX73` |
+| D5 | M8 + M3 | same as M3 | `.uzi/scratch/gate-log.rPj8mU` |
+| D6 | M6 + M7 + M3 | red at after-publish | `.uzi/scratch/gate-log.YJLX70` |
+
+After-publish, three fences guard the stage (`authorityCurrent`,
+`switchAdmissionClosed`, `summaryLifecycleClosed`); P2 reddens only when all three
+are removed, any two suffice. The before-publish masker is unidentified (not M3,
+M6, M7 or M8). Later stages are unobserved under D4 and D6 because the loop stops
+at the first failure.
+
+I1b post-isolation matrix (late A intent result must not post as B; fences F1
+`aborted`, F2 `summaryAllowed`, F3 `abandoned`, F4 `intentFlight === flight`):
+
+| Row | Edit | Result | Log |
+| --- | --- | --- | --- |
+| F1 | remove `aborted` | green | `.uzi/scratch/gate-log.u7BHqv` |
+| F2 | remove `summaryAllowed` | green | `.uzi/scratch/gate-log.cH1WVf` |
+| F3 | remove `abandoned` | green | `.uzi/scratch/gate-log.zk15bz` |
+| F4 | remove `intentFlight === flight` | green | `.uzi/scratch/gate-log.WJP1Hb` |
+| DIAG-F | F1 + F2 | red "late A intent result never posts as B" | `.uzi/scratch/gate-log.rACzqu` |
+| F34 | F3 + F4 | green | `.uzi/scratch/gate-log.638IAy` |
+| F123, F124, F1234 | three or four removed | red | `.uzi/scratch/gate-log.iNohG4`, `.uzi/scratch/gate-log.YkMi1r`, `.uzi/scratch/gate-log.zFYOjt` |
+
+F1 and F2 mask each other; F3 and F4 are masked by F1/F2.
+
+Guard matrix (retained unlaunched A intent ownership; launch/summary guard
+pieces G1 `assertSwitchAdmission`, G2 `assertCurrent`, G3 identity check, G4
+`summaryLifecycleClosed`, G5 signal `throwIfAborted`):
+
+| Row | Edit | Result | Log |
+| --- | --- | --- | --- |
+| G1 | remove | green | `.uzi/scratch/gate-log.85sDsx` |
+| G2 | remove | green | `.uzi/scratch/gate-log.R1vsFM` |
+| G3 | remove | green | `.uzi/scratch/gate-log.V4Zaq3` |
+| G4 | remove | green | `.uzi/scratch/gate-log.CHyf1A` |
+| G5 | remove | derails the Now drain with timeouts (the factory is shared with Now), no credit | `.uzi/scratch/gate-log.dDQ7Mh` |
+| D1 | substitute keeping G5 | red "retired A intent launch never starts at before-publish" and "retired A summary guard refuses with TrustedExecutionRefusal" | `.uzi/scratch/gate-log.6NyRWy` |
+| D2 | remove the `assertAuthority` call | red at the guard refusal | `.uzi/scratch/gate-log.Sj9L6Z` |
+| D4 | G1 + G2 + G3 | red | `.uzi/scratch/gate-log.Fjqb43` |
+| D5 | G1 + G2 + G3 + G4 | red, at the same assertions as D1 | `.uzi/scratch/gate-log.9SdHTs` |
+| D6 | G1 + G2 + G4 | red at "never starts at before-publish" | `.uzi/scratch/gate-log.EgoI6z` |
+| D7 | G1 + G4 | green | `.uzi/scratch/gate-log.8cWB2y` |
+| D8 | G2 + G4 | green | `.uzi/scratch/gate-log.JlQ4J3` |
+| D9 | G3 + G4 | green | `.uzi/scratch/gate-log.oK9V3O` |
+| D10 | G2 + G3 + G4 | red | `.uzi/scratch/gate-log.y91wgW` |
+| D11 | G1 + G3 + G4 (G2 only left) | green | `.uzi/scratch/gate-log.xEInIr` |
+
+G2 alone suffices; G1 and G3 are masked by G2. G5 derails the Now path, so it
+earns no credit. Recorded refusal messages: before-publish "codex credential
+authority retired"; later stages "summary credential authority changed". The
+preserve-only refusal is "codex epoch admission closed for capture"
+(`assertCaptureAdmission`, reviewer instrumentation). The "preserve-only
+re-armed lifecycle..." and "never acquires B after finishB" test assertions
+were not reached by any diagnostic (uncredited).
+
+Rejected or derailing mutants:
+- M5 original (dropping the emitter swap) throws; replaced by the
+  `summary_usage` bypass above.
+- K3 original (`?? 1` at runner.ts:17266) derails the A turn
+  (`.uzi/scratch/gate-log.5c4qvi`); replaced by K3'.
+- First-round P1a timeout (`.uzi/scratch/gate-log.zOBwCY`, at 5288bdce6) and
+  first-round K1/K2 timeouts (`.uzi/scratch/gate-log.u88o4c`,
+  `.uzi/scratch/gate-log.3dlSTY`, at 28222928c): fixtures then reworked
+  (a43bfe06b, c1b399b07).
+
+Attribution:
+- Delivered `credential_epoch_ordinal` 1 on B's plan `summary_usage` (P4); absent
+  on A usage (P1b, I1b).
+- Follow-on intent usage is unstamped. The follow-on flight's emitter ordinal is 0
+  (runner.ts `epochEmitter`; `flight.codexAuthority` is written only on a switch)
+  while the reused executor still holds ordinal 1. Recorded as an open
+  observation: I4 B-ordinal attribution is UNCREDITED.
+- REST post bodies carry no epoch field (client.ts `postPlanSummary`,
+  `postIntentSummary`): post-body attribution is UNCREDITED.
+
+Repair pass (459a299f3, 187208c46, after the cross-check):
+- Stage coverage. The P2 and I2 retained-consumer probes now also run at the
+  scope-assignment stages (before/after scope clear, and before/after scope
+  install when B is subscription) and at the Now publication stages
+  (before-Now-publish, after-Now-publish), besides executor publication
+  (before-publish, after-publish) and B preparation (before-prepare, login,
+  prepared). Observed stage lists: plan-unacked: scope stages, before-publish,
+  after-publish, before-Now-publish, after-Now-publish, before-prepare, login,
+  prepared; gated and retained intent: the same plus after-publishB and
+  after-finishB; preserve-only intent: scope stages, before-publish,
+  after-publish, before-Now-publish, after-Now-publish, before-prepare, login,
+  resume, policy-hold. Results are asserted at top level with the P2/I2
+  messages. The D6 diagnostic (both `summaryAllowed` flags removed and
+  `authorityCurrent` forced true) was run by the implementer in a scratch export
+  of the 459a299f3 candidate (`.uzi/scratch/gate-log.oBo3Vp`; the log does not
+  record the applied edit). It reddens P2 first at after-publish (inputs 1); the
+  scope stages and before-publish record zero-work attempts under it (masked), and the later stages, including the Now stages, are unobserved
+  because the assertion stops at the first failing stage.
+- At 187208c46 the I4 follow-on execute had a timeout-bounded cleanup join;
+  a timeout could still leave it running. The maintainer correction below
+  supplies an independent stop and requires actual settlement before restoration.
+- Gates at 459a299f3: `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` EXIT 0
+  (`.uzi/scratch/gate-log.gNJ2af`); full test/codex-executor.test.ts 1979/1979,
+  671.1 s (`.uzi/scratch/gate-log.0pXZ4s`); `git diff --check` clean
+  (`.uzi/scratch/gate-log.zyBkM1`). At 187208c46 (cleanup-only test change): the
+  focused 'publication gates Now|plan summary|intent summary' selection 24/24
+  (`.uzi/scratch/gate-log.Di171j`), typecheck and lint clean
+  (`.uzi/scratch/gate-log.5bBUjb`).
+
+Not applicable (production-path reasons):
+- Plan production trigger at the barriers: the Runner is inside the switch, not
+  inside gatePlan, during publication; plan attempts use the retained callback.
+- Plan on the preserve-only path: that claim is pre-approved, so no plan gate or
+  plan summary runs (codex-executor.ts preApproved check).
+- Intent production trigger at the barriers: the intent launch runs once per
+  `runLeg`, before any in-place switch; intent attempts use the retained
+  unlaunched ownership.
+- Scope-install stages when B is api_key: production installs no operation
+  scope for an API-key B, so only the clear stages exist.
+
+Exact selections per row. Plan rows (P1a, P1b, P2, P3, P4) ran with
+`--test-name-pattern='plan summary'`; intent rows (I1a, I1b, I2, I3, I4) with
+`--test-name-pattern='intent summary'`, each in a scratch export of the named
+revision (`git archive <sha>`, `.uzi/scratch` created inside the export,
+agent/node_modules symlinked), from the export's `agent/`:
+`env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 --test-name-pattern=<pattern> test/codex-executor.test.ts`.
+The restored-green baselines for the same selections are
+`.uzi/scratch/gate-log.SbWMZY` (plan, a43bfe06b), `.uzi/scratch/gate-log.2VPhcS`
+(intent, 28222928c) and `.uzi/scratch/gate-log.24Um5g` (intent, c1b399b07).
+
+Timing (not a finding; no wait change is established):
+- Matched selections, base 8be78a548 against 459a299f3, one sample each, node
+  v26.12.1, same worker:
+  - 'publication gates Now|plan summary|intent summary': base 11 tests, 6.65 s
+    (M2 suite 2.90 s, `.uzi/scratch/gate-log.OfniEz`); candidate 24 tests,
+    16.99 s (M2 suite 15.39 s, `.uzi/scratch/gate-log.eoDLII`).
+  - 'M2 actualRunner': base 96 tests, 124.6 s (suite 123.10 s,
+    `.uzi/scratch/gate-log.bmB3rE`); candidate 109 tests, 141.3 s (suite
+    139.74 s, `.uzi/scratch/gate-log.XFgV3M`), so about +16.7 s for the run
+    (suite +16.6 s) for 13 leaves.
+  - Single samples: noise is unmeasured. The command, environment, export setup
+    and node version are as reported by the gate owner; the logs record the
+    results, not those run conditions.
+- Earlier, unmatched figures kept for the record: base 'publication gates Now'
+  alone 2 tests, 8.1 s (describe 3.34 s, `.uzi/scratch/gate-log.QEGFlu`); the
+  focused selection 19.8 s at c1b399b07 (`.uzi/scratch/gate-log.FGj8Dj`) and
+  21.1 s at 28222928c (`.uzi/scratch/gate-log.af2F7W`); M2 describe 151.0 s at
+  28222928c (`.uzi/scratch/gate-log.LGBnDk`).
+- Full file 1979 tests, 655 s at c1b399b07 (`.uzi/scratch/gate-log.W4dRoA`) and
+  671.1 s at 459a299f3; no pre-change full-file baseline was measured.
+- CI step/job time and critical path: unmeasured, landing evidence; queue, cache
+  and rerun are not separated.
+
+Not credited or open:
+- Unmet acceptance clauses (individual targeted mutation proof): P2, I2 and I3
+  (fence matrix under the owner decision of 2026-11-21) and I1b post isolation
+  (outside that decision). The preserve-only and after-finishB intent
+  assertions were also not reached by any diagnostic. Combined removals are
+  diagnostic only and do not substitute for individual proof, so delivery is
+  partial and non-closing.
+- Post-body attribution (no epoch field on the REST summary posts) and I4
+  B-ordinal attribution (the follow-on frame characterizes a new Runner
+  flight's baseline; it does not prove delivered B attribution on the
+  transitioned claim).
+- Exact-head PR CI for the full agent suite is a landing obligation, not run here.
+- Reviewer N1: either half of the fix alone (entry check or in-flight
+  `allowed()`) is unpinned; the post-await `allowed()` term is defence in depth.
+- Reviewer N4: a plan-gate ACK spanning a completed switch now drops that
+  presentation's summary silently; low reachability.
+- Deferred non-blocking notes: late result synthesized at the `summaryRunner`
+  seam; decorations; dead entry-time `lateInput.aborted`; redundant final order
+  check; message wording; `summaryInputs` reads the live `currentAuthority`;
+  launch probe does not pin the refusal reason; duplicated release block;
+  CI time unmeasured.
+
+Maintainer fixture corrections (2026-11-21, review r6005818453):
+
+These tighten observations and fixture ownership. They do not upgrade P2, I2,
+I3, I1b post isolation, REST post-body attribution or I4 switched-claim ordinal
+attribution. The product's `admittedAuthority` fix is unchanged.
+
+| Control | Change and observed result | Scope |
+| --- | --- | --- |
+| S1 plan factory abort observation | At A's raw fixture factory, `Reflect.set(params, "signal", undefined)`: the old test passes; the corrected test fails at "A plan work observed its signal aborted by the switch" in both directions | Observation sensitivity, not an independent production-fence proof |
+| S2 intent factory abort observation | The same missing-signal fault at the intent factory: the old retained/preserve-only leaves pass; corrected retained leaves fail at "A intent work observed its signal aborted by the switch", and the preserve-only leaf at "preserve-only A intent work observed its supplied signal aborted" | Three named assertion reds; no guard-credit upgrade |
+| S3 fresh B post after an unacknowledged A gate | Omit only `postPlanSummary`: the old unacknowledged-gate leaves pass; corrected leaves fail at "exactly one B plan summary post for this run before cancellation" in both directions | Pins the positive post's run id and B-generated summary, after the existing retired-A assertions |
+| S4 B completion rather than timer cancellation | A diagnostic 1700 ms delay in the B fixture factory makes the old 1500 ms cancellation race fail the valid plan summary; the corrected leaves pass in both directions | The delay is diagnostic-only. Committed tests wait for the post or explicit callback completion; timeout reports failure instead of successful readiness |
+| S5 independent follow-on stop | The generation-8 inputs fixture deliberately never reports cancellation. Omit the body's independent stop while retaining outer cleanup: both leaves fail at "follow-on flight stops independently of its next inputs poll" | Runner shutdown stops the owned flight; cleanup awaits actual settlement before restoring fixtures |
+| S6 failure-path probe join | The new cleanup-only variant deliberately throws at the first publication barrier with a detached probe outstanding. Removing only the cleanup summary-probe join fails at "failure-path summary probes settle before fixture restoration" | Test-fixture regression only; it does not execute or credit the U20 publication assertions |
+
+Restoring the same fixture passes the focused selection (25 cases, including
+one cleanup-only case; zero skips). The missing-signal and missing-post controls
+show the former observation gaps without disabling other production guards.
+Probe scheduling is sealed before teardown releases barriers, and all started
+summary probes are joined before mock restoration. The follow-on readiness race
+records rejection before its named assertions, and its owned flight is stopped
+independently of polling; a timeout is never treated as proof of settlement.
+
+Control driver: `cdr-4583-fixture-mutants.py`; individual `cdr-4583-*-old.log`
+and `cdr-4583-*-fixed.log` records. The diagnostic factory delay is not a CI wait.
+On one local Linux sample the old 24-case selection took 6.724 s and the
+25-case selection 6.517 s; noise and CI critical-path impact are unmeasured.
+The new cleanup-only leaf took about 0.15 s. The full-file and check results
+were independently executed: all 1980 cases in the touched file passed on
+Linux with zero skips or cancellations, 219.150 s, concurrency 2 and the
+unchanged 120000 ms timeout. `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`
+passed as one job. The full agent suite remains an exact-head PR CI obligation.
 
 ### U21 — decision 11: no worker-side use of delivered Codex material before the predecessor proof (2026-11-18)
 

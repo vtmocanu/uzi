@@ -25,6 +25,7 @@
 {{- end -}}
 {{- $_ := include "uzi.workerMemoryGuardEnabled" . -}}
 {{- $_ := include "uzi.workerGoConcurrencyValidate" . -}}
+{{- $_ := include "uzi.workerRunCacheCapValidate" . -}}
 {{- if .Values.workers.enabled }}
 {{- /*
   THIS TEMPLATE RENDERS NOTHING, ON PURPOSE. It exists to evaluate the hosted-worker

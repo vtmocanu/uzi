@@ -258,6 +258,10 @@ func contractCases() []contractCase {
 		// zero.json carries a null the handler normalizes to []) and last_run_at is
 		// present-as-null.
 		newContractCase[AdminRepoActivityDTO]("admin_repo_activity"),
+		// Issue #4518: the admin worker-sizes envelope; sizes, advisories, refusals and
+		// refusal_totals are non-omitempty (the zero.json carries nulls the handler
+		// normalizes to []/{}).
+		newContractCase[AdminWorkerSizesDTO]("admin_worker_sizes"),
 	}
 }
 

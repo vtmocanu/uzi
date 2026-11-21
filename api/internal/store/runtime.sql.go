@@ -78,7 +78,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND fn_usage_primary_kind(kind)
+      AND fn_outcome_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -88,7 +88,7 @@ SELECT
     COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_user_id,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
+       WHERE r3.status = 'completed' AND fn_outcome_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -125,18 +125,18 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
-  AND fn_usage_primary_kind(kind)
+  AND fn_outcome_kind(kind)
 `
 
 type AdminRunOutcomesRow struct {
@@ -202,7 +202,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND fn_usage_primary_kind(kind)
+      AND fn_outcome_kind(kind)
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
 SELECT u.id AS user_id, u.email,
@@ -211,7 +211,7 @@ SELECT u.id AS user_id, u.email,
     COALESCE((SELECT f.origin FROM last_failure f WHERE f.user_id = u.id), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = u.id AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind) AND f.user_id = u.id
+       WHERE r3.user_id = u.id AND r3.status = 'completed' AND fn_outcome_kind(r3.kind) AND f.user_id = u.id
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS finished,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
@@ -251,19 +251,19 @@ SELECT u.id AS user_id, u.email,
               FROM runs r2
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
-  AND fn_usage_primary_kind(r.kind)
+  AND fn_outcome_kind(r.kind)
 GROUP BY u.id, u.email
 ORDER BY u.id
 `
@@ -1474,6 +1474,20 @@ WITH checker_template_pins AS MATERIALIZED (
           )
           OR 'codex_custom_model_v1' = ANY($28::text[])
       )
+      -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+      -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+      -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+      -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+      AND (
+          NOT (
+                r.harness = 'claude'
+                AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                AND r.review_target_run_id IS NULL
+                AND r.egress_profile_id IS NULL
+                AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+          )
+          OR 'claude_phase_models_v1' = ANY($28::text[])
+      )
       -- PRD #1908 (D-A): the NON-BYPASSABLE job-runner claim clause, a standalone sibling of the
       -- Codex clauses above. A repo-less 'job' run may be claimed ONLY by a NON-docker worker whose
       -- SELF-REPORTED protocol_capabilities contain 'job_runner_v1'. Every other kind is unaffected.
@@ -1748,6 +1762,20 @@ WITH checker_template_pins AS MATERIALIZED (
                             false)
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
+                )
+                -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+                -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+                AND (
+                    NOT (
+                          r.harness = 'claude'
+                          AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                          AND r.review_target_run_id IS NULL
+                          AND r.egress_profile_id IS NULL
+                          AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                    )
+                    OR 'claude_phase_models_v1' = ANY(p.protocol_capabilities)
                 )
                 -- PRD #1908 (D-A): MIRROR the job-runner claim clause for the peer, or fleet-spread could
                 -- DEFER a job to a docker or old-image peer that could never claim it. Reads the peer's
@@ -3127,6 +3155,20 @@ WHERE run.id = $1
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   )
+  -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+  -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+  -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+  -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+  AND (
+      NOT (
+            run.harness = 'claude'
+            AND run.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+            AND run.review_target_run_id IS NULL
+            AND run.egress_profile_id IS NULL
+            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = run.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+      )
+      OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+  )
   -- PRD #1906 M5: MIRROR ClaimRun's isolated-lane clause (both ways, the protocol capability,
   -- and no Codex-indicating profile-bound run), reading the candidate's OWN columns.
   AND ((run.egress_profile_id IS NOT NULL) = w.isolated_lane)
@@ -3576,6 +3618,33 @@ type CountOnlineWorkersSatisfyingJobRunnerParams struct {
 // excludes docker workers, exactly the set ClaimRun's clause admits.
 func (q *Queries) CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, arg CountOnlineWorkersSatisfyingJobRunnerParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingPhaseModels = `-- name: CountOnlineWorkersSatisfyingPhaseModels :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  -- The lane half of ClaimRun's isolated-lane clause: a lane worker never claims an unbound run.
+  AND NOT w.isolated_lane
+  AND 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+`
+
+// PRD #3252: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
+// 'claude_phase_models_v1' PROTOCOL capability. The planning-phase analogue of
+// CountOnlineWorkersSatisfyingCustomCodex: it answers "does the fleet have ANY worker that can
+// execute a Claude planning phase?", not "can THIS run be claimed right now?". It drives the
+// queued-reason resolver's phase-models rung (reasonNoPhaseModelsCapableWorker): a 0 here for a
+// phase_models_required queued run means every online worker predates the planning-phase protocol,
+// so ClaimRun's NON-BYPASSABLE clause can never be satisfied. Reads workers.protocol_capabilities
+// DIRECTLY, like its siblings. Only called for a phase_models_required queued run already past its
+// health threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingPhaseModels, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -12701,6 +12770,14 @@ SELECT id, runs.user_id, status, auto_approve,
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY($1::text[])),
             false))::boolean AS codex_custom_root,
+       -- PRD #3252: phase_models_required is the SQL-computed predicate every claim mirror carries (a Claude
+       -- lead-lane run whose owner has a planning value set needs 'claude_phase_models_v1'), so the health
+       -- queued-reason rung and the capable-worker filter agree with ClaimRun.
+       (runs.harness = 'claude'
+        AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+        AND runs.review_target_run_id IS NULL
+        AND runs.egress_profile_id IS NULL
+        AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = runs.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL)))::boolean AS phase_models_required,
        (EXISTS (
            SELECT 1 FROM runs r
            WHERE r.id = runs.id
@@ -12816,6 +12893,7 @@ type ListActiveRunsForHealthRow struct {
 	CrossCheckPinRequired          bool               `json:"cross_check_pin_required"`
 	TerminalPendingSince           pgtype.Timestamptz `json:"terminal_pending_since"`
 	CodexCustomRoot                bool               `json:"codex_custom_root"`
+	PhaseModelsRequired            bool               `json:"phase_models_required"`
 	CodexAccountGated              bool               `json:"codex_account_gated"`
 	IntakePauseHeld                bool               `json:"intake_pause_held"`
 	ReserveHoldReason              string             `json:"reserve_hold_reason"`
@@ -12958,6 +13036,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.CrossCheckPinRequired,
 			&i.TerminalPendingSince,
 			&i.CodexCustomRoot,
+			&i.PhaseModelsRequired,
 			&i.CodexAccountGated,
 			&i.IntakePauseHeld,
 			&i.ReserveHoldReason,
@@ -16017,6 +16096,20 @@ WHERE r.status = 'queued'
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
                  )
+                 -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                 -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+                 -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                 -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+                 AND (
+                     NOT (
+                           r.harness = 'claude'
+                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                           AND r.review_target_run_id IS NULL
+                           AND r.egress_profile_id IS NULL
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                     )
+                     OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+                 )
         AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -16114,6 +16207,20 @@ WHERE r.status = 'queued'
                              false)
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+                 )
+                 -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                 -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
+                 -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                 -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
+                 AND (
+                     NOT (
+                           r.harness = 'claude'
+                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                           AND r.review_target_run_id IS NULL
+                           AND r.egress_profile_id IS NULL
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                     )
+                     OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
                  )
         AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
@@ -16394,7 +16501,17 @@ WHERE r.status = 'queued'
   -- PRD #4320 / #4505: a provider-bound run (model_provider_key_mode set) is demand too. Provider
   -- execution is activated, so a fresh ephemeral worker can claim it; fn_placement_admitting_workers'
   -- provider clause (migration 00486) lets an online capable idle worker suppress it below.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[])
+      -- PRD #3252: a Claude lead-lane run whose owner has a planning value set is demand too: with no
+      -- worker reporting 'claude_phase_models_v1' online, only a freshly provisioned worker can claim it
+      -- (required_capabilities stays '{}' for it). The same predicate text as every claim site.
+      OR (
+            r.harness = 'claude'
+            AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+            AND r.review_target_run_id IS NULL
+            AND r.egress_profile_id IS NULL
+            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+      ))
 
   -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
   -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand
@@ -21387,6 +21504,9 @@ WITH candidates AS MATERIALIZED (
     SELECT r.id, r.kind FROM runs r, worker_active_runs a
     WHERE a.worker_id = $1 AND a.run_id = r.id AND a.terminal_pending = false
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = $1
   AND r.status = 'queued'
@@ -21459,6 +21579,9 @@ UPDATE runs r SET
 FROM worker_active_runs a
 WHERE a.worker_id = $1 AND a.run_id = r.id AND a.terminal_pending = false
   AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- PRD #3252 m4: the phase-switch hold keeps its claim through ResumePausedRun's queued interval; a heartbeat
+  -- snapshot listing the run live at the held generation must not revive it to running.
+  AND r.hold_reason IS DISTINCT FROM 'phase_switch_unavailable'
   AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = $1
   AND r.status = 'queued'
@@ -26228,7 +26351,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE user_id = $1 AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND fn_usage_primary_kind(kind)
+      AND fn_outcome_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -26237,7 +26360,7 @@ SELECT
     COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = $1 AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
+       WHERE r3.user_id = $1 AND r3.status = 'completed' AND fn_outcome_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -26282,20 +26405,20 @@ SELECT
               FROM runs r2
               WHERE r2.user_id = $1
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = $1
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND fn_usage_primary_kind(r2.kind)
+              AND fn_outcome_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE runs.user_id = $1
   AND status IN ('completed', 'failed', 'cancelled')
-  AND fn_usage_primary_kind(kind)
+  AND fn_outcome_kind(kind)
 `
 
 type SelfRunOutcomesParams struct {
@@ -26330,11 +26453,13 @@ type SelfRunOutcomesRow struct {
 // These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
 // provisioning / credential lookup / guardrail has no usage row, so a rate computed
 // over the usage join would systematically hide the infra failures this number exists
-// to surface. Issue #4209: outcomes count terminal PRIMARY work runs only, the population
-// fn_usage_primary_kind defines (issue, task, prompt, job, self_improve), over terminal
-// runs only (status IN ('completed','failed','cancelled')). Helper runs (chat, judge,
-// cross_check, mr_rework, ci_fix, manual and automatic alike) are not factory run outcomes.
-// This no longer mirrors the Runs page: ListRunsForUser still lists mr_rework and ci_fix.
+// to surface. Issue #4577 (revising #4209 for outcomes): outcomes count every terminal run
+// kind except chat (fn_outcome_kind: issue, task, prompt, job, self_improve, mr_rework,
+// ci_fix, cross_check, judge), over terminal runs only (status IN ('completed','failed',
+// 'cancelled')). Numerator and denominator are the same population; membership is by
+// runs.status only (cross-check metadata never moves a run between buckets); one row per
+// run, no dedup against a parent run. The usage run_count stays primary-only
+// (fn_usage_primary_kind).
 // Windowed on created_at (D3), the same
 // axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 // same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
@@ -27011,6 +27136,10 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- that has already exited. A pause is only ever requested on a running run, so no legitimate
   -- awaiting_approval report is expected from a paused row.
   AND status <> 'paused'
+  -- PRD #3252 m4: nor may a late report move a run held at phase_switch_unavailable to the gate. The hold
+  -- keeps its claim and ResumePausedRun leaves it queued on the same worker and generation, which the
+  -- paused-only exclusion above does not cover.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
 `
 
 type SetRunAwaitingApprovalParams struct {
@@ -27131,6 +27260,8 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- A provider-unavailable hold retains its claim; the specialized holds below do too.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+  -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
@@ -27200,6 +27331,8 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- A provider-unavailable hold retains its claim; the specialized holds below do too.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+  -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
@@ -27407,6 +27540,10 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- non-released row (the interlocked path is completeRunWithPermitLease, fenced on its own locked row),
   -- so this never blocks a legitimate completion.
   AND status <> 'paused' AND claim_released_at IS NULL
+  -- PRD #3252 m4: nor may a late report complete a run held at phase_switch_unavailable. The hold keeps its
+  -- claim (claim_released_at stays NULL) and ResumePausedRun leaves it queued with the same worker and
+  -- generation, so only this predicate stops the old flight's report reviving it.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- PRD #1908: a job is completed only from a live (claimed or running) status. In particular the
   -- issue #329 supersede arm below must never flip a job the wall backstop failed with
   -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so
@@ -28016,6 +28153,8 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   -- All paused runs are protected above. Retain provider protection through
   -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+  -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -28096,6 +28235,8 @@ WITH failed AS (
       -- All paused runs are protected above. Retain provider protection through
       -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
       AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable','codex_policy_hold'), FALSE))
+      -- PRD #3252 m4: nor may one leave the phase-switch hold, which keeps this claim through ResumePausedRun's queued interval.
+      AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'phase_switch_unavailable', FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -31075,6 +31216,7 @@ WITH candidates AS MATERIALIZED (
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
+  AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'phase_switch_unavailable', FALSE))
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -31125,6 +31267,7 @@ WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
+  AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'phase_switch_unavailable', FALSE))
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
 `
 
