@@ -269,6 +269,286 @@ are unbounded exactly as long as their holder is. A fire-once hook whose gate
 wait times out, including during a stalled durable commit, logs and drops its
 admission, as every other database error there does.
 
+### T3a: durable per-fire progress for one-time sweeps (#4512)
+
+Once implemented, this supersedes the narrowed partial-fire paragraph under
+"Caller semantics" in T3 above ("a one-time sweep does not retry that
+candidate", and the deferral to #4512).
+
+**Problem.** A scheduled one-time sweep that started some runs and then met a
+busy consumer gate recorded a `consumer_gate_busy` skip and advanced to
+`fired`, so the remaining slots were lost. Holding it instead would replay the
+whole sweep: no record links a run to its fire. Scheduled issue runs carry no
+`schedule_id`, `HasActiveRunForIssue` and the open-MR dedup stop guarding once
+a run ends, and `last_fire` is a diagnostic summary that `AdvanceSchedule` and
+`RecordScheduleHeldFire` overwrite. Run creation and the schedule advance also
+commit separately, so a crash between them leaves the row due. T3a adds a
+durable record of each fire's admissions with these properties:
+
+- **Atomic.** The progress row commits in the same PostgreSQL transaction as
+  the run it records. No reader sees a run without its row, or a row without its
+  run; any error or cancellation rolls back the run, the fire header and the
+  progress row together.
+- **Durable across a process crash.** This rests on PostgreSQL commit
+  durability at the default `synchronous_commit=on`. No filesystem or
+  power-loss claim is made.
+- **Recoverable.** A fresh scheduler or API instance re-reads the row's
+  `fire_epoch` and the ledger; nothing else is needed. A commit whose
+  acknowledgement is lost leaves both rows, and the retry reads them.
+
+No transaction is held across forge HTTP: the issue fetch, candidate listing and
+label I/O stay outside the create transaction, as before.
+
+**Occurrence identity.** `run_schedules.fire_epoch bigint NOT NULL DEFAULT 0`
+names the occurrence. It is bumped by a `BEFORE UPDATE` trigger, not by
+application code, so an older binary's re-arm still invalidates the old
+occurrence. The trigger condition is exactly:
+
+```sql
+WHEN ((OLD.timing = 'once' OR NEW.timing = 'once') AND (
+       (OLD.status IS DISTINCT FROM 'active' AND NEW.status = 'active')
+    OR NEW.run_at  IS DISTINCT FROM OLD.run_at
+    OR NEW.timing  IS DISTINCT FROM OLD.timing
+    OR NEW.target  IS DISTINCT FROM OLD.target
+    OR NEW.repo_id IS DISTINCT FROM OLD.repo_id))
+```
+
+and the function body only sets `NEW.fire_epoch := OLD.fire_epoch + 1`. A
+recurring-to-recurring update never meets the outer guard, so a pure recurring
+row's epoch never moves; a conversion into or out of `once` bumps. INSERTs do
+not fire it, so a new row starts at epoch 0.
+
+**Progress records** (two additive migrations, each opening with
+`SET LOCAL lock_timeout = '5s'`, following the 00438/00439 split):
+
+- The first adds the column, the epoch function and the trigger. Its Down drops
+  the trigger, the function, then the column.
+- The second adds `schedule_once_fires`, one header per
+  `(schedule_id, fire_epoch)` (cascading from `run_schedules`), holding the
+  fire's original effective cap: `effective_cap int NULL CHECK (>= 0)`, NULL
+  meaning unlimited. It also adds `schedule_once_fire_runs`, an append-only
+  ledger with one row per admitted issue, keyed
+  `(schedule_id, fire_epoch, issue_iid)` under an explicitly named primary key
+  and cascading from the header.
+- `run_uuid uuid NOT NULL` is the admitted run's id, written in the same
+  transaction. It deliberately has no foreign key, so deleting the run row
+  cannot null or cascade it: the run identity, the spent slot, the issue title
+  and the web URL (both `NOT NULL`) survive. A CHECK forbids the nil UUID, so a
+  summary rebuilt from the ledger never carries a zero `Started.RunID`.
+- A `BEFORE UPDATE` trigger raises on any change to `schedule_id`, `fire_epoch`,
+  `repo_id`, `issue_iid` or `run_uuid`, and no UPDATE query on the table exists.
+- The ledger stores an issue number, so it carries
+  `repo_id NOT NULL REFERENCES repos ON DELETE CASCADE` (indexed), gets the
+  00474 `awaiting_first_enable` guard trigger, and joins the
+  `RepoStoresIssueNumber` EXISTS list. This is the same rule as every other
+  table that stores an issue number for a repository: without it a repository
+  still awaiting its first enable could acquire issue numbers through the
+  ledger, which the issue-tracker link guard assumes cannot happen.
+- The second migration owns both triggers and the immutability function. Its
+  Down drops the triggers, then the function, then the tables.
+
+**Writers of `run_schedules`** (from a repo-wide search for UPDATE, INSERT and
+DELETE; exhaustive for direct SQL):
+
+| Writer | Epoch | Why |
+|---|---|---|
+| `CreateRunSchedule`, `CreateDefaultSchedule` (also the self-improve migration) | starts at 0 | INSERT; the trigger is UPDATE-only |
+| `UpdateRunSchedule` (config PATCH) | bumps on revival or a `run_at`, timing, target or repo change | the only writer that revives a fired or error once row (`status = 'active'`) |
+| `ResetDefaultSchedule` | none | writes `status = 'active'`, but default rows are always `recurring`, so the outer guard is false |
+| `SetRunScheduleEnabled` (pause/resume) | none | enabled-only, on any status |
+| `ResumeRecurringSchedule` | none | recurring only |
+| `CoalesceScheduleSiblingGroup`, `ClearSingletonSiblingGroup` | none | sibling-group bookkeeping |
+| `AdvanceSchedule` (recurring arm; becomes the guarded advance below) | none | `run_at` unchanged; `active` stays `active` |
+| once advance (becomes `AdvanceOnceScheduleGuarded`) | none | active to fired, `run_at` unchanged |
+| `SetRunScheduleStatus` | none in the fire path | its only callers are `park`'s, inside `advance`; replaced by `ParkScheduleGuarded` |
+| `ParkScheduleGuarded` (new) | none | active to error, `run_at` unchanged |
+| `RecordScheduleHeldFire`, `RecordOnceFirePartial` (new) | none | `last_fire` (and, for the held write, `recent_fires`) only |
+| `DeleteRunSchedule` | n/a | cascades the header and ledger |
+| FK side effects: secret delete `SET NULL` (00233), repo delete cascade (00103) | none / n/a | `credential_override_secret_id` is not in the predicate; a repo delete removes the row |
+
+The no-bump arms of a config edit (one that keeps `run_at`) are reachable only
+by direct SQL, because a one-time PATCH must carry a future `run_at` (below).
+
+**Admission: lock order inside the create transaction.** The scheduler passes an
+optional `OnceFireProgress` (schedule, user, repo, epoch, issue, title, URL,
+effective cap) to `CreateScheduledRun` / `CreateScheduledAutopilotRun`. Nil is
+today's behaviour and is what RunNow, recurring sweeps and the issue target
+pass. Non-nil progress without a transaction beginner, or on a store that is not
+`*store.Queries`, fails closed (`errOnceFireRequiresTx`, like
+`errCIRepairRequiresTx`). The order is:
+
+1. The consumer gate, shared, first (T3).
+2. The D11 resolve reads.
+3. `LockSecretMutationShared`, when the creation is lock-eligible (unchanged).
+4. `LockRunBranch` (advisory).
+5. The pinned secret `FOR SHARE` (`lockPinnedOverrideEnabled`).
+6. **New:** the repo row `FOR SHARE` (`LockRepoForCIWatch` or an equivalent
+   share query).
+7. **New:** `LockRunScheduleForUser`, `FOR UPDATE`, owner-scoped. A missing row
+   is `ErrOnceFireStale`.
+8. **New:** recheck the locked row: `timing = 'once'`, `target = 'sweep'`,
+   `status = 'active'`, `fire_epoch` equal to the claimed epoch; otherwise
+   `ErrOnceFireStale`. Identity binding: the progress user, repo and issue must
+   equal the actual create arguments, and the locked row's `user_id` and
+   `repo_id` must agree; any mismatch is `ErrOnceFireIdentity` before anything
+   is inserted.
+9. **New:** insert the header `ON CONFLICT DO NOTHING` with the passed cap, then
+   read the stored cap, the admitted count and whether this issue is already
+   recorded. Already recorded is `ErrOnceFireCandidateRecorded`; a non-NULL
+   stored cap with count at or above it is `ErrOnceFireCapSpent` (the NULL check
+   is explicit in Go). These are fresh READ COMMITTED statements under the row
+   lock, so they see every committed admission.
+10. `CreateRun`.
+11. **New:** insert the ledger row with `run_uuid` set to the id `CreateRun`
+    returned. A 23505 on the ledger's primary key maps to
+    `ErrOnceFireCandidateRecorded`, checked before the generic
+    unique-violation arm that yields `ErrActiveRunExists`.
+12. The Codex binding freeze.
+13. Commit.
+
+The schedule row lock serializes concurrent admissions for one fire.
+
+**Summary writes.** Every once-sweep summary (the partial write, the held write
+and the completing advance) goes through one helper, `WriteOnceFireSummary`. It
+opens a short transaction with no forge I/O, sets `lock_timeout = '5s'` (a stuck
+admission yields a 55P03, treated as transient), takes the same
+`LockRunScheduleForUser FOR UPDATE` row lock as step 7, rechecks the epoch and
+`status = 'active'`, re-reads the ledger under that lock, composes Started from
+the ledger rows plus the caller's skips and capacity fields, and writes either
+`last_fire` only (`RecordOnceFirePartial`, or the epoch-guarded
+`RecordScheduleHeldFire` when there is no progress yet) or the guarded advance
+`AdvanceOnceScheduleGuarded` (`AND fire_epoch = @fire_epoch AND
+status = 'active'`). An admission either committed before the summary's read
+and is included, or waits for the summary to commit; a delayed writer cannot
+overwrite a summary that lists more starts than it saw, because Started is never
+taken from the caller's earlier read. A stale epoch or status writes nothing and
+is logged as a benign stale fire. Outside the helper:
+
+- The recurring arm of `advance` uses `AdvanceScheduleGuarded`
+  (`AND fire_epoch = @fire_epoch`). A pure recurring row's epoch never moves, so
+  its cadence is unchanged; a stale recurring fire can no longer overwrite a row
+  converted to once mid-fire.
+- `park` uses `ParkScheduleGuarded` for every timing (`AND fire_epoch AND
+  status = 'active'`). Zero rows is a benign stale fire and suppresses the
+  owner notification.
+- `RecordScheduleHeldFire` outside the helper remains only for one-time issue
+  targets, with the added epoch guard.
+
+**Lock-order proof.** Admission locks, in order: advisory gate, advisory secret
+mutation (shared, when eligible), advisory run branch, pinned secret row
+(share), repo row (share), schedule row (exclusive), then its own new rows. Each
+concurrent writer either takes a prefix of that order or holds a single lock:
+
+- **Repo delete** (`DeleteRepoForUser`, `queries/forge.sql`). It locks the
+  repository's existing runs, deletes the repo row, then cascades to its
+  schedules, header and ledger rows. Admission takes the repo `FOR SHARE`
+  before the schedule `FOR UPDATE`, the order `LockRepoForCIWatch`'s header in
+  `queries/ci_watch.sql` records ("pinned secret, repo, schedule, episode,
+  run"). If admission holds the share lock, the delete waits at the repo row
+  before any cascade. If the delete holds the repo row first, admission waits at
+  step 6 and finds the repo gone. Admission locks no existing run row, and its
+  later inserts take only `KEY SHARE` on the repo it already share-locked.
+  Taking the schedule first would cycle: admission holding the schedule and
+  needing the repo key-share for its insert, the delete holding the repo and
+  cascading into the schedule.
+- **Secret delete and disable** (`withSecretLock`, `handler/secrets.go`,
+  `LockSecretMutation` exclusive, then the credential row). A lock-eligible
+  admission holds the shared mutation lock, so the two exclude each other
+  outright. Otherwise a pinned admission holds the secret row `FOR SHARE`
+  (step 5), which conflicts with the delete and the disable
+  (`lockPinnedOverrideEnabled`, `workersvc/credential_disabled.go`), so the
+  writer waits; if the writer is first, admission waits at step 5 before it
+  holds the schedule. An unpinned admission inserts no secret FK; the delete's
+  `SET NULL` on the schedule row then waits for admission to commit, with no
+  lock admission needs. The disable writes no `run_schedules` row.
+- **Schedule config edits.** A PATCH that involves ci_watch (including a
+  conversion from or to a once sweep) runs in one transaction whose first
+  statement is the schedule row lock (`lockScheduleForConfig`,
+  `handler/schedules_ci.go`); after it come only plain reads (repo ownership,
+  episode history, credential validation) and the update's FK checks, which
+  take `KEY SHARE` on the repo or secret only when those columns change, and
+  `KEY SHARE` is compatible with admission's `FOR SHARE` locks. Admission
+  waiting at step 7 therefore holds nothing the edit needs. A conversion bumps
+  the epoch, so the waiting admission then fails step 8 as stale. Every other
+  PATCH is a single autocommit `UpdateRunSchedule`.
+- **CI repair** (`CreateCIRepairRun`, `workersvc/ci_repair.go`) takes the same
+  pinned secret, repo, schedule order (`recheckCIWatchConfig`), and its schedule
+  is a ci_watch row, never an admitting once sweep.
+- **Held, partial and advance writes.** `WriteOnceFireSummary` takes only the
+  schedule row; its UPDATE changes no FK column (so no repo or secret
+  key-share) and the ledger has no FK to `runs` (so run deletion takes nothing
+  on it). The recurring guarded advance and the guarded park are single
+  autocommit statements on one row.
+- **`ClaimDueSchedules`** is `FOR UPDATE SKIP LOCKED` and autocommits: it never
+  waits, and a row under admission is simply not claimed that tick.
+
+**Fire semantics (scheduled tick, one-time sweep only).**
+
+- `process` calls the fire with `scheduled = true`; RunNow passes `false` and
+  keeps today's path exactly (no ledger read, no fold, no partial write, its
+  503 mapping). RunNow stays a distinct fire.
+- The ledger is read first, for the claimed epoch. With rows, the fire is a
+  continuation and uses the stored cap, not a recomputed one. A continuation
+  whose prior starts already reach the cap skips capacity and the candidate loop
+  and goes straight to the guarded advance. Otherwise the `capacity_room_needed`
+  admission check is skipped (the fire was already admitted), today's room bounds
+  only the new starts, and a room of 0 is a quiet hold (`errOnceFireHeld`): no
+  transient warning, no advance, a partial summary that omits the volatile
+  in-flight and room numbers, and a retry next tick. With no rows, the cap and
+  room-needed check are unchanged.
+- Recorded candidates are skipped before the active-run check and the forge
+  fetch and add no skip; prior starts are folded into Started; the cap break
+  counts prior plus new starts. `Matched` stays `len(Started)+len(Skips)`.
+- Gate contention after partial progress now returns the error, so the fire is
+  not advanced and retries next tick, the same as contention with nothing
+  started. A best-effort partial summary is written first. The partial summary
+  is `last_fire` only and never appended to `recent_fires`; it is skipped when
+  equal to the stored one; its failure never blocks the retry. The row staying
+  `active` and due is the visible retrying state.
+- The mid-fire credential-disabled and stored-override arms judge this attempt's
+  starts: with none, they hold or return as with no starts at all; otherwise
+  they record the skip, stop and advance as today.
+- Before the advance, Started is rebuilt from the ledger, so a lost-ack start
+  that surfaced as `fetch_failed` appears exactly once. If that read fails, the
+  fire does not advance.
+
+**Accepted boundaries.**
+
+- A one-time PATCH must carry a future `run_at` (`validateScheduleConfig`'s
+  once arm, `handler/schedules_request.go`), and a pending partial fire is
+  already due, so any owner edit of it moves `run_at` and starts a new
+  occurrence with the full cap. That is the owner's explicit new fire, and it
+  may start a finished candidate again. A partial fire parked at `error` is
+  revived only by such an edit, with the same result.
+- `process`'s owner-pause and credential pre-checks still run first, so even a
+  cap-spent continuation waits for those holds to clear before it advances.
+  Nothing is lost.
+- A summary may name a run that has since been deleted; the last-fire view
+  degrades to "Current state unavailable" (`CurrentStartedRun`,
+  `web/src/components/LastRun.tsx`). This is already true of today's `last_fire`
+  and `recent_fires` summaries.
+
+**Rollback limitation.** The trigger keeps occurrence invalidation correct when
+an older binary writes the row. It does not make an older scheduler read or
+respect the ledger. While an old scheduler binary runs it ignores the ledger: it
+can exceed the cap when resuming a partial one-time fire and advance normally,
+with no transient error involved. After roll-forward, the ledger is
+authoritative only for the admissions the new binary recorded; runs an old
+binary started in the same epoch have no ledger rows, so that epoch's cap and
+per-issue dedup can be exceeded and a finished candidate restarted. Running the
+second migration's Down destroys the ledger and every recorded `run_uuid`; a
+later Up recreates empty tables.
+
+**Retention.** Header and ledger rows of earlier epochs persist until the
+schedule is deleted, bounded by roughly cap x re-arms per schedule. No sweeper
+is added.
+
+**Not claimed.** There is no e2e coverage of the scheduled retry, the guarded
+advance and park, or the serialized summaries: every e2e schedule phase fires
+through `schedule run-now`, which this change leaves alone. The evidence is the
+PostgreSQL 17 and unit suites. No power-loss durability is claimed, and no cap
+protection while an old binary runs.
+
 ### Reopen semantics (narrowed)
 
 A reopen that the forge already reflects before the observation keeps the ref.
