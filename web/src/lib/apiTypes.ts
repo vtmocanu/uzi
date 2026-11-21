@@ -1804,6 +1804,9 @@ export interface AgentSourceStagedRole {
   // Review pins are always present; empty means Default for that harness.
   claude_model: string;
   codex_model: string;
+  // The source role's Claude-family effort pin (#3258); empty means Default. Absent on
+  // an older server.
+  effort?: string;
   tools?: string[];
   prompt_body?: string;
   // True when the displayed `prompt_body` differs from the raw applied body because

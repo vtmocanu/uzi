@@ -91,6 +91,17 @@ func ValidateDefaultEffort(raw string) (string, error) {
 	return "", fmt.Errorf("effort must be one of low, medium, high, xhigh, max or runtime")
 }
 
+// IsEffortLevel reports whether v is exactly one of EffortLevels (case-sensitive, no
+// trimming), the closed set a stored effort pin may hold.
+func IsEffortLevel(v string) bool {
+	for _, level := range EffortLevels {
+		if v == level {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateEffort is the single source of truth for the effort-level rules (PRD
 // #617), used by cross-check pins. It lives in this neutral, dependency-free
 // package so every surface can share it without an import cycle, mirroring

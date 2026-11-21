@@ -64,15 +64,17 @@ type agentSourceStatusDTO struct {
 }
 
 type agentSourceRoleDTO struct {
-	Name        string   `json:"name"`
-	OK          bool     `json:"ok"`
-	Reason      string   `json:"reason,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	ClaudeModel string   `json:"claude_model"`
-	CodexModel  string   `json:"codex_model"`
-	Tools       []string `json:"tools,omitempty"`
-	PromptBody  string   `json:"prompt_body,omitempty"`
+	Name        string `json:"name"`
+	OK          bool   `json:"ok"`
+	Reason      string `json:"reason,omitempty"`
+	Description string `json:"description,omitempty"`
+	Model       string `json:"model,omitempty"`
+	ClaudeModel string `json:"claude_model"`
+	CodexModel  string `json:"codex_model"`
+	// Effort is the staged role's Claude-family effort pin (PRD #3258 N8), "" for none.
+	Effort     string   `json:"effort"`
+	Tools      []string `json:"tools,omitempty"`
+	PromptBody string   `json:"prompt_body,omitempty"`
 	// BodySanitized is true when display-sanitization actually altered PromptBody, i.e.
 	// the raw body carries hidden control/bidi/format characters that the sanitized
 	// preview drops. The web approval surface flags this so the admin knows the preview
@@ -384,8 +386,11 @@ func stagedToDTO(staged store.AgentSourceStaged, lastAppliedSHA string) *agentSo
 			Model:       termsafe.CellText(role.Model),
 			ClaudeModel: termsafe.CellText(def.Model),
 			CodexModel:  termsafe.CellText(def.CodexModel),
-			Tools:       role.Tools,
-			PromptBody:  sanitizedBody,
+			// Effort is closed-set at parse time (one of the five levels or ""); CellText
+			// keeps a hand-edited legacy snapshot from carrying anything else to the panel.
+			Effort:     termsafe.CellText(def.Effort),
+			Tools:      role.Tools,
+			PromptBody: sanitizedBody,
 			// body_sanitized: true only when sanitization changed the body, i.e. the raw
 			// body differs from the preview shown. Apply still writes the RAW body.
 			BodySanitized: sanitizedBody != role.PromptBody,

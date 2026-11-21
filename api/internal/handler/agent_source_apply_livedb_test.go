@@ -51,7 +51,7 @@ type agentSourceFixture struct {
 var agentSourceSharedTemplateNames = []string{
 	"coder", "my-admin-global", "kept-synced-global", "changed-synced-global",
 	"old-synced-global", "tester", "admin-untouched", "reviewer-bot", "endpoint-role",
-	"endpoint-role-2", "restage-victim",
+	"endpoint-role-2", "restage-victim", "effort-role", "effort-legacy", "effort-bad",
 }
 
 // clearAgentSourceSharedState removes this suite's instance-wide rows (the singleton
@@ -472,4 +472,68 @@ func (d agentSourceDTO) stagedRole(t *testing.T, name string) agentSourceRoleDTO
 	}
 	t.Fatalf("role %q not in staged dto", name)
 	return agentSourceRoleDTO{}
+}
+
+// TestAgentSourceEffortApplyLiveDB pins PRD #3258 N8 on real rows: a staged role's
+// Claude-family effort previews on the review DTO, applies to agent_templates.effort
+// (codex_effort NULL, the source carries no Codex pin), and a re-staged identical
+// snapshot applies as unchanged. A role staged with the effort_ignored clamp (the
+// parser dropped an invalid value) and a legacy role with no effort key both apply
+// as NULL.
+func TestAgentSourceEffortApplyLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newAgentSourceFixture(ctx, t)
+	roles := []byte(`[` +
+		`{"name":"effort-role","ok":true,"description":"effort desc","effort":"high","prompt_body":"effort body\n"},` +
+		`{"name":"effort-legacy","ok":true,"description":"legacy desc","prompt_body":"legacy body\n"},` +
+		`{"name":"effort-bad","ok":true,"description":"bad desc","prompt_body":"bad body\n","notes":["effort_ignored"]}]`)
+	stage := func(sha string) {
+		t.Helper()
+		if _, err := f.q.UpsertAgentSourceStaged(ctx, store.UpsertAgentSourceStagedParams{
+			FetchedAt:  pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+			FetchedSha: sha, SourceUrl: "https://example.com/agents.git", SourceRef: "v1",
+			Roles: roles, Diff: []byte(`[]`),
+		}); err != nil {
+			t.Fatalf("seed staged: %v", err)
+		}
+	}
+	effortOf := func(name string) (pgtype.Text, pgtype.Text) {
+		t.Helper()
+		var e, ce pgtype.Text
+		if err := f.pool.QueryRow(ctx, `SELECT effort, codex_effort FROM agent_templates WHERE name = $1 AND scope <> 'user'`, name).Scan(&e, &ce); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return e, ce
+	}
+
+	stage("sha-effort-1")
+	dto := f.getDTO(ctx, t)
+	if got := dto.stagedRole(t, "effort-role"); got.Effort != "high" {
+		t.Fatalf("preview effort = %q, want high", got.Effort)
+	}
+	if got := dto.stagedRole(t, "effort-legacy"); got.Effort != "" {
+		t.Fatalf("legacy preview effort = %q, want empty", got.Effort)
+	}
+	if got := dto.stagedRole(t, "effort-bad"); got.Effort != "" || len(got.Notes) != 1 || got.Notes[0] != "effort_ignored" {
+		t.Fatalf("invalid-effort preview = %+v, want no effort and the effort_ignored note", got)
+	}
+
+	res, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-effort-1")
+	if err != nil || res.Applied != 3 {
+		t.Fatalf("apply: %+v, %v", res, err)
+	}
+	if e, ce := effortOf("effort-role"); !e.Valid || e.String != "high" || ce.Valid {
+		t.Fatalf("effort-role stored effort=%+v codex_effort=%+v, want high/NULL", e, ce)
+	}
+	for _, name := range []string{"effort-legacy", "effort-bad"} {
+		if e, ce := effortOf(name); e.Valid || ce.Valid {
+			t.Fatalf("%s stored effort=%+v codex_effort=%+v, want NULL/NULL", name, e, ce)
+		}
+	}
+
+	stage("sha-effort-2")
+	res2, err := f.rec.Apply(ctx, pgconv.UUID(f.admin), "sha-effort-2")
+	if err != nil || res2.Applied != 0 || res2.Unchanged != 3 {
+		t.Fatalf("re-apply of identical content: %+v, %v; want 0 applied, 3 unchanged", res2, err)
+	}
 }

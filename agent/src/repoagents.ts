@@ -42,6 +42,10 @@
 //     (models.ts) — a full id like `claude-opus-4-8`, not only a short alias.
 //     Only a string that could never be a model id (control chars, whitespace,
 //     over-length) is ignored, and the agent inherits the run default.
+//   - `effort` (PRD #3258 N9): kept only when exactly one of low, medium, high,
+//     xhigh or max; anything else is dropped with an `effort_ignored` note (value
+//     never echoed) and the agent follows the run's effort. It is the Claude-family
+//     effort, deleted on a Codex run by projectForHarness.
 //
 // The Agent/deferral denial here is DEFENCE-IN-DEPTH (layer 1). The structural
 // layer lives in the assembly path M3 routes repo agents through: `agents.ts`
@@ -99,6 +103,7 @@ import path from "node:path";
 import { AGENT_NAME_MAX_LEN, AGENT_NAME_RE, type AgentTemplate, type RepoAgentSummary } from "./protocol.js";
 import { ASYNC_DEFERRAL_TOOLS, NESTED_AGENT_TOOL } from "./guardrails.js";
 import { isValidModel } from "./models.js";
+import { isHarnessEffort } from "./harness.js";
 import { isCodexRoleModel } from "./codex/render.js";
 import { parseCodexAgentFile } from "./repoagents-codex.js";
 
@@ -188,8 +193,9 @@ export type RepoAgentNoteReason =
   /** A Codex agent declares a restriction (`features`, `skills`, `sandbox_mode`,
    *  `tools`) uzi cannot honour yet, so it is skipped rather than run unrestricted. */
   | "restriction_unsupported"
-  /** Kept, with an invalid `model_reasoning_effort` ignored (the agent follows the
-   *  run's effort). The value is never echoed. */
+  /** Kept, with an invalid effort ignored (the agent follows the run's effort): a
+   *  Markdown `effort:` or a TOML `model_reasoning_effort` that is not exactly one of
+   *  the five levels. The value is never echoed. */
   | "effort_ignored";
 
 export interface RepoAgentNote {
@@ -631,6 +637,15 @@ function parseAgentFile(raw: string, slug: string): ParsedAgentFile {
     else notes.push({ name, reason: "model_ignored" });
   }
 
+  // PRD #3258 N9: `effort:` is the agent's Claude-family effort when it is exactly one of the
+  // five levels after the trim; an empty value inherits silently (like model); anything else is
+  // dropped with a note that never carries the value. The loader adds the file's basename.
+  const effort = fm.fields.effort?.trim();
+  if (effort) {
+    if (isHarnessEffort(effort)) template.effort = effort;
+    else notes.push({ name, reason: "effort_ignored" });
+  }
+
   return { ok: true, template, notes };
 }
 
@@ -655,12 +670,12 @@ function filterTools(declared: readonly string[]): { kept: string[]; denied: str
 }
 
 interface Frontmatter {
-  fields: { name?: string; description?: string; tools?: string[]; model?: string };
+  fields: { name?: string; description?: string; tools?: string[]; model?: string; effort?: string };
   body: string;
 }
 
 /**
- * Split leading YAML frontmatter, keeping only the four keys an AgentTemplate has.
+ * Split leading YAML frontmatter, keeping only the five keys an AgentTemplate has.
  * Every other key is ignored — `hooks`, `settings`, and anything else a repo
  * invents can never reach the SDK through this path.
  *
@@ -709,6 +724,7 @@ function parseFrontmatter(raw: string): Frontmatter | null {
     if (key === "name" && fields.name === undefined) fields.name = value;
     else if (key === "description" && fields.description === undefined) fields.description = value;
     else if (key === "model" && fields.model === undefined) fields.model = value;
+    else if (key === "effort" && fields.effort === undefined) fields.effort = value;
     else if (key === "tools" && fields.tools === undefined) {
       if (value === "") {
         // `tools:` with nothing on the line opens a block sequence. Note it as a

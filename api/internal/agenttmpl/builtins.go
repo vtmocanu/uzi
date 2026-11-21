@@ -116,6 +116,14 @@ func parse(raw []byte) (Definition, error) {
 			d.Description = unquoteScalar(val)
 		case "model":
 			d.Model = val
+		case "effort":
+			// PRD #3258 N8: an optional Claude-family effort pin. Upstream copies ship
+			// none today; a later release may. Anything but one of EffortLevels
+			// (blank included) is a parse error, never a silent inherit.
+			if !IsEffortLevel(val) {
+				return Definition{}, fmt.Errorf("invalid effort %q: want one of %s", val, strings.Join(EffortLevels, ", "))
+			}
+			d.Effort = val
 		case "tools":
 			for _, t := range strings.Split(val, ", ") {
 				if t != "" {

@@ -169,6 +169,12 @@ below applies to both harnesses; Codex also filters tools:
   Claude ids. A run silently ignores the other harness's pin, so that subagent
   follows the lead. For example, `gpt-6-sol` pins Codex only, while `opus` pins
   Claude only. Codex role pins include `gpt-6-luna`.
+- **Markdown `effort:`** is the agent's Claude effort when it is exactly
+  `low`, `medium`, `high`, `xhigh` or `max`. It applies on a Claude run only and
+  never reaches a Codex run, where the subagent follows the run's effort. An
+  invalid value is dropped with a run-feed note naming the agent and, when the
+  file name is itself a valid agent name, its file; the value is never shown.
+  An empty `effort:` follows the run's effort without a note.
 - **`tools:`** entries Codex does not recognise are dropped, never widened
   into something broader, so a repo
   agent can only end up with less authority than it declared.
@@ -216,9 +222,9 @@ Each TOML file becomes one subagent:
   effort when it is exactly `low`, `medium`, `high`, `xhigh` or `max`; an agent
   without one follows the run's effort. An invalid value is dropped and the
   agent still runs, with a run-feed note naming the agent and, when the file
-  name is itself a valid agent name, its file (the value itself is never shown). A `.codex/agents` effort applies only on a Codex run and
-  never reaches a Claude run. An `effort:` in a Markdown `.claude/agents` file is
-  not read yet.
+  name is itself a valid agent name, its file (the value itself is never shown).
+  A `.codex/agents` effort applies only on a Codex run and never reaches a
+  Claude run.
 - **Default tools:** a TOML agent runs with the run's full default tool set,
   which can include `Bash`, subject to the guards below.
   `nickname_candidates`, `config_file`, `includes`, and other unrecognised keys
@@ -312,8 +318,8 @@ a failure to read them leaves the run on the owner's own agent templates.
 uzi parses the agent files itself; it never points Claude Code at the repo's
 `.claude/` directory. (This section describes `.claude/agents/*.md` files;
 `.codex/agents/*.toml` files are covered under
-[Which folder is read](#which-folder-is-read).) Each file's `name`, `description`, `tools`, and `model`
-frontmatter is honored, with model pins filtered for the run's harness as
+[Which folder is read](#which-folder-is-read).) Each file's `name`, `description`, `tools`, `model`, and `effort`
+frontmatter is honored, with model and effort pins filtered for the run's harness as
 [described above](#repo-agents-on-codex-runs) — including a `tools:` entry naming one of the
 [forge read tools](./forge-read-tools.md) (`mcp__forge__*`), which a repo
 agent can grant itself the same way a template does. That surface is
