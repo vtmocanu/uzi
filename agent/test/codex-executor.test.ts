@@ -32664,7 +32664,7 @@ describe("M2 actualRunner credential replacement", () => {
         let lateResolvedAfterAbort: boolean | undefined;
         let bInputsAtFinish: number | undefined;
         const retainedPlanCallbacks: ((planMd: string) => Promise<void>)[] = [];
-        const unackedAttempts: { stage: string; inputs: number; builds: number; releases: number; refreshes: number; posts: number }[] = [];
+        const unackedAttempts: { stage: string; inputs: number; builds: number; releases: number; refreshes: number; posts: number; error?: string }[] = [];
         let retiredCallbackAfterB: { before: { inputs: number; builds: number; posts: number };
           after: { inputs: number; builds: number; posts: number }; returned: boolean } | undefined;
         // Intent-summary variants only: record here, assert at the top level.
@@ -32741,8 +32741,12 @@ describe("M2 actualRunner credential replacement", () => {
         const probeRetiredIntentLaunch = async (stage: string): Promise<void> => {
           const index = summaryBuilds.findIndex(build => build.capability === oldClaim.capability);
           const ownership = summaryOwners[index];
-          if (!ownership) { retiredIntentLaunches.push({ stage, startCalls: -1, refusal: false, message: "no retained A ownership",
-            lifecycleAborted: undefined, inputs: 0, builds: 0, releases: 0, refreshes: 0, posts: 0, aSends: 0, bSends: 0, bInputs: 0, bBuilds: 0 }); return; }
+          // The slot is reserved at the call, so overlapping probes keep their start order.
+          const slot = retiredIntentLaunches.length;
+          retiredIntentLaunches.push({ stage, startCalls: -1, refusal: false, message: "probe pending",
+            lifecycleAborted: undefined, inputs: 0, builds: 0, releases: 0, refreshes: 0, posts: 0, aSends: 0, bSends: 0, bInputs: 0, bBuilds: 0 });
+          if (!ownership) { retiredIntentLaunches[slot] = { stage, startCalls: -1, refusal: false, message: "no retained A ownership",
+            lifecycleAborted: undefined, inputs: 0, builds: 0, releases: 0, refreshes: 0, posts: 0, aSends: 0, bSends: 0, bInputs: 0, bBuilds: 0 }; return; }
           const count = () => ({ inputs: intentInputs.length, builds: summaryBuilds.length, releases: credentialReleases,
             refreshes: credentialRefreshes, posts: intentPosts.length, aSends: a.transport.requests.length, bSends: b.transport.requests.length });
           const before = count();
@@ -32755,13 +32759,37 @@ describe("M2 actualRunner credential replacement", () => {
             message = error instanceof Error ? error.message : String(error);
           }
           const after = count();
-          retiredIntentLaunches.push({ stage, startCalls, refusal, message, lifecycleAborted: actualFlight?.steering.lifecycleSignal().aborted,
+          retiredIntentLaunches[slot] = { stage, startCalls, refusal, message, lifecycleAborted: actualFlight?.steering.lifecycleSignal().aborted,
             inputs: after.inputs - before.inputs, builds: after.builds - before.builds, releases: after.releases - before.releases,
             refreshes: after.refreshes - before.refreshes, posts: after.posts - before.posts,
             aSends: after.aSends - before.aSends, bSends: after.bSends - before.bSends,
             bInputs: intentInputs.filter(input => input.capability === next.capability).length,
-            bBuilds: summaryBuilds.filter(build => build.capability === next.capability).length });
+            bBuilds: summaryBuilds.filter(build => build.capability === next.capability).length };
         };
+        // Retained-consumer probes at the scope-assignment and Now-publication stages of the summary variants. Each
+        // probe starts synchronously at the production call and is recorded, never thrown, so a refusal defect reports
+        // at the top-level named assertions; the pending set is joined before the next executor barrier.
+        const summaryStageProbes: Promise<void>[] = [];
+        const summaryStageVariant = planSummaryUnacked || intentGatedHold || intentRetained || intentPreserve;
+        const startSummaryStageProbe = (stage: string): void => {
+          if (intentGatedHold || intentRetained || intentPreserve) {
+            summaryStageProbes.push(probeRetiredIntentLaunch(stage));
+          } else if (planSummaryUnacked) {
+            const callback = retainedPlanCallbacks[0];
+            const slot = unackedAttempts.length;
+            unackedAttempts.push({ stage, inputs: -1, builds: -1, releases: -1, refreshes: -1, posts: -1, error: "probe pending" });
+            if (!callback) { unackedAttempts[slot] = { stage, inputs: -1, builds: -1, releases: -1, refreshes: -1, posts: -1,
+              error: "no retained A plan callback" }; return; }
+            const before = { inputs: planInputs.length, builds: summaryBuilds.length, releases: credentialReleases,
+              refreshes: credentialRefreshes, posts: planPosts.length };
+            summaryStageProbes.push(callback("# Plan A\n- do it").then(() => undefined, (error: unknown) => error).then(error => {
+              unackedAttempts[slot] = { stage, inputs: planInputs.length - before.inputs, builds: summaryBuilds.length - before.builds,
+                releases: credentialReleases - before.releases, refreshes: credentialRefreshes - before.refreshes,
+                posts: planPosts.length - before.posts, ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }) };
+            }));
+          }
+        };
+        const joinSummaryStageProbes = async (): Promise<void> => { await Promise.all(summaryStageProbes); };
         const assertRetiredIntentLaunches = (stages: string[]) => {
           assert.deepEqual(retiredIntentLaunches.map(launch => launch.stage), stages, "retired A intent launch is probed at every stage");
           for (const launch of retiredIntentLaunches) {
@@ -33969,6 +33997,8 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(a.transport.requests.length, aSends, stage);
             assert.equal(b.transport.requests.length, bSends, stage);
             if (!assignment) nowPublicationProbes.push(stage);
+            // Summary variants invoke their retained A consumer at this exact scope/Now stage.
+            if (summaryStageVariant) startSummaryStageProbe(stage);
             if (publication === "gated" || injectedStage) {
               const probeConsumers = async () => {
                 assert.equal(bFinished, false, stage);
@@ -34279,11 +34309,20 @@ describe("M2 actualRunner credential replacement", () => {
         let bLookupScope: ReturnType<typeof acquireCodexOperationScope> | undefined;
         let actualAController: ReturnType<typeof acquireCodexOperationScope>["controller"] | undefined;
         const running = runner.execute(claim);
+        // The I4 follow-on flight is owned here so the outer cleanup joins it (bounded) before mocks are restored and
+        // the fixture directory is removed.
+        let followingFlight: Promise<unknown> | undefined;
         const joinExecution = async () => {
           const settled = await Promise.allSettled([running, ...triggers]);
+          // A follow-on join failure never hides the primary join failure, and never skips the bounded join.
+          followOnCancelRequested = true;
+          const followJoin = followingFlight
+            ? await withTimeout(followingFlight, 5000, "follow-on flight joins at cleanup").then(() => undefined, (error: unknown) => ({ error }))
+            : undefined;
           for (const result of settled) {
             if (result.status === "rejected") throw result.reason;
           }
+          if (followJoin) throw followJoin.error;
         };
         try {
           await withTimeout(aEntered.promise, 5000, "M2 A turn");
@@ -34294,7 +34333,7 @@ describe("M2 actualRunner credential replacement", () => {
               undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(oldClaim.capability));
             assert.ok(retainedAScope.controller === actualAController, "nonowning A reference retains the actual Runner entry");
           }
-          if (publication === "gated" || injectedStage) {
+          if (publication === "gated" || injectedStage || summaryStageVariant) {
             assert.ok(actualFlight, "capture the real run/generation/executor flight");
             scopeDescriptor = Object.getOwnPropertyDescriptor(actualFlight, "operationScope");
             assert.ok(!scopeDescriptor || ("value" in scopeDescriptor && scopeDescriptor.configurable),
@@ -34740,6 +34779,7 @@ describe("M2 actualRunner credential replacement", () => {
             }
             for (const barrier of publicationBarriers.slice(0, failureBoundaryCount)) {
               await withTimeout(barrier.entered.promise, 5000, barrier.stage);
+              await joinSummaryStageProbes();
               const builds = nowBuilds.length;
               const aRequests: number = a.transport.requests.length;
               const bRequests: number = b.transport.requests.length;
@@ -34794,7 +34834,8 @@ describe("M2 actualRunner credential replacement", () => {
                     assert.ok(aIntentBuildEnded && (ownedUnverifiedAtABuild ?? 0) >= 1 && ownedUnverifiedAtSuspensionReturn === 0 &&
                       order[0]! >= 0 && order[0]! < order[1]! && order[1]! < order[2]! &&
                       summaryBuilds.filter(build => build.capability === oldClaim.capability).length === 1 &&
-                      retiredIntentLaunches.length === 0,
+                      // Only the pre-publication scope-assignment probes have run.
+                      retiredIntentLaunches.map(launch => launch.stage).join() === expectedAssignmentStages.join(),
                       "retired A intent ownership is unlaunched and settled before publication");
                   }
                   await probeRetiredIntentLaunch(barrier.stage);
@@ -35144,7 +35185,8 @@ describe("M2 actualRunner credential replacement", () => {
               assert.ok(switchError instanceof PolicyContinuationRejected);
               assert.equal(switchError.cause, "provider_resume_rejected");
               if (intentPreserve) {
-                assertRetiredIntentLaunches(["before-publish", "after-publish", "before-prepare", "login", "resume", "policy-hold"]);
+                assertRetiredIntentLaunches([...expectedAssignmentStages, "before-publish", "after-publish",
+                  "before-Now-publish", "after-Now-publish", "before-prepare", "login", "resume", "policy-hold"]);
                 const hold = retiredIntentLaunches.find(launch => launch.stage === "policy-hold")!;
                 assert.equal(hold.lifecycleAborted, false, "preserve-only re-armed lifecycle still starts no retired A intent launch");
                 assert.equal(intentPosts.length, 0, "retired A intent launch never posts under the preserve-only hold");
@@ -35736,7 +35778,10 @@ describe("M2 actualRunner credential replacement", () => {
             const at = (event: string) => planSummaryEvents.indexOf(event);
             if (planSummaryUnacked) {
               assert.equal(retainedPlanCallbacks.length, 1, "A's first onPlanPersisted callback was retained uninvoked");
-              assert.deepEqual(unackedAttempts.map(attempt => attempt.stage), [...publicationStages],
+              // Scope assignment precedes the executor barriers; Now publication follows executor publication.
+              assert.deepEqual(unackedAttempts.map(attempt => attempt.stage),
+                [...expectedAssignmentStages, "before-publish", "after-publish", "before-Now-publish", "after-Now-publish",
+                  "before-prepare", "login", "prepared"],
                 "uninvoked A plan callback admits no summary work during partial publication");
               for (const attempt of unackedAttempts) {
                 assert.deepEqual(attempt, { stage: attempt.stage, inputs: 0, builds: 0, releases: 0, refreshes: 0, posts: 0 },
@@ -36036,7 +36081,8 @@ describe("M2 actualRunner credential replacement", () => {
               if (intentGatedHold) assert.equal(planSuspensionPendingAtRelease, true, "the suspension is still pending when A intent work is released");
               assert.equal(planAbortObserved, true, "A intent work observed its signal aborted by the switch");
               if (intentGatedHold) assert.ok(at("A-plan-aborted") >= 0 && at("A-plan-aborted") < at("A-plan-released"));
-              assertRetiredIntentLaunches(["before-publish", "after-publishB", "after-publish", "before-prepare", "login", "prepared", "after-finishB"]);
+              assertRetiredIntentLaunches([...expectedAssignmentStages, "before-publish", "after-publishB", "after-publish",
+                "before-Now-publish", "after-Now-publish", "before-prepare", "login", "prepared", "after-finishB"]);
             }
             if (intentLate) assert.equal(intentLateResolvedAfterAbort, true);
             if (intentFollowOn) {
@@ -36054,6 +36100,7 @@ describe("M2 actualRunner credential replacement", () => {
               const inputsBefore = intentInputs.length, buildsBefore = summaryBuilds.length;
               followOnActive = true;
               const following = runner.execute(followClaim);
+              followingFlight = following;
               try {
                 // Record whether the event happened within its bound instead of throwing, so the named assertions below report the defect.
                 let followOnTimer: ReturnType<typeof setTimeout> | undefined;
