@@ -15,6 +15,7 @@ import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
   isAppearanceMode,
+  DEFAULT_SIDEBAR_MOTION,
   isDarkTheme,
   isLightTheme,
   isTheme,
@@ -108,7 +109,7 @@ const SEED_USER_SETTINGS: UserSettings = {
   light_theme: null,
   dark_theme: null,
   typeface: null,
-  // Opt-in animated sidebar icons; null = inherit the (off) instance default.
+  // Animated sidebar icons are on by default; null follows that default.
   sidebar_motion: null,
   sidebar_token_ids: [],
   // PRD #1209 M3: LINKED Codex subscription accounts surfaced on the sidebar rail — the
@@ -674,10 +675,6 @@ export function setMockCodexCatalogSample(sample: MockCodexCatalogSample): void 
   mockCodexCatalogSample = sample;
 }
 
-// The mock's compiled default for animated sidebar icons (off), the value a null
-// override resolves against; mirrors the server's compiled default.
-const MOCK_SIDEBAR_MOTION_DEFAULT = false;
-
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -723,7 +720,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
-  const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
+  const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
   return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, planning_models, planning_efforts, default_model: projected ?? null } };
 }
 
@@ -868,7 +865,7 @@ export function sessionBody() {
       light_theme: resolved.light,
       dark_theme: resolved.dark,
       typeface: resolved.typeface,
-      sidebar_motion: userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT,
+      sidebar_motion: userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION,
       overrides: {
         mode: userSettings.appearance_mode,
         light_theme: userSettings.light_theme,
@@ -881,7 +878,7 @@ export function sessionBody() {
         light_theme: appSettings.default_light_theme,
         dark_theme: appSettings.default_dark_theme,
         typeface: appSettings.default_typeface,
-        sidebar_motion: MOCK_SIDEBAR_MOTION_DEFAULT,
+        sidebar_motion: DEFAULT_SIDEBAR_MOTION,
       },
     },
     // Deprecated single-theme trio (PRD #21), derived from the resolved appearance so

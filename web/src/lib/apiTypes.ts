@@ -591,9 +591,9 @@ export interface UserSettings {
   light_theme: string | null;
   dark_theme: string | null;
   typeface: string | null;
-  /** Raw per-user opt-in for animated sidebar icons; null = inherit the instance
-   *  default (off). Optional for older servers: absent reads as off, never as a
-   *  stored false. */
+  /** Raw per-user choice for animated sidebar icons; null = inherit the instance
+   *  default (on). Optional for older servers: absent follows the default, never
+   *  a stored false. */
   sidebar_motion?: boolean | null;
   /** Resolved sidebar-icon animation flag (override else the server default).
    *  Read-only; never sent on a PUT. Optional for older servers. */

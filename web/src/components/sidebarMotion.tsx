@@ -1,4 +1,4 @@
-// Opt-in animated sidebar icons (issue #4510). Two halves live here:
+// Animated sidebar icons with a personal opt-out (issue #4510). Two halves live here:
 //
 //  - SIDEBAR_MOTION_ICONS: one SVG per NAV_SECTIONS key. Each copies the matching icons.tsx
 //    glyph's markup verbatim (same svg attributes and path data) and adds `data-nav-motion`
