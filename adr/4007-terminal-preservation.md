@@ -533,7 +533,9 @@ holds a single row:
   rollout) returns the context error, checked before each candidate and after
   the loop, so the row stays due and is not advanced; the next tick resumes from
   the ledger. It logs the transient warning and writes no partial summary, so
-  `last_fire` shows this attempt's starts only after the next write.
+  `last_fire` shows this attempt's starts only after the next write. A
+  cancellation inside the consumer-gate wait instead surfaces as gate
+  contention and takes that arm, including its best-effort partial summary.
 - The mid-fire credential-disabled and stored-override arms judge this attempt's
   starts: with none, they hold or return as with no starts at all; otherwise
   they record the skip, stop and advance as today.

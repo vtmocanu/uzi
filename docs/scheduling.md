@@ -832,9 +832,12 @@ exceed `max_issues` once backfill walks past a skip), which ones
   Recurring schedules advance and re-fire next cadence. A one-time schedule
   with a disabled stored pin/override is **held** before any start: due,
   un-advanced, with the skip recorded as its last fire, until re-enable or
-  a changed stored choice. A disable after a partial one-time sweep start
-  stops the scan; the fire stays due and resumes its remaining slots from the
-  per-fire ledger once re-enabled or the stored choice is changed. A one-time single issue whose label
+  a changed stored choice. A disable seen before a tick starts anything,
+  including on a resumed partial one-time sweep, holds the fire the same way;
+  once re-enabled it resumes only its remaining slots from the per-fire
+  ledger. A disable that lands after the current tick has already started a
+  run stops the scan, records the skip and advances, dropping the remaining
+  slots. A one-time single issue whose label
   selects a disabled harness holds like a pin. On an unpinned label-selected
   sweep, harness disable is a per-candidate skip and scanning continues
   within the caps; stored-pin/override rules still apply. Missing credentials
@@ -958,11 +961,12 @@ last fire without advancing, so it can show a `last_fire` while still due. A
 `run-now` fire reports its own outcome in the response without
 touching `last_fire` at all, since a manual fire must not disturb the
 cadence. A schedule that has never fired and was never held that way
-reads `last_fire: null`. A scheduled one-time sweep interrupted partway
-(a busy repository gate, a crash, a failed advance, a shutdown, a capacity or
-credential hold) also keeps `last_fire` as a progress summary while it stays
-due; it names the runs the fire has started so far, and a named run may have
-since been deleted (the ledger keeps its run id, title and URL).
+reads `last_fire: null`. A scheduled one-time sweep held partway (a busy
+repository gate, a capacity or credential hold) also writes `last_fire` as a
+progress summary while it stays due; after a crash, a failed advance or a
+shutdown nothing is written until the next tick's write. The summary names
+the runs the fire has started so far, and a named run may have since been
+deleted (the ledger keeps its run id, title and URL).
 
 ### Recent fires
 
@@ -983,9 +987,10 @@ because the hold only writes when the stored summary differs.
 
 A partially completed one-time sweep fire does not append to `recent_fires`
 while it waits to resume; the entry is appended once, when the fire completes.
-Editing a pending one-time schedule (a change requires a future `run_at`)
-starts a new occurrence with the full cap; that is the owner's explicit
-re-fire. Rollback limitation: an older scheduler binary ignores the per-fire
+Changing the configuration of a pending one-time schedule (a change requires
+a future `run_at`) starts a new occurrence with the full cap; that is the
+owner's explicit re-fire. Pausing and resuming it keeps the same occurrence
+and its progress. Rollback limitation: an older scheduler binary ignores the per-fire
 ledger, so while it runs it can exceed the cap when resuming a partial one-time
 fire and advance normally. There is no end-to-end (compose) coverage of the
 scheduled one-time retry; it is covered by LiveDB and unit tests.
