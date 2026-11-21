@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -111,7 +112,7 @@ afterEach(() => {
 });
 
 function coordinator(client: RecoveryArchiveClient = new FakeClient()): RecoveryCoordinator {
-  return new RecoveryCoordinator({
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client,
     git: cache,
     log: nullLogger(),
@@ -185,7 +186,7 @@ describe("RecoveryCoordinator.pin — milestone2 provenance logging", () => {
   ]) {
     it(c.label, async () => {
       const { logger, lines } = recordingLogger();
-      const coord = new RecoveryCoordinator({
+      const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
         client: new FakeClient(), git: cache, log: logger,
         recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
       });
@@ -608,7 +609,7 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
         return res;
       },
     };
-    const sweeper = new RecoveryCoordinator({
+    const sweeper = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client, git: producer, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
     });
     await sweeper.resumePending();
@@ -643,7 +644,7 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
         return cache.produceRecoveryBundle(b, { ...o, maxBytes: 10 });
       },
     };
-    const sweeper = new RecoveryCoordinator({
+    const sweeper = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client, git: producer, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
     });
     await sweeper.resumePending();
@@ -673,7 +674,7 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
         return res;
       },
     };
-    const sweeper = new RecoveryCoordinator({
+    const sweeper = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client, git: producer, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
     });
     await sweeper.resumePending();

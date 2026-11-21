@@ -149,7 +149,7 @@ export function decodeRunEnvClaim(raw: unknown): { runEnv: ClaimRunEnvVar[]; run
 }
 
 /** Decodes the body of the run-env redact maintenance endpoint. protected:false must carry no
- *  versions. Throws a RunEnvClaimError on any violation. */
+ *  versions and protected:true at least one. Throws a RunEnvClaimError on any violation. */
 export function decodeRunEnvRedactResponse(raw: unknown): RunEnvRedactResponse {
   if (!isRecord(raw)) fail("response", "must be an object");
   if (typeof raw.protected !== "boolean") fail("protected", "must be a boolean");
@@ -158,5 +158,7 @@ export function decodeRunEnvRedactResponse(raw: unknown): RunEnvRedactResponse {
     if (versions.length > 0) fail("versions", "must be empty when protected is false");
     return { protected: false };
   }
-  return versions.length > 0 ? { protected: true, versions } : { protected: true };
+  // Fail closed: a protected run with no versions cannot be proven free of secrets by an empty needle set.
+  if (versions.length === 0) fail("versions", "must be non-empty when protected is true");
+  return { protected: true, versions };
 }

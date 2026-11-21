@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -290,7 +291,7 @@ describe("recovery cycle wrappers that reach a mutating hook", () => {
   let archive: Archive;
   let now: number;
 
-  const coord = () => new RecoveryCoordinator({
+  const coord = () => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     authority: env.rt, client: archive, git: env.cache as RecoveryBundleProducer, log: nullLogger(),
     recoveryRoot: env.cache.recoveryRoot, workerToken: TOKEN, now: () => now,
   });
@@ -389,7 +390,7 @@ describe("recovery cycle wrappers that reach a mutating hook", () => {
         const events: string[] = [];
         const rootDir = makeScratchRoot("authority-order-");
         t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
-        const c = new RecoveryCoordinator({
+        const c = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
           authority: scopeOf(events), client: {} as RecoveryArchiveClient, git: {} as RecoveryBundleProducer, log: nullLogger(),
           recoveryRoot: path.join(rootDir, "recovery"), workerToken: TOKEN,
         });
@@ -411,7 +412,7 @@ describe("recovery cycle wrappers that reach a mutating hook", () => {
     const seen: Array<{ signal?: AbortSignal; timeoutMs?: number } | undefined> = [];
     const rootDir = makeScratchRoot("authority-wait-");
     t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
-    const c = new RecoveryCoordinator({
+    const c = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       authority: { withTransaction: async (fn, options) => { seen.push(options); return fn(undefined as never); } },
       client: {} as RecoveryArchiveClient, git: {} as RecoveryBundleProducer, log: nullLogger(),
       recoveryRoot: path.join(rootDir, "recovery"), workerToken: TOKEN,
@@ -425,7 +426,7 @@ describe("recovery cycle wrappers that reach a mutating hook", () => {
   it("an AuthorityRefusal from a missing wrap would leave the pin in place (guard for the rows above)", async () => {
     const { c, record } = await bundled();
     // The same coordinator without an authority scope: the hook refuses (no active transaction), the pin stays.
-    const bare2 = new RecoveryCoordinator({ client: archive, git: env.cache as RecoveryBundleProducer, log: nullLogger(),
+    const bare2 = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git: env.cache as RecoveryBundleProducer, log: nullLogger(),
       recoveryRoot: env.cache.recoveryRoot, workerToken: TOKEN, now: () => now });
     void c;
     const outcome = await bare2.captureAndUpload({ record, barePath: bare, defaultBranch: "main" });

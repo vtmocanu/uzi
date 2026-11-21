@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -96,7 +97,7 @@ async function fixture(t: test.TestContext) {
   };
   const log = nullLogger();
   log.warn = (message, fields) => warnings.push({ message, fields });
-  const make = () => new RecoveryCoordinator({
+  const make = () => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot, workerToken: token, client, git: git as never, log, now: () => 1000,
     withInventorySourceBoundary: async (_ctx, action) => { await action(async () => true); return "passed"; },
   });

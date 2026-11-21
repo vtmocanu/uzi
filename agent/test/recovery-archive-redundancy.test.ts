@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -406,7 +407,7 @@ async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () 
       return state.claimResult === "none" ? undefined : { ...cloneClaim, coverageDigest: o.fingerprint as string };
     },
   };
-  const make = () => new RecoveryCoordinator({
+  const make = () => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: path.join(root, "journal"), workerToken: TOKEN, log: nullLogger(), client: client as never, git: git as never,
     withCompletionSourceBoundary: async (_s, action) => { await action(() => true); return "passed"; },
     onCompletionSourceForgotten: opts.onCompletionSourceForgotten,

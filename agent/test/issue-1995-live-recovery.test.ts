@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -204,7 +205,7 @@ function makeCoord(
   git: FakeGit,
   extra: Partial<ConstructorParameters<typeof RecoveryCoordinator>[0]> = {},
 ): RecoveryCoordinator {
-  return new RecoveryCoordinator({
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client,
     git,
     log: nullLogger(),

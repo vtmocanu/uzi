@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -151,7 +152,7 @@ class FakeRecoveryClient implements RecoveryArchiveClient {
  *  point — the coordinator's producer is the same live `git` the runner uses). */
 function coordOver(root: string, fakeClient: FakeRecoveryClient): RecoveryCoordinator {
   const producer: RecoveryBundleProducer = git; // GitCache satisfies RecoveryBundleProducer
-  return new RecoveryCoordinator({
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client: fakeClient,
     git: producer,
     log: nullLogger(),

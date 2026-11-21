@@ -1047,8 +1047,8 @@ export interface RecoveryCoordinatorOptions {
   isExecuting?: (runId: string) => boolean;
   /** PRD 4416 M2: where the exact-value scan needles of a run's secret variables come from when this coordinator
    *  publishes (a bundle upload, a held or terminal pack): the live claim's set, else the api's maintenance
-   *  answer; a withhold stops the publish and keeps custody. Absent (unit tests): nothing is scanned for. The
-   *  runner always wires it. */
+   *  answer; a withhold stops the publish and keeps custody. Absent: every publish is withheld (fail
+   *  closed). The runner always wires it. */
   scanNeedlesFor?: (runId: string, signal?: AbortSignal) => Promise<NeedleResolution>;
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
   /** Exact reports still need their authenticated generation evidence after FINAL.
@@ -1190,6 +1190,8 @@ const INVENTORY_RECONCILE_ATTENTION_REASONS: ReadonlySet<string> = new Set([
 /** The `needs_action` reasons a live pass may retry (all need a journaled bundle). */
 const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "capture_error",
+  // PRD 4416 M2: a withheld exact-value scan is retried by the live lane under its own backoff, not only at restart.
+  "publish_scan_withheld",
   "restart_upload_failed",
   "upload_transient",
   "storage_quota_exceeded",
@@ -4947,9 +4949,9 @@ export class RecoveryCoordinator {
   }
 
   /** The needles of a run's secret variables for a pack this coordinator is about to publish. With no wiring
-   *  (unit tests) there is nothing to scan for; an unresolvable answer marks the pack unscannable. */
+   *  or an unresolvable answer the pack is marked unscannable (fail closed). */
   private async packNeedles(runId: string, signal?: AbortSignal): Promise<{ needles: readonly ScanNeedle[] } | { needlesUnavailable: true }> {
-    if (!this.scanNeedlesFor) return { needles: [] };
+    if (!this.scanNeedlesFor) return { needlesUnavailable: true };
     try {
       const res = await this.scanNeedlesFor(runId, signal);
       return res.kind === "needles" ? { needles: res.needles } : { needlesUnavailable: true };
@@ -4965,7 +4967,6 @@ export class RecoveryCoordinator {
    * failure (no resolver answer, a changed or unreadable file, a git error, a deadline) is `withheld`.
    */
   private async bundleScanVerdict(record: JournaledBundleRecord, signal?: AbortSignal): Promise<"clean" | "hit" | "withheld"> {
-    if (!this.scanNeedlesFor) return "clean";
     const pack = await this.packNeedles(record.runId, signal);
     if ("needlesUnavailable" in pack) return "withheld";
     if (pack.needles.length === 0) return "clean";

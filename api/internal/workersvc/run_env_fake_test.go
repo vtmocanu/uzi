@@ -30,6 +30,14 @@ func (f *fakeStore) ListRunEnvRedactForRun(context.Context, uuid.UUID) ([]store.
 	return f.runEnv.redact, nil
 }
 
+func (f *fakeStore) ListRunEnvSecretReceiptVersionsForRun(context.Context, uuid.UUID) ([]store.ListRunEnvSecretReceiptVersionsForRunRow, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) WorkerHoldsOpenCustodyForRun(context.Context, store.WorkerHoldsOpenCustodyForRunParams) (bool, error) {
+	return false, nil
+}
+
 func (t *fakeClaimFinishTx) LockUserVaultStateForKeyShareNowait(context.Context, uuid.UUID) (store.LockUserVaultStateForKeyShareNowaitRow, error) {
 	t.f.runEnv.lockCalls++
 	if len(t.f.runEnv.lockErrs) > 0 {

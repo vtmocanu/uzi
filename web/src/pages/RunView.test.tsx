@@ -2202,12 +2202,22 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
   });
 
   it("lists injected variables by name, scope and secret badge, only when present", async () => {
-    renderPage({ ...PAUSED, injected_env: [{ name: "DB_URL", scope: "repo", secret: true }, { name: "LOG_LEVEL", scope: "global", secret: false }] }, true);
+    renderPage({ ...PAUSED, injected_env: [{ name: "DB_URL", scope: "repo", secret: true }, { name: "LOG_LEVEL", scope: "user", secret: false }] }, true);
     const section = await screen.findByRole("region", { name: "Variables injected" });
     expect(within(section).getByText("DB_URL")).toBeTruthy();
     expect(within(section).getByText("LOG_LEVEL")).toBeTruthy();
     expect(within(section).getAllByText("secret")).toHaveLength(1);
-    expect(within(section).getByText("global")).toBeTruthy();
+    expect(within(section).getByText("user")).toBeTruthy();
+    expect(within(section).getByText(/Set for this run.s current attempt/)).toBeTruthy();
+  });
+
+  it("renders a hostile injected variable name and scope with control and bidi characters stripped", async () => {
+    renderPage({ ...PAUSED, injected_env: [{ name: "EVIL\u001b[31mNAME‮", scope: "us‮er\u001b[0m", secret: false }] }, true);
+    const section = await screen.findByRole("region", { name: "Variables injected" });
+    expect(section.textContent).not.toContain("\u001b");
+    expect(section.textContent).not.toContain("‮");
+    expect(within(section).getByText("EVIL[31mNAME")).toBeTruthy();
+    expect(within(section).getByText("user[0m")).toBeTruthy();
   });
 
   it.each([[undefined], [[]]] as const)("renders no injected variables section when injected_env is %j", async (injected) => {

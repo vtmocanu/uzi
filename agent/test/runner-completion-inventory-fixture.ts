@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -104,7 +105,7 @@ export function acknowledgedCompletionInventory(runId: string, generation: numbe
       return "retained"; // Keep the acknowledged journal available to the runner's real guard.
     },
   };
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: path.join(fx.dataDir, "m2-inventory"), workerToken: "local-worker-fixture",
     log: nullLogger(), client: archive, git: producer,
   });

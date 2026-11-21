@@ -483,3 +483,28 @@ func (q *Queries) UpsertRunEnvReceipt(ctx context.Context, arg UpsertRunEnvRecei
 	)
 	return err
 }
+
+const workerHoldsOpenCustodyForRun = `-- name: WorkerHoldsOpenCustodyForRun :one
+SELECT EXISTS (
+    SELECT 1 FROM recovery_custody_holds h
+    WHERE h.run_id = $1 AND h.user_id = $2 AND h.state = 'open'
+      AND h.original_worker_id = $3
+      AND (NOT h.inventory_guarded OR (h.live_worker_id = $3 AND h.live_run_id = $1))
+)::boolean AS held
+`
+
+type WorkerHoldsOpenCustodyForRunParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+// Whether the worker took an open recovery custody hold on the run (the redact maintenance route's
+// second authorization, beside runs.worker_id). An inventory-guarded hold additionally requires
+// the worker to still be its live holder on this run. Read-only; no generation or repo check.
+func (q *Queries) WorkerHoldsOpenCustodyForRun(ctx context.Context, arg WorkerHoldsOpenCustodyForRunParams) (bool, error) {
+	row := q.db.QueryRow(ctx, workerHoldsOpenCustodyForRun, arg.RunID, arg.UserID, arg.WorkerID)
+	var held bool
+	err := row.Scan(&held)
+	return held, err
+}

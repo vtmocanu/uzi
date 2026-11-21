@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -87,7 +88,7 @@ afterEach(() => {
 const NEEDLES: ScanNeedle[] = runEnvScanNeedles([{ var_id: UUID, scope: "repo", rev: 2, name: "DB_PASSWORD", value: SECRET, secret: true, description: "" }], []);
 
 function coordinator(client: RecoveryArchiveClient, scanNeedlesFor?: (runId: string) => Promise<NeedleResolution>): RecoveryCoordinator {
-  return new RecoveryCoordinator({
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git: cache, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN, now: () => 1_700_000_000_000,
     ...(scanNeedlesFor ? { scanNeedlesFor } : {}),
   });
@@ -151,6 +152,37 @@ describe("the restart re-upload of a recovery bundle", () => {
       assert.equal(client.uploadCalls, 1, "the next pass, with an answer, uploads");
     });
   }
+
+  it("the LIVE lane retries a withheld bundle on the same coordinator once the answer arrives (no restart)", async () => {
+    const client = new FakeClient();
+    await pin(coordinator(client));
+    let answer: "down" | "up" = "down";
+    let clock = 1_700_000_000_000;
+    const live = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
+      client, git: cache, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN, now: () => clock,
+      scanNeedlesFor: () => resolveScanNeedles({
+        live: undefined,
+        fetchProtected: async () => {
+          if (answer === "down") throw Object.assign(new Error("http"), { status: 409 });
+          return { protected: false };
+        },
+      }),
+    });
+    await live.resumePending();
+    assert.equal((await only(live, "r1")).reason, "publish_scan_withheld");
+    assert.equal(client.uploadCalls, 0);
+    // Still down: the live pass retries, is withheld again, and uploads nothing.
+    clock += 3_600_000;
+    await live.resumeLive({ authenticatedAtMs: clock, isExecuting: () => false });
+    assert.equal(client.uploadCalls, 0);
+    assert.equal((await only(live, "r1")).reason, "publish_scan_withheld");
+    // The answer comes back; a later live pass (past its backoff) uploads, with no new coordinator.
+    answer = "up";
+    clock += 24 * 3_600_000;
+    await live.resumeLive({ authenticatedAtMs: clock, isExecuting: () => false });
+    assert.equal(client.uploadCalls, 1);
+    assert.equal((await only(live, "r1")).state, "uploaded");
+  });
 
   it("withholds when the scanner cannot read the bundle or the bundle changed after it was journaled", async () => {
     const client = new FakeClient();

@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -176,7 +177,7 @@ function makeCoordinator(opts: {
   token?: string | undefined;
   recoveryRoot?: string;
 } = {}): RecoveryCoordinator {
-  return new RecoveryCoordinator({
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client: opts.client ?? new FakeClient(),
     git: opts.git ?? new FakeGit(),
     log: nullLogger(),
@@ -747,7 +748,7 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
     const runId = "run-forget-race";
     await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
     // The live successor requests its pin after cleanup lists the dir; it must survive serialization.
-    const late = new RecoveryCoordinator({
+    const late = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client: new FakeClient(),
       git: new FakeGit(),
       log: nullLogger(),

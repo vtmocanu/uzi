@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -77,7 +78,7 @@ it("#3031 live re-drive is suppressed during a blocked terminal pass and resumes
   // trusted bare and journaled under the worker key, then left unsent.
   const bare = await git.ensureClone(claim.repo.clone_url);
   const main = command(bare, "rev-parse", "refs/remotes/origin/main");
-  const seeder = new RecoveryCoordinator({ client, git, log: recordingLogger().logger,
+  const seeder = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: recordingLogger().logger,
     recoveryRoot: git.recoveryRoot, workerToken: token });
   const seed = async (runId: string, branch: string) => {
     const saved = await seeder.freezeInventory({

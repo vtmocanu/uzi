@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -87,7 +88,7 @@ async function server(t: TestContext, handle: http.RequestListener) {
     token, "fixture", nullLogger());
 }
 function coordinator(f: Awaited<ReturnType<typeof fixture>>, client: WorkerClient, git = {} as GitCache) {
-  return new RecoveryCoordinator({ recoveryRoot: f.recoveryRoot, workerToken: token,
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: f.recoveryRoot, workerToken: token,
     log: nullLogger(), client, git });
 }
 
