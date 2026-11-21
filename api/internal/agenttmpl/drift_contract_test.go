@@ -134,6 +134,7 @@ func TestDriftFixtureIsWellFormed(t *testing.T) {
 		"codex-model-null-vs-empty-agree",
 		"model-moved-between-harnesses",
 		"effort-value-change",
+		"codex-effort-value-change",
 		"effort-null-equals-null",
 		"effort-moved-between-harnesses",
 	} {

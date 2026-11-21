@@ -110,6 +110,12 @@
       "expected": { "differs": true, "columns": ["effort"] }
     },
     {
+      "name": "codex-effort-value-change",
+      "shipped": { "description": "Implements features.", "model": "sonnet", "effort": "high", "codex_effort": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": "sonnet", "effort": "high", "codex_effort": "low", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["codex effort"] }
+    },
+    {
       "name": "effort-null-equals-null",
       "shipped": { "description": "Implements features.", "model": null, "effort": null, "codex_effort": null, "tools": [], "prompt_body": "You are the coder.\n" },
       "stored": { "description": "Implements features.", "model": null, "tools": [], "prompt_body": "You are the coder.\n" },
