@@ -379,10 +379,13 @@ reference](./cli.md#waiting-for-a-state-uzi-run-wait)). `uzi run wait` stops on
 it by default. Nothing resumes this hold on a timer.
 
 - **Resume** (`uzi run resume <id>` or the run page) queues the run for a new
-  claim. The next claim is already approved, goes straight to implementation and
-  verifies the switch again, so it holds again if the cause is still there.
-  Change the cause first: set a supported worker model, or clear the planning
-  setting.
+  claim, whose phase follows the run's state. An approved run goes straight to
+  implementation and verifies the switch again. The hold can also be taken
+  during planning, before approval: then an unapproved run with a submitted plan
+  shows the plan gate again (a revise re-plans and verifies the switch again),
+  and one with no plan yet plans again. In every case it holds again if the cause
+  is still there. Change the cause first: set a supported worker model, or clear
+  the planning setting.
 - **Cancel** ends the run as usual. If you cancel while the worker has not yet
   heard that the hold was recorded, the run still reports cancelled.
 - **The session and work are kept.** The approved plan, the session and the
@@ -392,8 +395,19 @@ it by default. Nothing resumes this hold on a timer.
   ends in `recovery_wait` or `failed`, as described in [Run
   recovery](./run-recovery.md).
 
-If the worker cannot reach the server while parking, it retries for up to 30
-minutes. After that the worker's flight ends and it keeps its copy of the work.
+If the worker cannot get the park confirmed, it keeps the quiesced run
+registered (so its heartbeats continue) and keeps retrying, reading ownership
+first, with no time limit of its own. It stops only on a definitive answer: the
+hold is recorded, the owner already resumed it, the plan was not approved (the
+hold is re-posted for the plan phase), the claim is gone, or an owner Cancel is
+confirmed. It also ends if the worker shuts down, or if the server parks the run
+first: ownership shows the run `paused` at this claim with another hold reason,
+for example the wall-clock limit's park. Then the flight ends without posting and
+the feed says "The server paused the run first (<reason>); this worker keeps the
+work." That park is the server's own and follows its own resume rules.
+
+If the worker shuts down or dies with the hold unapplied, its flight ends and it
+keeps its copy of the work.
 If the worker is still alive, its next heartbeat no longer lists the run, and
 the server treats it as missing from the snapshot. That handling applies only
 when the hold was not applied, so the run is still `running` or `awaiting_*`.

@@ -220,9 +220,9 @@ harness; the Codex side is tracked separately, issue #3253).
 A planning model needs an implementation model to switch to. If you set a
 planning model but there is no worker model and no template model, the run is
 refused before any turn with "unsupported phase configuration": set a worker
-model or clear the planning model. A fresh run that starts with its plan
-already approved and has no earlier session is exempt, because it never plans.
-A run resumed at its plan gate is refused even if you would simply approve.
+model or clear the planning model. The refusal applies to every start or
+resume, whether the run is new, already approved or resumed at its plan gate,
+even if you would simply approve. It does not apply to provider runs.
 
 ### Which workers run it
 
