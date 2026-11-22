@@ -14,7 +14,7 @@ import type { PublicationContextRequest, PublicationContextResponse } from "./pr
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
-import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -2703,7 +2703,7 @@ export class WorkerClient {
       if (isRecord(claim) && isRecord(claim.secrets)) {
         const provider = decodeProviderBinding(claim.secrets);
         if (provider) {
-          this.requireProviderCapability();
+          this.requireProviderCapability(provider.engine);
           claim.secrets.provider = provider;
         }
       }
@@ -2821,7 +2821,7 @@ export class WorkerClient {
     if (isRecord(claim) && isRecord(claim.secrets)) {
       const provider = decodeProviderBinding(claim.secrets);
       if (provider) {
-        this.requireProviderCapability();
+        this.requireProviderCapability(provider.engine);
         claim.secrets.provider = provider;
       }
     }
@@ -2830,8 +2830,10 @@ export class WorkerClient {
     return claim;
   }
 
-  /** Fail closed (PRD #4320): a provider claim is malformed unless this registration advertised claude_provider_v1. */
-  private requireProviderCapability(): void {
+  /** Codex providers are held unconditionally; Claude providers require their advertised capability. */
+  private requireProviderCapability(engine: "claude" | "codex"): void {
+    // HARDHOLD: no registration capability can authorize Codex provider execution.
+    if (engine === "codex") throw new ProviderLaneUnsupportedError();
     if (!this.hasClaudeProviderCapability) throw new ProviderBindingError("capability not advertised");
   }
 

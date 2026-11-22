@@ -36,4 +36,5 @@ it("the worker advertises claude_provider_v1 on registration", async () => {
   assert.ok(Array.isArray(caps) && caps.length > 0, "the registration carries a protocol capability list");
   assert.equal(caps.includes(CLAUDE_PROVIDER_CAPABILITY), true);
   assert.equal(caps.includes("claude_provider_v1"), true);
+  assert.equal(caps.includes("codex_provider_v1"), false);
 });

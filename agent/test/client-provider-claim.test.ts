@@ -74,7 +74,7 @@ for (const [label, kind, claim] of LANES) {
     for (const [name, over] of [
       ["a plain-http base URL", { base_url: "http://gw.example.test/a" }],
       ["userinfo in the base URL", { base_url: "https://u:p@gw.example.test/a" }],
-      ["an unknown engine", { engine: "codex" }],
+      ["an unknown engine", { engine: "other" }],
       ["a model map without haiku", { model_map: { sonnet: { model: "s" } } }],
       ["a short credential", { credential: "short" }],
       ["an out-of-range context window", { model_map: { haiku: { model: "h", context_window: 100 } } }],
@@ -105,3 +105,15 @@ describe("loopback is accepted only with the worker's own UZI_PROVIDER_ALLOW_LOO
     assert.equal((decoded!.secrets as Secrets).provider?.base_url, "http://127.0.0.1:4010/anthropic");
   });
 });
+
+for (const [label, kind, claim] of LANES) {
+  for (const caps of [[], [CLAUDE_PROVIDER_CAPABILITY, "codex_provider_v1"]]) {
+    it(`${label} holds Codex providers regardless of advertised capabilities (${caps.length})`, async () => {
+      await client.register("provider-worker", undefined, undefined, undefined, caps);
+      setBody(kind, { provider: provider({ engine: "codex", protocol: "openai_responses",
+        model_map: { default: { model: "gateway-default" } } }) });
+      await assert.rejects(claim(), (e: unknown) => e instanceof Error &&
+        "reason" in e && e.reason === "provider_lane_unsupported" && !e.message.includes(KEY));
+    });
+  }
+}
