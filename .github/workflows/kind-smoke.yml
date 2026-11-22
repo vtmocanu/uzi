@@ -107,9 +107,9 @@ jobs:
           kind load docker-image uzi-web:kind --name uzi-e2e
 
       - name: Setup Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e  # v5
         with:
-          version: v4.3.1
+          version: v4.3.2
 
       # Public CNPG operator, the SAME version the fleet runs, pinned to a fixed
       # release-asset URL (not a moving branch). Wait for the controller before the
