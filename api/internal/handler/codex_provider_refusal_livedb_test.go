@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
@@ -25,20 +27,22 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// Observe credential-opening inputs, not calls to the concrete vault.Open.
+// Observe credential-input SQL only, not calls to vault.Open or query arguments.
 type providerRouteInputReads struct {
-	*store.Queries
-	ciphertext, snapshots int
+	ciphertext, snapshots atomic.Int64
 }
 
-func (q *providerRouteInputReads) GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
-	q.ciphertext++
-	return q.Queries.GetUserSecretCiphertextByID(ctx, arg)
+func (q *providerRouteInputReads) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	switch {
+	case strings.HasPrefix(data.SQL, "-- name: GetUserSecretCiphertextByID "):
+		q.ciphertext.Add(1)
+	case strings.HasPrefix(data.SQL, "-- name: GetCodexProviderAccountSnapshot "):
+		q.snapshots.Add(1)
+	}
+	return ctx
 }
-func (q *providerRouteInputReads) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
-	q.snapshots++
-	return q.Queries.GetCodexProviderAccountSnapshot(ctx, arg)
-}
+
+func (*providerRouteInputReads) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 type providerRouteFixture struct {
 	ctx                                  context.Context
@@ -63,7 +67,8 @@ func newProviderRouteFixture(t *testing.T) *providerRouteFixture {
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	pool, err := store.OpenPool(ctx, dsn)
+	reads := &providerRouteInputReads{}
+	pool, err := store.OpenPool(ctx, dsn, store.WithQueryTracer(reads))
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
@@ -71,8 +76,7 @@ func newProviderRouteFixture(t *testing.T) *providerRouteFixture {
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	reads := &providerRouteInputReads{Queries: q}
-	wsvc := workersvc.New(reads, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	vlt := vault.NewPostgres(box, pool)
 	wsvc.SetVault(vlt)
 	wsvc.SetTxBeginner(pool)
@@ -224,7 +228,8 @@ func TestWorkerCodexProviderRoutesRefuseLiveDB(t *testing.T) {
 	}
 	refuse := func() {
 		t.Helper()
-		f.reads.ciphertext, f.reads.snapshots = 0, 0
+		f.reads.ciphertext.Store(0)
+		f.reads.snapshots.Store(0)
 		beforeCalls, beforeDiscover := f.provider.refreshCalls, f.provider.discoverCalls
 		for _, op := range []string{"release", "refresh"} {
 			body := fmt.Sprintf(`{"capability":%q}`, f.capability)
@@ -250,13 +255,14 @@ func TestWorkerCodexProviderRoutesRefuseLiveDB(t *testing.T) {
 				t.Fatalf("%s refusal lacks no-store", op)
 			}
 		}
-		if f.reads.ciphertext != 0 || f.reads.snapshots != 0 || f.provider.refreshCalls != beforeCalls || f.provider.discoverCalls != beforeDiscover {
-			t.Fatalf("refusal fetched credential inputs or called provider: ciphertext=%d snapshots=%d refresh=%d discover=%d", f.reads.ciphertext, f.reads.snapshots, f.provider.refreshCalls-beforeCalls, f.provider.discoverCalls-beforeDiscover)
+		if f.reads.ciphertext.Load() != 0 || f.reads.snapshots.Load() != 0 || f.provider.refreshCalls != beforeCalls || f.provider.discoverCalls != beforeDiscover {
+			t.Fatalf("refusal fetched credential inputs or called provider: ciphertext=%d snapshots=%d refresh=%d discover=%d", f.reads.ciphertext.Load(), f.reads.snapshots.Load(), f.provider.refreshCalls-beforeCalls, f.provider.discoverCalls-beforeDiscover)
 		}
 	}
 	nativeControl := func(generation int64, wantAccess, wantRefresh string) {
 		t.Helper()
-		f.reads.ciphertext, f.reads.snapshots = 0, 0
+		f.reads.ciphertext.Store(0)
+		f.reads.snapshots.Store(0)
 		calls := f.provider.refreshCalls
 		rec := f.post("/api/worker/runs/"+f.native.String()+"/codex/release", fmt.Sprintf(`{"capability":%q}`, f.capability))
 		var released codexSubscriptionResponse
@@ -266,10 +272,10 @@ func TestWorkerCodexProviderRoutesRefuseLiveDB(t *testing.T) {
 		if rec.Code != http.StatusOK || released.Generation != generation || released.AccessToken != wantAccess || released.ChatGPTAccountID != f.account {
 			t.Fatalf("native release generation %d: status=%d", generation, rec.Code)
 		}
-		if f.reads.ciphertext != 0 || f.reads.snapshots != 1 || f.provider.refreshCalls != calls || f.provider.discoverCalls != 0 {
-			t.Fatalf("native release inputs: ciphertext=%d snapshots=%d refresh=%d discover=%d", f.reads.ciphertext, f.reads.snapshots, f.provider.refreshCalls-calls, f.provider.discoverCalls)
+		if f.reads.ciphertext.Load() != 0 || f.reads.snapshots.Load() != 1 || f.provider.refreshCalls != calls || f.provider.discoverCalls != 0 {
+			t.Fatalf("native release inputs: ciphertext=%d snapshots=%d refresh=%d discover=%d", f.reads.ciphertext.Load(), f.reads.snapshots.Load(), f.provider.refreshCalls-calls, f.provider.discoverCalls)
 		}
-		f.reads.snapshots = 0
+		f.reads.snapshots.Store(0)
 		rec = f.post("/api/worker/runs/"+f.native.String()+"/codex/refresh", fmt.Sprintf(`{"capability":%q,"operation_id":%q,"observed_generation":%d}`, f.capability, uuid.NewString(), generation))
 		var refreshed codexRefreshResponse
 		if err := json.Unmarshal(rec.Body.Bytes(), &refreshed); err != nil {
@@ -278,8 +284,8 @@ func TestWorkerCodexProviderRoutesRefuseLiveDB(t *testing.T) {
 		if rec.Code != http.StatusOK || refreshed.Generation != generation+1 || refreshed.AccessToken != f.provider.newAccessToken || refreshed.ChatGPTAccountID != f.account {
 			t.Fatalf("native refresh generation %d: status=%d", generation, rec.Code)
 		}
-		if f.reads.ciphertext != 0 || f.reads.snapshots == 0 || f.provider.refreshCalls != calls+1 || f.provider.discoverCalls != 0 || f.provider.refreshToken != wantRefresh {
-			t.Fatalf("native refresh inputs/calls differ: ciphertext=%d snapshots=%d refresh=%d discover=%d", f.reads.ciphertext, f.reads.snapshots, f.provider.refreshCalls-calls, f.provider.discoverCalls)
+		if f.reads.ciphertext.Load() != 0 || f.reads.snapshots.Load() == 0 || f.provider.refreshCalls != calls+1 || f.provider.discoverCalls != 0 || f.provider.refreshToken != wantRefresh {
+			t.Fatalf("native refresh inputs/calls differ: ciphertext=%d snapshots=%d refresh=%d discover=%d", f.reads.ciphertext.Load(), f.reads.snapshots.Load(), f.provider.refreshCalls-calls, f.provider.discoverCalls)
 		}
 	}
 	refuse()
