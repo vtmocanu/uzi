@@ -171,6 +171,7 @@ export interface CodexProviderConfig {
  *  transitional credential remains private and never becomes model-visible. */
 export interface CodexLaunchRootSpec {
   readonly kind: "provider";
+  readonly providerBinding?: import("../protocol.js").ClaimCodexProviderBinding;
   readonly provider: CodexProviderConfig;
   readonly model: string;
   /** The canonical project / launch cwd (provisioned untrusted). */

@@ -229,3 +229,15 @@ export function assertAgentModelsMapped(
     if (def.model !== undefined && def.model !== "" && def.model !== "inherit") resolveProviderModel(def.model, modelMap);
   }
 }
+
+
+/** Internal Codex selections may use default; an explicit owner pin must have its own slot. */
+export function resolveCodexProviderModelSlot(
+  model: string | undefined,
+  modelMap: ClaimCodexProviderBinding["model_map"],
+  explicit = false,
+): keyof ClaimCodexProviderBinding["model_map"] {
+  if (model !== undefined && Object.hasOwn(modelMap, model)) return model as keyof typeof modelMap;
+  if (explicit) throw new ProviderModelUnmappedError(model ?? "");
+  return "default";
+}

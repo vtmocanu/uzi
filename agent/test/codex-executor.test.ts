@@ -89,8 +89,8 @@ import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
-import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
-import { CodexHarness, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
+import { createCodexProviderExecutionAuthority, selectCodexBinding, CodexSelectionError, type CodexBinding, type CodexExecutionAuthority } from "../src/codex/select.js";
+import { CodexHarness, type CodexLaunchRootSpec, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
@@ -782,7 +782,7 @@ function answerEnvProbe(
 
 function makeExecutor(
   rig: { client: FakeClient; deps: CodexExecutorDeps; probeCalls?: ProbeCall[] },
-  binding: CodexBinding,
+  binding: CodexExecutionAuthority,
   log: Logger = noopLog,
   dockerWiring?: DockerWiring,
   providerConfig: CodexProviderConfig = provider,
@@ -35298,9 +35298,9 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.ok(releases.length > 0, "real recovery auth bridge consumed reminted capability");
                 assert.ok(executedRecoveryExecutor && executedRecoveryRig);
                 const authority = (executedRecoveryExecutor as unknown as {
-                  currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+                  currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority<CodexBinding>>;
                 }).currentCodexAuthority;
-                assert.equal(authority.binding.capability, recovered.secrets.codex!.capability);
+                assert.equal((authority.binding as CodexBinding).capability, recovered.secrets.codex!.capability);
                 assert.equal(authority.ordinal, 0, "new flight starts its server-owned usage baseline");
                 assert.equal(authority.capabilityEpoch, undefined, "never inherits predecessor switch metadata");
                 const requests = executedRecoveryRig.transport.requests;
@@ -35511,7 +35511,7 @@ describe("M2 actualRunner credential replacement", () => {
           const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
           assert.equal(authority.ordinal, 1);
           assert.equal(authority.capabilityEpoch, 42, "capability counter is distinct from the usage ordinal");
-          assert.equal(authority.binding.capability, next.capability);
+          assert.equal((authority.binding as CodexBinding).capability, next.capability);
           const usage = feed.filter(m => m.payload.event === "codex_response_usage");
           assert.equal(usage.length, 1, "only B emitted provider usage");
           assert.deepEqual({ output: bMessage.credential_epoch_ordinal, usage: usage[0]!.credential_epoch_ordinal },
@@ -36508,7 +36508,7 @@ describe("Codex repeated actualRunner switching", () => {
         "first result really releases the held B publication");
       assert.equal(results[0]!.epoch, 42);
       const bAuthority = (executor as unknown as {
-        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority<CodexBinding>>;
       }).currentCodexAuthority;
       assert.equal(bAuthority.ordinal, 1);
       assert.equal(bAuthority.capabilityEpoch, 42);
@@ -36582,11 +36582,11 @@ describe("Codex repeated actualRunner switching", () => {
       }
       assert.equal(feed.some(m => m.payload.event === "resume_lineage_break"), false);
       const authority = (executor as unknown as {
-        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority<CodexBinding>>;
       }).currentCodexAuthority;
       assert.equal(authority.ordinal, 2);
       assert.equal(authority.capabilityEpoch, 43);
-      assert.equal(authority.binding.capability, cClaim.capability);
+      assert.equal((authority.binding as CodexBinding).capability, cClaim.capability);
       assert.ok(authority !== bAuthority, "C has a distinct immutable authority");
       assert.throws(() => bAuthority.assertCurrent(), /retired/);
       await assert.rejects(bScope.prepare("root", new AbortController().signal, () => {}), /closed/,
@@ -36609,5 +36609,116 @@ describe("Codex repeated actualRunner switching", () => {
       }
     }
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
+  });
+});
+
+describe("M2 provider executor composition", () => {
+  const providerClaim = () => ({
+    provider_id: "fixture-code", revision: 1, engine: "codex" as const,
+    protocol: "openai_responses" as const, auth_style: "bearer" as const,
+    base_url: "https://gateway.example.test/v1",
+    credential: ["fixture", "provider", "key"].join("-"),
+    model_map: { default: { model: "corp-code", context_window: 32768 } },
+  });
+
+  it("delivers frozen managed login on fresh roots with no vendor operations", async () => {
+    const rig = makeRig();
+    const input = providerClaim();
+    const binding = createCodexProviderExecutionAuthority(input);
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const specs: CodexLaunchRootSpec[] = [];
+    const launch = rig.deps.launchProviderRoot!;
+    const deps: CodexExecutorDeps = { ...rig.deps, launchProviderRoot: async (spec, mode) => {
+      assert.equal(mode, "provider");
+      specs.push(spec);
+      return launch(spec, mode);
+    } };
+    const executor = makeExecutor({ ...rig, deps }, binding);
+    input.credential = "changed-provider-credential";
+    input.model_map.default.model = "changed-model";
+    const { ctx } = makeCtx();
+    await executor.run(ctx);
+    assert.ok(specs.length >= 1);
+    assert.equal(specs[0]!.providerBinding?.credential, binding.providerBinding.credential);
+    assert.equal(specs[0]!.providerBinding?.model_map.default.model, "corp-code");
+    assert.equal(specs[0]!.model, "default");
+    const login = rig.transport.requests.find(r => r.method === "account/login/start");
+    assert.deepEqual(login?.params, { type: "apiKey", apiKey: binding.providerBinding.credential });
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("restarts at the frozen binding after a plan boundary", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("resumed-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const input = providerClaim();
+    const binding = createCodexProviderExecutionAuthority(input);
+    const specs: CodexLaunchRootSpec[] = [];
+    const launch = rig.deps.launchProviderRoot!;
+    rig.deps = { ...rig.deps, launchProviderRoot: async (spec, mode) => {
+      specs.push(spec);
+      assert.equal(mode, "provider");
+      return launch(spec, mode);
+    } };
+    const executor = makeExecutor(rig, binding);
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => {
+        input.base_url = "https://replacement.example.test";
+        input.credential = "replacement-fixture-key";
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      } });
+    await executor.run(ctx);
+    assert.equal(specs.length, 2);
+    assert.ok(rig.epochs[0]!.disposed() >= 1);
+    for (const spec of specs) {
+      assert.deepEqual(spec.providerBinding, binding.providerBinding);
+      assert.equal(spec.model, "default");
+    }
+    for (const epoch of rig.epochs) {
+      const login = epoch.transport.requests.find(r => r.method === "account/login/start");
+      assert.deepEqual(login?.params, { type: "apiKey", apiKey: binding.providerBinding.credential });
+    }
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("passes exclusive provider authority through the actual default launcher", async () => {
+    const rig = makeRig();
+    const { launchProviderRoot: unused, ...rest } = rig.deps;
+    void unused;
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    let reached = false;
+    rig.deps = { ...rest, launchCodexRootForTest: async spec => {
+      reached = true;
+      assert.deepEqual(spec.providerBinding, binding.providerBinding);
+      assert.equal(spec.provider, undefined);
+      assert.equal(spec.authMode, "provider");
+      assert.equal(spec.useAppServerAuth, true);
+      assert.equal(spec.model, "default");
+      assert.equal(spec.codeModeHost, true);
+      assert.equal(Object.hasOwn(spec, "credentialValue"), false);
+      throw new Error("provider launcher sentinel");
+    } };
+    const { ctx } = makeCtx();
+    await assert.rejects(makeExecutor(rig, binding).run(ctx), /provider launcher sentinel/);
+    assert.equal(reached, true);
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("refuses unmapped explicit models before login or vendor release", async () => {
+    const rig = makeRig();
+    const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()));
+    const { ctx } = makeCtx({ config: { default_model: "gpt-6-astra", default_model_source: "run_override" } });
+    await assert.rejects(executor.run(ctx), /provider_model_unmapped/);
+    assert.equal(rig.providerLaunches(), 0);
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
   });
 });

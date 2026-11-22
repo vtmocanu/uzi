@@ -19,7 +19,7 @@ import { WorkerClient, RequestError } from "./client.js";
 import { GitCache, readRetireScratchOutcomesActivation, readRetireScratchReclaimActivation, type GitCacheOptions } from "./git.js";
 import { StubExecutor, waitForStubOutboxCut } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
-import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
+import { createCodexProviderExecutionAuthority, selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
@@ -355,9 +355,8 @@ export function buildIsolatedExecutor(deps: { log: Logger; executorKind: Executo
 }
 
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps, addr: RunExecutorAddress = {}): RunExecution {
-  // Provider Code remains held, including on stub workers. A provider binding is
-  // authoritative and cannot fall back to a vendor credential or an unknown engine.
-  if (addr.provider && (addr.provider.engine !== "claude" || codex !== undefined)) {
+  // Provider authority is exclusive and cannot fall back to vendor credentials.
+  if (addr.provider && (!(["claude", "codex"] as string[]).includes(addr.provider.engine) || codex !== undefined)) {
     return { executor: new FailClosedExecutor("provider_lane_unsupported") };
   }
   const dirKey = runDirKey(runId, addr.generation);
@@ -365,7 +364,9 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
   const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;
   let selection;
   try {
-    selection = selectCodexBinding({ codex });
+    selection = addr.provider?.engine === "codex"
+      ? { kind: "codex" as const, binding: createCodexProviderExecutionAuthority(addr.provider) }
+      : selectCodexBinding({ codex });
   } catch (err) {
     if (err instanceof CodexSelectionError) {
       return { executor: new FailClosedExecutor(err.message) };

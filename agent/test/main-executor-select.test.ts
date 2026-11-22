@@ -46,20 +46,24 @@ const claudeProvider: ClaimProviderBinding = Object.freeze({
   credential: ["fixture", "provider", "credential"].join("-"), model_map: { haiku: { model: "corp-haiku" } },
 });
 
-describe("provider factory selection under the Code hold", () => {
+describe("provider factory selection", () => {
   it("Claude provider alone selects SDK", () => {
     assert.ok(buildRunExecutor("provider-claude", undefined, baseDeps(), { provider: claudeProvider }).executor instanceof SdkExecutor);
   });
 
   for (const executorKind of ["sdk", "stub"] as const) {
     for (const codex of [undefined, VALID_SUBSCRIPTION_CODEX]) {
-      it(`Code provider refuses before ${executorKind} construction, vendor block=${!!codex}`, async () => {
+      it(`Code provider dispatch for ${executorKind}, vendor block=${!!codex}`, async () => {
         const provider: ClaimProviderBinding = { ...claudeProvider, engine: "codex", protocol: "openai_responses",
           auth_style: "bearer", model_map: { default: { model: "corp-code" } } };
         const result = buildRunExecutor("provider-code", codex, baseDeps({ executorKind }), { provider });
-        assert.ok(result.executor instanceof FailClosedExecutor);
-        assert.equal(result.homeDir, undefined);
-        await assert.rejects(result.executor.run({} as never), /provider_lane_unsupported/);
+        if (codex !== undefined) {
+          assert.ok(result.executor instanceof FailClosedExecutor);
+          assert.equal(result.homeDir, undefined);
+          await assert.rejects(result.executor.run({} as never), /provider_lane_unsupported/);
+        } else {
+          assert.ok(result.executor instanceof (executorKind === "stub" ? StubExecutor : CodexExecutor));
+        }
       });
     }
     it(`Claude provider plus vendor Codex refuses before ${executorKind}`, () => {

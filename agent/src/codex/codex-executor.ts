@@ -71,7 +71,7 @@ import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
 import fs from "node:fs/promises";
@@ -227,7 +227,8 @@ import {
 } from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
-import type { CodexBinding, CodexExecutionAuthority } from "./select.js";
+import { createCodexProviderExecutionAuthority, type CodexBinding, type CodexExecutionAuthority } from "./select.js";
+import { resolveCodexProviderModelSlot } from "../provider-binding.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -958,7 +959,7 @@ export function createRunLaneInstallerReconcile(
   credentials: {
     runId: string;
     client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
-    binding: CodexBinding;
+    binding: CodexExecutionAuthority;
     registerToken: (token: string) => void;
     committed?: CodexCommittedGenerationCell;
     isVaultLocked?: () => boolean;
@@ -2060,7 +2061,7 @@ export interface CodexExecutorOptions {
   readonly codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
   /** Legacy construction input; credentials are always derived from the captured binding. */
   readonly summaryClaimCodex?: unknown;
-  readonly binding: CodexBinding;
+  readonly binding: CodexExecutionAuthority;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
   /** Startup-resolved Docker capability shared with the worker. */
@@ -2108,9 +2109,11 @@ export interface CodexExecutorOptions {
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
 /** Credential identity is fixed across provider-root recreations, never rebound in place. */
-export function createCodexEpochAuthority(input: CodexBinding, metadata: { capabilityEpoch?: number; ordinal: number } = { ordinal: 0 }) {
-  const binding = Object.freeze({ ...input });
-  const claim: Readonly<ClaimCodexSecrets> = Object.freeze({
+export function createCodexEpochAuthority<T extends CodexExecutionAuthority>(input: T, metadata: { capabilityEpoch?: number; ordinal: number } = { ordinal: 0 }) {
+  const binding: CodexExecutionAuthority = input.authMode === "provider"
+    ? createCodexProviderExecutionAuthority(input.providerBinding) : Object.freeze({ ...input } as CodexBinding);
+  const providerClaim = binding.authMode === "provider" ? binding.providerBinding : undefined;
+  const claim: Readonly<ClaimCodexSecrets> | undefined = binding.authMode === "provider" ? undefined : Object.freeze({
     auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
     ...(binding.authMode === "subscription" ? {
       generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
@@ -2122,7 +2125,7 @@ export function createCodexEpochAuthority(input: CodexBinding, metadata: { capab
   };
   let retired = false;
   return Object.freeze({
-    binding, claim, committedGeneration, capabilityEpoch: metadata.capabilityEpoch, ordinal: metadata.ordinal,
+    binding: binding as T, claim, providerClaim, committedGeneration, capabilityEpoch: metadata.capabilityEpoch, ordinal: metadata.ordinal,
     isCurrent: (): boolean => !retired,
     assertCurrent: (): void => {
       if (retired) throw new TrustedExecutionRefusal("codex credential authority retired");
@@ -2985,6 +2988,7 @@ export class CodexExecutor implements Executor {
         if (!authority || this.currentCodexAuthority !== authority)
           throw new TrustedExecutionRefusal("summary credential authority changed");
         authority.assertCurrent();
+        if (authority.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
         if (params.binding.capability !== authority.binding.capability ||
             params.binding.authMode !== authority.binding.authMode ||
             params.binding.accessToken !== authority.binding.accessToken ||
@@ -3182,7 +3186,11 @@ export class CodexExecutor implements Executor {
     // provider selection. config.toml names the custom HTTP provider in launcher.ts,
     // while thread/start carries this object and would otherwise override it back to
     // the production `openai` provider, silently bypassing the in-container fake.
-    const provider = this.deps.appServerAuthOpenAIBaseUrlForTest === undefined
+    const provider = binding.authMode === "provider" ? {
+      name: "uzi-provider-" + createHash("sha256").update(JSON.stringify([binding.providerBinding.provider_id, binding.providerBinding.revision])).digest("hex"),
+      baseUrl: binding.providerBinding.base_url, envKey: this.opts.provider.envKey,
+      model: binding.providerBinding.model_map.default.model,
+    } : this.deps.appServerAuthOpenAIBaseUrlForTest === undefined
       ? this.opts.provider
       : {
           ...this.opts.provider,
@@ -3345,6 +3353,7 @@ export class CodexExecutor implements Executor {
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => {
       const admitted = currentAuthority;
+      if (admitted.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
       admitted.assertCurrent();
       const prdText = (await prdInputP)?.prdText;
       admitted.assertCurrent();
@@ -4047,6 +4056,7 @@ export class CodexExecutor implements Executor {
       const suspendEpoch = async (bounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch> => {
         bounds.guard();
         const ownedAuthority = currentAuthority;
+        if (ownedAuthority.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
         const capturedReconcile = shared.reconcile;
         ownedAuthority.assertCurrent();
         this.assertCaptureAdmission();
@@ -5715,6 +5725,9 @@ export class CodexExecutor implements Executor {
     } = shared;
     const { binding, committedGeneration } = authority;
     authority.assertCurrent();
+    const providerSlot = binding.authMode === "provider"
+      ? resolveCodexProviderModelSlot(this.leadRequestFor(ctx, "plan").model, binding.providerBinding.model_map, (ctx.config?.default_model_source === "run_override" || ctx.config?.default_model_source === "schedule_pin"))
+      : undefined;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
     // owner/group/mode/directory-type immediately before each credentialed provider root. The
@@ -5767,7 +5780,10 @@ export class CodexExecutor implements Executor {
       // login (the token flows over `account/login/start`, NEVER the launcher env).
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
-      const initialToken = await this.releaseInitialCredential(ctx, binding, registerToken, committedGeneration, lifecycleSignal, revision, authority.assertCurrent);
+      const initialToken = binding.authMode === "provider"
+        ? binding.providerBinding.credential
+        : await this.releaseInitialCredential(ctx, binding, registerToken, committedGeneration, lifecycleSignal, revision, authority.assertCurrent);
+      registerToken(initialToken);
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
 
@@ -5796,7 +5812,7 @@ export class CodexExecutor implements Executor {
               },
             }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked())),
           }
-        : { mode: "api_key", apiKey: initialToken };
+        : { mode: binding.authMode, apiKey: initialToken };
       const appServerAuth = createCodexAppServerAuth(authConfig);
 
       // (4) The command + fileop effect surfaces, registered in THIS epoch's registry. Route the
@@ -5987,9 +6003,10 @@ export class CodexExecutor implements Executor {
       };
 
       harness = new CodexHarness({
-        admissionReporter: this.opts.client.codexAdmissionReporter?.(ctx.runId, ctx.claimGeneration),
+        admissionReporter: binding.authMode !== "provider" ? this.opts.client.codexAdmissionReporter?.(ctx.runId, ctx.claimGeneration) : undefined,
         registry,
         launchRoot: async (spec) => {
+          if (binding.authMode === "provider") spec = { ...spec, providerBinding: binding.providerBinding, model: Object.entries(binding.providerBinding.model_map).find(([, entry]) => entry?.model === spec.model)?.[0] ?? providerSlot! };
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
           const root = this.trackProviderRoot(await providerLaunchSeam(spec));
@@ -6024,8 +6041,8 @@ export class CodexExecutor implements Executor {
         // before the first turn/start, and the level itself is always sent unchanged. Issue #3251:
         // a Runtime default claim (no level) with a catalog reporter gets the report-only probe,
         // which does not delay turn/start.
-        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
-          : epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
+        ...(binding.authMode !== "provider" && epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
+          : binding.authMode !== "provider" && epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
       });
 
       const epochHarness = harness;
@@ -7261,14 +7278,16 @@ export class CodexExecutor implements Executor {
       // the claim; otherwise use the selected valid owner pin, then the provider default. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
-      model: leadRequest.model!,
+      model: this.opts.binding.authMode === "provider"
+        ? this.opts.binding.providerBinding.model_map[resolveCodexProviderModelSlot(leadRequest.model, this.opts.binding.providerBinding.model_map, (ctx.config?.default_model_source === "run_override" || ctx.config?.default_model_source === "schedule_pin"))]!.model
+        : leadRequest.model!,
       // PRD #1551 (D4/D5): mark the ROOT model's provenance ONLY when it came from the
       // server worker default (a present, non-empty `default_model`). This is the sole
       // source render.ts's resolveModel lets carry a validated CUSTOM (non-curated) ID
       // through unchanged; a malformed worker default then fails the run loudly rather
       // than silently substituting gpt-6-astra. The provider fallback above carries no
       // provenance, so it stays closed to the curated set exactly as before.
-      ...(typeof ctx.config?.default_model === "string" && ctx.config.default_model.length > 0
+      ...(this.opts.binding.authMode === "provider" || typeof ctx.config?.default_model === "string" && ctx.config.default_model.length > 0
         ? { modelSource: "worker_default" as const }
         : {}),
       ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
@@ -8665,11 +8684,11 @@ async function defaultLaunchProviderRoot(
   const handle = await launch({
     ownedDataRoot: spec.ownedDataRoot,
     // No credentialValue: the token flows over `account/login/start`, never the launcher env.
-    provider: {
+    ...(spec.providerBinding ? { providerBinding: spec.providerBinding } : { provider: {
       name: spec.provider.name,
       baseUrl: spec.provider.baseUrl,
       envKey: spec.provider.envKey,
-    },
+    } }),
     model: spec.model,
     codexBin: CODEX_BIN,
     supervisorBin: SUPERVISOR_BIN,
