@@ -56,10 +56,13 @@ A missing or unreadable fixture is a **fatal**, never a skip, on both sides.
 }
 ```
 
-`shipped` and `stored` are the five mutable columns of an agent template. `model` may be
+`shipped` and `stored` are the seven mutable columns of an agent template (description,
+model, codex_model, effort, codex_effort, tools, prompt_body). `model` may be
 `null` (decodes to Go `""`; TS reads it `?? ""`) — both mean Default. The optional
 `codex_model` key defaults to null; null and empty compare equal. Its drift label is
-`codex model`, immediately after `model`. `tools` may be
+`codex model`, immediately after `model`. The optional `effort` and `codex_effort` keys
+(issue #3258) default to null the same way; their labels are `effort` and `codex effort`,
+after `codex model`. `tools` may be
 `null`, `[]`, or an array; `null` and `[]` both mean inherit-all and compare equal.
 
 `expected.differs` (bool) pins the two **boolean** predicates, `SameContent` and
@@ -70,7 +73,7 @@ reads `differs` only.
 
 ## 🔴 This fixture's `expected` is HAND-AUTHORED, not recorded and not computed
 
-Every `expected` value here was written from the stated five-column rules — null equals
+Every `expected` value here was written from the stated column rules — null equals
 empty, `tools` is order-sensitive, nothing is ever trimmed — **not** recorded from a
 live system and **not** computed by calling any of the three implementations. That makes
 it closer to `fixtures/judge-fidelity/`'s hand-authored expectation than to

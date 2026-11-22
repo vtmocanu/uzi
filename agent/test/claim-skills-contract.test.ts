@@ -216,4 +216,12 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   const reviewer = claim.agents.find((a) => a.name === "reviewer");
   assert.deepEqual(coder?.skills, ["team-runbook", "team-kb"]);
   assert.deepEqual(reviewer?.skills, []);
+
+  // Issue #3258 N4: a template effort pin rides agents[].effort (omitempty on the Go side), so the
+  // coder carries its pin and the unpinned reviewer omits the key. Reading it through the typed
+  // AgentTemplate makes `npm run typecheck` fail if `effort` is dropped from protocol.ts.
+  const coderEffort: string | null | undefined = coder?.effort;
+  assert.equal(coderEffort, "high");
+  assert.equal(reviewer !== undefined && Object.hasOwn(reviewer, "effort"), false);
+  assert.equal(reviewer?.effort, undefined);
 });

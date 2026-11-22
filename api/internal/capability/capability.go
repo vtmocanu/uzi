@@ -401,7 +401,14 @@ const RecoveryRunOpenHoldsV1 = "recovery_run_open_holds_v1"
 // reports it; the route refuses unsupported, with no write, for a worker that does not.
 const RecoveryTerminalPreservationV1 = "recovery_terminal_preservation_v1"
 
+// TemplateEffortV1 (issue #3258) negotiates the per-subagent reasoning effort on claim agents
+// (ClaimAgent.effort). A worker that reports it applies a template's effort pin; the api never
+// sends the key to one that does not and records a run-feed notice instead. It is a worker/server
+// protocol fact, so it lives in the protocol vocabulary only.
+const TemplateEffortV1 = "template_effort_v1"
+
 var protocolVocabulary = map[string]struct{}{
+	TemplateEffortV1:                {},
 	RecoveryRunOpenHoldsV1:          {},
 	RecoveryTerminalPreservationV1:  {},
 	RecoveryBindinglessClosedV1:     {},
@@ -468,7 +475,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, HibernationCachePruneV1, HibernationInventoryV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, RecoveryTerminalPreservationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, ClaudePhaseModelsV1, CodexCompletionInterlockV1, CredentialSwitchV1, CredentialSwitchInPlaceV1, CodexCredentialSwitchV1, CodexSwitchStoppedV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, ClaudeProviderV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, IssueKeyV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1}
+var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, HibernationCachePruneV1, HibernationInventoryV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, RecoveryTerminalPreservationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, ClaudePhaseModelsV1, CodexCompletionInterlockV1, CredentialSwitchV1, CredentialSwitchInPlaceV1, CodexCredentialSwitchV1, CodexSwitchStoppedV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, ClaudeProviderV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, IssueKeyV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1, TemplateEffortV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

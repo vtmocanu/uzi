@@ -267,7 +267,7 @@ export interface ModelSettingCell {
 /** One harness's cell of the ordinary reasoning-effort setting (PRD #3247), parallel to
  *  ModelSettingCell. `effort` is the stored token (null = Default, a level, or
  *  "runtime"); `resolved_effort` is the level a claim sends, null exactly when `mode`
- *  is "runtime_default". `source` is user_default | builtin; labelled by
+ *  is "runtime_default". `source` and `default_source` are user_default | template | builtin; labelled by
  *  fixtures/model-settings/contract.json. */
 export interface EffortSettingCell {
   harness: Harness;
@@ -300,7 +300,7 @@ type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
   | "cross_check_pin" | "cross_check_worker_default" | "run_override" | "user_planning_default";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override" | "user_planning_default";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "template" | "run_override" | "user_planning_default";
 type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
@@ -731,6 +731,10 @@ export interface AgentTemplate {
   description: string;
   model: string | null;
   codex_model: string | null;
+  // Per-harness reasoning-effort pins (PRD #3258): one of low|medium|high|xhigh|max, or null for
+  // no pin. Optional for api/web rollout skew (a server that predates them omits the keys).
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
@@ -738,7 +742,7 @@ export interface AgentTemplate {
   user_id: string | null;
   updated_by: string | null;
   // differs_from_builtin is computed server-side per request (issue #201 M4a):
-  // whether this row's five mutable columns still match the definition the
+  // whether this row's mutable columns still match the definition the
   // running release ships under the same name. It is false for anything that has
   // no shipped counterpart — a global row, a user row that merely shares a
   // builtin's name, and a builtin this release no longer ships.
@@ -775,6 +779,8 @@ export interface BuiltinDefinition {
   description: string;
   model: string | null;
   codex_model: string | null;
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -789,6 +795,9 @@ export interface AgentTemplateInput {
   model: string | null;
   // Omitted on PUT preserves the stored pin; null or blank clears it.
   codex_model?: string | null;
+  // Omitted on PUT preserves the stored effort pin; null or blank clears it.
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
   scope?: "global" | "user";
@@ -1829,6 +1838,9 @@ export interface AgentSourceStagedRole {
   // Review pins are always present; empty means Default for that harness.
   claude_model: string;
   codex_model: string;
+  // The source role's Claude-family effort pin (#3258); empty means Default. Absent on
+  // an older server.
+  effort?: string;
   tools?: string[];
   prompt_body?: string;
   // True when the displayed `prompt_body` differs from the raw applied body because

@@ -75,7 +75,7 @@ describe("AgentNew real editor model pins", () => {
       "Default · lead's model", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
     ]);
     expect(within(claude).getByRole("option", { name: "Default · lead's model" })).toBeTruthy();
-    const help = screen.getByText("Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these pins.");
+    const help = screen.getByText("Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.");
     expect(claude.getAttribute("aria-describedby")).toBe(help.id);
     expect(codex.getAttribute("aria-describedby")).toBe(help.id);
 
@@ -110,7 +110,32 @@ describe("AgentNew real editor model pins", () => {
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith("/agents/created"));
     expect(api.createAgentTemplate).toHaveBeenCalledExactlyOnceWith({
       name: "my-agent", scope: "user", description: "Routes useful work.",
-      model, codex_model: codexModel, tools: null, prompt_body: "Do useful work.",
+      model, codex_model: codexModel, effort: null, codex_effort: null, tools: null, prompt_body: "Do useful work.",
+    });
+  });
+
+  it("offers the closed effort levels (no runtime), explains the lead Default, and creates with independent effort pins", async () => {
+    renderNew();
+    const claude = screen.getByRole("combobox", { name: "Claude effort" }) as HTMLSelectElement;
+    const codex = screen.getByRole("combobox", { name: "Codex effort" }) as HTMLSelectElement;
+    expect(within(claude).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Default · follows the run's effort", "low", "medium (uzi default)", "high", "xhigh", "max",
+    ]);
+    expect(screen.queryByText("Used when you have no default effort for this harness")).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "lead" } });
+    expect(screen.getByText("Used when you have no default effort for this harness")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "my-agent" } });
+
+    fillRequiredFields();
+    fireEvent.change(claude, { target: { value: "xhigh" } });
+    fireEvent.change(codex, { target: { value: "low" } });
+    fireEvent.change(codex, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create template" }));
+
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith("/agents/created"));
+    expect(api.createAgentTemplate).toHaveBeenCalledExactlyOnceWith({
+      name: "my-agent", scope: "user", description: "Routes useful work.",
+      model: null, codex_model: null, effort: "xhigh", codex_effort: null, tools: null, prompt_body: "Do useful work.",
     });
   });
 
@@ -136,7 +161,7 @@ describe("AgentNew real editor model pins", () => {
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith("/agents/created"));
     expect(api.createAgentTemplate).toHaveBeenCalledExactlyOnceWith({
       name: "my-agent", scope: "user", description: "Routes useful work.",
-      model: null, codex_model: null, tools: null, prompt_body: "Do useful work.",
+      model: null, codex_model: null, effort: null, codex_effort: null, tools: null, prompt_body: "Do useful work.",
     });
   });
 });
@@ -172,6 +197,8 @@ describe("AgentNew — encodes the server id at the navigate() sink (#644)", () 
       description: "Routes useful work.",
       model: null,
       codex_model: null,
+      effort: null,
+      codex_effort: null,
       tools: null,
       prompt_body: "Do useful work.",
     });

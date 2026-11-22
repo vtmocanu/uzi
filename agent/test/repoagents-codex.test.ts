@@ -59,7 +59,7 @@ describe("Codex TOML projection", { skip: repoAgentReadSkip("TOML projection") }
     assert.deepEqual(Object.keys(r.agents[0]!).sort(), ["description", "name", "prompt_body"]);
   });
 
-  it("honours model while ignoring effort, nicknames, config_file, includes and unknown keys", async () => {
+  it("honours model and effort while ignoring nicknames, config_file, includes and unknown keys", async () => {
     toml(
       "coder.toml",
       TOML_OK(
@@ -79,9 +79,43 @@ describe("Codex TOML projection", { skip: repoAgentReadSkip("TOML projection") }
     const r = await detectRepoAgents(clone, "codex");
     assert.deepEqual(r.notes, []);
     const t = r.agents[0]!;
-    assert.deepEqual(Object.keys(t).sort(), ["description", "model", "name", "prompt_body"]);
+    assert.deepEqual(Object.keys(t).sort(), ["description", "effort", "model", "name", "prompt_body"]);
     assert.equal(t.model, "gpt-6-luna");
+    assert.equal(t.effort, "high");
     assert.equal(t.tools, undefined);
+  });
+
+  it("notes an invalid effort with the file basename, keeps the agent, and never echoes the value", async () => {
+    toml("review-file.toml", TOML_OK("reviewer", 'model_reasoning_effort = "SECRETVALUE"\n'));
+    const r = await detectRepoAgents(clone, "codex");
+    assert.deepEqual(names(r), ["reviewer"]);
+    assert.equal(r.agents[0]!.effort, undefined);
+    assert.deepEqual(r.notes, [{ name: "reviewer", reason: "effort_ignored", file: "review-file" }]);
+    const text = describeRepoAgentNote(r.notes[0]!);
+    assert.equal(text, 'repo agent "reviewer" (file "review-file") declared an invalid effort; it follows the run\'s effort');
+    assert.ok(!text.includes("SECRETVALUE"));
+  });
+
+  it("omits the file clause when the basename is not a valid agent name or is overlong", async () => {
+    toml("Bad_File.toml", TOML_OK("one", 'model_reasoning_effort = "nope"\n'));
+    toml(`${"a".repeat(70)}.toml`, TOML_OK("two", 'model_reasoning_effort = "nope"\n'));
+    const r = await detectRepoAgents(clone, "codex");
+    assert.deepEqual(names(r), ["one", "two"]);
+    assert.deepEqual(r.notes, [
+      { name: "one", reason: "effort_ignored" },
+      { name: "two", reason: "effort_ignored" },
+    ]);
+    assert.equal(describeRepoAgentNote(r.notes[0]!), 'repo agent "one" declared an invalid effort; it follows the run\'s effort');
+  });
+
+  it("keeps a .codex effort on a Codex run and deletes it on a Claude run (family by folder)", async () => {
+    toml("coder.toml", TOML_OK("coder", 'model_reasoning_effort = "max"\n'));
+    const codex = await detectRepoAgents(clone, "codex");
+    assert.equal(codex.agents[0]!.effort, "max");
+    const claude = await detectRepoAgents(clone, "claude");
+    assert.equal(claude.folder, ".codex/agents");
+    assert.deepEqual(names(claude), ["coder"]);
+    assert.ok(!Object.hasOwn(claude.agents[0]!, "effort"), "a .codex effort never reaches a Claude run");
   });
 
   for (const key of ["features", "skills", "sandbox_mode", "tools"] as const) {

@@ -128,8 +128,8 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
       visited.add(c.id);
     }
     assert.deepEqual([...visited].sort(), LEAD_REQUEST_CASES.map((c) => c.id).sort());
-    assert.equal(LEAD_REQUEST_CASES.length, 45);
-    assert.equal(visited.size, 45, "all shared request cases exercised");
+    assert.equal(LEAD_REQUEST_CASES.length, 54);
+    assert.equal(visited.size, 54, "all shared request cases exercised");
   });
 
   it("a plan_phase model without model_source falls back to the implement source, not builtin", () => {

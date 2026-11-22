@@ -2,9 +2,9 @@ package agenttmpl
 
 import "slices"
 
-// SameContent reports whether two definitions carry the same content: the five
-// mutable columns of an agent template — description, model, codex_model, tools and prompt
-// body.
+// SameContent reports whether two definitions carry the same content: the seven
+// mutable columns of an agent template — description, model, codex_model, effort,
+// codex_effort, tools and prompt body.
 //
 // It lives here, and not in handler, because it is the ONE answer to "has this
 // row drifted from the definition this binary ships?" (issue #201 M4a). agenttmpl
@@ -34,8 +34,8 @@ import "slices"
 //     TrimSpace cannot make a pristine row look drifted.
 //
 // IT DOES NOT RENDER EITHER SIDE AND COMPARE THE BYTES, which is the tempting
-// shortcut. CodexModel deliberately has no rendered representation; comparing
-// rendered bytes would miss changes to that pin. Two more reasons it stays
+// shortcut. CodexModel and CodexEffort deliberately have no rendered
+// representation; comparing rendered bytes would miss changes to those pins. Two more reasons it stays
 // column-based:
 //
 //   - Render serializes the FRONTMATTER, so anything a future release adds there
@@ -50,6 +50,8 @@ func SameContent(a, b Definition) bool {
 	return a.Description == b.Description &&
 		a.Model == b.Model &&
 		a.CodexModel == b.CodexModel &&
+		a.Effort == b.Effort &&
+		a.CodexEffort == b.CodexEffort &&
 		a.PromptBody == b.PromptBody &&
 		slices.Equal(a.Tools, b.Tools)
 }

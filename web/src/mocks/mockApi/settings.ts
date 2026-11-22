@@ -38,7 +38,7 @@ import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "..
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
-import { mockDefaultClaudeModel } from "./agents";
+import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
 
@@ -923,6 +923,39 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
   return view;
 }
 
+// Issue #3258 N3: the recordings carry no lead-template effort, so the delivered mock lead
+// template's effort is applied at response time, mirroring how leadEffortSettingCell derives it: when
+// the owner's preference for the harness is NULL or blank, the worker_effort cell resolves to the
+// template's level with source template, and its default names the template. The demo ships no
+// lead row, so without a delivered lead template effort the recording is served unchanged. The
+// extra `c.effort === null` check only keeps a recorded stored preference authoritative.
+function withLeadTemplateEffort(view: EffectiveSettings, efforts: { claude: string | null; codex: string | null }, prefs: { claude: unknown; codex: unknown }): EffectiveSettings {
+  view.efforts = view.efforts.map(c => {
+    if (c.setting !== "worker_effort") return c;
+    const h = c.harness as "claude" | "codex";
+    const level = efforts[h];
+    if (!level) return c;
+    const next = { ...c, default_effort: level, default_source: "template" };
+    const pref = prefs[h];
+    if (c.effort === null && (pref === null || pref === undefined || (typeof pref === "string" && pref.trim() === ""))) {
+      return { ...next, resolved_effort: level, source: "template", mode: "explicit" as const };
+    }
+    return next;
+  });
+  // Planning inherits the resolved run effort, including the template tier, unless pinned.
+  const ordinary = view.efforts.find(c => c.setting === "worker_effort" && c.harness === "claude");
+  if (efforts.claude && ordinary) {
+    view.efforts = view.efforts.map(c => {
+      if (c.setting !== "planning_effort" || c.harness !== "claude") return c;
+      const next = { ...c, default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source };
+      return c.effort === null
+        ? { ...next, resolved_effort: ordinary.resolved_effort, source: ordinary.source, mode: ordinary.mode }
+        : next;
+    });
+  }
+  return view;
+}
+
 // PRD #3252: the recordings are taken with no planning value, so the mock user's stored planning
 // pair is applied at response time on the Claude planning cells, through the same mock cell
 // builders /me/settings uses. With neither value set the recording is served unchanged.
@@ -1675,7 +1708,11 @@ export const settingsApi = {
   // planning one (an owner with a Claude planning pair, PRD #3252); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(withPlanning(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on)), 60);
+    const view = withLeadTemplateEffort(
+      withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on),
+      mockLeadTemplateEfforts(),
+      { claude: userSettings.default_effort, codex: userSettings.default_codex_effort });
+    return delay(withPlanning(view), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();

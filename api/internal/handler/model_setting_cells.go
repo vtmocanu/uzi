@@ -8,6 +8,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -108,7 +109,10 @@ func planningModelCells(planning, claudeLane, leadClaudePin *string) []apitypes.
 // level is sent and DefaultEffort carries the preference token); a stored planning level resolves
 // with user_planning_default and explicit mode.
 func planningEffortCells(planning, claudeEffort *string) []apitypes.EffortSettingCellDTO {
-	ordinary := effortSettingCell("claude", claudeEffort)
+	return []apitypes.EffortSettingCellDTO{planningEffortCellFromOrdinary(planning, effortSettingCell("claude", claudeEffort))}
+}
+
+func planningEffortCellFromOrdinary(planning *string, ordinary apitypes.EffortSettingCellDTO) apitypes.EffortSettingCellDTO {
 	cell := apitypes.EffortSettingCellDTO{
 		Harness: "claude", Effort: planning,
 		DefaultSource:  ordinary.Source,
@@ -127,7 +131,7 @@ func planningEffortCells(planning, claudeEffort *string) []apitypes.EffortSettin
 			cell.ResolvedEffort, cell.Source, cell.Mode = &level, planningSourceUserPlanningDefault, agenttmpl.EffortModeExplicit
 		}
 	}
-	return []apitypes.EffortSettingCellDTO{cell}
+	return cell
 }
 
 // catalogDefaultDTO projects the service result onto the wire shape; unknown carries
@@ -154,6 +158,28 @@ func effortSettingCell(harness string, stored *string) apitypes.EffortSettingCel
 	if r.Mode == agenttmpl.EffortModeExplicit {
 		level := r.Level
 		cell.ResolvedEffort = &level
+	}
+	return cell
+}
+
+// leadEffortSettingCell is the worker-effort cell of an effective-settings view, built from the
+// lead prediction so it shows what a claim ships (issue #3258 N3). It is effortSettingCell over the
+// owner's stored preference, except when the prediction resolved the lead template's effort (source
+// template: the preference is NULL or blank): then the cell resolves to that level with source
+// template. DefaultEffort/DefaultSource describe what clearing the preference (NULL) resolves to:
+// the lead template's effort with source template when it has a valid one, else the builtin.
+// effortSettingCell itself stays preference-only for the Settings preference cells.
+func leadEffortSettingCell(harness string, lead workersvc.LeadPrediction) apitypes.EffortSettingCellDTO {
+	cell := effortSettingCell(harness, lead.UserEffort)
+	if lead.TemplateEffort != nil {
+		cell.DefaultEffort = *lead.TemplateEffort
+		cell.DefaultSource = string(leadcfg.EffortSourceTemplate)
+	}
+	if lead.EffortSource == string(leadcfg.EffortSourceTemplate) && lead.Effort != nil {
+		level := *lead.Effort
+		cell.ResolvedEffort = &level
+		cell.Source = lead.EffortSource
+		cell.Mode = agenttmpl.EffortModeExplicit
 	}
 	return cell
 }

@@ -6,9 +6,14 @@ import "time"
 // setting (PRD #3247), parallel to ModelSettingCellDTO. A setting's cells are an
 // array, always ordered claude then codex. Effort is the stored preference token
 // (null = Default, a level, or "runtime"); DefaultEffort/DefaultSource are what
-// Default means (medium, builtin). ResolvedEffort is the level a claim sends, null
-// exactly when Mode is "runtime_default" (no level is sent). Source is user_default
-// or builtin; Mode is explicit or runtime_default. Labelled per surface by
+// Default means: medium/builtin, or on the effective-settings worker_effort cell the lead
+// template's effort/template when it pins one (issue #3258). ResolvedEffort is the level the
+// cell resolves to, null exactly when Mode is "runtime_default" (no level is sent); the
+// /api/me/settings preference cells do not apply the lead-template tier, so only the
+// effective-settings cell is what a lead claim sends. Source is user_default
+// or builtin, plus template on the effective-settings worker_effort cell when the owner
+// has no preference for the harness and the lead template's effort applies (issue #3258);
+// Mode is explicit or runtime_default. Labelled per surface by
 // fixtures/model-settings/contract.json.
 //
 // CatalogDefault (issue #3251) is carried on the codex cell only, always: the level the

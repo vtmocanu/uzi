@@ -17,20 +17,24 @@ UPDATE agent_templates
 SET description = $1,
     model = $2,
     codex_model = $3,
-    tools = $4,
-    prompt_body = $5,
+    effort = $4,
+    codex_effort = $5,
+    tools = $6,
+    prompt_body = $7,
     origin = 'synced',
     customized = false,
-    updated_by = $6,
+    updated_by = $8,
     updated_at = now()
-WHERE id = $7 AND scope = 'builtin'
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+WHERE id = $9 AND scope = 'builtin'
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type ApplySyncedOverrideBuiltinParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
@@ -48,6 +52,8 @@ func (q *Queries) ApplySyncedOverrideBuiltin(ctx context.Context, arg ApplySynce
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.UpdatedBy,
@@ -70,14 +76,16 @@ func (q *Queries) ApplySyncedOverrideBuiltin(ctx context.Context, arg ApplySynce
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
 
 const createAgentTemplate = `-- name: CreateAgentTemplate :one
-INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, scope, user_id, updated_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+INSERT INTO agent_templates (name, description, model, codex_model, effort, codex_effort, tools, prompt_body, scope, user_id, updated_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type CreateAgentTemplateParams struct {
@@ -85,6 +93,8 @@ type CreateAgentTemplateParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	Scope       string      `json:"scope"`
@@ -101,6 +111,8 @@ func (q *Queries) CreateAgentTemplate(ctx context.Context, arg CreateAgentTempla
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.Scope,
@@ -124,6 +136,8 @@ func (q *Queries) CreateAgentTemplate(ctx context.Context, arg CreateAgentTempla
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
@@ -159,7 +173,7 @@ func (q *Queries) DeleteSyncedGlobalTemplate(ctx context.Context, name string) (
 }
 
 const getAgentTemplate = `-- name: GetAgentTemplate :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model FROM agent_templates WHERE id = $1
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort FROM agent_templates WHERE id = $1
 `
 
 // Unfiltered fetch for the write path: the handler loads the row, then applies
@@ -184,12 +198,14 @@ func (q *Queries) GetAgentTemplate(ctx context.Context, id uuid.UUID) (AgentTemp
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
 
 const getAgentTemplateForUpdate = `-- name: GetAgentTemplateForUpdate :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model FROM agent_templates WHERE id = $1 FOR UPDATE
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort FROM agent_templates WHERE id = $1 FOR UPDATE
 `
 
 // Lock the current row before merging omitted pins and deciding customized.
@@ -212,12 +228,14 @@ func (q *Queries) GetAgentTemplateForUpdate(ctx context.Context, id uuid.UUID) (
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
 
 const getAgentTemplateForViewer = `-- name: GetAgentTemplateForViewer :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model FROM agent_templates
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort FROM agent_templates
 WHERE id = $1
   AND ($2::boolean
        OR scope IN ('builtin', 'global')
@@ -250,12 +268,14 @@ func (q *Queries) GetAgentTemplateForViewer(ctx context.Context, arg GetAgentTem
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
 
 const getSharedAgentTemplateByName = `-- name: GetSharedAgentTemplateByName :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model FROM agent_templates WHERE name = $1 AND scope <> 'user'
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort FROM agent_templates WHERE name = $1 AND scope <> 'user'
 `
 
 // Shared-namespace lookup for the reconciler's shadow-warning classification.
@@ -281,13 +301,15 @@ func (q *Queries) GetSharedAgentTemplateByName(ctx context.Context, name string)
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
 
 const insertBuiltinAgentTemplate = `-- name: InsertBuiltinAgentTemplate :execrows
-INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, is_builtin, scope, origin)
-VALUES ($1, $2, $3, $4, $5, $6, true, 'builtin', 'embedded')
+INSERT INTO agent_templates (name, description, model, codex_model, effort, codex_effort, tools, prompt_body, is_builtin, scope, origin)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, 'builtin', 'embedded')
 ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING
 `
 
@@ -296,6 +318,8 @@ type InsertBuiltinAgentTemplateParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 }
@@ -318,6 +342,8 @@ func (q *Queries) InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuil
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 	)
@@ -328,9 +354,9 @@ func (q *Queries) InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuil
 }
 
 const insertSyncedGlobalTemplate = `-- name: InsertSyncedGlobalTemplate :one
-INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, is_builtin, scope, origin, updated_by)
-VALUES ($1, $2, $3, $4, $5, $6, false, 'global', 'synced', $7)
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+INSERT INTO agent_templates (name, description, model, codex_model, effort, codex_effort, tools, prompt_body, is_builtin, scope, origin, updated_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, 'global', 'synced', $9)
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type InsertSyncedGlobalTemplateParams struct {
@@ -338,6 +364,8 @@ type InsertSyncedGlobalTemplateParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
@@ -354,6 +382,8 @@ func (q *Queries) InsertSyncedGlobalTemplate(ctx context.Context, arg InsertSync
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.UpdatedBy,
@@ -375,12 +405,14 @@ func (q *Queries) InsertSyncedGlobalTemplate(ctx context.Context, arg InsertSync
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
 
 const listAgentTemplates = `-- name: ListAgentTemplates :many
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model FROM agent_templates ORDER BY name
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort FROM agent_templates ORDER BY name
 `
 
 // Unfiltered list of every template (all scopes). Claim assembly uses it until
@@ -411,6 +443,8 @@ func (q *Queries) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, erro
 			&i.Customized,
 			&i.Origin,
 			&i.CodexModel,
+			&i.Effort,
+			&i.CodexEffort,
 		); err != nil {
 			return nil, err
 		}
@@ -423,7 +457,7 @@ func (q *Queries) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, erro
 }
 
 const listAgentTemplatesForViewer = `-- name: ListAgentTemplatesForViewer :many
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model FROM agent_templates
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort FROM agent_templates
 WHERE $1::boolean
    OR scope IN ('builtin', 'global')
    OR (scope = 'user' AND user_id = $2)
@@ -464,6 +498,8 @@ func (q *Queries) ListAgentTemplatesForViewer(ctx context.Context, arg ListAgent
 			&i.Customized,
 			&i.Origin,
 			&i.CodexModel,
+			&i.Effort,
+			&i.CodexEffort,
 		); err != nil {
 			return nil, err
 		}
@@ -480,18 +516,22 @@ UPDATE agent_templates
 SET description = $1,
     model = $2,
     codex_model = $3,
-    tools = $4,
-    prompt_body = $5,
+    effort = $4,
+    codex_effort = $5,
+    tools = $6,
+    prompt_body = $7,
     updated_at = now()
-WHERE name = $6 AND scope = 'builtin' AND customized = false AND origin = 'embedded'
-  AND (description, model, codex_model, tools, prompt_body)
-      IS DISTINCT FROM ($1, $2, $3, $4, $5)
+WHERE name = $8 AND scope = 'builtin' AND customized = false AND origin = 'embedded'
+  AND (description, model, codex_model, effort, codex_effort, tools, prompt_body)
+      IS DISTINCT FROM ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type RefreshPristineBuiltinParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	Name        string      `json:"name"`
@@ -516,6 +556,8 @@ func (q *Queries) RefreshPristineBuiltin(ctx context.Context, arg RefreshPristin
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.Name,
@@ -531,20 +573,24 @@ UPDATE agent_templates
 SET description = $1,
     model = $2,
     codex_model = $3,
-    tools = $4,
-    prompt_body = $5,
-    updated_by = $6,
+    effort = $4,
+    codex_effort = $5,
+    tools = $6,
+    prompt_body = $7,
+    updated_by = $8,
     customized = false,
     origin = 'embedded',
     updated_at = now()
-WHERE id = $7 AND scope = 'builtin'
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+WHERE id = $9 AND scope = 'builtin'
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type ResetBuiltinAgentTemplateParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
@@ -566,6 +612,8 @@ func (q *Queries) ResetBuiltinAgentTemplate(ctx context.Context, arg ResetBuilti
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.UpdatedBy,
@@ -588,6 +636,8 @@ func (q *Queries) ResetBuiltinAgentTemplate(ctx context.Context, arg ResetBuilti
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
@@ -597,25 +647,29 @@ UPDATE agent_templates
 SET description = $1,
     model = $2,
     codex_model = $3,
-    tools = $4,
-    prompt_body = $5,
-    updated_by = $6,
-    customized = $7,
+    effort = $4,
+    codex_effort = $5,
+    tools = $6,
+    prompt_body = $7,
+    updated_by = $8,
+    customized = $9,
     -- Keep a builtin's origin in lockstep with customized (PRD #602 M1): a genuine
     -- admin edit is 'admin', saving the shipped body byte-for-byte returns it to
     -- 'embedded' (idempotent with Reset). A non-builtin (global/user) row keeps its
     -- existing origin — NULL — which the CHECK requires, so this never sets an
     -- illegal origin on it.
-    origin = CASE WHEN scope = 'builtin' THEN (CASE WHEN $7::boolean THEN 'admin' ELSE 'embedded' END) ELSE origin END,
+    origin = CASE WHEN scope = 'builtin' THEN (CASE WHEN $9::boolean THEN 'admin' ELSE 'embedded' END) ELSE origin END,
     updated_at = now()
-WHERE id = $8
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+WHERE id = $10
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type UpdateAgentTemplateParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
@@ -638,6 +692,8 @@ func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTempla
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.UpdatedBy,
@@ -661,6 +717,8 @@ func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTempla
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
@@ -669,20 +727,24 @@ const updateAgentTemplateModelPins = `-- name: UpdateAgentTemplateModelPins :one
 UPDATE agent_templates
 SET model = $1,
     codex_model = $2,
-    updated_by = $3,
+    effort = $3,
+    codex_effort = $4,
+    updated_by = $5,
     updated_at = now()
-WHERE id = $4
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+WHERE id = $6
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type UpdateAgentTemplateModelPinsParams struct {
-	Model      pgtype.Text `json:"model"`
-	CodexModel pgtype.Text `json:"codex_model"`
-	UpdatedBy  pgtype.UUID `json:"updated_by"`
-	ID         uuid.UUID   `json:"id"`
+	Model       pgtype.Text `json:"model"`
+	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
+	UpdatedBy   pgtype.UUID `json:"updated_by"`
+	ID          uuid.UUID   `json:"id"`
 }
 
-// CLI pin-only edit (PRD #3264 M3): writes ONLY the two model pins plus the audit
+// CLI pin-only edit (PRD #3264 M3, #3258): writes ONLY the model and effort pins plus the audit
 // columns. description, tools, prompt_body, customized and origin are deliberately not
 // touched. The caller holds the row lock (GetAgentTemplateForUpdate) and passes the locked
 // current value for a lane the request omitted, so an omitted lane is preserved.
@@ -690,6 +752,8 @@ func (q *Queries) UpdateAgentTemplateModelPins(ctx context.Context, arg UpdateAg
 	row := q.db.QueryRow(ctx, updateAgentTemplateModelPins,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.UpdatedBy,
 		arg.ID,
 	)
@@ -710,6 +774,8 @@ func (q *Queries) UpdateAgentTemplateModelPins(ctx context.Context, arg UpdateAg
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }
@@ -719,18 +785,22 @@ UPDATE agent_templates
 SET description = $1,
     model = $2,
     codex_model = $3,
-    tools = $4,
-    prompt_body = $5,
-    updated_by = $6,
+    effort = $4,
+    codex_effort = $5,
+    tools = $6,
+    prompt_body = $7,
+    updated_by = $8,
     updated_at = now()
-WHERE name = $7 AND scope = 'global' AND origin = 'synced'
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+WHERE name = $9 AND scope = 'global' AND origin = 'synced'
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model, effort, codex_effort
 `
 
 type UpdateSyncedGlobalTemplateParams struct {
 	Description string      `json:"description"`
 	Model       pgtype.Text `json:"model"`
 	CodexModel  pgtype.Text `json:"codex_model"`
+	Effort      pgtype.Text `json:"effort"`
+	CodexEffort pgtype.Text `json:"codex_effort"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
@@ -747,6 +817,8 @@ func (q *Queries) UpdateSyncedGlobalTemplate(ctx context.Context, arg UpdateSync
 		arg.Description,
 		arg.Model,
 		arg.CodexModel,
+		arg.Effort,
+		arg.CodexEffort,
 		arg.Tools,
 		arg.PromptBody,
 		arg.UpdatedBy,
@@ -769,6 +841,8 @@ func (q *Queries) UpdateSyncedGlobalTemplate(ctx context.Context, arg UpdateSync
 		&i.Customized,
 		&i.Origin,
 		&i.CodexModel,
+		&i.Effort,
+		&i.CodexEffort,
 	)
 	return i, err
 }

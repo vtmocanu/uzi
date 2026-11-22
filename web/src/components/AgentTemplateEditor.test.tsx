@@ -24,7 +24,7 @@ function renderEditor(name: string) {
 }
 
 const WORKER_MODEL_HELP = "Each harness's Run defaults model takes precedence over its lead template pin.";
-const MODEL_HELP = "Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these pins.";
+const MODEL_HELP = "Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.";
 
 describe("AgentTemplateEditor model Default label (#3255)", () => {
   it("names the SDK/account default for the lead and explains the user override", () => {
@@ -139,6 +139,20 @@ describe("AgentTemplateEditor pin validation", () => {
     const preview = container.querySelector("pre")!.textContent!;
     expect(preview).toContain("model: claude-custom");
     expect(preview).not.toContain("gpt-6-sol");
+  });
+
+  it("live preview carries the Claude effort as it changes and never the Codex effort (#3258)", () => {
+    const { container } = render(<AgentTemplateEditor
+      initial={{ name: "coder", description: "d", model: null, effort: "high", codex_effort: "low", tools: null, prompt_body: "b" }}
+      nameEditable={false} submitLabel="Save" busy={false} error="" onSubmit={vi.fn()}
+    />);
+    const preview = () => container.querySelector("pre")!.textContent!;
+    expect(preview()).toContain("effort: high");
+    expect(preview()).not.toContain("low");
+    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
+    expect(preview()).toContain("effort: max");
+    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "" } });
+    expect(preview()).not.toContain("effort");
   });
 
   it.each([

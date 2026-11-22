@@ -4,6 +4,7 @@ import {
   frontmatterFieldWarning,
   isLeadTemplateName,
   modelFieldWarning,
+  renderSubagent,
   TEMPLATE_SCOPE_LABEL,
   templateScopeBadgeTone,
   templateModelDefaultLabel,
@@ -150,6 +151,22 @@ describe("isLeadTemplateName", () => {
     }
     for (const n of ["coder", "reviewer", "leader", "lead-x", ""]) {
       expect(isLeadTemplateName(n)).toBe(false);
+    }
+  });
+});
+
+// Issue #3258 (M3 review): the live preview mirrors the server Render, which emits the Claude
+// effort after model and never a Codex pin.
+describe("renderSubagent effort", () => {
+  const base = { name: "coder", description: "d", model: "sonnet", tools: ["Read"], prompt_body: "Body.\n" };
+  it("emits the Claude effort after model", () => {
+    expect(renderSubagent({ ...base, effort: "high" })).toBe(
+      "---\nname: coder\ndescription: d\ntools: Read\nmodel: sonnet\neffort: high\n---\n\nBody.\n",
+    );
+  });
+  it("omits the line when unpinned", () => {
+    for (const effort of [undefined, null, ""]) {
+      expect(renderSubagent({ ...base, effort })).not.toContain("effort");
     }
   });
 });

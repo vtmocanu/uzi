@@ -11,6 +11,7 @@
   },
   "block-scalar-model.md": {
     "description": "Model line opens a block scalar and is dropped.",
+    "effort": "",
     "model": "",
     "name": "block-scalar-model",
     "notes": [],
@@ -20,6 +21,7 @@
   },
   "body-cf-kept.md": {
     "description": "Clean description.",
+    "effort": "",
     "model": "",
     "name": "body-cf-kept",
     "notes": [],
@@ -29,6 +31,7 @@
   },
   "bom-crlf.md": {
     "description": "From Windows.",
+    "effort": "",
     "model": "",
     "name": "bom-crlf",
     "notes": [],
@@ -38,6 +41,7 @@
   },
   "canon-task.md": {
     "description": "Canonicalizes Task to Agent.",
+    "effort": "",
     "model": "",
     "name": "canon-task",
     "notes": [
@@ -58,6 +62,7 @@
   },
   "column-zero-tools.md": {
     "description": "Zero-indent block sequence tools.",
+    "effort": "",
     "model": "",
     "name": "column-zero-tools",
     "notes": [],
@@ -75,8 +80,64 @@
   },
   "description-1024.md": {
     "description": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "effort": "",
     "model": "",
     "name": "description-1024",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "effort-block-scalar.md": {
+    "description": "Effort line opens a block scalar and is dropped.",
+    "effort": "",
+    "model": "",
+    "name": "effort-block-scalar",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "effort-duplicate.md": {
+    "description": "Two effort lines; the first wins.",
+    "effort": "high",
+    "model": "",
+    "name": "effort-duplicate",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "effort-empty.md": {
+    "description": "An empty effort inherits without a note.",
+    "effort": "",
+    "model": "",
+    "name": "effort-empty",
+    "notes": [],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "effort-invalid.md": {
+    "description": "Declares an effort outside the five levels.",
+    "effort": "",
+    "model": "",
+    "name": "effort-invalid",
+    "notes": [
+      {
+        "name": "effort-invalid",
+        "reason": "effort_ignored"
+      }
+    ],
+    "ok": true,
+    "prompt_body": "body\n",
+    "tools": null
+  },
+  "effort-valid.md": {
+    "description": "Declares a valid effort.",
+    "effort": "high",
+    "model": "",
+    "name": "effort-valid",
     "notes": [],
     "ok": true,
     "prompt_body": "body\n",
@@ -94,6 +155,7 @@
   },
   "inline-bracket-tools.md": {
     "description": "Bracket inline tools.",
+    "effort": "",
     "model": "",
     "name": "inline-bracket-tools",
     "notes": [],
@@ -106,6 +168,7 @@
   },
   "inline-plain-tools.md": {
     "description": "Plain inline tools.",
+    "effort": "",
     "model": "",
     "name": "inline-plain-tools",
     "notes": [],
@@ -118,6 +181,7 @@
   },
   "model-honored-full.md": {
     "description": "Honors a full model id.",
+    "effort": "",
     "model": "claude-opus-4-8",
     "name": "model-honored-full",
     "notes": [],
@@ -127,6 +191,7 @@
   },
   "model-ignored.md": {
     "description": "Model has interior whitespace.",
+    "effort": "",
     "model": "",
     "name": "model-ignored",
     "notes": [
@@ -151,6 +216,7 @@
   },
   "quote-stripping.md": {
     "description": "Quoted description.",
+    "effort": "",
     "model": "",
     "name": "quote-stripping",
     "notes": [],
@@ -160,6 +226,7 @@
   },
   "slug-fallback.md": {
     "description": "Falls back to the filename slug.",
+    "effort": "",
     "model": "",
     "name": "slug-fallback",
     "notes": [],
@@ -169,6 +236,7 @@
   },
   "tool-token-too-long.md": {
     "description": "Oversized tool token is dropped.",
+    "effort": "",
     "model": "",
     "name": "tool-token-too-long",
     "notes": [],
@@ -186,6 +254,7 @@
   },
   "tools-malformed-token.md": {
     "description": "Malformed tool token is dropped.",
+    "effort": "",
     "model": "",
     "name": "tools-malformed-token",
     "notes": [],
@@ -198,6 +267,7 @@
   },
   "tools-over-limit.md": {
     "description": "Only the first 64 tools are considered.",
+    "effort": "",
     "model": "",
     "name": "tools-over-limit",
     "notes": [],
@@ -272,6 +342,7 @@
   },
   "trailing-feff-desc.md": {
     "description": "Clean description.",
+    "effort": "",
     "model": "",
     "name": "trailing-feff-desc",
     "notes": [],
@@ -281,6 +352,7 @@
   },
   "unknown-keys.md": {
     "description": "Has unknown keys.",
+    "effort": "",
     "model": "",
     "name": "unknown-keys",
     "notes": [],
@@ -290,6 +362,7 @@
   },
   "valid-minimal.md": {
     "description": "A minimal valid role.",
+    "effort": "",
     "model": "",
     "name": "valid-minimal",
     "notes": [],

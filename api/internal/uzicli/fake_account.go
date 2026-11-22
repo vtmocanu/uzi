@@ -249,6 +249,12 @@ func (f *FakeClient) PutAgentTemplateModelPins(_ context.Context, id string, pat
 		if v, ok := patch["codex_model"]; ok {
 			t.CodexModel = v
 		}
+		if v, ok := patch["effort"]; ok {
+			t.Effort = v
+		}
+		if v, ok := patch["codex_effort"]; ok {
+			t.CodexEffort = v
+		}
 		raw, err := json.Marshal(map[string]AgentTemplatePins{"template": *t})
 		if err != nil {
 			return AgentTemplatePinsResult{}, err
