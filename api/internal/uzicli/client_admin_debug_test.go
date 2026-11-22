@@ -130,6 +130,7 @@ func TestAdminListRunsDebugRefusesAServerThatIgnoredStatus(t *testing.T) {
 		"missing status_filter":  `{"runs":[],"truncated":false}`,
 		"mismatched filter":      `{"runs":[],"truncated":false,"status_filter":["failed","running"]}`,
 		"subset filter":          `{"runs":[],"truncated":false,"status_filter":["failed"]}`,
+		"superset filter":        `{"runs":[],"truncated":false,"status_filter":["failed","cancelled","running"]}`,
 		"row outside the filter": `{"runs":[{"id":"r1","status":"completed"}],"truncated":false,"status_filter":["failed","cancelled"]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
