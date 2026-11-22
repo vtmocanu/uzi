@@ -306,44 +306,84 @@ function safeRead(obj: object, key: string): unknown {
   }
 }
 
-function ownStringFields(obj: object): string[] {
-  return Object.keys(obj).filter((k) => typeof safeRead(obj, k) === "string");
+/** Project only diagnostic data. Cycles become markers only when a scrub is needed;
+ * key-free graphs keep their original identity. Unreadable edges fail closed. */
+function sanitizeDiagnostic(value: object, text: TextRedactor): object {
+  const active = new WeakSet<object>();
+  const errors = new WeakSet<object>();
+  let changed = false;
+  const scrub: TextRedactor = (s) => {
+    const out = text(s);
+    if (out !== s) changed = true;
+    return out;
+  };
+  const project = (v: unknown): unknown => {
+    if (!v || typeof v !== "object") return v;
+    if (active.has(v)) return "[circular diagnostic]";
+    active.add(v);
+    try {
+      // Arrays have one serialized element projection. Walking their keys first
+      // would duplicate every nested-array subtree before discarding that work.
+      if (Array.isArray(v)) return Array.from(v, project);
+      const keys = new Set(Object.keys(v));
+      if (v instanceof Error) {
+        for (const k of ["message", "stack", "name", "cause"]) if (k in v) keys.add(k);
+      }
+      const projected = Object.fromEntries([...keys].map(k => [k, project((v as Record<string, unknown>)[k])]));
+      if (v instanceof Error) errors.add(projected);
+      return projected;
+    } finally {
+      active.delete(v);
+    }
+  };
+  const projected = project(value) as object;
+  const redacted = redactStrings(projected, scrub);
+  if (!changed) return value;
+  // Reattach Error prototypes and standard-field visibility without invoking constructors.
+  const restore = (original: unknown, shape: unknown, clean: unknown): unknown => {
+    if (!shape || typeof shape !== "object" || !clean || typeof clean !== "object") return clean;
+    const out = errors.has(shape) ? Object.create(Object.getPrototypeOf(original)) : clean;
+    const originalNames = new Map<string, string>();
+    for (const name of Object.keys(shape)) {
+      const scrubbed = text(name);
+      if (!originalNames.has(scrubbed)) originalNames.set(scrubbed, name);
+    }
+    for (const [k, child] of Object.entries(clean)) {
+      const oldKey = originalNames.get(k);
+      const old = oldKey === undefined ? undefined : (shape as Record<string, unknown>)[oldKey];
+      const originalChild = oldKey === undefined || !original || typeof original !== "object"
+        ? undefined : (original as Record<string, unknown>)[oldKey];
+      Object.defineProperty(out, k, { value: restore(originalChild, old, child),
+        enumerable: errors.has(shape) ? (Object.getOwnPropertyDescriptor(original, oldKey ?? k)?.enumerable ?? false) : true,
+        writable: true, configurable: true });
+    }
+    return out;
+  };
+  const clean = restore(value, projected, redacted) as object;
+  if (value instanceof Error) {
+    const keys = new Set([...Object.getOwnPropertyNames(value), ...Object.getOwnPropertyNames(clean)]);
+    const safe = [...keys].every(k => {
+      let owner: object | null = value;
+      while (owner && !Object.hasOwn(owner, k)) owner = Object.getPrototypeOf(owner);
+      const before = owner ? Object.getOwnPropertyDescriptor(owner, k) : undefined;
+      const after = Object.getOwnPropertyDescriptor(clean, k);
+      return !before || (after ? (("value" in before && before.writable) || (k === "stack" && before.configurable && typeof before.set === "function")) : before.configurable);
+    });
+    if (safe) {
+      for (const k of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(clean, k);
+        if (descriptor) Object.defineProperty(value, k, { ...descriptor,
+          configurable: Object.getOwnPropertyDescriptor(value, k)?.configurable ?? true });
+        else Reflect.deleteProperty(value, k);
+      }
+      return value;
+    }
+  }
+  return clean;
 }
 
-/** Redacts `message`, `stack`, `name` and the enumerable string fields of `err`. Other fields,
- *  including a nested `cause`, are not inspected. */
 function sanitizeError(err: Error, text: TextRedactor): Error {
-  const redacted = new Map<string, string>();
-  for (const k of new Set(["message", "stack", "name", ...ownStringFields(err)])) {
-    const v = safeRead(err, k);
-    if (typeof v !== "string") continue;
-    const r = text(v);
-    if (r !== v) redacted.set(k, r);
-  }
-  if (redacted.size === 0) return err;
-  try {
-    for (const [k, v] of redacted) (err as unknown as Record<string, unknown>)[k] = v;
-    if ([...redacted].every(([k, v]) => safeRead(err, k) === v)) return err;
-  } catch {
-    // frozen, or an accessor without a setter: fall through to the replacement
-  }
-  const copy = Object.create(Object.getPrototypeOf(err)) as Error;
-  const define = (k: string, value: unknown, enumerable: boolean): void => {
-    Object.defineProperty(copy, k, { value, enumerable, writable: true, configurable: true });
-  };
-  for (const k of Object.keys(err)) {
-    const v = safeRead(err, k);
-    define(k, typeof v === "string" ? text(v) : v, true);
-  }
-  const message = safeRead(err, "message");
-  define("message", text(typeof message === "string" ? message : String(message ?? "")), false);
-  const stack = safeRead(err, "stack");
-  if (typeof stack === "string") define("stack", text(stack), false);
-  if (redacted.has("name") || Object.hasOwn(err, "name")) {
-    const name = safeRead(err, "name");
-    define("name", typeof name === "string" ? text(name) : name, Object.keys(err).includes("name"));
-  }
-  return copy;
+  return sanitizeDiagnostic(err, text) as Error;
 }
 
 function sanitizeNonError(value: unknown, text: TextRedactor): unknown {
@@ -370,14 +410,10 @@ function sanitizeNonError(value: unknown, text: TextRedactor): unknown {
     }
     case "object": {
       if (value === null) return value;
-      const fields = ownStringFields(value);
+      const clean = sanitizeDiagnostic(value, text);
       const shown = safeStringify(value);
-      const message = safeRead(value, "message");
-      const bearing = [shown, ...fields.map((k) => safeRead(value, k) as string), typeof message === "string" ? message : ""].some((s) => text(s) !== s);
-      if (!bearing) return value;
-      const substitute: Record<string, unknown> = {};
-      for (const k of fields) substitute[k] = text(safeRead(value, k) as string);
-      if (typeof message === "string") substitute["message"] = text(message);
+      if (clean === value && shown === text(shown)) return value;
+      const substitute = clean === value ? Object.create(Object.getPrototypeOf(value), Object.getOwnPropertyDescriptors(value)) : clean;
       Object.defineProperty(substitute, "toString", { value: () => text(shown), enumerable: false });
       return Object.freeze(substitute);
     }
@@ -558,7 +594,11 @@ async function runCodexAdviceModelPass(
   const deadlineAt = Date.now() + opts.timeoutMs;
   const abort = new AbortController();
   const external = linkExternalAbort(opts.signal, abort, opts.label);
-  const usage = usageLatch(opts);
+  const text = opts.log.redactDiagnostic ? (s: string) => opts.log.redactDiagnostic!(s) : undefined;
+  const scope: ProviderScope | undefined = text ? {
+    text, log: redactingLogger(opts.log, text), thrown: err => sanitizeThrown(err, text, opts.label),
+  } : undefined;
+  const usage = usageLatch(opts, scope);
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
@@ -626,7 +666,11 @@ async function runCodexAdviceModelPass(
     }
   })();
   try {
-    return await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
+    const result = await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
+    return scope ? scope.text(result) : result;
+  } catch (err) {
+    // The run promise has already classified credential evidence.
+    throw scope ? scope.thrown(err) : err;
   } finally {
     if (timer) clearTimeout(timer);
     external?.unlink();

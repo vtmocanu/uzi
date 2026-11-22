@@ -7,7 +7,7 @@ import { parseSync } from "oxc-parser";
 
 // M2 textual architecture census, re-enumerated at e7ffe477e3cfbcb6ec3f84cb5546f5c1ceb45983.
 // Pins are reviewed source lines, NOT generated at test time. No per-file budgets.
-// Parser use excludes comments/string lookalikes/types and handles optional chains. This is
+// Parser use excludes comments/string lookalikes/types and handles optional chains.
 // Literal computed members and direct provider destructuring are included. Dynamic
 // reflection, arbitrary aliases, dependencies and sources outside src are outside this
 // textual census; this is not arbitrary JS dataflow analysis.
@@ -27,6 +27,7 @@ const SITES: Site[] = [
   {"file": "claude-advice-harness.ts", "line": "const providerModel = credential.kind === \"provider\" ? resolveProviderModel(request.model, credential.modelMap) : undefined;", "count": 1, "category": "engine-handling", "rationale": "SdkCredential provider variant is Claude SDK configuration; resolveProviderModel is a Claude map resolver."},
   {"file": "claude-cross-check.ts", "line": "if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);", "count": 1, "category": "lane-refusal", "rationale": "Provider presence refuses this unsupported lane regardless of engine."},
   {"file": "client.ts", "line": "claim.secrets.provider = provider;", "count": 2, "category": "admission-write", "rationale": "Decoded binding written only after requireProviderCapability engine hold."},
+  {"file": "codex/config.ts", "line": "const { model, provider, projectPath } = opts;", "count": 1, "category": "native-config", "rationale": "CodexConfigProvider config builder input is not ClaimProviderBinding and grants no provider execution permission."},
   {"file": "codex/codex-advice-harness.ts", "line": "this.provider = opts.provider;", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
   {"file": "codex/codex-executor.ts", "line": "? this.opts.provider", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
   {"file": "codex/codex-executor.ts", "line": "...this.opts.provider,", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
@@ -111,24 +112,38 @@ function evidence(source: string): Evidence {
   function visit(value: unknown): void {
     if (Array.isArray(value)) { for (const child of value) visit(child); return; }
     const node = record(value);
-    const object = record(node.object);
+    const unwrap = (value: unknown): Record<string, unknown> => {
+      let result = record(value);
+      while (["TSAsExpression", "TSSatisfiesExpression", "TSNonNullExpression",
+        "TSTypeAssertion", "ChainExpression", "ParenthesizedExpression"].includes(String(result.type))) {
+        result = record(result.expression);
+      }
+      return result;
+    };
+    const object = unwrap(node.object);
     const memberName = (member: Record<string, unknown>): unknown =>
       member.computed === true ? record(member.property).value : record(member.property).name;
     const receiver = object.type === "Identifier" ? object.name : memberName(object);
     const carrier = node.type === "MemberExpression" && memberName(node) === "provider" &&
       ["secrets", "opts", "ctx", "addr", "input"].includes(String(receiver));
-    const callee = record(node.callee);
+    const callee = unwrap(node.callee);
     const accessor = node.type === "CallExpression" && callee.type === "Identifier" &&
       ["sdkCredentialFromBinding", "resolveProviderModel", "assertAgentModelsMapped"].includes(String(callee.name));
-    const binding = record(node.id);
-    const init = record(node.init);
-    const destructured = node.type === "VariableDeclarator" && binding.type === "ObjectPattern" &&
-      init.type === "MemberExpression" && memberName(init) === "secrets" &&
-      Array.isArray(binding.properties) && binding.properties.some(value => {
-        const prop = record(value);
-        const key = record(prop.key);
-        return (prop.computed === true ? key.value : key.name ?? key.value) === "provider";
-      });
+    const binding = record(node.type === "AssignmentExpression" ? node.left : node.id);
+    const init = unwrap(node.type === "AssignmentExpression" ? node.right : node.init);
+    const properties = (pattern: Record<string, unknown>): Record<string, unknown>[] =>
+      pattern.type === "ObjectPattern" && Array.isArray(pattern.properties) ? pattern.properties.map(record) : [];
+    const propertyName = (prop: Record<string, unknown>): unknown =>
+      prop.computed === true ? record(prop.key).value : record(prop.key).name ?? record(prop.key).value;
+    const hasProvider = (pattern: Record<string, unknown>): boolean =>
+      properties(pattern).some(prop => propertyName(prop) === "provider");
+    const knownCarrier = init.type === "Identifier"
+      ? ["secrets", "opts", "ctx", "addr", "input"].includes(String(init.name))
+      : init.type === "MemberExpression" && memberName(init) === "secrets";
+    const nestedSecrets = properties(binding).some(prop =>
+      propertyName(prop) === "secrets" && hasProvider(record(prop.value)));
+    const destructured = (node.type === "VariableDeclarator" || node.type === "AssignmentExpression") &&
+      ((knownCarrier && hasProvider(binding)) || nestedSecrets);
     if (typeof node.start === "number") {
       if (carrier || accessor || destructured) hits.add(source.lastIndexOf("\n", node.start - 1) + 1);
       // Explicit syntax families exclude Literal, TemplateElement and type-node starts.
@@ -264,6 +279,11 @@ describe("M2 provider consumer architectural census (textual scope)", () => {
       'void claim.secrets["provider"];', "void ctx['provider'];",
       "const {provider} = claim.secrets;", "const {provider: renamed} = claim.secrets;",
       'const {["provider"]: renamed} = claim["secrets"];',
+      ...["secrets", "ctx", "opts", "addr", "input"].map(name => `const {provider} = ${name};`),
+      "({provider: renamed} = ctx);",
+      "const {secrets: {provider}} = claim;",
+      "const {provider} = (ctx as Context);",
+      'void (claim.secrets as Secrets)["provider"];',
     ]) {
       assert.deepEqual(readLines(source), [source]);
       assert.ok(offenders(new Map(sources).set("nested/new.ts", source)).length);
