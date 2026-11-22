@@ -16,7 +16,7 @@ package store_test
 // ClaimRun statements per call and the ClaimRun statement's pg_prepared_statements generic/custom
 // plan counts.
 //
-// Service construction mirrors cmd/server/main.go's workersvc.New(...) literal, with the config
+// Service construction uses a subset of cmd/server/main.go's workersvc.New(...) literal, with the config
 // defaults of internal/config/config.go: WorkerHeartbeatStale 45s (WORKER_HEARTBEAT_STALE),
 // WorkerSpreadGrace 9s (3 x WORKER_POLL_INTERVAL 3s), plus the other claim windows. Only
 // CustodyHoldLimit is a fixed reader (the settings cache is not wired here).
@@ -204,17 +204,19 @@ func (e *cpEnv) runECell(ctx context.Context, box *secretbox.Box, runLabel strin
 				fail("warm read %s: %v", tbl, err)
 			}
 		}
-		var preHolds, cooldowns, liveSameUser int64
-		if err := obs.queryRow(cctx, `SELECT (SELECT count(*) FROM recovery_custody_holds WHERE state = 'open'),
+		var preHolds32 int32 // count(*)::int4: pgx refuses an out-of-range value, so no narrowing conversion
+		var cooldowns, liveSameUser int64
+		if err := obs.queryRow(cctx, `SELECT (SELECT count(*)::int4 FROM recovery_custody_holds WHERE state = 'open'),
 		        (SELECT count(*) FROM forge_origin_cooldowns),
 		        (SELECT count(*) FROM workers WHERE user_id = $1 AND id <> $2 AND last_heartbeat_at >= now() - interval '45 seconds')`,
-			[]any{f.User, f.Worker}, &preHolds, &cooldowns, &liveSameUser); err != nil {
+			[]any{f.User, f.Worker}, &preHolds32, &cooldowns, &liveSameUser); err != nil {
 			fail("pre-conditions: %v", err)
 		}
+		preHolds := int64(preHolds32)
 		if cooldowns != 0 || liveSameUser != 0 {
 			fail("pre-conditions: %d forge_origin_cooldowns rows, %d live same-user peers, want 0 and 0", cooldowns, liveSameUser)
 		}
-		custody := int32(preHolds) + int32(seeded) + cpESlack
+		custody := preHolds32 + int32(seeded) + cpESlack
 		stats0 := cpReadStats(cctx, t, obs)
 
 		// One fresh pool for the whole cell.
@@ -336,7 +338,7 @@ func (e *cpEnv) runECell(ctx context.Context, box *secretbox.Box, runLabel strin
 					fail("call %d: read holds: %v", idx+1, err)
 				}
 				if own != 1 || open != preHolds+int64(idx+1) {
-					fail("call %d: run %s has %d open holds and the user %d open holds in total, want 1 and %d", idx+1, rid, own, open, preHolds+int64(idx+1))
+					fail("call %d: run %s has %d open holds and %d open holds in total across all users, want 1 and %d", idx+1, rid, own, open, preHolds+int64(idx+1))
 				}
 			} else if payload != nil {
 				fail("call %d: scenario (%s) must be idle, but a run %s was claimed", idx+1, c.Scen, payload.RunID)
@@ -351,10 +353,8 @@ func (e *cpEnv) runECell(ctx context.Context, box *secretbox.Box, runLabel strin
 		for i := 1; i <= cpEWarm; i++ {
 			d, _ := call(i)
 			warms = append(warms, cpMs(d))
-			if i+1 <= 12 {
-				s := snap(fmt.Sprintf("call %d", i+1))
-				ph.EarlyPlanCounts = append(ph.EarlyPlanCounts, cpEarly{Call: i + 1, Generic: s.Generic, Custom: s.Custom})
-			}
+			s := snap(fmt.Sprintf("call %d", i+1))
+			ph.EarlyPlanCounts = append(ph.EarlyPlanCounts, cpEarly{Call: i + 1, Generic: s.Generic, Custom: s.Custom})
 		}
 		ph.WarmupMs = warms
 		ph.FirstCallsSumMs = ph.ColdMs

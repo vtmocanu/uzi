@@ -236,7 +236,7 @@ view join coming back into the run list.
   default only with a new measurement showing the hot-path planning overhead is small.
   That could follow a PostgreSQL planner change, a simpler `ClaimRun`, or a per-statement
   mechanism that exempts the hot paths. Until then the query-shape rule and its test are
-  the guard. Issue #4602 did not take this route: it added a per-statement idle precheck at
+  the guard. Issue #4602 did not take this route: it added an idle precheck query at
   the claim seam (`HasQueuedRunForUser`) instead of a pool or plan-mode change, and
   `plan_cache_mode` stays `auto`. `ClaimRun`'s SQL is unchanged.
 - A new consumer of `run_usage_totals` must follow the rule, and should get a case in
@@ -252,7 +252,11 @@ runs a new read, `HasQueuedRunForUser` (`api/internal/store/queries/runtime.sql`
 caller's transaction before the savepoint loop:
 
 ```sql
-SELECT EXISTS (SELECT 1 FROM runs WHERE user_id = @user_id AND status = 'queued' AND kind <> 'chat' AND NOT cross_check_lane)
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE user_id = @user_id AND status = 'queued'
+      AND kind <> 'chat' AND NOT cross_check_lane
+)::boolean AS has_queued;
 ```
 
 When it returns false, the poll returns idle without planning or executing `ClaimRun`. The
@@ -265,11 +269,14 @@ for this one statement. Regression tests:
 `ClaimRun` calls even when another owner has a queued run and this user has a queued chat
 run; a queued run this worker cannot claim still runs `ClaimRun` once per poll; no negative
 caching; concurrent claimants with a calibration step; the snapshot path's idle commit; the
-leased path's idle poll). Five fail with the precheck removed.
+leased path's idle poll). Five of them fail with the precheck removed (the concurrent-claimants
+control passes either way); the snapshot test's persistence assertion also fails when the idle
+commit is removed. Both checks ran in scratch exports against throwaway postgres.
 
-**Environment.** Throwaway `postgres:17` (17.12) in docker on a 4-vCPU Linux worker, go1.27.3,
+**Environment.** Throwaway `postgres:17` (17.12) in docker on a shared Linux worker (GOMAXPROCS 4), go1.27.3,
 jit on with `jit_above_cost` 100000 never reached, `plan_cache_mode` `auto` unless forced, pgx
-`QueryExecModeCacheStatement`, a fresh template clone per cell. The harness is the opt-in
+`QueryExecModeCacheStatement`, a fresh template clone per cell, autovacuum disabled on every table
+in the template (so no autovacuum or autoanalyze ran during timing). The harness is the opt-in
 `TestClaimRunPlanMeasurement` in `api/internal/store/claimrun_plan_measure_test.go`, with
 `claimrun_plan_scale_test.go` and `claimrun_plan_service_test.go`. It is gated by
 `UZI_CLAIMRUN_PLAN_MEASURE=1` and a throwaway `UZI_TEST_DATABASE_URL`, sits outside the
@@ -278,16 +285,18 @@ LiveDB$ sweep, and is selected by stage.
 **Units.** The "ClaimRun segment" is test code mirroring production: begin READ COMMITTED,
 `GetWorkerForUpdate`, [C2 precheck], savepoint, `OptInRunFences`, [C1 set], `ClaimRun`, [C1
 restore, which also runs on `ErrNoRows`], release/rollback, commit. The "isolated statement"
-is `ClaimRun` alone. Each cell: 1 cold call, 10 warm-ups, N=100 timed calls; medians of 3 reps.
+is `ClaimRun` alone. Each cell: 1 cold call, 10 warm-ups, N=100 timed calls. T1, T2, T4 and E
+report the median of 3 reps' p50s (ranges are across reps); T3 has 2 reps; T5 has 1 rep per
+profile.
 
 **T1** (profile p1, `auto`). Segment p50, then cold + 10 warm-ups summed, both in ms.
 
 | Scenario | base | C1 | C2 | C1+C2 |
 |---|---|---|---|---|
 | (a) idle-empty | 2.19 / 414-433 | 2.38 / 121-124 | 0.92 / 17.8-18.1 | 1.01 / 18-21 |
-| (c) claimable | 8.44 / 474-501 | 8.77 / 200-205 | 8.67 / 492-511 | 9.09 / 212-218 |
+| (c) claimable | 8.44 / 474-501 | 8.77 / 200-205 | 8.67 / 492-511 | 9.09 / 212-217 |
 
-1. The isolated statement's p50 was about 0.95 ms for (a) and 7.1 ms for (c).
+1. The isolated statement's p50 was about 0.95 ms for (a) and 7.0-7.2 ms for (c) across candidates.
 2. Round trips per call, base vs C2: 7 vs 4 for (a), 8 vs 9 for (c).
 
 **T2** (base, forced modes). Segment p50 / cold + warm-ups, ms.
@@ -299,18 +308,19 @@ is `ClaimRun` alone. Each cell: 1 cold call, 10 warm-ups, N=100 timed calls; med
 
 **T3** (server split, `EXPLAIN (ANALYZE, SUMMARY)` `EXECUTE` 1-12).
 
-1. Under `auto`, executions 1-5 are custom plans: 53-71 ms planning and 0.7-2.0 ms execution for (a).
+1. Under `auto`, executions 1-5 are custom plans: 52-73 ms planning and 0.7-2.2 ms execution for (a), across both reps.
 2. The generic plan is built at execution 6, with 60.7 ms planning.
 3. From execution 7, planning is 0.12-0.16 ms and execution about 0.8 ms for (a). For (c), execution is about 7-8 ms, and 17.7 ms on the first.
-4. Forced generic: 75-79 ms planning on execution 1, then 0.12-0.18 ms. Forced custom: 48-59 ms planning on every execution.
+4. Forced generic: 73.5-79.3 ms planning on execution 1, then 0.12-0.18 ms. Forced custom: 69-75 ms planning on execution 1, then 48-59 ms on every later execution.
 5. Client wall time per EXPLAIN was about 7 ms against about 0.9 ms of server execution at idle, so EXPLAIN instrumentation is not free.
 
 **Mechanism** (stage S, a plan-choice-only diagnostic at 1k, 10k, 50k, 150k, 220k and 300k
-runs; 40% of the history belongs to the measured user, with 0 queued runs).
+runs; 40% of the history belongs to the measured user; the template keeps pmSeed's one queued
+run, and the harness removes it in the measured clone for the idle scenario).
 
 1. The generic cost grew 276, 539, 1,394, 3,525, 4,968, 6,785. That reaches the production figure of about 5,000 at about 220k runs.
-2. At every size, `auto` used 5 custom plans and switched to the generic plan on call 6. Custom cost was about the generic cost + 27.
-3. At (c), generic execution was never slower than custom: 7.3 ms vs 7.9-8.4 ms.
+2. At every size, `auto` used 5 custom plans and switched to the generic plan on call 6. The custom-plan estimate was about the generic estimate + 11.5 at 1k runs and + 27 from 10k up.
+3. At (c), generic execution was never slower than custom by median: 6.9-7.4 ms vs 7.9-8.4 ms.
 
 So `auto` never stayed custom, and steady-state idle `ClaimRun` is about 0.95 ms. The cost is
 per fresh connection or per re-prepare: 5 custom plans plus the generic build, about 420 ms
@@ -319,16 +329,17 @@ over the first 11 calls.
 **Not explained.** The production per-call planning/execution split (about 75 ms per call,
 inferred from read-only sampling) is unexplained. Unverified candidate causes: connection
 churn; pgx statement-cache eviction; plan invalidation, for example from autovacuum/ANALYZE
-on referenced tables. The maintainer observed autovacuum ANALYZE on `runs` in production; its
+on referenced tables. The harness disables autovacuum, so it could not exhibit that last
+candidate. The maintainer observed autovacuum ANALYZE on `runs` in production; its
 causal effect was not established.
 
-**T4** ({base, C2}, p1, 3 reps). Segment p50.
+**T4** ({base, C2}, p1, 3 reps). Segment p50, median of the 3 reps.
 
 | Scenario | base | C2 | Note |
 |---|---|---|---|
-| (b) queued run this worker cannot claim | 2.26 ms | 2.40 ms | `ClaimRun` still runs: the stated residual |
-| (d) backlog of 300 queued runs | 28.45 ms | 29.47 ms (+0.9 ms, +3%) | isolated statement unchanged, about 27.1 ms |
-| (e) row locked by another session | 6.71 ms | 6.88 ms | |
+| (b) queued run this worker cannot claim | 2.27 ms | 2.40 ms | `ClaimRun` still runs: the stated residual |
+| (d) backlog of 300 queued runs | 28.55 ms | 29.44 ms (+0.9 ms, +3%) | isolated statement unchanged, about 27.1 ms |
+| (e) row locked by another session | 6.74 ms | 6.94 ms | |
 
 All outcomes were correct: (d) claimed and (e) idle.
 
@@ -346,14 +357,17 @@ the fix). Configured like production: `WorkerHeartbeatStale` 45s, `WorkerSpreadG
 | (b) queued-but-ineligible | 2.85 to 3.00 ms (+0.15 ms, +5%) | | 12 to 13 |
 | (c) claimable | 21.82 to 22.71 ms (+0.88 ms, +4.0%) | | 42 to 43 |
 
-In (c) every call claimed a distinct run and opened one hold; the ranges barely overlap. The
+In (c) every call claimed a distinct run and opened one hold; the per-rep p50 ranges do not
+overlap (base 21.54-21.95, fix 22.23-22.77 ms). In (a) and (b) every call returned idle; the
+recorded per-call statement counts (1 `ClaimRun` per call on base, and in (b) on the fix) show
+the idle came from the claim seam, not an earlier exit. The
 owner accepted about 0.25 ms (about 3%) of extra cost on claimable polls. The end-to-end
 figure is +0.88 ms (+4%), recorded as measured: larger in absolute terms than the M1 segment
 estimate, similar in relative terms.
 
 **Method notes and deviations.**
 
-1. Stage F (a fixture feasibility check) and stage S (the scale diagnostic) ran in addition to the pre-registered 119-cell table. The owner was told about S when choosing the fix.
+1. Stage F (a fixture feasibility check: 13 clones) and stage S (the scale diagnostic: 6 templates, each with 2 measured clones and 2 EXPLAIN clones) ran in addition to the pre-registered 119-cell table. Together with the table they exceed the plan's 120-cell cap. That expansion was not reported to the owner beforehand; the owner was told about S's results when choosing the fix, and F produced no timing claim.
 2. By default the harness also runs an isolated-statement pass in each M1 cell. That roughly doubles the `ClaimRun` executions above the plan's stated bound of 11,861, and it shares the cell's clone.
 3. The harness re-runs ANALYZE on `runs`, `workers` and `cross_checks` in each clone after the scenario change (`UZI_CLAIMRUN_PLAN_CLONE_ANALYZE`, on by default).
 4. Profile p1 replays lane `''`, while the real service sends `'run'`. The SQL treats them identically.

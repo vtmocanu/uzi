@@ -1608,7 +1608,7 @@ func (e *cpEnv) project(n int) cpProjection {
 		perCall[k] /= float64(cnt[k])
 	}
 	p := cpProjection{PerCloneSetupSecs: setup, PerCallSecs: perCall, Stages: map[string]float64{}, N: n,
-		Note: "linear model from the P0 cells: idle-type scenarios (a,b,e) use P0's (a) cost, claimable-type (c,d) use P0's (c) cost; T3 counts its 12 executions at the (a)/(c) per-call cost; M3 end-to-end cells are not part of this harness"}
+		Note: "linear model from the P0 cells: idle-type scenarios (a,b,e) use P0's (a) cost, claimable-type (c,d) use P0's (c) cost; T3 counts its 12 executions at the (a)/(c) per-call cost; stage E (the M3 end-to-end Service.Claim cells) is not part of this projection"}
 	if len(cnt) < 2 {
 		return p
 	}
