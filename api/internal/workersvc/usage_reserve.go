@@ -88,10 +88,10 @@ type reserveSnap struct {
 	defaultID   uuid.UUID
 	judgeMode   string
 	judgeSecret *uuid.UUID
-	// weeklyClaude / weeklyCodex are every credential's raw weekly reading, kept only when the
-	// snapshot was built with keepWeekly (the next-claim preview); nil otherwise.
+	// weeklyClaude is every Anthropic token's raw weekly reading, kept only when the snapshot was
+	// built with keepWeekly (the next-claim preview); nil otherwise. Codex readings are read by
+	// the preview from the account rate limits instead.
 	weeklyClaude map[uuid.UUID]usagereserve.WeeklyReading
-	weeklyCodex  map[uuid.UUID]usagereserve.CodexWeeklyReading
 }
 
 func (r *reserveSnap) on() bool { return r != nil && r.threshold != nil }
@@ -141,7 +141,6 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 	snap.synced = map[uuid.UUID]time.Time{}
 	if keepWeekly {
 		snap.weeklyClaude = map[uuid.UUID]usagereserve.WeeklyReading{}
-		snap.weeklyCodex = map[uuid.UUID]usagereserve.CodexWeeklyReading{}
 	}
 
 	tokens, err := q.ListReserveClaudeTokens(ctx, userID)
@@ -203,9 +202,6 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 			}
 		}
 		snap.codex[a.AliasID] = usagereserve.EvaluateCodex(snap.threshold, r, iv.codex, now)
-		if keepWeekly {
-			snap.weeklyCodex[a.AliasID] = usagereserve.CodexWeekly(r, iv.codex, now)
-		}
 	}
 
 	bound, err := q.GetUserJudgeAnthropicBinding(ctx, userID)

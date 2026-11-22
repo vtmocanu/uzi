@@ -118,7 +118,9 @@ type NextClaimSnapshot struct {
 	codexAvailable   bool
 	codexAccounts    []codexAccountView
 	codexAliasLabels map[uuid.UUID]string
-	codexPooled      map[uuid.UUID]bool
+	// codexAliasAccount maps a linked alias id (enabled or not) to its provider account id.
+	codexAliasAccount map[uuid.UUID]uuid.UUID
+	codexPooled       map[uuid.UUID]bool
 
 	// settling is the credential-switch settling fence of paused runs, filled by
 	// LoadNextClaimSettling for the runs the caller will ask about.
@@ -136,6 +138,7 @@ type nextClaimCodexQueries interface {
 	ListUserSecretsForKind(ctx context.Context, arg store.ListUserSecretsForKindParams) ([]store.ListUserSecretsForKindRow, error)
 	GetCodexAccountRateLimitsForUser(ctx context.Context, userID uuid.UUID) ([]store.GetCodexAccountRateLimitsForUserRow, error)
 	ListCodexPoolAliases(ctx context.Context, userID uuid.UUID) ([]store.ListCodexPoolAliasesRow, error)
+	ListCodexAliasAccountsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListCodexAliasAccountsForUserRow, error)
 }
 
 // LoadNextClaimSnapshot reads one owner's next-claim state once: the auto-select candidates, the
@@ -217,6 +220,16 @@ func (n *NextClaimSnapshot) loadCodex(ctx context.Context, q nextClaimCodexQueri
 	for _, sec := range secrets {
 		n.codexAliasLabels[sec.ID] = sec.Label
 	}
+	links, err := q.ListCodexAliasAccountsForUser(ctx, ownerID)
+	if err != nil {
+		return fmt.Errorf("next claim: codex alias links: %w", err)
+	}
+	n.codexAliasAccount = make(map[uuid.UUID]uuid.UUID, len(links))
+	for _, l := range links {
+		if l.ProviderAccountID.Valid {
+			n.codexAliasAccount[l.UserSecretID] = uuid.UUID(l.ProviderAccountID.Bytes)
+		}
+	}
 	pool, err := q.ListCodexPoolAliases(ctx, ownerID)
 	if err != nil {
 		return fmt.Errorf("next claim: codex pool: %w", err)
@@ -292,12 +305,7 @@ func (n *NextClaimSnapshot) ReserveEnforced(run store.Run) bool {
 
 // WeeklyRaw is a credential's raw weekly reading. OK is false when it has no usable fresh reading.
 // Windows lists every Codex weekly window (nil for Anthropic).
-type WeeklyRaw struct {
-	OK       bool
-	Pct      float64
-	ResetsAt *time.Time
-	Windows  []usagereserve.CodexWeeklyWindow
-}
+type WeeklyRaw = usagereserve.CodexWeeklyReading
 
 // Weekly is the raw weekly reading of a credential key: "anthropic:<secret id>" or "codex:<provider
 // account id>". ok is false for an unknown key or a key whose reading was not loaded.
@@ -320,21 +328,22 @@ func (n *NextClaimSnapshot) Weekly(credKey string) (WeeklyRaw, bool) {
 	case "codex":
 		for _, a := range n.codexAccounts {
 			if a.id == u {
-				return WeeklyRaw{OK: a.reading.OK, Pct: a.reading.Pct, ResetsAt: a.reading.ResetsAt, Windows: a.reading.Windows}, true
+				return a.reading, true
 			}
 		}
 	}
 	return WeeklyRaw{}, false
 }
 
-// codexAccountOfAlias finds the linked account an alias label belongs to.
+// codexAccountOfAlias finds the linked account an alias id is bound to, by the alias's own link (so a
+// disabled alias still resolves). ok is false when the alias is unlinked or its account has no view.
 func (n *NextClaimSnapshot) codexAccountOfAlias(alias uuid.UUID) (codexAccountView, bool) {
-	label, ok := n.codexAliasLabels[alias]
+	acct, ok := n.codexAliasAccount[alias]
 	if !ok {
 		return codexAccountView{}, false
 	}
 	for _, a := range n.codexAccounts {
-		if slices.Contains(a.aliases, label) {
+		if a.id == acct {
 			return a, true
 		}
 	}
@@ -570,13 +579,18 @@ func (n *NextClaimSnapshot) codexReason(run store.Run, res *NextClaimResult) {
 	}
 	res.Reason = NextClaimAccountBound
 	cur := uuid.UUID(run.CodexSecretID.Bytes)
-	curAcct, _ := n.codexAccountOfAlias(cur)
+	curAcct, ok := n.codexAccountOfAlias(cur)
+	if !ok {
+		// The run's own account cannot be resolved: never guess an alternative.
+		res.Reason = NextClaimUnknown
+		return
+	}
 	limit := n.effectiveLimit()
 
 	var bestAcct *codexAccountView
 	for i := range n.codexAccounts {
 		a := &n.codexAccounts[i]
-		if a.id == curAcct.id && curAcct.id != uuid.Nil {
+		if a.id == curAcct.id {
 			continue
 		}
 		if a.reauth || !a.reading.OK || a.reading.Pct >= limit || len(a.aliases) == 0 {
@@ -644,8 +658,9 @@ func (n *NextClaimSnapshot) PreviewWait(run store.Run) string {
 	}
 
 	if run.Status == "limit_wait" {
-		// Already parked: the count was incremented when it parked, and the stored stamps are the
-		// decision that was made.
+		// Already parked: the stored stamps are the decision that was made. Otherwise the park
+		// decision is re-run at the stored count, which already includes this park, so it is the
+		// count a re-park after the retry would be checked at.
 		if !run.LimitResetsAt.Valid {
 			return WaitUnknown
 		}
@@ -663,9 +678,6 @@ func (n *NextClaimSnapshot) PreviewWait(run store.Run) string {
 		in.DeadSecretID = uuid.Nil
 		if run.LimitDeadSecretID.Valid {
 			in.DeadSecretID = uuid.UUID(run.LimitDeadSecretID.Bytes)
-		}
-		if in.LimitWaitCount > 0 {
-			in.LimitWaitCount--
 		}
 		return waitOf(decideLimitPark(in))
 	}

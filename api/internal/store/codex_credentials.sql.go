@@ -477,6 +477,40 @@ func (q *Queries) LinkCodexCredentialState(ctx context.Context, arg LinkCodexCre
 	return result.RowsAffected(), nil
 }
 
+const listCodexAliasAccountsForUser = `-- name: ListCodexAliasAccountsForUser :many
+SELECT user_secret_id, provider_account_id FROM codex_credential_state
+WHERE user_id = $1
+`
+
+type ListCodexAliasAccountsForUserRow struct {
+	UserSecretID      uuid.UUID   `json:"user_secret_id"`
+	ProviderAccountID pgtype.UUID `json:"provider_account_id"`
+}
+
+// Every codex alias state row this user owns with its linked provider account id (NULL when
+// the alias is not linked), enabled or disabled. The next-claim preview maps a run's own
+// alias id to its account through this, so a disabled alias still resolves. Owner-scoped,
+// read-only, no secret material.
+func (q *Queries) ListCodexAliasAccountsForUser(ctx context.Context, userID uuid.UUID) ([]ListCodexAliasAccountsForUserRow, error) {
+	rows, err := q.db.Query(ctx, listCodexAliasAccountsForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCodexAliasAccountsForUserRow{}
+	for rows.Next() {
+		var i ListCodexAliasAccountsForUserRow
+		if err := rows.Scan(&i.UserSecretID, &i.ProviderAccountID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCodexCredentialStatesForUser = `-- name: ListCodexCredentialStatesForUser :many
 SELECT user_secret_id, status FROM codex_credential_state
 WHERE user_id = $1

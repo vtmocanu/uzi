@@ -34,6 +34,11 @@ type ncFake struct {
 	codexSecrets  []store.ListUserSecretsForKindRow
 	codexAccounts []store.GetCodexAccountRateLimitsForUserRow
 	codexPool     []store.ListCodexPoolAliasesRow
+	codexLinks    []store.ListCodexAliasAccountsForUserRow
+}
+
+func (f *ncFake) ListCodexAliasAccountsForUser(context.Context, uuid.UUID) ([]store.ListCodexAliasAccountsForUserRow, error) {
+	return f.codexLinks, nil
 }
 
 func (f *ncFake) GetUserUsageReserve(context.Context, uuid.UUID) (store.GetUserUsageReserveRow, error) {
@@ -459,6 +464,10 @@ func cxEnv(t *testing.T, used1, used2 float64, thr *int16, mode string) (*ncEnv,
 		{ID: cxAliasOne, Kind: store.KindCodexAuth, Label: "cx-one"},
 		{ID: cxAliasTwo, Kind: store.KindCodexAuth, Label: "cx-two"},
 	}
+	e.f.codexLinks = []store.ListCodexAliasAccountsForUserRow{
+		{UserSecretID: cxAliasOne, ProviderAccountID: pgtype.UUID{Bytes: cxAcctOne, Valid: true}},
+		{UserSecretID: cxAliasTwo, ProviderAccountID: pgtype.UUID{Bytes: cxAcctTwo, Valid: true}},
+	}
 	e.f.codexAccounts = []store.GetCodexAccountRateLimitsForUserRow{
 		cxAccount(t, cxAcctOne, "cx-one", used1, false), cxAccount(t, cxAcctTwo, "cx-two", used2, false),
 	}
@@ -530,6 +539,26 @@ func TestNextClaimReasonCodexAccountBound(t *testing.T) {
 		e.f.codexAccounts[1].LastSuccessAt = pgconv.Time(autoNow.Add(-3 * time.Hour))
 		if res := e.svc.NextClaimReason(cxRun(), e.snapshot(t)); res.Alternative != nil {
 			t.Errorf("alternative = %+v, want none", res.Alternative)
+		}
+	})
+	t.Run("disabled current alias with a sibling on the same account never offers that account", func(t *testing.T) {
+		e, _ := cxEnv(t, 95, 30, nil, "default")
+		sibling := uuid.MustParse("00000000-0000-0000-0000-0000000c1a03")
+		e.f.codexSecrets = append(e.f.codexSecrets, store.ListUserSecretsForKindRow{ID: sibling, Kind: store.KindCodexAuth, Label: "cx-one-sibling"})
+		e.f.codexLinks = append(e.f.codexLinks, store.ListCodexAliasAccountsForUserRow{UserSecretID: sibling, ProviderAccountID: pgtype.UUID{Bytes: cxAcctOne, Valid: true}})
+		// cx-one (the run's alias) is disabled: only the sibling stays listed on account one, whose
+		// reading is the lowest here so it would win if the run's own account were not excluded.
+		e.f.codexAccounts[0] = cxAccount(t, cxAcctOne, "cx-one-sibling", 5, false)
+		res := e.svc.NextClaimReason(cxRun(), e.snapshot(t))
+		if res.Alternative == nil || res.Alternative.ID != cxAliasTwo {
+			t.Errorf("alternative = %+v, want cx-two, never the run's own account", res.Alternative)
+		}
+	})
+	t.Run("run alias with no resolvable account is unknown", func(t *testing.T) {
+		e, _ := cxEnv(t, 95, 30, nil, "default")
+		e.f.codexLinks = e.f.codexLinks[1:]
+		if res := e.svc.NextClaimReason(cxRun(), e.snapshot(t)); res.Reason != NextClaimUnknown || res.Alternative != nil {
+			t.Errorf("got %+v, want unknown with no alternative", res)
 		}
 	})
 	t.Run("parked run cannot be switched manually", func(t *testing.T) {
@@ -657,7 +686,8 @@ func TestPreviewWait(t *testing.T) {
 		{name: "running run, reserve enforced with pausing on", run: running(), want: WaitReservePause},
 		{name: "running chat run is exempt from the reserve", run: func() store.Run { r := running(); r.Kind = runkind.Chat; return r }(), want: WaitWaits},
 		{name: "running run, pausing off, reads the park decision", snap: func(n *NextClaimSnapshot) { n.reserve.pauseRunning = false }, run: running(), want: WaitWaits},
-		{name: "parked at count == MaxWaits still waits (the count was incremented at park)", run: parked(3, reset.Add(-time.Hour), reset), want: WaitWaits},
+		{name: "parked at count == MaxWaits with the retry at the reset still waits", run: parked(3, reset, reset), want: WaitWaits},
+		{name: "parked at count == MaxWaits, earlier retry, no switch possible, fails", run: parked(3, reset.Add(-time.Hour), reset), want: WaitFails},
 		{name: "parked past the budget fails", run: parked(4, reset.Add(-time.Hour), reset), want: WaitFails},
 		{name: "parked with the stored retry at the reset waits", run: parked(1, reset, reset), want: WaitWaits},
 		{name: "parked with the stored retry past the reset waits", run: parked(1, reset.Add(time.Hour), reset), want: WaitWaits},
