@@ -449,6 +449,50 @@ describe("Agents page personalized lead line (#3262)", () => {
     expect(screen.queryByText(/opus-a/)).toBeNull();
   });
 
+  it("places a new viewer's line by that viewer's allocations, never the previous viewer's", async () => {
+    const tmpls = [
+      tmpl({ id: "b-lead", name: "lead", scope: "builtin" }),
+      tmpl({ id: "g-orch", name: "orchestrator", scope: "global" }),
+    ];
+    const allocsA = [
+      alloc({ id: "b-lead", name: "lead", scope: "builtin" }),
+      alloc({ id: "g-orch", name: "orchestrator", scope: "global", global_default: false, effective: false }),
+    ];
+    const allocsB = [
+      alloc({ id: "b-lead", name: "lead", scope: "builtin", effective: false, my_override: false }),
+      alloc({ id: "g-orch", name: "orchestrator", scope: "global", global_default: false, effective: true, my_override: true }),
+    ];
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: tmpls });
+    const allocB = deferred<{ templates: TemplateAllocation[] }>();
+    mockApi.getTemplateAllocations
+      .mockResolvedValueOnce({ templates: allocsA })
+      .mockImplementationOnce(() => allocB.promise);
+    mockApi.getEffectiveSettings
+      .mockResolvedValueOnce(eff(CLAUDE_A, null))
+      .mockResolvedValueOnce(eff({ ...CLAUDE_A, model: "opus-b" }, null));
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    const view = renderPage();
+    await screen.findByText(LINE_CLAUDE_A);
+    const leadRowA = screen.getByRole("link", { name: "lead" }).closest("tr")!;
+    expect(within(leadRowA).getByText(LINE_CLAUDE_A)).toBeTruthy();
+
+    mockUseAuth.mockReturnValue({ user: { ...MEMBER, id: "u-other" } } as ReturnType<typeof useAuth>);
+    view.rerender(<MemoryRouter><Agents /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.getEffectiveSettings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    // B's prediction has landed but B's allocations are still pending.
+    expect(screen.queryByText(/For your/)).toBeNull();
+
+    await act(async () => {
+      allocB.resolve({ templates: allocsB });
+    });
+    const orchRow = (await screen.findByRole("link", { name: "orchestrator" })).closest("tr")!;
+    expect(within(orchRow).getByText("For your Claude runs: opus-b · your choice; effort high · your choice")).toBeTruthy();
+    const leadRowB = screen.getByRole("link", { name: "lead" }).closest("tr")!;
+    expect(within(leadRowB).queryByText(/For your/)).toBeNull();
+  });
+
   it("shows no personal line or note when the list fails to load", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
     mockApi.listAgentTemplates.mockRejectedValue(new Error("list failed"));

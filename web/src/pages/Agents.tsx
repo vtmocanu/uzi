@@ -51,16 +51,25 @@ export function Agents() {
   // must not fire from stale state and drop one (reviewer M7 ride-along).
   const [busy, setBusy] = useState(false);
 
+  const userId = user?.id;
+  // The viewer the loaded allocations belong to. A viewer change re-runs the load
+  // (deps below) but the previous viewer's allocations stay on screen until it
+  // lands, so the personal line is gated on this matching the current viewer.
+  const [allocFor, setAllocFor] = useState<string | null>(null);
+
   const { data, loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [{ templates }, { templates: alloc }] = await Promise.all([
         api.listAgentTemplates(),
         api.getTemplateAllocations(),
       ]);
-      setAllocations(alloc);
+      if (isCurrent()) {
+        setAllocations(alloc);
+        setAllocFor(userId ?? null);
+      }
       return { templates };
     },
-    [],
+    [userId],
     { fallback: "Failed to load templates" },
   );
   const templates = useMemo(() => data?.templates ?? [], [data]);
@@ -83,7 +92,6 @@ export function Agents() {
   // keyed by allocVersion + viewer: a response is shown only for the allocations
   // and user it was requested for. allocVersion bumps on every successful PUT.
   const [allocVersion, setAllocVersion] = useState(0);
-  const userId = user?.id;
   const [personal, setPersonal] = useState<{
     forVersion: number;
     forUserId: string;
@@ -117,7 +125,12 @@ export function Agents() {
     [templates, allocById, sharedNames],
   );
   const personalData =
-    !loading && !loadError && personal && personal.forVersion === allocVersion && personal.forUserId === user?.id
+    !loading &&
+    !loadError &&
+    personal &&
+    personal.forVersion === allocVersion &&
+    personal.forUserId === user?.id &&
+    allocFor === user?.id
       ? personal.data
       : null;
   const rowLine = (id: string): ReactNode => {
