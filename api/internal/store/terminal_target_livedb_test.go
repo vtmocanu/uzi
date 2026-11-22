@@ -566,6 +566,12 @@ func TestListActiveMRTargetRunsPlanUsesIndexLiveDB(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		e.seed(t, ttRun{repo: e.repoID, kind: "mr_rework", status: "queued", iid: int64(2000 + i)})
 	}
+	// Rows in other repos make a repo-scoped index path the selective one: the assertion below
+	// is that the plan narrows by repo_id through an index, not merely that some index exists
+	// (runs_pkey alone would satisfy ORDER BY id under enable_seqscan=off).
+	for i := 0; i < 200; i++ {
+		e.seed(t, ttRun{kind: "mr_rework", status: "queued", iid: int64(5000 + i)})
+	}
 	e.exec(t, `ANALYZE runs`)
 
 	cfg, err := pgxpool.ParseConfig(os.Getenv("UZI_TEST_DATABASE_URL"))
@@ -617,17 +623,23 @@ func TestListActiveMRTargetRunsPlanUsesIndexLiveDB(t *testing.T) {
 		}
 		return plan.String()
 	}
-	usesIndex := func(plan string) bool {
-		return strings.Contains(plan, "Index Scan") || strings.Contains(plan, "Index Only Scan") || strings.Contains(plan, "Bitmap Index Scan")
+	// repoIndexed reports whether some index node's Index Cond constrains repo_id.
+	repoIndexed := func(plan string) bool {
+		for _, line := range strings.Split(plan, "\n") {
+			if strings.Contains(line, "Index Cond:") && strings.Contains(line, "repo_id") {
+				return true
+			}
+		}
+		return false
 	}
 	own := explain(false)
 	t.Logf("planner's own choice on this table:\n%s", own)
-	if usesIndex(own) && !strings.Contains(own, "Seq Scan") {
+	if repoIndexed(own) && !strings.Contains(own, "Seq Scan on runs") {
 		return
 	}
 	plan := explain(true)
-	t.Logf("with enable_seqscan=off (an index scan is possible check):\n%s", plan)
-	if !usesIndex(plan) || strings.Contains(plan, "Seq Scan on runs") {
-		t.Fatalf("no index path for ListActiveMRTargetRuns:\n%s", plan)
+	t.Logf("with enable_seqscan=off (a repo-scoped index path is possible check):\n%s", plan)
+	if !repoIndexed(plan) || strings.Contains(plan, "Seq Scan on runs") {
+		t.Fatalf("no repo_id-scoped index path for ListActiveMRTargetRuns:\n%s", plan)
 	}
 }

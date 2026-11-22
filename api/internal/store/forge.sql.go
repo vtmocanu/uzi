@@ -1103,8 +1103,8 @@ type ListActiveMRTargetRunsRow struct {
 
 // Issue #4616 early-polling enumeration: the active ci_fix / mr_rework runs of one repo
 // that carry a verified MR target, so the poller can cancel them once that MR merges or
-// closes. The kind/status predicate matches the partial index
-// uq_runs_one_active_branch_ref (migration 00167), so that index serves the scan. The
+// closes. repo_id leads uq_runs_one_active_branch_ref (migration 00167) and
+// idx_runs_repo (00020), so the scan is repo-scoped through an index. The
 // caller takes 32 rows and keeps a keyset cursor (id > @after_id); LIMIT 33 lets it tell
 // whether another page exists. An unbound ci_fix (NULL ci_fix_mr_iid) is deliberately
 // excluded: there is no branch-to-MR inference here.

@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
-import { StubExecutor,type ExecutorResult, type RunContext } from "../src/executor.js";
+import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { PublicationContextRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { followSuccessfulPush, sourcePublicationContext } from "./publication-fixture.js";
@@ -281,7 +281,7 @@ describe("#4616 M4 refresh publication: target_terminal context refusal", () => 
     }
 
     // Guarded inventory: the guarded settlement owns cleanup. With a real RecoveryCoordinator the
-    // refusal must leave the guarded hold open, send no release, and keep the clone with the archive.
+    // refusal must leave the guarded hold open, send no release, and keep the trusted bare, recovery pin and archive (verified cleanup may retire the clone).
     // forge_mismatch is a secondary control: target_terminal behaves identically.
     it(`${lane}/github: guarded inventory keeps its hold and source on target_terminal`, async t => {
       const outcomes: Record<string, unknown> = {};
