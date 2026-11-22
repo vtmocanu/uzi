@@ -536,7 +536,7 @@ func TestRunEnvReceiptsMigrationRoundTripLiveDB(t *testing.T) {
 }
 
 // A var_id that already names more than one variable cannot be backfilled into a single
-// identity: the migration refuses and names the problem instead of picking one silently.
+// identity: the migration refuses and names the problem.
 func TestRunEnvReceiptsMigrationRefusesAmbiguousVarIDLiveDB(t *testing.T) {
 	_, dsn := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
 	pool := cjOpenPool(t, dsn)

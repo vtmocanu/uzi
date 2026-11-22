@@ -1,5 +1,5 @@
 // The prompt block that tells a lead-lane agent which user variables are set in its commands (PRD 4416
-// M2, plan O7). The names, scopes and descriptions are attacker-influenceable text (a repo's settings),
+// M2). The names, scopes and descriptions are attacker-influenceable text (a repo's settings),
 // so the block is nonce-fenced like every other untrusted block, descriptions are stripped of terminal
 // escapes and invisible or bidi characters, and a plain value is rendered JSON-quoted with the same
 // characters escaped. A secret value NEVER appears: only its name and description do.

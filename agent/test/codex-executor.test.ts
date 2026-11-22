@@ -37289,7 +37289,7 @@ describe("Codex repeated actualRunner switching", () => {
   });
 });
 
-// PRD 4416 M2 (W2b): the Codex lead prompts carry the run-variables block (names, descriptions, plain
+// PRD 4416 M2: the Codex lead prompts carry the run-variables block (names, descriptions, plain
 // values; never a secret value). Dummy values only.
 describe("CodexExecutor prompts: run variables", () => {
   const SECRET = "dummy-secret-run-value-000000";

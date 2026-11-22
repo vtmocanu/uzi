@@ -7,7 +7,7 @@ import { renderCodexRun } from "../src/codex/render.js";
 import type { HarnessAgent, RunTurnRequest } from "../src/harness.js";
 import type { AgentTemplate, ClaimRunEnvVar } from "../src/protocol.js";
 
-// PRD 4416 M2 (W2b): the run-variables prompt block. Every value is an obvious dummy.
+// PRD 4416 M2: the run-variables prompt block. Every value is an obvious dummy.
 
 const UUID = "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44";
 const SECRET = "dummy-secret-run-value-000000";

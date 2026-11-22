@@ -546,7 +546,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 				if retired.RetiredCount+1 > runenv.MaxRetiredVersions || retired.ValueBytes+int64(live.ValueBytes) > runenv.MaxRetiredValueBytes {
-					return withHeldByRuns(ctx, q, userID, &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)})
+					return withHeldByRuns(ctx, q, userID, &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this update keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)})
 				}
 				if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
 					return withHeldByRuns(ctx, q, userID, runEnvHeadroomConflict(runEnvCodeHistoryFull, err))

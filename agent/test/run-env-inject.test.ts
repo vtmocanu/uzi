@@ -10,7 +10,7 @@ import { makeTextRedactor } from "../src/redact.js";
 import { RUN_ENV_DENIED_NAMES, RUN_ENV_DENIED_PREFIXES } from "../src/run-env-names.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 
-// PRD 4416 M2 (W2a): injection of user variables into the lead lane's env builders, and the forms
+// PRD 4416 M2: injection of user variables into the lead lane's env builders, and the forms
 // registered for redaction. No token-shaped literal lives here: every value is an obvious dummy.
 
 const UUID = "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44";

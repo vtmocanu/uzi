@@ -67,17 +67,31 @@ caught beyond the PRD list:
   `process_loader`), Node debug and telemetry switches (`NODE_DEBUG`, `NODE_V8_COVERAGE`;
   `harness_control`) and Node TLS and proxy behaviour (`NODE_EXTRA_CA_CERTS`,
   `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_USE_ENV_PROXY`, `NODE_USE_SYSTEM_CA`; `network_wiring`).
+- Further names the Node runtime the harness runs on reads: `NODE`, `NODE_NO_WARNINGS`,
+  `NODE_SKIP_PLATFORM_CHECK`, `NODE_PENDING_PIPE_INSTANCES` and `UV_USE_IO_URING` (`NODE` and
+  `UV_USE_IO_URING` are `process_loader`, `NODE_NO_WARNINGS` is `harness_control`).
 - `SSLKEYLOGFILE` (`network_wiring`): it would log the TLS keys of the worker's provider traffic.
 - Trust-root overrides of other tools (`AWS_CA_BUNDLE`, `PIP_CERT`, `DENO_CERT` and similar;
   `network_wiring`), credentials the Claude CLI reads without a provider selector
   (`AWS_BEARER_TOKEN_BEDROCK`, `CLOUDSDK_AUTH_ACCESS_TOKEN`; `provider_auth`), and the CLI's
   internal prefixes (`CCR_`, `_CLAUDE_`, `ANT_OTEL_`, `OTEL_LOG_`; `harness_control`).
 - `LC_` (`shell_semantics`, like `LANG`) and `GCM_` (`git_authority`).
+- Telemetry and metadata endpoints the harness reads: the prefixes `OTEL_EXPORTER_OTLP_`,
+  `GCE_METADATA_` and `AWS_ENDPOINT_URL_BEDROCK` and the name `AWS_EC2_METADATA_SERVICE_ENDPOINT`
+  (all `network_wiring`). The `AWS_ENDPOINT_URL_BEDROCK` prefix has no trailing underscore on
+  purpose, so it also covers `AWS_ENDPOINT_URL_BEDROCK_AGENT*`. `OTEL_EXPORTER_OTLP_*` and
+  `GCE_METADATA_*` were first treated as allowed application settings and are now denied network
+  wiring, because the harness reads them.
 
 Names that a harness also reads but that are application configuration (`AWS_REGION`, cloud
 credentials, `CLOUD_ML_REGION`) stay allowed and are recorded in the fixture's `overlaps` with the
 reason. The PRD's invariant holds: user variables cannot change the provider or the
 authentication the worker selects. The rules guard the worker, not the build.
+
+Rollout: the added names and prefixes ship with run-variable delivery, which no released worker
+has, so no deployed worker injects a variable under them. Enabling a variable keeps the full name
+rule. Disabling or deleting one checks only the name's shape, so a stored variable whose name a
+later rule denies can still be removed.
 
 ## Claim, snapshot, gate
 
@@ -124,7 +138,9 @@ authentication the worker selects. The rules guard the worker, not the build.
   (`FOR SHARE NOWAIT`, a busy owner is skipped), deletes in bounded batches, then deletes variable
   identities no row and no receipt references.
 - **`var_id` identity guard.** `run_env_var_ids` binds each `var_id` to one
-  `(user, repo, scope, name)` for good, kept after its rows and its repo are gone. A trigger
+  `(user, repo, scope, name)` and is never reused while referenced. The identity is deleted by the
+sweeper once no row and no receipt references it (`DeleteRunEnvSweepIdentities`), after which the
+id may be issued again; var_ids are random UUIDs. A trigger
   on `run_env_vars` creates the identity on first insert and refuses, with `check_violation`, any
   insert under another owner, repo, scope or name and any update of those columns. A receipt that
   names a `var_id` can therefore never be satisfied by a row of another variable. The migration refuses
@@ -151,6 +167,14 @@ delivered them: a restart, a held or terminal publication, a recovery upload. It
 
 - **Authorization**: the run belongs to the worker's user and the worker is its last holder
   (`runs.worker_id`), or took an open custody hold on it.
+- **Bound while a publication can still need it.** Plaintext is served only while the requested
+  run is not terminal, or while a publication is in flight for it: an open custody hold, a capture
+  preparing or uploading, a held publication prepared, invoked or of unknown outcome, or a
+  terminal preservation bound or publishing (`RunEnvRedactOpen` and
+  `fn_run_env_publication_pending`). A cross-check child is served only while it is not terminal
+  and its `cross_checks` row is open before its deadline, or while a publication is in flight for it.
+  Otherwise the route answers 409 `run_env_redact_closed`, and the worker withholds the publish. The
+  route's own 404 carries the code `run_env_run_not_found`.
 - **No generation bound.** A worker that last held the run may read the full receipted history
   whatever the current claim generation. This is accepted: the route is read-only, same user
   only, and the same worker was delivered those values by the claim that wrote the receipts.
@@ -162,16 +186,24 @@ lead's code and output, so it must mask what the lead was given. Its claim carri
 `run_env_redact` with the **lead's** secret versions only, opened for the run's owner. A worker
 without `run_env_v1`, or a lead version that cannot be opened, ends the child as
 `checker_unavailable` (a non-pass that forces a human gate) rather than parking it. The redact
-route answers the child with its lead's set.
+route answers the child with its lead's set, for as long as the route is open for the child
+(see the bound above).
 
 ## Redaction and the exact-value scan
 
 Registered forms (`agent/src/run-env-forms.ts`) are, for each secret value of the claim's
-`run_env` and `run_env_redact`: the value, its JSON-escaped form when it differs, and the three
-base64 alignments trimmed to the characters that do not depend on neighbouring bytes. Plain
+`run_env` and `run_env_redact`, the whole-value encodings: raw, JSON-escaped, JSON with escaped
+slashes, HTML-safe `\u00XX` (both hex cases), percent-encoded (both hex cases, `+` for a space),
+and three standard and three URL-safe base64 alignments trimmed to the characters that do not
+depend on neighbouring bytes. Each is also registered for the value without its trailing line
+break and, for a multi-line value, with line endings normalized to LF. A multi-line value also
+registers each of its lines (8 characters or more, PEM armor lines excluded) for redaction only,
+never as a scan needle, because a public line would hit unrelated files. The scan needles instead add
+diff-shaped forms of the value, its lines joined by `\n+`, `\n-` and `\n ` (LF and CRLF). Plain
 values are never registered. The forms join the run's existing redactor, so every sink it already
 covers masks them; this change also routes the plan, the plan summary, the intent summary and
-the planning diff through it.
+the planning diff through it. The lead's prompt lists only the variables the executor actually
+injected: a name dropped as protected or already set by the tool profile is not listed.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
 (`agent/src/run-env-scan.ts`): every object reachable from the candidate tip and not from the
@@ -179,7 +211,19 @@ exclusion set, messages, paths and contents. The verdict is `clean`, `hit` (the 
 variable, never a value) or `withhold` (deadline, git error, unresolved range, byte cap, or needles
 that could not be resolved). There is no fail-open outcome, unlike the gitleaks path, which defers
 to forge push protection that cannot know these values. A clean verdict is bound to the exact tip
-and exclusion set that is then published (`scanCoversCandidate`). Sites:
+and exclusion set that is then published (`scanCoversCandidate`).
+
+Needle resolution (`resolveScanNeedles`): a publish with a live claim uses its needles. With no
+live flight the worker asks the redact route. A 404 carrying `run_env_run_not_found` or a 409
+withholds. A 404 without that code (an api that lacks the route) resolves to no needles only when no
+durable per-run marker exists. The worker writes the marker (`agent/src/run-env-seen.ts`: temp
+file, fsync, rename, fsync of the directory) before any variable reaches an executor, for every
+claim carrying `run_env` or `run_env_redact`, and a failed write stops the run from starting.
+Markers are never removed. The marker proves only that this worker never received variables for the
+run: work adopted from another worker, or claimed by a build from before the marker existed (not
+released), has none.
+
+Sites:
 
 - **Checkpoint publish**, at the single `publishCheckpoint` call, so tick, iteration, milestone,
   park, shutdown, pause and overlay checkpoints all pass it. A run holding secret variables also
@@ -225,6 +269,11 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
+- **Mixed hunk.** A diff hunk that mixes context and added lines of one multi-line secret is not
+  matched as a whole by the patch text check. Per-line redaction still masks it, and the blob scan
+  still blocks a committed file.
+- **Marker coverage.** The absent-route fallback relies on the per-run marker, which exists only
+  for runs this worker received variables for, as described above.
 - **Migration Down refuses** rather than losing data: it raises when any version-2 row or any receipt
   exists, because removing them would leave values unopenable or unmasked.
 - **Sweeper and cross-check children** (deferred). Retention reads the receipts of the run that

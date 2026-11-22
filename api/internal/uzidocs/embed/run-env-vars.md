@@ -50,7 +50,9 @@ job receives CI variables. Tools that read the environment work unchanged.
 ## What the agent is told
 
 The lead's prompt lists each injected variable's name, scope and description,
-and the value of each plain variable. A secret's value is never in a prompt. The
+and the value of each plain variable. A variable the worker did not inject,
+because its name is protected or the tool profile already sets it, is not
+listed. A secret's value is never in a prompt. The
 block states that the variables are already set in every command, so the agent
 does not have to guess or ask. Descriptions and plain values are treated as
 untrusted text: control and invisible characters are stripped or escaped.
@@ -60,14 +62,20 @@ login command uses it.
 ## Redaction and the publish scan
 
 For each secret, uzi redacts the value from run messages, the worker log, the
-plan and its summary, and the other output the run produces. It also redacts the
-value's JSON-escaped form and the forms it takes inside base64 text (such as
-the entry a registry login stores, or an HTTP Basic header). Redaction is
+plan and its summary, and the other output the run produces. It also redacts
+these forms of the value: JSON-escaped (with and without escaped slashes),
+HTML-safe `\u00XX`, percent-encoded, and base64 or base64url text that embeds
+it (such as the entry a registry login stores, or an HTTP Basic header). Each
+form is also registered without a trailing line break, and for a multi-line
+value with LF line endings. Each line of a multi-line value (8 characters or
+more, PEM header and footer lines excluded) is redacted on its own. Redaction is
 exact-match with an 8-character floor, so it is a net, not a boundary: another
 encoding of the value is not caught.
 
 Before work leaves the worker, every commit in the outgoing range is searched
-for those forms, not only the final tree. That covers checkpoint pushes
+for those forms, not only the final tree. For a multi-line secret it also
+searches for the value as it reads inside a diff, with its lines joined by
+`+`, `-` or space prefixes. That covers checkpoint pushes
 (including parked, paused and shutdown checkpoints), the final push, held and
 terminal preservation packs, recovery archives and the preserved patch.
 
@@ -81,6 +89,12 @@ terminal preservation packs, recovery archives and the preserved patch.
   later, and the work stays on the worker under its recovery hold. At the final
   push the run fails as `push_secret_blocked` instead.
 - A plain value found in tracked files holds nothing.
+- A diff hunk that mixes context lines and added lines of one multi-line secret
+  is not matched as a whole by the check on the preserved patch. Each line is
+  still redacted, and a committed file that holds the secret is still blocked.
+- A worker that must look up a finished run's secrets is served them only while
+  the run is active or a publication of its work is still in flight. Otherwise
+  the publish is withheld.
 
 ## Rotating and deleting while runs are active
 
@@ -127,19 +141,29 @@ denied:
 - Prefixes: `UZI_`, `CLAUDE_`, `ANTHROPIC_`, `CODEX_`, `OPENAI_`, `MCP_`,
   `DISABLE_`, `GH_`, `GITHUB_`, `GITLAB_`, `GLAB_`, `GIT_`, `SSH_`, `LD_`,
   `DYLD_`, `BASH_`, `XDG_`, `SSL_CERT_`, `PYTHON`, `PERL5`, `NIX_`, `DEVBOX_`,
-  `OTEL_EXPORTER_OTLP_`, `GCE_METADATA_`, `AWS_ENDPOINT_URL_BEDROCK`.
+  `BUN_`, `CCR_`, `SELF_HOSTED_RUNNER_`, `BUGHUNTER_`, `_CLAUDE_`, `ANT_OTEL_`,
+  `ANT_CLAUDE_`, `OTEL_LOG_`, `LC_`, `GCM_`, `OTEL_EXPORTER_OTLP_`,
+  `GCE_METADATA_`, `AWS_ENDPOINT_URL_BEDROCK` (which also covers
+  `AWS_ENDPOINT_URL_BEDROCK_AGENT*`).
 - Any name ending in `_PROXY`.
 - Process, shell, Docker, Go, Node, Java, curl and browser settings such as
   `PATH`, `HOME`, `TMPDIR`, `SHELL`, `DOCKER_HOST`, `DOCKER_CONFIG`, `GOFLAGS`,
-  `NODE`, `NODE_OPTIONS`, `UV_USE_IO_URING`, `AWS_EC2_METADATA_SERVICE_ENDPOINT`,
-  `JAVA_TOOL_OPTIONS`, `NETRC`, `CURL_CA_BUNDLE`, `RUBYOPT`.
+  `NODE`, `NODE_OPTIONS`, `UV_USE_IO_URING`, `JAVA_TOOL_OPTIONS`, `NETRC`,
+  `CURL_CA_BUNDLE`, `RUBYOPT`.
+- Network and cloud endpoint settings the harness reads, such as
+  `AWS_EC2_METADATA_SERVICE_ENDPOINT`, and any `OTEL_EXPORTER_OTLP_*`,
+  `GCE_METADATA_*` or `AWS_ENDPOINT_URL_BEDROCK*` name.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
 
 Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `GOOGLE_APPLICATION_CREDENTIALS`,
-`NPM_TOKEN`, `GRADLE_OPTS`, `DOCKER_AUTH_CONFIG`, `NO_COLOR`. The full list is
-`fixtures/run-env/name-rules.json`.
+`NPM_TOKEN`, `GRADLE_OPTS`, `DOCKER_AUTH_CONFIG`, `NO_COLOR`. The bullets above
+are examples; the full list is `fixtures/run-env/name-rules.json`.
+
+Saving or enabling a variable checks the full list. **Disable** and **Delete**
+check only the name's shape, so a stored variable whose name a later rule denies
+can still be removed.
 
 ## Entering a value
 

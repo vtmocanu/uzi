@@ -10,7 +10,7 @@ import { runEnvSeen } from "../src/run-env-seen.js";
 
 installHarness();
 
-// PRD 4416 M2 (W2b R3): the runner registers every form of a secret run variable with the logger and the
+// PRD 4416 M2: the runner registers every form of a secret run variable with the logger and the
 // flight's redactor, hands the variables to a lead-lane executor, and evicts the forms at terminal.
 // Every value is an obvious dummy.
 
@@ -135,7 +135,7 @@ describe("the run variable marker", () => {
   });
 });
 
-// PRD 4416 M2 (W2b item 3): run_env values live in memory only. The cheapest credible proof is two-fold:
+// PRD 4416 M2: run_env values live in memory only. The cheapest credible proof is two-fold:
 // the durable-state writers take typed records that cannot carry the claim's secrets object (a source
 // pin: none of them names the claim types, `secrets` or run_env), and a run executed with a plaintext
 // secret variable leaves no file under the worker's data directory or the run home that contains it.

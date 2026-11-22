@@ -1,9 +1,6 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
--- The backfill and the identity trigger below read a table whose writers must not interleave.
--- runs and users are locked first (the two foreign keys below take these modes anyway), so the
--- migration takes the parent locks before the run_env_vars lock, the same order as the claim and
--- the env writers; any remaining deadlock is detected and rolls the migration back.
+-- Locks runs and users, then run_env_vars, before the backfill and the identity trigger.
 LOCK TABLE runs, users IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE run_env_vars IN ACCESS EXCLUSIVE MODE;
 
@@ -39,7 +36,7 @@ CREATE INDEX run_env_receipts_var_idx ON run_env_receipts (var_id);
 -- run_env_var_ids: the identity of every variable ever created, kept after its rows and
 -- its repo are gone. A var_id is bound to one (user, repo, scope, name) for good, so a
 -- receipt that names a var_id can never be satisfied by a row of another variable. repo_id
--- has no foreign key on purpose: the identity must survive the repo.
+-- has no foreign key.
 CREATE TABLE run_env_var_ids (
     var_id  uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -50,9 +47,7 @@ CREATE TABLE run_env_var_ids (
 -- The sweeper's orphan-identity scan and the user cascade read by owner.
 CREATE INDEX run_env_var_ids_user_idx ON run_env_var_ids (user_id);
 
--- The backfill below keeps one identity per var_id, so a var_id that already names more than one
--- (user, repo, name) cannot be bound to a single identity. Refuse the migration loudly rather than
--- pick one silently: the data is fixed by hand first.
+-- Fails when a var_id already names more than one (user, repo, name).
 -- +goose StatementBegin
 DO $$
 BEGIN
@@ -179,9 +174,7 @@ $$;
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
--- Version-2 rows and receipts have no version-1 representation: dropping aad_version would leave
--- ciphertexts the older code cannot open, and dropping the receipts would forget which secret
--- versions runs still need masked. Refuse, and let the owner decide what to do with that data.
+-- Fails when any version-2 row or receipt exists.
 -- +goose StatementBegin
 DO $$
 BEGIN

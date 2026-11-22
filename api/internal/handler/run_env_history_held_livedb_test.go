@@ -13,7 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4416 M2 W1c: held_by_runs on env_history_full, the delete-with-receipt re-create, and
+// held_by_runs on env_history_full, the delete-with-receipt re-create, and
 // the secret to plain conversion, through the handler against PostgreSQL.
 
 // paddedRetiredVersions fills the owner's retired-version budget and returns the var ids.
