@@ -58,6 +58,27 @@ func findFunctionBlock(section, name string) (block string, closed bool) {
 	return "", false
 }
 
+// fromFunctionKeyword is a definition block from its FUNCTION keyword on, so a CREATE FUNCTION
+// predecessor and a CREATE OR REPLACE FUNCTION Down with the same body compare equal.
+func fromFunctionKeyword(block string) string {
+	loc := regexp.MustCompile(`(?i)\bFUNCTION\b`).FindStringIndex(block)
+	if loc == nil {
+		return block
+	}
+	return block[loc[0]:]
+}
+
+func TestFromFunctionKeyword(t *testing.T) {
+	a := fromFunctionKeyword("CREATE FUNCTION fn_x() AS $$ x $$;")
+	b := fromFunctionKeyword("CREATE OR REPLACE FUNCTION fn_x() AS $$ x $$;")
+	if a != b || a != "FUNCTION fn_x() AS $$ x $$;" {
+		t.Fatalf("got %q and %q", a, b)
+	}
+	if fromFunctionKeyword("CREATE FUNCTION fn_x() AS $$ y $$;") == b {
+		t.Fatal("different bodies compare equal")
+	}
+}
+
 func TestFindFunctionBlock(t *testing.T) {
 	const body = "() RETURNS int AS $$ SELECT 1 $$;"
 	cases := []struct {
@@ -128,7 +149,7 @@ func TestRunEnvPlacementDownRestoresPredecessorFunction(t *testing.T) {
 	if down == "" {
 		t.Fatalf("%s Down does not define %s", placement, placementFunction)
 	}
-	if down != prior {
+	if fromFunctionKeyword(down) != fromFunctionKeyword(prior) {
 		t.Fatalf("%s Down function (%d bytes) differs from %s Up function (%d bytes)", placement, len(down), priorFile, len(prior))
 	}
 }

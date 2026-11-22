@@ -82,10 +82,9 @@ caught beyond the PRD list:
   purpose, so it also covers `AWS_ENDPOINT_URL_BEDROCK_AGENT*`. `OTEL_EXPORTER_OTLP_*` and
   `GCE_METADATA_*` are denied as network wiring because the harness reads them.
 - `AWS_ENDPOINT_URL` (`network_wiring`), by exact name: the global AWS endpoint override also
-  routes Bedrock traffic. `AWS_ENDPOINT_URL_STS` and the other per-service names stay allowed.
-  Names are checked on write only, so a stored `AWS_ENDPOINT_URL` variable stays; a worker with
-  the rule drops it at injection with a run event naming the rule, and an older worker injects it
-  until updated.
+  routes Bedrock traffic. `AWS_ENDPOINT_URL_STS` and the other non-Bedrock per-service names stay
+  allowed. Names are checked on write only, so a stored variable whose name a later rule denies is
+  dropped at injection by a worker that has the rule, with a run event naming the rule.
 
 Names that a harness also reads but that are application configuration (`AWS_REGION`, cloud
 credentials, `CLOUD_ML_REGION`) stay allowed and are recorded in the fixture's `overlaps` with the
@@ -216,11 +215,12 @@ computed once per executor run, after tool provisioning and before any prompt, w
 build applies (`runEnvInjectedSet`, `agent/src/run-env-inject.ts`), and the env build folds exactly that set.
 
 A claim's forms are computed once (`runEnvClaimForms`) and capped at `RUN_ENV_FORM_CHARS_MAX`
-(40,000,000 UTF-16 units of distinct forms). Over the cap no partial form set is used: the claim
+(40,000,000 UTF-16 units of distinct forms). Over the cap only the raw values (and their trimmed and
+LF variants) are registered for redaction, with no scan needles or line forms: the claim
 fails before the clone and any output with a failure reason starting `run_env_forms_over_budget` (no
 value), and nothing is published. A lane with no live flight (held, terminal, bundle publication)
 withholds with the reason `forms_over_budget`. A store filled to its bounds with multi-line values
-can pass the cap. The worker log and `SecretSet` keep incremental, reference-counted literal indexes.
+can pass the cap. A cross-check child over the cap ends as `checker_unavailable`.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
 (`agent/src/run-env-scan.ts`): every object reachable from the candidate tip and not from the
@@ -255,9 +255,9 @@ Sites:
   withheld whole when the claim is over budget; when a whole-value form occurs in it; when one occurs
   in a rebuilt per-hunk pre-image or post-image (context plus removed or added lines, also with line
   breaks normalized to LF); when any registered line form occurs; or when it cannot be parsed
-  (binary, combined diff, a line-count mismatch, a non-header line before the first hunk). The
-  image, line-form and parse checks apply only when the run has secret variables, so a run with a
-  secret variable loses its preserved patch when the diff touches a binary file. Otherwise it is
+  (binary, combined diff, a line-count mismatch, for example a non-header line between a file
+  header and its first hunk). The image, line-form and parse checks apply when the run has any
+  secret variable, retired versions included, so a run with a secret variable loses its preserved patch when the diff touches a binary file. Otherwise it is
   redacted and gitleaks-scanned as before.
 
 ## Where the PRD differed from the code
@@ -292,7 +292,8 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
-- **Patch gaps.** The patch check misses a secret whose lines are all short or public and that is
+- **Patch gaps.** The patch check misses a secret whose lines are all short, public, or without a letter, digit or second
+  distinct character, and that is
   split across files or by elided context between hunks, and a value that appears only re-encoded
   (each line indented in a YAML block, or an encoding other than those registered). The blob scan
   still blocks a committed file.

@@ -52,9 +52,7 @@ job receives CI variables. Tools that read the environment work unchanged.
 The lead's prompt lists each injected variable's name, scope and description,
 and the value of each plain variable. A variable the worker did not inject,
 because its name is protected or the tool profile already sets it, is not
-listed. The list is computed once per run, after tool provisioning and before
-any prompt, with the rules the environment build applies. A secret's value is
-never in a prompt. The
+listed. A secret's value is never in a prompt. The
 block states that the variables are already set in every command, so the agent
 does not have to guess or ask. Descriptions and plain values are treated as
 untrusted text: control and invisible characters are stripped or escaped.
@@ -81,8 +79,12 @@ A run's secret forms are computed once per claim and capped at 40,000,000
 characters (`RUN_ENV_FORM_CHARS_MAX`). A claim over the cap fails before any
 work, with a failure reason starting `run_env_forms_over_budget` (never a
 value), and publishes nothing. A publish with no live flight (held, terminal and
-bundle publication) is withheld with the reason `forms_over_budget`. A store
-filled to its limits with multi-line values can pass the cap.
+bundle publication) is withheld with the reason `forms_over_budget`. A
+cross-check child whose claim is over the cap ends as checker unavailable
+instead. A store filled to its limits with multi-line values can pass the cap.
+To get under it, remove or shorten secret variables, multi-line ones first;
+retired versions still count until they leave the retention window (see
+[Rotating and deleting while runs are active](#rotating-and-deleting-while-runs-are-active)).
 
 Before work leaves the worker, every commit in the outgoing range is searched
 for those forms, not only the final tree. For a multi-line secret it also
@@ -106,10 +108,13 @@ terminal preservation packs, recovery archives and the preserved patch.
   pre-image or post-image (context plus removed or added lines, also with line
   breaks normalized to LF); when any registered line form occurs in it; or, for
   a run with secret variables, when the patch cannot be parsed (binary, combined
-  diff, a line-count mismatch, or a non-header line before the first hunk). A
-  run with any secret variable therefore loses its preserved patch when the diff
-  touches a binary file. Otherwise the patch is redacted and scanned as before.
-- Gaps that remain: a secret whose lines are all short or public and that is
+  diff, a line-count mismatch, or for example a non-header line between a file
+  header and its first hunk). The image, line-form and parse checks apply when
+  the run has any secret variable, retired versions included, so such a run
+  loses its preserved patch when the diff touches a binary file. Otherwise the
+  patch is redacted and scanned as before.
+- Gaps that remain: a secret whose lines are all short, public, or without a
+  letter, digit or second distinct character, and that is
   split across files or by elided context between hunks, and a value that
   appears only re-encoded, such as each line indented in a YAML block or in an
   encoding other than those registered. A committed file that holds the whole
@@ -177,8 +182,8 @@ denied:
 - Network and cloud endpoint settings the harness reads, such as
   `AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AWS_ENDPOINT_URL` (the global AWS
   endpoint override also routes Bedrock traffic), and any `OTEL_EXPORTER_OTLP_*`,
-  `GCE_METADATA_*` or `AWS_ENDPOINT_URL_BEDROCK*` name. Per-service names such
-  as `AWS_ENDPOINT_URL_STS` stay allowed.
+  `GCE_METADATA_*` or `AWS_ENDPOINT_URL_BEDROCK*` name. The other non-Bedrock
+  per-service names, such as `AWS_ENDPOINT_URL_STS`, stay allowed.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
 
@@ -189,10 +194,9 @@ are examples; the full list is `fixtures/run-env/name-rules.json`.
 
 Saving or enabling a variable checks the full list. **Disable** and **Delete**
 check only the name's shape, so a stored variable whose name a later rule denies
-can still be removed. Names are checked on write only, so an `AWS_ENDPOINT_URL`
-variable stored before this rule stays: a worker that has the rule drops it at
-injection with a run event naming the rule, and an older worker injects it until
-it is updated.
+can still be removed. Names are checked on write only, so a stored variable whose
+name a later rule denies is dropped at injection by a worker that has the rule,
+with a run event naming the rule.
 
 ## Entering a value
 
