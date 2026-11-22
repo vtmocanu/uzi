@@ -154,6 +154,11 @@ func (s *Service) reconcileTerminalStopOnce(ctx context.Context, w store.Worker,
 		return PublicationContextResponse{}, reconcileRetry, err
 	}
 	stamped := run.StopKind.Valid && run.StopKind.String == "cancelled" && run.StopReason.Valid && run.StopReason.String == reason
+	if run.StopKind.Valid && !stamped {
+		// An operator or earlier verdict owns the run: never overwritten, and answered before the
+		// snapshot compare so a foreign stamp is forge_mismatch, not authority_changed.
+		return publicationUnknown("forge_mismatch"), reconcileDone, nil
+	}
 	same, err := publicationSnapshotsEqualModuloStop(before, after, id, stamped)
 	if err != nil {
 		return publicationUnknown("authority_unknown"), reconcileDone, nil
@@ -163,10 +168,6 @@ func (s *Service) reconcileTerminalStopOnce(ctx context.Context, w store.Worker,
 	}
 	if stamped {
 		return publicationUnknown("target_terminal"), reconcileDone, nil
-	}
-	if run.StopKind.Valid {
-		// An operator or earlier verdict owns the run: never overwritten.
-		return publicationUnknown("forge_mismatch"), reconcileDone, nil
 	}
 	if err := s.terminalFault(terminalStopFaultStamp, attempt); err != nil {
 		return PublicationContextResponse{}, reconcileRetry, err

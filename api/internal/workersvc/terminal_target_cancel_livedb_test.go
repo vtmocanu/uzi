@@ -141,13 +141,13 @@ func TestTerminalTargetCancelLiveWorkerLiveDB(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			c := newTermCancelEnv(t)
 			r := c.seedRun(t, kind, "running", true, 1)
-			c.e.exec(t, "UPDATE runs SET failure_reason='stale failure' WHERE id=$1", r.id)
+			c.e.exec(t, "UPDATE runs SET failure_reason='stale failure', fail_origin='agent_failure' WHERE id=$1", r.id)
 			if err := c.cancel(t, r); err != nil {
 				t.Fatal(err)
 			}
-			status, sk, sr, failure, _, inputs := c.fields(t, r.id)
-			if status != "running" || sk != "cancelled" || sr != termMergedReason || failure != "" || inputs != 1 {
-				t.Fatalf("after cancel: %s %s %q %q inputs=%d", status, sk, sr, failure, inputs)
+			status, sk, sr, failure, stampOrigin, inputs := c.fields(t, r.id)
+			if status != "running" || sk != "cancelled" || sr != termMergedReason || failure != "" || stampOrigin != "" || inputs != 1 {
+				t.Fatalf("after cancel: %s %s %q %q %q inputs=%d", status, sk, sr, failure, stampOrigin, inputs)
 			}
 			// A duplicate call writes no second input.
 			c.requireNoOp(t, r, func() error { return c.cancel(t, r) })
@@ -185,7 +185,7 @@ func TestTerminalTargetCancelServerSideLiveDB(t *testing.T) {
 			t.Run(kind+"/"+tc.status, func(t *testing.T) {
 				c := newTermCancelEnv(t)
 				r := c.seedRun(t, kind, tc.status, tc.worker, 0)
-				c.e.exec(t, "UPDATE runs SET failure_reason='stale failure' WHERE id=$1", r.id)
+				c.e.exec(t, "UPDATE runs SET failure_reason='stale failure', fail_origin='agent_failure' WHERE id=$1", r.id)
 				if err := c.cancel(t, r); err != nil {
 					t.Fatal(err)
 				}

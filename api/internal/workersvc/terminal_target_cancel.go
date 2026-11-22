@@ -21,8 +21,11 @@ const terminalTargetCancelTimeout = 10 * time.Second
 
 // TerminalTargetObservation is what a caller saw about an active ci_fix / mr_rework run and
 // the merge request it targets when it decided the MR left the opened state (issue #4616).
-// CancelRunForTerminalTarget re-checks every field under row locks and does nothing when the
-// run moved since, so a stale observation can never cancel a reclaimed or re-pointed run.
+// CancelRunForTerminalTarget re-checks the observation under row locks (kind, repo, target MR,
+// source branch, worker, claim generation, no stop_kind) and does nothing when the run moved
+// since, so a stale observation can never cancel a reclaimed or re-pointed run. Status is
+// carried for the caller's context only: it is not compared, the locked row's own status
+// drives the decision (terminal statuses never match).
 type TerminalTargetObservation struct {
 	RunID uuid.UUID
 	// RepoID is the repository the run must belong to (uuid.Nil skips the check).

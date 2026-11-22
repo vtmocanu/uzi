@@ -40,8 +40,8 @@ type termPub struct {
 
 // newTermPub seeds a completed source publication for MR 7 and a RUNNING request run of the
 // given kind (bound to that MR) owned by the fixture's worker at generation 1, with the forge
-// reporting the MR in the given state. The request carries a stale failure_reason so a cancel's
-// clearing of it is observable.
+// reporting the MR in the given state. The request carries a stale failure_reason and fail_origin
+// so a cancel's clearing of both is observable.
 func newTermPub(t *testing.T, kind, state string) *termPub {
 	t.Helper()
 	f := seedSourcePublication(t, false)
@@ -51,11 +51,11 @@ func newTermPub(t *testing.T, kind, state string) *termPub {
 	branch := *f.req.Branch
 	id := uuid.New()
 	if kind == "ci_fix" {
-		f.e.exec(t, `INSERT INTO runs(id,user_id,repo_id,kind,status,worker_id,claim_generation,pipeline_ref,pipeline_id,ci_fix_mr_iid,issue_title,issue_description,failure_reason)
- VALUES($1,$2,$3,'ci_fix','running',$4,1,$5,123,7,'term','','stale failure')`, id, f.w.UserID, f.e.repoID, f.w.ID, branch)
+		f.e.exec(t, `INSERT INTO runs(id,user_id,repo_id,kind,status,worker_id,claim_generation,pipeline_ref,pipeline_id,ci_fix_mr_iid,issue_title,issue_description,failure_reason,fail_origin)
+ VALUES($1,$2,$3,'ci_fix','running',$4,1,$5,123,7,'term','','stale failure','agent_failure')`, id, f.w.UserID, f.e.repoID, f.w.ID, branch)
 	} else {
-		f.e.exec(t, `INSERT INTO runs(id,user_id,repo_id,kind,status,worker_id,claim_generation,pipeline_ref,mr_iid,target_run_id,issue_title,issue_description,failure_reason)
- VALUES($1,$2,$3,'mr_rework','running',$4,1,$5,7,$6,'term','','stale failure')`, id, f.w.UserID, f.e.repoID, f.w.ID, branch, f.id)
+		f.e.exec(t, `INSERT INTO runs(id,user_id,repo_id,kind,status,worker_id,claim_generation,pipeline_ref,mr_iid,target_run_id,issue_title,issue_description,failure_reason,fail_origin)
+ VALUES($1,$2,$3,'mr_rework','running',$4,1,$5,7,$6,'term','','stale failure','agent_failure')`, id, f.w.UserID, f.e.repoID, f.w.ID, branch, f.id)
 	}
 	p := &termPub{f: f, kind: kind, id: id, branch: branch}
 	p.proof = &contextPublicationForge{summary: forge.MergeRequestSummary{IID: 7, State: state, SourceBranch: branch, HeadSHA: strings.Repeat("b", 40)}}
@@ -112,7 +112,7 @@ func TestPublicationContextTerminalTargetStopsRunLiveDB(t *testing.T) {
 				}
 				wantUnknown(t, p.resolve(), "target_terminal")
 				r := p.row(t)
-				if r.Status != "running" || r.StopKind != "cancelled" || r.StopReason != want || r.FailureReason != "" || r.Inputs != 0 {
+				if r.Status != "running" || r.StopKind != "cancelled" || r.StopReason != want || r.FailureReason != "" || r.FailOrigin != "" || r.Inputs != 0 {
 					t.Fatalf("after stamp: %+v", r)
 				}
 				// The same answer again, and no second write or input.
@@ -273,9 +273,41 @@ func TestPublicationContextTerminalStopReconciliationLiveDB(t *testing.T) {
 			}
 			return nil
 		}
-		wantUnknown(t, p.resolve(), "authority_changed")
-		if r := p.row(t); r.StopKind != "cancelled" || r.StopReason != "operator reason" {
+		wantUnknown(t, p.resolve(), "forge_mismatch")
+		if r := p.row(t); r.StopKind != "cancelled" || r.StopReason != "operator reason" || r.Inputs != 0 {
 			t.Fatalf("operator verdict overwritten: %+v", r)
+		}
+	})
+	t.Run("operator stop lands during reconciliation", func(t *testing.T) {
+		p := newTermPub(t, "mr_rework", forge.MRStateClosed)
+		p.f.svc.terminalStopFault = func(phase string, attempt int) error {
+			switch {
+			case phase == terminalStopFaultBeforeCommit && attempt == 0:
+				return errors.New("injected rollback")
+			case phase == terminalStopFaultReconcileBegin && attempt == 1:
+				p.f.e.exec(t, "UPDATE runs SET stop_kind='stopped', stop_reason='operator wind-down' WHERE id=$1", p.id)
+			}
+			return nil
+		}
+		wantUnknown(t, p.resolve(), "forge_mismatch")
+		if r := p.row(t); r.StopKind != "stopped" || r.StopReason != "operator wind-down" {
+			t.Fatalf("operator stop overwritten: %+v", r)
+		}
+	})
+	t.Run("source changes during reconciliation", func(t *testing.T) {
+		p := newTermPub(t, "ci_fix", forge.MRStateMerged)
+		p.f.svc.terminalStopFault = func(phase string, attempt int) error {
+			switch {
+			case phase == terminalStopFaultBeforeCommit && attempt == 0:
+				return errors.New("injected rollback")
+			case phase == terminalStopFaultReconcileBegin && attempt == 1:
+				p.f.e.exec(t, "UPDATE runs SET completion_non_closing_reason='partial' WHERE id=$1", p.f.id)
+			}
+			return nil
+		}
+		wantUnknown(t, p.resolve(), "authority_changed")
+		if r := p.row(t); r.StopKind != "" || r.StopReason != "" || r.Inputs != 0 {
+			t.Fatalf("stamped after the source changed: %+v", r)
 		}
 	})
 	t.Run("generation changes during reconciliation", func(t *testing.T) {

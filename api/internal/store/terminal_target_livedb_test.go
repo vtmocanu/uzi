@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -538,5 +539,95 @@ func TestCancelRunServerSideForTerminalTargetLiveDB(t *testing.T) {
 					before.Status, before.StopKind, before.StopReason, after.Status, after.StopKind, after.StopReason)
 			}
 		})
+	}
+}
+
+// sqlCapture is a pgx query tracer that records the statement and arguments the generated
+// ListActiveMRTargetRuns sends, so the plan test explains the exact production text.
+type sqlCapture struct {
+	sql  string
+	args []any
+}
+
+func (c *sqlCapture) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	c.sql, c.args = d.SQL, d.Args
+	return ctx
+}
+
+func (c *sqlCapture) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// The enumeration must be served by an index on runs, never a sequential scan. The plan is first
+// taken with the planner's own choice over a seeded table; a tiny table can legitimately
+// seq-scan, in which case the test re-plans inside a rolled-back transaction with
+// enable_seqscan=off and asserts an index scan is POSSIBLE for the statement. The log says which
+// of the two proved it.
+func TestListActiveMRTargetRunsPlanUsesIndexLiveDB(t *testing.T) {
+	e := newTerminalTargetEnv(t)
+	for i := 0; i < 60; i++ {
+		e.seed(t, ttRun{repo: e.repoID, kind: "mr_rework", status: "queued", iid: int64(2000 + i)})
+	}
+	e.exec(t, `ANALYZE runs`)
+
+	cfg, err := pgxpool.ParseConfig(os.Getenv("UZI_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capt := &sqlCapture{}
+	cfg.ConnConfig.Tracer = capt
+	cpool, err := pgxpool.NewWithConfig(e.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cpool.Close)
+	params := store.ListActiveMRTargetRunsParams{RepoID: e.repoID, AfterID: uuid.Nil}
+	if _, err := store.New(cpool).ListActiveMRTargetRuns(e.ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(capt.sql, "ListActiveMRTargetRuns") || len(capt.args) != 2 {
+		t.Fatalf("captured statement %q args %v", capt.sql, capt.args)
+	}
+
+	explain := func(seqscanOff bool) string {
+		t.Helper()
+		tx, err := e.pool.Begin(e.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(e.ctx) }()
+		if seqscanOff {
+			if _, err := tx.Exec(e.ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rows, err := tx.Query(e.ctx, "EXPLAIN "+capt.sql, capt.args...)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		defer rows.Close()
+		var plan strings.Builder
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			plan.WriteString(line + "\n")
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return plan.String()
+	}
+	usesIndex := func(plan string) bool {
+		return strings.Contains(plan, "Index Scan") || strings.Contains(plan, "Index Only Scan") || strings.Contains(plan, "Bitmap Index Scan")
+	}
+	own := explain(false)
+	t.Logf("planner's own choice on this table:\n%s", own)
+	if usesIndex(own) && !strings.Contains(own, "Seq Scan") {
+		return
+	}
+	plan := explain(true)
+	t.Logf("with enable_seqscan=off (an index scan is possible check):\n%s", plan)
+	if !usesIndex(plan) || strings.Contains(plan, "Seq Scan on runs") {
+		t.Fatalf("no index path for ListActiveMRTargetRuns:\n%s", plan)
 	}
 }
