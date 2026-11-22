@@ -215,6 +215,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// run's own web search is server-side (Decision 10; the schema CHECK forbids the pair,
 	// this is the backstop).
 	isolated := run.EgressProfileID.Valid
+	// PRD #4323: shared untrusted-input bounds still block Codex provider activation.
+	// Hold every provider-bound Codex claim before context, binding or credential reads,
+	// regardless of worker capabilities; the pure binding builder is not activation proof.
+	if providerBoundRun(run) && run.Harness == harnessCodex {
+		return nil, errProviderLaneClaimRefused
+	}
 	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
 		return nil, errIsolatedClaimRefused
 	}

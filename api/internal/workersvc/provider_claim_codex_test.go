@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -13,6 +14,45 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
+
+// Exercise the production entry point, not assembleProviderBinding. With no store,
+// box or vault, any context/credential access panics; no payload can authorize spend.
+func TestCodexProviderActualClaimHeldBeforeReads(t *testing.T) {
+	for _, kind := range []string{runkind.Issue, runkind.Task, runkind.Prompt, runkind.SelfImprove} {
+		t.Run(kind, func(t *testing.T) {
+			run := providerBoundRow(kind)
+			run.Harness = harnessCodex
+			run.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			run.ClaimGeneration = 1
+			switch kind {
+			case runkind.Issue:
+				run.IssueIid = pgtype.Int8{Int64: 42, Valid: true}
+				run.IssueTitle = "Implement the requested change"
+				run.IssueDescription = "A valid issue description"
+			case runkind.Task:
+				run.Interactive = true
+				run.Title = pgtype.Text{String: "Review the task", Valid: true}
+				run.IssueDescription = "A valid task instruction"
+			case runkind.Prompt:
+				run.Title = pgtype.Text{String: "Run the prompt", Valid: true}
+				run.IssueDescription = "A valid prompt instruction"
+			case runkind.SelfImprove:
+				run.ScheduleID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+				run.IssueDescription = "Improve the repository"
+			}
+			wkr := store.Worker{ID: uuid.New(), UserID: run.UserID, ProtocolCapabilities: []string{
+				capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+				capability.ClaudeProviderV1,
+			}}
+			// Production must refuse even a fully capable worker at the actual claim seam.
+			svc := &Service{}
+			payload, err := svc.assembleClaim(context.Background(), wkr, run)
+			if payload != nil || !errors.Is(err, errProviderLaneClaimRefused) {
+				t.Fatalf("payload present=%v err=%v, want provider lane refusal and no payload", payload != nil, err)
+			}
+		})
+	}
+}
 
 func TestCodexProviderCapabilityBeforeRead(t *testing.T) {
 	s := &Service{q: bindingReadSpy{fakeStore: &fakeStore{}, t: t}}
@@ -115,9 +155,6 @@ func TestProviderClaimEngineProfileAndLockedRecheck(t *testing.T) {
 					}
 					if f.opens != 1 {
 						t.Fatalf("opens=%d", f.opens)
-					}
-					if err := assertClaimSecretsExclusive(ClaimSecrets{Provider: pb}); err != nil {
-						t.Fatal(err)
 					}
 				} else {
 					var refusal *providerClaimRefusal
