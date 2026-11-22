@@ -3628,7 +3628,7 @@ setting prints once. The rows, in order:
 | `planning model`, `planning effort` | `claude` | The optional [Claude planning settings](./worker-model.md#planning-model-and-effort), shown only for Claude. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
 | `task review model` | `claude`, `codex` | Your stored model (`your choice`) or the built-in; an unset Claude model notes `the SDK decides`. Set it with `uzi settings set task-review-model`. |
-| `task review effort` | `claude`, `codex` | Your stored level, else the worker effort it follows (the source label names the inherited setting), else the built-in `medium`; `not sent` only for Runtime default. Set it with `uzi settings set task-review-effort`; `reset` follows the worker effort again. |
+| `task review effort` | `claude`, `codex` | Your stored level, else the worker effort it follows (SOURCE is then the worker effort's source and STORED reads Default), else the built-in `medium`; `not sent` only for Runtime default. Set it with `uzi settings set task-review-effort`; `reset` follows the worker effort again. |
 
 `SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.
 When a start choice is chosen at creation, the table is followed by one block per

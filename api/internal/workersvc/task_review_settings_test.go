@@ -231,7 +231,7 @@ func TestReviewClaimTaskReviewModel(t *testing.T) {
 				t.Fatalf("notes = %+v, want %d", notes, tc.wantNotes)
 			}
 			if tc.wantNotes == 1 {
-				if !strings.Contains(notes[0].Text, "task review model") || !strings.Contains(notes[0].Text, "built-in") {
+				if !strings.Contains(notes[0].Text, "task review model") || !strings.Contains(notes[0].Text, "runs on its built-in model and sends no effort") {
 					t.Fatalf("note text does not name the withheld setting: %q", notes[0].Text)
 				}
 				if p.LastSeq != 6 || fs.lastSeqUpdated == nil || *fs.lastSeqUpdated != 6 {

@@ -358,7 +358,7 @@ Each harness's review also has its own reasoning effort, next to the model under
 lets the runtime decide.
 
 Left unset, the review follows your [worker effort](./worker-effort.md) for the
-same harness (Claude `effort`, Codex Codex effort), including a Runtime
+same harness (the Claude effort or the Codex effort), including a Runtime
 default. If the worker effort is unset too, the built-in `medium` is sent.
 **Behaviour change:** before this release no review effort was sent, so an owner
 who sets nothing now has reviews send their worker effort (the built-in
