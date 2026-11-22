@@ -1821,6 +1821,10 @@ fixture_hold_deadline() {
       *) fail 'unexpected deadline read' ;;
     esac
   }
+  uzi_cli() {
+    echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
+    echo '{"discarded":true}'
+  }
   case "$mode" in
     blocked-read)
       # The real bounded reader: the first holds read answers capturing; every later
@@ -1836,15 +1840,32 @@ fixture_hold_deadline() {
         return 28
       } ;;
     late-transition)
-      # Real wall clock (no custody_case reset): the poll starts inside the budget, but
-      # the capture turns source_only in a reply that lands 2s later, past the deadline.
-      echo 0 > "$SEQ_DIR/deadline-reads"
+      # One wall clock only: the pause is free (no virtual second on top of real time),
+      # so the poll starts inside the budget; its source_only reply lands only once the
+      # real clock has reached the deadline it was handed.
+      sleep() { :; }
       apiget_before() {
         local reads
         reads=$(( $(cat "$SEQ_DIR/deadline-reads") + 1 ))
         echo "$reads" > "$SEQ_DIR/deadline-reads"
         if [ "$reads" = 1 ]; then deadline_holds capturing; return 0; fi
-        command sleep 2; deadline_holds source_only
+        while [ "$SECONDS" -lt "$1" ]; do command sleep 0.2; done
+        deadline_holds source_only
+      } ;;
+    post-discard-late)
+      # Real bounded reader on the wall clock: the owner discard is acknowledged only
+      # after the deadline, so the verifying re-read is refused rather than unbounded.
+      local fixture_start=$SECONDS
+      echo open > "$SEQ_DIR/deadline-state"
+      curl() {
+        echo "$*" >> "$SEQ_DIR/deadline-budgets"
+        deadline_holds source_only | jq -c --arg state "$(cat "$SEQ_DIR/deadline-state")" '.holds[0].state=$state'
+      }
+      uzi_cli() {
+        echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
+        while [ "$SECONDS" -lt $((fixture_start + 3)) ]; do command sleep 0.2; done
+        echo discarded > "$SEQ_DIR/deadline-state"
+        echo '{"discarded":true}'
       } ;;
     capturing-real)
       # The real bounded reader over a capture that never settles: when the pause spends
@@ -1863,14 +1884,14 @@ fixture_hold_deadline() {
       }
       timeout=1 ;;
   esac
-  uzi_cli() {
-    echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
-    echo '{"discarded":true}'
-  }
   if output="$(resolve_fixture_source_hold "$UUID" 1 "$timeout" 2>&1)"; then
     fail "deadline overrun resolved the hold: $output"
   fi
-  [ "$(cat "$SEQ_DIR/deadline-discards")" = 0 ] || fail "discarded after the deadline: $output"
+  if [ "$mode" = post-discard-late ]; then
+    [ "$(cat "$SEQ_DIR/deadline-discards")" = 1 ] || fail "expected exactly one acknowledged discard: $output"
+  else
+    [ "$(cat "$SEQ_DIR/deadline-discards")" = 0 ] || fail "discarded after the deadline: $output"
+  fi
   case "$mode" in
     blocked-read)
       [[ "$output" == *'exceeded the 2s deadline'* ]] || fail "blocked read missed the deadline diagnostic: $output"
@@ -1880,25 +1901,30 @@ fixture_hold_deadline() {
       [[ "$output" == *'changed after the 2s deadline'* ]] || fail "late transition missed the deadline diagnostic: $output" ;;
     capturing-real)
       [[ "$output" == *'still capturing after 2s'* ]] || fail "capture timeout lost its diagnostic: $output" ;;
+    post-discard-late)
+      [[ "$output" == *'re-read failed or exceeded the 2s deadline'* ]] || fail "late post-discard re-read was not refused: $output" ;;
     slow-archives)
       [[ "$output" == *'passed before the owner disposition'* ]] || fail "slow pre-discard read missed the deadline diagnostic: $output" ;;
   esac
-  echo "deadline $mode failed closed with zero discards"
+  echo "deadline $mode failed closed with zero discards past the deadline"
 }
-custody_case "a blocked holds read past the deadline fails with zero discards" pass 'deadline blocked-read failed closed with zero discards' \
+custody_case "a blocked holds read past the deadline fails with zero discards" pass 'deadline blocked-read failed closed with zero discards past the deadline' \
   fixture_hold_deadline blocked-read
-custody_case "a capture that never settles keeps its diagnostic under the real bounded reader" pass 'deadline capturing-real failed closed with zero discards' \
+custody_case "a capture that never settles keeps its diagnostic under the real bounded reader" pass 'deadline capturing-real failed closed with zero discards past the deadline' \
   fixture_hold_deadline capturing-real
-# Deliberately outside custody_case: SECONDS must keep its wall-clock behaviour here.
+# Deliberately outside custody_case, so SECONDS keeps counting real time; each mode run
+# here keeps to that one clock (no virtual sleep second is mixed into the budget).
 wall_clock_deadline_case() {
   local name="$1" mode="$2" output
   cases=$((cases + 1))
-  if output="$(fixture_hold_deadline "$mode" 2>&1)" && [[ "$output" == *"deadline $mode failed closed with zero discards"* ]]; then
+  if output="$(fixture_hold_deadline "$mode" 2>&1)" && [[ "$output" == *"deadline $mode failed closed with zero discards past the deadline"* ]] \
+      && ! [[ "$output" == *"unexpected custody"* || "$output" == *"unexpected receipt"* ]]; then
     passed=$((passed + 1)); echo "PASS: $name"
   else echo "FAIL: $name: output [$output]"; fi
 }
 wall_clock_deadline_case "a capturing to source_only transition seen after the deadline fails with zero discards" late-transition
 wall_clock_deadline_case "a read that outlives the deadline before the owner disposition discards nothing" slow-archives
+wall_clock_deadline_case "a discard acknowledged after the deadline gets a bounded, refused re-read" post-discard-late
 
 # Execute the actual owning phase boundaries against the real owner helper. The
 # fixture holds every phase's runs plus the completed outage case (which must

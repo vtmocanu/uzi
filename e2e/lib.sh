@@ -1535,7 +1535,7 @@ resolve_fixture_source_hold() {
   reply="$(uzi_cli run discard "$run" --hold "$id" --yes --json)" || fail "fixture owner disposition failed: run=$run hold=$id"
   printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "fixture owner disposition not acknowledged: $reply"
   view="$(apiget_before "$deadline" /api/recovery/holds)" \
-    || fail "fixture owner disposition re-read failed or exceeded the ${timeout}s deadline: run=$run hold=$id"
+    || fail "fixture owner disposition re-read failed or exceeded the ${timeout}s deadline (discard was acknowledged): run=$run hold=$id"
   printf '%s' "$view" | jq -e --arg run "$run" --arg id "$id" --argjson generation "$generation" \
     '[.holds[] | select(.id==$id and .run_id==$run and .generation==$generation)] | length==1 and .[0].state=="discarded"' >/dev/null \
     || fail "fixture owner disposition has no exact discarded row: run=$run hold=$id"
