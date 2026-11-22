@@ -1425,6 +1425,19 @@ resolve_fixture_source_hold() {
   [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
   id="$(printf '%s' "$hold" | jq -r '.[0].id')"
   [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid fixture hold id: $hold"
+  # A capture still being prepared/uploaded settles on its own; wait it out on the
+  # shared deadline, then branch on whatever it became (available, source_only, released).
+  while [ "$(printf '%s' "$hold" | jq -r '.[0].attention // ""')" = capturing ]; do
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then
+      fail "fixture hold still capturing after ${timeout}s: run=$run generation=$generation hold=$id"
+    fi
+    sleep 1
+    view="$(apiget /api/recovery/holds)"
+    hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
+      '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
+    [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
+    [ "$(printf '%s' "$hold" | jq -r '.[0].id')" = "$id" ] || fail "fixture hold identity changed: run=$run generation=$generation $hold"
+  done
   state="$(printf '%s' "$hold" | jq -r '.[0].state')"
   case "$state" in
     released|discarded) pass "fixture hold already resolved: run=$run generation=$generation hold=$id"; return ;;

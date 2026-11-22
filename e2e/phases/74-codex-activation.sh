@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  admin secrets (adds then deletes a codex openai_api_key default; temporarily deletes+recreates the default anthropic_token for the codex-only sub-scenario, which cascades its anthropic_rate_limits gauge row); creates a fire-once prompt schedule pinned harness=codex (deleted before this phase ends); creates several issues+runs on REPO_ID
-# restores: admin secrets end exactly as found (one default anthropic_token = $DUMMY_ANTHROPIC, zero codex-kind secrets); the anthropic_rate_limits gauge is reseeded 55/12 (phase 47's values) under the recreated token id; an EXIT-trap fail-safe recreates the default anthropic_token if a mid-scenario assertion fails, mirroring 34-vault.sh, so a fail-soft driver never strands the admin Codex-only; every run this phase creates ends completed or cancelled (no handoff, nothing for the end-of-phase boundary)
+# restores: admin secrets end exactly as found (one default anthropic_token = $DUMMY_ANTHROPIC, zero codex-kind secrets); the anthropic_rate_limits gauge is reseeded 55/12 (phase 47's values) under the recreated token id; an EXIT-trap fail-safe recreates the default anthropic_token if a mid-scenario assertion fails, mirroring 34-vault.sh, so a fail-soft driver never strands the admin Codex-only; every run this phase creates ends completed or cancelled (no handoff); the cancelled codex-only run's capture-less generation hold is resolved explicitly with resolve_fixture_source_hold before the phase ends
 # =============================================================================
 # PRD #1429 M6 — the last milestone of the atomic Codex public-activation PRD: prove
 # the WHOLE joined change (M1-M5) end to end, offline, through the fake forge + the
@@ -258,6 +258,8 @@ pass "Codex-only user's plain run $CX_ONLY_RUN implicitly resolved to codex (D11
 # samples it (an unsettled run FAILs the phase).
 apipost "/api/runs/$CX_ONLY_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 wait_status "$CX_ONLY_RUN" cancelled
+CX_ONLY_GEN="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$CX_ONLY_RUN'")"
+[[ "$CX_ONLY_GEN" =~ ^[1-9][0-9]*$ ]] || fail "codex-only run $CX_ONLY_RUN has no claim generation: '$CX_ONLY_GEN'"
 
 # Explicit restore (not just the trap fail-safe): recreate the default anthropic_token
 # with the SAME seeded literal via the upsert-shaped PUT (34-vault.sh's own restore
@@ -277,6 +279,11 @@ trap - EXIT  # explicit restore confirmed; drop the fail-safe
          RETURNING user_secret_id")" = "$CX_NEW_ANTH_ID" ] \
   || fail "could not restore the admin token rate-limit gauge at its current revision (missing secret or seed failed)"
 pass "restored the admin's default anthropic_token ($CX_NEW_ANTH_ID) and its 55/12 rate-limit gauge (phase 47's values)"
+
+# The cancelled codex-only run left a capture-less source_only generation hold open that the
+# worker settles only slowly; resolve it explicitly once the admin's default token is back
+# (the CLI authenticates with the admin's uzc_ token, not the anthropic secret).
+resolve_fixture_source_hold "$CX_ONLY_RUN" "$CX_ONLY_GEN"
 
 # --- (7) teardown: leave admin secrets exactly as this phase found them -----------
 curl -fsS -b "$JAR" -X DELETE "$BASE/api/me/secrets/openai_api_key/$CX_OPENAI_ID" \

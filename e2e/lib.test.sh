@@ -1605,7 +1605,7 @@ fixture_owner_decision() {
         elif $mode=="duplicate" then .holds += [ .holds[0] ]
         elif $mode=="wrong-generation" then .holds[0].generation=9
         elif $mode=="released" or $mode=="discarded" then .holds[0].state=$mode
-        elif $mode=="capturing" then .holds[0] += {attention:"capturing",capture_state:"uploading"}
+        elif $mode=="capturing" or $mode=="capturing-then-source" then .holds[0] += {attention:"capturing",capture_state:"uploading"}
         elif $mode=="needs_action" then .holds[0] += {attention:"needs_action",capture_state:"needs_action"}
         elif $mode=="ready" then .holds[0].has_available_capture=true
         elif $mode=="invalid-id" then .holds[0].id="bad"
@@ -1614,9 +1614,18 @@ fixture_owner_decision() {
     '{archives:[{id:"ready-archive",hold_id:$sibling,state:"available",checksum:"stable",byte_size:123}]}
       | if $mode=="target-capture" then .archives += [{id:"partial",hold_id:$target,state:"preparing"}] else . end' > "$SEQ_DIR/fixture-archives"
   [ "$mode" != live ] || status=awaiting_approval
+  echo 0 > "$SEQ_DIR/hold-reads"
   apiget() {
+    local reads
     case "$1" in
-      /api/recovery/holds) cat "$SEQ_DIR/fixture-holds" ;;
+      /api/recovery/holds)
+        reads=$(( $(cat "$SEQ_DIR/hold-reads") + 1 ))
+        echo "$reads" > "$SEQ_DIR/hold-reads"
+        if [ "$mode" = capturing-then-source ] && [ "$reads" -ge 3 ]; then
+          jq 'del(.holds[0].capture_state) | .holds[0].attention="source_only"' "$SEQ_DIR/fixture-holds" > "$SEQ_DIR/fixture-next"
+          mv "$SEQ_DIR/fixture-next" "$SEQ_DIR/fixture-holds"
+        fi
+        cat "$SEQ_DIR/fixture-holds" ;;
       "/api/runs/$UUID/archives") cat "$SEQ_DIR/fixture-archives" ;;
       "/api/runs/$UUID") jq -nc --arg run "$UUID" --arg status "$status" '{run:{id:$run,status:$status}}' ;;
       *) fail 'unexpected fixture read' ;;
@@ -1626,6 +1635,18 @@ fixture_owner_decision() {
     [ "$*" = "run discard $UUID --hold $target --yes --json" ] || fail 'unscoped fixture disposition'
     echo $(( $(cat "$SEQ_DIR/dispositions") + 1 )) > "$SEQ_DIR/dispositions"
     [ "$mode" != rpc-failed ] || return 1
+    case "$mode" in
+      race|race-archive)
+        # The worker starts a capture after the helper read source_only; the owner
+        # RPC still lands the discard on the exact row.
+        jq '.holds[0] += {attention:"capturing",capture_state:"preparing"}' "$SEQ_DIR/fixture-holds" > "$SEQ_DIR/fixture-next"
+        mv "$SEQ_DIR/fixture-next" "$SEQ_DIR/fixture-holds" ;;
+    esac
+    if [ "$mode" = race-archive ]; then
+      jq --arg target "$target" '.archives += [{id:"raced-archive",hold_id:$target,state:"available",checksum:"raced",byte_size:7}]' \
+        "$SEQ_DIR/fixture-archives" > "$SEQ_DIR/fixture-next"
+      mv "$SEQ_DIR/fixture-next" "$SEQ_DIR/fixture-archives"
+    fi
     if [ "$mode" != post-state ]; then
       jq --arg id "$target" '(.holds[]|select(.id==$id)).state="discarded"' "$SEQ_DIR/fixture-holds" > "$SEQ_DIR/fixture-next"
       mv "$SEQ_DIR/fixture-next" "$SEQ_DIR/fixture-holds"
@@ -1645,6 +1666,10 @@ fixture_owner_decision() {
     [ "$(cat "$SEQ_DIR/dispositions")" = 0 ] || fail 'resolved hold was mutated'
   else [ "$(cat "$SEQ_DIR/dispositions")" = 1 ] || fail 'exact owner choice missing'
   fi
+  if [ "$mode" = race-archive ]; then
+    jq -e '[.archives[]|select(.id=="raced-archive" and .state=="available" and .checksum=="raced")]|length==1' "$SEQ_DIR/fixture-archives" >/dev/null \
+      || fail 'raced available archive was not preserved'
+  fi
   echo 'exact fixture generation resolved, siblings and ready archive preserved'
 }
 custody_case "exact fixture owner choice preserves sibling and archive" pass 'exact fixture generation resolved' fixture_owner_decision source
@@ -1655,9 +1680,13 @@ for mode in missing duplicate wrong-generation; do
   custody_case "fixture decision rejects $mode identity" fail 'missing/ambiguous' fixture_owner_decision "$mode"
 done
 custody_case "fixture decision rejects a live run" fail 'not terminal' fixture_owner_decision live
-for mode in capturing needs_action ready; do
+for mode in needs_action ready; do
   custody_case "fixture decision rejects $mode work" fail 'not a capture-less owner decision' fixture_owner_decision "$mode"
 done
+custody_case "fixture decision times out on a hold that stays capturing" fail 'still capturing after 120s' fixture_owner_decision capturing
+custody_case "fixture decision waits out capturing then discards the capture-less hold" pass 'exact fixture generation resolved' fixture_owner_decision capturing-then-source
+custody_case "fixture decision passes a capture race on the exact discarded row" pass 'exact fixture generation resolved' fixture_owner_decision race
+custody_case "fixture decision preserves an archive that appears during the race" pass 'exact fixture generation resolved' fixture_owner_decision race-archive
 custody_case "fixture decision catches capture evidence omitted by hold summary" fail 'has capture evidence' fixture_owner_decision target-capture
 custody_case "fixture decision refuses malformed hold id" fail 'invalid fixture hold id' fixture_owner_decision invalid-id
 custody_case "fixture decision rejects failed owner RPC" fail 'disposition failed' fixture_owner_decision rpc-failed
@@ -1674,11 +1703,17 @@ fixture_archive_receipt() {
   local COMPOSE=(fixture_agent_log)
   fixture_agent_log() { echo 'recreated agent log tail'; }
   echo 0 > "$SEQ_DIR/receipt-polls"
+  echo 0 > "$SEQ_DIR/receipt-hold-reads"
   apiget() {
+    local reads
     case "$1" in
-      /api/recovery/holds) jq -nc --arg run "$UUID" --arg id "$fixture_id" --arg mode "$mode" \
-        '{holds:[{id:$id,run_id:$run,generation:1,state:"open",inventory_guarded:true,attention:"source_only",
-          has_available_capture:true,capture_state:(if $mode=="preparing" then "preparing" else "available" end)}]}' ;;
+      /api/recovery/holds)
+        reads=$(( $(cat "$SEQ_DIR/receipt-hold-reads") + 1 ))
+        echo "$reads" > "$SEQ_DIR/receipt-hold-reads"
+        jq -nc --arg run "$UUID" --arg id "$fixture_id" --arg mode "$mode" --argjson reads "$reads" \
+        '(if $mode=="capturing-timeout" or ($mode=="capturing-available" and $reads<2) then "capturing" else "source_only" end) as $attention
+        | {holds:[{id:$id,run_id:$run,generation:1,state:"open",inventory_guarded:true,attention:$attention,
+          has_available_capture:($attention!="capturing"),capture_state:(if $attention=="capturing" then "preparing" else "available" end)}]}' ;;
       "/api/runs/$UUID/archives") echo '{"archives":[{"id":"kept","state":"available","checksum":"stable","byte_size":12}]}' ;;
       "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
       *) fail 'unexpected fixture receipt route' ;;
@@ -1719,28 +1754,43 @@ custody_case "captured fixture refuses mid-wait discard" fail 'unexpected dispos
 custody_case "captured fixture requires matching archive proof" fail 'lacks archive proof' fixture_archive_receipt no-proof
 custody_case "captured fixture preserves exact hold identity" fail 'changed identity' fixture_archive_receipt wrong-id
 custody_case "captured fixture timeout retains row worker and recreation log" fail 'recreated agent log tail' fixture_archive_receipt timeout
-custody_case "preparing fixture fails immediately" fail 'not a capture-less owner decision' fixture_archive_receipt preparing
+custody_case "capturing fixture that never settles times out on the shared deadline" fail 'still capturing after 2s' fixture_archive_receipt capturing-timeout
+custody_case "capturing fixture that becomes available waits for archive FINAL" pass 'fixture archive custody receipt:' fixture_archive_receipt capturing-available
 
 # Execute the actual owning phase boundaries against the real owner helper. The
-# nine-hold fixture includes the completed outage case, which must remain open.
+# fixture holds every phase's runs plus the completed outage case (which must
+# remain open); a phase may end ONLY its own (run, generation) obligations.
 fixture_phase_boundary() {
-  local phase="$1" before after run gen n=0 entry
+  local phase="$1" want="$2" intended="$3" before after n=0 entry name gen run
   local X=b4dec5cf-e6d4-413b-b3a8-0005a2835701 ED=b4dec5cf-e6d4-413b-b3a8-0005a2835702
   local RUN_KA=b4dec5cf-e6d4-413b-b3a8-0005a2835703 RUN_KB=b4dec5cf-e6d4-413b-b3a8-0005a2835704
   local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
   local RUN_C=b4dec5cf-e6d4-413b-b3a8-0005a2835707
+  local E=b4dec5cf-e6d4-413b-b3a8-0005a2835708 EA=b4dec5cf-e6d4-413b-b3a8-0005a2835709
+  local G=b4dec5cf-e6d4-413b-b3a8-0005a2835710 GA=b4dec5cf-e6d4-413b-b3a8-0005a2835711
+  local AS_RUN=b4dec5cf-e6d4-413b-b3a8-0005a2835712 AS_RUN_RF=b4dec5cf-e6d4-413b-b3a8-0005a2835713
+  local AS_RUN2=b4dec5cf-e6d4-413b-b3a8-0005a2835714 AS_RUN3=b4dec5cf-e6d4-413b-b3a8-0005a2835715
+  local RUN_D=b4dec5cf-e6d4-413b-b3a8-0005a2835716 RUN_E=b4dec5cf-e6d4-413b-b3a8-0005a2835717
+  local CX_ONLY_RUN=b4dec5cf-e6d4-413b-b3a8-0005a2835718
   # shellcheck disable=SC2034  # read by the extracted owning phase statements
   local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3 GEN_C_ORIGINAL=1
+  # shellcheck disable=SC2034  # read by the extracted owning phase statements
+  local GEN_E=1 GEN_EA=1 GEN_G=1 GEN_GA=1 AS_GEN=1 AS_GEN_RF=1 AS_GEN2=1 AS_GEN3=2 CX_ONLY_GEN=1
   # shellcheck disable=SC2034  # read by the extracted phase-42 boundary
   local RA_RESTORE_AT=2026-10-08T09:08:20Z
   echo '{"holds":[]}' > "$SEQ_DIR/boundary-holds"
-  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$RUN_C:1" "$RUN_C:2" "$UUID:1"; do
+  # Every row is a capture-less open hold except the already-released first hold of AS_RUN3.
+  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$RUN_C:1" "$RUN_C:2" \
+      "$E:1" "$EA:1" "$G:1" "$GA:1" "$AS_RUN:1" "$AS_RUN_RF:1" "$AS_RUN2:1" "$AS_RUN3:1" "$AS_RUN3:2" \
+      "$RUN_D:1" "$RUN_E:1" "$CX_ONLY_RUN:1" "$UUID:1"; do
     run="${entry%:*}"; gen="${entry##*:}"; n=$((n + 1))
     jq --arg run "$run" --argjson gen "$gen" --arg id "$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")" \
-      '.holds += [{id:$id,run_id:$run,generation:$gen,state:"open",attention:"source_only",has_available_capture:false}]' \
+      '.holds += [{id:$id,run_id:$run,generation:$gen,state:(if $run=="'"$AS_RUN3"'" and $gen==1 then "released" else "open" end),
+        attention:"source_only",has_available_capture:false}]' \
       "$SEQ_DIR/boundary-holds" > "$SEQ_DIR/boundary-next"
     mv "$SEQ_DIR/boundary-next" "$SEQ_DIR/boundary-holds"
   done
+  cp "$SEQ_DIR/boundary-holds" "$SEQ_DIR/boundary-initial"
   apiget() {
     case "$1" in
       /api/recovery/holds) cat "$SEQ_DIR/boundary-holds" ;;
@@ -1759,16 +1809,38 @@ fixture_phase_boundary() {
     echo '{"discarded":true}'
   }
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
+  [ "$before" = 22 ] || fail "fixture should start with 22 open holds, has $before"
   eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$ROOT/e2e/phases/$phase.sh")"
   after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  [ "$before" = 11 ] && [ "$after" -lt 10 ] || fail 'next sweep still blocked by deliberate fixture holds'
-  jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
+  [ "$after" = $((before - want)) ] || fail "$phase: expected $((before - want)) open holds after, got $after"
+  # Identity: each intended (run, generation) ends discarded or released; every other
+  # row, the completed outage evidence included, is byte-for-byte unchanged.
+  for entry in $intended; do
+    name="${entry%:*}"; gen="${entry##*:}"
+    run="${!name}"
+    jq -e --arg run "$run" --argjson gen "$gen" \
+      '[.holds[]|select(.run_id==$run and .generation==$gen)] | length==1 and (.[0].state|IN("discarded","released"))' \
+      "$SEQ_DIR/boundary-holds" >/dev/null || fail "$phase: intended hold $name generation $gen was not resolved"
+  done
+  jq -e --argjson want "$want" --argjson initial "$(cat "$SEQ_DIR/boundary-initial")" \
+    '([.holds[] | . as $h | select(($initial.holds[]|select(.id==$h.id)).state != $h.state)] | length) == $want' \
+    "$SEQ_DIR/boundary-holds" >/dev/null || fail "$phase: the number of changed holds is not exactly $want"
+  jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)] | length==1 and .[0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
     || fail 'completed outage case lost its evidence'
-  echo 'own phase relieved capacity while completed outage evidence stayed open'
+  echo "$phase ended exactly $want intended holds ($before -> $after open); completed outage evidence stayed open"
 }
-for phase in 42-api-outage-readoption 45-bounded-concurrency 52-api-outage-outbox; do
-  custody_case "$phase resolves only its intentional fixture obligations" pass 'own phase relieved capacity' fixture_phase_boundary "$phase"
-done
+# phase  count  intended NAME:generation identities (NAME is the phase variable holding the run id)
+fixture_phase_case() {
+  local phase="$1" want="$2" intended="$3"
+  custody_case "$phase resolves only its intentional fixture obligations" pass "$phase ended exactly $want intended holds" \
+    fixture_phase_boundary "$phase" "$want" "$intended"
+}
+fixture_phase_case 42-api-outage-readoption 7 'E:1 EA:1 G:1 GA:1 X:1 X:2 ED:1'
+fixture_phase_case 45-bounded-concurrency 4 'RUN_KA:1 RUN_KB:1 RUN_C:1 RUN_C:2'
+fixture_phase_case 52-api-outage-outbox 3 'RUN_F1:1 RUN_F2:1 RUN_F2:3'
+fixture_phase_case 48-auto-selection 4 'AS_RUN:1 AS_RUN_RF:1 AS_RUN2:1 AS_RUN3:2'
+fixture_phase_case 73-forge-unreachable-park 2 'RUN_D:1 RUN_E:1'
+fixture_phase_case 74-codex-activation 1 'CX_ONLY_RUN:1'
 
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.
