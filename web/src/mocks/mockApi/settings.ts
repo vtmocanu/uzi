@@ -38,7 +38,7 @@ import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "..
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
-import { mockTaskReviewEffort, mockTaskReviewEffortCells, mockTaskReviewModelCells } from "./taskReviewModels";
+import { claudeReviewModelError, mockTaskReviewEffort, mockTaskReviewEffortCells, mockTaskReviewModelCells } from "./taskReviewModels";
 import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
@@ -1903,11 +1903,9 @@ export const settingsApi = {
       // PRD #1570: blank clears to the built-in; the Claude lane refuses a Codex role id,
       // mirroring the server's Claude-lane validator.
       const trimmed = patch.task_review_model?.trim() ?? "";
-      if (trimmed !== "" && /\s/.test(trimmed)) {
-        throw new ApiError(400, "task_review_model must be a single token with no spaces");
-      }
-      if (CODEX_ROLE_MODELS.includes(trimmed)) {
-        throw new ApiError(400, "task_review_model: model is a Codex model id");
+      const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+      if (modelError !== "") {
+        throw new ApiError(400, `task_review_model: ${modelError}`);
       }
       next = { ...next, task_review_model: trimmed === "" ? null : trimmed };
     }

@@ -72,4 +72,35 @@ describe("mock user settings: task review (PRD #1570)", () => {
     expect(settings.task_review_model).toBeNull();
     expect(settings.codex_task_review_model).toBeNull();
   });
+
+  it("refuses Claude review models the server's ValidateModel refuses, writing nothing", async () => {
+    const api = await reload();
+    for (const bad of ["op\u0000us", "op\u200bus", "op\u202eus", "x".repeat(101), "é".repeat(51)]) {
+      await expect(api.putMySettings({ task_review_model: bad })).rejects.toMatchObject({ status: 400 });
+    }
+    const { settings } = await api.getMySettings();
+    expect(settings.task_review_model).toBeNull();
+    // The 100-byte boundary itself is accepted, like the server.
+    const ok = await api.putMySettings({ task_review_model: "x".repeat(100) });
+    expect(ok.settings.task_review_models?.[0]).toMatchObject({ source: "user_default" });
+  });
+});
+
+describe("mock task-review cells for corrupt stored values (PRD #1570)", () => {
+  it("a stored Claude model the lane refuses reads as the SDK default", async () => {
+    const { mockTaskReviewModelCells } = await import("./mockApi/taskReviewModels");
+    for (const bad of ["op\u0000us", "op\u200bus", "x".repeat(101), "gpt-6-astra"]) {
+      expect(mockTaskReviewModelCells(bad, null)[0]).toMatchObject({ model: bad, resolved_model: "", source: "builtin" });
+    }
+  });
+
+  it("a corrupt stored review effort resolves to the built-in medium, sent, whatever the worker effort", async () => {
+    const { mockTaskReviewEffortCells } = await import("./mockApi/taskReviewModels");
+    const high = { harness: "claude", effort: "high", default_effort: "medium", default_source: "builtin", resolved_effort: "high", source: "user_default", mode: "explicit" } as const;
+    const runtime = { harness: "codex", effort: "runtime", default_effort: "medium", default_source: "builtin", resolved_effort: null, source: "user_default", mode: "runtime_default" } as const;
+    const cells = mockTaskReviewEffortCells({ claude: "turbo", codex: "turbo" }, { claude: high, codex: runtime });
+    for (const c of cells) {
+      expect(c).toMatchObject({ effort: "turbo", resolved_effort: "medium", source: "builtin", mode: "explicit" });
+    }
+  });
 });
