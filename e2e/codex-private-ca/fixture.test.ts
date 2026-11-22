@@ -12,9 +12,53 @@ import { createServer as netServer, type Socket } from "node:net";
 
 const source = "/run/cdr-private-ca/source.pem";
 
-for (const row of ["stalled", "trusted", "no-extra"] as const) {
-  const trusted = row !== "no-extra";
-  test(row === "trusted" ? "private CA completes Responses" : row === "no-extra" ? "no extra CA refuses private TLS" : "stalled TLS has bounded typed timeout", async () => {
+// These startup controls call baked loadConfig without constructing an executor.
+for (const kind of ["missing", "unreadable", "malformed", "oversized", "65certs"] as const) {
+  test(`loadConfig rejects ${kind} CA with sanitized error`, async () => {
+    assert.equal(process.getuid?.(), 10001);
+    const { loadConfig } = await import("/app/src/config.ts");
+    const file = `/run/cdr-private-ca/${kind}.pem`;
+    if (kind === "missing") {
+      await assert.rejects(fs.stat(file), { code: "ENOENT" });
+    } else {
+      const stat = await fs.stat(file);
+      assert.deepEqual([stat.uid, stat.gid, stat.mode & 0o777],
+        [0, 10001, kind === "unreadable" ? 0o400 : 0o440]);
+      if (kind === "unreadable") {
+        await assert.rejects(fs.readFile(file), { code: "EACCES" });
+      } else {
+        const bytes = await fs.readFile(file);
+        if (kind === "oversized") assert.equal(bytes.length, 1024 * 1024 + 1);
+        if (kind === "65certs") {
+          assert.equal(bytes.toString().match(/-----BEGIN CERTIFICATE-----/g)?.length, 65);
+          assert.ok(bytes.length < 1024 * 1024);
+        }
+        if (kind === "malformed") assert.equal(bytes.toString(), "-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n");
+      }
+    }
+    assert.throws(() => loadConfig({
+      UZI_API_URL: "http://127.0.0.1:1",
+      UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"),
+      UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk", UZI_CODEX_CA_FILE: file,
+    }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      const fixed = "Invalid UZI_CODEX_CA_FILE configuration";
+      assert.equal(error.message, fixed);
+      assert.equal(error.stack, fixed);
+      assert.equal(error.cause, undefined);
+      const exposed = [String(error), error.stack, JSON.stringify(error)].join("\n");
+      assert.ok(!exposed.includes(file));
+      assert.ok(!exposed.includes("-----BEGIN CERTIFICATE-----"));
+      assert.ok(!exposed.includes("invalid\n"));
+      return true;
+    });
+  });
+}
+
+for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
+  const trusted = row === "stalled" || row === "trusted";
+  const caFile = row === "unrelated" ? "/run/cdr-private-ca/unrelated.pem" : source;
+  test(row === "trusted" ? "private CA completes Responses" : row === "no-extra" ? "no extra CA refuses private TLS" : row === "unrelated" ? "unrelated CA refuses private TLS" : "stalled TLS has bounded typed timeout", async () => {
     console.log("row-start", row, "container-elapsed-seconds", Date.now() / 1000 - Number(process.env.FIXTURE_CONTAINER_STARTED_SECONDS));
     const { CodexTransportError } = await import("/app/src/codex/transport.ts");
     const { createLogger } = await import("/app/src/log.ts");
@@ -28,10 +72,10 @@ for (const row of ["stalled", "trusted", "no-extra"] as const) {
     assert.equal(process.env.UZI_UID_SPLIT, "1");
     assert.equal(process.env.NODE_EXTRA_CA_CERTS, undefined);
     assert.equal(process.env.UZI_CLI_CA_FILE, undefined);
-    const stat = await fs.stat(source);
+    const stat = await fs.stat(caFile);
     assert.deepEqual([stat.uid, stat.gid, stat.mode & 0o777], [0, 10001, 0o440]);
-    assert.match(await fs.readFile(source, "utf8"), /BEGIN CERTIFICATE/);
-    const read = runnerCommand("/bin/cat", [source]);
+    assert.match(await fs.readFile(caFile, "utf8"), /BEGIN CERTIFICATE/);
+    const read = runnerCommand("/bin/cat", [caFile]);
     assert.throws(() => execFileSync(read.command, read.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" }),
       (error: any) => error.status !== 0 && /Permission denied/.test(error.stderr.toString()));
     const credential = ["cdr", "synthetic", "provider", "claim"].join("-");
@@ -119,7 +163,7 @@ for (const row of ["stalled", "trusted", "no-extra"] as const) {
     try {
       const cfg = loadConfig({ UZI_API_URL: `http://127.0.0.1:${(api.address() as any).port}`,
         UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"), UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk",
-        ...(trusted ? { UZI_CODEX_CA_FILE: source } : {}) });
+        ...(row !== "no-extra" ? { UZI_CODEX_CA_FILE: caFile } : {}) });
       const id = `ca-${row}`;
       const workspace = `/data/${id}-work`;
       await fs.mkdir(workspace, { mode: 0o2770 });
@@ -171,7 +215,7 @@ for (const row of ["stalled", "trusted", "no-extra"] as const) {
         console.log("await-returned", id, "executor.run rejection");
         assert.equal(receipts.length, 0);
         assert.equal(httpRequests, 0, "zero HTTP requests, including rejected routes");
-        if (row === "no-extra") assert.ok(tlsErrors > 0, "our listener observed failed handshakes");
+        if (row === "no-extra" || row === "unrelated") assert.ok(tlsErrors > 0, "our listener observed failed handshakes");
         else assert.ok(connections > 0, "our stalled listener accepted TCP");
       }
       assert.deepEqual(unexpected, []);

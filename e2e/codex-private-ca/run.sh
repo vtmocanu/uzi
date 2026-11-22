@@ -13,7 +13,7 @@ EXPECTED=${FIXTURE_EXPECTED_ID:-sha256:eda31cfe5c9f9e9d819174eb33ecd060f69cf5e9c
 actual=$(docker image inspect "$IMAGE" --format '{{.Id}}')
 printf 'image=%s id=%s revision=%s\n' "$IMAGE" "$actual" "$(git rev-parse HEAD)"
 test "$actual" = "$EXPECTED"
-sha256sum "$HERE/run.sh" "$HERE/fixture.test.ts"
+sha256sum "$HERE/run.sh" "$HERE/fixture.test.ts" "$HERE/README.md"
 scratch=$(mktemp -d "$REPO/.uzi/scratch/private-ca.XXXXXX")
 name="cdr-private-ca-$$"
 cleanup() {
@@ -25,8 +25,9 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$scratch/ca.key" -out "$scrat
 openssl req -newkey rsa:2048 -nodes -keyout "$scratch/server.key" -out "$scratch/server.csr" -subj /CN=localhost >/dev/null 2>&1
 printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$scratch/extensions"
 openssl x509 -req -in "$scratch/server.csr" -CA "$scratch/ca.pem" -CAkey "$scratch/ca.key" -CAcreateserial -out "$scratch/server.pem" -days 1 -extfile "$scratch/extensions" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$scratch/unrelated.key" -out "$scratch/unrelated.pem" -days 1 -subj /CN=cdr-unrelated-ca >/dev/null 2>&1
 mkdir "$scratch/mount"
-cp "$scratch/ca.pem" "$scratch/server.key" "$scratch/server.pem" "$scratch/mount/"
+cp "$scratch/unrelated.pem" "$scratch/ca.pem" "$scratch/server.key" "$scratch/server.pem" "$scratch/mount/"
 chmod 755 "$scratch" "$scratch/mount"
 chmod 644 "$scratch/mount/"*
 set +e
@@ -44,6 +45,18 @@ timeout --kill-after=10s 240s docker run --rm --name "$name" --network none \
     cp /fixture/ca.pem /run/cdr-private-ca/source.pem
     chown 0:10001 /run/cdr-private-ca/source.pem
     chmod 0440 /run/cdr-private-ca/source.pem
+    cp /fixture/unrelated.pem /run/cdr-private-ca/unrelated.pem
+    cp /fixture/ca.pem /run/cdr-private-ca/unreadable.pem
+    printf "%s\n" "-----BEGIN CERTIFICATE-----" "invalid" "-----END CERTIFICATE-----" > /run/cdr-private-ca/malformed.pem
+    head -c 1048577 /dev/zero > /run/cdr-private-ca/oversized.pem
+    i=0
+    while [ "$i" -lt 65 ]; do
+      cat /fixture/ca.pem >> /run/cdr-private-ca/65certs.pem
+      i=$((i + 1))
+    done
+    chown 0:10001 /run/cdr-private-ca/*.pem
+    chmod 0440 /run/cdr-private-ca/*.pem
+    chmod 0400 /run/cdr-private-ca/unreadable.pem
     exec /usr/local/sbin/uzi-entrypoint /bin/sh -c "cd /app && exec node --import tsx --test --test-concurrency=1 --test-timeout=120000 /work/private-ca/fixture.test.ts"
   '
 rc=$?
