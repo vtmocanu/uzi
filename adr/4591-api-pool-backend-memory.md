@@ -171,16 +171,19 @@ UZI_POOL_MEMORY_ROUNDS=24 UZI_POOL_MEMORY_REPS=1 UZI_POOL_MEMORY_JIT=default \
 UZI_POOL_MEMORY_JIT=off UZI_POOL_MEMORY_PHASES=latency,cold,stress UZI_POOL_MEMORY_OUT=out-c.jsonl \
   go test -count=1 -timeout 58m -run '^TestPoolBackendMemoryMeasurement$' -v ./internal/store
 # (d) wide-read sample (run 3's wide section; see the provenance caveat below)
-UZI_POOL_MEMORY_PHASES=wide UZI_POOL_MEMORY_OUT=out-d.jsonl \
+UZI_POOL_MEMORY_JIT=default UZI_POOL_MEMORY_PHASES=wide UZI_POOL_MEMORY_OUT=out-d.jsonl \
   go test -count=1 -timeout 58m -run '^TestPoolBackendMemoryMeasurement$' -v ./internal/store
 ```
 
 The three runs (a to c) took 1626 s, 814 s and 458 s on the same container.
 
 Each invocation now names its databases `pm_<32-hex uuid>_...` and drops only the databases it
-created. A crashed run can leave them behind; list them with
-`SELECT datname FROM pg_database WHERE datname ~ '^pm_[0-9a-f]{32}_'` and drop them manually.
-Nothing sweeps them automatically.
+created. A crashed run can leave them behind, and nothing sweeps them automatically. To clean
+up after one, take that invocation's exact `database_prefix` from its `meta` output record and
+confirm the invocation has stopped, then drop only the databases named `<database_prefix>_...`.
+`SELECT datname FROM pg_database WHERE datname ~ '^pm_[0-9a-f]{32}_'` is an inventory of every
+invocation's databases, active runs included, never a deletion list. If the prefix or the
+stopped state cannot be established, drop nothing.
 
 ### Memory, JIT off (primary)
 

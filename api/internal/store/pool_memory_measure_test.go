@@ -40,7 +40,7 @@ package store_test
 // which rechecks the marker on its own connection and runs nothing without it. A database is
 // dropped only if this run's CREATE of it succeeded; an ambiguous CREATE outcome preserves the
 // database and reports the manual DROP. There is no startup cleanup: a crashed run's leftovers
-// are swept by hand (see pmLab). Measurements run on CREATE DATABASE ... TEMPLATE clones,
+// are dropped by hand, by exact prefix only (see pmLab). Measurements run on CREATE DATABASE ... TEMPLATE clones,
 // each with its own observer connection, dropped afterwards. The isolation differs per phase:
 //   - Memory: one clone per candidate x repetition.
 //   - Latency and stress: one clone per round, shared by every candidate in that round (see
@@ -3456,7 +3456,10 @@ func pmCheckMarker(ctx context.Context, c *pgx.Conn) error {
 // Every invocation names its databases from its own random prefix (template prefix+"_tpl",
 // clones prefix+"_"+label) and drops only databases whose CREATE it saw succeed, so it can
 // never drop a database it did not create. There is no startup cleanup. After a crashed run,
-// leftovers can be listed and dropped by hand (never automatically):
+// drop its leftovers by hand (never automatically), and only by that invocation's exact
+// database_prefix from its meta record, once the invocation is confirmed stopped. The query
+// below inventories every invocation's databases, active runs included; it is never a
+// deletion list. If the prefix or stopped state is unknown, drop nothing.
 //
 //	SELECT datname FROM pg_database WHERE datname ~ '^pm_[0-9a-f]{32}_'
 //
