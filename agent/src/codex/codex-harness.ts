@@ -123,7 +123,7 @@ import {
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import type { CodexAuthSuspensionLease, CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
+import { codexConnectionBudget, type CodexAuthSuspensionLease, type CodexAppServerAuthMode, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -1703,16 +1703,19 @@ export class CodexHarness implements RunHarness {
     try { await this.onTokenUsageIncomplete(this.accountant.incompleteNoticeText!); } catch { /* execution continues */ }
   }
 
+  private connectionBudget?: () => number;
+
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
     this.registry.assertWorkAdmission();
     if (this.transport) {
       // A prior startup may have failed after the root was registered. Re-enter the
       // pinned auth owner so its poison state remains the explicit failure, and never
       // proceed merely because a transport object exists.
-      await this.appServerAuth?.authenticate(this.transport, signal);
+      await this.appServerAuth?.authenticate(this.transport, signal, this.connectionBudget);
       if (!this.notes) this.notes = this.transport.notifications();
       return;
     }
+    this.connectionBudget = codexConnectionBudget(this.authMode);
     const reservation = this.registry.reserveLaunch("provider");
     if (reservation.kind !== "reserved") {
       throw new CodexHarnessError({ category: "protocol", message: "codex provider launch admission is closed" });
@@ -1778,7 +1781,7 @@ export class CodexHarness implements RunHarness {
     };
     // The pinned initialize/initialized/login sequence completes before any thread/model
     // work. The auth owner has no reference to the model callback broker.
-    await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal) ?? Promise.resolve());
+    await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal, this.connectionBudget) ?? Promise.resolve());
     // Single-consumer: obtain the notifications iterator exactly once for the root.
     this.notes = this.transport.notifications();
     this.log.debug("codex provider root launched", { supervisorPid: launched.supervisorPid });
@@ -1851,7 +1854,7 @@ export class CodexHarness implements RunHarness {
         config: this.threadConfig(),
         developerInstructions: rendered.leadPrompt.systemPrompt,
       },
-      { signal },
+      { signal, deadlineMs: this.connectionBudget?.() },
     );
     const id = res?.thread?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -1883,7 +1886,7 @@ export class CodexHarness implements RunHarness {
           config: this.threadConfig(),
           developerInstructions: rendered.leadPrompt.systemPrompt,
         },
-        { signal: request.signal },
+        { signal: request.signal, deadlineMs: this.connectionBudget?.() },
       );
     } catch (error) {
       // Only a provider rejection of thread/resume is a lost lineage. Transport
@@ -1932,11 +1935,12 @@ export class CodexHarness implements RunHarness {
     this.dispatchStartedAt = this.nowMs();
     // A sent RPC can spend even if its acknowledgement never arrives.
     onDispatch?.();
-    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
+    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal, deadlineMs: this.connectionBudget?.() });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex turn/start returned no turn id" });
     }
+    this.connectionBudget = undefined;
     this.admissionAttempt?.bind(id);
     return id;
   }

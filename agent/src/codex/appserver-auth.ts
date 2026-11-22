@@ -14,11 +14,19 @@
 import { randomUUID } from "node:crypto";
 
 import type { HarnessError } from "../harness.js";
-import type { CodexNotification, CodexTransport } from "./transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "./transport.js";
 import { RunResidueBlockedError, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 /** Outer bridge budget: above WorkerClient's 8s cap, below app-server's hard 10s cap. */
 export const CODEX_REFRESH_BRIDGE_BUDGET_MS = 9_000;
+
+/** Internal per-root setup allowance; no provider configuration can extend it.
+ * The transport owns timer cleanup. Abort signals retain any earlier run bound. */
+export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined): (() => number) | undefined {
+  if (mode !== "provider") return undefined;
+  const end = performance.now() + 10_000;
+  return () => Math.max(1, Math.ceil(end - performance.now()));
+}
 
 const INITIALIZE_METHOD = "initialize";
 const INITIALIZED_METHOD = "initialized";
@@ -81,7 +89,7 @@ export interface CodexAuthSuspensionLease {
 export interface CodexAppServerAuthSession {
   readonly mode: CodexAppServerAuthMode;
   /** Initialize and authenticate exactly this app-server connection. */
-  authenticate(transport: CodexTransport, signal?: AbortSignal): Promise<void>;
+  authenticate(transport: CodexTransport, signal?: AbortSignal, connectionBudget?: () => number): Promise<void>;
   /** Handle only the pinned subscription-refresh server request. */
   handleServerRequest(
     transport: CodexTransport,
@@ -177,7 +185,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     this.mode = config.mode;
   }
 
-  authenticate(transport: CodexTransport, signal?: AbortSignal): Promise<void> {
+  authenticate(transport: CodexTransport, signal?: AbortSignal, connectionBudget?: () => number): Promise<void> {
     if (this.interceptedClosed) {
       return Promise.reject(transportError("codex authentication request admission is closed"));
     }
@@ -191,7 +199,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
 
     this.transport = transport;
     this.state = "starting";
-    const startup = this.start(transport, signal).then(
+    const startup = this.start(transport, signal, connectionBudget).then(
       () => {
         if (this.state === "poisoned") throw protocolError("codex authentication session is poisoned");
         this.state = "ready";
@@ -199,6 +207,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       (error: unknown) => {
         this.poison();
         if (error instanceof CodexAppServerAuthError) throw error;
+        if (error instanceof CodexTransportError && error.failure.category === "timeout") throw error;
         // issue #2213: the quarantine refusal reaches the runner as itself, never as a transport fault.
         if (error instanceof RunResidueBlockedError) throw error;
         throw transportError("codex authentication startup failed");
@@ -397,14 +406,14 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     }
   }
 
-  private async start(transport: CodexTransport, signal?: AbortSignal): Promise<void> {
+  private async start(transport: CodexTransport, signal?: AbortSignal, connectionBudget?: () => number): Promise<void> {
     const initialized = await transport.request<unknown>(
       INITIALIZE_METHOD,
       {
         clientInfo: { name: "uzi", title: "uzi", version: "0.1.0-m4" },
         capabilities: { experimentalApi: true, requestAttestation: false },
       },
-      { signal },
+      { signal, deadlineMs: connectionBudget?.() },
     );
     const init = asObject(initialized);
     if (
@@ -437,7 +446,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         };
     // issue #2213: a quarantined worker sends no provider credential (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
-    const response = await transport.request<unknown>(LOGIN_METHOD, loginParams, { signal });
+    const response = await transport.request<unknown>(LOGIN_METHOD, loginParams, { signal, deadlineMs: connectionBudget?.() });
     const expected = this.config.mode !== "subscription" ? "apiKey" : "chatgptAuthTokens";
     if (asObject(response)?.type !== expected) {
       throw protocolError("codex account/login/start returned an unexpected authentication mode");

@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import { PassThrough } from "node:stream";
+import { createCodexTransport, CodexTransportError } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 
 import {
@@ -17,6 +19,27 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 }
+
+it("provider pending initialize keeps the typed connection deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const inbound = new PassThrough();
+  const outbound = new PassThrough();
+  const transport = createCodexTransport({ inbound, outbound });
+  const auth = createCodexAppServerAuth({ mode: "provider", apiKey: "fixture-key" });
+  const pending = auth.authenticate(transport, undefined, () => 10);
+  let failure: unknown;
+  const settled = pending.catch(error => { failure = error; });
+  t.mock.timers.tick(10);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    assert.ok(failure instanceof CodexTransportError);
+    assert.equal(failure.failure.category, "timeout");
+    assert.equal(failure.message, "codex transport request deadline exceeded");
+  } finally {
+    await transport.close();
+    await settled;
+  }
+});
 
 const INITIAL = { accessToken: "initial-access-token", accountId: "server-account-1" };
 const REFRESHED = { accessToken: "refreshed-access-token", accountId: "server-account-1" };

@@ -70,7 +70,7 @@ import type {
   HarnessThrownFailure,
 } from "../harness.js";
 import type { CodexProviderConfig } from "./codex-harness.js";
-import type { CodexAppServerAuthSession } from "./appserver-auth.js";
+import { codexConnectionBudget, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexAdvice } from "./render.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -338,6 +338,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
       return disposePromise;
     };
+    const connectionBudget = codexConnectionBudget(this.authMode);
     const work = (async (): Promise<AdviceResult> => {
       const launched = await this.launchRoot({
         kind: "advice",
@@ -355,7 +356,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
       disposeSeam = launched.dispose;
       transportSeam = launched.transport;
-      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver, operation);
+      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver, operation, connectionBudget);
     })();
 
     // Late-disposal owner: a launch that resolves AFTER the finally already ran (a slow
@@ -438,16 +439,17 @@ export class CodexAdviceHarness implements AdviceHarness {
     signal: AbortSignal,
     usageObserver?: AdviceRequest["usageObserver"],
     operation?: AdviceOperation,
+    connectionBudget?: () => number,
   ): Promise<AdviceResult> {
     // Authentication is setup, so it completes before any thread/model work.
-    await this.appServerAuth?.authenticate(transport, signal);
-    const threadId = await this.startThread(transport, cwd, rendered, model, signal);
+    await this.appServerAuth?.authenticate(transport, signal, connectionBudget);
+    const threadId = await this.startThread(transport, cwd, rendered, model, signal, connectionBudget);
     // PRD #2603: a fresh accountant per call, one fresh (non-resumed) thread, so a duplicate or
     // stale `thread/tokenUsage/updated` note is never counted twice (the accountant's magnitude
     // gate) and nothing carries over from another call.
     const accountant = new CodexUsageAccountant();
     accountant.registerThread(threadId, model ?? this.provider.model, false);
-    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal, operation);
+    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal, operation, connectionBudget);
 
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
@@ -630,6 +632,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     rendered: RenderedCodexAdvice,
     model: string | undefined,
     signal: AbortSignal,
+    connectionBudget?: () => number,
   ): Promise<string> {
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
@@ -648,7 +651,7 @@ export class CodexAdviceHarness implements AdviceHarness {
         },
         developerInstructions: rendered.systemPrompt,
       },
-      { signal },
+      { signal, deadlineMs: connectionBudget?.() },
     );
     const id = res?.thread?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -664,6 +667,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     model: string | undefined,
     signal: AbortSignal,
     operation?: AdviceOperation,
+    connectionBudget?: () => number,
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
@@ -679,7 +683,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       check();
     } while (permit?.() === false);
     this.admissionAttempt = this.admissionReporter?.begin(threadId);
-    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
+    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal, deadlineMs: connectionBudget?.() });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexAdviceError({ category: "protocol", message: "codex advice turn/start returned no turn id" });

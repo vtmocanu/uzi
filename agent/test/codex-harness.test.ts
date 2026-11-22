@@ -6815,6 +6815,35 @@ describe("CodexHarness: no-turn preparation", () => {
 });
 
 describe("CodexHarness: preparation deadline", () => {
+  for (const method of ["thread/start", "thread/resume", "turn/start"]) {
+    it(`provider pending ${method} uses the connection deadline`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      let sent!: () => void;
+      const ready = new Promise<void>(resolve => { sent = resolve; });
+      outbound.on("data", (chunk: Buffer) => {
+        const frame = JSON.parse(chunk.toString());
+        if (frame.method === method) { sent(); return; }
+        inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+      });
+      const { harness } = makeHarness({ authMode: "provider",
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) });
+      const request = makeRequest({ resumeSessionId: method === "thread/resume" ? "saved" : undefined });
+      const pending = method === "turn/start"
+        ? collect(harness.startTurn(request).events)
+        : harness.prepareRootAndThread(request, { allowFresh: true });
+      const rejected = assert.rejects(pending, error =>
+        error instanceof CodexTransportError && error.failure.category === "timeout");
+      try {
+        await ready;
+        t.mock.timers.tick(10_001);
+        await rejected;
+      } finally { await harness.close(); }
+    });
+  }
+
   it("retains a transport timeout without fresh fallback", async () => {
     const failure = new CodexTransportError({ category: "timeout", message: "deadline" });
     const transport = new FakeTransport(method => {
