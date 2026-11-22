@@ -95,7 +95,7 @@ opportunity is spent and the context stays queued. A second inactivity gate,
 - **[Code]** The hint reads the journal once for each distinct run in the
   whole queue, on every materializing live pass
   (`agent/src/recovery.ts:4380-4390`). Passes that are credential-blocked,
-  lack discovery or the inventory feature (`agent/src/recovery.ts:6129`), or
+  lack discovery or the inventory feature (`agent/src/recovery.ts:6130`), or
   run with a cap below 2 skip it.
 - **[Inference]** A newly owed context has no frozen record, so it can never
   be priority. The #3614 reservation covers only invalidated-inventory
@@ -336,7 +336,7 @@ wall-clock guarantee.
 | F | Put the hold RPC before the journal read for each entry. | Unchanged. | Saves at most one journal read per no-hold selection, `cap` per pass at most. The hint's queue-wide reads are untouched. | Unchanged. | Inverts the provenance-first order (`agent/src/recovery.ts:4421-4424`). A context that is settled but has no hold would then cost an RPC instead of a local read. The saving is small, and the order change needs review. |
 | G | Use the exact-generation hold read (`?generation=`). | Unchanged on its own. | RPC count is unchanged. The read returns one generation's hold, including a verified closed observation (`released` or `discarded`) for this worker (`api/internal/recovery/exact_observation.go:20`, `:57`). | Unchanged. | Gated by capability negotiation (`RecoveryHeldPublicationV2` / `RecoveryBindinglessClosedV1`, `api/internal/handler/recovery.go:211-231`) and, for closed observations, the `Uzi-Recovery-Observation` header that guards mixed-version rollouts. It is a different read contract from the ordinary listing, so it needs rollout review. Its closed observation is the input option E would need. |
 | C | Bounded skip-ahead: a `hold_unavailable` visit does not consume a capped opportunity. Selection keeps scanning up to K extra entries per pass, and every visited entry rotates. | About `ceil((L+1)/(cap+K))` passes when the entries ahead have no hold. | Up to K extra selection-time journal reads and K extra hold RPCs per pass, on top of the unchanged hint reads and capture-path re-checks. The extra calls lengthen the pass, and the next pass is scheduled from its end. No new memory and no staleness, because every visit is fresh. | Unchanged: no cache, and membership is kept. | Changes the #3614 opportunity contract ("rotates raw contexts … before execution/hold checks"). It also raises the per-pass selection budget, so it falls within the issue's out-of-scope "timer/cap increases". It needs an explicit owner scope decision, not only a policy choice. |
-| D | First-arrival reservation: one slot per pass for a context never visited since it entered the queue, analogous to #3614. | With A first arrivals ahead of it, a new arrival progresses within A+1 passes, usually on the next pass. | No added per-pass reads or RPCs. Memory is one visited-key set, bounded by the queue. No staleness. | A context removed and re-added is a new arrival again (as #3614 already treats it), so discovery churn can earn repeat priority. | New fairness contract. With cap ≥ 3, ordinary survivors slow to `ceil(N/(cap-2))` when both reservations are active. Owner decision plus an ADR-1296 amendment. |
+| D | First-arrival reservation: one slot per pass for a context never visited since it entered the queue, analogous to #3614. | With A first arrivals ahead of it, a new arrival is selected within A+1 passes. That helps only if it is ready when selected: an arrival still executing or without an open hold spends its reservation and rotates behind the survivors, unless "visited" is defined as passing the checks, which then needs its own bound. | No added per-pass reads or RPCs. Memory is one visited-key set, bounded by the queue. No staleness. | A context removed and re-added is a new arrival again (as #3614 already treats it), so discovery churn can earn repeat priority. | New fairness contract. With cap ≥ 3, ordinary survivors slow to `ceil(N/(cap-2))` when both reservations are active. Owner decision plus an ADR-1296 amendment. |
 | H | Demote instead of keeping position: a context that just reported `hold_unavailable` rotates behind fresh arrivals, not behind its siblings. | New arrivals overtake no-hold contexts. | Memory is one flag per queued entry. No staleness. | Membership is kept, so a context whose hold appears later still progresses. | Fairness change. Under continuous arrivals, demoted contexts can starve, so it needs its own bound. Owner decision plus an ADR-1296 amendment. |
 | E | Skip or back off a context in scheduling. Variant E1 caches the absence of a listed hold. Variant E2 (with G) caches only a positively observed closure. | Faster while the cache holds. | Memory is one entry per cached context. E1 needs a staleness bound and invalidation. E2 caches a terminal state, because closed holds never reopen (`agent/src/recovery.ts:4426`). | E1 is unsafe: the tester's cross-pass absence-cache mutant hid a scenario 4 context whose hold appeared later. E2 is not refuted by scenario 4, but it must still never hide a context that a later generation or a custody move makes eligible. | Needs a closed-hold cache decision. Closed custody alone grants no FINAL or cleanup authority (`api/internal/apitypes/recovery.go:327`). A closed context with pins left is #2823's pruning input, so E2 borders that boundary. Named as a dependency, not proposed. |
 
@@ -368,7 +368,8 @@ If the owner decides that first-reconstruction latency matters, the
 recommended candidate is **D, a first-arrival reservation**. It keeps:
 
 - the existing per-pass cap and selection budget, so it adds no reads or
-  RPCs per pass and stays inside the issue's scope;
+  RPCs per pass and does not touch the issue's out-of-scope "timer/cap
+  increases";
 - fresh checks on every visit, with no cache and therefore no staleness;
 - queue membership, so the behaviour proven for later-eligible and
   executing→inactive contexts is unchanged.
@@ -378,6 +379,13 @@ Its costs are fairness costs:
 - Ordinary survivors slow from `ceil(N/(cap-1))` to `ceil(N/(cap-2))` passes
   while both reservations are in use. This needs cap ≥ 3.
 - A context that discovery drops and re-adds earns the reservation again.
+- Below cap 3, D must yield or be disabled. At cap 2, a #3614 entry and a
+  first arrival would leave ordinary survivors no slot. At cap 1, D would
+  take the only slot, which #3614 deliberately never does.
+- What counts as "visited" must be defined. If selection counts, an arrival
+  that is not yet ready gains nothing. If passing the checks counts, an
+  arrival that never becomes ready needs a bound, like #3614's
+  permanent-refusal case.
 
 D needs an owner decision on the fairness contract and an ADR-1296
 amendment.
