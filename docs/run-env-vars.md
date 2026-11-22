@@ -150,13 +150,13 @@ terminal preservation packs, recovery archives and the preserved patch.
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
 - A run with a multi-line secret therefore has no preserved patch. Its work is
-  not lost: recover it through the run's custody (the held pack or recovery
-  capture) with `uzi run export`.
+  not lost: it stays in the run's custody, as a held ref (`uzi run held`, then
+  `git fetch`) or a recovery capture (`uzi run export`).
 - Pending owner decision, gaps that remain: a fragment of a secret line shorter
-  than 8 characters, or a line that appears only re-encoded (for example indented
-  in a YAML block, or in an encoding other than those registered), is not
-  masked in run output; the redaction cost grows with the number of forms times
-  the longest literal for long periodic secret lines; a terminal report journaled
+  than 8 characters, or a line whose own characters change on the way out (for example
+  re-indented to less indentation, folded, or in an encoding other than those
+  registered), is not masked in run output; for long periodic secret lines the
+  redaction cost is the text length times the longest literal; a terminal report journaled
   with a patch by an older worker and replayed after an upgrade keeps that patch;
   and the whitespace-only exemption uses JavaScript's `\s`, which includes
   Unicode spaces such as NBSP. A committed file that holds the whole secret is

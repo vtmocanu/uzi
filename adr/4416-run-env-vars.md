@@ -278,7 +278,7 @@ Sites:
   or post-image (`hunk_image_value`; context plus removed or added lines, also with line breaks
   normalized to LF). The multi-line rule closes the gaps of a secret split across files or by elided
   context between hunks, which no check on fragments below the line-form floor can close; the work
-  stays recoverable through the run's custody (held pack, recovery capture, `uzi run export`). With
+  stays recoverable through the run's custody (a held ref via `uzi run held`, or a recovery capture via `uzi run export`). With
   every secret single-line, `hunk_image_value` is a backstop only: a single-line form holds no line
   break, so a single-line hit is already `raw_value`. The image and parse checks apply when the run
   has any secret variable, retired versions included. Otherwise the patch is redacted and
@@ -336,12 +336,13 @@ Pending owner decision (not accepted). The split-across-files and elided-context
 closed by the `multi_line_secret` rule above. These exceptions remain from this change:
 
 - **(a) Short fragments and re-encoded lines.** A fragment of a secret line shorter than 8
-  characters, or a line that appears only re-encoded (for example indented in a YAML block, or in an
-  unregistered encoding), is not masked in run output. The blob scan still blocks a committed file
+  characters, or a line whose own characters change on the way out (re-indented to less indentation, folded, or
+  in an unregistered encoding), is not masked in run output. A line copied with extra indentation is
+  still masked, since redaction matches it as a substring. The blob scan still blocks a committed file
   that holds the whole value.
 - **(b) Redaction cost for periodic secret lines.** The radix-trie index removes the cost of many
-  forms sharing a prefix, but the worst case of n x longest-literal for long periodic secret lines is
-  unchanged.
+  forms sharing a prefix, but for long periodic secret lines the cost is still text length x longest literal, a
+  bound that held before the trie as well.
 - **(c) A replayed terminal report keeps its patch.** A terminal report journaled with a patch by an
   older worker and replayed after an upgrade keeps that patch.
 - **(d) Whitespace-only lines use `\s`.** The whitespace-only exemption uses JavaScript's `\s`, which
