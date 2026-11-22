@@ -355,6 +355,11 @@ export function buildIsolatedExecutor(deps: { log: Logger; executorKind: Executo
 }
 
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps, addr: RunExecutorAddress = {}): RunExecution {
+  // Provider Code remains held, including on stub workers. A provider binding is
+  // authoritative and cannot fall back to a vendor credential or an unknown engine.
+  if (addr.provider && (addr.provider.engine !== "claude" || codex !== undefined)) {
+    return { executor: new FailClosedExecutor("provider_lane_unsupported") };
+  }
   const dirKey = runDirKey(runId, addr.generation);
   const keyOpt = addr.generation === undefined ? {} : { dirKey };
   const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;

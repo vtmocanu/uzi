@@ -135,6 +135,7 @@ import type {
   AgentTemplate,
   AskUserQuestion,
   ClaimCodexSecrets,
+  ClaimProviderBinding,
   ClaimConfig,
   ClaimResponse,
   GatePresentedRequirements,
@@ -245,7 +246,8 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
+import { ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { makeTextRedactor, providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
@@ -2361,7 +2363,7 @@ export type ExecutorFactory = (runId: string, codex?: ClaimCodexSecrets, addr?: 
 
 /** issue #3644: which per-attempt directories an executor is built for. `generation` set = an independent restore's successor,
  *  whose HOME and provision dir are `<runId>.g<generation>`; absent = today's `<runId>` paths. */
-export interface RunExecutorAddress { generation?: number }
+export interface RunExecutorAddress { generation?: number; provider?: ClaimProviderBinding }
 
 /**
  * PRD #218 M1 — the worker-shutdown registry entry for one in-flight run. A graceful
@@ -6297,6 +6299,27 @@ export class RunRunner {
     }
   }
 
+  private makeClaimExecutor(runId: string, codex: ClaimCodexSecrets | undefined, addr?: RunExecutorAddress): RunExecution {
+    try {
+      // Preserve the vendor factory's original argument count.
+      return addr === undefined ? this.makeExecutor(runId, codex) : this.makeExecutor(runId, codex, addr);
+    } catch (error) {
+      if (error instanceof ProviderLaneUnsupportedError) throw new ProviderLaneUnsupportedError();
+      const canaries = [
+        ...(codex ? [codex.access_token, codex.capability] : []),
+        ...(addr?.provider ? providerKeyForms(addr.provider.credential) : []),
+      ];
+      if (canaries.length === 0) throw error;
+      const redact = makeTextRedactor(canaries);
+      // Even reading an unknown error message may throw; never let that exception
+      // bypass redaction when the claim's registrations are about to be evicted.
+      let message: string;
+      try { message = errMessage(error); } catch { message = "executor construction failed"; }
+      // Never carry an original cause or arbitrary object fields past secret eviction.
+      throw new Error(redactThenSanitize(redact, message));
+    }
+  }
+
   private async executeReservedPolicyClaim(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
     ownMemory: (operation: Promise<void>) => void, reservation?: symbol): Promise<void> {
     const runId = claim.run_id;
@@ -6313,8 +6336,18 @@ export class RunRunner {
     for (const s of codexCanaries) this.log.addSecret(s);
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
     // per execution so nothing subprocess-scoped is shared with a concurrent run. The
-    // DARK Codex selection seam reads claim.secrets.codex (absent ⇒ the literal Claude path).
-    const initialExecutor = this.makeExecutor(runId, claim.secrets.codex);
+    // provider binding is forwarded by identity alongside the native vendor credential.
+    const providerForms = claim.secrets.provider ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const s of providerForms) this.log.addSecret(s);
+    let initialExecutor: RunExecution;
+    try {
+      initialExecutor = this.makeClaimExecutor(runId, claim.secrets.codex,
+        claim.secrets.provider ? { provider: claim.secrets.provider } : undefined);
+    } catch (error) {
+      // makeClaimExecutor detaches diagnostics before reference-counted eviction.
+      for (const s of [...providerForms, ...codexCanaries]) this.log.removeSecret(s);
+      throw error;
+    }
     // Issue #1324 M5: a publication-only claim still needs its executor object (quiescence, capture and the
     // finalize boundary read it) but no model work may ever start on it.
     let executor = publicationOnlyExecutor(claim, initialExecutor.executor);
@@ -6337,13 +6370,12 @@ export class RunRunner {
     // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
     // this registration (with the redactors' below) is the only protection for it.
     // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
-    if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
     for (const s of runScopedSecrets) this.log.addSecret(s);
-    // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
+    // Codex canaries and provider forms were ALREADY registered before construction; append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
     // exactly ONCE yet still evicted at the terminal (removeSecret is ref-counted, so a
     // second add here would leave a dangling registration the single eviction can't clear).
-    runScopedSecrets.push(...codexCanaries);
+    runScopedSecrets.push(...codexCanaries, ...providerForms);
 
     const flight = this.buildFlight(
       claim,
@@ -17037,7 +17069,7 @@ export class RunRunner {
             steering,
             claim: {
               kind: resolveRunKind(claim.kind),
-              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.provider),
+              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || claim.secrets.provider?.engine === "claude"),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex,
                 claim.secrets.codex && this.nowSummaryOpts.codexAdviceHarnessFactory
                   ? executor.bindCodexSummaryFactory?.(this.nowSummaryOpts.codexAdviceHarnessFactory)
@@ -30922,7 +30954,7 @@ export class RunRunner {
   private async swapRestoreExecutor(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const generation = flight.claimGeneration;
     const initialHome = flight.runHome;
-    const built = this.makeExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation });
+    const built = this.makeClaimExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation, ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}) });
     if (initialHome !== undefined && built.homeDir === initialHome) throw new Error("the successor executor was built on the predecessor's HOME");
     const next = publicationOnlyExecutor(claim, built.executor);
     const prior = flight.executor;
@@ -31773,7 +31805,7 @@ export class RunRunner {
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal);
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
-            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex).executor);
+            flight.executor = publicationOnlyExecutor(claim, this.makeClaimExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex, claim.secrets.provider ? { provider: claim.secrets.provider } : undefined).executor);
             this.registerEvidenceExecutor(flight);
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.
