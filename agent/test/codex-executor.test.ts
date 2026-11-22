@@ -37290,6 +37290,100 @@ describe("M2 provider executor composition", () => {
     });
   }
 
+
+  for (const sensitive of [false, true]) {
+    it(`provider root RPC composition sensitive=${sensitive} preserves write boundaries and unpriced tokens`, async () => {
+      const key = ["root-fixture", '"', "/", "<>&", "tail"].join("");
+      // Independent challenge strings: do not generate the input using providerKeyForms.
+      const inputs = sensitive ? [key, 'root-fixture\\"/<>&tail', 'root-fixture\\"\\/<>&tail',
+        "root-fixture%22%2F%3C%3E%26tail", 'root-fixture\\"/\\u003c\\u003e\\u0026tail'] : ["clean-alpha", "clean-beta"];
+      const payload = { control: "root-output-control",
+        ...Object.fromEntries(inputs.map((value, ordinal) => [value, { value, ordinal }])) };
+      const text = JSON.stringify(payload);
+      const model = "gpt-6.1-sol"; // Gateway collision with a priced vendor model.
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+        model_map: { default: { model, context_window: 32768 } } });
+      assert.ok(Object.isFrozen(binding.providerBinding));
+      const forms = providerKeyForms(key);
+      if (sensitive) for (const input of inputs) assert.ok(forms.includes(input));
+      const rig = makeRig();
+      const writes: { sink: string; args: unknown[] }[] = [];
+      const forbidden: string[] = [];
+      const deny = (name: string) => async () => { forbidden.push(name); assert.fail(name); };
+      Object.assign(rig.client, {
+        releaseCodex: deny("releaseCodex"), refreshCodex: deny("refreshCodex"),
+        checkCodexOperationAdmission: deny("checkCodexOperationAdmission"),
+        reportFinding: async (...args: unknown[]) => { writes.push({ sink: "finding", args }); return "finding-root"; },
+        saveMemory: async (...args: unknown[]) => {
+          writes.push({ sink: "memory", args });
+          return { id: "memory-root", title: rec(args[1]).title };
+        },
+        replyMRThread: async (...args: unknown[]) => { writes.push({ sink: "forge", args }); return { replied: true }; },
+      });
+      const { logger, lines } = recordingLogger();
+      // runner.buildFlight owns root-feed redaction at the production batcher boundary.
+      const posted: OutgoingMessage[] = [];
+      const batchClient = { postMessages: async (_id: string, messages: OutgoingMessage[]) => {
+        posted.push(...messages);
+      } } as unknown as WorkerClient;
+      const batcher = new MessageBatcher(batchClient, "run-1", 0, 5, logger,
+        makeRedactor(forms), makeTextRedactor(forms));
+      const { ctx, emitted } = makeCtx({
+        redactText: makeTextRedactor(forms),
+        reportProgress: async progress => { writes.push({ sink: "progress", args: [progress] }); },
+      });
+      const capture = ctx.emit;
+      ctx.emit = message => { capture(message); batcher.emit(message); };
+      rig.transport.push(threadStarted())
+        .push({ kind: "rate_limits_updated", method: "account/rateLimits/updated",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {} })
+        .push(agentMessage(text))
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 137, outputTokens: 29, totalTokens: 166 }))
+        .push(toolCall(81, "report_progress", { completed: [text], in_progress: ["root-control"] }, "th-1", "tn-1", "root-progress"))
+        .push(toolCall(82, reportIncidentalIssueToolName(), {
+          title: "root finding", description: text, location: text, labels: ["root-control"], confidence: "high" }, "th-1", "tn-1", "root-finding"))
+        .push(toolCall(83, memoryToolNames()[0]!, {
+          title: "root memory", body: text, basis: "observed", evidence: "root-output-control " + inputs.join(" | ") }, "th-1", "tn-1", "root-memory"))
+        .push(toolCall(84, "mcp__forge__reply_mr_thread", { reply_id: "root-reply", body: text }, "th-1", "tn-1", "root-forge"));
+      const running = makeExecutor(rig, binding, logger).run(ctx);
+      try {
+        await waitFor(() => [81, 82, 83, 84].every(id => rig.transport.responses.some(r => r.requestId === id)),
+          "root RPC callbacks settled");
+        rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+        await withTimeout(running, 3000, "root composition completion");
+      } finally {
+        rig.transport.end();
+        await running;
+        await batcher.close();
+      }
+      assert.deepEqual(forbidden, []);
+      assert.deepEqual(writes.map(w => w.sink).sort(), ["finding", "forge", "memory", "progress"], JSON.stringify(rig.transport.responses));
+      for (const id of [81, 82, 83, 84]) {
+        const reply = rig.transport.responses.find(r => r.requestId === id)!;
+        assert.equal(rec(rec(reply.response).result).success, true, `root callback ${id} succeeds`);
+      }
+      const usage = lastResultModelUsage(emitted)!;
+      assert.deepEqual(Object.keys(usage), [model]);
+      assert.equal(rec(usage[model]).inputTokens, 137);
+      assert.equal(rec(usage[model]).outputTokens, 29);
+      assert.equal(rec(usage[model]).costUSD, undefined);
+      assert.equal(rec(usage[model]).costStatus, "unreported");
+      for (const [channel, value] of Object.entries({ writes, posted, responses: rig.transport.responses, logs: lines })) {
+        const visible = JSON.stringify(value);
+        for (const form of forms) {
+          assert.ok(!visible.includes(form), `key escaped ${channel}`);
+          assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), `escaped key escaped ${channel}`);
+        }
+      }
+      for (const write of writes) assert.match(JSON.stringify(write), /root-output-control/);
+      if (!sensitive) {
+        assert.equal(writes.find(w => w.sink === "forge")!.args[2], text);
+        assert.deepEqual(JSON.parse(String(rec(writes.find(w => w.sink === "memory")!.args[1]).body)), payload);
+        assert.ok(posted.some(m => JSON.stringify(m).includes("clean-alpha")));
+      }
+    });
+  }
+
   it("refuses unmapped explicit models before login or vendor release", async () => {
     const rig = makeRig();
     const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()));
