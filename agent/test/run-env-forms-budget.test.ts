@@ -191,7 +191,7 @@ describe("the form budget shared with the api", () => {
     });
 
     it("escaped copies of a multi-line value's line forms add at most 6 + 7 units per byte", () => {
-      for (const name of ["control-padded token lines with trailing breaks", "control-padded token lines, LF"]) {
+      for (const name of ["control-padded token lines with trailing breaks", "control-padded token lines, LF", "control-padded lowercase-only lines"]) {
         const value = GENERATORS[name]!(4096);
         const claim = runEnvClaimForms([secretVar("MULTI", value)], undefined);
         let extra = 0;

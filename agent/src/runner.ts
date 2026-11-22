@@ -1,4 +1,4 @@
-import { RUN_ENV_FORM_CHARS_MAX, RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms, type RunEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
+import { RUN_ENV_FORM_CHARS_MAX, RUN_ENV_FORMS_OVER_BUDGET, multiLineSecretVariables, runEnvClaimForms, type RunEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
 import { redactPorcelainLine, hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, FORMS_OVER_BUDGET, patchScanVerdict, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
 import { runEnvContextField } from "./run-env-lane.js";
 import { markRunEnvSeen, runEnvSeen } from "./run-env-seen.js";
@@ -12095,13 +12095,15 @@ export class RunRunner {
       if (rawPatch === null) return undefined;
       // PRD 4416 M2: the RAW, uncapped patch is judged before redaction. It is withheld whole (not shipped
       // scrubbed) when the claim's forms were over budget, when a whole-value form occurs in the patch or in any
-      // hunk's rebuilt pre- or post-image, when a registered line form of a multi-line secret occurs, or when
-      // the patch cannot be rebuilt into hunk images.
+      // hunk's rebuilt pre- or post-image, when a registered line form of a multi-line secret occurs, when the
+      // run holds any multi-line secret at all (live or a retained version, any length: fragments split across
+      // files or hunks cannot be matched), or when the patch cannot be rebuilt into hunk images.
       if (flight.scanOverBudget) {
         runLog.warn("preserved patch withheld: the run's secret forms were over budget", { run_id: runId, site });
         return undefined;
       }
-      const verdict = patchScanVerdict(rawPatch, needlesOf(flight), flight.scanLineForms ?? []);
+      const verdict = patchScanVerdict(rawPatch, needlesOf(flight), flight.scanLineForms ?? [],
+        multiLineSecretVariables(claim.secrets.run_env, claim.secrets.run_env_redact));
       if (verdict.withhold) {
         runLog.warn("preserved patch withheld: run secret scan", {
           run_id: runId, site, reason: verdict.reason, variables: verdict.variables.slice(0, 10),

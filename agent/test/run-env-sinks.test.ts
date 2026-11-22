@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { makeMemoryToolHandlers } from "../src/memory-tools.js";
@@ -295,7 +296,8 @@ describe("questions, now summary, failure reasons and the merge request", () => 
 describe("a line fragment of a multi-line secret is masked in every sink", () => {
   const LOWER = "zqxvbnmkl";
   const ONE_DIGIT = "pwrtyhgf4";
-  const OTHER_LINES = ["Qm9kdXMtZml4dHVyZS1hLQ", "c2Vjb25kLWZpeHR1cmUtYg"];
+  // Two long structural lines, derived from a hash so no literal is encoded text.
+  const OTHER_LINES = ["first", "second"].map((n) => crypto.createHash("sha256").update(`sinks-${n}`).digest("base64url").slice(0, 22));
   const MULTI = [OTHER_LINES[0]!, LOWER, ONE_DIGIT, OTHER_LINES[1]!].join("\n");
   const UUID = "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44";
   const shapes: Array<[string, () => { run_env?: ClaimRunEnvVar[]; run_env_redact?: ClaimRunEnvRedact[] }]> = [
@@ -310,13 +312,18 @@ describe("a line fragment of a multi-line secret is masked in every sink", () =>
       const forms = (): string[] => runEnvClaimForms(vars().run_env, vars().run_env_redact).redaction;
 
       it(`${shape}, ${label}: masked in a feed payload`, async () => {
-        const sent: OutgoingMessage[] = [];
-        const client = { async postMessages(_id: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
-        const batcher = new MessageBatcher(client, "run-frag", 0, 0, nullLogger(), makeRedactor(forms()), makeTextRedactor(forms()));
-        batcher.emit({ kind: "question", agent: "lead", payload: { question_id: "q1", questions: [{ header: "h", question: `is ${fragment} right?`, options: [{ label: `use ${fragment}` }] }] } });
-        await batcher.close();
-        assert.equal(sent.length, 1);
-        assert.ok(!JSON.stringify(sent).includes(fragment));
+        const { gitlab } = fakeGitlab();
+        const claim = gitlabClaim(46120 + mrCount++, { secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", ...vars() } });
+        const exec: Executor = {
+          async run(ctx) {
+            ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: `echo ${fragment}`, description: `show ${fragment}` } } });
+            return { branch: ctx.branch };
+          },
+        };
+        await runner(exec, gitlab).execute(claim);
+        const feed = api.messages(claim.run_id);
+        assert.ok(feed.some((m) => m.kind === "tool_use"), "the tool_use message reached the feed");
+        assert.ok(!JSON.stringify(feed).includes(fragment), "no feed message carries the fragment");
       });
 
       it(`${shape}, ${label}: masked in the merge request title and body`, async () => {

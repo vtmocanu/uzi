@@ -12,7 +12,7 @@ import { RunRunner } from "../src/runner.js";
 import { patchScanVerdict } from "../src/run-env-scan.js";
 import { runEnvClaimForms } from "../src/run-env-forms.js";
 import type { GitHubClient } from "../src/forge.js";
-import type { ClaimRunEnvVar } from "../src/protocol.js";
+import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { api, client, fakeGitHub, fx, git, gitlabClaim, installHarness } from "./runner-harness.js";
 
 installHarness();
@@ -45,9 +45,9 @@ function githubRunner(github: GitHubClient, log: Logger = nullLogger()): RunRunn
 const SCAN_WITHHELD = "preserved patch withheld: run secret scan";
 const OVER_BUDGET_WITHHELD = "preserved patch withheld: the run's secret forms were over budget";
 
-const claimFor = (iid: number, vars: ClaimRunEnvVar[] = [var1]) => gitlabClaim(iid, {
+const claimFor = (iid: number, vars: ClaimRunEnvVar[] = [var1], redact?: ClaimRunEnvRedact[]) => gitlabClaim(iid, {
   repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, default_branch: "main", forge_type: "github" },
-  secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: vars },
+  secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: vars, ...(redact === undefined ? {} : { run_env_redact: redact }) },
 });
 
 /** What the git layer returns: the whole, uncapped diff. */
@@ -58,13 +58,13 @@ const filler = "+".concat("y".repeat(79), "\n").repeat(8000);
 const bigHead = (n: number): string => `${header}index 1111111..2222222 100644\n--- a/${WORKFLOW}\n+++ b/${WORKFLOW}\n@@ -0,0 +1,${n} @@\n`;
 
 async function failedReport(
-  iid: number, full: string, vars?: ClaimRunEnvVar[], tweak?: (runner: RunRunner) => void,
+  iid: number, full: string, vars?: ClaimRunEnvVar[], tweak?: (runner: RunRunner) => void, redact?: ClaimRunEnvRedact[],
 ): Promise<{ fail_origin?: string; preserved_patch?: string; logged: Array<Record<string, unknown>> }> {
   const { github } = fakeGitHub();
   git.pushBranch = (async () => undefined) as typeof git.pushBranch;
   git.branchWorkflowFiles = (async () => [WORKFLOW]) as typeof git.branchWorkflowFiles;
   git.workflowScopeDiff = diffOf(full);
-  const claim = claimFor(iid, vars);
+  const claim = claimFor(iid, vars, redact);
   const { logger, lines } = recordingLogger();
   const runner = githubRunner(github, logger);
   tweak?.(runner);
@@ -147,17 +147,17 @@ describe("the preserved patch and the structural lines of a secret file", () => 
 
   for (const line of lines.slice(0, 6)) {
     it(`is withheld as line_form when it adds only the structural line ${line.trim()}`, () => {
-      const verdict = patchScanVerdict(added(line), claim.needles, claim.lineForms);
+      const verdict = patchScanVerdict(added(line), claim.needles, claim.lineForms, ["KUBECONFIG_FILE"]);
       assert.deepEqual(verdict, { withhold: true, reason: "line_form", variables: ["KUBECONFIG_FILE"] });
     });
   }
 
   it("is not withheld when it adds a whitespace-only line", () => {
-    assert.deepEqual(patchScanVerdict(added(" ".repeat(8)), claim.needles, claim.lineForms), { withhold: false });
+    assert.deepEqual(patchScanVerdict(added(" ".repeat(8)), claim.needles, claim.lineForms, []), { withhold: false });
   });
 
   it("is withheld as line_form when it adds the key line", () => {
-    const verdict = patchScanVerdict(added(lines[0]!, keyLine), claim.needles, claim.lineForms);
+    const verdict = patchScanVerdict(added(lines[0]!, keyLine), claim.needles, claim.lineForms, ["KUBECONFIG_FILE"]);
     assert.deepEqual(verdict, { withhold: true, reason: "line_form", variables: ["KUBECONFIG_FILE"] });
   });
 });
@@ -186,9 +186,9 @@ describe("the preserved patch decodes quoted header paths", () => {
 
     it(`decodes the header path carrying ${label} when the only needle form is the value itself`, () => {
       const full = realDiff([{ name: value }]);
-      assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], []),
+      assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], [], []),
         { withhold: true, reason: "header_path", variables: ["DB_PASSWORD"] });
-      assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: ["no-such-value-anywhere"] }], []).withhold, false);
+      assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: ["no-such-value-anywhere"] }], [], []).withhold, false);
     });
   }
 
@@ -199,9 +199,9 @@ describe("the preserved patch decodes quoted header paths", () => {
       `diff --git "a/${quoted}" "b/${quoted}"`, "new file mode 100644", "index 0000000..e69de29",
       `--- /dev/null`, `+++ "b/${quoted}"`, "",
     ].join("\n");
-    assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], []),
+    assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], [], []),
       { withhold: true, reason: "header_path", variables: ["DB_PASSWORD"] });
-    assert.equal(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: ["no-such-value-anywhere"] }], []).withhold, false);
+    assert.equal(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: ["no-such-value-anywhere"] }], [], []).withhold, false);
   });
 
   it("withholds a Binary files header whose quoted paths carry a non-ASCII secret", () => {
@@ -211,7 +211,7 @@ describe("the preserved patch decodes quoted header paths", () => {
       `diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644",
       `Binary files "a/${quoted}" and "b/${quoted}" differ`, "",
     ].join("\n");
-    const verdict = patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], []);
+    const verdict = patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], [], []);
     assert.equal(verdict.withhold, true);
     assert.equal(verdict.withhold && verdict.reason, "header_path");
   });
@@ -239,12 +239,12 @@ describe("the preserved patch fails closed on what the raw text cannot show", ()
     const failed = await failedReport(46210, full, [multiVar(SHORT_LINES)]);
     assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
     assert.equal(failed.preserved_patch, undefined);
-    assert.deepEqual(withholdReasons(failed.logged), ["hunk_image_value"]);
+    assert.deepEqual(withholdReasons(failed.logged), ["multi_line_secret"]);
   });
 
   it("withholds a binary patch", async () => {
     const full = `${header}index 1111111..2222222 100644\nGIT binary patch\nliteral 3\nKc2\n\nliteral 0\nHcmV?d00001\n`;
-    const failed = await failedReport(46211, full, [multiVar(SHORT_LINES)]);
+    const failed = await failedReport(46211, full);
     assert.equal(failed.fail_origin, "workflow_scope_missing");
     assert.equal(failed.preserved_patch, undefined);
     assert.deepEqual(withholdReasons(failed.logged), ["unparseable_patch"]);
@@ -256,15 +256,15 @@ describe("the preserved patch fails closed on what the raw text cannot show", ()
     const failed = await failedReport(46214, full, [multiVar(SHORT_LINES)]);
     assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
     assert.equal(failed.preserved_patch, undefined);
-    assert.deepEqual(withholdReasons(failed.logged), ["hunk_image_value"]);
+    assert.deepEqual(withholdReasons(failed.logged), ["multi_line_secret"]);
   });
 
   it("withholds a clean patch when the claim's forms were over budget", async () => {
     const clean = hunkPatch("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}");
-    const control = await failedReport(46215, clean, [multiVar(SHORT_LINES)]);
+    const control = await failedReport(46215, clean);
     assert.match(control.preserved_patch ?? "", /\+on: \[push\]/, "control: the same patch is attached when the claim is within budget");
     assert.ok(!control.logged.some((l) => l.msg === OVER_BUDGET_WITHHELD), "control: no over-budget warning");
-    const failed = await failedReport(46216, clean, [multiVar(SHORT_LINES)], (runner) => {
+    const failed = await failedReport(46216, clean, undefined, (runner) => {
       const internals = runner as unknown as { buildFlight(...a: unknown[]): { scanOverBudget?: boolean } };
       const build = internals.buildFlight.bind(runner);
       internals.buildFlight = (...a) => { const f = build(...a); f.scanOverBudget = true; return f; };
@@ -283,9 +283,57 @@ describe("the preserved patch fails closed on what the raw text cannot show", ()
     assert.deepEqual(withholdReasons(failed.logged), ["line_form"]);
   });
 
-  it("still attaches a clean patch, hunks and all", async () => {
-    const failed = await failedReport(46213, hunkPatch("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"), [multiVar(SHORT_LINES)]);
+  it("still attaches a clean patch, hunks and all, for a single-line secret", async () => {
+    const failed = await failedReport(46213, hunkPatch("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"));
     assert.equal(failed.fail_origin, "workflow_scope_missing");
     assert.match(failed.preserved_patch ?? "", /\+on: \[push\]/);
   });
+
+  it("withholds the same clean patch as multi_line_secret when the secret is multi-line", async () => {
+    const failed = await failedReport(46217, hunkPatch("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"), [multiVar(SHORT_LINES)]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.equal(failed.preserved_patch, undefined);
+    assert.deepEqual(withholdReasons(failed.logged), ["multi_line_secret"]);
+  });
+});
+
+// A multi-line secret whose lines are each under the 8-character line-form floor, split so that no whole-value or
+// line form can match: across two files, or across two hunks of one file with elided context between. The run is
+// withheld whole whether the secret is live or only a retained older version (run_env_redact).
+describe("the preserved patch of a run holding a multi-line secret is always withheld", () => {
+  const other: ClaimRunEnvVar = { ...var1, name: "OTHER_TOKEN", value: "unrelated-single-line-value-111111" };
+  const otherFile = ".github/workflows/second-guard.yml";
+  const section = (file: string, ...body: string[]): string =>
+    `diff --git a/${file} b/${file}\nindex 1111111..2222222 100644\n--- a/${file}\n+++ b/${file}\n${body.join("\n")}\n`;
+  const splitFile = section(WORKFLOW, "@@ -0,0 +1,2 @@", `+${SHORT_LINES[0]}`, "+ordinary: one") +
+    section(otherFile, "@@ -0,0 +1,2 @@", `+${SHORT_LINES[1]}`, `+${SHORT_LINES[2]}`);
+  const elided = section(WORKFLOW, "@@ -1,1 +1,2 @@", " name: guard", `+${SHORT_LINES[0]}`,
+    "@@ -40,1 +41,3 @@", " jobs: {}", `+${SHORT_LINES[1]}`, `+${SHORT_LINES[2]}`);
+  const shapes: Array<[string, string]> = [["split across two files", splitFile], ["split across two hunks with elided context", elided]];
+
+  let n = 46250;
+  for (const [label, patch] of shapes) {
+    it(`withholds a patch with a live multi-line secret ${label}`, async () => {
+      assert.ok(!patch.includes(SHORT_LINES.join("\n")), "no whole-value form in the raw text");
+      const failed = await failedReport(n++, patch, [other, multiVar(SHORT_LINES)]);
+      assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
+      assert.equal(failed.preserved_patch, undefined);
+      assert.deepEqual(withholdReasons(failed.logged), ["multi_line_secret"]);
+    });
+
+    it(`withholds a patch with a retained multi-line secret version ${label}`, async () => {
+      const retainedVersion: ClaimRunEnvRedact = { var_id: var1.var_id, scope: "repo", rev: 1, name: "OLD_BLOB", value: SHORT_LINES.join("\n") };
+      const failed = await failedReport(n++, patch, [other], undefined, [retainedVersion]);
+      assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
+      assert.equal(failed.preserved_patch, undefined);
+      assert.deepEqual(withholdReasons(failed.logged), ["multi_line_secret"]);
+    });
+
+    it(`keeps the identical patch ${label} when the run's only secret is single-line`, async () => {
+      const failed = await failedReport(n++, patch, [other]);
+      assert.equal(failed.fail_origin, "workflow_scope_missing");
+      assert.ok(failed.preserved_patch !== undefined, "the patch is attached");
+      assert.deepEqual(withholdReasons(failed.logged), []);
+    });
+  }
 });

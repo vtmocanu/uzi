@@ -459,10 +459,11 @@ describe("run variable scan: a secret published as a git path", () => {
 });
 
 describe("run variable scan: held publication and the recovery archive", () => {
-  async function held(secrets: object, content: Content) {
+  async function held(secrets: object, content: Content, steer?: (server: ReturnType<typeof heldServer>) => void) {
     const claim = gitlabClaim(iid++, { claim_generation: 50, inventory_guarded: true, secrets: secrets as never });
     const { gitlab } = fakeGitlab();
     const server = heldServer(claim);
+    steer?.(server);
     skipCheckpoints();
     const work: Partial<Work> = {};
     const r = runner(failingWork(work, (ctx) => { commit(ctx.worktreePath, content.path, content.body); }), gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
@@ -481,6 +482,37 @@ describe("run variable scan: held publication and the recovery archive", () => {
     const { server } = await held(noVars(), leak(SECRET));
     assert.equal(server.heldCalls.length, 1);
   });
+
+  // A multi-line secret withholds only the preserved patch; the work stays recoverable through custody.
+  const SHORT_LINES = ["ab12", "cd34", "ef56"];
+  const multiLive = () => ({
+    forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "vendor-oauth-token-000000",
+    run_env: [{ var_id: UUID, scope: "repo" as const, rev: 1, name: "SVC_BLOB", value: SHORT_LINES.join("\n"), secret: true, description: "" }],
+  });
+  const multiRetained = () => ({
+    forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "vendor-oauth-token-000000",
+    run_env: runEnv(),
+    run_env_redact: [{ var_id: UUID, scope: "repo" as const, rev: 1, name: "OLD_BLOB", value: SHORT_LINES.join("\n") }],
+  });
+
+  // The api refuses the held pack, so the clean work is archived and custody stays open (hold, capture, export).
+  const refuseHeld = (server: ReturnType<typeof heldServer>): void => {
+    server.heldAnswer = () => ({ ok: false, httpStatus: 409, reason: "ci_config_guard" });
+  };
+  const shapes: Array<[string, () => object]> = [["live", multiLive], ["retained", multiRetained]];
+  for (const [kind, secrets] of shapes) {
+    it(`a run holding a ${kind} multi-line secret still publishes its clean held range`, { skip: HELD_LINUX_ONLY }, async () => {
+      const { server } = await held(secrets(), CLEAN);
+      assert.equal(server.heldCalls.length, 1, "the held pack is uploaded");
+    });
+
+    it(`a run holding a ${kind} multi-line secret still archives its clean range and keeps custody when the held pack is refused`, { skip: HELD_LINUX_ONLY }, async () => {
+      const { claim, server, work } = await held(secrets(), CLEAN, refuseHeld);
+      assert.equal(server.heldCalls.length, 1, "the held pack was offered");
+      assert.ok(server.archiveUploads() >= 1, "the recovery archive is uploaded");
+      await assertCustodyRetained(server, claim, work, `${kind} multi-line secret, clean range`);
+    });
+  }
 });
 
 describe("run variable scan: preserved_patch", () => {

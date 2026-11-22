@@ -95,13 +95,13 @@ describe("which lines of a multi-line value are registered alone", () => {
   }
 
   for (const code of ["84629137", "5083619274"]) {
-    it(`the digits-only line ${code} (8+ digits, 5+ distinct) is masked on its own`, () => {
+    it(`the digits-only line ${code} is masked on its own`, () => {
       const redact = redactOf([FILLER[0], code, FILLER[1]].join("\n"));
       assert.ok(!redact(`log: ${code} end`).includes(code));
     });
   }
 
-  for (const [label, line] of [["a digits-only line with 4 distinct digits", "11223344"], ["a one-digit mixed token", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a lowercase-only line", "abcdefgh"]] as const) {
+  for (const [label, line] of [["a digits-only line of repeated digits", "11223344"], ["a mixed line with one digit", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a lowercase-only line", "abcdefgh"]] as const) {
     it(`${label} is registered alone`, () => {
       const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
       assert.ok(!redact(`text ${line} end`).includes(line));
@@ -368,7 +368,7 @@ describe("every line of 8+ characters of a multi-line value is registered, excep
     assertLineClasses(lines, [], lines);
   });
 
-  it("an AWS credentials file masks its section-less lines of 8+ characters", () => {
+  it("an AWS credentials file masks every line of 8+ characters, section headers included", () => {
     const lines = ["[default]", "region = us-east-1", `aws_access_key_id = ${["AK", "IA", "7Q2M", "X9D4", "K1LZ", "8P3R"].join("")}`, `aws_secret_access_key = ${b64("aws-secret")}`];
     assertLineClasses(lines, [], lines);
   });

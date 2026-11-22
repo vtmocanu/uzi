@@ -257,7 +257,7 @@ export function patchImages(patch: string): { images: string[] } | "unparseable"
 
 export type PatchVerdict =
   | { withhold: false }
-  | { withhold: true; reason: "raw_value" | "hunk_image_value" | "unparseable_patch" | "line_form" | "header_path"; variables: string[] };
+  | { withhold: true; reason: "raw_value" | "hunk_image_value" | "unparseable_patch" | "line_form" | "header_path" | "multi_line_secret"; variables: string[] };
 
 /** The file header lines of a diff that name a path (git C-quotes such a path unless core.quotePath is off). */
 const PATH_HEADER_PREFIXES = ["diff --git ", "--- ", "+++ ", "rename from ", "rename to ", "copy from ", "copy to ", "Binary files "];
@@ -352,13 +352,19 @@ function headerPathHits(patch: string, needles: readonly ScanNeedle[]): string[]
  * Whether a raw (uncapped, unredacted) preserved patch may be redacted and shipped. It must not carry a
  * whole-value form of a secret variable (raw text, or the rebuilt pre- or post-image of any hunk, where a
  * value split by diff prefixes reads as one run), nor any registered line form of a multi-line secret, and it
- * must be a diff {@link patchImages} can rebuild. Variable names only; never a value.
+ * must be a diff {@link patchImages} can rebuild. A run holding any multi-line secret (`multiLine`, the names
+ * from multiLineSecretVariables, with no length floor) is always withheld. Variable names only; never a value.
  */
 export function patchScanVerdict(
-  rawPatch: string, needles: readonly ScanNeedle[], lineForms: readonly ScanNeedle[],
+  rawPatch: string, needles: readonly ScanNeedle[], lineForms: readonly ScanNeedle[], multiLine: readonly string[],
 ): PatchVerdict {
   const raw = textHitVariables(rawPatch, needles);
   if (raw.length > 0) return { withhold: true, reason: "raw_value", variables: raw };
+  const lines = textHitVariables(rawPatch, lineForms);
+  if (lines.length > 0) return { withhold: true, reason: "line_form", variables: lines };
+  // A run holding a multi-line secret (of any length) never ships a patch: fragments of its lines split across
+  // files or separated by elided context between hunks cannot be matched reliably, whatever their length.
+  if (multiLine.length > 0) return { withhold: true, reason: "multi_line_secret", variables: [...multiLine] };
   if (needles.length === 0 && lineForms.length === 0) return { withhold: false };
   // Header paths are decoded from git's C-quoting ("\303\251", "\t", "\"", "\\") and searched.
   const header = headerPathHits(rawPatch, needles);
@@ -375,8 +381,6 @@ export function patchScanVerdict(
     }
   }
   if (hit.size > 0) return { withhold: true, reason: "hunk_image_value", variables: [...hit] };
-  const lines = textHitVariables(rawPatch, lineForms);
-  if (lines.length > 0) return { withhold: true, reason: "line_form", variables: lines };
   return { withhold: false };
 }
 

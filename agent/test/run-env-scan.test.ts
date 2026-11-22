@@ -386,16 +386,16 @@ describe("patchScanVerdict", () => {
 
   it("withholds a whole value in the raw text as raw_value, naming the variable only", () => {
     const f = forms("DB_PASSWORD", [SECRET]);
-    const verdict = patchScanVerdict(hunk("@@ -0,0 +1 @@", `+token=${SECRET}`), f.needles, f.lineForms);
+    const verdict = patchScanVerdict(hunk("@@ -0,0 +1 @@", `+token=${SECRET}`), f.needles, f.lineForms, []);
     assert.deepEqual(verdict, { withhold: true, reason: "raw_value", variables: ["DB_PASSWORD"] });
   });
 
   it("withholds a value split across diff prefixes as hunk_image_value, also under CRLF", () => {
     const f = forms("SVC_BLOB", multi);
     const lf = hunk("@@ -1,2 +1,3 @@", ` ${multi[0]}`, `+${multi[1]}`, ` ${multi[2]}`);
-    assert.deepEqual(patchScanVerdict(lf, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
+    assert.deepEqual(patchScanVerdict(lf, f.needles, f.lineForms, []), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
     const crlf = hunk("@@ -1,2 +1,3 @@", ` ${multi[0]}\r`, `+${multi[1]}\r`, ` ${multi[2]}\r`);
-    assert.deepEqual(patchScanVerdict(crlf, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
+    assert.deepEqual(patchScanVerdict(crlf, f.needles, f.lineForms, []), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
   });
 
   it("withholds a value whose line breaks in the patch are a lone CR, read as LF after normalization", () => {
@@ -403,25 +403,41 @@ describe("patchScanVerdict", () => {
     // The first two lines of the value are joined by a lone CR inside one added line; the third is the next added line.
     const lone = hunk("@@ -0,0 +1,2 @@", `+${multi[0]}\r${multi[1]}`, `+${multi[2]}`);
     assert.ok(!lone.includes(multi.join("\n")) && !lone.includes(multi.join("\r\n")), "no whole-value form in the raw text");
-    assert.deepEqual(patchScanVerdict(lone, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
+    assert.deepEqual(patchScanVerdict(lone, f.needles, f.lineForms, []), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
   });
 
   it("withholds an unreadable patch as unparseable_patch once the claim has any form", () => {
     const f = forms("SVC_BLOB", multi);
     const binary = "diff --git a/a.bin b/a.bin\nBinary files a/a.bin and b/a.bin differ\n";
-    assert.deepEqual(patchScanVerdict(binary, f.needles, f.lineForms), { withhold: true, reason: "unparseable_patch", variables: [] });
-    assert.deepEqual(patchScanVerdict(binary, [], []), { withhold: false }, "a claim with no secret forms ships any patch");
+    assert.deepEqual(patchScanVerdict(binary, f.needles, f.lineForms, []), { withhold: true, reason: "unparseable_patch", variables: [] });
+    assert.deepEqual(patchScanVerdict(binary, [], [], []), { withhold: false }, "a claim with no secret forms ships any patch");
   });
 
   it("withholds one registered line of a multi-line secret as line_form", () => {
     const f = forms("SVC_BLOB", long);
-    assert.deepEqual(patchScanVerdict(hunk("@@ -0,0 +1 @@", `+${long[0]}`), f.needles, f.lineForms),
+    assert.deepEqual(patchScanVerdict(hunk("@@ -0,0 +1 @@", `+${long[0]}`), f.needles, f.lineForms, []),
       { withhold: true, reason: "line_form", variables: ["SVC_BLOB"] });
   });
 
-  it("lets a clean patch through", () => {
+  it("lets a clean patch through for a single-line secret", () => {
+    const f = forms("DB_PASSWORD", [SECRET]);
+    assert.deepEqual(patchScanVerdict(hunk("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"), f.needles, f.lineForms, []), { withhold: false });
+  });
+
+  it("withholds even a clean patch as multi_line_secret when the run holds a multi-line secret, short lines included", () => {
     const f = forms("SVC_BLOB", multi);
-    assert.deepEqual(patchScanVerdict(hunk("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"), f.needles, f.lineForms), { withhold: false });
+    const clean = hunk("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}");
+    assert.deepEqual(patchScanVerdict(clean, f.needles, f.lineForms, ["SVC_BLOB"]), { withhold: true, reason: "multi_line_secret", variables: ["SVC_BLOB"] });
+    assert.deepEqual(patchScanVerdict(clean, [], [], ["SVC_BLOB"]), { withhold: true, reason: "multi_line_secret", variables: ["SVC_BLOB"] });
+  });
+
+  it("checks raw_value, then line_form, then multi_line_secret", () => {
+    const f = forms("SVC_BLOB", long);
+    const lineHit = hunk("@@ -0,0 +1 @@", `+${long[0]}`);
+    assert.deepEqual(patchScanVerdict(lineHit, f.needles, f.lineForms, ["SVC_BLOB"]), { withhold: true, reason: "line_form", variables: ["SVC_BLOB"] });
+    const g = forms("DB_PASSWORD", [SECRET]);
+    const rawHit = hunk("@@ -0,0 +1 @@", `+${SECRET}`);
+    assert.deepEqual(patchScanVerdict(rawHit, g.needles, g.lineForms, ["SVC_BLOB"]), { withhold: true, reason: "raw_value", variables: ["DB_PASSWORD"] });
   });
 });
 

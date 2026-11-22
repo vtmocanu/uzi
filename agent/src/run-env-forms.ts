@@ -176,6 +176,18 @@ export function runEnvClaimForms(
   };
 }
 
+/** The distinct names of the claim's multi-line secrets, with no length floor: live `secret: true` run_env
+ *  entries and run_env_redact versions whose value holds a CR or LF. A run with any is never given a preserved patch. */
+export function multiLineSecretVariables(
+  runEnv: readonly ClaimRunEnvVar[] | undefined,
+  runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
+): string[] {
+  const names = new Set<string>();
+  for (const v of runEnv ?? []) if (v.secret && isMultiLine(v.value)) names.add(v.name);
+  for (const r of runEnvRedact ?? []) if (isMultiLine(r.value)) names.add(r.name);
+  return [...names];
+}
+
 function overBudgetForms(entries: ReadonlyArray<{ value: string }>, formChars: number): RunEnvClaimForms {
   const raw = new Set<string>();
   for (const { value } of entries) for (const v of valueVariants(value)) raw.add(v);
