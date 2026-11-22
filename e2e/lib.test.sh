@@ -1993,7 +1993,7 @@ fixture_hold_deadline() {
           # exec hangs for 10s and must be killed at the remaining budget.
           sleep() { :; }
           eval "$(awk '/^db_psql_rows\(\) \(/,/^\)/' "$LIB")"
-          printf '#!/bin/sh\n: > "$0.started"\nsleep 10\n: > "$0.finished"\n' > "$SEQ_DIR/compose-hang"
+          printf '#!/bin/sh\n: > "$0.started"\nsleep 10 >/dev/null 2>&1\n: > "$0.finished"\n' > "$SEQ_DIR/compose-hang"
           chmod +x "$SEQ_DIR/compose-hang"
           # shellcheck disable=SC2034  # read by the extracted real db_psql_rows
           local COMPOSE=("$SEQ_DIR/compose-hang") PGPW=fixture ENVFILE="$SEQ_DIR/no-envfile" ;;
