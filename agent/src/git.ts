@@ -1143,6 +1143,10 @@ export interface GitCacheOptions {
   /** issue #4263 — test-only: LOWER (never raise) the foreign-bare scan limits of compactAttemptLedger, and replace its clock
    *  (milliseconds) so a deadline can be exercised. A value above the production limit is ignored. Production never passes it. */
   compactForeignScanForTest?: { maxBares?: number; maxConfigBytes?: number; maxRecords?: number; deadlineMs?: number; now?: () => number };
+  /** issue #4416 — test-only: the clock of the object scan (scanObjectsGrouped, and through it the path pass), and an optional
+   *  hook called as the scan reaches each stage, immediately before that stage's deadline check, so a test can move the
+   *  clock at an exact point instead of racing the real one. Production never passes it. */
+  objectScanClockForTest?: { now: () => number; atStage?: (stage: "before_path_pass" | "path_pass" | "object_pass") => void };
   /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
    *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
    *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
@@ -6211,6 +6215,7 @@ export class GitCache {
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
   /** See {@link GitCacheOptions.retireBindingStep}; undefined in production. */
   private readonly retireBindingStepSeam: GitCacheOptions["retireBindingStep"];
+  private readonly objectScanClock: GitCacheOptions["objectScanClockForTest"];
   /** The foreign-bare scan limits of compactAttemptLedger: the production constants, lowered only by the test seam. */
   private readonly compactForeignLimits: { maxBares: number; maxConfigBytes: number; maxRecords: number; deadlineMs: number };
   private readonly compactForeignNow: () => number;
@@ -6279,6 +6284,7 @@ export class GitCache {
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.retireBindingStepSeam = opts.retireBindingStep;
+    this.objectScanClock = opts.objectScanClockForTest;
     const lowered = (production: number, requested: number | undefined): number =>
       typeof requested === "number" && requested >= 0 ? Math.min(production, requested) : production;
     const foreignSeam = opts.compactForeignScanForTest;
@@ -20261,8 +20267,10 @@ export class GitCache {
         range.excludes.some((x) => !SHA40_RE.test(x))) return untrusted("range_invalid");
     const maxObjects = opts.caps?.maxObjects ?? CHECKPOINT_SCAN_MAX_OBJECTS;
     const maxTotal = opts.caps?.maxTotalBytes ?? opts.maxBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES;
-    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
-    const remaining = (): number => deadlineAt - Date.now();
+    const seam = this.objectScanClock;
+    const now = seam?.now ?? Date.now;
+    const deadlineAt = now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => deadlineAt - now();
     const hasKeyForm = (s: string): boolean => active.some((g) => g.forms.some((l) => s.includes(l)));
     let producer: { stdout: Readable; exited: Promise<number>; cancel: () => void } | undefined;
     try {
@@ -20275,6 +20283,10 @@ export class GitCache {
       // listed by C's own diff. A root commit diffs against the empty tree; `-t` lists tree entries (empty
       // trees and gitlinks included); for a merge `-c` lists every path that differs from EVERY parent, a
       // superset of the paths absent from all parents. Each such path is searched whole.
+      // A deadline spent before the path pass is "deadline", inside it "path_scan_incomplete", before the object pass "deadline".
+      seam?.atStage?.("before_path_pass");
+      if (remaining() <= 0) return untrusted("deadline");
+      seam?.atStage?.("path_pass");
       const pathPass = await this.scanPathsForGroups(barePath, revs, active, {
         maxPaths: opts.caps?.maxPaths ?? CHECKPOINT_SCAN_MAX_PATHS,
         maxPathBytes: opts.caps?.maxPathBytes ?? CHECKPOINT_SCAN_MAX_PATH_BYTES,
@@ -20285,6 +20297,8 @@ export class GitCache {
         file: PATH_WITHHELD, startLine: 0, commit: h.commit, ruleId, ...(h.label === undefined ? {} : { variable: h.label }),
       }));
       this.checkCheckpointCooperation();
+      seam?.atStage?.("object_pass");
+      if (remaining() <= 0) return untrusted("deadline");
       const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--objects", ...revs]), {
         env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (maxObjects + 1) * 4096,
       });
@@ -20446,6 +20460,8 @@ export class GitCache {
     remaining: () => number,
   ): Promise<{ complete: true; hits: Array<{ label: string | undefined; commit: string }> } | { complete: false }> {
     const incomplete = { complete: false } as const;
+    // A deadline already spent on entry is incomplete before any git work (a zero-commit range reads no clock otherwise).
+    if (remaining() <= 0) return incomplete;
     const matchers = active.map((g) => ({ label: g.label, matcher: literalMatcher(g.forms) }));
     const hits: Array<{ label: string | undefined; commit: string }> = [];
     const seen = new Set<string>();

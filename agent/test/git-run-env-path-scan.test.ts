@@ -206,8 +206,41 @@ describe("scanObjectsForRunEnv: the path pass fails closed", () => {
   it("reaching maxPathBytes is path_scan_incomplete", async () => {
     assert.deepEqual(await scan(prepare(), [NESTED], { caps: { maxPathBytes: 8 } }), incomplete);
   });
-  it("a spent deadline is path_scan_incomplete", async () => {
-    assert.deepEqual(await scan(prepare(), [NESTED], { deadlineMs: 1 }), incomplete);
+  type Stage = "before_path_pass" | "path_pass" | "object_pass";
+  // A scan whose clock jumps a billion milliseconds when it reaches `jumpAt` (never, when undefined).
+  const scanWithClock = async (tip: string, jumpAt: Stage | undefined) => {
+    let t = 0;
+    const seen: Stage[] = [];
+    const clocked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      objectScanClockForTest: { now: () => t, atStage: (s) => { seen.push(s); if (s === jumpAt) t += 10 ** 9; } },
+    }));
+    const res = await clocked.scanObjectsForRunEnv(bare, { tip, excludes: [base] }, needles(NESTED));
+    return { res, seen };
+  };
+
+  it("a deadline spent inside the path pass is path_scan_incomplete", async () => {
+    const { res, seen } = await scanWithClock(prepare(), "path_pass");
+    assert.deepEqual(res, incomplete);
+    assert.deepEqual(seen, ["before_path_pass", "path_pass"]);
+  });
+  it("a deadline spent before the path pass is deadline", async () => {
+    const { res, seen } = await scanWithClock(prepare(), "before_path_pass");
+    assert.deepEqual(res, { trusted: false, reason: "deadline" });
+    assert.deepEqual(seen, ["before_path_pass"]);
+  });
+  it("a deadline spent before the object pass is deadline", async () => {
+    const { res, seen } = await scanWithClock(prepare(), "object_pass");
+    assert.deepEqual(res, { trusted: false, reason: "deadline" });
+    assert.deepEqual(seen, ["before_path_pass", "path_pass", "object_pass"]);
+  });
+  it("a deadline spent inside the path pass of an empty range is path_scan_incomplete", async () => {
+    const { res } = await scanWithClock(base, "path_pass");
+    assert.deepEqual(res, incomplete);
+  });
+  it("without a clock jump every stage is reached and the scan is clean", async () => {
+    const { res, seen } = await scanWithClock(prepare(), undefined);
+    assert.deepEqual(res, { trusted: true, findings: [] });
+    assert.deepEqual(seen, ["before_path_pass", "path_pass", "object_pass"]);
   });
   it("the same range under the default caps is clean", async () => {
     assert.deepEqual(await scan(prepare(), [NESTED]), { trusted: true, findings: [] });
