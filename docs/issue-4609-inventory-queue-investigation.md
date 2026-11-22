@@ -169,7 +169,7 @@ Diagnostics are counted by wrapping the instance's `noteInventoryDiagnostic`.
 The log is not used, because `noteRedriveExit`
 (`agent/src/recovery.ts:2143-2158`) deduplicates repeated reasons.
 
-Reads are counted per phase of the pass:
+Reads are calls to `newReconstructionRecords` (journal reads), not filesystem operations. They are counted per phase of the pass:
 
 - **skip:** during discovery;
 - **hint:** during the priority hint;
@@ -406,7 +406,7 @@ Either implementation must ship its own red-then-green regression. Scenario
 
 ### Limitations
 
-- The counts come from a single fixture shape: one context per run, a fake
+- The counts come from a single fixture shape: one context per run, a fake Git producer (the capture and upload run against fixture seams, not a live worker), a fake
   API, and no settled records.
 - Real journal-read, hold-RPC and capture latencies were not measured.
 - Production queue sizes are unknown, and the #4570 incident does not supply
