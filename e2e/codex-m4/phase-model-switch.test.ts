@@ -20,7 +20,7 @@ before(async () => {
   if (P_LAYER_SKIP) return;
   const config = await loadPackagedConfig();
   const bin = resolveCodexBin().codexBin;
-  assertBinaryVersion(bin, "0.167.0");
+  assertBinaryVersion(bin, "0.169.0");
   fs.mkdirSync("../.uzi/scratch", { recursive: true });
   root = fs.mkdtempSync(path.resolve("../.uzi/scratch/phase-model-"));
   const home = path.join(root, "home"), cwd = path.join(root, "cwd");
@@ -137,7 +137,7 @@ test("Codex phase case 6: today's shared accountant attributes switched usage to
   assert.deepEqual(observed.accountedCold, [A]);
   const warmResult = observed.switch as { resumed: { model: string }; wire: { model?: unknown } };
   const coldResult = observed.cold as { reclaimed: { model: string }; wire: { model?: unknown } };
-  console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.167.0", efforts: observed.efforts, effortReports: observed.effortReports, requests: observed.requests,
+  console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.169.0", efforts: observed.efforts, effortReports: observed.effortReports, requests: observed.requests,
     warmResumeModel: warmResult.resumed.model, warmRequestModel: warmResult.wire.model,
     coldResumeModel: coldResult.reclaimed.model, coldRequestModelWithoutTurnOverride: coldResult.wire.model, warmControl: observed.warmControl,
     switchedModelAccounting: observed.accounted })}`);
