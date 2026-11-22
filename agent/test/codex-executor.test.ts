@@ -99,7 +99,7 @@ import type {
   LaunchAdviceRootSeam,
 } from "../src/codex/codex-advice-harness.js";
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
-import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { JudgeEvidenceReducer, type JudgeEvidence } from "../src/judge-evidence.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
@@ -37202,6 +37202,82 @@ describe("M2 provider executor composition", () => {
       assert.equal(rec(usage[model]).costUSD, undefined);
       assert.equal(rig.client.releaseCalls.length, 0);
       assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
+
+  for (const sensitive of [false, true]) {
+    it(`provider child output boundary preserves ${sensitive ? "encoded-key secrecy and unpriced usage" : "clean output and distinct usage"}`, async () => {
+      // Inputs are constructed independently of the production expected-form helper.
+      const key = ["child-fixture", '"', "/", "<>&", "tail"].join("");
+      const json = 'child-fixture\\"/<>&tail';
+      const slash = 'child-fixture\\"\\/<>&tail';
+      const unicode = 'child-fixture\\"/\\u003c\\u003e\\u0026tail';
+      const percent = 'child-fixture%22%2F%3C%3E%26tail';
+      const inputs = sensitive ? [key, json, slash, percent, unicode] : ["clean-alpha", "clean-beta"];
+      const payload = { control: "child-output-control", ...Object.fromEntries(inputs.map((value, i) => [value, { value, ordinal: i }])) };
+      const text = JSON.stringify(payload);
+      const rootModel = "corp-root";
+      const childModel = "corp-child";
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport
+            .push(agentMessage(text, "th-child"))
+            .push(toolCall(11, "uzi_bash", { command: "echo child-output-control" }, "th-child", "tn-child", "child-shell"))
+            .push(tokenUsageUpdated("th-child", "tn-child", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+            .push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      } });
+      // Only the effect seam is fake; the tool broker, projection and delegation are real.
+      rig.deps = { ...rig.deps, spawnCommand: async () => ({ code: 0, stdout: text, stderr: "child-stderr-control" }) };
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+        model_map: { default: { model: rootModel, context_window: 32768 },
+          "gpt-6.1-sol": { model: childModel, context_window: 65536 } } });
+      const forms = providerKeyForms(key);
+      if (sensitive) for (const input of inputs) assert.ok(forms.includes(input), "independent input is a recognized key form");
+      const { logger, lines } = recordingLogger();
+      const { ctx, emitted } = makeCtx({ redactText: makeTextRedactor(forms), agents: [
+        { name: "lead", description: "lead", prompt_body: "lead body" },
+        { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-6.1-sol" },
+      ] });
+      rig.transport.push(threadStarted())
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 10, outputTokens: 5, totalTokens: 15 }))
+        .push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "root-child"));
+      const running = makeExecutor(rig, binding, logger).run(ctx);
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "output child settled");
+      rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+      await withTimeout(running, 3000, "output child run");
+      const reply = rig.transport.responses.find(r => r.requestId === 1)!;
+      assert.match(JSON.stringify(reply), /child-output-control/, "child text reaches the parent response");
+      assert.ok(emitted.some(m => m.agent === "coder" && JSON.stringify(m).includes("child-output-control")), "child feed was emitted");
+      assert.ok(rig.transport.responses.some(r => r.requestId === 11), "actual tool broker settled child command");
+      const usage = lastResultModelUsage(emitted)!;
+      assert.ok(usage, "final accounting was emitted");
+      assert.deepEqual(Object.keys(usage).sort(), [childModel, rootModel]);
+      assert.equal(rec(usage[rootModel]).inputTokens, 10);
+      assert.equal(rec(usage[childModel]).inputTokens, 200);
+      const rows = Object.values(usage).map(rec);
+      assert.equal(rows.reduce((sum, row) => sum + Number(row.inputTokens), 0), 210);
+      assert.equal(rows.reduce((sum, row) => sum + Number(row.outputTokens), 0), 105);
+      assert.equal(rows.length, 2, "root and child retain distinct model accounting");
+      for (const row of rows) assert.equal(row.costUSD, undefined, "provider tokens remain unpriced");
+      assert.equal(rig.transport.requests.filter(r => r.method === "thread/start").length, 2);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+      const visible = JSON.stringify({ emitted, responses: rig.transport.responses, logs: lines });
+      if (sensitive) {
+        for (const form of forms) {
+          for (const [channel, value] of Object.entries({ emitted, responses: rig.transport.responses, logs: lines })) {
+            assert.ok(!JSON.stringify(value).includes(form), `provider form escaped ${channel} (response IDs: ${rig.transport.responses.filter(r => JSON.stringify(r).includes(form)).map(r => r.requestId).join(",")}): ${form}`);
+          }
+          assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), "JSON-escaped provider form escaped output boundary");
+        }
+      } else {
+        for (const input of inputs) assert.ok(visible.includes(input), "clean member and value survive");
+      }
     });
   }
 

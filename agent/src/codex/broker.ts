@@ -38,6 +38,7 @@
 // second copy of the clamping logic.
 
 import path from "node:path";
+import { redactStrings } from "../redact.js";
 import { CODE_DISPOSITIONS_TOOL, authorizeCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkerMemoryCommands } from "../worker-memory-commands.js";
@@ -435,7 +436,7 @@ export interface ScreenPolicy {
 export interface RunGrants {
   readonly semanticPlanning?: import("../semantic-plan.js").SemanticPlanning;
   readonly ownerDecisionRequested?: boolean;
-  /** The run's text redactor, applied by scanSignals before its parse-time clamps. */
+  /** The claim's text redactor, applied to responses and before shell and signal clamps. */
   readonly redactText?: (text: string) => string;
   readonly role: string;
   readonly phase: "plan" | "implement";
@@ -655,7 +656,8 @@ export class CodexCallbackBroker {
     origin: CallbackOrigin,
   ): Promise<CallbackResult> {
     if (!this.registry.workAdmissionOpen()) return deny("admission_closed", "executor lifetime closed");
-    return this.registry.admitWork(() => this.handleAdmittedToolCall(rt, name, args, origin));
+    const result = await this.registry.admitWork(() => this.handleAdmittedToolCall(rt, name, args, origin));
+    return this.grants.redactText ? redactStrings(result, this.grants.redactText) : result;
   }
 
   private async handleAdmittedToolCall(
@@ -902,8 +904,8 @@ export class CodexCallbackBroker {
       ok: true,
       output: {
         code: spawned.code,
-        stdout: boundedString(spawned.stdout, MAX_SHELL_OUTPUT_BYTES),
-        stderr: boundedString(spawned.stderr, MAX_SHELL_OUTPUT_BYTES),
+        stdout: boundedString(this.grants.redactText?.(spawned.stdout) ?? spawned.stdout, MAX_SHELL_OUTPUT_BYTES),
+        stderr: boundedString(this.grants.redactText?.(spawned.stderr) ?? spawned.stderr, MAX_SHELL_OUTPUT_BYTES),
       },
     };
   }
