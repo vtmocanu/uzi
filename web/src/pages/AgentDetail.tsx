@@ -325,7 +325,9 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
           <div>
             <dt className="text-faint">Model &amp; effort</dt>
             <dd className="text-fg">
-              {pins.rows[0].model.label} · {pins.rows[0].effort.label} (Claude and Codex)
+              <div>{pins.rows[0].model.label}</div>
+              <div className="text-muted">{`effort: ${pins.rows[0].effort.label}`}</div>
+              <div className="text-xs text-faint">both harnesses</div>
             </dd>
           </div>
         ) : (
@@ -333,7 +335,8 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
             <div key={r.family}>
               <dt className="text-faint">{r.family}</dt>
               <dd className="text-fg">
-                {r.model.label} · {r.effort.label}
+                <div>{r.model.label}</div>
+                <div className="text-muted">{`effort: ${r.effort.label}`}</div>
               </dd>
             </div>
           ))

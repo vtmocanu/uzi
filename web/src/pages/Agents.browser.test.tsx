@@ -133,6 +133,7 @@ it.each(["dawn", "ember"])("shows per-family pins, the collapsed default and the
 
   const reviewerRow = screen.getByRole("link", { name: "reviewer" }).closest("tr")!;
   expectVisible(within(reviewerRow).getByText("Default · follows lead"), "collapsed default");
+  expectVisible(within(reviewerRow).getByText("effort: Default · follows the run's effort"), "collapsed effort");
 
   const leadRow = screen.getByRole("link", { name: "lead" }).closest("tr")!;
   expectVisible(await within(leadRow).findByText(/^For your Claude runs/), "lead line");

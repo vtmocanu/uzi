@@ -238,7 +238,7 @@ export function Agents() {
                   <th className="px-4 py-3 font-medium">Name</th>
                   <th className="px-4 py-3 font-medium">Scope</th>
                   <th className="px-4 py-3 font-medium">Description</th>
-                  <th className="px-4 py-3 font-medium">Model & effort</th>
+                  <th className="min-w-[14rem] px-4 py-3 font-medium">Model & effort</th>
                   <th className="px-4 py-3 font-medium">Tools</th>
                   <th className="px-4 py-3 text-center font-medium">In my runs</th>
                   {isAdmin && <th className="px-4 py-3 text-center font-medium">Global default</th>}
@@ -294,7 +294,7 @@ function personalHarnessLines(data: EffectiveSettings, prefix: (family: string) 
     const family = h === "claude" ? "Claude" : "Codex";
     const parts: string[] = [];
     if (m) {
-      const unset = h === "claude" ? "SDK/account default" : m.default_model || "built-in";
+      const unset = modelSettingSourceLabel("note", "sdk_default");
       parts.push(`${m.resolved_model || unset} · ${modelSettingSourceLabel("model", m.source)}`);
     }
     if (e) {
@@ -411,18 +411,19 @@ function AgentRow({
         <Badge tone={templateScopeBadgeTone(t.scope)}>{TEMPLATE_SCOPE_LABEL[t.scope]}</Badge>
       </td>
       <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
-      <td className="px-4 py-3 text-muted">
+      <td className="min-w-[14rem] px-4 py-3 text-muted">
         {pins.collapsed ? (
           <div role="group" aria-label="Claude and Codex model and effort" className="space-y-0.5">
             <div>{pins.rows[0].model.label}</div>
-            <div>{pins.rows[0].effort.label}</div>
+            <div className="text-muted">{`effort: ${pins.rows[0].effort.label}`}</div>
             <div className="text-xs text-faint">both harnesses</div>
           </div>
         ) : (
-          <div className="space-y-0.5">
+          <div className="space-y-1.5">
             {pins.rows.map((r) => (
               <div key={r.harness} role="group" aria-label={`${r.family} model and effort`}>
-                {`${r.family}: ${r.model.label} · ${r.effort.label}`}
+                <div>{`${r.family}: ${r.model.label}`}</div>
+                <div className="text-muted">{`effort: ${r.effort.label}`}</div>
               </div>
             ))}
           </div>

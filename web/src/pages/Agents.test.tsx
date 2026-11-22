@@ -119,13 +119,18 @@ describe("Agents page unset model label (#3255)", () => {
     render(<MemoryRouter><Agents /></MemoryRouter>);
     const leadRow = (await screen.findByRole("link", { name: "lead" })).closest("tr")!;
     // An all-unset lead is never collapsed: both families show their defaults.
-    expect(within(leadRow).getByText("Claude: Default · SDK/account default (built-in) · Default · built-in (medium)")).toBeTruthy();
-    expect(within(leadRow).getByText("Codex: Default · built-in (gpt-6.1-sol) · Default · built-in (medium)")).toBeTruthy();
+    const leadClaude = within(leadRow).getByLabelText("Claude model and effort");
+    expect(within(leadClaude).getByText("Claude: Default · SDK/account default (built-in)")).toBeTruthy();
+    expect(within(leadClaude).getByText("effort: Default · built-in (medium)")).toBeTruthy();
+    const leadCodex = within(leadRow).getByLabelText("Codex model and effort");
+    expect(within(leadCodex).getByText("Codex: Default · built-in (gpt-6.1-sol)")).toBeTruthy();
+    expect(within(leadCodex).getByText("effort: Default · built-in (medium)")).toBeTruthy();
     expect(within(leadRow).queryByText("both harnesses")).toBeNull();
     const coderRow = screen.getByRole("link", { name: "coder" }).closest("tr")!;
-    expect(within(coderRow).getByText("Default · follows lead")).toBeTruthy();
-    expect(within(coderRow).getByText("Default · follows the run's effort")).toBeTruthy();
-    expect(within(coderRow).getByText("both harnesses")).toBeTruthy();
+    const collapsed = within(coderRow).getByRole("group", { name: "Claude and Codex model and effort" });
+    expect(within(collapsed).getByText("Default · follows lead")).toBeTruthy();
+    expect(within(collapsed).getByText("effort: Default · follows the run's effort")).toBeTruthy();
+    expect(within(collapsed).getByText("both harnesses")).toBeTruthy();
     expect(screen.queryByText("inherit")).toBeNull();
   });
 });
@@ -142,21 +147,22 @@ describe("Agents page per-harness pins", () => {
   it.each([
     {
       pins: { model: "sonnet", codex_model: "gpt-6-sol", effort: "high", codex_effort: "low" },
-      claude: "Claude: sonnet · high",
-      codex: "Codex: gpt-6-sol · low",
+      claude: ["Claude: sonnet", "effort: high"],
+      codex: ["Codex: gpt-6-sol", "effort: low"],
     },
     {
       pins: { model: null, codex_model: "gpt-6-luna", effort: null, codex_effort: "high" },
-      claude: "Claude: Default · follows lead · Default · follows the run's effort",
-      codex: "Codex: gpt-6-luna · high",
+      claude: ["Claude: Default · follows lead", "effort: Default · follows the run's effort"],
+      codex: ["Codex: gpt-6-luna", "effort: high"],
     },
   ])("shows stored pins in both families: $claude / $codex", async ({ pins, claude, codex }) => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
     mockApi.listAgentTemplates.mockResolvedValue({ templates: [tmpl({ id: "b-coder", name: "coder", scope: "builtin", ...pins })] });
     mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
     render(<MemoryRouter><Agents /></MemoryRouter>);
-    expect((await screen.findByLabelText("Claude model and effort")).textContent).toBe(claude);
-    expect(screen.getByLabelText("Codex model and effort").textContent).toBe(codex);
+    const lines = (el: HTMLElement) => [...el.children].map((c) => c.textContent);
+    expect(lines(await screen.findByLabelText("Claude model and effort"))).toEqual(claude);
+    expect(lines(screen.getByLabelText("Codex model and effort"))).toEqual(codex);
     expect(screen.queryByText("both harnesses")).toBeNull();
   });
 });
@@ -229,12 +235,12 @@ describe("Agents page personalized lead line (#3262)", () => {
     expect(screen.queryByTestId("personal-lead-note")).toBeNull();
   });
 
-  it("shows only usable harnesses and SDK/account default for an empty model", async () => {
+  it("shows only usable harnesses and the sdk_default note for an empty model", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
     seedLead();
     mockApi.getEffectiveSettings.mockResolvedValue(eff({ ...CLAUDE_A, model: "" }, null));
     renderPage();
-    expect(await screen.findByText("For your Claude runs: SDK/account default · your choice; effort high · your choice")).toBeTruthy();
+    expect(await screen.findByText("For your Claude runs: the SDK decides · your choice; effort high · your choice")).toBeTruthy();
     expect(screen.queryByText(/For your Codex runs/)).toBeNull();
   });
 
@@ -249,17 +255,19 @@ describe("Agents page personalized lead line (#3262)", () => {
     )).toBeTruthy();
   });
 
-  it("names the Codex default model, else built-in, for an empty Codex model; never SDK/account default", async () => {
+  it("shows the sdk_default note for an empty model on both harnesses, with or without a Codex default model", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
     seedLead();
-    mockApi.getEffectiveSettings.mockResolvedValue(eff(CLAUDE_A, { ...CODEX_A, model: "", defaultModel: "gpt-d" }));
+    mockApi.getEffectiveSettings.mockResolvedValue(eff({ ...CLAUDE_A, model: "" }, { ...CODEX_A, model: "", defaultModel: "gpt-d" }));
     const first = renderPage();
-    expect(await screen.findByText(/^For your Codex runs: gpt-d · built-in;/)).toBeTruthy();
+    expect(await screen.findByText(/^For your Codex runs: the SDK decides · built-in;/)).toBeTruthy();
+    expect(screen.getByText(/^For your Claude runs: the SDK decides · your choice;/)).toBeTruthy();
     first.unmount();
     mockApi.getEffectiveSettings.mockResolvedValue(eff(CLAUDE_A, { ...CODEX_A, model: "" }));
     renderPage();
-    expect(await screen.findByText(/^For your Codex runs: built-in · built-in;/)).toBeTruthy();
-    expect(screen.queryByText(/For your Codex runs: SDK\/account default/)).toBeNull();
+    expect(await screen.findByText(/^For your Codex runs: the SDK decides · built-in;/)).toBeTruthy();
+    expect(screen.queryByText(/For your Codex runs: (gpt-d|built-in ·)/)).toBeNull();
+    expect(screen.queryByText(/For your Claude runs: SDK\/account default/)).toBeNull();
   });
 
   it.each([
