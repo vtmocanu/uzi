@@ -1237,7 +1237,7 @@ export class CodexHarness implements RunHarness {
   private async prepareThread(request: RunTurnRequest, rendered: RenderedCodexRun): Promise<boolean> {
     this.assertOpen();
     this.assertPhaseBoundaryCertain();
-    if (this.phaseModelVerificationRequired && request.resumeSessionId === undefined)
+    if ((this.phaseModelVerificationRequired || this.phaseTransition?.current?.pending) && request.resumeSessionId === undefined)
       throw new PhaseSwitchUnverifiedError("malformed", {}, {});
     this.latchModel(rendered);
     if (request.signal.aborted || this.stopRequested) return false;
