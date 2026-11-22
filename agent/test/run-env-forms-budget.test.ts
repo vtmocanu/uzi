@@ -57,13 +57,20 @@ const GENERATORS: Record<string, Gen> = {
   "three-byte characters": (n) => fill([" ", "€"], n),
   "CRLF lines with trailing breaks": (n) => fill(["abcdefghij\r\n"], n - 4, "z") + "\r\n\r\n\r\n\r\n".slice(0, 4),
   "LF lines": (n) => fill(["abcdefghij\n"], n),
-  "short lines (no line forms, many joins)": (n) => "abcdefgh" + fill(["\n"], n - 8),
+  "one 8-character line then breaks (one line form, many joins)": (n) => "abcdefgh" + fill(["\n"], n - 8),
+  // Lines the old token rule never registered: every line of 8+ characters now is a line form.
+  "control-padded lowercase-only lines": (n) => fill(["abcdefgh\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u000b\n"], n),
+  "control-padded lowercase-only lines, CRLF with trailing breaks": (n) =>
+    fill(["abcdefgh" + range(1, 8).join("") + "\r\n"], n - 4, "\u0001") + "\r\n\r\n",
+  "lowercase-only 8-character lines": (n) => fill(["abcdefgh\n"], n),
+  "digit-only 8-character lines": (n) => fill(["11223344\n"], n),
+  "punctuation-only 8-character lines": (n) => fill(["========\r\n"], n),
   "alternating text and break": (n) => fill(["a\n"], n),
   "lone CR and LF": (n) => fill(["a\r", "b\n"], n),
   "spaces and html-significant characters": (n) => fill([" ", "<", ">", "&", "/", '"', "\\"], n),
   "high-variety alphanumerics": (n) => hashed("variety", n),
   "controls with a space": (n) => " " + fill(range(1, 31, [9, 10, 13]), n - 1),
-  // Lines that hold a secret-shaped token, so each registers as a line form, padded with controls that JSON-escape to
+  // Lines that each register as a line form, padded with controls that JSON-escape to
   // six units per byte, and ending in breaks so all four value variants exist.
   "control-padded token lines with trailing breaks": (n) =>
     fill(["aB3xY7kQ" + range(1, 8).join("") + "\r\n"], n - 4, "\u0001") + "\r\n\r\n",

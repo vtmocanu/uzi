@@ -7,11 +7,12 @@ import { makeForgeToolHandlers } from "../src/forge-tools.js";
 import { makeFindingsToolHandlers } from "../src/findings-tools.js";
 import { redactPlanSummary } from "../src/summary-runner.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { createLogger } from "../src/log.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { sanitizeNowText, trimToolFrame } from "../src/now-summary.js";
 import type { Executor } from "../src/executor.js";
 import { runEnvClaimForms } from "../src/run-env-forms.js";
-import type { ClaimRunEnvVar, OutgoingMessage } from "../src/protocol.js";
+import type { ClaimRunEnvRedact, ClaimRunEnvVar, OutgoingMessage } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { ScratchPublicationError } from "../src/git.js";
@@ -286,4 +287,58 @@ describe("questions, now summary, failure reasons and the merge request", () => 
       assert.ok(ctx.includes(`part(redact, ${input.startsWith("Title") ? "`" + input : input}`), input);
     }
   });
+});
+
+// Regression 3a: a line of a multi-line secret that the old token rule left public (lowercase-only, or one case
+// with a single digit) is masked wherever it appears alone, for a live run_env secret and a retained
+// run_env_redact version, in a feed payload, in the merge request title and body, and in a log line.
+describe("a line fragment of a multi-line secret is masked in every sink", () => {
+  const LOWER = "zqxvbnmkl";
+  const ONE_DIGIT = "pwrtyhgf4";
+  const OTHER_LINES = ["Qm9kdXMtZml4dHVyZS1hLQ", "c2Vjb25kLWZpeHR1cmUtYg"];
+  const MULTI = [OTHER_LINES[0]!, LOWER, ONE_DIGIT, OTHER_LINES[1]!].join("\n");
+  const UUID = "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44";
+  const shapes: Array<[string, () => { run_env?: ClaimRunEnvVar[]; run_env_redact?: ClaimRunEnvRedact[] }]> = [
+    ["a live run_env secret", () => ({ run_env: [secretVar("SVC_FILE", MULTI)] })],
+    ["a retained run_env_redact version", () => ({ run_env_redact: [{ var_id: UUID, scope: "repo", rev: 1, name: "OLD_FILE", value: MULTI }] })],
+  ];
+  let mrCount = 0;
+  const fragments: Array<[string, string]> = [["a lowercase-only line", LOWER], ["a single-case line with one digit", ONE_DIGIT]];
+
+  for (const [shape, vars] of shapes) {
+    for (const [label, fragment] of fragments) {
+      const forms = (): string[] => runEnvClaimForms(vars().run_env, vars().run_env_redact).redaction;
+
+      it(`${shape}, ${label}: masked in a feed payload`, async () => {
+        const sent: OutgoingMessage[] = [];
+        const client = { async postMessages(_id: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
+        const batcher = new MessageBatcher(client, "run-frag", 0, 0, nullLogger(), makeRedactor(forms()), makeTextRedactor(forms()));
+        batcher.emit({ kind: "question", agent: "lead", payload: { question_id: "q1", questions: [{ header: "h", question: `is ${fragment} right?`, options: [{ label: `use ${fragment}` }] }] } });
+        await batcher.close();
+        assert.equal(sent.length, 1);
+        assert.ok(!JSON.stringify(sent).includes(fragment));
+      });
+
+      it(`${shape}, ${label}: masked in the merge request title and body`, async () => {
+        const { gitlab, calls } = fakeGitlab();
+        const claim = gitlabClaim(46110 + mrCount++, {
+          secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", ...vars() },
+          issue_title: `rotate ${fragment}`,
+        });
+        simulateCommittedWork();
+        const exec: Executor = { run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "own", agents: ["coder", "reviewer"] } }) };
+        await runner(exec, gitlab).execute(claim);
+        assert.ok(calls.length > 0, "a merge request was opened");
+        assert.match(calls[0]!.body ?? "", /rotate /, "the title is still built from the issue");
+        for (const call of calls) assert.ok(!(call.body ?? "").includes(fragment), "no outbound forge body carries the fragment");
+      });
+
+      it(`${shape}, ${label}: masked in a log line`, () => {
+        const log = createLogger("error");
+        for (const f of forms()) log.addSecret(f);
+        const scrubbed = log.redactDiagnostic!(JSON.stringify({ msg: `saw ${fragment} here` }));
+        assert.ok(!scrubbed.includes(fragment));
+      });
+    }
+  }
 });

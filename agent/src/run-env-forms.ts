@@ -11,10 +11,11 @@
 // bytes or the final padding, depend on data the worker cannot know and are dropped. The same three
 // alignments are also kept in the URL-safe alphabet.
 //
-// A multi-line value (a PEM key, a JSON credential file) is also split by line, but only for REDACTION: a
-// line of it can appear alone in output and must be masked there. A line is never a scan needle. The scan
-// instead gets the value as it reads inside a unified diff, where every line after the first carries a
-// `+`, `-` or ` ` prefix.
+// A multi-line value (a PEM key, a JSON credential file) is also split by line: every line of at least
+// MIN_SECRET_LEN characters, except PEM armor and whitespace-only lines, is registered for REDACTION and for
+// the preserved-patch line check, because a line of it can appear alone in output. A line is never a scan
+// needle. The scan instead gets the value as it reads inside a unified diff, where every line after the
+// first carries a `+`, `-` or ` ` prefix.
 
 import { MIN_SECRET_LEN, providerKeyForms } from "./redact.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "./protocol.js";
@@ -42,44 +43,18 @@ function wholeValueForms(value: string): string[] {
 
 const LINE_BREAK = /\r\n|\r|\n/;
 const PEM_ARMOR = /^-----(BEGIN|END) [^-]+-----$/;
-/** A leading `key:` or `key=` (optionally after a YAML `- `, with the key optionally quoted). An `=` that
- *  only pads the end of the line (base64 padding) and a `:` that starts `//` (a URL scheme) are not a key. */
-const LEADING_KEY = /^\s*(?:-\s+)?["']?[A-Za-z0-9_.-]+["']?\s*(?::|=(?!=*\s*$))(?!\/\/)\s*/;
-/** A URL's `scheme://` and host[:port]; an optional `userinfo@` between them is captured. The scheme starts where
- *  no scheme character precedes it, so a long run of scheme characters is scanned once. */
-const URL_SCHEME_HOST = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/((?:[^\s/@]*@)?)[A-Za-z0-9.-]+(?::\d+)?/g;
-/** A maximal run of token characters; `/` and every other character separate tokens. */
-const TOKEN = /[A-Za-z0-9+=_-]+/g;
-const MIN_DISTINCT_CHARS = 5;
+const WHITESPACE_ONLY = /^\s*$/;
 
 function isMultiLine(value: string): boolean {
   return value.includes("\r") || value.includes("\n");
 }
 
-/** Whether a token is long enough and has at least {@link MIN_DISTINCT_CHARS} distinct characters, and is
- *  either all digits or mixes upper- and lower-case letters or a letter with at least two digits. */
-function isSecretToken(token: string): boolean {
-  if (token.length < MIN_SECRET_LEN || new Set(token).size < MIN_DISTINCT_CHARS) return false;
-  if (/^[0-9]+$/.test(token)) return true;
-  const upper = /[A-Z]/.test(token);
-  const lower = /[a-z]/.test(token);
-  const digits = (token.match(/[0-9]/g) ?? []).length;
-  return (upper && lower) || ((upper || lower) && digits >= 2);
-}
-
-/** The part of a line that may hold a secret: the line without its leading key, and without each URL's
- *  scheme and host (a URL's userinfo, path, query and fragment stay). */
-function valuePart(line: string): string {
-  return line.replace(LEADING_KEY, "").replace(URL_SCHEME_HOST, " $1");
-}
-
-/** The lines of a multi-line value that may be registered alone: at least {@link MIN_SECRET_LEN} long, not PEM
- *  armor, and holding a token that {@link isSecretToken} accepts in its value part. */
+/** The lines of a multi-line value that are registered alone: every line at least {@link MIN_SECRET_LEN} long
+ *  except PEM armor and whitespace-only lines. No condition on letter case, token variety, digits or key name. */
 function lineForms(value: string): string[] {
   const out: string[] = [];
   for (const line of value.split(LINE_BREAK)) {
-    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line)) continue;
-    if (!(valuePart(line).match(TOKEN) ?? []).some(isSecretToken)) continue;
+    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line) || WHITESPACE_ONLY.test(line)) continue;
     out.push(line, JSON.stringify(line).slice(1, -1));
   }
   return out;

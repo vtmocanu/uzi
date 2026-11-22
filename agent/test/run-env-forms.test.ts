@@ -101,13 +101,20 @@ describe("which lines of a multi-line value are registered alone", () => {
     });
   }
 
-  for (const [label, line] of [["a digits-only line with 4 distinct digits", "11223344"], ["a one-digit mixed token", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a whitespace run", "        "]] as const) {
-    it(`${label} is not registered alone`, () => {
+  for (const [label, line] of [["a digits-only line with 4 distinct digits", "11223344"], ["a one-digit mixed token", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a lowercase-only line", "abcdefgh"]] as const) {
+    it(`${label} is registered alone`, () => {
       const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
-      assert.equal(redact(`text ${line} end`), `text ${line} end`);
-      assert.ok(!redact(`text ${FILLER[0]} end`).includes(FILLER[0]), "its other lines still are");
+      assert.ok(!redact(`text ${line} end`).includes(line));
+      assert.ok(!redact(`text ${FILLER[0]} end`).includes(FILLER[0]), "its other lines are too");
     });
   }
+
+  it("a whitespace-only line is not registered alone", () => {
+    const line = "        ";
+    const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
+    assert.equal(redact(`text ${line} end`), `text ${line} end`);
+    assert.ok(!redact(`text ${FILLER[0]} end`).includes(FILLER[0]), "its other lines still are");
+  });
 });
 
 describe("a multi-line secret in a unified diff", () => {
@@ -144,11 +151,15 @@ describe("a multi-line secret in a unified diff", () => {
     assert.deepEqual(textHitVariables(asPatch(OTHER_PEM.split("\n")), needles), []);
   });
 
-  it("a constant line of a JSON credential is not a hit, while the whole credential is", () => {
+  it("a constant line of a JSON credential is masked alone but is never a scan needle, while the whole credential is a hit", () => {
     const credential = ["{", '  "type": "service_account",', '  "project_id": "dummy-project-0001",', '  "private_key_id": "0123456789abcdef"', "}"].join("\n");
-    const sa = runEnvClaimForms([secretVar("GCP_CREDENTIALS", credential)], []).needles;
-    const publicLine = asPatch(['  "type": "service_account",', '  "client_email": "a@b.example"']);
+    const claim = runEnvClaimForms([secretVar("GCP_CREDENTIALS", credential)], []);
+    const sa = claim.needles;
+    const constant = '  "type": "service_account",';
+    const publicLine = asPatch([constant, '  "client_email": "a@b.example"']);
     assert.deepEqual(textHitVariables(publicLine, sa), []);
+    assert.ok(claim.lineForms[0]!.forms.includes(constant), "the constant line is a line form");
+    assert.ok(!makeTextRedactor(claim.redaction)(`x ${constant} y`).includes(constant), "and is masked");
     assert.deepEqual(textHitVariables(asPatch(credential.split("\n")), sa), ["GCP_CREDENTIALS"]);
   });
 
@@ -297,52 +308,52 @@ describe("the largest claim redacts in bounded time", () => {
   });
 });
 
-// A line of a multi-line value is registered alone only when its value part (after a leading key, and without a
-// URL's scheme and host) holds a token that is long, varied and mixes letter case or letters with digits. Armor
-// is joined at runtime; every secret-looking value is derived from a hash or joined from parts.
+// Every line of a multi-line value of at least 8 characters is registered alone, except PEM armor and
+// whitespace-only lines. Armor is joined at runtime; every secret-looking value is derived from a hash or joined
+// from parts.
 const hex = (seed: string, n = 40): string => crypto.createHash("sha256").update(seed).digest("hex").slice(0, n);
 const b64 = (seed: string, n = 40): string => crypto.createHash("sha256").update(seed).digest("base64").replace(/[+/=]/g, "Q").slice(0, n);
 
-/** Builds a claim from `lines`, then checks each public line is left alone and each secret line is masked, in
+/** Builds a claim from `lines`, then checks each excluded line is left alone and each registered line is masked, in
  *  redacted text and in the per-name line forms. */
-function assertLineClasses(lines: string[], publicLines: string[], secretLines: string[]): void {
+function assertLineClasses(lines: string[], excluded: string[], registered: string[]): void {
   const claim = runEnvClaimForms([secretVar("SVC_FILE", lines.join("\n"))], []);
   const redact = makeTextRedactor(claim.redaction);
   const forms = claim.lineForms.find((n) => n.name === "SVC_FILE")?.forms ?? [];
-  for (const line of publicLines) {
+  for (const line of excluded) {
     const text = `before\n${line}\nafter`;
-    assert.equal(redact(text), text, `public: ${line}`);
+    assert.equal(redact(text), text, `excluded: ${line}`);
     assert.ok(!forms.includes(line), `not a line form: ${line}`);
   }
-  for (const line of secretLines) {
+  for (const line of registered) {
     const text = `before\n${line}\nafter`;
-    assert.notEqual(redact(text), text, `secret: ${line}`);
+    assert.notEqual(redact(text), text, `registered: ${line}`);
     assert.ok(forms.includes(line), `a line form: ${line}`);
   }
 }
 
-describe("lines of a multi-line value are registered only when they hold a secret-like token", () => {
+describe("every line of 8+ characters of a multi-line value is registered, except PEM armor and whitespace-only lines", () => {
   const ENTROPY = bodyLines("one");
 
-  it("blank padding, a flat run, a legacy PEM header and punctuation rules are not registered; entropy lines are", () => {
-    const value = ["{", " ".repeat(8), "aaaaaaaaaaaaaaaa", "Proc-Type: 4,ENCRYPTED", "========", `"client_email": "${ENTROPY[0]}",`, ENTROPY[1]!, ENTROPY[2]!, "}"];
-    assertLineClasses(value, [value[1]!, value[2]!, value[3]!, value[4]!], [value[5]!, ENTROPY[1]!, ENTROPY[2]!]);
+  it("lowercase-only, single-case one-digit, legacy PEM header, leading-key, URL host and rule lines are registered; armor and whitespace-only are not", () => {
+    const value = [BEGIN, " ".repeat(8), "aaaaaaaaaaaaaaaa", "abcdefghij", "abcdefg1", "ABCDEFG1", "Proc-Type: 4,ENCRYPTED", "========",
+      `"client_email": "${ENTROPY[0]}",`, "    server: https://kubernetes.example.com:6443", "11223344", ENTROPY[1]!, END];
+    assertLineClasses(value, [BEGIN, value[1]!, END], value.slice(2, -1));
     const claim = runEnvClaimForms([secretVar("SVC_FILE", value.join("\n"))], []);
     const forms = claim.lineForms[0]!.forms;
     assert.ok(forms.includes(JSON.stringify(ENTROPY[1]).slice(1, -1)), "the JSON-escaped form is kept");
     assert.ok(!makeTextRedactor(claim.redaction)(`x ${JSON.stringify(ENTROPY[1]).slice(1, -1)} y`).includes(ENTROPY[1]!.slice(0, 30)));
   });
 
-  it("a URL's host is not examined: a host label that reads like a token leaves the line public", () => {
-    const host = ["ec2", "54", "12", "34", "56"].join("-") + ".compute-1.ExampleCloud.com";
-    assertLineClasses(["kind: Config", `    server: https://${host}:6443`, ENTROPY[0]!], [`    server: https://${host}:6443`], [ENTROPY[0]!]);
+  it("a line shorter than 8 characters is not registered", () => {
+    assertLineClasses(["abcdefg", ENTROPY[0]!], ["abcdefg"], [ENTROPY[0]!]);
   });
 
-  it("a mixed-case token with fewer than 5 distinct characters is not registered", () => {
-    assertLineClasses(["AaBbAaBbAaBb", ENTROPY[0]!], ["AaBbAaBbAaBb"], [ENTROPY[0]!]);
+  it("an 8-space line and a tab-and-space line are excluded", () => {
+    assertLineClasses([" ".repeat(8), "\t \t \t \t ", ENTROPY[0]!], [" ".repeat(8), "\t \t \t \t "], [ENTROPY[0]!]);
   });
 
-  it("a 256 KiB line of scheme characters builds its forms in linear time", () => {
+  it("a 256 KiB line builds its forms in linear time", () => {
     const long = hex("long-line", 64).repeat(4096);
     const started = performance.now();
     const claim = runEnvClaimForms([secretVar("LONG_HEX", `${long}\n${ENTROPY[0]}\n`)], []);
@@ -351,44 +362,21 @@ describe("lines of a multi-line value are registered only when they hold a secre
     assert.ok(ms < 1500, `forms built in ${ms.toFixed(0)} ms`);
   });
 
-  it("a kubeconfig keeps its structure readable and masks its data lines", () => {
-    const secrets = [`    certificate-authority-data: ${b64("ca", 60)}`, `    client-key-data: ${b64("key", 60)}`, `    token: ${b64("tok", 32)}`];
-    assertLineClasses(
-      ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443", ...secrets],
-      ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443"],
-      secrets,
-    );
+  it("a kubeconfig masks every line of 8+ characters", () => {
+    const lines = ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443",
+      `    certificate-authority-data: ${b64("ca", 60)}`, `    client-key-data: ${b64("key", 60)}`, `    token: ${b64("tok", 32)}`];
+    assertLineClasses(lines, [], lines);
   });
 
-  it("an AWS credentials file keeps its section and region readable and masks its keys", () => {
-    const secrets = [`aws_access_key_id = ${["AK", "IA", "7Q2M", "X9D4", "K1LZ", "8P3R"].join("")}`, `aws_secret_access_key = ${b64("aws-secret")}`, `aws_session_token = ${b64("aws-session", 64)}`];
-    assertLineClasses(["[default]", "region = us-east-1", ...secrets], ["[default]", "region = us-east-1"], secrets);
+  it("an AWS credentials file masks its section-less lines of 8+ characters", () => {
+    const lines = ["[default]", "region = us-east-1", `aws_access_key_id = ${["AK", "IA", "7Q2M", "X9D4", "K1LZ", "8P3R"].join("")}`, `aws_secret_access_key = ${b64("aws-secret")}`];
+    assertLineClasses(lines, [], lines);
   });
 
-  it("a docker config keeps its braces and registry readable and masks the auth, even letters-only", () => {
-    const lettersOnly = Buffer.from("user:pass").toString("base64");
-    assert.ok(/^[A-Za-z]+$/.test(lettersOnly) && /[a-z]/.test(lettersOnly) && /[A-Z]/.test(lettersOnly), "fixture is letters only, mixed case");
-    const secrets = [`"auth": "${Buffer.from(`user:${b64("docker-pass", 24)}`).toString("base64")}"`, `"auth": "${lettersOnly}"`];
-    assertLineClasses(["{", '"auths": {', '"registry.example.com": {', ...secrets, "}", "}", "}"],
-      ["{", '"auths": {', '"registry.example.com": {'], secrets);
-  });
-
-  it("a Google service account keeps its constant members readable and masks its key id and key body", () => {
-    const body = bodyLines("gsa");
-    const secrets = [`"private_key_id": "${hex("gsa-id")}",`, ...body];
-    assertLineClasses(
-      ["{", '"type": "service_account",', '"auth_uri": "https://accounts.google.com/o/oauth2/auth",', '"token_uri": "https://oauth2.googleapis.com/token",',
-        '"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",', '"universe_domain": "googleapis.com"', ...secrets, "}"],
-      ['"type": "service_account",', '"auth_uri": "https://accounts.google.com/o/oauth2/auth",', '"token_uri": "https://oauth2.googleapis.com/token",',
-        '"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",', '"universe_domain": "googleapis.com"'],
-      secrets,
-    );
-  });
-
-  it("a secret in a value that looks like a public member is still masked", () => {
-    const tok = b64("odd", 32);
-    const secrets = [`"token_uri": "${tok}",`, `"type": "${tok}",`, `"token_uri": "https://oauth2.googleapis.com/${tok}"`, `url = https://oauth2:${tok}@git.example.com`];
-    assertLineClasses(["{", ...secrets, "}"], [], secrets);
+  it("a Google service account masks its constant members, key id and key body", () => {
+    const lines = ["{", '"type": "service_account",', '"auth_uri": "https://accounts.google.com/o/oauth2/auth",', '"token_uri": "https://oauth2.googleapis.com/token",',
+      '"universe_domain": "googleapis.com"', `"private_key_id": "${hex("gsa-id")}",`, ...bodyLines("gsa"), "}"];
+    assertLineClasses(lines, [], lines.filter((l) => l.length >= 8));
   });
 
   it("a padded last base64 line without + or / is masked", () => {

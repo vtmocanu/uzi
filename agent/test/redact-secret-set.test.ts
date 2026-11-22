@@ -65,8 +65,9 @@ describe("SecretSet", () => {
 
 describe("SecretSet over a run's secret variable forms", () => {
   const ENTROPY = Array.from({ length: 80 }, (_, i) => createHash("sha256").update(`entropy-${i}`).digest("base64"));
-  const PUBLIC_LINES = ["apiVersion: v1", "kind: Config", "current-context: example", "    server: https://kubernetes.example.com:6443", "clusters:", "- name: example", " ".repeat(8)];
-  const value = [...PUBLIC_LINES, ...ENTROPY, "}"].join("\n");
+  const STRUCTURAL_LINES = ["apiVersion: v1", "kind: Config", "current-context: example", "    server: https://kubernetes.example.com:6443", "clusters:", "- name: example"];
+  const PADDING = " ".repeat(8);
+  const value = [...STRUCTURAL_LINES, PADDING, ...ENTROPY, "}"].join("\n");
   const claim = runEnvClaimForms([
     { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "SVC_JSON", value, secret: true, description: "" },
   ], []);
@@ -75,11 +76,13 @@ describe("SecretSet over a run's secret variable forms", () => {
     assert.ok(claim.redaction.length > PER_SECRET_MAX, `${claim.redaction.length} forms`);
   });
 
-  it("leaves public lines and padding unmasked and masks an entropy line, in text and payloads", () => {
+  it("leaves whitespace-only padding unmasked and masks every other line of 8+ characters, in text and payloads", () => {
     const set = new SecretSet(claim.redaction);
-    for (const line of PUBLIC_LINES) {
-      assert.equal(set.text(`a\n${line}\nb`), `a\n${line}\nb`);
-      assert.deepEqual(set.payload({ k: line }), { k: line });
+    assert.equal(set.text(`a\n${PADDING}\nb`), `a\n${PADDING}\nb`);
+    assert.deepEqual(set.payload({ k: PADDING }), { k: PADDING });
+    for (const line of STRUCTURAL_LINES) {
+      assert.equal(set.text(`a\n${line}\nb`), `a\n${REDACTED}\nb`);
+      assert.deepEqual(set.payload({ k: line }), { k: REDACTED });
     }
     assert.equal(set.text(`a ${ENTROPY[1]} b`), `a ${REDACTED} b`);
     assert.deepEqual(set.payload({ k: [ENTROPY[2]] }), { k: [REDACTED] });

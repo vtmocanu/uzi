@@ -137,17 +137,23 @@ function realDiff(files: Array<{ name: string; body?: string; rename?: string }>
   }
 }
 
-// A patch whose added lines are only the structural lines of a multi-line secret file is not withheld; one that
-// adds a line holding a secret-like token is. The key line is derived from a hash.
+// A patch that adds any line of 8+ characters of a multi-line secret file is withheld as line_form, structural
+// lines included. The key line is derived from a hash.
 describe("the preserved patch and the structural lines of a secret file", () => {
   const keyLine = `    client-key-data: ${crypto.createHash("sha256").update("patch-key").digest("base64").replace(/[+/=]/g, "Q")}`;
   const lines = ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443", keyLine];
   const claim = runEnvClaimForms([{ ...var1, name: "KUBECONFIG_FILE", value: lines.join("\n") }], []);
   const added = (...body: string[]): string => hunkPatch(`@@ -0,0 +1,${body.length} @@`, ...body.map((l) => `+${l}`));
 
-  it("is not withheld when it adds only the structural lines", () => {
-    const verdict = patchScanVerdict(added(...lines.slice(0, 6)), claim.needles, claim.lineForms);
-    assert.deepEqual(verdict, { withhold: false });
+  for (const line of lines.slice(0, 6)) {
+    it(`is withheld as line_form when it adds only the structural line ${line.trim()}`, () => {
+      const verdict = patchScanVerdict(added(line), claim.needles, claim.lineForms);
+      assert.deepEqual(verdict, { withhold: true, reason: "line_form", variables: ["KUBECONFIG_FILE"] });
+    });
+  }
+
+  it("is not withheld when it adds a whitespace-only line", () => {
+    assert.deepEqual(patchScanVerdict(added(" ".repeat(8)), claim.needles, claim.lineForms), { withhold: false });
   });
 
   it("is withheld as line_form when it adds the key line", () => {
