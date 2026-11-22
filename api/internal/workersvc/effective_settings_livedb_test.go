@@ -446,7 +446,7 @@ func TestEffectiveSettingsSubagentPinsMatchClaimLiveDB(t *testing.T) {
 
 // TestEffectiveSettingsReviewClaimLiveDB pins the review branch against a real Codex review claim.
 func TestEffectiveSettingsReviewClaimLiveDB(t *testing.T) {
-	t.Run("codex review claim ships no model, the built-in is predicted", func(t *testing.T) {
+	t.Run("codex review ignores worker model and predicts inherited built-in effort", func(t *testing.T) {
 		fx := newEffFix(t)
 		fx.codexDefault()
 		fx.lane("default_codex_model", "custom-codex-preview") // a custom lane must not reach the review
@@ -462,8 +462,12 @@ func TestEffectiveSettingsReviewClaimLiveDB(t *testing.T) {
 			t.Fatalf("a Codex review claim ships default_model %q, want none", *payload.Config.DefaultModel)
 		}
 		got := fx.predictLead(HarnessCodex, true)
-		if got.Model != agenttmpl.CodexTaskReviewModel || got.ModelSource != "builtin" || got.Effort != nil {
+		if got.Model != agenttmpl.CodexTaskReviewModel || got.ModelSource != "builtin" {
 			t.Fatalf("review prediction = %+v", got)
+		}
+		if got.Effort == nil || *got.Effort != "medium" || got.EffortSource != "builtin" ||
+			got.ReviewEffort.Mode != agenttmpl.EffortModeExplicit || !got.ReviewEffortInherited {
+			t.Fatalf("unset review effort must inherit built-in medium: %+v", got)
 		}
 	})
 }
