@@ -200,8 +200,10 @@ reconcile writers.
 
 A `ci_fix` that is bound to a PR (`runs.ci_fix_mr_iid`, see above) is
 cancelled once that PR is merged or closed, since there is nothing left to fix.
-An unbound `ci_fix` is never matched to a PR by branch name, so this does not
-apply to it. Two paths do it:
+Two paths do it. Early polling covers only a bound `ci_fix` (an unbound one has
+no `ci_fix_mr_iid` for the poller to select); the publication backstop covers
+both bound and unbound runs, since an unbound run's source can still resolve by
+branch.
 
 - **Early polling.** The forge poller checks active `ci_fix` and
   [`mr_rework`](./mr-review-watcher.md#when-the-merge-request-merges-or-closes-mid-rework)
@@ -211,22 +213,27 @@ apply to it. Two paths do it:
   merged or closed state; any read error or mismatch leaves the run alone.
   A run with a live worker gets a cancel the worker drains and ends
   `cancelled`; a queued, `limit_wait` or `pool_wait` run is cancelled by the
-  server. `paused` and `recovery_wait` runs (held for their owner) and runs
-  whose worker is stale are left alone. An existing stop verdict (an operator
+  server. The poller leaves `paused` and `recovery_wait` runs and runs whose
+  worker is stale alone (the MR watcher still cancels a parked `mr_rework`). An existing stop verdict (an operator
   cancel, stop or auto-stop) is never overwritten, and a run with a pending
   terminal outcome is deferred to a later pass.
 - **Publication backstop.** When the worker asks for publication context and
-  the bound PR is merged or closed, the server stops the run and answers with
-  the refusal reason `target_terminal`. The worker does not push and reports
-  failed, and the run lands `cancelled` with no failure reason. Its work is
-  kept and recoverable with `uzi run held` / `uzi run recovery` (see
-  [Run recovery](./run-recovery.md)).
+  the PR is merged or closed and the rest of the publication context resolves
+  (source binding, identity match, live claim, unchanged snapshot), the server
+  stops the run and answers with the refusal reason `target_terminal`;
+  otherwise the existing refusal is returned and nothing is stamped. The worker
+  does not push and reports failed, and the run lands `cancelled` with no
+  failure reason. Its work is not discarded; it stays recoverable under the
+  usual held-publication and recovery rules (`uzi run held` / `uzi run
+  recovery`, see [Run recovery](./run-recovery.md)).
 
 The recorded stop reason is "target MR merged; further publication stopped."
 or "target MR closed; further publication stopped.", shown like any other
 `stop_reason`.
 
-Limits: a `paused` or `recovery_wait` `ci_fix` is cancelled only after its
-owner resumes it, when the backstop catches it. If storage stays unavailable
-through the backstop's bounded retries, the earlier refusal is returned and the
-run may end `failed` rather than `cancelled`.
+Limits: a `paused` or `recovery_wait` `ci_fix` is not cancelled while parked;
+once it is resumed or promoted (a `recovery_wait` run can be promoted back to
+queued by the server without the owner), the poller or the publication backstop
+cancels it. If storage stays unavailable through the backstop's bounded
+retries, the worker gets `authority_unknown`, nothing is stamped, and the run
+may end `failed` rather than `cancelled`.

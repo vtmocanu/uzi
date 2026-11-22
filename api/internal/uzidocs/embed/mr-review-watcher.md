@@ -399,13 +399,19 @@ run's branch, a full 40-hex head SHA and a merged or closed state. A run with a
 live worker gets a cancel the worker drains and ends `cancelled`; an existing
 stop verdict (an operator cancel, stop or auto-stop) is never overwritten. If
 the worker asks for publication context after the MR has merged or closed, the
-server refuses with `target_terminal`, nothing is pushed and the run lands
-`cancelled` with its work retained (`uzi run held` / `uzi run recovery`).
+server refuses with `target_terminal` (when the rest of the publication context
+resolves; otherwise the existing refusal is returned and nothing is stamped),
+nothing is pushed and the run normally lands `cancelled`. Its work is not
+discarded; it stays recoverable under the usual held-publication and recovery
+rules (`uzi run held` / `uzi run recovery`).
 
-The recorded stop reason is "target MR merged; further publication stopped."
-or "target MR closed; further publication stopped.", replacing the earlier
-"MR merged/closed during rework". The same early polling, backstop and limits
-apply to a bound `ci_fix`; see
+`mr_rework` runs, parked `paused` and `recovery_wait` ones included, are
+cancelled by the MR watcher. The recorded stop reason is "target MR merged;
+further publication stopped." or "target MR closed; further publication
+stopped.", replacing the earlier "MR merged/closed during rework". The same
+early polling and backstop apply to a bound `ci_fix`, but the limit that a
+`paused` or `recovery_wait` run is not cancelled while parked is `ci_fix`-only;
+see
 [Automatic CI fix](./ci-autofix.md#when-the-pull-request-merges-or-closes-mid-fix).
 
 ## Rework on demand
