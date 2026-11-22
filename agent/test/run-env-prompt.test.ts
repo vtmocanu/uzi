@@ -4,6 +4,8 @@ import { buildRunEnvBlock, sanitizeRunEnvPromptText } from "../src/run-env-promp
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildPlanPrompt, buildSelfImprovePlanPrompt } from "../src/prompt.js";
 import { assembleAgents, subagentsFromTemplates } from "../src/agents.js";
 import { renderCodexRun } from "../src/codex/render.js";
+import { sdkRunEnvInjected, type SdkCredential } from "../src/sdk-env.js";
+import { commandRunEnvInjected } from "../src/codex/codex-executor.js";
 import type { HarnessAgent, RunTurnRequest } from "../src/harness.js";
 import type { AgentTemplate, ClaimRunEnvVar } from "../src/protocol.js";
 
@@ -108,6 +110,29 @@ describe("buildRunEnvBlock", () => {
 
   it("does not list a name the injection would refuse", () => {
     assert.equal(buildRunEnvBlock([v("PATH"), v("lowercase")]), "");
+  });
+});
+
+describe("prompts built from the precomputed injected set, before any env build", () => {
+  const cred: SdkCredential = { kind: "oauth", token: "dummy-oauth-token-do-not-scan-0000" };
+  const claimVars = [v("NPM_TOKEN"), v("REGION"), v("PATH"), v("DB_PASSWORD", { value: SECRET, secret: true })];
+
+  it("a Claude plan prompt lists the injected names and leaves out a tool-profile shadow and a denied name", () => {
+    const injected = sdkRunEnvInjected(claimVars, cred, "/h", { NPM_TOKEN: "from-tool-profile" });
+    const prompt = buildPlanPrompt({ branch: "agent/issue-9", subagentNames: ["coder"], issueIid: 9, issueTitle: "t", issueDescription: "d", runEnv: injected });
+    assert.match(prompt, /- REGION \(repo scope\)/);
+    assert.match(prompt, /- DB_PASSWORD \(repo scope, secret/);
+    assert.doesNotMatch(prompt, /- NPM_TOKEN/);
+    assert.doesNotMatch(prompt, /- PATH/);
+  });
+
+  it("a Codex block lists the injected names and leaves out a tool-profile shadow and a denied name", () => {
+    const injected = commandRunEnvInjected(claimVars, "/private/tmp", { NPM_TOKEN: "from-tool-profile", PATH: "/nix/bin" });
+    const block = buildRunEnvBlock(injected);
+    assert.match(block, /- REGION \(repo scope\)/);
+    assert.match(block, /- DB_PASSWORD \(repo scope, secret/);
+    assert.doesNotMatch(block, /- NPM_TOKEN/);
+    assert.doesNotMatch(block, /- PATH/);
   });
 });
 

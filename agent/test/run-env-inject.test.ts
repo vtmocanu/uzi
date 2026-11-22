@@ -2,9 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
-import { buildCommandEnv, withCommandGitTrust } from "../src/codex/codex-executor.js";
-import { foldRunEnv, runEnvDropText } from "../src/run-env-inject.js";
+import { buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "../src/sdk-env.js";
+import { buildCommandEnv, commandRunEnvInjected, withCommandGitTrust } from "../src/codex/codex-executor.js";
+import { foldRunEnv, runEnvDropText, runEnvInjectedSet } from "../src/run-env-inject.js";
 import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { RUN_ENV_DENIED_NAMES, RUN_ENV_DENIED_PREFIXES } from "../src/run-env-names.js";
@@ -135,6 +135,57 @@ describe("foldRunEnv protected predicate", () => {
     assert.ok(!Object.hasOwn(env, "MY_FLAG"));
     assert.equal(env.OTHER_FLAG, "dummy-value-other_flag");
     assert.deepEqual(drops, [["MY_FLAG", "protected worker key"]]);
+  });
+});
+
+describe("runEnvInjectedSet", () => {
+  const names = (vars: readonly ClaimRunEnvVar[]): string[] => vars.map((x) => x.name);
+
+  it("names the same variables and drops, in the same order, as foldRunEnv over the same env", () => {
+    const pre: Record<string, string | undefined> = { PRESET_KEY: "x", UNSET_KEY: undefined, PINNED_KEY: "p" };
+    const vars = [...hostile, v("PRESET_KEY"), v("UNSET_KEY"), v("PINNED_KEY"), v("TWICE_NAMED", "first"), v("TWICE_NAMED", "second"), v("LAST_ONE")];
+    const isProtected = (k: string): boolean => k === "PINNED_KEY";
+    const env = { ...pre };
+    const { drops, onDrop } = collector();
+    const folded = foldRunEnv(env, { vars, onDrop }, isProtected);
+    const set = runEnvInjectedSet(vars, Object.keys(pre), isProtected);
+    assert.deepEqual(set.injected, folded);
+    assert.deepEqual(set.dropped.map((d) => [d.name, d.rule]), drops);
+    assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(pre, k)).sort(), names(set.injected).sort());
+    assert.deepEqual(set.injected.filter((x) => x.name === "TWICE_NAMED").map((x) => x.value), ["first"], "the first of two same-named variables wins");
+    assert.ok(!set.injected.some((x) => ["PRESET_KEY", "UNSET_KEY", "PINNED_KEY"].includes(x.name)));
+  });
+
+  it("is pure: it reads no env and leaves its inputs unchanged", () => {
+    const vars = [v("A_ONE"), v("PATH")];
+    const keys = ["X_KEY"];
+    const before = JSON.stringify([vars, keys]);
+    runEnvInjectedSet(vars, keys, () => false);
+    assert.equal(JSON.stringify([vars, keys]), before);
+  });
+
+  it("buildSdkEnv injects exactly sdkRunEnvInjected's list, tool-profile shadows included", () => {
+    const cred: SdkCredential = { kind: "oauth", token: "dummy-oauth-token-do-not-scan-0000" };
+    const tool = { NPM_TOKEN: "from-tool-profile", NIX_SSL_CERT_FILE: "/nix/ca.pem" };
+    const vars = [...hostile, v("NPM_TOKEN"), v("REGION")];
+    const base = buildSdkEnv(cred, "/h", tool);
+    const env = buildSdkEnv(cred, "/h", tool, undefined, undefined, undefined, undefined, { vars });
+    const injected = sdkRunEnvInjected(vars, cred, "/h", tool);
+    assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(base, k)).sort(), names(injected).sort());
+    assert.ok(!names(injected).includes("NPM_TOKEN"));
+    assert.equal(env.NPM_TOKEN, "from-tool-profile");
+    assert.deepEqual(sdkRunEnvInjected([], cred, "/h", tool), []);
+  });
+
+  it("buildCommandEnv injects exactly commandRunEnvInjected's list, tool-profile shadows included", () => {
+    const tool = { PATH: "/nix/bin", NPM_TOKEN: "from-tool-profile" };
+    const vars = [...hostile, v("NPM_TOKEN"), v("REGION")];
+    const base = buildCommandEnv("/private/tmp", tool);
+    const env = buildCommandEnv("/private/tmp", tool, undefined, false, { vars });
+    const injected = commandRunEnvInjected(vars, "/private/tmp", tool);
+    assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(base, k)).sort(), names(injected).sort());
+    assert.ok(!names(injected).includes("NPM_TOKEN"));
+    assert.equal(env.NPM_TOKEN, "from-tool-profile");
   });
 });
 

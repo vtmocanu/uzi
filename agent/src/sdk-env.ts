@@ -24,7 +24,8 @@
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
-import { foldRunEnv, type RunEnvInjection } from "./run-env-inject.js";
+import type { ClaimRunEnvVar } from "./protocol.js";
+import { foldRunEnv, runEnvInjectedSet, type RunEnvInjection } from "./run-env-inject.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
 
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
@@ -167,7 +168,9 @@ function credentialEnv(credential: SdkCredential): Record<string, string | undef
 }
 
 /**
- * Build the sparse env handed to `query({ options: { env } })`.
+ * Build the sparse env handed to `query({ options: { env } })`. This block documents the parameters of
+ * {@link buildSdkEnv}; the function it sits on is its pre-fold half (everything before the run's variables
+ * fold in), shared with {@link sdkRunEnvInjected} so both see the same keys.
  *
  * @param credential the OAuth token (CLAUDE_CODE_OAUTH_TOKEN) or the frozen provider binding (PRD #4320)
  * @param homeDir    the pinned HOME (a dir on $UZI_DATA_DIR) for session persistence
@@ -196,15 +199,11 @@ function credentialEnv(credential: SdkCredential): Record<string, string | undef
  *                   right after the toolEnv fold with the lowest precedence (see foldRunEnv); every
  *                   worker-set key below still wins. Undefined ⇒ the env is byte-identical to before.
  */
-export function buildSdkEnv(
+function sdkPreFoldEnv(
   credential: SdkCredential,
   homeDir: string,
-  toolEnv: Record<string, string> = {},
-  dockerHost?: string,
-  attempt?: SdkAttemptEnv,
-  goWorkDir?: string,
-  runTmpdir?: string,
-  runEnv?: RunEnvInjection,
+  toolEnv: Record<string, string>,
+  runTmpdir: string | undefined,
 ): SdkEnv {
   const env = {
     ...credentialEnv(credential),
@@ -250,8 +249,39 @@ export function buildSdkEnv(
     if (PROTECTED_ENV_KEYS.has(k)) continue;
     env[k] = v;
   }
+  return env;
+}
+
+/** The keys buildSdkEnv refuses to let a user variable take (the credential, HOME and the pinned ANTHROPIC_* keys). */
+const isSdkRunEnvProtected = (k: string): boolean => PROTECTED_ENV_KEYS.has(k);
+
+/** PRD #4416 M2: the variables of `vars` that {@link buildSdkEnv} injects for these inputs, computed over the
+ *  same pre-fold env the builder folds into and with the same predicate, so the executor can name them once
+ *  per claim (before any prompt) and the fold injects exactly this list. Pass the `credential`, `homeDir`,
+ *  `toolEnv` and `runTmpdir` the builder is given. */
+export function sdkRunEnvInjected(
+  vars: readonly ClaimRunEnvVar[],
+  credential: SdkCredential,
+  homeDir: string,
+  toolEnv: Record<string, string>,
+  runTmpdir?: string,
+): ClaimRunEnvVar[] {
+  return runEnvInjectedSet(vars, Object.keys(sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir)), isSdkRunEnvProtected).injected;
+}
+
+export function buildSdkEnv(
+  credential: SdkCredential,
+  homeDir: string,
+  toolEnv: Record<string, string> = {},
+  dockerHost?: string,
+  attempt?: SdkAttemptEnv,
+  goWorkDir?: string,
+  runTmpdir?: string,
+  runEnv?: RunEnvInjection,
+): SdkEnv {
+  const env = sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir);
   // PRD #4416 M2: user variables, after the tool profile and before every worker-set key below.
-  foldRunEnv(env, runEnv, (k) => PROTECTED_ENV_KEYS.has(k));
+  foldRunEnv(env, runEnv, isSdkRunEnvProtected);
   // PRD #4416 M2: every worker-set key assigned from here on overwrites a user variable of the same
   // name silently (no drop event), which is safe only because each such key is also denied by name
   // (RUN_ENV_DENIED_NAMES / prefixes), so a user variable never reaches this point under it.

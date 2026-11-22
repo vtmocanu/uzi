@@ -154,13 +154,14 @@ export async function resolveScanNeedles(opts: {
   return { kind: "needles", needles: forms.needles };
 }
 
-/** The only lines git emits between a `diff --git` line and the first hunk of a file. */
+/** The prefixes of the extended header lines patchImages accepts between a `diff --git` line and the first
+ *  hunk of a file. Any other line there makes the patch unparseable. */
 const FILE_HEADER_PREFIXES = [
   "index ", "--- ", "+++ ", "old mode ", "new mode ", "new file mode ", "deleted file mode ",
   "similarity index ", "dissimilarity index ", "rename from ", "rename to ", "copy from ", "copy to ",
 ];
 
-const HUNK_HEADER =/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 /**
  * The pre-image and post-image text of every hunk of a unified diff, rebuilt per file and per hunk. The
@@ -168,11 +169,12 @@ const HUNK_HEADER =/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
  * prefix stripped and every line terminated by "\n" (a CRLF line keeps its "\r"). A `\ No newline at end of
  * file` marker removes the terminator of the line before it from the image(s) that line belongs to; it is not a
  * content line. Hunks are never joined with one another. Lines between a `diff --git` line and its first hunk
- * are file headers and carry no content.
+ * are file headers and carry no content, provided each starts with one of FILE_HEADER_PREFIXES.
  *
  * Returns "unparseable" for anything it cannot rebuild exactly: a binary patch, a combined diff, a line that
- * is not a hunk line inside or between hunks, or a hunk whose line counts do not match its header. A caller
- * that must not ship a patch it cannot read withholds it.
+ * is not a hunk line inside or between hunks, a line between a `diff --git` line and its first hunk that is
+ * not a recognised file header line, or a hunk whose line counts do not match its header. A caller that must
+ * not ship a patch it cannot read withholds it.
  */
 export function patchImages(patch: string): { images: string[] } | "unparseable" {
   const lines = patch.split("\n");
@@ -288,7 +290,7 @@ export function patchScanVerdict(
 }
 
 /** The names of the variables whose forms occur in `text` (a raw patch), in needle order. Used before the
- *  patch is redacted. One pass over the text for every form of every needle. */
+ *  patch is redacted. */
 export function textHitVariables(text: string, needles: readonly ScanNeedle[]): string[] {
   const formsPresent = literalsPresent(needles.flatMap((n) => n.forms));
   const present = formsPresent(text);

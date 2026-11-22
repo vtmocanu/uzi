@@ -397,6 +397,14 @@ describe("patchScanVerdict", () => {
     assert.deepEqual(patchScanVerdict(crlf, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
   });
 
+  it("withholds a value whose line breaks in the patch are a lone CR, read as LF after normalization", () => {
+    const f = forms("SVC_BLOB", multi);
+    // The first two lines of the value are joined by a lone CR inside one added line; the third is the next added line.
+    const lone = hunk("@@ -0,0 +1,2 @@", `+${multi[0]}\r${multi[1]}`, `+${multi[2]}`);
+    assert.ok(!lone.includes(multi.join("\n")) && !lone.includes(multi.join("\r\n")), "no whole-value form in the raw text");
+    assert.deepEqual(patchScanVerdict(lone, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
+  });
+
   it("withholds an unreadable patch as unparseable_patch once the claim has any form", () => {
     const f = forms("SVC_BLOB", multi);
     const binary = "diff --git a/a.bin b/a.bin\nBinary files a/a.bin and b/a.bin differ\n";
