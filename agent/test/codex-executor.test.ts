@@ -6976,6 +6976,37 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     });
   }
 
+  for (const revision of [false, true]) {
+    for (const implementEffort of ["medium", undefined]) {
+      it(`restored gate actual-first-turn catalog: ${revision ? "revision" : "implementation"}, implement ${implementEffort ?? "runtime"}`, async () => {
+        const saved = "catalog-restored";
+        const turn = epochResponder(saved, "catalog-first-turn", (t, th, tn) => {
+          if (revision) t.push(toolCall(1, "submit_plan", { plan_md: "revised catalog plan" }, th, tn, "catalog-submit"));
+          else t.push(signalDone(th, tn));
+          t.push(turnCompleted("completed", th, tn));
+        });
+        const rig = makeRig({ responder: c => c.method === "model/list"
+          ? catalog("gpt-6-astra", ["medium"]) : turn(c) });
+        const { ctx, emitted } = makeCtx({ sessionId: saved, approvedPlan: "saved catalog plan",
+          planApproved: false, resumePhase: "awaiting_approval",
+          config: { ...(implementEffort ? { default_effort: implementEffort as "medium" } : {}), plan_phase: { effort: "high" } },
+          takeResumedGateEvent: async () => revision ? { kind: "revise", feedback: "revise", inputId: 1 } : undefined,
+          gatePlan: async () => revision ? { kind: "cancel" } as never : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never,
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        if (revision) await assert.rejects(withTimeout(running, 3000, "catalog revision"), /run cancelled/);
+        else await withTimeout(running, 3000, "catalog implementation");
+        const notes = emitted.filter(m => m.payload.event === NOTE_EVENT);
+        assert.equal(notes.length, revision ? 1 : 0, "advisory follows the first dispatched effort");
+        if (revision) assert.match(String(notes[0]!.payload.text), /reasoning effort high/);
+        assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, revision || implementEffort ? 1 : 0);
+        const starts = rig.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(starts.length, 1);
+        assert.equal(rec(starts[0]!.params).effort, revision ? "high" : implementEffort);
+      });
+    }
+  }
+
   it("sanitizes the model id in the note", async () => {
     const hostile = "evil\u001b[31m\nmodel";
     const { notes } = await run({ effort: "max", providerModel: hostile, list: () => catalog(hostile, ["low"]) });
@@ -37817,6 +37848,10 @@ describe("B2 cold approval model handoff", () => {
       if (!hasSession) assert.match(prompts[0]!, /persisted candidate/);
       assert.deepEqual(sources, ["own"]);
       assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+      const revisionRoutes = rig.epochs[0]!.transport.requests.filter(r => r.method === "thread/start" || r.method === "thread/resume");
+      assert.equal(revisionRoutes.length, 1, "the revision uses exactly one thread route");
+      assert.equal(revisionRoutes[0]!.method, hasSession ? "thread/resume" : "thread/start");
+      if (hasSession) assert.equal(rec(revisionRoutes[0]!.params).threadId, saved);
       assertImplementationResume(rig.epochs[1]!.transport);
     });
   }
@@ -37966,6 +38001,7 @@ describe("B2 cold approval model handoff", () => {
 
   for (const observed of ["gpt-6.1-sol", "gpt-6-astra", null]) {
     it(`consumed approval cut then checkpoint recreation verifies ${observed ?? "missing"} without another split`, async () => {
+      const accounting = observeUsage();
       const checkpoint: Responder = c => {
         if (c.method !== "turn/start") return implementation()(c);
         const tn = "b2-checkpoint";
@@ -37983,6 +38019,7 @@ describe("B2 cold approval model handoff", () => {
         gatePlan: approval, checkpoint: async () => { checkpoints++; } });
       const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "B2 consumed cut recreation");
       assert.equal(checkpoints, 1);
+      assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]], "checkpoint recreation never repeats the consumed approval cut");
       assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
       assert.equal(rig.epochs[2]!.transport.turnStartCount, observed === "gpt-6.1-sol" ? 1 : 0);
       assert.equal(result.phaseSwitchHeld?.phase, observed === "gpt-6.1-sol" ? undefined : "implement");

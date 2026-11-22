@@ -230,6 +230,16 @@ export interface CodexPhaseTransitionCell {
   current?: CodexPhaseTransition;
 }
 
+type CodexCatalogProbe = {
+  readonly timeoutMs: number;
+  /** Issue #3251: default true (the shipped awaited probe). False starts the same single request
+   *  without awaiting it: the first `turn/start` does not wait, and the parse and `onEntry` run in a
+   *  detached continuation bounded by `timeoutMs`; nothing is sent for a turn already stopped, and
+   *  a stop before the reply suppresses `onEntry`. */
+  readonly blocking?: boolean;
+  readonly onEntry: (entry: CodexCatalogEntry | undefined, model: string) => void;
+};
+
 export interface CodexHarnessOptions {
   /** One cell per executor claim, shared with the claim's accountant across all epochs.
    *  Mint current only at approval; model is the canonical rendered implementation model.
@@ -279,19 +289,13 @@ export interface CodexHarnessOptions {
   /** Issue #1583: the 12-hex-char namespace of this harness's projected tool ids. Generated from
    *  `crypto.randomBytes` when absent; injectable so a test can pin the ids. */
   readonly idNonce?: string;
-  /** PRD #3247 M2: opt-in, once-per-instance `model/list` probe. Runs after the root thread is
-   *  started/resumed and before the first `turn/start`; `onEntry` is called synchronously with the
-   *  matching catalog entry (and the model it was matched for), or `undefined` on any timeout/error/malformed/absent result. It is not called when the turn is
-   *  stopped or aborted during the probe, and it never throws into the turn. */
-  readonly catalogProbe?: {
-    readonly timeoutMs: number;
-    /** Issue #3251: default true (the shipped awaited probe). False starts the same single request
-     *  without awaiting it: the first `turn/start` does not wait, and the parse and `onEntry` run in a
-     *  detached continuation bounded by `timeoutMs`; nothing is sent for a turn already stopped, and
-     *  a stop before the reply suppresses `onEntry`. */
-    readonly blocking?: boolean;
-    readonly onEntry: (entry: CodexCatalogEntry | undefined, model: string) => void;
-  };
+  /** PRD #3247 M2: opt-in, once-per-instance `model/list` probe, after thread preparation and
+   *  before the first turn. `onEntry` receives the matching entry and model, or undefined on a
+   *  bounded failure. Report-only probes do not delay the turn; a stop suppresses the callback,
+   *  and onEntry faults never escape into the turn. */
+  // A factory selects awaited explicit-effort versus report-only Runtime default from the
+  // first actual turn request. It is consumed once, just like an already configured probe.
+  readonly catalogProbe?: CodexCatalogProbe | ((request: RunTurnRequest) => CodexCatalogProbe | undefined);
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -738,10 +742,11 @@ export class CodexHarness implements RunHarness {
 
   /** PRD #3247 M2: one bounded `model/list` call; the result (or undefined) goes to `onEntry`.
    *  Consumed on first use so a recreated turn or a resume fallback never probes twice. */
-  private async runCatalogProbe(abort: Promise<"aborted">, signal: AbortSignal): Promise<void> {
-    const probe = this.catalogProbe;
-    if (!probe) return;
+  private async runCatalogProbe(request: RunTurnRequest, abort: Promise<"aborted">, signal: AbortSignal): Promise<void> {
+    const configured = this.catalogProbe;
     this.catalogProbe = undefined;
+    const probe = typeof configured === "function" ? configured(request) : configured;
+    if (!probe) return;
     // The exact model thread/start sends (currentModel is set in runTurn before this runs).
     const model = this.currentModel ?? this.provider.model;
     if (probe.blocking === false) {
@@ -798,7 +803,7 @@ export class CodexHarness implements RunHarness {
   /** The detached half of a non-blocking probe: parse + onEntry raced against the probe timeout.
    *  Never rejects; a stop/abort before the reply suppresses onEntry. */
   private async finishCatalogProbe(
-    probe: NonNullable<CodexHarnessOptions["catalogProbe"]>,
+    probe: CodexCatalogProbe,
     call: Promise<unknown>,
     model: string,
     abort: Promise<"aborted">,
@@ -1526,7 +1531,7 @@ export class CodexHarness implements RunHarness {
       const notes = this.notes!;
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
-      await this.runCatalogProbe(abortPromise, request.signal);
+      await this.runCatalogProbe(request, abortPromise, request.signal);
 
       this.assertOpen();
       // 3. Stop before sending model work if cancellation arrived during thread setup.

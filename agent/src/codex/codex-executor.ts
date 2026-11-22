@@ -5839,11 +5839,6 @@ export class CodexExecutor implements Executor {
     revision: number,
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
-    // Probe the first actual phase's pair; Runtime default remains absent.
-    const restoredGate = ctx.resumePhase === "awaiting_approval" && !!ctx.sessionId && !!ctx.approvedPlan?.trim();
-    const firstPhase = !(ctx.planApproved === true && !!ctx.approvedPlan?.trim()) && !restoredGate && ctx.gatePlan
-      ? "plan" : "implement";
-    const level = this.leadRequestFor(ctx, firstPhase).effort;
     // Snapshot the runner contract once for all effect surfaces in this epoch.
     // Legacy direct callers may still bind through the static executor option.
     const captureMemory = ctx.capturedMemory;
@@ -6170,13 +6165,12 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
-        // Advisory catalog probe, only on the claim's first root epoch. PRD #3247 M2: an explicit
-        // level gets the awaiting probe; its note is emitted from onEntry, which the harness calls
-        // before the first turn/start, and the level itself is always sent unchanged. Issue #3251:
-        // a Runtime default claim (no level) with a catalog reporter gets the report-only probe,
-        // which does not delay turn/start.
-        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
-          : epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
+        // Advisory probe only on the claim's first root epoch, selected when its first turn
+        // actually dispatches. A restored gate can revise on the planning pair or proceed on
+        // the implementation pair; explicit effort waits, Runtime default reports without waiting.
+        ...(epochIndex === 0 ? { catalogProbe: (request: RunTurnRequest) => request.effort !== undefined
+          ? this.catalogProbeFor(ctx, request.effort)
+          : ctx.codexCatalogReport !== undefined ? this.catalogReportProbeFor(ctx) : undefined } : {}),
       });
 
       const epochHarness = harness;
