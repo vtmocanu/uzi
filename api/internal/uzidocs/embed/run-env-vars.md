@@ -84,7 +84,7 @@ cross-check child whose claim is over the cap ends as checker unavailable
 instead. A store filled to its limits with multi-line values can pass the cap.
 To get under it, remove or shorten secret variables, multi-line ones first. A
 run keeps counting the older versions it was given; a new run counts only the
-current values.
+current values, and a cross-check child counts every version its lead was given.
 
 Before work leaves the worker, every commit in the outgoing range is searched
 for those forms, not only the final tree. For a multi-line secret it also
@@ -114,7 +114,7 @@ terminal preservation packs, recovery archives and the preserved patch.
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
 - Gaps that remain: a secret whose lines are all short, public, or without a
-  letter or digit, or with only one distinct character, and that is
+  letter or digit, or with only one distinct non-space character, and that is
   split across files or by elided context between hunks, and a value that
   appears only re-encoded, such as each line indented in a YAML block or in an
   encoding other than those registered. A committed file that holds the whole
