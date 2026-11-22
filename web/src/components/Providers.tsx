@@ -379,7 +379,7 @@ function ProviderRow({
   // models, or uzi's 200k fallback when none is configured (agent/src/sdk-env.ts).
   const configured = mapped.map(({ role }) => p.model_map[role]!.context_window).filter((w): w is number => !!w);
   const blankLabel = configured.length
-    ? ` (no context window: the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens, applies)`
+    ? ` (no context window: uzi requests the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens)`
     : " (no context window: 200k assumed)";
   const rowBusy = busy || testing;
   const blocked = sourceBlockedReason(p);

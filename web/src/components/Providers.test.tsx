@@ -112,7 +112,7 @@ describe("Providers — list", () => {
     expect(within(first).getByText("Authorization: Bearer")).toBeTruthy();
     expect(within(first).getByText("gw-small")).toBeTruthy();
     // p1 maps haiku with a 32768 window and sonnet with none: the smallest configured window applies.
-    expect(within(first).getByText(/\(no context window: the smallest configured one, 32,768 tokens, applies\)/)).toBeTruthy();
+    expect(within(first).getByText(/\(no context window: uzi requests the smallest configured one, 32,768 tokens\)/)).toBeTruthy();
     expect(within(first).queryByText(/200k assumed/)).toBeNull();
     expect(within(first).getByText("Key enabled")).toBeTruthy();
 
