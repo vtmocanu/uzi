@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -194,7 +195,14 @@ func TestPMSamplerStopKeepsHealthyRead(t *testing.T) {
 		}
 		stopped := make(chan pmSamplerResult, 1)
 		go func() { stopped <- s.Stop() }()
-		time.Sleep(20 * time.Millisecond)
+		stopDeadline := time.Now().Add(5 * time.Second)
+		for !s.stopRequested() {
+			if time.Now().After(stopDeadline) {
+				close(release)
+				t.Fatal("Stop never requested a stop")
+			}
+			time.Sleep(time.Millisecond)
+		}
 		close(release)
 		var res pmSamplerResult
 		select {
@@ -210,6 +218,44 @@ func TestPMSamplerStopKeepsHealthyRead(t *testing.T) {
 		}
 		if res.N == 0 {
 			t.Errorf("the in-flight read's sample was not recorded: %+v", res)
+		}
+	})
+	t.Run("timeout after stop request counts as error", func(t *testing.T) {
+		e := pmGuardEnv(t, "", pmCand{Name: "T"})
+		e.curPID.Store(4242)
+		e.mu.Lock()
+		e.pidRec(4242)
+		e.mu.Unlock()
+		entered := make(chan struct{}, 1)
+		var sp atomic.Pointer[pmSampler]
+		read := func(_ context.Context, _ uint32) (pmMem, error) {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			var s *pmSampler
+			for s == nil && time.Now().Before(deadline) {
+				if s = sp.Load(); s == nil {
+					time.Sleep(time.Millisecond)
+				}
+			}
+			for s != nil && !s.stopRequested() && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			// The read's own timeout fires while the sampler context is still live.
+			return pmMem{}, fmt.Errorf("read: %w", context.DeadlineExceeded)
+		}
+		s := newPMSampler(context.Background(), e, read, 5*time.Millisecond)
+		sp.Store(s)
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the read never started")
+		}
+		res := s.Stop()
+		if res.Errors != 1 || res.Dropped != 0 {
+			t.Fatalf("timeout after a stop request: Errors=%d Dropped=%d, want 1 and 0 (%+v)", res.Errors, res.Dropped, res)
 		}
 	})
 	t.Run("blocked read escalates", func(t *testing.T) {
