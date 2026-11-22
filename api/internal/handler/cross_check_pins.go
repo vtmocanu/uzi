@@ -122,16 +122,18 @@ func saveCrossCheckPinsTx(ctx context.Context, q *store.Queries, patches []store
 // crossCheckPinSettings returns the four pin cells and, as second and third values, the lead
 // template's Codex pin (template_codex_model) and Claude pin (template_model) from the same rows: the LATERAL
 // lead/orchestrator selection is the one rule, identical on every row, so the first
-// row carries it (invalid when there are no rows or no pin).
-func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, pgtype.Text, pgtype.Text, error) {
+// row carries it (invalid when there are no rows or no pin). The fourth value is the lead
+// template's raw Claude effort (template_effort), unfiltered; invalid when there are no rows.
+func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, pgtype.Text, pgtype.Text, pgtype.Text, error) {
 	rows, err := h.q.ListUserCrossCheckPins(ctx, userID)
 	if err != nil {
-		return nil, pgtype.Text{}, pgtype.Text{}, err
+		return nil, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, err
 	}
-	var leadCodexPin, leadClaudePin pgtype.Text
+	var leadCodexPin, leadClaudePin, leadClaudeEffort pgtype.Text
 	if len(rows) > 0 {
 		leadCodexPin = rows[0].TemplateCodexModel
 		leadClaudePin = rows[0].TemplateModel
+		leadClaudeEffort = rows[0].TemplateEffort
 	}
 	cells := make([]crossCheckPinDTO, 0, len(rows))
 	for _, row := range rows {
@@ -153,5 +155,5 @@ func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) (
 			Model: model, Effort: effort, ResolvedModel: resolved.Model, ResolvedEffort: resolved.Effort,
 			ModelSource: resolved.ModelSource, EffortSource: resolved.EffortSource, Active: true})
 	}
-	return cells, leadCodexPin, leadClaudePin, nil
+	return cells, leadCodexPin, leadClaudePin, leadClaudeEffort, nil
 }

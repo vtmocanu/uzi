@@ -1685,13 +1685,15 @@ export function RunDefaults() {
       {/* Per-user default reasoning effort (PRD #617 M5). A CLOSED dropdown — the SDK
           reasoning-effort levels plus a Default option — with no custom mode and no warning
           surface, because the enum is closed and the control can only emit a valid
-          level or "" (default). Leave it on Default to use the built-in uzi default (medium). */}
+          level or "" (default). Default means the lead template's effort, else medium. */}
       <Card className="space-y-5">
         <div>
           <SectionTitle>Reasoning effort</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             Choose reasoning effort independently for Claude and Codex runs. Leave it on{" "}
-            <em>Default</em> to use the built-in uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>).
+            <em>Default</em> and the lead uses the lead template's effort for that harness when it
+            has one, else <code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>; judge,
+            chat and jobs use <code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>.
             Higher levels reason more deeply and cost more. Claude's SDK can downgrade a level
             its model does not support; Codex receives the selected level directly. It applies to your
             own runs only; other users are unaffected.
@@ -1706,7 +1708,7 @@ export function RunDefaults() {
         ) : (
           <div className="space-y-3">
             <Field label="Claude effort" htmlFor="worker-effort">
-              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} defaultLabel="Default · medium (built-in)" runtimeLabel="Runtime default · value not reported" />
+              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} defaultLabel="Default · lead template's effort, else medium (built-in)" runtimeLabel="Runtime default · value not reported" />
             </Field>
             <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
               Save Claude effort
@@ -1714,7 +1716,7 @@ export function RunDefaults() {
             {showCodexLane && (
               <>
                 <Field label="Codex effort" htmlFor="codex-effort">
-                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} defaultLabel="Default · medium (built-in)" runtimeLabel={codexRuntimeDefaultLabel(codexEffortCell)} />
+                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} defaultLabel="Default · lead template's effort, else medium (built-in)" runtimeLabel={codexRuntimeDefaultLabel(codexEffortCell)} />
                 </Field>
                 <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
                   Save Codex effort

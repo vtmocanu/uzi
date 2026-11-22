@@ -94,4 +94,30 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
     ({ settings } = await api.putMySettings({ planning_claude_effort: null }));
     expect(settings.planning_efforts![0]).toMatchObject({ effort: null, default_effort: "runtime", resolved_effort: null, source: "user_default", mode: "runtime_default" });
   });
+
+  // The server composes planningEffortCellFromOrdinary(..., leadEffortSettingCell(...)), so a
+  // delivered lead template's Claude effort is the planning default while the Claude
+  // preference is blank, and a stored planning level still wins.
+  it("derives the planning effort default from a delivered lead template effort", async () => {
+    const api = await reload();
+    const { templates } = await import("./mockApi/agents");
+    const lead = {
+      ...templates[0]!, id: "b-lead-planning-cell", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: "high", codex_effort: null,
+    };
+    templates.push(lead);
+    await api.setTemplateAllocations({ my_overrides: [{ template_id: lead.id, enabled: true }] });
+    let { settings } = await api.getMySettings();
+    expect(settings.planning_efforts![0]).toMatchObject({
+      effort: null, default_effort: "high", default_source: "template", resolved_effort: "high", source: "template", mode: "explicit",
+    });
+    ({ settings } = await api.putMySettings({ planning_claude_effort: "low" }));
+    expect(settings.planning_efforts![0]).toMatchObject({
+      effort: "low", default_effort: "high", default_source: "template", resolved_effort: "low", source: "user_planning_default",
+    });
+    ({ settings } = await api.putMySettings({ planning_claude_effort: null, default_effort: "max" }));
+    expect(settings.planning_efforts![0]).toMatchObject({
+      default_effort: "max", default_source: "user_default", resolved_effort: "max", source: "user_default",
+    });
+  });
 });

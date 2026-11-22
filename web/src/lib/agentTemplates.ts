@@ -229,26 +229,62 @@ export function isLeadTemplateName(name: string): boolean {
 }
 
 // templateModelDefaultLabel names what an unset pin resolves to: the lead uses
-// its harness's built-in default, any other template follows the lead's model.
+// its harness's built-in default, any other template follows the lead
+// ("Default · follows lead").
 export function templateModelDefaultLabel(name: string, harness: Harness = "claude"): string {
-  if (!isLeadTemplateName(name)) return "Default · lead's model";
+  if (!isLeadTemplateName(name)) return "Default · follows lead";
   return harness === "codex"
     ? `Default · built-in (${DEFAULT_CODEX_MODEL})`
     : "Default · SDK/account default (built-in)";
 }
 
-// templateModelsLabel is shared by the list and detail surfaces so both pins
-// and their harness-specific Default labels have one presentation.
-export function templateModelsLabel(t: Pick<AgentTemplate, "name" | "model" | "codex_model">): string {
-  return `Claude: ${t.model || templateModelDefaultLabel(t.name, "claude")} · Codex: ${t.codex_model || templateModelDefaultLabel(t.name, "codex")}`;
+// templateEffortDefaultLabel names what an unset effort pin resolves to: the
+// lead/orchestrator uses the built-in medium, any other template follows the
+// run's effort.
+export function templateEffortDefaultLabel(name: string): string {
+  return isLeadTemplateName(name) ? "Default · built-in (medium)" : "Default · follows the run's effort";
 }
 
-// templateEffortsLabel is the sibling of templateModelsLabel for the per-harness
-// reasoning-effort pins, shared by the list and detail surfaces. It returns ""
-// when neither harness is pinned so an unpinned template shows nothing extra.
-export function templateEffortsLabel(t: Pick<AgentTemplate, "effort" | "codex_effort">): string {
-  if (!t.effort && !t.codex_effort) return "";
-  return `Claude effort: ${t.effort || "Default"} · Codex effort: ${t.codex_effort || "Default"}`;
+export interface TemplatePinValue {
+  value: string | null;
+  label: string;
+}
+
+export interface TemplatePinRow {
+  family: "Claude" | "Codex";
+  harness: Harness;
+  model: TemplatePinValue;
+  effort: TemplatePinValue;
+}
+
+// templatePinRows is the structured model/effort pin presentation: one row per
+// harness family with the stored value (or null) and the label to show. It
+// reads only the stored fields. collapsed is true only for a non-lead template
+// with all four pins empty, which callers render as one "both harnesses" row.
+export function templatePinRows(
+  t: Pick<AgentTemplate, "name" | "model" | "codex_model" | "effort" | "codex_effort">,
+): { collapsed: boolean; rows: TemplatePinRow[] } {
+  const pin = (v: string | null | undefined, fallback: string): TemplatePinValue => {
+    const value = v ? v : null;
+    return { value, label: value ?? fallback };
+  };
+  const effortDefault = templateEffortDefaultLabel(t.name);
+  const rows: TemplatePinRow[] = [
+    {
+      family: "Claude",
+      harness: "claude",
+      model: pin(t.model, templateModelDefaultLabel(t.name, "claude")),
+      effort: pin(t.effort, effortDefault),
+    },
+    {
+      family: "Codex",
+      harness: "codex",
+      model: pin(t.codex_model, templateModelDefaultLabel(t.name, "codex")),
+      effort: pin(t.codex_effort, effortDefault),
+    },
+  ];
+  const allEmpty = rows.every((r) => r.model.value === null && r.effort.value === null);
+  return { collapsed: !isLeadTemplateName(t.name) && allEmpty, rows };
 }
 
 // looseSecretWarning returns a warning string if the text looks like it might

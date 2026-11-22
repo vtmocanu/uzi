@@ -628,11 +628,13 @@ function mockPlanningModel(raw: string | null | undefined): string | null {
   return trimmed;
 }
 
-// PRD #3252: the read-only Claude planning cells, mirroring Go planningModelCells /
-// planningEffortCells. The default pair is the implement lane's resolution (the user's
-// Claude model lane, else the built-in with an empty model = the SDK decides; the mock has
-// no lead-template pin) and the ordinary Claude effort cell's resolution ("runtime" token
-// in runtime mode); a stored value resolves with source user_planning_default.
+// PRD #3252: the read-only Claude planning cells. The model cell mirrors Go planningModelCells;
+// the effort cell mirrors the server's planningEffortCellFromOrdinary(..., leadEffortSettingCell(...)).
+// The default pair is the implement lane's resolution (the user's Claude model lane, else the
+// built-in with an empty model = the SDK decides; the mock has no lead-template model pin) and
+// the ordinary Claude effort cell's resolution ("runtime" token in runtime mode), where a blank
+// Claude preference with a delivered lead template effort resolves to that level with source
+// template; a stored planning value resolves with source user_planning_default.
 function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined): ModelSettingCell[] {
   const laneModel = lane?.trim() ?? "";
   const def = laneModel !== "" && !CODEX_ROLE_MODELS.includes(laneModel)
@@ -647,8 +649,15 @@ function mockPlanningModelCells(planning: string | null | undefined, lane: strin
   }];
 }
 
-function mockPlanningEffortCells(planning: string | null | undefined, claudeEffort: string | null | undefined): EffortSettingCell[] {
-  const ordinary = mockEffortCell("claude", claudeEffort);
+function mockPlanningEffortCells(
+  planning: string | null | undefined,
+  claudeEffort: string | null | undefined,
+  leadClaudeEffort: string | null,
+): EffortSettingCell[] {
+  let ordinary = mockEffortCell("claude", claudeEffort);
+  if (leadClaudeEffort && (claudeEffort ?? "").trim() === "") {
+    ordinary = { ...ordinary, resolved_effort: leadClaudeEffort, source: "template", mode: "explicit" };
+  }
   const level = (planning ?? "").trim();
   const set = ["low", "medium", "high", "xhigh", "max"].includes(level);
   return [{
@@ -710,7 +719,11 @@ function mySettingsResponse(): { settings: UserSettings } {
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
   const planning_models = mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model);
-  const planning_efforts = mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort);
+  const planning_efforts = mockPlanningEffortCells(
+    userSettings.planning_claude_effort,
+    userSettings.default_effort,
+    state.session ? mockLeadTemplateEfforts().claude : null,
+  );
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
   const me = state.session;
@@ -963,7 +976,7 @@ function withPlanning(view: EffectiveSettings): EffectiveSettings {
   const model = userSettings.planning_claude_model, effort = userSettings.planning_claude_effort;
   if (model == null && effort == null) return view;
   const [m] = mockPlanningModelCells(model, userSettings.default_claude_model);
-  const [e] = mockPlanningEffortCells(effort, userSettings.default_effort);
+  const [e] = mockPlanningEffortCells(effort, userSettings.default_effort, mockLeadTemplateEfforts().claude);
   // The recording's default pair stays; only the stored value and, when it applies, the resolution move.
   view.models = view.models.map(c => c.setting !== "planning_model" ? c
     : m.source === "user_planning_default" ? { ...c, model: m.model, resolved_model: m.resolved_model, source: "user_planning_default" } : { ...c, model: m.model });

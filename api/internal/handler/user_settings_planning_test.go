@@ -145,10 +145,12 @@ func TestPutMySettingsPlanningNullClearsBothAndGetReturnsNull(t *testing.T) {
 	}
 }
 
-// claudePinSettingsDB gives the settings fake a lead template Claude pin (template_model).
+// claudePinSettingsDB gives the settings fake a lead template Claude pin (template_model) and
+// Claude effort (template_effort).
 type claudePinSettingsDB struct {
 	*fakeSettingsDB
-	pin pgtype.Text
+	pin    pgtype.Text
+	effort pgtype.Text
 }
 
 func (f *claudePinSettingsDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -163,6 +165,7 @@ func (f *claudePinSettingsDB) Query(ctx context.Context, sql string, args ...any
 					return err
 				}
 				*dest[8].(*pgtype.Text) = f.pin
+				*dest[10].(*pgtype.Text) = f.effort
 				return nil
 			}
 		}
@@ -174,6 +177,7 @@ func TestPlanningCellsResolution(t *testing.T) {
 	tests := []struct {
 		name                   string
 		lane, pin              pgtype.Text
+		tmplEffort             pgtype.Text
 		sharedEffort           pgtype.Text
 		planModel, planEffort  pgtype.Text
 		wantDefault            string
@@ -208,10 +212,25 @@ func TestPlanningCellsResolution(t *testing.T) {
 		{name: "runtime default effort, no planning effort", sharedEffort: textOf(ptr("runtime")),
 			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
 			wantEffDefault: "runtime", wantEffDefSrc: "user_default", wantEffResolved: nil, wantEffSrc: "user_default", wantEffMod: "runtime_default"},
+		{name: "lead template effort, no preference", tmplEffort: textOf(ptr("high")),
+			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
+			wantEffDefault: "high", wantEffDefSrc: "template", wantEffResolved: ptr("high"), wantEffSrc: "template", wantEffMod: "explicit"},
+		{name: "preference beats lead template effort", tmplEffort: textOf(ptr("high")), sharedEffort: textOf(ptr("low")),
+			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
+			wantEffDefault: "low", wantEffDefSrc: "user_default", wantEffResolved: ptr("low"), wantEffSrc: "user_default", wantEffMod: "explicit"},
+		{name: "runtime preference beats lead template effort", tmplEffort: textOf(ptr("high")), sharedEffort: textOf(ptr("runtime")),
+			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
+			wantEffDefault: "runtime", wantEffDefSrc: "user_default", wantEffResolved: nil, wantEffSrc: "user_default", wantEffMod: "runtime_default"},
+		{name: "planning level beats lead template effort", tmplEffort: textOf(ptr("high")), planEffort: textOf(ptr("max")),
+			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
+			wantEffDefault: "high", wantEffDefSrc: "template", wantEffResolved: ptr("max"), wantEffSrc: "user_planning_default", wantEffMod: "explicit"},
+		{name: "invalid lead template effort is ignored", tmplEffort: textOf(ptr("bogus")),
+			wantDefault: "", wantDefaultSrc: "builtin", wantResolved: "", wantSrc: "builtin",
+			wantEffDefault: "medium", wantEffDefSrc: "builtin", wantEffResolved: ptr("medium"), wantEffSrc: "builtin", wantEffMod: "explicit"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			db := &claudePinSettingsDB{fakeSettingsDB: &fakeSettingsDB{claudeModel: tc.lane, effort: tc.sharedEffort, planningModel: tc.planModel, planningEffort: tc.planEffort}, pin: tc.pin}
+			db := &claudePinSettingsDB{fakeSettingsDB: &fakeSettingsDB{claudeModel: tc.lane, effort: tc.sharedEffort, planningModel: tc.planModel, planningEffort: tc.planEffort}, pin: tc.pin, effort: tc.tmplEffort}
 			h := &Handler{q: store.New(db)}
 			rec := httptest.NewRecorder()
 			h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))

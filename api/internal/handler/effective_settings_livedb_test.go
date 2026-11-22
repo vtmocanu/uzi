@@ -1002,6 +1002,22 @@ func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
 			}
 		}
 	})
+	t.Run("lead template effort, no preference", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.anthropic()
+		f.leadTemplateEffort("high", "low")
+		dto, _ := f.get()
+		e := effortCell(t, dto.Efforts, "planning_effort", "claude")
+		if e.DefaultEffort != "high" || e.DefaultSource != "template" || e.ResolvedEffort == nil || *e.ResolvedEffort != "high" || e.Source != "template" || e.Mode != "explicit" {
+			t.Errorf("effective planning effort = %+v, want high / template", e)
+		}
+		_, me := mySettings(f)
+		m := me[0]
+		if !eqStr(e.Effort, m.Effort) || e.DefaultEffort != m.DefaultEffort || e.DefaultSource != m.DefaultSource || e.Source != m.Source || e.Mode != m.Mode ||
+			!eqStr(e.ResolvedEffort, m.ResolvedEffort) {
+			t.Errorf("planning effort %+v != /me/settings %+v", e, m)
+		}
+	})
 	t.Run("a codex role id in the planning column is ignored", func(t *testing.T) {
 		f := newEffFix(t, nil)
 		f.anthropic()
