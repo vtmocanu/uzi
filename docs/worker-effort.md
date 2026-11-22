@@ -80,6 +80,8 @@ The lead's effort for a harness resolves in this order:
    *lead template*.
 4. The built-in **medium**.
 
+On Claude, a configured [planning effort](#planning-effort) overrides steps 2 through 4 for the plan phase.
+
 The template tier applies only when your preference is unset or blank, so
 choosing **Runtime default** keeps sending no level even when the lead template
 pins one. It reaches the worker as the claimed default effort. `uzi settings get` and

@@ -123,6 +123,8 @@ Cross-harness execution; changing P/Q lead precedence; schedule effort pins; new
 
 ## Decision Log
 
+- 2026-11-22 (integration): `/me/settings` Planning "Same as the run" still derives its displayed default from the user's preference, like the ordinary preference cell; claims and effective previews include the template tier. The preference-cell UI correction is deferred to [#3262](https://github.com/vtmocanu/uzi/issues/3262#issuecomment-7070339319).
+
 - 2026-11-21: Drafted by the lead (Claude session) with the Codex buddy. Runtime research (buddy, origin/main `f99e8a84`): the SDK 0.3.319 type contract was verified from the exact npm tarball; the Codex delegation seam already carries per-role effort. Storage/API/CLI research (subagent) found the #3249 PRD's "no agent-template CLI" baseline stale (#3264 shipped it).
 - N3 mirrors the model chain: the lead template applies only when the user has no per-harness default.
 - r2 (buddy REVISE 3 on r1, digest `9f4350ef`): N3 reuses the existing `template` source token instead of a new one, preserves an explicit `runtime` preference, keeps non-lead lanes unchanged, and adds effective-settings/preview parity; N5 keeps the Codex catalog advisory lead-only (no per-child probe); N8/N9 extend the shared parser differential golden and the render round trip.

@@ -471,6 +471,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			RunEffort:       run.Effort,
 			RunEffortSource: run.EffortSource,
 			LaneModel:       laneModel,
+			TemplateEffort:  leadTemplateEffort(templates, harness),
 		}
 		// PRD #3252: the owner's Claude planning pair is read (strictly) only for a Claude lead-lane
 		// claim, so no other claim pays the read or can fail on it.
@@ -523,12 +524,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, errCustomModelCapabilityMissing
 	}
 
-	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
-	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
+	// The run owner's per-user default reasoning effort (PRD #617). Ordinary lanes resolve NULL
+	// to the built-in medium; the lead lane also applies its template tier below the user's choice.
+	// An explicit level is carried and
 	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. A start-time
 	// run_override effort frozen onto the run (runs.effort, PRD #3250) wins over the owner's value
-	// through leadEffortFor; otherwise the owner's per-user value is the only source, except for a
+	// through leadEffortFor (or the lead-specific helper below), except for a
 	// checker child, which carries its frozen cross-check
 	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
 	// is always a canonical level (validated pin or high), never `runtime`, so it
@@ -545,7 +546,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
 	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
-	// ships leadEffortFor's value as DefaultEffort (nil for the owner's runtime default), so the
+	// ships leadEffortWithTemplate's value as DefaultEffort (nil for the owner's runtime default), so the
 	// value and its source come from one resolver.
 	var defaultModelSource, defaultEffortSource *string
 	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)

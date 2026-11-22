@@ -3141,11 +3141,8 @@ export class SdkExecutor implements Executor {
         ),
         state.implementRequest.effort,
       );
-      // PRD #305: repo-source defs are freshly built from repo files here and were NOT
-      // touched by the own-roster override above; apply it so the flag covers the repo
-      // roster (the primary case: an auto-approved scheduled run resolves to the repo
-      // roster). Own-source defs are effort-filled copies of the untouched
-      // assembled.subagents, so they take the IMPLEMENT lead model here.
+      // PRD #305: apply the implementation model override to either source's copied roster.
+      // The plan roster used its own copy; effort pins and this phase's effort are preserved.
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
