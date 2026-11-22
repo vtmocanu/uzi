@@ -227,7 +227,7 @@ import {
 } from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
-import type { CodexBinding } from "./select.js";
+import type { CodexBinding, CodexExecutionAuthority } from "./select.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -244,7 +244,8 @@ import {
 
 // ─── Part G: the FIXED production vendor targets ────────────────────────────────
 /**
- * The FIXED production Codex provider ENDPOINT targets. The name/baseUrl/envKey NEVER come from
+ * The FIXED production Codex vendor arm. A separate validated provider execution authority
+ * carries its frozen destination, model map and key; it never overrides this vendor config. The name/baseUrl/envKey NEVER come from
  * a claim, model, repo, saved label or callback — they are immutable vendor endpoints wired only
  * here. The `wireApi` is pinned to `"responses"` downstream in `launcher.ts`
  * (buildCodexConfigToml), and the binary/supervisor/PATH are already fixed there too.
@@ -711,7 +712,7 @@ class ChildFrameQueue implements CodexChildSink {
 export class CodexAdviceCredentialBridge {
   private readonly runId: string;
   private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
-  private readonly binding: CodexBinding;
+  private readonly binding: CodexExecutionAuthority;
   // ONE operation id per logical refresh, retained across retries (part F). Reset via
   // {@link beginRefreshOperation} when a genuinely NEW logical refresh starts.
   private refreshOperationId: string | undefined;
@@ -720,17 +721,17 @@ export class CodexAdviceCredentialBridge {
   constructor(
     runId: string,
     client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">,
-    binding: CodexBinding,
+    binding: CodexExecutionAuthority,
   ) {
     this.runId = runId;
     this.client = client;
     this.binding = binding;
-    this.observedGeneration = binding.generation; // subscription initial; undefined for api_key
+    this.observedGeneration = binding.authMode === "subscription" ? binding.generation : undefined; // subscription initial; undefined for api_key
   }
 
   /** The immutable auth mode of the bound credential. Exposed so the advice composition can
    *  pick the app-server auth mode (subscription vs api_key) without reaching into the binding. */
-  get authMode(): CodexBinding["authMode"] {
+  get authMode(): CodexExecutionAuthority["authMode"] {
     return this.binding.authMode;
   }
 
@@ -743,6 +744,10 @@ export class CodexAdviceCredentialBridge {
   /** Release the run's currently-committed access token (both auth modes). Fails CLOSED
    *  (throws) on any release error — capability/ownership loss must not fall back. */
   async release(signal?: AbortSignal): Promise<string> {
+    if (this.binding.authMode === "provider") {
+      signal?.throwIfAborted();
+      return this.binding.providerBinding.credential;
+    }
     const expected = this.binding.authMode === "subscription"
       ? {
           authMode: "subscription" as const,
@@ -771,7 +776,7 @@ export class CodexAdviceCredentialBridge {
    *  lazily on the first call and RETAINED across retries. */
   async refresh(signal?: AbortSignal): Promise<string> {
     if (this.binding.authMode !== "subscription") {
-      throw new Error("codex advice refresh is not permitted for an api_key credential");
+      throw new Error(`codex advice refresh is not permitted for an ${this.binding.authMode} credential`);
     }
     if (this.observedGeneration === undefined) {
       throw new Error("codex advice refresh has no observed generation");
@@ -809,6 +814,7 @@ export class CodexAdviceCredentialBridge {
    * like the run lane).
    */
   buildSubscriptionRefreshBridge(registerToken: (token: string) => void): CodexSubscriptionRefreshBridge {
+    if (this.binding.authMode === "provider") throw new Error("codex provider subscription refresh is not permitted");
     return buildAppServerRefreshBridge(
       this.runId,
       this.client,
@@ -1070,7 +1076,7 @@ export function createRunLaneInstallerReconcile(
 export function buildRunLaneReconcile(
   runId: string,
   client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">,
-  binding: CodexBinding,
+  binding: CodexExecutionAuthority,
   registerToken: (token: string) => void,
   committed: CodexCommittedGenerationCell = { value: binding.authMode === "subscription" ? binding.generation : undefined },
   isVaultLocked?: () => boolean,
@@ -1103,6 +1109,17 @@ export function buildRunLaneReconcile(
         : `codex ${binding.authMode} boundary reconcile failed` }],
       ...(deferral ? { deferral } : {}),
     });
+    // Provider keys are claim-delivered authority, independent of vendor vault/meter admission.
+    // Each fresh boundary registers the same frozen key; no credential exchange or retry occurs.
+    if (binding.authMode === "provider") {
+      if (authoritySignal?.aborted || expired()) return blocked();
+      if (!cause && cleanCheckpointAdmission(request.checkpointStop, lifecycleSignal)) {
+        throw new CheckpointSoftDeadlineError();
+      }
+      assertCurrent?.();
+      registerToken(binding.providerBinding.credential);
+      return { kind: "ready" };
+    }
     // Only a pre-exchange stop can be clean. A shutdown proof explains lifecycle
     // cancellation for admission, never authorizes ordinary credential work.
     const cleanStop = () => !cause && !operationUncertain && !boundarySignal.aborted &&
@@ -1251,6 +1268,8 @@ export async function makeCodexAdviceHarness(
   operationScope?: CodexAdviceHarnessOptions["operationScope"],
   onRefreshDenied?: () => void,
 ): Promise<CodexAdviceHarness> {
+  // Provider bridge execution is separate from advice-root wiring, which remains held.
+  if (bridge.authMode === "provider") throw new Error("codex provider advice factory wiring is not enabled");
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
   // per-worker eviction, so over-retention is the safe direction (mirrors the run lane's redactor
