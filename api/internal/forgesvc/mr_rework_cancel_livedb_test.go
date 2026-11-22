@@ -65,6 +65,7 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 	// large so a worker whose last_heartbeat_at = now() reads as a LIVE poller in
 	// hasLivePoller (now() - heartbeat < stale). now defaults to time.Now via New.
 	workerSvc := workersvc.New(q, nil, workersvc.Params{WorkerHeartbeatStale: time.Hour})
+	workerSvc.SetTxBeginner(pool) // the fenced terminal-target cancel runs in one transaction
 	forgeSvc := New(q, nil, time.Second, nil)
 	forgeSvc.SetReworkCanceller(workerSvc)
 
