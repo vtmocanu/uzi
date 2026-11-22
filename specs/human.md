@@ -121,6 +121,7 @@ Tracked as GitLab issue vtmocanu/uzi#6; PRD at `prds/done/6-ci-status-integratio
 - When CI is broken, spin up an agent to review what happened and fix it if it can.
 - If the code was bad, uzi verifies its own fix (the fix's pipeline must pass).
 - Source: plan.md line 52.
+- An active `ci_fix` bound to a PR, or `mr_rework`, run is cancelled (not failed) once its target MR is merged or closed, by forge polling or by a server refusal (`target_terminal`) at publication; work is retained, and an existing stop verdict is never overwritten (#4616). (AI-synced 2026-11-22)
 
 ## uzi CI + GitLab demo / self-host example
 

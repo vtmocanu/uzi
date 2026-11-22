@@ -552,7 +552,10 @@ no recorded PR, such as a failed older issue run with a non-closing restriction,
 no longer influence it. Unbound and older `ci_fix` rows resolve as before and
 are not repaired. The publication-time forge check confirms the bound PR is
 open on that branch at that instant: there is no lease, and a closed PR
-reopened on the same head is an accepted race. Two non-rework roots on the
+reopened on the same head is an accepted race. If the bound PR is merged or
+closed at that check, the server stops the run and refuses with
+`target_terminal`: the run lands `cancelled`, not failed, with its work
+retained ([Automatic CI fix](ci-autofix.md#when-the-pull-request-merges-or-closes-mid-fix)). Two non-rework roots on the
 bound PR still refuse as `ambiguous_source`. Creation refusals are in
 [Automatic CI fix](ci-autofix.md#when-the-branchs-pull-request-cant-be-determined).
 
