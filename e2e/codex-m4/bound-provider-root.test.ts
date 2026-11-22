@@ -160,18 +160,34 @@ test("provider fake issue composes executor to pinned app-server and authenticat
   // This listener's exact bearer and recorded requests prove the responder is ours.
   const requests: Record<string, unknown>[] = [];
   const errors: string[] = [];
+  const requestCap = 4 * 1024 * 1024;
   const server = createServer((request, response) => {
+    if (request.url !== "/v1/responses" || request.method !== "POST" ||
+        request.headers.authorization !== `Bearer ${credential}`) {
+      response.writeHead(401, { connection: "close" }).end();
+      return;
+    }
     let raw = "";
-    request.setEncoding("utf8");
-    request.on("data", chunk => { raw += chunk; });
-    request.on("end", () => {
-      if (request.url !== "/v1/responses" || request.method !== "POST" ||
-          request.headers.authorization !== `Bearer ${credential}`) {
-        errors.push("unexpected destination or bearer");
-        response.writeHead(400).end();
+    let bytes = 0;
+    let rejected = false;
+    request.on("error", () => {});
+    request.on("data", (chunk: Buffer) => {
+      if (rejected) return;
+      bytes += chunk.length;
+      if (bytes > requestCap) {
+        rejected = true;
+        raw = "";
+        response.writeHead(413, { connection: "close" }).end();
         return;
       }
-      requests.push(JSON.parse(raw));
+      raw += chunk.toString("utf8");
+    });
+    request.on("end", () => {
+      if (rejected) return;
+      let parsed: Record<string, unknown>;
+      try { parsed = JSON.parse(raw); }
+      catch { response.writeHead(400).end(); return; }
+      requests.push(parsed);
       const id = `focused-root-${requests.length}`;
       const item = requests.length === 1
         ? { type: "custom_tool_call", call_id: "root-done", name: "exec", input: "text(await tools.signal_done({}));" }
@@ -191,6 +207,18 @@ test("provider fake issue composes executor to pinned app-server and authenticat
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   const fake = { baseUrl: `http://127.0.0.1:${address.port}/v1`, requests, errors };
+  const unauthorized = await fetch(`${fake.baseUrl}/responses`, { method: "POST", body: "{}" });
+  assert.equal(unauthorized.status, 401);
+  await unauthorized.arrayBuffer();
+  const oversized = await fetch(`${fake.baseUrl}/responses`, { method: "POST",
+    headers: { authorization: `Bearer ${credential}` },
+    body: new ReadableStream<Uint8Array>({ start(controller) {
+      for (let i = 0; i <= requestCap / 65536; i++) controller.enqueue(new Uint8Array(65536));
+      controller.close();
+    } }), ...{ duplex: "half" } });
+  assert.equal(oversized.status, 413);
+  await oversized.arrayBuffer();
+  assert.equal(requests.length, 0, "refused input never reaches the responder");
   const input = { provider_id: "focused-root", revision: 7, engine: "codex" as const,
     protocol: "openai_responses" as const, base_url: fake.baseUrl, auth_style: "bearer" as const,
     credential, model_map: { default: { model: "gpt-6-astra", context_window: 65536 } } };
