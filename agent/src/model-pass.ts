@@ -38,7 +38,7 @@ import type { Logger } from "./log.js";
 import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
 import type { ClaimProviderBinding, StateRequest } from "./protocol.js";
-import { sdkCredentialFromBinding } from "./provider-binding.js";
+import { ProviderLaneUnsupportedError, sdkCredentialFromBinding } from "./provider-binding.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type { CodexBinding } from "./codex/select.js"; // type-only — erased at runtime, no construction here
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
@@ -405,6 +405,9 @@ function safeStringify(value: unknown): string {
  * so the Claude path stays byte-identical to before this change.
  */
 export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise<string> {
+  // Provider execution is held for every non-Claude engine, including callers that
+  // also supply native Codex options. Refuse before dispatch or HOME/timer setup.
+  if (opts.provider && opts.provider.engine !== "claude") throw new ProviderLaneUnsupportedError();
   if (opts.codex) return runCodexAdviceModelPass(opts, opts.codex);
 
   const token = opts.token;
