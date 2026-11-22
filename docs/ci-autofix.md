@@ -235,5 +235,6 @@ Limits: a `paused` or `recovery_wait` `ci_fix` is not cancelled while parked;
 once it is resumed or promoted (a `recovery_wait` run can be promoted back to
 queued by the server without the owner), the poller or the publication backstop
 cancels it. If storage stays unavailable through the backstop's bounded
-retries, the worker gets `authority_unknown`, nothing is stamped, and the run
-may end `failed` rather than `cancelled`.
+retries, the worker gets `authority_unknown` and the run may end `failed`
+rather than `cancelled`. Usually nothing is stamped, but a commit whose
+response was lost may already have recorded the stop.
