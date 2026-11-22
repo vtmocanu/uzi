@@ -20,10 +20,12 @@ package store_test
 //
 // Knobs:
 //
-//	UZI_CLAIMRUN_PLAN_STAGES    required. A comma list of P0,T1,T2,T3,T4,T5,R (and F, a cheap
-//	                            profile-fixture feasibility check: one cold call per profile and
-//	                            scenario (a) and (c), no timing claim). R is the fallback reserve.
-//	                            Stages always run in the order P0,F,T1,T2,T3,T4,T5,R.
+//	UZI_CLAIMRUN_PLAN_STAGES    required. A comma list of P0,T1,T2,T3,T4,T5,R (the pre-registered
+//	                            table; R is the fallback reserve), plus two diagnostics outside it:
+//	                            F, a cheap profile-fixture feasibility check (one cold call per
+//	                            profile and scenario, no timing claim), and S, the plan-choice
+//	                            scale diagnostic (claimrun_plan_scale_test.go).
+//	                            Stages always run in the order P0,F,S,T1,T2,T3,T4,T5,R.
 //	UZI_CLAIMRUN_PLAN_WINNER    C1|C2|C1C2, required for T4, T5 and R.
 //	UZI_CLAIMRUN_PLAN_RUNNERUP  C1|C2|C1C2, required for R, and different from the winner.
 //	UZI_CLAIMRUN_PLAN_N         timed calls per cell. Default 100, minimum 50. P0 always uses 20.
@@ -159,7 +161,7 @@ func cpLoadConfig(t *testing.T) cpConfig {
 	var cfg cpConfig
 	raw := strings.TrimSpace(os.Getenv("UZI_CLAIMRUN_PLAN_STAGES"))
 	if raw == "" {
-		t.Fatal("UZI_CLAIMRUN_PLAN_STAGES is required (a comma list of P0,T1,T2,T3,T4,T5,R)")
+		t.Fatal("UZI_CLAIMRUN_PLAN_STAGES is required (a comma list of P0,F,S,T1,T2,T3,T4,T5,R)")
 	}
 	want := map[string]bool{}
 	for _, s := range strings.Split(raw, ",") {
@@ -563,7 +565,7 @@ func (e *cpEnv) binding(ctx context.Context, p *cpProfile) *cpBinding {
 			p.name, params.Lane, params.CustodyHoldLimit, params.RecoveryCapable, params.ReserveOn, params.IsEphemeral,
 			uuid.UUID(params.WorkerID.Bytes), params.UserID, p.laneWant, p.custody, p.recovery, p.reserve, p.ephemeral)
 	}
-	if p.ephemeral && !(params.LeaseSince.Valid && params.LeaseRepoID.Valid && params.LeaseBranch.Valid && params.EphemeralLease.Valid && params.LeaseAt.Valid) {
+	if p.ephemeral && (!params.LeaseSince.Valid || !params.LeaseRepoID.Valid || !params.LeaseBranch.Valid || !params.EphemeralLease.Valid || !params.LeaseAt.Valid) {
 		t.Fatalf("capture %s: ephemeral profile captured without its lease parameters: %+v", p.name, params)
 	}
 	b := &cpBinding{params: params, args: args}
@@ -1657,7 +1659,7 @@ func TestClaimRunPlanMeasurement(t *testing.T) {
 	ctx := context.Background()
 	pmRequireThrowawayDB(ctx, t, dsn)
 	outPath := filepath.Clean(cfg.out)
-	f, err := os.Create(outPath) //nolint:gosec // G304: path is the operator-supplied measurement output under opt-in env
+	f, err := os.Create(outPath)
 	if err != nil {
 		t.Fatalf("create output: %v", err)
 	}
