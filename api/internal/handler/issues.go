@@ -63,8 +63,8 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// The created issue carries the configured uzi run-eligibility label (PRD #764); on a
-	// linked repo the link's stored eligibility name (PRD #4173 D14), refused with a 500
+	// The created issue carries the configured uzi run-eligibility label (PRD #764), on a
+	// linked repo the link's stored eligibility name (PRD #4173 D14); refused with a 500
 	// before the write when the label settings cannot be read.
 	labels, err := h.createLabels(r.Context(), repo)
 	if err != nil {

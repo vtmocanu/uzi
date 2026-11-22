@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 	"github.com/vtmocanu/uzi/api/internal/settings"
@@ -301,11 +303,12 @@ func TestFileFindingFailsClosedWhenTheLabelSettingsCannotBeReadLiveDB(t *testing
 	})
 }
 
-// PRD #4173 M5 review (Greptile on 9bcd89761): the other routes that create an issue on a
-// linked repo (the board's new issue, a run-review recommendation, an admin judge
-// recommendation) read the uzi and autopilot labels to rewrite the set for the link. When
-// those settings cannot be read the defaults would stand in for the saved names, so each
-// route answers 500 before any issue tracker write and leaves no filing claim behind.
+// PRD #4173 M5 review (Greptile on 9bcd89761 and 5c8212113): the other routes that create
+// an issue (the board's new issue, a run-review recommendation, an admin judge
+// recommendation) read the uzi label, and on a linked repo the autopilot label too, to
+// build the set. When those settings cannot be read the defaults would stand in for the
+// saved names, so on a linked and on an unlinked repo each route answers 500 before any
+// write and leaves no filing claim behind.
 func TestLinkedRepoIssueCreationFailsClosedWhenTheLabelSettingsCannotBeReadLiveDB(t *testing.T) {
 	unreadable := func(f *neverEnabledFixture) {
 		f.h.settings = settings.New(&settingsStore{
@@ -323,32 +326,49 @@ func TestLinkedRepoIssueCreationFailsClosedWhenTheLabelSettingsCannotBeReadLiveD
 	}
 	cases := []struct {
 		name string
-		call func(f *neverEnabledFixture, w http.ResponseWriter)
+		call func(f *neverEnabledFixture, w http.ResponseWriter, repo uuid.UUID)
 	}{
-		{"CreateIssue", func(f *neverEnabledFixture, w http.ResponseWriter) {
-			f.h.CreateIssue(w, f.request(http.MethodPost, map[string]string{"title": "t", "description": "d"}, map[string]string{"id": f.repoID.String()}))
+		{"CreateIssue", func(f *neverEnabledFixture, w http.ResponseWriter, repo uuid.UUID) {
+			f.h.CreateIssue(w, f.request(http.MethodPost, map[string]string{"title": "t", "description": "d"}, map[string]string{"id": repo.String()}))
 		}},
-		{"FileIssue", func(f *neverEnabledFixture, w http.ResponseWriter) {
-			f.h.FileIssue(w, f.request(http.MethodPost, map[string]string{"repo_id": f.repoID.String(), "title": "t", "description": "d"},
+		{"FileIssue", func(f *neverEnabledFixture, w http.ResponseWriter, repo uuid.UUID) {
+			f.h.FileIssue(w, f.request(http.MethodPost, map[string]string{"repo_id": repo.String(), "title": "t", "description": "d"},
 				map[string]string{"id": f.runID.String(), "recID": f.recID.String()}))
 		}},
-		{"AdminFileJudgeIssue", func(f *neverEnabledFixture, w http.ResponseWriter) {
+		{"AdminFileJudgeIssue", func(f *neverEnabledFixture, w http.ResponseWriter, repo uuid.UUID) {
 			f.h.AdminFileJudgeIssue(w, f.request(http.MethodPost, adminFileIssueRequest{
-				Category: "improve_agent", Target: "ne-" + f.repoID.String(), RepoID: f.repoID.String(), Title: "t", Description: "d",
+				Category: "improve_agent", Target: "ne-" + f.repoID.String(), RepoID: repo.String(), Title: "t", Description: "d",
 			}, nil))
 		}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run("linked/"+tc.name, func(t *testing.T) {
 			f := seedNeverEnabledFixture(t)
 			srv := linkNeverEnabledFixture(t, f)
 			unreadable(f)
 			rr := httptest.NewRecorder()
-			tc.call(f, rr)
+			tc.call(f, rr, f.repoID)
 			if rr.Code != http.StatusInternalServerError {
 				t.Fatalf("status = %d body = %s, want 500", rr.Code, rr.Body.String())
 			}
 			wantNoTrackerWrite(t, srv)
+			if n := claims(t, f); n != 0 {
+				t.Errorf("%d filing claim(s) left behind, want 0", n)
+			}
+		})
+		// An unlinked repo: the saved uzi label "start" must not be replaced by the
+		// default "uzi" on the forge issue.
+		t.Run("unlinked/"+tc.name, func(t *testing.T) {
+			f := seedNeverEnabledFixture(t)
+			unreadable(f)
+			rr := httptest.NewRecorder()
+			tc.call(f, rr, f.goodRepo)
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d body = %s, want 500", rr.Code, rr.Body.String())
+			}
+			if n := f.hits.Load(); n != 0 {
+				t.Errorf("the forge saw %d request(s), want 0", n)
+			}
 			if n := claims(t, f); n != 0 {
 				t.Errorf("%d filing claim(s) left behind, want 0", n)
 			}

@@ -25,17 +25,18 @@ func linkedEligibility(repo store.GetRepoForUserRow) (string, bool) {
 }
 
 // createLabels returns the labels an issue uzi creates on repo carries: the configured
-// uzi run-eligibility label (PRD #764). For an unlinked repo the read stays best-effort,
-// as before: a cold settings read yields the compiled-in default, never an empty label.
-// For a linked repo the uzi and autopilot labels come from one settings snapshot, the uzi
-// label is replaced by the stored eligibility name and the autopilot label is dropped (PRD
-// #4173 D12, D14); a settings read error is returned there, since the default names cannot
-// say which label the owner saved, and the caller refuses before any write (PRD #4173 M5
-// review).
+// uzi run-eligibility label (PRD #764). For a linked repo the uzi and autopilot labels come
+// from one settings snapshot, the uzi label is replaced by the stored eligibility name and
+// the autopilot label is dropped (PRD #4173 D12, D14). A settings read error is returned
+// for any repo, since the default names it comes with cannot say which label the owner
+// saved; the caller refuses before the claim and before any write (PRD #4173 M5 review).
 func (h *Handler) createLabels(ctx context.Context, repo store.GetRepoForUserRow) ([]string, error) {
 	eligibility, linked := linkedEligibility(repo)
 	if !linked {
-		uzi, _ := h.settings.UziLabel(ctx)
+		uzi, err := h.settings.UziLabel(ctx)
+		if err != nil {
+			return nil, err
+		}
 		return []string{uzi}, nil
 	}
 	names, err := h.settings.FilingLabels(ctx)

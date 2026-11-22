@@ -131,8 +131,8 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility
 	// label (PRD #764), NEVER autopilot and NEVER from the request body — the API
 	// surface gives the client no way to attach a trigger label.
-	// On a linked repo the link's stored eligibility name (PRD #4173 D14); a label settings
-	// read error there is refused before the claim and before any write (PRD #4173 M5 review).
+	// On a linked repo the link's stored eligibility name (PRD #4173 D14). A label settings
+	// read error is refused before the claim and before any write (PRD #4173 M5 review).
 	labels, err := h.createLabels(ctx, repo)
 	if err != nil {
 		slog.Error("file issue: read the label settings", "error", err)
