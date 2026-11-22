@@ -3786,9 +3786,8 @@ export class CodexExecutor implements Executor {
       // run's canonical checkout, via worker-set command-line-scope config (see
       // withCommandGitTrust). Composed HERE, never in commandEffectSpec: the post-run
       // boundary sink shares that function and must keep its own gitEnv() untouched.
-      // PRD #4416 M2: the variables the builder injects are named once per executor run, here, after provisioning
-      // (the builder's pre-fold inputs are known by now) and before the env build and every prompt: each prompt
-      // site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+      // PRD #4416 M2: the set of variables the builder injects, computed once per executor run after provisioning:
+      // each prompt site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
       const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
         ? commandRunEnvInjected(ctx.runEnv, this.deps.commandTmpdir ?? "/tmp", provisioned.toolEnv)
         : undefined;

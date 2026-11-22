@@ -509,7 +509,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		newBytes := int64(len(value))
 		// The form budget: the secret value bytes a run of this repo registers for masking.
 		// Refuse only a write that would end over the cap AND grow the total, so a store
-		// already over it (rows written before the cap) can still shrink.
+		// already over the cap can still shrink.
 		secretBytes, err := q.GetRunEnvFormBudgetUsage(ctx, store.GetRunEnvFormBudgetUsageParams{UserID: userID, RepoID: repo})
 		if err != nil {
 			return err

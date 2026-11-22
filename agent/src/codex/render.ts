@@ -385,9 +385,7 @@ function renderSubagentPrompt(agent: HarnessAgent, childTurnBudgetMs?: number, r
   return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${runEnv}${budget}${SUBAGENT_SAFETY_APPEND}`;
 }
 
-// sanitizeName / isUnsafeNameChar live in ../diagnostic-name.ts (import-free, so the
-// worker image's pnpm proof can load them without node_modules). sanitizeName is
-// re-exported here for existing callers.
+// sanitizeName / isUnsafeNameChar live in ../diagnostic-name.ts; sanitizeName is re-exported here.
 export { sanitizeName };
 
 /** Code-unit comparator (UTF-16), IDENTICAL to what `sortedSet`'s default `.sort()`

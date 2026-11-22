@@ -9,6 +9,7 @@ import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { LimitReachedError } from "../src/limit.js";
 import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
+import { recordingLogger } from "./helpers.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, assertCustodyRetained, commit, failingWork, heldServer, skipCheckpoints, type Work,
 } from "./runner-held-publication-fixture.js";
@@ -330,6 +331,15 @@ describe("run variable scan: a secret published as a git path", () => {
   };
   const addCommit = (dir: string, name: string): void => { write(dir, name); g(dir, "add", "-A"); g(dir, "commit", "-m", "update"); };
 
+  // Leaves `dir` mid-merge of a side branch into `branch`, both parents holding a commit of their own.
+  const startEvilMerge = (dir: string, branch: string): void => {
+    g(dir, "checkout", "-q", "-b", "side");
+    addCommit(dir, "side.txt");
+    g(dir, "checkout", "-q", branch);
+    addCommit(dir, "mine.txt");
+    g(dir, "merge", "--no-commit", "--no-ff", "side");
+  };
+
   const onOrigin = (n: number): boolean => {
     try {
       execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "--quiet", `refs/heads/agent/issue-${n}`], { stdio: "pipe" });
@@ -385,6 +395,24 @@ describe("run variable scan: a secret published as a git path", () => {
       const c = g(dir, "commit-tree", root, "-p", "HEAD", "-m", "update");
       g(dir, "reset", "--hard", c);
     }],
+    ["an empty-tree entry an evil merge introduces", PATH_VALUE, (ctx, v) => {
+      const dir = ctx.worktreePath;
+      startEvilMerge(dir, ctx.branch);
+      const empty = g(dir, "hash-object", "-t", "tree", "/dev/null");
+      const [a, mid, leaf] = v.split("/") as [string, string, string];
+      const mk = (input: string): string => execFileSync("git", ["-C", dir, "mktree"], { env: G_ENV, encoding: "utf8", input }).trim();
+      const inner = mk(`040000 tree ${empty}\t${leaf}\n`);
+      const middle = mk(`040000 tree ${inner}\t${mid}\n`);
+      const root = mk(`${g(dir, "ls-tree", g(dir, "write-tree"))}\n040000 tree ${middle}\t${a}\n`);
+      const c = g(dir, "commit-tree", root, "-p", "HEAD", "-p", "side", "-m", "merge");
+      g(dir, "reset", "--hard", c);
+    }],
+    ["a gitlink an evil merge introduces", PATH_VALUE, (ctx, v) => {
+      const dir = ctx.worktreePath;
+      startEvilMerge(dir, ctx.branch);
+      g(dir, "update-index", "--add", "--cacheinfo", `160000,${g(dir, "rev-parse", "HEAD")},${v}`);
+      g(dir, "commit", "-m", "merge");
+    }],
   ];
   for (const [label, value, work] of cases) {
     it(`withholds the final push of ${label}, naming the variable and nothing else`, async () => {
@@ -410,9 +438,14 @@ describe("run variable scan: a secret published as a git path", () => {
         return { branch: ctx.branch };
       },
     };
-    await runner(exec, gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 }).execute(claim);
+    const rec = recordingLogger();
+    await runnerWith(() => ({ executor: exec }), gitlab, JOIN_TOKEN, rec.logger, { checkpointIntervalMs: 1 }).execute(claim);
     assert.equal(seen.uploads, 0, "ZERO checkpoint uploads");
     assert.equal(continued, true);
+    const skipped = rec.lines.filter((l) => (l as { msg?: string }).msg === "checkpoint publish skipped: secret_found") as Array<{ findings?: string[] }>;
+    assert.ok(skipped.length >= 1, "the withhold is logged as a skipped checkpoint publish with reason secret_found");
+    for (const l of skipped) assert.ok(l.findings?.some((f) => f.includes("variable DB_PASSWORD")), "names the variable");
+    assert.ok(!JSON.stringify(rec.lines).includes(PATH_VALUE), "no value in any log line");
   });
 
   it("FAILS CLOSED: an incomplete path pass (path cap reached) pushes nothing", async (t) => {

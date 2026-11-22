@@ -7551,7 +7551,7 @@ export class RunRunner {
       // The variables' forms passed the budget: no complete form set exists, so the run fails before the clone,
       // the executor or any output.
       if (runEnvForms.overBudget) {
-        // A pending policy outcome is settled first: dispatchFailure sends no report while the admission holds.
+        // A pending policy outcome is settled first.
         if (flight.policyAdmission && !await this.reconcilePolicyAdmission(claim, flight)) return;
         throw new Error(`${RUN_ENV_FORMS_OVER_BUDGET}: the run's secret variables exceed ${RUN_ENV_FORM_CHARS_MAX} characters of registered forms`);
       }

@@ -6,19 +6,49 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, "..", "..");
 const pnpmTest = path.join(here, "js-deps-pnpm-real.test.ts");
 const sdkEnv = path.resolve(here, "..", "src", "sdk-env.ts");
+
+/** The source with every block and line comment replaced by a space. String literals ('...', "...", `...`)
+ *  are copied through whole, so a comment opener inside one starts no comment. A quoted string ends at its
+ *  closing quote or at a newline; a template literal ends at its closing backtick. */
+function stripComments(src: string): string {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i]!;
+    const two = src.slice(i, i + 2);
+    if (two === "/*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end < 0 ? src.length : end + 2;
+      out += " ";
+    } else if (two === "//") {
+      const end = src.indexOf("\n", i);
+      i = end < 0 ? src.length : end;
+      out += " ";
+    } else if (c === "'" || c === '"' || c === "`") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c && !(c !== "`" && src[j] === "\n")) j += src[j] === "\\" ? 2 : 1;
+      out += src.slice(i, j + 1);
+      i = j + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
 
 /** Value specifiers loaded by a source text. Skips only `import type` / `export type`
  *  statements; `import { type X } from "x"` stays a load under verbatimModuleSyntax. */
 function valueSpecifiers(src: string): string[] {
   const out: string[] = [];
-  const stripped = src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/^\s*\/\/.*$/gm, " ");
+  const stripped = stripComments(src);
   const stmt = /(?:^|[;\n}])\s*(import|export)\s+(type\s+)?([^;'"`]*?\bfrom\s*)?(["'])([^"'\n]+)\4/g;
   for (const m of stripped.matchAll(stmt)) {
     const kind = m[1];
@@ -104,13 +134,15 @@ describe("worker-image import closure", () => {
   });
 
   it("the detector reports a bare specifier (self-check)", () => {
-    const scratch = path.join(repoRoot, ".uzi", "scratch");
-    fs.mkdirSync(scratch, { recursive: true });
-    const dir = fs.mkdtempSync(path.join(scratch, "closure-selfcheck-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "closure-selfcheck-"));
     try {
       fs.writeFileSync(path.join(dir, "a.ts"), 'import { b } from "./b.js";\nexport const a = b;\n');
       fs.writeFileSync(path.join(dir, "b.ts"), 'import { type T } from "somepkg";\nexport const b = 1;\n');
       fs.writeFileSync(path.join(dir, "c.ts"), 'import type { T } from "typeonly";\nimport fs from "node:fs";\n');
+      fs.writeFileSync(path.join(dir, "d.ts"), 'const open = "/*";\nimport x from "hidden-pkg";\nconst close = "*/";\nexport { open, close, x };\n');
+      const hidden = walk([path.join(dir, "d.ts")]);
+      assert.equal(hidden.violations.length, 1, "a comment opener inside a string literal hides no import");
+      assert.match(hidden.violations[0] as string, /imports bare specifier "hidden-pkg"/);
       const bad = walk([path.join(dir, "a.ts")]);
       assert.equal(bad.violations.length, 1);
       assert.match(bad.violations[0] as string, /a\.ts -> b\.ts imports bare specifier "somepkg"/);

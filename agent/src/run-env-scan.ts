@@ -104,8 +104,7 @@ export type NeedleResolution =
 /**
  * Where the needles of a publish come from.
  *  - A live flight uses the set its own claim carried (`live`), including an empty set: a run whose claim
- *    carried no secret variables has nothing to mask, and that is established locally, so a run that never
- *    receives variables is never withheld while its flight is live.
+ *    carried no secret variables has nothing to mask.
  *  - With no flight (the run is terminal, the worker restarted, or a held or terminal publication lane runs
  *    after the flight is gone) the api is asked. `{protected:false}` means no needles, and is also the answer
  *    for a run with no governing run (neither a lead-lane run nor a cross-check child).
@@ -271,7 +270,7 @@ function cUnquote(body: string): string {
   for (let i = 0; i < body.length; i++) {
     const c = body[i]!;
     if (c !== "\\") {
-      // By code point: an astral character is two UTF-16 units and must not be encoded as two lone surrogates.
+      // Read by code point, so an astral character is encoded as one UTF-8 sequence.
       const cp = body.codePointAt(i)!;
       bytes.push(...Buffer.from(String.fromCodePoint(cp), "utf8"));
       if (cp > 0xffff) i += 1;
@@ -329,6 +328,7 @@ export function redactPorcelainLine(line: string, redactText: (text: string) => 
 function headerPathHits(patch: string, needles: readonly ScanNeedle[]): string[] {
   const hit = new Set<string>();
   const forms = needles.map((n) => ({ name: n.name, forms: n.forms.filter((f) => f.length > 0) }));
+  const present = literalsPresent(forms.flatMap((n) => n.forms));
   for (const line of patch.split("\n")) {
     const prefix = PATH_HEADER_PREFIXES.find((p) => line.startsWith(p));
     if (prefix === undefined) continue;
@@ -341,8 +341,8 @@ function headerPathHits(patch: string, needles: readonly ScanNeedle[]): string[]
     // The decoded line, each quoted path alone, and the sides of a `diff --git a/.. b/..` or `Binary files .. and ..` line.
     const candidates = [decoded, ...quoted, ...decoded.split(/ (?=b\/)| and /)];
     for (const candidate of candidates) {
-      const padded = `/${candidate.replace(/\t$/, "")}/`;
-      for (const n of forms) if (n.forms.some((f) => padded.includes(f))) hit.add(n.name);
+      const found = present(`/${candidate.replace(/\t$/, "")}/`);
+      if (found.size > 0) for (const n of forms) if (n.forms.some((f) => found.has(f))) hit.add(n.name);
     }
   }
   return [...hit];
@@ -360,7 +360,7 @@ export function patchScanVerdict(
   const raw = textHitVariables(rawPatch, needles);
   if (raw.length > 0) return { withhold: true, reason: "raw_value", variables: raw };
   if (needles.length === 0 && lineForms.length === 0) return { withhold: false };
-  // git C-quotes a header path ("\303\251", "\t", "\"", "\\"), so the raw text above does not hold the decoded value.
+  // Header paths are decoded from git's C-quoting ("\303\251", "\t", "\"", "\\") and searched.
   const header = headerPathHits(rawPatch, needles);
   if (header.length > 0) return { withhold: true, reason: "header_path", variables: header };
   const rebuilt = patchImages(rawPatch);

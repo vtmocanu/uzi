@@ -620,8 +620,7 @@ func TestRunEnvRetiredByteBudgetBoundaryLiveDB(t *testing.T) {
 	f.withReceipts()
 	f.put("BIG_SECRET", jsonBody(map[string]any{"value": strings.Repeat("s", 1000)}), http.StatusCreated)
 	// Retire history up to (limit - the live value's bytes), 65536 bytes per row at most. The
-	// padding sits in a second repo: the history budget is per user, while the form budget
-	// counts one repo's secret bytes and the history can exceed it.
+	// padding sits in a second repo.
 	other := envSecondRepo(t, f.pool, f.repo)
 	remaining := runenv.MaxRetiredValueBytes - 1000
 	for remaining > 0 {
@@ -903,7 +902,7 @@ func TestRunEnvRecreateAgainstPendingDeletionLimitsLiveDB(t *testing.T) {
 		f := newEnvFixture(t)
 		f.withReceipts()
 		for i := range 3 {
-			// Plain: the secret form budget (116959 bytes) would stop a second full-size secret before the scope limit.
+			// Plain values: not counted by the secret form budget.
 			f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", 65536), "secret": false}), http.StatusCreated)
 		}
 		f.put("BIG_3", jsonBody(map[string]any{"value": strings.Repeat("a", 65536-8)}), http.StatusCreated) // 262136 bytes
@@ -1149,8 +1148,7 @@ func TestRunEnvDeniedStoredNameCanBeDisabledAndDeletedLiveDB(t *testing.T) {
 }
 
 // PRD #4416 form budget: a variable write that would push the repo's secret value bytes
-// past runenv.MaxClaimSecretBytes is refused with env_forms_budget, so a store filled to
-// its limits never makes a claim whose forms pass the worker's cap.
+// past runenv.MaxClaimSecretBytes is refused with env_forms_budget.
 
 // budgetBase creates one 65536-byte secret and one 1000-byte secret SMALL (66536 secret
 // bytes), leaving room, below one value's maximum size, for SMALL to be rewritten to a
@@ -1228,7 +1226,7 @@ func TestRunEnvFormBudgetHeldUpdateLiveDB(t *testing.T) {
 
 func TestRunEnvFormBudgetUnheldUpdateLiveDB(t *testing.T) {
 	// An unheld old version is replaced, so R = U - old + new: SMALL may grow by the room
-	// plus its own 1000 bytes, which a held update could not.
+	// plus its own 1000 bytes.
 	newSize := runenv.MaxClaimSecretBytes - runenv.MaxValueBytes
 	f := newEnvFixture(t)
 	f.budgetBase()
@@ -1245,7 +1243,7 @@ func TestRunEnvFormBudgetUnheldUpdateLiveDB(t *testing.T) {
 // A disabled secret and a pending-deletion secret are still sealed rows a claim can carry
 // (a run holding a receipt for the deleted one still masks it), so both count toward the
 // budget: with the store at the cap and a 65536-byte secret in one of those states, a new
-// 8-byte secret is refused. Excluding either state would let it in.
+// 8-byte secret is refused.
 func TestRunEnvFormBudgetCountsDisabledSecretLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	used := f.budgetBase()

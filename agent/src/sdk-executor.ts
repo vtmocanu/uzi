@@ -1705,9 +1705,8 @@ export class SdkExecutor implements Executor {
     const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
     // PRD #4416 M2: the lead lane alone receives the run's user variables (lowest precedence); each
     // dropped name is reported as a run event naming the rule, never the value.
-    // The variables the builder injects are named once per executor run, here, after provisioning (the
-    // builder's pre-fold inputs are known by now) and before the env build and every prompt: each prompt site
-    // reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+    // The set of variables the builder injects, computed once per executor run after provisioning: each prompt
+    // site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
     const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
       ? sdkRunEnvInjected(ctx.runEnv, credential, this.homeDir, toolEnv, ctx.runTmpdir)
       : undefined;

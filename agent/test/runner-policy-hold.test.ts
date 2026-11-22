@@ -192,8 +192,8 @@ describe("policy admission on every production claim", () => {
     };
     const claim = gitlabClaim(3708, { claim_generation: 3, secrets: secrets as never });
     await outbox.journalPolicyHold(claim.run_id, original);
-    // The original stays pending at its own generation (so the claim is admitted under it); the rehold at this claim's
-    // generation settles it while the run keeps running, so the claim goes on to fail on its forms.
+    // The original stays pending at its own generation; the rehold at this claim's generation settles it while the
+    // run keeps running, and the claim then fails on its forms.
     const modes: string[] = [];
     client.reportPolicyHold = async (_id, body) => {
       if (body.claim_generation === 1) return { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 };
@@ -202,7 +202,7 @@ describe("policy admission on every production claim", () => {
     };
     client.getRunOwnership = async () => ({ status: "running", claim_generation: 3, claim_released: false }) as never;
     let models = 0;
-    // An attempt-paths runner: the settlement runs before phaseClone, so the mode comes from the runner's own paths.
+    // An attempt-paths runner: the mode comes from the runner's own paths.
     await runnerWith(() => ({ executor: { run: async () => { models++; throw new Error("unexpected model"); } } }),
       fakeGitlab().gitlab, undefined, nullLogger(), { outbox, dockerHost: "unix:///fixture" }).execute(claim);
     assert.equal(models, 0);

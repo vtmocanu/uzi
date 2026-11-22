@@ -1,6 +1,4 @@
-// Diagnostic-name sanitizing. Deliberately import-free: this file is reachable from the
-// worker image's pnpm proof test, which runs with no node_modules, so it may use no
-// imports at all.
+// Diagnostic-name sanitizing. This file has no imports.
 
 /** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's
  *  MAX_DIAGNOSTIC_CHARS. An over-long name is truncated with an ellipsis. */
