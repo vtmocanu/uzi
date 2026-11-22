@@ -36615,6 +36615,7 @@ describe("Codex repeated actualRunner switching", () => {
 });
 
 describe("M2 provider executor composition", () => {
+  m2Runner.installHarness();
   function barrier() {
     let resolve!: () => void;
     const promise = new Promise<void>(r => { resolve = r; });
@@ -36667,6 +36668,174 @@ describe("M2 provider executor composition", () => {
     });
   }
 
+
+  for (const clean of [true, false]) it(`M2 provider launched pending advice disposal clean=${clean}`, async () => {
+    const rig = makeRig();
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    const entered = barrier(), disposalEntered = barrier(), releaseDisposal = barrier();
+    const events: string[] = [];
+    const transport = new FakeTransport(c => {
+      if (c.method === "turn/start") { events.push("turn"); entered.resolve(); }
+      return defaultResponder(c);
+    });
+    let disposals = 0, publications = 0;
+    const raw = makeProductionCodexAdviceHarnessFactory(new Proxy({}, {
+      get: (_target, name) => { throw new Error("vendor operation " + String(name)); },
+    }) as never, noopLog, "/unused", {
+      launchRoot: async spec => {
+        const owner = summaryOwnership.get(params)!;
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        const handle = await owner.launch(async () => ({
+          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+            nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null },
+          failed: undefined, whenFailed: new Promise<Error>(() => {}),
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+          waitChild: async () => ({ event: "child_exit", code: 0 }),
+          dispose: async () => {
+            disposals++; events.push("dispose"); disposalEntered.resolve();
+            await releaseDisposal.promise;
+            return clean
+              ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
+              : { clean: false, reason: "survivor" };
+          },
+        }));
+        return { cwd: "/isolated", transport, dispose: async () => {
+          await transport.close();
+          if (!(await handle.dispose()).clean) throw new Error("unclean summary");
+        } };
+      },
+    });
+    const factory = executor.bindCodexSummaryFactory(raw);
+    const params = { runId: "run-1", binding };
+    summaryCallDeadlines.set(params, Date.now() + 10_000);
+    const harness = await factory(params);
+    const pending = harness.run({ label: "summary", model: "gpt-6-sol", prompt: "Summarize", systemPrompt: "Read only",
+      output: { kind: "text" }, signal: new AbortController().signal, timeoutMs: 5000 },
+      { onTerminal: () => {} }).then(result => { publications++; return result; });
+    const rejected = assert.rejects(pending, clean ? /credential authority retired/ : /summary auth, transport or root cleanup failed/);
+    try {
+      await entered.promise;
+      const authority = executor["currentCodexAuthority"]!;
+      authority.retire();
+      events.push("retire");
+      transport.push(agentMessage("stale provider output")).push(turnCompleted("completed")).end();
+      await disposalEntered.promise;
+      let settled = false;
+      pending.finally(() => { settled = true; }).catch(() => {});
+      await Promise.resolve();
+      assert.equal(settled, false, "pending advice retains disposal join");
+      assert.equal(publications, 0);
+      releaseDisposal.resolve();
+      await rejected;
+      assert.equal(transport["closedFlag"], true);
+      assert.equal(disposals, 1, "registered root and harness share disposal");
+      assert.deepEqual(events, ["turn", "retire", "dispose"]);
+      const capture = await executor.withCredentialFreeCapture(1000, async () => {});
+      assert.equal(capture.kind, clean ? "observed_empty" : "incomplete",
+        "unconfirmed disposal must retain custody");
+      assert.equal(publications, 0);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    } finally { releaseDisposal.resolve(); await rejected; }
+  });
+
+  // main.ts:849,921 supplies the raw production factory to delivery SummaryRunner;
+  // runner.ts:17074-17077 binds executor ownership for Now only. Post-run owned
+  // delivery is a safety control: closed admission must remain closed.
+  for (const ownedEditor of [false, true]) it(`M2 provider actual runner ${ownedEditor ? "refuses post-run owned editor with lead-only fallback" : "publishes editor output and redacted lead claims"}`, async () => {
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) =>
+      transport.push(toolCall(98, "signal_done", { pr_summary: {
+        what: "Lead delivery " + providerClaim().credential,
+        verification: [{ command: "verify " + providerClaim().credential, result: "pass" }],
+      } }, th, tn, "done")).push(turnCompleted("completed", th, tn))) });
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    const transport = new FakeTransport(defaultResponder);
+    transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(agentMessage(JSON.stringify({ summary: "Editor delivery " + binding.providerBinding.credential,
+        changes: ["Visible change"], scope_notes: [], review_pointers: [] })))
+      .push(turnCompleted("completed")).end();
+    let launches = 0, disposals = 0;
+    const raw = makeProductionCodexAdviceHarnessFactory(new Proxy({}, {
+      get: (_target, name) => { throw new Error("vendor operation " + String(name)); },
+    }) as never, noopLog, "/unused", {
+      launchRoot: async spec => {
+        launches++;
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        assert.equal(spec.providerSlot, "default");
+        return { transport, cwd: "/isolated", dispose: async () => { disposals++; } };
+      },
+    });
+    let factoryFailure: unknown;
+    const owned = executor.bindCodexSummaryFactory(raw);
+    const observedFactory: typeof owned = async params => {
+      try { return await owned(params); } catch (error) { factoryFailure = error; throw error; }
+    };
+    ownedSummaryFactories.add(observedFactory);
+    const publicationLog = recordingLogger();
+    const summary = new SummaryRunner(publicationLog.logger, {
+      homeRoot: path.resolve("../.uzi/scratch"),
+      queryFn: (() => assert.fail("Claude called")) as never,
+      codexAdviceHarnessFactory: ownedEditor ? observedFactory : raw,
+    });
+    const usage: import("../src/harness.js").AdviceUsageSnapshot[] = [];
+    const generate = summary.generateDeliverySummary.bind(summary);
+    summary.generateDeliverySummary = input => generate({ ...input, onUsage: snapshot => {
+      usage.push(snapshot); input.onUsage?.(snapshot);
+    } });
+    const prApi = new FakePrDescApi();
+    m2Runner.api.prDescription = prApi;
+    const forge = m2Runner.fakeGitlab();
+    m2FollowPush(m2Runner.git, forge.pr, true);
+    const delivery: Executor = { run: async ctx => {
+      commitInTree(ctx.worktreePath, "provider-proof.txt", "delivered work\n");
+      return executor.run(ctx);
+    } };
+    const claim = m2Runner.gitlabClaim(45091, {
+      plan_approved: true, plan_md: "Approved provider delivery", plan_source: "seeded",
+      secrets: { forge_pat: "fixture-forge-pat-000000", provider: binding.providerBinding },
+    });
+    await m2Runner.runner(delivery, forge.gitlab, undefined, { summaryRunner: summary }).execute(claim);
+    assert.ok(m2Runner.api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"),
+      JSON.stringify(m2Runner.api.states));
+    if (ownedEditor) {
+      assert.ok(factoryFailure instanceof Error);
+      assert.match(factoryFailure.message, /summary admission closed/);
+      assert.ok(publicationLog.lines.some(line =>
+        JSON.stringify(line).includes('"msg":"delivery summary skipped"')
+        && JSON.stringify(line).includes('"error_class":"TrustedExecutionRefusal"')));
+      assert.equal(launches, 0, "completed lead refuses owned factory before root launch");
+      assert.equal(disposals, 0);
+      assert.equal(transport.requests.length, 0);
+      assert.deepEqual(usage, []);
+      assert.doesNotMatch(forge.pr.description, /Editor delivery/);
+      assert.match(forge.pr.description, /Lead delivery/);
+      assert.match(forge.pr.description, /verify/);
+      assert.ok(prApi.calls.some(c => c.op === "stage" && c.body.source === "lead_only"));
+      assert.ok(!prApi.calls.some(c => c.op === "stage" && c.body.source === "generated"));
+    } else {
+      assert.equal(factoryFailure, undefined);
+      assert.equal(launches, 1);
+      assert.equal(disposals, 1);
+      assert.equal(usage.length, 1);
+      assert.equal(usage[0]!["corp-code"]!.inputTokens, 100);
+      assert.equal(usage[0]!["corp-code"]!.outputTokens, 20);
+      assert.equal(usage[0]!["corp-code"]!.costStatus, "unreported");
+      assert.equal(usage[0]!["corp-code"]!.costUSD, undefined);
+      assert.match(forge.pr.description, /Editor delivery/);
+      assert.match(forge.pr.description, /verify/);
+      assert.ok(prApi.calls.some(c => c.op === "stage" && c.body.source === "generated"));
+      assert.ok(!JSON.stringify({ body: forge.pr.description, staged: prApi.calls }).includes(binding.providerBinding.credential));
+      assert.equal((transport.requests.find(r => r.method === "turn/start")!.params as { model: string }).model, "corp-code");
+    }
+    assert.ok(!JSON.stringify({ body: forge.pr.description, staged: prApi.calls }).includes(binding.providerBinding.credential));
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
 
   it("M2 provider delivery owned SummaryRunner preserves tuple and default-map sol", async () => {
     const { buildDeliveryContext } = await import("../src/pr-description-context.js");
