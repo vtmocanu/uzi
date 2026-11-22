@@ -2,17 +2,17 @@
 
 **Issue:** #3253
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Implementation in progress, refreshed 2026-11-22. Child Q-codex of epic #1703 (r1 was the single Q draft). Approved implementation baseline: `b8ca3f6e1` (#4580 merged); Codex runtime pin `0.167.0`. Required execution and review evidence remains incomplete; this PRD is not archived.
+**Status:** Completed 2026-11-22 for worker implementation and in-run verification of D1. Child Q-codex of epic #1703 (r1 was the single Q draft). Approved implementation baseline: `b8ca3f6e1` (#4580 merged); Codex runtime pin `0.167.0`. Exact-head CI and the separately listed landing obligations remain unverified.
 **Priority:** `priority::normal`.
 **Parent:** #1703.
-**Accounting prerequisite:** #4580 ([accounting child](done/4580-codex-usage-model-segments.md)) merged at `b8ca3f6e1`, supplying the tested segment interface. #3246 and #3252 are closed and their code is on this base. #3244's resolver/reporting seam merged in PR #3695; its remaining owner landing acceptance is not an unfinished-code dependency. #3245, #3247 and #3250 are already on base.
+**Accounting prerequisite:** #4580 ([accounting child](4580-codex-usage-model-segments.md)) merged at `b8ca3f6e1`, supplying the tested segment interface. #3246 and #3252 are closed and their code is on this base. #3244's resolver/reporting seam merged in PR #3695; its remaining owner landing acceptance is not an unfinished-code dependency. #3245, #3247 and #3250 are already on base.
 
 **Related:**
 - P: a run choice wins in both phases.
 - F: see section 7.
 - B: Runtime default effort and `EffortSettingCellDTO` (D6).
 - PRD #3068: Codex fresh-thread consent, relevant only to the unselected section-5 fallback. Recheck its landed status if that fallback is redesigned; it is not a prerequisite for the selected cold same-thread mechanism.
-- [ADR-2555](../adr/2555-run-usage-attribution.md): Codex response attribution, amended here.
+- [ADR-2555](../../adr/2555-run-usage-attribution.md): Codex response attribution, amended here.
 - ADR-0195: per-model usage fold.
 
 **Delivery:**
@@ -66,7 +66,9 @@ Settings gain an optional **Codex planning model** and **Codex planning effort**
 
 Preserve Q-claude's precedence (P's `run_override` wins in both phases), claim-time provenance, capability and reporting contracts while extending their currently Claude-only implementations to Codex. D1/D6 permit the explicit-planning/Runtime-default implementation effort combination; there is no active combination rejection or locked cross-field helper to reuse.
 
-Per-model usage, cost and ADR-2555 `usage_record` events attribute each token to the model that produced it. Token totals are conserved in every column. No duplicate, stale or replayed notification is counted. This holds across resume and reclaim. A delta that cannot be attributed is kept conservative and never assigned to the implementation model.
+Per-model usage, cost and ADR-2555 `usage_record` events attribute proved claim deltas to the model that produced them, conserving accepted cumulative deltas in all seven columns. Duplicate/stale observations are excluded, while resumed historical replay either advances the prior segment within the same claim or establishes an excluded baseline after reclaim. Unattributable work stays conservative and is never reassigned to implementation to make totals look complete.
+
+A worker process crash loses the accountant, pending transition, guard state, notification queues and unflushed frames. Assume committed PostgreSQL rows and successfully persisted credential-free session files survive; `persistSession` returning alone does not prove a save because it can swallow persistence errors. New claims rediscover phase from persisted plan/approval/question/session facts, register that phase on a new accountant and verify again. Successfully delivered frames fold idempotently/additively; absent frames and never-observed provider spend are not reconstructed. A post-cut reclaim does not recreate that cut. A committed lost-ACK hold remains owner-controlled, banks wait once, and permits Resume/Cancel. This adds no usage journal, fsync, storage/power-loss guarantee or all-provider-spend guarantee. Atomic planning-pair updates mean PostgreSQL readers cannot observe half a pair from the single UPDATE; they do not add a storage durability promise.
 
 Acceptance examples (each one a test):
 
@@ -187,7 +189,7 @@ These are requirements only:
 - **Specs:** `specs/human.md` Feature #17 line, tagged `(AI-synced YYYY-MM-DD)`.
 - **ADRs:**
   - ADR 3252-phase-model-switch gains a Codex section: the cut happens only at an epoch's replay boundary, segments and the extended regression gate, the mid-epoch refusal, and the resume-response guard.
-  - [ADR-2555](../adr/2555-run-usage-attribution.md): retain #4580's segment-accounting amendment and document this PR's real replay-boundary integration without duplicating the child design.
+  - [ADR-2555](../../adr/2555-run-usage-attribution.md): retain #4580's segment-accounting amendment and document this PR's real replay-boundary integration without duplicating the child design.
 - **Changelog:** a fragment.
 
 ### 7. Extend the effective-settings seam already on base
@@ -226,9 +228,9 @@ F and the Claude planning extensions are on this base. Extend their files uncond
 
 ### M1. Codex planning pair end to end
 
-**Blocked by:** #4580 merged.
+**Dependency satisfied:** #4580 merged at `b8ca3f6e1`.
 
-- Sections 1-7, including unconditional effective-settings extensions and the real harness use of the child's segment interface.
+- Selected D1 sections 1–4 and 6–7, including unconditional effective-settings extensions and the real harness use of the child's segment interface. Section 5 is the unselected alternative, not deferred implementation.
 - Dispatch checklist in the PR: child merge SHA, unchanged pinned cold guard evidence, and any #3068 applicability limited to the unselected section-5 fallback. Never activate that fallback without new design review.
 - Acceptance: examples 1-7 are tests; Q-spike case 6 is rewritten to segmented attribution; real replay and late-old-epoch ordering, failed-start/credential-deferred cleanup, Codex hold and lost-ACK/Resume controls pass.
 - In-run checks: targeted touched agent tests with the repository timeout and concurrency limits, `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`, `task check:api`, `task check:web`, `task check-docs:web`, `task scan:secrets`, and `task sast:semgrep`. Run heavy commands serially; no full suites in-run.
@@ -242,6 +244,43 @@ F and the Claude planning extensions are on this base. Extend their files uncond
 - Pinned `test:codex-m4` real-runtime proof and packaged/macOS coverage as applicable to the touched seam; report its execution environment. No live credentials are needed for the offline provider characterization.
 - Measure affected unit files/jobs before and after, the `test:codex-m4` shard-1 delta and `agent-stage M4 duration_seconds`, and critical-path impact. Separate queue/cache effects and identify unmeasured values. No implementation or validation writes to workflows.
 
+## Verified delivery (2026-11-22)
+
+The selected D1 mechanism is implemented. The following checks describe worker evidence, not hosted or merge acceptance.
+
+- [x] Example 1: integrated executor/harness planning and same-thread cold implementation use the intended pair, report H phase entries, and conserve proved per-column usage. The full affected executor file passed 2,001 tests.
+- [x] Example 2: two production harness instances share the accountant; missed planning replay is recorded before one cut; predecessor cleanup precedes admission; late retired ingress cannot change implementation usage. Seven-column and per-response attribution assertions passed.
+- [x] Examples 3–4: fresh-accountant reclaim/re-plan and three pre/post-boundary reconstruction windows passed. Delivered-frame folding and committed hold recovery passed LiveDB checks. These are reconstruction fixtures, not a kill-process or storage-crash proof.
+- [x] Example 5: phase/custom capability mirrors, same-worker satisfiers, frozen/excluded controls, empty-fleet demand, placement rollback and all three placement-function callers passed. The four serialized database command groups recorded 76, 106, 47 and 192 named passes respectively, with zero nested SKIP/FAIL; those groups also include focused unit controls. Migration Up/Down/Up restores the dynamically captured predecessor function.
+- [x] Example 6: exact/missing/mismatched/unsafe model guards, missing saved thread, no-turn preparation, implementation-phase holds, per-kind fences, Resume/Cancel, lost ACK and one-time banking passed. Approval advice, failed construction/cleanup, pending replacement and pre-boundary recreation controls passed.
+- [x] Example 7: both harness fixture consumers, custom IDs, alias rejection, pair presence/null semantics and both Runtime-default save orders passed. Pinned cold runtime reports a present null effort when omitted; no numeric default is supplied.
+- [x] Named production mutations compiled and failed behavioral assertions: replayBeforeCut, resumeModelGuard, oldEpochCleanupAdmission, lateOldEpochUsage, epochModelImmutable, transitionLostOnReplacement, phaseCapabilityRequired and customCapabilityRequired. SQL mutants regenerated executed queries and independently distinguished the opposite capability gate. The strict stale-request mutant fails the intended resume-model assertion before the later epoch guard; an earlier bare-exception result was not credited.
+- [x] Worker advertisement and unchanged credential/coordinator controls passed 236 tests. The broader harness/accountant/property, cost, reporting, hold and preflight group passed 728 tests, all without skips or failures.
+- [x] Focused web files passed: 328 DOM/pure/fixture/parity cases, plus 32 effective-settings cases and six Chromium browser cases. Mock reset regression failed 12 behavioral cases on the unfixed source, then passed the full 32-case file after repair. Untouched recordings and stored null resets remain distinct without new marker state.
+- [x] Component static gates, focused raced API/CLI tests, docs synchronization/validation, migration numbering/additivity, spec numbering, changelog entry, token-literal and guidance checks passed. Secret and Semgrep checks detected their canaries and found no tree findings. Required E2E-lib and forge-fake targets passed.
+- [x] Documentation, embedded mirrors, Feature #17, ADR-3252/ADR-2555 and a UUID changelog fragment reflect the implementation; committed repairs received reviewer, tester and auditor coverage.
+
+### Pinned runtime and timing
+
+Linux x86_64, Node 26.12.1, real Codex 0.167.0: `task test:codex-m4` passed 273 tests with zero skips/failures. Its completeness checker satisfied all required Claude/U, Codex/U and Codex/P rows; local stage duration was 88 seconds. The evidence file and inherited temporary files were relocated into worktree scratch without changing the checker, source imports or test selection.
+
+Focused timing used the same stable export path, installed dependencies and pinned binary, comparing accounting prerequisite commit `b8ca3f6e1` with the delivered runtime:
+
+| File | Base wall / passed | Candidate wall / passed |
+|---|---:|---:|
+| phase-model-switch.test.ts | 3.02 s / 7 | 3.31 s / 8 |
+| codex-harness.test.ts | 15.46 s / 509 | 14.28 s / 543 |
+
+These are single local samples with uncontrolled cold/warm cache effects, not a performance trend. CI shard-1 delta, affected-job times and critical-path impact remain unmeasured landing obligations; no baseline full-M4 result is claimed.
+
+### Validation fixture and remaining landing work
+
+The stock worker's Git 2.54.1 lacks its native HTTP backend: the unchanged forge-fake test failed with HTTP 500 on both task base and candidate. The matching, signed Alpine git-daemon 2.54.1-r0 package supplied the native helper under scratch. A command-local Git launcher retained `/usr/bin/git` and all arguments, completing only its helper lookup; the original TLS/auth/config controls and test source were unchanged. The focused reproducer and full required target then passed. No system package, Git config, dependency lockfile or workflow changed. The image provisioning gap was reported separately.
+
+Tracked literal/identifier sweeps across E2E phases, lib helpers/tests and forge-fake found no stale expectation for the planning fields, phase/custom capabilities or hold marker. Full affected lifecycle phases remain unrun locally: worker join/restart (13/15), usage park (16), CLI (18), reject/revise/clarify (26/43/44), health/selection (46/48), schedules/self-improvement (60/61/62), handoff/rework (70/71), and Codex activation/meters (74/75). Run these through the applicable exact-head E2E lane.
+
+Dispatch checklist: #4580 merged at `b8ca3f6e1`; the #3244 resolver/reporting seam is locally present at `075c54de2` (#3695), while that issue's external acceptance remains unverified. #3068 applies only to the unselected fresh-conversation alternative. Keep API-before-worker rollout, exact-head full suites, packaged/macOS proof and landing-time migration renumbering as stated above. None is claimed passed here.
+
 ## Decision Log
 
 - **D1. Mechanism: same conversation at the cold approval epoch (#3246, live evidence 2026-11-20).** User-run native ChatGPT-login probes on Codex 0.167.0: the full matrix and corrected effort-only report are retained in the durable #3246 evidence comment linked below. Implementation provenance is the squash-merge of the Q-spike PR. All twelve original and eight focused turns completed and returned the nonce. Both probes reported unchanged auth-file mtime; credentials were subsequently removed by the operator. The model/effort mechanism is established for this cold shape; the Q-claude guard dependency is now met by PR #4571; #4580 has since merged at `b8ca3f6e1`; its code dependency is satisfied.
@@ -250,7 +289,7 @@ F and the Claude planning extensions are on this base. Extend their files uncond
   - **Model omission is not a production setting:** `buildRunRequest` uses `leadRequestFor` / `resolveLeadRequest` (`agent/src/lead-config-report.ts`) and always supplies the provider/model fallback. Model omission above is a test-only resume-effectiveness control.
   - **Case 5, closed by the corrected live report:** after Astra/high, warm Sol turns with omitted effort and explicit null both reported `effortPresent=true, effort=high`. After resetting to Astra/high and restarting the app-server, cold Sol resume reported `resumeEffortPresent=true, resumeEffort=null`; the subsequent omitted/null Sol turns both reported `effortPresent=true, effort=null`. Thus warm omission keeps the override; cold omission resets it to Runtime default. The live numeric default is not reported and must not be called low; low was observed only on the offline provider wire. Settings notifications are post-dispatch observations, not an admission barrier. The older report's `unreported` conflation is superseded.
   - **Save-time decision:** the explicit-planning/Runtime-default implementation combination needs no rejection for this cold approval-epoch mechanism. Preserve omission on `turn/start`; do not replace it with a guessed numeric effort. A warm alternative is outside this decision and needs fresh proof/review.
-  - **Current attribution is still wrong, as expected:** every adopted switched live usage note was attributed to Astra, including cold post-replay Sol work. The passing characterization pins that current behavior for this PRD to invert when adding segments; Q-spike changes no accountant behavior. Totals are cumulative and replay must not be charged again.
+  - **Historical Q-spike attribution, before #4580/#3253:** every adopted switched live usage note was attributed to Astra, including cold post-replay Sol work. That characterization originally pinned the behavior to invert; Q-spike itself changed no accountant behavior. This delivery replaces case 6 with segmented attribution and larger-replay assertions. Totals are cumulative and replay must not be charged again.
   - **Provider acceptance/cache:** the initial Astra switch-group turn reported 32 reasoning tokens; subsequent Sol and cold resumed turns completed without rejection. Raw live reasoning-item forwarding was not inspected. The first warm Sol response reported last input 14,275, cache read/write 0 and output 30; the first cold Sol response reported last input 23,058, cache read/write 0 and output 30, with complete pricing-field evidence. Use `last`, not cumulative totals, for those observations. Other Astra turns had cache hits; this one probe does not establish a general cross-model cache rule.
   - Sanitized full and corrected live observations: [Q-spike evidence](https://github.com/vtmocanu/uzi/issues/3246#issuecomment-7038584349).
 - **D2. Segments are cut only at an epoch's first-turn replay boundary; any later change gets a typed refusal.** This keeps the shared accountant's cross-epoch baseline and dedup. Rejected:
@@ -268,5 +307,5 @@ F and the Claude planning extensions are on this base. Extend their files uncond
 - **D11. The cut follows the replay boundary (R2-5, buddy Q3).** Replay reconciles the plan's work, so its advance belongs to the plan segment. An unpriceable advance degrades only the plan model.
 - **D12. Extend the regression gate instead of clamping per segment (R2-6).** Monotone cumulatives make conservation exact by construction. A dip is malformed data and should fail closed. Rejected: clamping each segment delta, which over-counts across a dip.
 - **D13. The guard compares against the intended implementation model and fails closed on a missing or unrecognized response (buddy Q4, R2-9).** An echo makes the same-conversation mechanism not dispatchable.
-- **D14. Owner-approved split, 2026-11-21.** Extract the independent accounting outcome to [#4580](done/4580-codex-usage-model-segments.md), one run and PR first. Block this Codex planning PRD on that child's merge. #1703 indexes both outcomes. Rejected: one large PR combining the accounting change and end-to-end planning. This PRD owns production cut ordering, cold verification, settings/mirrors and hold integration.
+- **D14. Owner-approved split, 2026-11-21.** Extract the independent accounting outcome to [#4580](4580-codex-usage-model-segments.md), one run and PR first. Block this Codex planning PRD on that child's merge. #1703 indexes both outcomes. Rejected: one large PR combining the accounting change and end-to-end planning. This PRD owns production cut ordering, cold verification, settings/mirrors and hold integration.
 - **D15. Refresh to shipped Q-claude, 2026-11-21.** Extend the actual Claude-only resolution/hold gates and atomic setter rather than an imaginary locked combination-rule helper. Preserve budget banking and race fences. Keep the Codex-specific cold-resume guard; D18 is the Claude proof, not a portable app-server API.

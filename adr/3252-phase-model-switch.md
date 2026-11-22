@@ -2,7 +2,7 @@
 
 **Status**: Implemented on branch agent/issue-3252 (2026-11-21); exact-head CI pending
 **Date**: 2026-11-21
-**Related**: Issue #3252; [PRD #3252](../prds/done/3252-claude-planning-model.md) (the Decision Log carries D1-D19); Q-spike #3246 (mechanism evidence); epic #1703; [PRD #3253](../prds/3253-codex-planning-model.md) (Codex integration; evidence record maintained separately)
+**Related**: Issue #3252; [PRD #3252](../prds/done/3252-claude-planning-model.md) (the Decision Log carries D1-D19); Q-spike #3246 (mechanism evidence); epic #1703; [PRD #3253](../prds/done/3253-codex-planning-model.md) (Codex integration; evidence record maintained separately)
 
 ## Decision (summary)
 
