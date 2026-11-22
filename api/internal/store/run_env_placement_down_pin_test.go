@@ -102,6 +102,20 @@ func TestFindFunctionBlock(t *testing.T) {
 	}
 }
 
+// predecessorPlacementFunction returns the Up definition of the placement function from the
+// highest-numbered file in earlier (sorted ascending) that defines it, and that file's name.
+func predecessorPlacementFunction(t *testing.T, placement string, earlier []string) (block, file string) {
+	t.Helper()
+	for i := len(earlier) - 1; i >= 0; i-- {
+		up, _ := migrationSection(t, earlier[i], false)
+		if b := functionBlock(t, earlier[i], up, placementFunction); b != "" {
+			return b, earlier[i]
+		}
+	}
+	t.Fatalf("no migration below %s defines %s in its Up section", placement, placementFunction)
+	return "", ""
+}
+
 // The run env placement migration's Down restores fn_placement_admitting_workers exactly as the
 // latest earlier migration that defines it left it. That predecessor is derived, not named: the
 // run env placement migration is the one file matching *_run_env_placement.sql, and the
@@ -128,17 +142,7 @@ func TestRunEnvPlacementDownRestoresPredecessorFunction(t *testing.T) {
 	}
 	sort.Strings(earlier)
 
-	var prior, priorFile string
-	for i := len(earlier) - 1; i >= 0; i-- {
-		up, _ := migrationSection(t, earlier[i], false)
-		if block := functionBlock(t, earlier[i], up, placementFunction); block != "" {
-			prior, priorFile = block, earlier[i]
-			break
-		}
-	}
-	if prior == "" {
-		t.Fatalf("no migration below %s defines %s in its Up section", placement, placementFunction)
-	}
+	prior, priorFile := predecessorPlacementFunction(t, placement, earlier)
 	t.Logf("%s Down is compared with the Up of %s", placement, priorFile)
 
 	downSection, found := migrationSection(t, placement, true)
@@ -154,5 +158,58 @@ func TestRunEnvPlacementDownRestoresPredecessorFunction(t *testing.T) {
 	}
 	if fromFunctionKeyword(down) != fromFunctionKeyword(prior) {
 		t.Fatalf("%s Down function (%d bytes) differs from %s Up function (%d bytes)", placement, len(down), priorFile, len(prior))
+	}
+}
+
+// The run env placement migration's Up is the predecessor's Up function plus exactly the
+// run_env_v1 claim clause (its comment lines and its one AND line), so a rebuilt Up cannot drop a
+// predecessor clause. Removing those lines from the Up function must give the predecessor's Up
+// function from the FUNCTION keyword on.
+func TestRunEnvPlacementUpAddsOnlyRunEnvClause(t *testing.T) {
+	matches, err := filepath.Glob(filepath.Join("migrations", "*_run_env_placement.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("want exactly one migrations/*_run_env_placement.sql, got %v", matches)
+	}
+	placement := filepath.Base(matches[0])
+	all, err := filepath.Glob(filepath.Join("migrations", "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var earlier []string
+	for _, m := range all {
+		if base := filepath.Base(m); base < placement {
+			earlier = append(earlier, base)
+		}
+	}
+	sort.Strings(earlier)
+	prior, priorFile := predecessorPlacementFunction(t, placement, earlier)
+
+	upSection, _ := migrationSection(t, placement, false)
+	up := functionBlock(t, placement, upSection, placementFunction)
+	if up == "" {
+		t.Fatalf("%s Up does not define %s", placement, placementFunction)
+	}
+	// Remove the clause line and the contiguous comment lines directly above it.
+	lines := strings.Split(up, "\n")
+	var stripped []string
+	removedClause := 0
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "AND ('run_env_v1' = ANY(") {
+			removedClause++
+			for len(stripped) > 0 && strings.HasPrefix(strings.TrimSpace(stripped[len(stripped)-1]), "--") {
+				stripped = stripped[:len(stripped)-1]
+			}
+			continue
+		}
+		stripped = append(stripped, line)
+	}
+	if removedClause != 1 {
+		t.Fatalf("%s Up must carry exactly one run_env_v1 claim clause, found %d", placement, removedClause)
+	}
+	if got, want := fromFunctionKeyword(strings.Join(stripped, "\n")), fromFunctionKeyword(prior); got != want {
+		t.Fatalf("%s Up minus the run_env_v1 clause (%d bytes) differs from %s Up function (%d bytes)", placement, len(got), priorFile, len(want))
 	}
 }
