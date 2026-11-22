@@ -58,7 +58,7 @@ RE_SECRET_NAME=E2E_REGISTRY_TOKEN
 
 re_new_issue() {
   apipost "/api/repos/$REPO_ID/issues" \
-    "$(jq -nc --arg t "$1" '{title:$t, description:"implements prds/4416-repo-env-vars.md"}')" \
+    "$(jq -nc --arg t "$1" '{title:$t, description:"implements the repo run variables feature"}')" \
     | jq -r '.card.iid'
 }
 
