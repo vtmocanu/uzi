@@ -142,7 +142,8 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 	}
 }
 
-// claimRunInTx runs ClaimRun inside tx, which the caller holds with the worker row locked and
+// claimRunInTx claims through claimCheckpointRun inside tx (ClaimRun executes only after that
+// function's idle precheck finds a same-owner queued run), which the caller holds with the worker row locked and
 // re-read (reread is that locked row). It reports (run, true, nil) for a claim, (_, false, nil) for
 // idle (no candidate, or a lease claim refused), and an error otherwise; the caller commits tx for
 // both non-error outcomes, because whatever it did before the claim (a snapshot replace) must

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -185,52 +186,173 @@ func TestClaimIdlePrecheckNoNegativeCachingLiveDB(t *testing.T) {
 // one claims it and the other is idle. (The existing concurrent admission test claims two
 // runs, so it does not cover one run and two claimants.)
 func TestClaimIdlePrecheckConcurrentClaimantsLiveDB(t *testing.T) {
-	f, _ := newTracedClaimFixture(t)
-	run := f.seedRun("queued", 0)
+	// Calibration: the hand-built second worker, polling alone, claims a fresh queued run. Only
+	// then does "exactly one of the two claims" below mean a real race rather than a second
+	// worker that could never have claimed.
+	t.Run("second worker alone claims", func(t *testing.T) {
+		f, _ := newTracedClaimFixture(t)
+		second := f.addSecondWorker()
+		run := f.seedRun("queued", 0)
+		p, err := f.svc.Claim(f.env.ctx, second, nil)
+		if err != nil {
+			t.Fatalf("second worker Claim: %v", err)
+		}
+		if p == nil || p.RunID != run.String() {
+			t.Fatalf("second worker claim = %+v, want run %s", p, run)
+		}
+		if s := f.runStatus(t, run); s != "claimed" {
+			t.Fatalf("status = %q, want claimed", s)
+		}
+	})
+
+	t.Run("one run two claimants", func(t *testing.T) {
+		f, _ := newTracedClaimFixture(t)
+		run := f.seedRun("queued", 0)
+		workers := []store.Worker{f.wkr, f.addSecondWorker()}
+
+		type result struct {
+			runID string
+			err   error
+		}
+		results := make([]result, len(workers))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i, w := range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				p, err := f.svc.Claim(f.env.ctx, w, nil)
+				results[i].err = err
+				if p != nil {
+					results[i].runID = p.RunID
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		claimed := 0
+		for i, r := range results {
+			if r.err != nil {
+				t.Fatalf("worker %d: Claim: %v", i, r.err)
+			}
+			if r.runID != "" {
+				claimed++
+				if r.runID != run.String() {
+					t.Fatalf("worker %d claimed %s, want %s", i, r.runID, run)
+				}
+			}
+		}
+		if claimed != 1 {
+			t.Fatalf("claimants that got the run = %d, want exactly 1", claimed)
+		}
+		if s := f.runStatus(t, run); s != "claimed" {
+			t.Fatalf("status = %q, want claimed", s)
+		}
+	})
+}
+
+// addSecondWorker inserts a second online worker for the fixture's owner, mirroring how the
+// fixture's own worker is seeded, and returns its claim-time row.
+func (f *custodyContinuationFixture) addSecondWorker() store.Worker {
 	second := uuid.New()
 	f.env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at)
 	            VALUES ($1, $2, 'second', $3, 'online', now())`, second, f.userID, second[:])
 	f.env.exec(`UPDATE workers SET last_heartbeat_at = now() WHERE id = $1`, f.workerID)
-	workers := []store.Worker{f.wkr, {ID: second, UserID: f.userID, Name: "second", Status: "online", ProtocolCapabilities: f.wkr.ProtocolCapabilities}}
+	return store.Worker{ID: second, UserID: f.userID, Name: "second", Status: "online", ProtocolCapabilities: f.wkr.ProtocolCapabilities}
+}
 
-	type result struct {
-		runID string
-		err   error
+// newTracedLeaseEnv is a lease-env (2h lease) whose Service queries and claim transactions run on a
+// traced pool, so the tracer sees every statement a Claim issues. Seeding keeps using e.pool.
+func newTracedLeaseEnv(t *testing.T) (leaseEnv, *Service, *claimStmtTracer) {
+	t.Helper()
+	e := newLeaseEnv(t)
+	tr := &claimStmtTracer{}
+	pool, err := store.OpenPool(e.ctx, os.Getenv("UZI_TEST_DATABASE_URL"), store.WithQueryTracer(tr))
+	if err != nil {
+		t.Fatalf("open traced pool: %v", err)
 	}
-	results := make([]result, len(workers))
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for i, w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			p, err := f.svc.Claim(f.env.ctx, w, nil)
-			results[i].err = err
-			if p != nil {
-				results[i].runID = p.RunID
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
+	t.Cleanup(pool.Close)
+	svc := New(store.New(pool), e.box, testParams())
+	svc.SetVault(e.vlt)
+	svc.SetTxBeginner(pool)
+	svc.SetBackground(func(func()) {})
+	svc.SetEphemeralSettings(fakeEphemeralSettings{lease: 2 * time.Hour})
+	return e, svc, tr
+}
 
-	claimed := 0
-	for i, r := range results {
-		if r.err != nil {
-			t.Fatalf("worker %d: Claim: %v", i, r.err)
-		}
-		if r.runID != "" {
-			claimed++
-			if r.runID != run.String() {
-				t.Fatalf("worker %d claimed %s, want %s", i, r.runID, run)
-			}
-		}
+// The snapshot idle path with a false precheck: a valid snapshot is replaced in the claim
+// transaction, ClaimRun never executes, and the replacement still commits.
+func TestClaimIdlePrecheckSnapshotIdleCommitsReplaceLiveDB(t *testing.T) {
+	e, svc, tr := newTracedLeaseEnv(t)
+	w, served, _ := e.seedBound(t, "running", 1, false)
+
+	r := awaitClaim(t, e.claimAsync(svc, w, 1, served))
+	if r.err != nil || r.payload != nil {
+		t.Fatalf("claim = (%+v, %v), want idle", r.payload, r.err)
 	}
-	if claimed != 1 {
-		t.Fatalf("claimants that got the run = %d, want exactly 1", claimed)
+	if got := tr.claimRun.Load(); got != 0 {
+		t.Fatalf("ClaimRun executions = %d, want 0", got)
 	}
-	if s := f.runStatus(t, run); s != "claimed" {
-		t.Fatalf("status = %q, want claimed", s)
+	if got := tr.precheck.Load(); got != 1 {
+		t.Fatalf("HasQueuedRunForUser executions = %d, want 1", got)
+	}
+	if got := e.workerRow(t, w).SnapshotEpoch; got != 1 {
+		t.Fatalf("snapshot_epoch = %d, want 1 (the replacement must persist)", got)
+	}
+	if s := e.runStatusOf(t, served); s != "running" {
+		t.Fatalf("served run = %q, want running", s)
+	}
+}
+
+// The leased idle path with a false precheck: no ClaimRun, the lease and binding are untouched,
+// the claim reports lease-claim (false, false), and a lease-admissible run enqueued afterwards is
+// claimed by the next poll.
+func TestClaimIdlePrecheckLeasedIdleLiveDB(t *testing.T) {
+	e, svc, tr := newTracedLeaseEnv(t)
+	probe := &leaseProbe{}
+	svc.leaseClaimProbe = probe.hook
+	w, served, iid := e.seedLeasedWorker(t)
+	before := e.workerRow(t, w)
+
+	r := awaitClaim(t, e.claimAsync(svc, w, 1))
+	if r.err != nil || r.payload != nil {
+		t.Fatalf("claim = (%+v, %v), want idle", r.payload, r.err)
+	}
+	if got := tr.claimRun.Load(); got != 0 {
+		t.Fatalf("ClaimRun executions = %d, want 0", got)
+	}
+	if got := tr.precheck.Load(); got != 1 {
+		t.Fatalf("HasQueuedRunForUser executions = %d, want 1", got)
+	}
+	if probe.calls.Load() != 1 || probe.admitted.Load() != 0 || probe.rebound.Load() != 0 {
+		t.Fatalf("lease probe calls=%d admitted=%d rebound=%d, want 1/0/0",
+			probe.calls.Load(), probe.admitted.Load(), probe.rebound.Load())
+	}
+	after := e.workerRow(t, w)
+	if !after.LeaseSince.Valid || after.LeaseSince != before.LeaseSince ||
+		after.LeaseRepoID != before.LeaseRepoID || after.LeaseBranch != before.LeaseBranch {
+		t.Fatalf("lease changed: before=(%v %v %v) after=(%v %v %v)",
+			before.LeaseSince, before.LeaseRepoID, before.LeaseBranch,
+			after.LeaseSince, after.LeaseRepoID, after.LeaseBranch)
+	}
+	if got := e.boundRun(t, w); got.Bytes != served {
+		t.Fatalf("worker bound to %v after an idle claim, want %s", got, served)
+	}
+	if after.SnapshotEpoch != 1 {
+		t.Fatalf("snapshot_epoch = %d, want 1 (the replacement must persist)", after.SnapshotEpoch)
+	}
+
+	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
+	r = awaitClaim(t, e.claimAsync(svc, w, 2))
+	if r.err != nil || r.payload == nil || r.payload.RunID != follow.String() {
+		t.Fatalf("next claim = (%+v, %v), want the follow-up %s", r.payload, r.err, follow)
+	}
+	if got := e.boundRun(t, w); got.Bytes != follow {
+		t.Fatalf("worker bound to %v, want the follow-up", got)
+	}
+	if got := tr.claimRun.Load(); got != 1 {
+		t.Fatalf("ClaimRun executions = %d after the follow-up claim, want 1", got)
 	}
 }

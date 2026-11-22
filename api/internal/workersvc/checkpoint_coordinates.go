@@ -55,7 +55,7 @@ func frozenCheckpointCoordinates(run store.Run) (*CheckpointCoordinates, error) 
 //
 // Issue #4602: an idle precheck runs first, on the caller's transaction and before any
 // savepoint. HasQueuedRunForUser tests exact top-level conjuncts of ClaimRun's target, so
-// false means ClaimRun would claim nothing at this snapshot; the poll is then idle without
+// false means ClaimRun would claim nothing at the precheck's statement snapshot; the poll is then idle without
 // planning or executing ClaimRun. Nothing is cached between polls, and a true result admits
 // nothing by itself: ClaimRun below remains the authoritative claim.
 func (s *Service) claimCheckpointRun(ctx context.Context, tx pgx.Tx, params store.ClaimRunParams) (store.Run, error) {
