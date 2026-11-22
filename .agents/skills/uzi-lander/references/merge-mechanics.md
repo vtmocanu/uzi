@@ -170,6 +170,8 @@ green `main` badge can be a subset. *(A future improvement: derive the EXPECTED 
 from the last known-good `main` commit's runs and fail closed until each expected workflow
 has a completed run for the target SHA.)*
 
+Before local repair, follow SKILL.md's **Main-CI repair ownership** check: inspect ci_watch schedules and episode run IDs, agree one fixer, and settle any existing repair. A scheduled repair is a prompt run on its own branch, not a ci_fix or a direct main push.
+
 On red, read each failed job and classify: **code / conflict / missing-file** → fix on a
 branch, PR, merge, re-watch (never push code to `main`); **flaky** (passes on isolated
 re-run; `gh run rerun <run-id> --failed`) → file an issue, do not chase. Rerun only while

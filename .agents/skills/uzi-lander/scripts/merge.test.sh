@@ -90,9 +90,9 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
     *'-q .state'*) printf '%s\n' "\$st" ;;
     *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
     *)     if [ -n "\$oid" ]; then
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"},"baseRefName":"main"}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","headRefName":"agent/issue-42","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"},"baseRefName":"main"}'
            else
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"'"\${MERGEABLE:-MERGEABLE}"'","mergeCommit":null,"baseRefName":"main"}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","headRefName":"agent/issue-42","mergeStateStatus":"BLOCKED","mergeable":"'"\${MERGEABLE:-MERGEABLE}"'","mergeCommit":null,"baseRefName":"main"}'
            fi ;;
   esac
   exit 0
@@ -386,6 +386,50 @@ grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "pass+ski
 CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
 merge_run green
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
+# A green head is still owned by an active helper. The second lookup models a
+# helper appearing while the other merge preflights run; no real factory is used.
+cat > "$WORK/bin/uzi" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+case "$*" in
+  'repo list --json') echo '[{"id":"repo","path_with_namespace":"test/repo"}]' ;;
+  'run list --json')
+    n=0; [ ! -f "$HELPER_CALLS" ] || n=$(cat "$HELPER_CALLS")
+    n=$((n+1)); echo "$n" > "$HELPER_CALLS"
+    if [ "${HELPER_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '[]'
+    else printf '%s\n' "$HELPER_RUNS"; fi ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$WORK/bin/uzi"
+export HELPER_CALLS="$WORK/helper.calls" CONFIRM_AFTER_MERGE=1
+helper_merge() {
+  rm -f "$WORK/merge.log" "$HELPER_CALLS"
+  set +e
+  bash "$SCRIPT" test/repo 42 > "$WORK/m.helper" 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq "$1" ] || fail "helper guard rc=$rc, want $1: $(cat "$WORK/m.helper")"
+  if [ "$1" -ne 0 ]; then [ ! -e "$WORK/merge.log" ] || fail 'helper refusal merged'; fi
+}
+export HELPER_RUNS='[{"id":"fix-active","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-42","status":"running"}]'
+helper_merge 14
+grep -qF 'fix-active' "$WORK/m.helper" || fail 'active ci_fix id missing'
+export HELPER_LATE=1
+helper_merge 14
+[ "$(cat "$HELPER_CALLS")" -eq 2 ] || fail 'merge did not refresh ownership'
+unset HELPER_LATE
+export HELPER_RUNS='[{"id":"rework-active","kind":"mr_rework","repo_id":"repo","mr_iid":42,"status":"awaiting_approval"}]'
+helper_merge 14
+grep -qF 'wait-mrrework.sh' "$WORK/m.helper" || fail 'rework wait guidance missing'
+export HELPER_RUNS='not-json'
+helper_merge 4
+export HELPER_RUNS='[{"id":"bad","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-42","status":null}]'
+helper_merge 4
+export HELPER_RUNS='[{"id":"unrelated","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-420","status":"running"}]'
+helper_merge 0
+[ -s "$WORK/merge.log" ] || fail 'unrelated branch prevented merge'
+unset HELPER_RUNS HELPER_CALLS CONFIRM_AFTER_MERGE
 # A required context the base branch's rules name but the head has not reported is pending:
 # right after a push only the fast required checks have registered.
 export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"},{"context":"slow"}]}}]'
