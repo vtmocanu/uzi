@@ -132,6 +132,14 @@ The pre-agent-change M4 baseline and large cold-resume test concern native prese
 
 The current [claim assembly hold](../api/internal/workersvc/claim_assembly.go) (around line 215) refuses a provider-bound Codex run before context/binding/credential reads regardless of capability. [CodexProviderV1](../api/internal/capability/capability.go) is vocabulary; [worker registration](../agent/src/worker.ts) does not advertise it. Pure helper Code-binding tests describe a future contract and do not prove executable activation.
 
+## Execution-plan M2 verification record
+
+At revision `94b5ffe240b895da9180bce67cff181b70f99443`, the provider-only execution/protection selections passed: 197 executor tests, 298 authority/config/consumer/upload/session tests, 39 launcher/advice tests and 54 secrecy/census tests. These are focused selections, not the full agent suite. The launcher selection additionally skipped the native existing-root creator test because the command identity is not the worker UID; its `baseSpec` uses native provider configuration, without a frozen provider binding. That test was NOT verified here; existing worker-UID CI remains a landing obligation, and M3's production UID-split/private-CA proof remains required.
+
+The CI-discovered [bound-provider runtime case](../e2e/codex-m4/bound-provider-root.test.ts) drives the executor, default launcher adapter, managed authentication and pinned app-server against an authenticated local HTTP fake. OS provisioning/supervisor evidence are simulated; it proves neither kernel isolation nor production session staging. The full `task test:codex-m4` at this revision passed 273 tests with zero skips and completeness checks, taking 86 seconds; strict `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` also passed. The encoded plan-publication regression was observed failing before the decoded-object scrub and passing afterward, with clean and vendor controls retained.
+
+The attempted pre-change timing export failed a Git-dependent receipt test (271 passes, one failure, zero skips; test wall 156.140 seconds). Its lack of checkout metadata makes it an invalid clean baseline. No speedup, slowdown or CI critical-path delta is established; runtime cost comparison remains unresolved for M4. Neither PRD checkbox nor capability advertisement is enabled by this execution-plan unit record.
+
 ## Decision Log
 
 - **2026-11-22: Amend validation boundary (maintainer).** The full unfiltered store-integration sweep and full `test:api` are exact-head PR CI landing obligations, pending and not passed in-run. Required focused LiveDB proofs still run serially on disposable databases with named PASS and zero SKIP; affected non-LiveDB race tests run with the database variable unset. Static checks, sqlc drift, runtime/CA/conformance, security checks and the completed-delivery activation gate remain mandatory. Do not change committed deadlines or guards to force the aggregate sweep through this worker.
