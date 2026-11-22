@@ -76,6 +76,72 @@ describe("InfoTip", () => {
     }
   });
 
+  // WCAG 1.4.13 persistence: each input holds the tip open on its own.
+  it("stays open after the pointer leaves while the trigger keeps focus", () => {
+    vi.useFakeTimers();
+    try {
+      render(<InfoTip label="About" tip="text" />);
+      const trigger = screen.getByRole("button", { name: "About" });
+      const host = trigger.parentElement!;
+      fireEvent.mouseEnter(host);
+      fireEvent.focus(trigger);
+      fireEvent.mouseLeave(host);
+      act(() => vi.advanceTimersByTime(500));
+      expect(isOpen(trigger)).toBe(true);
+      fireEvent.blur(trigger, { relatedTarget: null });
+      expect(isOpen(trigger)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays open after focus leaves while the pointer is still over it", () => {
+    vi.useFakeTimers();
+    try {
+      render(<InfoTip label="About" tip="text" />);
+      const trigger = screen.getByRole("button", { name: "About" });
+      const host = trigger.parentElement!;
+      fireEvent.focus(trigger);
+      fireEvent.mouseEnter(host);
+      fireEvent.blur(trigger, { relatedTarget: null });
+      expect(isOpen(trigger)).toBe(true);
+      fireEvent.mouseLeave(host);
+      act(() => vi.advanceTimersByTime(500));
+      expect(isOpen(trigger)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a clicked tip open after the pointer leaves, until a press outside", () => {
+    vi.useFakeTimers();
+    try {
+      render(<><InfoTip label="About" tip="text" /><p>elsewhere</p></>);
+      const trigger = screen.getByRole("button", { name: "About" });
+      const host = trigger.parentElement!;
+      fireEvent.mouseEnter(host);
+      fireEvent.click(trigger);
+      fireEvent.mouseLeave(host);
+      act(() => vi.advanceTimersByTime(500));
+      expect(isOpen(trigger)).toBe(true);
+      fireEvent.pointerDown(screen.getByText("elsewhere"));
+      expect(isOpen(trigger)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays dismissed after Escape until the next hover, focus or click", () => {
+    render(<InfoTip label="About" tip="text" />);
+    const trigger = screen.getByRole("button", { name: "About" });
+    fireEvent.mouseEnter(trigger.parentElement!);
+    fireEvent.focus(trigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(isOpen(trigger)).toBe(false);
+    fireEvent.click(trigger);
+    expect(isOpen(trigger)).toBe(true);
+  });
+
   it("opens on click (a tap) and a second click does not close it", () => {
     render(<InfoTip label="About" tip="text" />);
     const trigger = screen.getByRole("button", { name: "About" });
