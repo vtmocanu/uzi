@@ -11,7 +11,9 @@ package store_test
 // and it writes JSON lines to the file named by UZI_POOL_MEMORY_OUT (required). Optional
 // knobs (defaults in parentheses): UZI_POOL_MEMORY_ROUNDS (20) memory rounds per candidate,
 // UZI_POOL_MEMORY_LIFETIME (45s) and UZI_POOL_MEMORY_JITTER (10s) for the recycling
-// candidates, UZI_POOL_MEMORY_MAX_RECYCLE_WAIT (12m) cap on one recycling candidate's run,
+// candidates, UZI_POOL_MEMORY_MAX_RECYCLE_WAIT (12m) cap on one recycling candidate's run (a
+// recycling candidate that hits this wait before UZI_POOL_MEMORY_ROUNDS rounds fails the
+// run, so set the wait to cover the requested rounds),
 // UZI_POOL_MEMORY_DISCOVER=1 (run only the breadth table once and write each entry's
 // observed outcome, used to re-pin the table after a schema change), UZI_POOL_MEMORY_REPS (2)
 // memory repetitions per candidate (an integer >= 1, else the test fails),
@@ -569,7 +571,9 @@ func pmParseMem(smaps, status string) (pmMem, error) {
 	return m, nil
 }
 
-// pmObserverReadTimeout bounds one observer read once it holds the observer lock.
+// pmObserverReadTimeout bounds one observer read once it holds the observer lock. It bounds
+// every observer read (sampler, sampleHeld and the explain-phase reads). Under pgx v5 a query
+// cancelled mid-flight closes the observer connection, so later reads then fail loudly.
 const pmObserverReadTimeout = 30 * time.Second
 
 // read samples one backend. raw, when non-nil, receives the three raw file bodies.
@@ -604,6 +608,11 @@ func (o *pmObserver) read(ctx context.Context, pid uint32, raw *[3]string) (pmMe
 		} else {
 			m.CgroupCurrentB, m.CgroupAnonB, m.CgroupFileB = &n, &anon, &file
 		}
+	}
+	// A deadline or cancel during the cgroup queries would have closed the connection anyway;
+	// report it instead of returning a sample that only carries a CgroupNote.
+	if err := ctx.Err(); err != nil {
+		return pmMem{}, fmt.Errorf("read cgroup for /proc/%d: %w", pid, err)
 	}
 	if raw != nil {
 		raw[0], raw[1], raw[2] = smaps, status, cur+"\n---- memory.stat ----\n"+stat
@@ -778,8 +787,8 @@ func (e *pmEnv) pidGone(pid uint32) bool {
 // openPool builds the candidate's api-style pool: pgxpool.ParseConfig, then the candidate's
 // fields set directly, MaxConns 1, with the tracer and PID-recording hooks.
 //
-// Only the memory and wide phases use openPool; the explain and discover phases build their
-// own connections and are not covered by the guards in poolConfig. The wide phase's
+// The memory, latency/stress, cold and wide phases use openPool; the explain and discover
+// phases build their own connections and are not covered by the guards in poolConfig. The wide phase's
 // SET plan_cache_mode = force_generic_plan runs after acquire, so the AfterConnect mode check
 // (which sees the connection's startup state) is unaffected by it. The guards are a harness
 // guard only and do not restrict production OpenPool.
@@ -1309,7 +1318,8 @@ type pmSamplerResult struct {
 
 // pmSamplerJoinWait is how long Stop waits for the sampler goroutine to finish on its own
 // before cancelling its context. It exceeds the per-read timeout in pmObserver.read, so a
-// healthy read in flight is never cancelled by a graceful Stop.
+// graceful Stop never cancels a healthy in-flight read when no other reader is queued on the
+// observer mutex (a queued reader's wait is not bounded by that timeout).
 const pmSamplerJoinWait = 35 * time.Second
 
 type pmSampler struct {
@@ -1374,9 +1384,10 @@ func (s *pmSampler) loop(sctx context.Context, interval time.Duration) {
 		now := time.Now()
 		mem, err := s.read(sctx, pid)
 		if err != nil {
-			// A read that failed because the sampler is being stopped or cancelled is not a
-			// sampling error.
-			if sctx.Err() != nil || s.stopRequested() || e.pidGone(pid) || e.curPID.Load() != pid {
+			// A read that failed because the sampler's own context was cancelled, or whose backend
+			// is gone or replaced, is not a sampling error. A read that hit its own timeout after
+			// a stop request still counts as an error.
+			if sctx.Err() != nil || e.pidGone(pid) || e.curPID.Load() != pid {
 				s.res.Dropped++
 			} else {
 				s.res.Errors++
@@ -2757,7 +2768,6 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 	// the deferred closePool above and before the caller's clone closes the observer.
 	var sum pmMemSummary
 	pmWithSampler(func() *pmSampler { return e.startSampler(ctx) }, func(sampler *pmSampler) {
-
 		minRounds := pmEnvMinInt(t, "UZI_POOL_MEMORY_ROUNDS", 20, 1)
 		maxWait := pmEnvDuration("UZI_POOL_MEMORY_MAX_RECYCLE_WAIT", 12*time.Minute)
 		var post []pmSample

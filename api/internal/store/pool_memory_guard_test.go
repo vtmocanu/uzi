@@ -70,6 +70,9 @@ func pmGuardEnv(t *testing.T, dsn string, cand pmCand) *pmEnv {
 func TestPMWithSamplerJoinsOnGoexit(t *testing.T) {
 	e := pmGuardEnv(t, "", pmCand{Name: "T"})
 	e.curPID.Store(4242)
+	e.mu.Lock()
+	e.pidRec(4242)
+	e.mu.Unlock()
 	entered := make(chan struct{}, 1)
 	var mu sync.Mutex
 	var readErr error
@@ -159,9 +162,62 @@ func TestPMSamplerStopKeepsHealthyRead(t *testing.T) {
 			t.Errorf("Close after Stop = %+v, want %+v", closed, first)
 		}
 	})
+	t.Run("in-flight read survives Stop", func(t *testing.T) {
+		e := pmGuardEnv(t, "", pmCand{Name: "T"})
+		e.curPID.Store(4242)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var once sync.Once
+		var mu sync.Mutex
+		var errAfterWait error
+		read := func(ctx context.Context, _ uint32) (pmMem, error) {
+			first := false
+			once.Do(func() { first = true })
+			if !first {
+				return pmMem{PrivateKB: 100, AnonymousKB: 50}, nil
+			}
+			close(entered)
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+			}
+			mu.Lock()
+			errAfterWait = ctx.Err()
+			mu.Unlock()
+			return pmMem{PrivateKB: 100, AnonymousKB: 50}, nil
+		}
+		s := newPMSampler(context.Background(), e, read, 5*time.Millisecond)
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the read never started")
+		}
+		stopped := make(chan pmSamplerResult, 1)
+		go func() { stopped <- s.Stop() }()
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+		var res pmSamplerResult
+		select {
+		case res = <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not return after the read was released")
+		}
+		mu.Lock()
+		got := errAfterWait
+		mu.Unlock()
+		if got != nil {
+			t.Errorf("the in-flight read saw ctx.Err() = %v at completion, want nil (graceful Stop must not cancel first)", got)
+		}
+		if res.N == 0 {
+			t.Errorf("the in-flight read's sample was not recorded: %+v", res)
+		}
+	})
 	t.Run("blocked read escalates", func(t *testing.T) {
 		e := pmGuardEnv(t, "", pmCand{Name: "T"})
 		e.curPID.Store(4242)
+		e.mu.Lock()
+		e.pidRec(4242)
+		e.mu.Unlock()
 		entered := make(chan struct{}, 1)
 		read := func(ctx context.Context, _ uint32) (pmMem, error) {
 			select {
@@ -259,6 +315,7 @@ func TestPMPoolConfig(t *testing.T) {
 		{"simple_protocol mode", base + "&default_query_exec_mode=simple_protocol", candA, true},
 		{"describe_exec mode", base + "&default_query_exec_mode=describe_exec", candA, true},
 		{"DSN capacity under A", base + "&statement_cache_capacity=64", candA, true},
+		{"DSN capacity overridden by B128", base + "&statement_cache_capacity=64", candB, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -431,8 +488,9 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 			c.Release()
 		}
 		pool.Close()
-		if err == nil || !strings.Contains(err.Error(), "plan_cache_mode") {
-			t.Fatalf("Acquire with plan_cache_mode=force_custom_plan = %v, want a plan_cache_mode error", err)
+		var pgErr *pgconn.PgError
+		if err == nil || !strings.Contains(err.Error(), "want auto") || errors.As(err, &pgErr) {
+			t.Fatalf("Acquire with plan_cache_mode=force_custom_plan = %v, want the harness guard's own \"want auto\" error and not a server PgError", err)
 		}
 		c, pool, err = acquire(dsn)
 		if err != nil {
