@@ -23,7 +23,7 @@ All **deployment** configuration is via environment variables, set in `.env` (co
 | `OAUTH_RATE_LIMIT_MAX` / `OAUTH_RATE_LIMIT_WINDOW` | `60` / `1m` | Budget of the OAuth token endpoint (`/api/oauth/token`, and `/api/oauth/revoke` when it ships). Applied per client IP on every request, so failed client authentication spends it, and again per client (the product's id) once the client has authenticated, so one product's retry storm cannot starve another's. The per-client budget is one bucket per product shared by all of that product's users, so raise it for a busy multi-user product. Over it, a 429 `temporarily_unavailable` with `Retry-After`. See [Registering an OAuth client](./oauth-clients.md). |
 | `TRUSTED_PROXIES` | *(empty)* | CIDRs whose direct connections are trusted to speak for a real client via `X-Forwarded-For`. Only requests whose `RemoteAddr` falls in one of these ranges get their `X-Forwarded-For` honored; everyone else's is ignored. **Empty (the default) never trusts `X-Forwarded-For`, and that is correct for compose** — see [auth-design.md](auth-design.md). Set it **only** if you front uzi with your own reverse proxy, and set it to *that proxy's address*, narrowly: a hand-typed CIDR also covers the `agent` container, which shares the network and runs untrusted code by design. |
 | `DATABASE_URL` | set by compose | pgx connection string, built from `POSTGRES_*` and the `db` service name. Not meant to be set directly when using compose. |
-| `DB_MAX_CONNS` | `20` | Maximum pgx pool connections per api replica. Precedence: a valid `DB_MAX_CONNS`; else a `pool_max_conns` in `DATABASE_URL` (URL query or keyword/value form, or a pg service file it references); else `20`. Independent of CPU count: it replaces pgx's `max(4, NumCPU)` default. Budget replicas × `DB_MAX_CONNS` against Postgres `max_connections` (100 by default, for example under the cnpg mode). Must be a positive 32-bit integer; zero, a negative number, trailing junk or overflow logs one boot warning naming the key and falls through to the `DATABASE_URL` value, then `20`. An invalid `pool_max_conns` inside `DATABASE_URL` still fails boot. The effective size and its source (`env`, `dsn` or `default`) are logged once at boot (`db pool sized`). |
+| `DB_MAX_CONNS` | `20` | Maximum pgx pool connections per api replica. Precedence: a valid `DB_MAX_CONNS`; else a `pool_max_conns` in `DATABASE_URL` (URL query or keyword/value form, or a pg service file it references); else `20`. Independent of CPU count: it replaces pgx's `max(4, NumCPU)` default. Budget api replicas × `DB_MAX_CONNS` against Postgres `max_connections` (100 by default, for example under the cnpg mode). See [Database connection memory and sizing](#database-connection-memory-and-sizing-issue-4591) for the per-connection memory side. Must be a positive 32-bit integer; zero, a negative number, trailing junk or overflow logs one boot warning naming the key and falls through to the `DATABASE_URL` value, then `20`. An invalid `pool_max_conns` inside `DATABASE_URL` still fails boot. The effective size and its source (`env`, `dsn` or `default`) are logged once at boot (`db pool sized`). |
 | `JWT_SECRET_FILE` | — (optional) | Path to a file that holds `JWT_SECRET`, for a mounted Docker or Kubernetes secret. Set this or `JWT_SECRET`, never both: the API refuses to start when both are set. The API removes one trailing newline from the file and applies the same checks as to `JWT_SECRET`. A missing or unreadable file stops the start. |
 | `UZI_SECRET_KEY_FILE` | — (optional) | Path to a file that holds `UZI_SECRET_KEY` (the base64 key). Same rules as `JWT_SECRET_FILE`: one of the two forms only, one trailing newline removed, the same boot checks as `UZI_SECRET_KEY`. |
 | `DATABASE_URL_FILE` | — (optional) | Path to a file that holds the complete `DATABASE_URL` connection string, not the password alone. Same rules as `JWT_SECRET_FILE`: one of the two forms only, one trailing newline removed. |
@@ -1233,6 +1233,93 @@ A per-connection alternative to the role-wide `ALTER ROLE`: a `plan_cache_mode=.
 in `DATABASE_URL` is kept by pgx as an unrecognized DSN parameter and passed to
 PostgreSQL as a connection runtime parameter, so it applies only to connections made
 with that DSN.
+
+## Database connection memory and sizing (issue #4591)
+
+Each api pool connection is one PostgreSQL backend process. pgx caches every parameterised
+statement it sends as a server-side prepared statement, and the backend keeps each one's plan
+in memory until the connection closes. The api uses pgx's default per-connection cache of
+**512** statements, unchanged. [ADR-4591](../adr/4591-api-pool-backend-memory.md) measured
+lower caps and shorter connection lifetimes on a synthetic fixture; that measurement was
+inconclusive and changed no default.
+
+**Release notes for operators.** No default changed. The synthetic measurement in ADR-4591
+was inconclusive for a global default change, so the api keeps pgx's defaults. The overrides
+below remain available if you want to trade backend memory against re-prepares for your own
+workload.
+
+**Overrides**, as keys in the `DATABASE_URL` query (or the keyword/value or service-file
+form). pgx reads them and does not forward them to PostgreSQL:
+
+```text
+postgres://app:<password>@example.com:5432/uzi?statement_cache_capacity=256
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `statement_cache_capacity` | `512` (pgx's default, unchanged) | Per-connection prepared-statement cache. **Never set `0`**: with pgx's default exec mode it makes every query fail except an argument-less `Exec` ("cannot use QueryExecModeCacheStatement with disabled statement cache"); `0` is only valid together with a different `default_query_exec_mode`. |
+| `description_cache_capacity` | pgx's `512` | No effect under the default cached-statement exec mode (`default_query_exec_mode` unset): pgx uses it only under `cache_describe`. |
+| `pool_max_conn_lifetime` | `1h` | Unchanged pgx default. |
+| `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default. In the synthetic harness, `ClaimRun` spent about 69-75 ms planning on the first execution on a fresh connection (after a reconnect), and about 348-358 ms summed over its six prepared executions (further custom and generic planning on later executions). A re-prepare on a warm connection restarts the same custom-then-generic planning sequence, but its planning time was not measured separately. Harness observations, not production figures. |
+| `pool_max_conn_idle_time` | `30m` | Unchanged pgx default. |
+
+**Lowering the statement cache.** Lowering `statement_cache_capacity` in `DATABASE_URL`
+trades backend memory for re-prepares once a connection runs more distinct statements than the
+cap between two uses of a hot statement (worker claim, message append). In the synthetic
+harness that showed as the `ClaimRun` per-execution mean rising from about 7 ms to about
+68 ms at a cap of 32 under stress. To check after a change, compare `ClaimRun` latency, or, with the database
+owner's agreement, compare `pg_stat_statements` plans to calls with `track_planning` on.
+
+**JIT may add memory.** In the synthetic measurement with PostgreSQL's default `jit = on`,
+the candidates that evict statements or recycle connections showed LLVM mapped and about 8.5-14 MiB more heap
+than in the `jit = off` runs, plus about 51 MiB of shared library text (counted once per
+instance). Whether statements whose plans cross `jit_above_cost` cause this is a hypothesis;
+it was not established, and a library mapping alone is not proof of a JIT compilation. If you
+want JIT off:
+
+- `ALTER ROLE <app-role> SET jit = off;` affects **new sessions only**, so existing pool
+  connections keep JIT until they are replaced. The change takes effect as sessions are
+  replaced, or after an API restart. pgxpool's background health check closes idle connections
+  that are past their lifetime, but a checked-out connection is not interrupted and is
+  destroyed only when it is released, so there is no fixed deadline.
+- Or add `jit=off` to the `DATABASE_URL` query: pgx passes unknown keys through as startup
+  parameters. The chart ships no PgBouncer; a transaction-mode PgBouncer rejects a startup
+  parameter it does not track, failing the connection, unless it is listed in
+  `ignore_startup_parameters`, which drops it silently (see
+  [ADR-1620](../adr/1620-custom-plan-cache-mode.md)).
+- Or `ALTER DATABASE ... SET jit = off`, or a server-wide setting; that is the database
+  owner's call.
+
+Identify which statements JIT first (`pg_stat_statements` `jit_functions > 0`, or `EXPLAIN`)
+before tuning any cost threshold; no `jit_above_cost` value is recommended here.
+
+**Sizing estimate.** Peak backend memory across the pools is roughly
+**api replicas × per-api DB_MAX_CONNS × per-backend memory**, where api replicas is the
+number of api pools connected to the same primary (CNPG standby instances are not part of the
+multiplier). This is an estimate, not a hard bound.
+
+Choose per-backend input from representative measurements of your own workload, including connection age, cold/reprepare and concurrent query peaks. The synthetic fixture below illustrates the arithmetic only; its 60/75 MiB values are not production sizing recommendations and do not supersede the reported incident measurements.
+
+Synthetic illustration (arithmetic only): the harness measured about 60 MiB per backend with
+JIT off and about 75 MiB with JIT on, at a 128-statement cache candidate (not the api's 512
+default). One replica × 20
+connections would then be about 1.2 GiB (JIT off) or 1.5 GiB (JIT on). Add:
+
+- what is counted once: `shared_buffers`, the shared LLVM library page cache, and the
+  PostgreSQL background processes;
+- headroom for non-api connections (one-off `/server setup` runs, admin `psql` sessions, migrations, CNPG's own connections);
+- concurrent query memory: up to `work_mem` per sort node and `work_mem × hash_mem_multiplier`
+  per hash node (`hash_mem_multiplier` defaults to 2.0 since PostgreSQL 15; see the
+  [PostgreSQL 17 resource settings](https://www.postgresql.org/docs/17/runtime-config-resource.html)).
+  These multiply by the number of such nodes in a plan and by the number of concurrent
+  queries, so leave headroom. Each parallel worker of a parallel query gets its own
+  allowance;
+- other PostgreSQL and container overhead.
+
+The estimate assumes every pool connection has been opened and used; pgxpool opens connections
+lazily and closes idle ones after 30 minutes. The chart's api Deployment uses `Recreate`, so
+a rollout adds no overlapping pool. Figures come from PostgreSQL 17.12 with a small synthetic
+fixture and 100 ms sampling; CNPG may run a different major version.
 
 ## Current Codex worker baseline
 

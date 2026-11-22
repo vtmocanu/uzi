@@ -294,8 +294,9 @@ api:
   # ("107374182400"; an unquoted number renders as 1.073741824e+11, which the api rejects);
   # under simple/cnpg the chart renders it from the database storage size and setting it here too fails the render (duplicate key).
   # DB_MAX_CONNS (optional, QUOTED string, e.g. "20"): api DB pool size per replica. Budget
-  # replicas x value against Postgres max_connections. Unset means the DATABASE_URL
-  # pool_max_conns, else 20.
+  # api replicas x value against Postgres max_connections. Unset means the DATABASE_URL
+  # pool_max_conns, else 20. Per-connection memory, statement-cache overrides and the sizing
+  # estimate: docs/configuration.md "Database connection memory and sizing".
   config:
     API_ADDR: ":8080"
     # Optional startup forge seed type: gitlab (default), forgejo, or github.
