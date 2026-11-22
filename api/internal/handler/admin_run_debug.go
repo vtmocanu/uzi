@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -112,7 +113,7 @@ func auditHoldsRunDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID
 
 // auditRunsListDebugRead records an all-states admin run listing. ownerFilter nil
 // means all owners; since is omitted from the record when nil.
-func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, ownerFilter *uuid.UUID, since *time.Time, returned int) {
+func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, ownerFilter *uuid.UUID, since *time.Time, statuses []string, returned int) {
 	owner := "all"
 	if ownerFilter != nil {
 		owner = ownerFilter.String()
@@ -120,6 +121,9 @@ func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID
 	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, route), "owner_filter", owner)
 	if since != nil {
 		attrs = append(attrs, "since", since.UTC().Format(time.RFC3339Nano))
+	}
+	if len(statuses) > 0 {
+		attrs = append(attrs, "status_filter", strings.Join(statuses, ","))
 	}
 	attrs = append(attrs, "returned", returned)
 	adminRunDebugLogger().InfoContext(r.Context(), adminRunDebugMessage, attrs...)

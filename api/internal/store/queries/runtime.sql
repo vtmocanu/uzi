@@ -1010,6 +1010,8 @@ LIMIT 500;
 -- Issue #4198: the admin run debug listing. Runs in EVERY status (terminal included),
 -- newest first (created_at, then id as the tiebreak), across all users or one @user_id,
 -- optionally created at or after @since, excluding chat, judge, and cross-check runs.
+-- @statuses (NULL = every status) narrows to runs whose status is in the array; the filter
+-- applies before LIMIT so a rare status is not crowded out by newer rows of other statuses.
 -- The caller asks for one row more than it serves so it can report truncation.
 -- Keep in step with ListActiveRunsAll (select list, joins, cross-check flags) and
 -- ListRunsForUser (has_available_capture).
@@ -1065,6 +1067,7 @@ JOIN users u ON u.id = r.user_id
 WHERE r.kind NOT IN ('chat', 'judge', 'cross_check')
   AND (sqlc.narg(user_id)::uuid IS NULL OR r.user_id = sqlc.narg(user_id)::uuid)
   AND (sqlc.narg(since)::timestamptz IS NULL OR r.created_at >= sqlc.narg(since)::timestamptz)
+  AND (sqlc.narg(statuses)::text[] IS NULL OR r.status = ANY(sqlc.narg(statuses)::text[]))
 ORDER BY r.created_at DESC, r.id DESC
 LIMIT @max_rows;
 

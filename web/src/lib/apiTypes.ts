@@ -5125,6 +5125,9 @@ export interface RunInputsEnvelope {
 export interface AdminRunsDebug {
   runs: RunSummaryItem[];
   truncated: boolean;
+  /** Echo of the applied ?status= filter. Absent when no filter was sent, and also from an
+   *  older server that ignored the filter, so a client that asked for one can detect that. */
+  status_filter?: string[];
 }
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
