@@ -111,6 +111,8 @@ func TestAdminRunWritersRefusalIsIdenticalForEverySelector(t *testing.T) {
 		"repo=not-a-uuid&branch=&mr_iid=05&repo=x",
 		"repo=" + uuid.New().String() + "&branch=nope",
 		rwValidQuery().Encode(),
+		rwValidQuery().Encode() + "&mr_iid=7;",
+		rwValidQuery().Encode() + "&x=1",
 	}
 	for _, c := range rwCallers {
 		var first string

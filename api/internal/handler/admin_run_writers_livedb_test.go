@@ -48,20 +48,20 @@ type rwlOwner struct{ user, conn, repo uuid.UUID }
 
 // rwlPurgeUsers registers a cleanup that deletes the users returned by idsSQL (resolved when
 // the cleanup runs, before anything is deleted) together with their runs, repos and forge
-// connections, so the shared test database keeps no rows of this test. A failed delete is
-// logged, not fatal: the test's own verdict stands.
+// connections, so the shared test database keeps no rows of this test. A failed delete fails
+// the test, so leftover rows in the shared database never pass silently.
 func rwlPurgeUsers(t *testing.T, pool *pgxpool.Pool, idsSQL string, arg any) {
 	t.Helper()
 	t.Cleanup(func() {
 		ctx := context.Background()
 		rows, err := pool.Query(ctx, idsSQL, arg)
 		if err != nil {
-			t.Logf("purge: resolve users: %v", err)
+			t.Errorf("purge: resolve users: %v", err)
 			return
 		}
 		ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
 		if err != nil {
-			t.Logf("purge: collect users: %v", err)
+			t.Errorf("purge: collect users: %v", err)
 			return
 		}
 		for _, stmt := range []string{
@@ -71,7 +71,7 @@ func rwlPurgeUsers(t *testing.T, pool *pgxpool.Pool, idsSQL string, arg any) {
 			`DELETE FROM users WHERE id = ANY($1)`,
 		} {
 			if _, err := pool.Exec(ctx, stmt, ids); err != nil {
-				t.Logf("purge %q: %v", stmt, err)
+				t.Errorf("purge %q: %v", stmt, err)
 			}
 		}
 	})
