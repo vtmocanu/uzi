@@ -88,6 +88,10 @@ type reserveSnap struct {
 	defaultID   uuid.UUID
 	judgeMode   string
 	judgeSecret *uuid.UUID
+	// weeklyClaude / weeklyCodex are every credential's raw weekly reading, kept only when the
+	// snapshot was built with keepWeekly (the next-claim preview); nil otherwise.
+	weeklyClaude map[uuid.UUID]usagereserve.WeeklyReading
+	weeklyCodex  map[uuid.UUID]usagereserve.CodexWeeklyReading
 }
 
 func (r *reserveSnap) on() bool { return r != nil && r.threshold != nil }
@@ -111,24 +115,34 @@ func (s *Service) reserveSnapshot(ctx context.Context, userID uuid.UUID, now tim
 	if !ok {
 		return &reserveSnap{userID: userID}, nil
 	}
-	return buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals())
+	return buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals(), false)
 }
 
-func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUID, now time.Time, iv reserveIntervals) (*reserveSnap, error) {
+// buildReserveSnapshot reads the owner's reserve state. keepWeekly additionally reads the credential
+// readings when NO threshold is set and keeps every credential's raw weekly reading
+// (usagereserve.ClaudeWeekly / CodexWeekly) in the snapshot; the claim path passes false, so its reads
+// are exactly what they were. With no threshold the verdicts stay OK and the snapshot stays OFF.
+func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUID, now time.Time, iv reserveIntervals, keepWeekly bool) (*reserveSnap, error) {
 	set, err := q.GetUserUsageReserve(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("weekly reserve settings: %w", err)
 	}
 	snap := &reserveSnap{userID: userID}
-	if !set.WeeklyReservePct.Valid {
+	if !set.WeeklyReservePct.Valid && !keepWeekly {
 		return snap, nil
 	}
-	thr := set.WeeklyReservePct.Int16
-	snap.threshold = &thr
-	snap.pauseRunning = set.WeeklyReservePauseRunning
+	if set.WeeklyReservePct.Valid {
+		thr := set.WeeklyReservePct.Int16
+		snap.threshold = &thr
+		snap.pauseRunning = set.WeeklyReservePauseRunning
+	}
 	snap.claude = map[uuid.UUID]usagereserve.Verdict{}
 	snap.codex = map[uuid.UUID]usagereserve.Verdict{}
 	snap.synced = map[uuid.UUID]time.Time{}
+	if keepWeekly {
+		snap.weeklyClaude = map[uuid.UUID]usagereserve.WeeklyReading{}
+		snap.weeklyCodex = map[uuid.UUID]usagereserve.CodexWeeklyReading{}
+	}
 
 	tokens, err := q.ListReserveClaudeTokens(ctx, userID)
 	if err != nil {
@@ -150,6 +164,9 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 			snap.synced[t.UserSecretID] = v
 		}
 		snap.claude[t.UserSecretID] = usagereserve.EvaluateClaude(snap.threshold, r, iv.claude, now)
+		if keepWeekly {
+			snap.weeklyClaude[t.UserSecretID] = usagereserve.ClaudeWeekly(r, iv.claude, now)
+		}
 		// A probe-rejected token is never picked by the auto lane (autoselect.Floor skips it), so it is
 		// not part of the pool the reserve reasons about: counting it as permitted would admit a run
 		// the picker then cannot place on any permitted token.
@@ -186,6 +203,9 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 			}
 		}
 		snap.codex[a.AliasID] = usagereserve.EvaluateCodex(snap.threshold, r, iv.codex, now)
+		if keepWeekly {
+			snap.weeklyCodex[a.AliasID] = usagereserve.CodexWeekly(r, iv.codex, now)
+		}
 	}
 
 	bound, err := q.GetUserJudgeAnthropicBinding(ctx, userID)
@@ -721,7 +741,7 @@ func EphemeralReserveHeld(ctx context.Context, q *store.Queries, runID uuid.UUID
 	if run.Status != "queued" {
 		return false, nil
 	}
-	snap, err := buildReserveSnapshot(ctx, q, run.UserID, now, reserveIntervals{claude: iv.Claude, codex: iv.Codex})
+	snap, err := buildReserveSnapshot(ctx, q, run.UserID, now, reserveIntervals{claude: iv.Claude, codex: iv.Codex}, false)
 	if err != nil {
 		return false, err
 	}
