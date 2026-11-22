@@ -7,7 +7,7 @@ import { RunDefaults } from "./RunDefaults";
 import { api, type User } from "../lib/api";
 import type { UserSettings, UserSettingsPatch } from "../lib/apiTypes";
 import { mockSummaryModelCells } from "../mocks/mockApi/summaryModels";
-import { mockTaskReviewModelCells } from "../mocks/mockApi/taskReviewModels";
+import { mockTaskReviewEffortCells, mockTaskReviewModelCells } from "../mocks/mockApi/taskReviewModels";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -99,4 +99,23 @@ it("a Codex-only user saves and resets the Codex task-review model (PRD #1570)",
   await userEvent.selectOptions(select, "inherit");
   await userEvent.click(screen.getByRole("button", { name: "Save Codex task-review model" }));
   await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ codex_task_review_model: null }));
+});
+
+it("a Codex-only user saves the Codex task-review effort and sees the inherited default (PRD #1570 M2)", async () => {
+  const workerCodex = { harness: "codex", effort: "low", default_effort: "medium", default_source: "builtin", resolved_effort: "low", source: "user_default", mode: "explicit" } as const;
+  const workerClaude = { ...workerCodex, harness: "claude" } as const;
+  const effortSettings = (codex: string | null): UserSettings => ({
+    ...settings(null),
+    codex_task_review_effort: codex,
+    task_review_efforts: mockTaskReviewEffortCells({ claude: null, codex }, { claude: workerClaude, codex: workerCodex }),
+  });
+  mockApi.getMySettings.mockImplementation(async () => ({ settings: effortSettings(null) }));
+  mockApi.putMySettings.mockImplementation(async (patch: UserSettingsPatch) => ({ settings: effortSettings(patch.codex_task_review_effort ?? null) }));
+  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  const select = (await screen.findByLabelText("Codex task-review effort")) as HTMLSelectElement;
+  expect(select.options[0].textContent).toBe("Default \u00b7 follows worker effort (low)");
+  await userEvent.selectOptions(select, "high");
+  await userEvent.click(screen.getByRole("button", { name: "Save Codex task-review effort" }));
+  await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_task_review_effort: "high" }));
+  await waitFor(() => expect(select.value).toBe("high"));
 });

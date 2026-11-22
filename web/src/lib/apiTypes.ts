@@ -581,6 +581,12 @@ export interface UserSettings {
   codex_task_review_model?: string | null;
   /** Read-only resolved view of both task-review lanes (PRD #1570), claude then codex. */
   task_review_models?: ModelSettingCell[] | null;
+  /** Per-user task-review effort per harness (PRD #1570 M2): a level, "runtime", or null =
+   *  inherit the worker effort. */
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
+  /** Read-only resolved task-review effort cells, claude then codex. Never sent on a PUT. */
+  task_review_efforts?: EffortSettingCell[] | null;
   /** Per-user Claude planning model and effort (PRD #3252); null inherits. Optional for
    *  older servers. */
   planning_claude_model?: string | null;
@@ -679,6 +685,9 @@ export interface UserSettingsPatch {
   /** Per-user task-review models (PRD #1570); present-null clears back to the built-in. */
   task_review_model?: string | null;
   codex_task_review_model?: string | null;
+  /** Task-review efforts (PRD #1570 M2): a level or "runtime"; present-null clears to inherit. */
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it

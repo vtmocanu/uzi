@@ -11,7 +11,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
 import { UsageReserveSetting } from "../components/UsageReserveSetting";
-import type { UserSettings, BindMode, Harness, ModelSettingCell } from "../lib/apiTypes";
+import type { UserSettings, BindMode, EffortSettingCell, Harness, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
@@ -443,6 +443,13 @@ export function RunDefaults() {
   const [codexTaskReviewModel, setCodexTaskReviewModel] = useState("");
   const [savedCodexTaskReviewModel, setSavedCodexTaskReviewModel] = useState("");
   const [codexTaskReviewModelBusy, setCodexTaskReviewModelBusy] = useState(false);
+  // PRD #1570 M2: the task-review effort per harness ("" = follow the worker effort).
+  const [taskReviewEffort, setTaskReviewEffort] = useState("");
+  const [savedTaskReviewEffort, setSavedTaskReviewEffort] = useState("");
+  const [taskReviewEffortBusy, setTaskReviewEffortBusy] = useState(false);
+  const [codexTaskReviewEffort, setCodexTaskReviewEffort] = useState("");
+  const [savedCodexTaskReviewEffort, setSavedCodexTaskReviewEffort] = useState("");
+  const [codexTaskReviewEffortBusy, setCodexTaskReviewEffortBusy] = useState(false);
 
   // Per-user default reasoning effort (PRD #617 M5): "" = inherit (a NULL/inherit value
   // resolves to the uzi default `medium` at claim assembly, issue #1157). Its own saved/busy pair,
@@ -505,6 +512,12 @@ export function RunDefaults() {
       const ctrm = settings.codex_task_review_model ?? "";
       setCodexTaskReviewModel(ctrm);
       setSavedCodexTaskReviewModel(ctrm);
+      const tre = settings.task_review_effort ?? "";
+      setTaskReviewEffort(tre);
+      setSavedTaskReviewEffort(tre);
+      const ctre = settings.codex_task_review_effort ?? "";
+      setCodexTaskReviewEffort(ctre);
+      setSavedCodexTaskReviewEffort(ctre);
       const codexEff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(codexEff);
       setSavedCodexEffort(codexEff);
@@ -733,6 +746,48 @@ export function RunDefaults() {
     }
   };
 
+  // Task-review effort (PRD #1570 M2): a closed enum like the worker effort, so no warning
+  // gate. The Default option follows the worker effort; the label names its current level.
+  const claudeTaskReviewEffortCell = committedSettings?.task_review_efforts?.find((c) => c.harness === "claude");
+  const codexTaskReviewEffortCell = committedSettings?.task_review_efforts?.find((c) => c.harness === "codex");
+  const taskReviewEffortDirty = taskReviewEffort !== savedTaskReviewEffort;
+  const codexTaskReviewEffortDirty = codexTaskReviewEffort !== savedCodexTaskReviewEffort;
+  const taskReviewEffortDefaultLabel = (cell: EffortSettingCell | undefined) =>
+    `Default \u00b7 follows worker effort (${
+      !cell ? "medium" : cell.default_effort === "runtime" ? "Runtime default" : cell.default_effort
+    })`;
+  const saveTaskReviewEffort = async (harness: "claude" | "codex") => {
+    setError("");
+    setNotice("");
+    const claude = harness === "claude";
+    (claude ? setTaskReviewEffortBusy : setCodexTaskReviewEffortBusy)(true);
+    try {
+      const value = (claude ? taskReviewEffort : codexTaskReviewEffort) || null;
+      const { settings } = await api.putMySettings(claude ? { task_review_effort: value } : { codex_task_review_effort: value });
+      setCommittedSettings(current => current && ({
+        ...current,
+        task_review_effort: settings.task_review_effort,
+        codex_task_review_effort: settings.codex_task_review_effort,
+        task_review_efforts: settings.task_review_efforts,
+      }));
+      const saved = (claude ? settings.task_review_effort : settings.codex_task_review_effort) ?? "";
+      (claude ? setTaskReviewEffort : setCodexTaskReviewEffort)(saved);
+      (claude ? setSavedTaskReviewEffort : setSavedCodexTaskReviewEffort)(saved);
+      const name = claude ? "Claude" : "Codex";
+      setNotice(
+        saved === ""
+          ? `${name} task-review effort cleared. Task reviews follow your ${name} worker effort.`
+          : saved === "runtime"
+            ? `${name} task-review effort set to Runtime default. The runtime decides.`
+            : `${name} task-review effort set to ${saved}. It applies to your next task review.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err, `Failed to save ${claude ? "Claude" : "Codex"} task-review effort`));
+    } finally {
+      (claude ? setTaskReviewEffortBusy : setCodexTaskReviewEffortBusy)(false);
+    }
+  };
+
   // Per-user default reasoning effort (PRD #617 M5). No warning gate: the dropdown is a
   // CLOSED enum, so it can only emit a valid level or "" (inherit) — there is no
   // out-of-enum shape for the server to reject.
@@ -750,6 +805,7 @@ export function RunDefaults() {
         default_effort: settings.default_effort,
         effort_settings: settings.effort_settings,
         planning_efforts: settings.planning_efforts,
+        task_review_efforts: settings.task_review_efforts,
       }));
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
@@ -775,7 +831,7 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings }));
+      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings, task_review_efforts: settings.task_review_efforts }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
@@ -1531,8 +1587,8 @@ export function RunDefaults() {
         <div>
           <SectionTitle>Task review</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            The model the optional <code>uzi handoff --review</code> pass uses to review a task
-            run&rsquo;s work. Applies to your own runs only.
+            The model and effort the optional <code>uzi handoff --review</code> pass uses to review a task
+            run&rsquo;s work. The effort follows your worker effort unless you set one here. Applies to your own runs only.
           </p>
         </div>
         <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
@@ -1545,7 +1601,10 @@ export function RunDefaults() {
                   placeholder={TASK_REVIEW_CLAUDE_DEFAULT}
                   autoComplete="off"
                   spellCheck={false}
-                  aria-describedby={claudeTaskReviewCell ? "task-review-model-effect" : undefined}
+                  aria-describedby={
+                    [claudeTaskReviewCell && "task-review-model-effect", "task-review-model-help", taskReviewModelWarning && "task-review-model-warning"]
+                      .filter(Boolean).join(" ")
+                  }
                   onChange={(e) => setTaskReviewModel(e.target.value)}
                 />
               </Field>
@@ -1554,14 +1613,32 @@ export function RunDefaults() {
                   {taskReviewClaudeInEffect(claudeTaskReviewCell)}
                 </p>
               )}
-              <p className="text-xs text-faint">Leave empty for the SDK default.</p>
-              {taskReviewModelWarning && <Alert message={taskReviewModelWarning} tone="warning" />}
+              <p id="task-review-model-help" className="text-xs text-faint">Leave empty for the SDK default.</p>
+              {taskReviewModelWarning && (
+                <div id="task-review-model-warning"><Alert message={taskReviewModelWarning} tone="warning" /></div>
+              )}
               <Button
                 type="button"
                 disabled={taskReviewModelBusy || !taskReviewModelDirty || taskReviewModelWarning !== ""}
                 onClick={saveTaskReviewModel}
               >
                 Save Claude task-review model
+              </Button>
+              <Field label="Claude task-review effort" htmlFor="task-review-effort">
+                <EffortSelect
+                  id="task-review-effort"
+                  value={taskReviewEffort}
+                  onChange={setTaskReviewEffort}
+                  defaultLabel={taskReviewEffortDefaultLabel(claudeTaskReviewEffortCell)}
+                  runtimeLabel="Runtime default"
+                />
+              </Field>
+              <Button
+                type="button"
+                disabled={taskReviewEffortBusy || !taskReviewEffortDirty}
+                onClick={() => saveTaskReviewEffort("claude")}
+              >
+                Save Claude task-review effort
               </Button>
             </div>
           )}
@@ -1589,6 +1666,22 @@ export function RunDefaults() {
                 onClick={saveCodexTaskReviewModel}
               >
                 Save Codex task-review model
+              </Button>
+              <Field label="Codex task-review effort" htmlFor="codex-task-review-effort">
+                <EffortSelect
+                  id="codex-task-review-effort"
+                  value={codexTaskReviewEffort}
+                  onChange={setCodexTaskReviewEffort}
+                  defaultLabel={taskReviewEffortDefaultLabel(codexTaskReviewEffortCell)}
+                  runtimeLabel="Runtime default"
+                />
+              </Field>
+              <Button
+                type="button"
+                disabled={codexTaskReviewEffortBusy || !codexTaskReviewEffortDirty}
+                onClick={() => saveTaskReviewEffort("codex")}
+              >
+                Save Codex task-review effort
               </Button>
             </div>
           )}

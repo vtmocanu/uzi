@@ -38,7 +38,7 @@ import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "..
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
-import { mockTaskReviewModelCells } from "./taskReviewModels";
+import { mockTaskReviewEffort, mockTaskReviewEffortCells, mockTaskReviewModelCells } from "./taskReviewModels";
 import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
@@ -106,6 +106,9 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #1570: the task-review lanes; null = the built-in. Resolved into task_review_models.
   task_review_model: null,
   codex_task_review_model: null,
+  // PRD #1570 M2: the task-review efforts; null = inherit the worker effort.
+  task_review_effort: null,
+  codex_task_review_effort: null,
   theme: null,
   // PRD #1167 "Lights on" m2: the four raw appearance overrides, all null = inherit
   // the instance defaults.
@@ -715,6 +718,10 @@ function mySettingsResponse(): { settings: UserSettings } {
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
   const planning_models = mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model);
+  const task_review_efforts = mockTaskReviewEffortCells(
+    { claude: userSettings.task_review_effort, codex: userSettings.codex_task_review_effort },
+    { claude: effort_settings[0], codex: effort_settings[1] },
+  );
   const planning_efforts = mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort);
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
@@ -726,7 +733,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, effort_settings, planning_models, planning_efforts, default_model: projected ?? null } };
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1910,6 +1917,12 @@ export const settingsApi = {
         throw new ApiError(400, `codex_task_review_model: "${trimmed}" is not a supported Codex model`);
       }
       next = { ...next, codex_task_review_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.task_review_effort !== undefined) {
+      next = { ...next, task_review_effort: mockTaskReviewEffort(patch.task_review_effort, "task_review_effort") };
+    }
+    if (patch.codex_task_review_effort !== undefined) {
+      next = { ...next, codex_task_review_effort: mockTaskReviewEffort(patch.codex_task_review_effort, "codex_task_review_effort") };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

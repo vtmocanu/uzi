@@ -108,7 +108,13 @@ describe("Run defaults: task review model (PRD #1570 M1)", () => {
     const claude = (await screen.findByLabelText("Claude task-review model")) as HTMLInputElement;
     fireEvent.change(claude, { target: { value: "gpt-6-astra" } });
     expect(await screen.findByText(/Not a Claude model: gpt-6-astra is a Codex model/)).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Save Claude task-review model" }) as HTMLButtonElement).disabled).toBe(true);
+    const save = screen.getByRole("button", { name: "Save Claude task-review model" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
     expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    const describedBy = (claude.getAttribute("aria-describedby") ?? "").split(" ");
+    expect(describedBy).toContain("task-review-model-help");
+    expect(describedBy).toContain("task-review-model-warning");
+    expect(document.getElementById("task-review-model-warning")?.textContent).toMatch(/Not a Claude model/);
   });
 });
