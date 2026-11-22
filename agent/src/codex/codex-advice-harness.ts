@@ -40,6 +40,9 @@
 //     disposal; a cleanup warning NEVER replaces the primary failure; partial text is
 //     NEVER returned after a timeout.
 
+import { createHash } from "node:crypto";
+import type { ClaimCodexProviderBinding } from "../protocol.js";
+import { resolveCodexProviderModelSlot } from "../provider-binding.js";
 import { ownedSummaryHarnesses } from "./summary-ownership.js";
 import { renderCodexAdvice } from "./render.js";
 import {
@@ -96,6 +99,8 @@ export class CodexAdviceError extends Error {
  *  launcher-fixed values plus the private credential; it NEVER carries a run worktree, a
  *  broker/handler registry, agents or tools — the advice ceiling by construction. */
 export interface CodexAdviceLaunchSpec {
+  readonly providerBinding?: ClaimCodexProviderBinding;
+  readonly providerSlot?: keyof ClaimCodexProviderBinding["model_map"];
   readonly kind: "advice";
   /** The advice lane label (judge/review/summary); used only for the launcher's own
    *  isolation naming/diagnostics, never model-visible. */
@@ -140,6 +145,7 @@ interface AdviceOperation {
   close(): void;
 }
 export interface CodexAdviceHarnessOptions {
+  readonly providerBinding?: ClaimCodexProviderBinding;
   readonly operationScope?: () => AdviceOperation;
   readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly launchRoot: LaunchAdviceRootSeam;
@@ -150,7 +156,7 @@ export interface CodexAdviceHarnessOptions {
   readonly credentialValue?: string;
   /** PRD #2603: the credential mode the price table projects usage cost under. Absent ⇒ the
    *  usage snapshot carries tokens with an `unreported` cost. */
-  readonly authMode?: "subscription" | "api_key";
+  readonly authMode?: "subscription" | "api_key" | "provider";
   /** Injected clock for the price table's promotional boundary. Defaults to the wall clock. */
   readonly now?: () => Date;
   readonly log: Logger;
@@ -231,10 +237,11 @@ export class CodexAdviceHarness implements AdviceHarness {
   private admissionAttempt?: import("./admission-signal.js").AdmissionAttempt;
   private readonly launchRoot: LaunchAdviceRootSeam;
   private readonly provider: CodexProviderConfig;
+  private readonly providerBinding?: ClaimCodexProviderBinding;
   private readonly appServerAuth?: CodexAppServerAuthSession;
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
-  private readonly authMode?: "subscription" | "api_key";
+  private readonly authMode?: "subscription" | "api_key" | "provider";
   private readonly now: () => Date;
   private readonly log: Logger;
 
@@ -246,7 +253,11 @@ export class CodexAdviceHarness implements AdviceHarness {
     this.authMode = opts.authMode;
     this.now = opts.now ?? (() => new Date());
     this.launchRoot = opts.launchRoot;
-    this.provider = opts.provider;
+    this.providerBinding = opts.providerBinding;
+    this.provider = opts.providerBinding ? { ...opts.provider,
+      name: "uzi-provider-" + createHash("sha256").update(JSON.stringify([opts.providerBinding.provider_id, opts.providerBinding.revision])).digest("hex"),
+      baseUrl: opts.providerBinding.base_url, model: opts.providerBinding.model_map.default.model,
+    } : opts.provider;
     if (opts.appServerAuth !== undefined && opts.credentialValue !== undefined) {
       throw new CodexAdviceError({
         category: "protocol",
@@ -284,7 +295,8 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
     }
 
-    const model = rendered.model ?? this.provider.model;
+    const providerSlot = this.providerBinding ? resolveCodexProviderModelSlot(request.model, this.providerBinding.model_map) : undefined;
+    const model = this.providerBinding ? this.providerBinding.model_map[providerSlot!]!.model : rendered.model ?? this.provider.model;
 
     // Internal abort: fired by the external request.signal OR the wall-clock timeout. It
     // bounds the thread/turn RPCs and the notifications race so a hung pass settles.
@@ -327,6 +339,8 @@ export class CodexAdviceHarness implements AdviceHarness {
         kind: "advice",
         label: request.label,
         provider: this.provider,
+        providerBinding: this.providerBinding,
+        providerSlot,
         model,
         // PRIVATE → the isolated launcher env ONLY; never a thread/turn param or frame.
         credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
@@ -554,7 +568,7 @@ export class CodexAdviceHarness implements AdviceHarness {
    *  mode is unknown or the model cannot be priced), never invented. */
   private usageSnapshot(accountant: CodexUsageAccountant): AdviceUsageSnapshot | undefined {
     const byModel = accountant.aggregateByModel(
-      this.authMode === undefined ? undefined : { authMode: this.authMode, now: this.now() },
+      this.authMode === undefined || this.authMode === "provider" ? undefined : { authMode: this.authMode, now: this.now() },
     );
     if (byModel === undefined) return undefined;
     const out: Record<string, AdviceModelUsage> = {};
@@ -624,7 +638,9 @@ export class CodexAdviceHarness implements AdviceHarness {
         ephemeral: true,
         environments: [],
         dynamicTools: [],
-        config: this.adviceThreadConfig(cwd),
+        config: { ...this.adviceThreadConfig(cwd),
+          ...(this.providerBinding ? { model_context_window: this.providerBinding.model_map[resolveCodexProviderModelSlot(rendered.model, this.providerBinding.model_map)]!.context_window } : {}),
+        },
         developerInstructions: rendered.systemPrompt,
       },
       { signal },

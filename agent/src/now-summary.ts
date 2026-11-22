@@ -294,7 +294,7 @@ export class NowSummaryController {
     this.redact = deps.redact ?? ((s) => s);
     this.authority = deps.claim.codex ? snapshotCodex(deps.claim.codex, 0) : undefined;
     try {
-      if (this.authority && !deps.claim.claude && this.authority.runId.length > 0 &&
+      if (this.authority && this.authority.binding.authMode !== "provider" && !deps.claim.claude && this.authority.runId.length > 0 &&
           Number.isSafeInteger(this.authority.claimGeneration) && (this.authority.claimGeneration ?? 0) > 0) {
         this.initialValidatedCodex = snapshotCodex({ ...this.authority, binding: validateNowBinding(this.authority.binding) }, 0);
         this.authority = this.initialValidatedCodex;

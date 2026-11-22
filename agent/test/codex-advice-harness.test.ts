@@ -1943,3 +1943,93 @@ describe("Codex summary skip reasons (#3248 M3)", () => {
     });
   }
 });
+
+describe("provider advice foundation", () => {
+  it("executes the production factory with frozen routing, managed login and unpriced usage", async () => {
+    const { createCodexProviderExecutionAuthority } = await import("../src/codex/select.js");
+    const { createHash } = await import("node:crypto");
+    const binding = createCodexProviderExecutionAuthority({
+      provider_id: "advice-gateway", revision: 3, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example/v1", auth_style: "bearer", credential: "advice-fixture-key",
+      model_map: { default: { model: "gpt-6-luna", context_window: 64000 }, "gpt-6-luna": { model: "mapped-mini", context_window: 32000 } },
+    });
+    for (const [requested, slot, model, context] of [
+      ["gpt-6-luna", "gpt-6-luna", "mapped-mini", 32000],
+      ["internal-vendor-default", "default", "gpt-6-luna", 64000],
+    ] as const) {
+      let disposed = 0;
+      const specs: CodexAdviceLaunchSpec[] = [];
+      const transport = new FakeTransport(authResponder);
+      transport.push(tokenUsage(bdown(100, 20), bdown(100, 20))).push(agentMessage("provider answer")).push(turnCompleted()).end();
+      const client = new Proxy({}, { get: (_target, name) => { throw new Error("vendor call: " + String(name)); } });
+      const factory = makeProductionCodexAdviceHarnessFactory(client as never, noopLog, "/unused", {
+        launchRoot: async spec => { specs.push(spec); return { transport, cwd: "/isolated", dispose: async () => { disposed++; } }; },
+      });
+      const harness = await factory({ runId: "provider-advice", binding });
+      let usage: AdviceUsageSnapshot | undefined;
+      const result = await harness.run(makeAdviceRequest({ model: requested, usageObserver: u => { usage = u; } }), noThrowPolicy);
+      assert.equal(result.text, "provider answer");
+      assert.equal(disposed, 1);
+      assert.equal(specs[0]!.providerBinding, binding.providerBinding);
+      assert.ok(Object.isFrozen(specs[0]!.providerBinding));
+      assert.equal(specs[0]!.providerSlot, slot);
+      assert.equal(specs[0]!.model, model);
+      const identity = "uzi-provider-" + createHash("sha256").update(JSON.stringify(["advice-gateway", 3])).digest("hex");
+      assert.equal(specs[0]!.provider.name, identity);
+      assert.equal(specs[0]!.provider.baseUrl, binding.providerBinding.base_url);
+      assert.equal(specs[0]!.credentialValue, undefined);
+      assert.deepEqual(transport.requests.find(r => r.method === "account/login/start")?.params,
+        { type: "apiKey", apiKey: "advice-fixture-key" });
+      const thread = transport.requests.find(r => r.method === "thread/start")!.params as Record<string, unknown>;
+      assert.equal(thread.model, model);
+      assert.equal(thread.modelProvider, identity);
+      assert.deepEqual(thread.environments, []);
+      assert.deepEqual(thread.dynamicTools, []);
+      assert.equal((thread.config as Record<string, unknown>).model_context_window, context);
+      assert.equal(usage?.[model]?.inputTokens, 100);
+      assert.equal(usage?.[model]?.outputTokens, 20);
+      assert.equal(usage?.[model]?.costStatus, "unreported");
+      assert.equal(usage?.[model]?.costUSD, undefined);
+    }
+  });
+
+  it("redacts encoded provider text, usage member collisions and thrown errors with a minimal logger", async () => {
+    const { createCodexProviderExecutionAuthority } = await import("../src/codex/select.js");
+    const { providerKeyForms } = await import("../src/redact.js");
+    const key = 'provider-advice/<&"fixture';
+    const binding = createCodexProviderExecutionAuthority({
+      provider_id: "redact-advice", revision: 1, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example/v1", auth_style: "bearer", credential: key,
+      model_map: { default: { model: "mapped" } },
+    });
+    const forms = providerKeyForms(key);
+    let observed: AdviceUsageSnapshot | undefined;
+    const options = {
+      provider: binding.providerBinding, label: "summary", prompt: "p", systemPrompt: "s",
+      homeRoot: "/unused", homePrefix: "unused-", timeoutMs: 5000, denyReason: "denied", log: noopLog,
+      queryFn: (() => { throw new Error("Claude must not run"); }) as never,
+      onUsage: (u: AdviceUsageSnapshot) => { observed = u; },
+      codex: { runId: "provider", binding, buildHarness: (async () => ({
+        run: async (request: AdviceRequest) => {
+          request.usageObserver?.(Object.fromEntries(forms.map(form => [form, { inputTokens: 2, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "unreported" as const }])));
+          return { text: forms.join(" | ") };
+        },
+      })) as never },
+    };
+    const text = await runReadOnlyModelPass(options);
+    for (const form of forms) {
+      assert.equal(text.includes(form), false);
+      assert.equal(JSON.stringify(observed).includes(form), false);
+    }
+    assert.equal(Object.values(observed!)[0]!.inputTokens, forms.length * 2);
+    for (const form of forms) {
+      options.codex.buildHarness = (async () => { throw new Error(form, { cause: { [form]: form } }); }) as never;
+      await assert.rejects(runReadOnlyModelPass(options), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message.includes(form), false);
+        assert.equal(JSON.stringify(error.cause).includes(form), false);
+        return true;
+      });
+    }
+  });
+});

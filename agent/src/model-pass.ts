@@ -40,7 +40,7 @@ import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.j
 import type { ClaimProviderBinding, StateRequest } from "./protocol.js";
 import { ProviderLaneUnsupportedError, sdkCredentialFromBinding } from "./provider-binding.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
-import type { CodexBinding } from "./codex/select.js"; // type-only — erased at runtime, no construction here
+import type { CodexExecutionAuthority } from "./codex/select.js"; // type-only — erased at runtime, no construction here
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import type {
   AdviceRequest,
@@ -115,7 +115,7 @@ export interface ReadOnlyModelPassOpts {
   codex?: {
     readonly runId: string;
     readonly claimGeneration?: number;
-    readonly binding: CodexBinding;
+    readonly binding: CodexExecutionAuthority;
     readonly buildHarness: CodexAdviceHarnessFactory;
     /** PRD #2603: "deny" ⇒ the call may not refresh the shared credential (see
      *  CodexAdviceHarnessBuildParams.refresh). Existing callers pass none. */
@@ -444,9 +444,11 @@ function safeStringify(value: unknown): string {
  * so the Claude path stays byte-identical to before this change.
  */
 export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise<string> {
-  // Non-Claude provider execution is held. A provider cannot be combined with
-  // native Codex authority either. Refuse before dispatch or HOME/timer setup.
-  if (opts.provider && (opts.provider.engine !== "claude" || opts.codex !== undefined)) throw new ProviderLaneUnsupportedError();
+  // Internal Codex advice may carry only its own frozen provider authority.
+  // Native Codex and mixed provider authorities refuse before setup.
+  if (opts.provider && (opts.codex
+    ? opts.provider.engine !== "codex" || opts.codex.binding.authMode !== "provider" || opts.codex.binding.providerBinding !== opts.provider || !Object.isFrozen(opts.provider)
+    : opts.provider.engine !== "claude")) throw new ProviderLaneUnsupportedError();
   if (opts.codex) return runCodexAdviceModelPass(opts, opts.codex);
 
   const token = opts.token;
@@ -598,7 +600,8 @@ async function runCodexAdviceModelPass(
   const abort = new AbortController();
   const external = linkExternalAbort(opts.signal, abort, opts.label);
   const text = opts.log.redactDiagnostic ? (s: string) => opts.log.redactDiagnostic!(s) : undefined;
-  const scope: ProviderScope | undefined = text ? {
+  const scope: ProviderScope | undefined = codex.binding.authMode === "provider"
+    ? providerScope(codex.binding.providerBinding.credential, opts.log, opts.label) : text ? {
     text, log: redactingLogger(opts.log, text), thrown: err => sanitizeThrown(err, text, opts.label),
   } : undefined;
   const usage = usageLatch(opts, scope);
@@ -643,6 +646,7 @@ async function runCodexAdviceModelPass(
       runId: codex.runId,
       claimGeneration: codex.claimGeneration,
       binding: codex.binding,
+      ...(scope ? { log: scope.log } : {}),
       signal: abort.signal,
       ...(codex.refresh ? { refresh: codex.refresh } : {}),
       onRefreshDenied: () => { refreshDenied = true; },

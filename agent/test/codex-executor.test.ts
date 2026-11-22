@@ -33561,9 +33561,11 @@ describe("M2 actualRunner credential replacement", () => {
             nowSummary: { homeRoot: dir, queryFn: (() => { throw new Error("Codex Now reached Claude"); }) as never,
               codexAdviceHarnessFactory: (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
                 nowBuilds.push(params);
+                const vendorBinding = params.binding;
+                assert.ok(vendorBinding.authMode !== "provider");
                 const owner = summaryOwnership.get(params)!;
                 owners.push(owner);
-                const isA = params.binding.capability === oldClaim.capability;
+                const isA = vendorBinding.capability === oldClaim.capability;
                 if (isA && phase === "factory") {
                   params.signal!.addEventListener("abort", () => nowAborted.resolve(), { once: true });
                   nowEntered.resolve();
@@ -33590,7 +33592,7 @@ describe("M2 actualRunner credential replacement", () => {
                   owner.guard(); liveBAdmitted = true;
                 }
                 return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
-                  nowRuns.push(params.binding.capability);
+                  nowRuns.push(vendorBinding.capability);
                   const tracked = trackedRoot();
                   summaryRoots.push(tracked);
                   const root: CodexRootHandle = {

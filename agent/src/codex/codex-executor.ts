@@ -1269,9 +1269,8 @@ export async function makeCodexAdviceHarness(
   admissionReporter?: CodexAdmissionReporter,
   operationScope?: CodexAdviceHarnessOptions["operationScope"],
   onRefreshDenied?: () => void,
+  providerBinding?: import("../protocol.js").ClaimCodexProviderBinding,
 ): Promise<CodexAdviceHarness> {
-  // Provider bridge execution is separate from advice-root wiring, which remains held.
-  if (bridge.authMode === "provider") throw new Error("codex provider advice factory wiring is not enabled");
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
   // per-worker eviction, so over-retention is the safe direction (mirrors the run lane's redactor
@@ -1286,7 +1285,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny", onRefreshDenied));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter, operationScope });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, providerBinding, log, admissionReporter, operationScope });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1346,7 +1345,7 @@ function buildAdviceAuthConfig(
   onRefreshDenied?: () => void,
 ): CodexAppServerAuthConfig {
   if (bridge.authMode !== "subscription") {
-    return { mode: "api_key", apiKey: initial };
+    return { mode: bridge.authMode, apiKey: initial };
   }
   const accountId = bridge.chatgptAccountId;
   if (accountId === undefined) {
@@ -1414,8 +1413,8 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       ownedDataRoot,
       // No credentialValue: the token flows over account/login/start, never the launcher env
       // (mirrors defaultLaunchProviderRoot).
-      provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey },
-      model: spec.model,
+      ...(spec.providerBinding ? { providerBinding: spec.providerBinding } : { provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey } }),
+      model: spec.providerSlot ?? spec.model,
       codexBin: CODEX_BIN,
       supervisorBin: SUPERVISOR_BIN,
       kind: "provider",
@@ -1508,9 +1507,10 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
  *  release/refresh calls; `binding` is the claim's validated `secrets.codex` block
  *  ({@link import("./select.js").selectCodexBinding}'s output). */
 export interface CodexAdviceHarnessBuildParams {
+  readonly log?: Logger;
   readonly runId: string;
   readonly claimGeneration?: number;
-  readonly binding: CodexBinding;
+  readonly binding: CodexExecutionAuthority;
   readonly signal?: AbortSignal;
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
    *  refreshCodex, for callers sharing the run's credential (Now, intent and plan summaries). */
@@ -1537,12 +1537,13 @@ export type CodexAdviceHarnessFactory = (params: CodexAdviceHarnessBuildParams) 
  */
 export function makeProductionCodexAdviceHarnessFactory(
   client: WorkerClient,
-  log: Logger,
+  baseLog: Logger,
   homeRoot: string,
   deps: { launchRoot?: LaunchAdviceRootSeam } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const { runId, binding, signal, refresh, onRefreshDenied } = params;
+    const log = params.log ?? baseLog;
     const ownership = summaryOwnership.get(params);
     ownership?.guard();
     // Retain the owner's scope before credential release can yield. A delayed advice
@@ -1558,7 +1559,7 @@ export function makeProductionCodexAdviceHarnessFactory(
       return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
         binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
         scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined,
-        onRefreshDenied);
+        onRefreshDenied, binding.authMode === "provider" ? binding.providerBinding : undefined);
     } catch (error) { close(); throw error; }
   };
 }
@@ -2988,7 +2989,7 @@ export class CodexExecutor implements Executor {
         if (!authority || this.currentCodexAuthority !== authority)
           throw new TrustedExecutionRefusal("summary credential authority changed");
         authority.assertCurrent();
-        if (authority.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
+        if (authority.binding.authMode === "provider" || params.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
         if (params.binding.capability !== authority.binding.capability ||
             params.binding.authMode !== authority.binding.authMode ||
             params.binding.accessToken !== authority.binding.accessToken ||

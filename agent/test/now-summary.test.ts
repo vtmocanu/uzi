@@ -1141,7 +1141,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
     binding: {
       authMode: mode, accessToken: "B-token", capability: "B-cap",
       ...(mode === "subscription" ? { generation: 8, chatgptAccountId: "B-account", chatgptPlanType: null } : {}),
-    } as NonNullable<ReadOnlyModelPassOpts["codex"]>["binding"],
+    } as import("../src/codex/select.js").CodexBinding,
   });
 
   it("permits the switch-owned lifecycle stop but never a pause or terminal stop", async () => {
@@ -1162,6 +1162,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
       h.c.observeSetting();
       await h.clock.advance(0);
       assert.equal(h.calls.length, 2);
+      assert.ok(h.calls[1]!.opts.codex!.binding.authMode !== "provider");
       assert.equal(h.calls[1]!.opts.codex!.binding.accessToken, replace ? "B-token" : "A-token");
       h.calls[1]!.resolve("settled");
       await settle();
@@ -1287,6 +1288,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
       await held;
       await h.clock.advance(0);
       const next = h.calls[1]!;
+      assert.ok(next.opts.codex!.binding.authMode !== "provider");
       assert.equal(next.opts.codex!.binding.accessToken, "B-token");
       assert.equal(next.opts.codex!.binding.authMode, b.binding.authMode);
       assert.notEqual(next.opts.codex!.binding, old.binding);
@@ -1296,6 +1298,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
       assert.equal(next.opts.codex!.buildHarness, old.buildHarness);
       await next.opts.codex!.buildHarness(next.opts.codex!);
       assert.equal(h.factoryCalls.length, 1);
+      assert.ok(h.factoryCalls[0]!.binding.authMode !== "provider");
       assert.equal(h.factoryCalls[0]!.binding.accessToken, "B-token");
       assert.equal(h.factoryCalls[0]!.binding.authMode, b.binding.authMode);
       assert.equal(h.factoryCalls[0]!.claimGeneration, 7);
