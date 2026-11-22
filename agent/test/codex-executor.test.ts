@@ -37352,6 +37352,100 @@ describe("M2 provider executor composition", () => {
     }
   });
 
+  for (const sensitive of [false, true]) {
+    it(`M2 owned production intent and plan publication sensitive=${sensitive}`, async () => {
+      // Supported injected transports: production composition, not real runtime proof.
+      const key = ["summary-echo", '"', "/", "<>&", "tail"].join("");
+      // Independent encoded fixtures, deliberately not derived from providerKeyForms.
+      const echoes = [key, 'summary-echo\\"/<>&tail', 'summary-echo\\"\\/<>&tail',
+        "summary-echo%22%2F%3C%3E%26tail", 'summary-echo\\"/\\u003c\\u003e\\u0026tail'];
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+      const intentPosted = installerBarrier();
+      const done = epochResponder("th-1", "tn-1", (t, th, tn) =>
+        t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Provider plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([plan, done]);
+      let vendorCalls = 0;
+      const forbidden = () => { vendorCalls++; throw new Error("unexpected vendor operation"); };
+      const posted: Record<string, unknown> = {};
+      Object.assign(rig.client, {
+        releaseCodex: forbidden, refreshCodex: forbidden, checkCodexOperationAdmission: forbidden,
+        postIntentSummary: async (id: string, summary: string) => {
+          assert.equal(id, "run-1"); posted.intent = summary; intentPosted.resolve();
+        },
+        postPlanSummary: async (id: string, body: unknown) => {
+          assert.equal(id, "run-1"); posted.plan = body;
+        },
+      });
+      const { logger, lines } = recordingLogger();
+      const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/m2-summary-"));
+      const transports: FakeTransport[] = [];
+      let disposals = 0;
+      const factory = makeProductionCodexAdviceHarnessFactory(rig.client as never, logger, root, {
+        launchRoot: async spec => {
+          assert.deepEqual(spec.providerBinding, binding.providerBinding);
+          assert.equal(spec.providerSlot, "default");
+          const ordinal = transports.length;
+          assert.ok(ordinal < 2, "one advice root per pass");
+          const control = ordinal === 0 ? "Intent control" : "Plan control";
+          const summary = sensitive ? control + " " + echoes.join(" | ") : control;
+          const text = ordinal === 0 ? summary : JSON.stringify({ summary, deltas: [{ kind: "added", text: "Visible delta" }] });
+          const transport = new FakeTransport(defaultResponder);
+          transport.push(threadStarted())
+            .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100 + ordinal, outputTokens: 20, totalTokens: 120 + ordinal }))
+            .push(agentMessage(text)).push(turnCompleted("completed")).end();
+          transports.push(transport);
+          return { transport, cwd: "/isolated", dispose: async () => { disposals++; } };
+        },
+      });
+      const { ctx, emitted } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        gatePlan: async (md, _milestones, awaiting) => {
+          await withTimeout(intentPosted.promise, 3000, "intent publication");
+          await awaiting?.(md);
+          return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
+        },
+      });
+      const executor = new CodexExecutor(logger, root,
+        { binding, client: rig.client as never, provider, codexAdviceHarnessFactory: factory },
+        { installDeps: async () => ({ results: [], truncated: false }), ...rig.deps,
+          spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+      try {
+        await executor.run(ctx);
+        assert.equal(transports.length, 2);
+        assert.equal(disposals, 2, "both owned advice roots disposed before return");
+        assert.ok(rig.epochs.every(e => e.reaped() > 0), "executor roots reaped");
+        const suffix = sensitive ? " " + echoes.map(() => "***REDACTED***").join(" | ") : "";
+        assert.equal(posted.intent, "Intent control" + suffix);
+        assert.deepEqual(posted.plan, { summary: "Plan control" + suffix, deltas: [{ kind: "added", text: "Visible delta" }], plan_md: "Provider plan" });
+        const usage = emitted.filter(m => m.kind === "summary_usage");
+        assert.deepEqual(usage.map(m => m.payload.pass).sort(), ["intent", "plan"]);
+        for (const [ordinal, pass] of ["intent", "plan"].entries()) {
+          const event = usage.find(m => m.payload.pass === pass)!;
+          const observed = (event.payload.model_usage as import("../src/harness.js").AdviceUsageSnapshot)["corp-code"]!;
+          assert.equal(observed.inputTokens, 100 + ordinal);
+          assert.equal(observed.outputTokens, 20);
+          assert.equal(observed.costStatus, "unreported");
+          assert.equal(observed.costUSD, undefined);
+          const turns = transports[ordinal]!.requests.filter(r => r.method === "turn/start");
+          assert.equal(turns.length, 1);
+          assert.equal(rec(turns[0]!.params).model, "corp-code");
+        }
+        const visible = JSON.stringify({ posted, emitted, lines });
+        for (const echo of echoes) {
+          assert.ok(!visible.includes(echo), "key echo escaped publication");
+          assert.ok(!visible.includes(JSON.stringify(echo).slice(1, -1)), "encoded key echo escaped publication");
+        }
+        assert.equal(vendorCalls, 0, "provider never enters vendor operations");
+      } finally {
+        await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("derives provider-only intent and plan claims from the frozen epoch", async () => {
     const done = epochResponder("th-1", "tn-1", (t, th, tn) =>
       t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));

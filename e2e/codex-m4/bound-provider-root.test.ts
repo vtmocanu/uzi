@@ -159,7 +159,6 @@ test("provider fake issue composes executor to pinned app-server and authenticat
   // Same deterministic SSE vocabulary as M4, kept local to the agent TS project.
   // This listener's exact bearer and recorded requests prove the responder is ours.
   const requests: Record<string, unknown>[] = [];
-  const errors: string[] = [];
   const requestCap = 4 * 1024 * 1024;
   const server = createServer((request, response) => {
     if (request.url !== "/v1/responses" || request.method !== "POST" ||
@@ -167,7 +166,7 @@ test("provider fake issue composes executor to pinned app-server and authenticat
       response.writeHead(401, { connection: "close" }).end();
       return;
     }
-    let raw = "";
+    const chunks: Buffer[] = [];
     let bytes = 0;
     let rejected = false;
     request.on("error", () => {});
@@ -176,16 +175,16 @@ test("provider fake issue composes executor to pinned app-server and authenticat
       bytes += chunk.length;
       if (bytes > requestCap) {
         rejected = true;
-        raw = "";
+        chunks.length = 0;
         response.writeHead(413, { connection: "close" }).end();
         return;
       }
-      raw += chunk.toString("utf8");
+      chunks.push(chunk);
     });
     request.on("end", () => {
       if (rejected) return;
       let parsed: Record<string, unknown>;
-      try { parsed = JSON.parse(raw); }
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
       catch { response.writeHead(400).end(); return; }
       requests.push(parsed);
       const id = `focused-root-${requests.length}`;
@@ -206,7 +205,7 @@ test("provider fake issue composes executor to pinned app-server and authenticat
   t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
-  const fake = { baseUrl: `http://127.0.0.1:${address.port}/v1`, requests, errors };
+  const fake = { baseUrl: `http://127.0.0.1:${address.port}/v1`, requests };
   const unauthorized = await fetch(`${fake.baseUrl}/responses`, { method: "POST", body: "{}" });
   assert.equal(unauthorized.status, 401);
   await unauthorized.arrayBuffer();
@@ -328,7 +327,6 @@ test("provider fake issue composes executor to pinned app-server and authenticat
   assert.ok(fake.requests.length >= 2, "authenticated real HTTP request and callback continuation");
   for (const request of fake.requests) assert.equal(request.model, "gpt-6-astra");
   assert.match(JSON.stringify(fake.requests.slice(1)), /root-done/, "callback result returns to our HTTP listener");
-  assert.deepEqual(fake.errors, []);
   assert.ok(methods.some(m => m.method === "turn/start"));
   assert.ok(emitted.length > 0);
 });

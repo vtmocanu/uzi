@@ -42,6 +42,7 @@ export type SummarySkipReason = ModelPassCredentialReason;
 export type SummaryPassName = "intent" | "plan" | "pr_description";
 import { isValidModel } from "./models.js";
 import { errMessage } from "./util.js";
+import { makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
 import { summaryModelTimeoutMs } from "./config.js";
 import type { Logger } from "./log.js";
 
@@ -407,16 +408,19 @@ export class SummaryRunner {
       this.log.warn("plan summary generation failed", { error: errMessage(err) });
       return null;
     }
-    return this.parsePlanSummary(text);
+    const provider = input.claim ? input.claim.secrets.provider : input.provider;
+    return this.parsePlanSummary(text, provider?.credential);
   }
 
   /** Parse + defensively coerce the plan turn's JSON. Never throws: a parse failure or a
    *  missing/blank `summary` returns null (the summary is the load-bearing field); a
    *  non-array `deltas` degrades to []; malformed delta elements are dropped. */
-  private parsePlanSummary(text: string): PlanSummaryResult | null {
+  private parsePlanSummary(text: string, providerCredential?: string): PlanSummaryResult | null {
     let obj: unknown;
     try {
       obj = extractJsonObject(text);
+      // JSON decoding can reveal encoded key forms; scrub names and values before clipping.
+      if (providerCredential) obj = redactStrings(obj, makeTextRedactor(providerKeyForms(providerCredential)));
     } catch (err) {
       this.log.warn("plan summary JSON parse failed", { error: errMessage(err) });
       return null;
