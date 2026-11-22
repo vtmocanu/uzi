@@ -65,8 +65,8 @@ export const REDACTION_WORK_BUDGET = 2 ** 26;
  *  partly redacted one. */
 export const REDACTION_WITHHELD = "[withheld: redaction work budget exceeded]";
 
-/** The charged work of one redaction. The overflowing charge is included, so a finished count never exceeds
- *  REDACTION_WORK_BUDGET plus the longest single literal. */
+/** The charged work of one redaction. The overflowing charge is included, and nothing is added once the budget is
+ *  passed, so a finished count never exceeds REDACTION_WORK_BUDGET + 1 plus the longest single literal. */
 export interface RedactionWork {
   charged: number;
 }
@@ -79,8 +79,29 @@ class RedactionBudgetExceeded extends Error {
 }
 
 function charge(work: RedactionWork, units: number): void {
+  if (work.charged > REDACTION_WORK_BUDGET) throw new RedactionBudgetExceeded();
   work.charged += units;
   if (work.charged > REDACTION_WORK_BUDGET) throw new RedactionBudgetExceeded();
+}
+
+/** Redacts every string (and member name) of a payload against ONE shared work counter, so a payload's total
+ *  charged work is bounded, not each string's. Once the budget is spent, each further string that needs a charged
+ *  comparison is withheld whole; strings needing none pass through. */
+function redactPayloadWithin(payload: Record<string, unknown>,
+  within: (s: string, work: RedactionWork) => string): Record<string, unknown> {
+  const work: RedactionWork = { charged: 0 };
+  try {
+    return redactStrings(payload, (s) => {
+      try {
+        return within(s, work);
+      } catch (err) {
+        if (err instanceof RedactionBudgetExceeded) return REDACTION_WITHHELD;
+        throw err;
+      }
+    });
+  } finally {
+    workObserver?.(work);
+  }
 }
 
 let workObserver: ((work: RedactionWork) => void) | undefined;
@@ -132,27 +153,34 @@ function usableSecrets(secrets: Array<string | undefined | null>): string[] {
  * batcher's PayloadRedactor.
  */
 export function makeTextRedactor(secrets: Array<string | undefined | null>): TextRedactor {
+  const within = textRedactorWithin(secrets);
+  if (within === undefined) return (s) => s;
+  return (s) => runWithinBudget((work) => within(s, work)) ?? REDACTION_WITHHELD;
+}
+
+/** The budgeted core of makeTextRedactor (throws once `work` passes the budget); undefined when no secret is usable. */
+function textRedactorWithin(secrets: Array<string | undefined | null>): ((s: string, work: RedactionWork) => string) | undefined {
   const list = usableSecrets(secrets);
-  if (list.length === 0) return (s) => s;
+  if (list.length === 0) return undefined;
   // With no invisible character in any secret the visible forms are the plain list itself.
   const stripped = list.some((secret) => INVISIBLE_TEST.test(secret));
   const visible = stripped ? list.map((secret) => secret.replace(INVISIBLE, "")).filter((v) => v.length >= MIN_SECRET_LEN) : list;
   if (list.length > PER_SECRET_MAX) {
     const find = literalSpanFinder(list);
     const findVisible = !stripped ? find : visible.length > 0 ? literalSpanFinder(visible) : undefined;
-    return (s) => runWithinBudget((work) => {
+    return (s, work) => {
       let out = replaceSpans(s, find(s, work));
       if (findVisible && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisible, work);
       return out;
-    }) ?? REDACTION_WITHHELD;
+    };
   }
   const findEach = spansOfEach(list);
   const findVisibleEach = !stripped ? findEach : spansOfEach(visible);
-  return (s) => runWithinBudget((work) => {
+  return (s, work) => {
     let out = replaceSpans(s, findEach(s, work));
     if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisibleEach, work);
     return out;
-  }) ?? REDACTION_WITHHELD;
+  };
 }
 
 /** The most secrets redacted one pass each; a longer list is matched in a single indexed pass. */
@@ -278,14 +306,14 @@ export class LiteralIndex {
 
   /** The [start, end) span of the longest literal at each position where one occurs: sorted by start, and
    *  possibly overlapping (replaceSpans merges them). Throws once `work` passes the budget. */
-  find(text: string, work: RedactionWork = { charged: 0 }): Array<[number, number]> {
+  find(text: string, work: RedactionWork): Array<[number, number]> {
     const spans: Array<[number, number]> = [];
     this.scan(text, work, true, (literal, at) => spans.push([at, at + literal.length]));
     return spans;
   }
 
   /** Every literal occurring in the text, not only the longest at a position. Throws once `work` passes the budget. */
-  present(text: string, work: RedactionWork = { charged: 0 }): Set<string> {
+  present(text: string, work: RedactionWork): Set<string> {
     const found = new Set<string>();
     this.scan(text, work, false, (literal) => found.add(literal));
     return found;
@@ -459,9 +487,9 @@ export function redactStrings<T>(value: T, scrubString: TextRedactor,
  * to scrub. Member names use the same redaction and collision rules as values.
  */
 export function makeRedactor(secrets: Array<string | undefined | null>): PayloadRedactor {
-  if (usableSecrets(secrets).length === 0) return (payload) => payload;
-  const scrubString = makeTextRedactor(secrets);
-  return (payload) => redactStrings(payload, scrubString);
+  const within = textRedactorWithin(secrets);
+  if (within === undefined) return (payload) => payload;
+  return (payload) => redactPayloadWithin(payload, within);
 }
 
 /**
@@ -481,7 +509,7 @@ export class SecretSet {
   private visible: { list: string[]; index: LiteralIndex | undefined } | undefined;
   readonly text: TextRedactor = (s) => this.redactText(s);
   readonly payload: PayloadRedactor = (payload) =>
-    this.list.length === 0 ? payload : redactStrings(payload, this.text);
+    this.list.length === 0 ? payload : redactPayloadWithin(payload, (s, work) => this.redactWithin(s, work));
 
   constructor(initial: Array<string | null | undefined>) {
     for (const secret of usableSecrets(initial)) this.append(secret);

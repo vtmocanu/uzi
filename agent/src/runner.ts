@@ -4378,11 +4378,7 @@ export class RunRunner {
   ): Promise<TerminalLaneResult> {
     const hooks = this.terminalPreservationTestOverride;
     const failureFirst = (): string | undefined => {
-      // The reason may arrive already redacted (a withheld marker after a redaction work overflow), so a typed
-      // origin the caller classified from the RAW reason wins; the reason text is the fallback.
-      const mapped = body.fail_origin === "push_secret_blocked" || body.fail_origin === "worker_residue_blocked"
-        ? body.fail_origin
-        : typeof body.failure_reason === "string" ? failOriginForReason(body.failure_reason) : undefined;
+      const mapped = typeof body.failure_reason === "string" ? failOriginForReason(body.failure_reason) : undefined;
       if (mapped === "push_secret_blocked" || mapped === "worker_residue_blocked") return mapped;
       // Defensive: the only writer of flight.secretBlocked is the terminal lane itself (a secret finding latches it); active
       // remediation is refused by the lane's own policy().blocked gate, which also runs before any universe read.

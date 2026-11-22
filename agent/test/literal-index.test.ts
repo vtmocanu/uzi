@@ -22,8 +22,8 @@ const naivePresent = (live: ReadonlySet<string>, text: string): Set<string> => {
 };
 
 function check(index: LiteralIndex, live: ReadonlySet<string>, text: string, label: string): void {
-  assert.deepEqual(index.find(text), naiveFind(live, text), `find ${label}`);
-  assert.deepEqual([...index.present(text)].sort(), [...naivePresent(live, text)].sort(), `present ${label}`);
+  assert.deepEqual(index.find(text, { charged: 0 }), naiveFind(live, text), `find ${label}`);
+  assert.deepEqual([...index.present(text, { charged: 0 })].sort(), [...naivePresent(live, text)].sort(), `present ${label}`);
   assert.equal(index.size, live.size, `size ${label}`);
 }
 
@@ -48,8 +48,8 @@ describe("LiteralIndex agrees with a naive reference", () => {
     for (const l of live) index.add(l);
     const text = `..${KEY}xyzzy..${KEY}xy.${KEY}xyz`;
     check(index, live, text, "prefix");
-    assert.deepEqual([...index.present(text)].sort(), [...live].sort(), "present reports every literal, prefixes included");
-    assert.deepEqual(index.find(`${KEY}xyzzy`), [[0, KEY.length + 5]], "find reports the longest only");
+    assert.deepEqual([...index.present(text, { charged: 0 })].sort(), [...live].sort(), "present reports every literal, prefixes included");
+    assert.deepEqual(index.find(`${KEY}xyzzy`, { charged: 0 }),[[0, KEY.length + 5]], "find reports the longest only");
   });
 
   it("a literal of exactly 8 units", () => {
@@ -148,7 +148,7 @@ describe("LiteralIndex agrees with a naive reference", () => {
       }
       for (const [l, held] of counts) for (let n = held; n > 0; n--) index.remove(l);
       assert.equal(index.size, 0, `seed ${seed} drained`);
-      assert.deepEqual(index.find(keys.join("")), []);
+      assert.deepEqual(index.find(keys.join(""), { charged: 0 }), []);
     }
   });
 });

@@ -9,6 +9,7 @@ import { RunRunner } from "../src/runner.js";
 import { REDACTION_WITHHELD } from "../src/redact.js";
 import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "../src/plugin-errors.js";
 import type { GitHubClient } from "../src/forge.js";
+import type { ClaimRunEnvVar } from "../src/protocol.js";
 import { api, client, fakeGitHub, fx, git, gitlabClaim, installHarness } from "./runner-harness.js";
 
 installHarness();
@@ -21,9 +22,16 @@ const WORKFLOW = ".github/workflows/main-guard.yml";
 const LONG = "a".repeat(32 * 1024 - 1) + "b";
 const PERIODIC = "a".repeat(64 * 1024);
 
+const repo = () => ({ id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, default_branch: "main", forge_type: "github" }) as const;
 const claimFor = (iid: number) => gitlabClaim(iid, {
-  repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, default_branch: "main", forge_type: "github" },
+  repo: repo(),
   secrets: { forge_pat: LONG, anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+});
+// The same literal as an in-budget run_env secret claim (its registered forms pass the form budget).
+const RUN_ENV_VAR: ClaimRunEnvVar = { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "BIG_SECRET", value: LONG, secret: true, description: "" };
+const runEnvClaimFor = (iid: number) => gitlabClaim(iid, {
+  repo: repo(),
+  secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: [RUN_ENV_VAR] },
 });
 
 function runnerWith(github: GitHubClient, run: (ctx: { worktreePath: string; branch: string }) => Promise<unknown>, log: Logger): RunRunner {
@@ -47,6 +55,20 @@ describe("the work guard through the runner's terminal path", () => {
     assert.equal(body.status, "failed");
     assert.equal(body.failure_reason, REDACTION_WITHHELD);
     assert.equal(body.fail_origin, "skills_plugin_load_failed", "classified from the raw reason, before redaction");
+    assert.ok(!JSON.stringify(body).includes("aaaaaaaa"));
+  });
+
+  it("state report with the literal as a run_env claim: withheld, typed origin kept", async () => {
+    const { github } = fakeGitHub();
+    const claim = runEnvClaimFor(46303);
+    const { logger } = recordingLogger();
+    const runner = runnerWith(github, async () => {
+      throw new Error(`${REASON_SKILLS_PLUGIN_LOAD_FAILED}: ${PERIODIC}`);
+    }, logger);
+    await runner.execute(claim);
+    const body = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
+    assert.equal(body.failure_reason, REDACTION_WITHHELD);
+    assert.equal(body.fail_origin, "skills_plugin_load_failed");
     assert.ok(!JSON.stringify(body).includes("aaaaaaaa"));
   });
 

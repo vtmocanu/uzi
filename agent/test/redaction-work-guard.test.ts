@@ -1,6 +1,10 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { MessageBatcher } from "../src/batcher.js";
 import { createLogger } from "../src/log.js";
+import { recordingLogger } from "./helpers.js";
+import type { WorkerClient } from "../src/client.js";
+import type { OutgoingMessage } from "../src/protocol.js";
 import { buildDeliveryContext, type DeliveryContextGit } from "../src/pr-description-context.js";
 import {
   literalsPresent, makeRedactor, makeTextRedactor, observeRedactionWork, PER_SECRET_MAX, REDACTION_WITHHELD,
@@ -16,8 +20,8 @@ import { patchScanVerdict } from "../src/run-env-scan.js";
 const REDACTED = "***REDACTED***";
 const LONG = "a".repeat(32 * 1024 - 1) + "b";
 const PERIODIC = "a".repeat(64 * 1024);
-/** Never more than the budget plus one literal comparison: the overflowing charge is counted too. */
-const CEILING = REDACTION_WORK_BUDGET + LONG.length;
+/** Never more than the budget plus the overflowing charge, which is at most 1 + the longest literal. */
+const CEILING = REDACTION_WORK_BUDGET + 1 + LONG.length;
 
 // Fillers for the indexed (> PER_SECRET_MAX literals) path, assembled at runtime from parts.
 const fillers = (n: number): string[] => Array.from({ length: n }, (_, i) => ["dummy", "filler", String(i).padStart(4, "0"), "zz"].join("-"));
@@ -89,6 +93,61 @@ describe("the matcher's work guard, per redaction consumer", () => {
     assert.deepEqual(makeRedactor([LONG])(payload), expected);
     assert.deepEqual(new SecretSet([LONG]).payload(payload), expected);
     assert.deepEqual(makeRedactor(MANY)(payload), expected);
+  });
+
+  it("one payload shares ONE budget: several periodic strings charge at most budget + 1 + one literal in total", () => {
+    const payload = {
+      kind: "tool_result", note: "short field",
+      a: PERIODIC, b: PERIODIC, nested: { c: PERIODIC, keep: "keep me" }, list: [PERIODIC, "ok"],
+    };
+    const expected = {
+      kind: "tool_result", note: "short field",
+      a: REDACTION_WITHHELD, b: REDACTION_WITHHELD, nested: { c: REDACTION_WITHHELD, keep: "keep me" }, list: [REDACTION_WITHHELD, "ok"],
+    };
+    const redactors: Array<[string, (p: Record<string, unknown>) => Record<string, unknown>]> = [
+      ["makeRedactor", makeRedactor([LONG])],
+      ["makeRedactor indexed", makeRedactor(MANY)],
+      ["SecretSet.payload", new SecretSet([LONG]).payload],
+      ["SecretSet.payload indexed", new SecretSet(MANY).payload],
+    ];
+    for (const [label, redact] of redactors) {
+      let out: Record<string, unknown> = {};
+      const charged = chargedBy(() => { out = redact(payload); });
+      assert.deepEqual(out, expected, label);
+      assert.ok(charged > REDACTION_WORK_BUDGET && charged <= CEILING, `${label}: charged ${charged}`);
+    }
+  });
+
+  it("the feed through the real batcher: the posted message carries the withheld marker, not the output", async () => {
+    const sent: OutgoingMessage[] = [];
+    const client = { async postMessages(_runId: string, messages: OutgoingMessage[]): Promise<void> { sent.push(...messages); } } as unknown as WorkerClient;
+    const { logger } = recordingLogger();
+    const set = new SecretSet([LONG]);
+    const batcher = new MessageBatcher(client, "run-feed", 0, 0, logger, set.payload, set.text);
+    batcher.emit({ kind: "tool_result", agent: "lead", payload: { tool_use_id: "tu1", content: PERIODIC, is_error: false } });
+    await batcher.close();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]!.payload.content, REDACTION_WITHHELD);
+    assert.equal(sent[0]!.payload.tool_use_id, "tu1");
+    assert.ok(!JSON.stringify(sent).includes("aaaaaaaa"));
+  });
+
+  it("only the across-invisible pass overflows: the whole string is withheld", () => {
+    // The raw text never holds the literal's 8-unit prefix, so the first pass is cheap; its visible projection is periodic.
+    const text = "aaa\u200b".repeat(16 * 1024);
+    const first: RedactionWork = { charged: 0 };
+    spansOfEach([LONG])(text, first);
+    assert.ok(first.charged < REDACTION_WORK_BUDGET / 1000, `first pass charged ${first.charged}`);
+    for (const [label, redact] of [
+      ["makeTextRedactor", makeTextRedactor([LONG])],
+      ["makeTextRedactor indexed", makeTextRedactor(MANY)],
+      ["SecretSet.text", new SecretSet([LONG]).text],
+    ] as const) {
+      let out = "";
+      const charged = chargedBy(() => { out = redact(text); });
+      assert.equal(out, REDACTION_WITHHELD, label);
+      assert.ok(charged > REDACTION_WORK_BUDGET && charged <= CEILING, `${label}: charged ${charged}`);
+    }
   });
 
   it("the feed: a member NAME over budget is withheld too, never kept raw", () => {
