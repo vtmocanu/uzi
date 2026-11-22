@@ -2600,14 +2600,16 @@ export class CodexHarness implements RunHarness {
     // usage was reconciled and no model is incomplete, aggregateByModel() is undefined and the
     // terminal usage is left byte-identical to before C4a. `now` is the real clock at the terminal point; the price
     // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
-    const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
+    // Custom providers remain unpriced even when their model IDs match vendor IDs.
+    const pricing = this.authMode === undefined || this.authMode === "provider"
+      ? undefined : { authMode: this.authMode, now: new Date() };
     const modelUsage = this.accountant.aggregateByModel(pricing);
     // An ambiguous base turn usage must not bypass the incomplete claim accounting.
     const usage = attachModelUsage(this.accountant.usageIncomplete
       ? undefined : normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
     // The RUN-level API-equivalent cost: metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
-    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
+    const cost = pricing === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
     const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
     const limitEvidence = usageLimit ? this.rateLimits.classify(this.authMode) : undefined;
     const durationMs = Math.max(0, Math.floor(this.nowMs() - (this.dispatchStartedAt ?? this.nowMs())));

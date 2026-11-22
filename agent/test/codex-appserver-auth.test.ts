@@ -785,3 +785,42 @@ describe("Codex app-server auth: intercepted request ownership", () => {
     });
   });
 });
+
+describe("immutable provider managed authentication", () => {
+  it("snapshots provider apiKey login and refuses refresh without vendor calls", async () => {
+    const config = { mode: "provider" as const, apiKey: "provider-fixture-credential" };
+    const auth = createCodexAppServerAuth(config);
+    config.apiKey = "changed-after-construction";
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    assert.equal(auth.mode, "provider");
+    assert.deepEqual(transport.calls.find(call => call.method === "account/login/start")?.params,
+      { type: "apiKey", apiKey: "provider-fixture-credential" });
+    await assert.rejects(auth.handleServerRequest(transport, refreshRequest(900)), CodexAppServerAuthError);
+    assert.equal(transport.calls.filter(call => call.kind === "request").length, 2);
+    assert.equal(responses(transport).length, 1);
+  });
+
+  it("refuses provider subscription, endpoint and environment authority", () => {
+    for (const extra of [
+      { initial: INITIAL }, { bridge: { refresh: () => { throw new Error("must not call vendor"); } } },
+      { baseUrl: "https://evil.example" }, { env: { OPENAI_API_KEY: "evil" } },
+      { headers: {} }, { accountId: "other" },
+    ]) {
+      assert.throws(() => createCodexAppServerAuth({
+        mode: "provider", apiKey: "provider-fixture-credential", ...extra,
+      }), CodexAppServerAuthError);
+    }
+    assert.throws(() => createCodexAppServerAuth({ mode: "provider", apiKey: "" }), CodexAppServerAuthError);
+  });
+});
+
+it("provider interceptor refuses refresh and never invokes vendor authority", async () => {
+  const auth = createCodexAppServerAuth({ mode: "provider", apiKey: "provider-fixture-credential" });
+  const transport = new FakeTransport();
+  await auth.authenticate(transport);
+  assert.equal(transport.emitServerRequest(refreshRequest(901)), true);
+  await assert.rejects(auth.drainInterceptedRequests(), CodexAppServerAuthError);
+  assert.equal(responses(transport).length, 1);
+  assert.equal(transport.calls.filter(call => call.kind === "request").length, 2);
+});

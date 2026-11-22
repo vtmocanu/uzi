@@ -411,6 +411,63 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
 });
 
 describe("launchCodexRoot: app-server auth (production config, no env credential)", () => {
+  const binding = {
+    provider_id: "frozen-provider", revision: 3, engine: "codex" as const,
+    protocol: "openai_responses" as const, base_url: "https://gateway.example/v1",
+    auth_style: "bearer" as const, credential: "provider-fixture-credential",
+    model_map: { default: { model: "gateway-model", context_window: 64000 } },
+  };
+  it("launches frozen provider mapped config without credential environment injection", async () => {
+    await launchCodexRoot(baseSpec({
+      provider: undefined, providerBinding: binding, model: "default",
+      useAppServerAuth: true, authMode: "provider", codeModeHost: true,
+    }), baseDeps(newFake()));
+    const config = treeCalls[0]!.files[0]!.content;
+    assert.match(config, /model = "gateway-model"/);
+    assert.match(config, /model_context_window = 64000/);
+    assert.match(config, /base_url = "https:\/\/gateway.example\/v1"/);
+    assert.match(config, /requires_openai_auth = true/);
+    assert.match(config, /request_max_retries = 0/);
+    assert.match(config, /stream_max_retries = 0/);
+    assert.match(config, /supports_websockets = false/);
+    assert.match(config, /trust_level = "untrusted"/);
+    assert.doesNotMatch(config, /env_key|provider-fixture-credential/);
+    assert.equal(spawnCalls[0]!.options.env.CODEX_EXEC_SERVER_URL, "none");
+    assert.equal(spawnCalls[0]!.options.env.CODEX_PROVIDER_KEY, undefined);
+    assert.equal(JSON.stringify(spawnCalls[0]!.options.env).includes(binding.credential), false);
+  });
+
+  it("refuses missing, mixed, malformed and injected provider authority before provisioning", async () => {
+    const valid = baseSpec({ provider: undefined, providerBinding: binding,
+      model: "default", useAppServerAuth: true, authMode: "provider" });
+    const bad: Partial<CodexLaunchSpec>[] = [
+      { providerBinding: undefined }, { provider: baseSpec().provider },
+      { useAppServerAuth: false }, { authMode: "api_key" }, { authMode: "subscription" },
+      { model: "unmapped" }, { kind: "command" },
+      ...[
+        { credential: "" }, { engine: "claude" }, { auth_style: "x_api_key" },
+        { base_url: "https://user:pass@gateway.example/v1" },
+        { envKey: "EVIL" }, { headers: { Authorization: "evil" } },
+        { name: "openai" }, { model_map: { default: { model: "bad model" } } },
+      ].map(change => ({ providerBinding: { ...binding, ...change } as unknown as typeof binding })),
+    ];
+    for (const change of bad) {
+      await assert.rejects(launchCodexRoot({ ...valid, ...change }, baseDeps(newFake())));
+    }
+    await assert.rejects(launchCodexRoot(valid, baseDeps(newFake(), {
+      appServerAuthOpenAIBaseUrlForTest: "http://127.0.0.1:9000/v1",
+    })));
+    assert.equal(treeCalls.length, 0);
+    assert.equal(spawnCalls.length, 0);
+  });
+
+  it("preserves vendor api-key configuration", async () => {
+    await launchCodexRoot(baseSpec({ useAppServerAuth: true, authMode: "api_key" }), baseDeps(newFake()));
+    assert.match(treeCalls[0]!.files[0]!.content, /model_provider = "openai"/);
+    assert.doesNotMatch(treeCalls[0]!.files[0]!.content, /base_url|model_providers/);
+    assert.equal(spawnCalls[0]!.options.env.CODEX_PROVIDER_KEY, undefined);
+  });
+
   it("useAppServerAuth emits the PRODUCTION config and injects NO provider env credential", async () => {
     const fake = newFake();
     // The spec still carries a provider credentialValue; under app-server auth the launcher
@@ -752,7 +809,7 @@ describe("launchCodexRoot: trusted construction contract", () => {
   it("trusted refusal: rejects allowlist-reserved and malformed provider env keys", async () => {
     for (const envKey of ["PATH", "CODEX_EXEC_SERVER_URL", "BAD-KEY"]) {
       await assert.rejects(
-        launchCodexRoot(baseSpec({ provider: { ...baseSpec().provider, envKey } }), baseDeps(newFake())),
+        launchCodexRoot(baseSpec({ provider: { ...baseSpec().provider!, envKey } }), baseDeps(newFake())),
         (error: unknown) => error instanceof TrustedExecutionRefusal
           && error.message === "provider envKey is invalid or reserved by the launcher allowlist",
       );

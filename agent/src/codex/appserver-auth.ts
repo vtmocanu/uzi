@@ -32,7 +32,7 @@ const MAX_INTERCEPTED_AUTH_BYTES = 16 * 1024;
 const MAX_PREVIOUS_ACCOUNT_ID_BYTES = 256;
 const BRIDGE_CANCEL_SETTLEMENT_MS = 250;
 
-export type CodexAppServerAuthMode = "api_key" | "subscription";
+export type CodexAppServerAuthMode = "api_key" | "subscription" | "provider";
 
 /**
  * Access-token/account identity already verified by the uzi API. The adapter must not
@@ -56,7 +56,7 @@ export interface CodexSubscriptionRefreshBridge {
 
 export type CodexAppServerAuthConfig =
   | {
-      readonly mode: "api_key";
+      readonly mode: "api_key" | "provider";
       readonly apiKey: string;
     }
   | {
@@ -166,8 +166,8 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
   constructor(config: CodexAppServerAuthConfig) {
     // Snapshot the discriminant and secret values. A caller retaining and mutating its
     // input object cannot switch this root to another credential mode after construction.
-    this.config = config.mode === "api_key"
-      ? { mode: "api_key", apiKey: config.apiKey }
+    this.config = config.mode !== "subscription"
+      ? { mode: config.mode, apiKey: config.apiKey }
       : {
           mode: "subscription",
           initial: { accessToken: config.initial.accessToken, accountId: config.initial.accountId },
@@ -221,7 +221,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     if (this.state !== "ready" || this.transport !== transport) {
       this.poisonAndRespond(transport, note.requestId, "codex authentication refresh arrived outside the active session");
     }
-    if (this.config.mode === "api_key") {
+    if (this.config.mode !== "subscription") {
       this.poisonAndRespond(transport, note.requestId, "codex api-key session received a subscription refresh request");
     }
     this.validateRefreshParams(transport, note.requestId, note.params);
@@ -427,7 +427,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     // The pump waits for `startup` (and therefore validated login) before answering.
     this.installRefreshPump(transport);
 
-    const loginParams = this.config.mode === "api_key"
+    const loginParams = this.config.mode !== "subscription"
       ? { type: "apiKey", apiKey: this.config.apiKey }
       : {
           type: "chatgptAuthTokens",
@@ -438,7 +438,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     // issue #2213: a quarantined worker sends no provider credential (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
     const response = await transport.request<unknown>(LOGIN_METHOD, loginParams, { signal });
-    const expected = this.config.mode === "api_key" ? "apiKey" : "chatgptAuthTokens";
+    const expected = this.config.mode !== "subscription" ? "apiKey" : "chatgptAuthTokens";
     if (asObject(response)?.type !== expected) {
       throw protocolError("codex account/login/start returned an unexpected authentication mode");
     }
@@ -457,7 +457,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
           if (this.interceptedClosed) {
             this.poisonAndRespond(transport, requestId, "codex authentication request admission is closed");
           }
-          if (this.config.mode === "api_key") {
+          if (this.config.mode !== "subscription") {
             this.poisonAndRespond(transport, requestId, "codex api-key session received a subscription refresh request");
           }
           // Validate and discard the untrusted hint synchronously, before an async task
@@ -667,7 +667,13 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
 
 /** Create one immutable auth owner for one app-server root. */
 export function createCodexAppServerAuth(config: CodexAppServerAuthConfig): CodexAppServerAuthSession {
-  if (config.mode === "api_key") {
+  if (config.mode !== "provider" && config.mode !== "api_key" && config.mode !== "subscription") {
+    throw protocolError("codex authentication mode is unsupported");
+  }
+  if (config.mode === "provider" && Object.keys(config).some(key => key !== "mode" && key !== "apiKey")) {
+    throw protocolError("codex provider auth received mixed authority or unsupported options");
+  }
+  if (config.mode !== "subscription") {
     if (!isNonEmptyString(config.apiKey)) throw protocolError("codex api-key credential is empty");
   } else if (validateVerifiedTokens(config.initial) === undefined) {
     throw protocolError("codex subscription credential is incomplete");

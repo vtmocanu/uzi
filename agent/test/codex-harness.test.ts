@@ -2479,6 +2479,23 @@ describe("CodexHarness: cost projection from the run auth mode (PRD #1332 C4b / 
     assert.deepEqual(term.metrics.cost, { kind: "unreported" });
   });
 
+  it("provider auth preserves tokens without vendor-id collision pricing", async () => {
+    const { harness, transport } = makeHarness({ authMode: "provider" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "unreported");
+    assert.equal(mu.inputTokens, 300);
+    assert.equal(mu.outputTokens, 200);
+    assert.ok(!("costUSD" in mu));
+    assert.deepEqual(term.metrics.cost, { kind: "unreported" });
+  });
+
   it("an api_key run with an unreconciled gap keeps tokens but reports the run cost unreported", async () => {
     const { harness, transport } = makeHarness({ authMode: "api_key" });
     transport
