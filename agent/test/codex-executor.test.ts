@@ -37045,21 +37045,42 @@ describe("M2 provider executor composition", () => {
     });
   }
 
-  for (const mode of ["provider", "api_key"] as const) for (const sensitive of [false, true]) {
-    it(`M2 catalog default model key overlap ${mode} sensitive=${sensitive}`, async () => {
+  for (const mode of ["provider", "api_key"] as const) for (const sensitive of [false, true]) for (const blocking of [false, true]) {
+    it(`M2 catalog default model key overlap ${mode} sensitive=${sensitive} blocking=${blocking}`, async () => {
       // Prefixless credential is also a syntactically valid model ID.
       const key = ["catalog", "overlap", "fixture"].join("-");
       const model = sensitive ? key : "catalog-clean-control";
       const reports: CodexCatalogDefaultBody[] = [];
-      const rig = makeRig({ token: key, responder: c => c.method === "model/list"
-        ? { data: [{ id: model, model, supportedReasoningEfforts: [{ reasoningEffort: "high" }],
-          defaultReasoningEffort: "high" }] } : defaultResponder(c) });
+      let catalogSettled!: () => void;
+      const catalogDone = new Promise<void>(resolve => { catalogSettled = resolve; });
+      const rig = makeRig({ token: key, responder: async c => {
+        if (c.method === "model/list") return {
+          data: [{ id: model, model, supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+            defaultReasoningEffort: "high" }],
+        };
+        // Keep the report-only probe alive until its actual onEntry/report callback returns.
+        if (c.method === "turn/start" && mode !== "provider") {
+          await withTimeout(catalogDone, 3000, "actual catalog callback settled");
+        }
+        return defaultResponder(c);
+      } });
       const { logger, lines } = recordingLogger();
-      const { ctx } = makeCtx({ config: { default_model: mode === "provider" ? "default" : model }, redactText: makeTextRedactor([key]),
-        codexCatalogReport: new CodexCatalogReporter({
+      const reporter = new CodexCatalogReporter({
           client: { recordCodexCatalogDefault: async (_run, body) => { reports.push(body); return { kind: "ok" }; } },
           runId: "run-1", claimGeneration: 7, catalogContext: "b".repeat(64), logger,
-        }),
+      });
+      const report = reporter.report.bind(reporter);
+      reporter.report = (entry, reportedModel) => {
+        try { report(entry, reportedModel); }
+        finally { catalogSettled(); }
+      };
+      const claimSecret = "separate-claim-secret";
+      const { ctx } = makeCtx({
+        config: { default_model: mode === "provider" ? "default" : model,
+          ...(blocking ? { default_effort: "high" as const } : {}) },
+        // Native key is known ONLY through the runtime release, never claim redaction.
+        redactText: makeTextRedactor(mode === "provider" ? [key, claimSecret] : [claimSecret]),
+        codexCatalogReport: reporter,
       });
       const posted: OutgoingMessage[] = [];
       const batcher = new MessageBatcher({ postMessages: async (_run: string, messages: OutgoingMessage[]) => {
@@ -37072,7 +37093,11 @@ describe("M2 provider executor composition", () => {
         model_map: { default: { model, context_window: 32768 } } }) : bindingOf(API_KEY);
       try { await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "catalog key overlap"); }
       finally { await batcher.close(); }
-      await new Promise(r => setImmediate(r));
+      if (mode !== "provider") await withTimeout(catalogDone, 3000, "catalog callback");
+      const turns = rig.transport.requests.filter(r => r.method === "turn/start");
+      assert.equal(turns.length, 1);
+      assert.equal(rec(turns[0]!.params).model, model, "catalog redaction leaves requested model unchanged");
+      assert.equal(rec(turns[0]!.params).effort, blocking ? "high" : undefined);
       assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, mode === "provider" ? 0 : 1);
       if (mode === "provider") assert.deepEqual(reports, []);
       if (!sensitive && mode !== "provider") {
