@@ -258,7 +258,8 @@ rotated, the median round's per-execution mean. The columns are that mean in mic
 two reps each), per execution: planning about 69-75 ms on the first, about 50-58 ms on
 executions 2 to 5, about 60-65 ms on the sixth (when PostgreSQL builds the generic plan);
 execution about 19 ms, then about 8 ms. Planning dominates. 348-358 ms (across the four runs)
-is the **sum** of planning over the six prepared executions, not a per-reconnect charge. In
+is the **sum** of planning over the six prepared executions, paid across those executions
+rather than at once. In
 this harness, the first execution on a fresh connection (after a reconnect) pays about 69-75 ms of
 planning (only the reconnect case was measured: `pmRunExplain` uses a fresh connection); the further custom planning (executions 2 to 5, about 50-58 ms each) and the generic
 planning (the sixth, about 60-65 ms) follow on later executions, and a re-prepare on a warm connection restarts the same
@@ -269,9 +270,11 @@ reps (56.6 and 53.9 MiB) were below B128's 57.1 MiB, within a 2.7 MiB rep-to-rep
 
 ### Wide-read sample (a lower bound, not an envelope)
 
-Run 3, server default JIT. Every sqlc text (1691) was prepared, and each successfully prepared
-text was then executed twice with NULL arguments (one per parameter) inside `BEGIN READ ONLY`,
-with a savepoint per statement. The outcome tallies count the first pass only: 705 execute;
+Run 3, server default JIT. The table records that run's figures. The current harness prepares
+every sqlc text (1691) and executes each successfully prepared text twice with NULL arguments
+(one per parameter) inside `BEGIN READ ONLY`, with a savepoint per statement; its outcome tallies
+count the first pass only. Whether run 3 used exactly this method is not established (see
+below). The recorded tallies are: 705 execute;
 986 are writes the read-only transaction refuses after planning, and pgx then invalidates
 them, so they are never retained; NULL arguments plan small. It is therefore a **lower bound
 and not an upper bound**: it shows no worse case than what it ran, and a real wide workload could

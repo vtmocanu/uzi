@@ -571,8 +571,9 @@ func pmParseMem(smaps, status string) (pmMem, error) {
 	return m, nil
 }
 
-// pmObserverReadTimeout bounds one observer read once it holds the observer lock. It bounds
-// every observer read (sampler, sampleHeld and the explain-phase reads). Under pgx v5 a query
+// pmObserverReadTimeout bounds one pmObserver.read once it holds the observer lock: the
+// sampler's reads and the memory reads of sampleHeld and the explain phase. llvmMaps, queryRow
+// and exec use the caller's context without this bound. Under pgx v5 a query
 // cancelled mid-flight closes the observer connection, so later reads then fail loudly.
 const pmObserverReadTimeout = 30 * time.Second
 
@@ -805,7 +806,7 @@ func (e *pmEnv) openPool(ctx context.Context) {
 }
 
 // pmCheckPoolConfig fails when the parsed DSN left the pool unable to measure the candidate:
-// a non-default default_query_exec_mode (exec, simple_protocol, describe_exec) caches no
+// a non-default default_query_exec_mode (exec, simple_protocol, describe_exec, cache_describe) caches no
 // prepared statement, and a statement_cache_capacity in the DSN that the candidate does not
 // then override would make the capacity labels not measure the statement cache.
 func pmCheckPoolConfig(cfg *pgxpool.Config, cand pmCand) error {
