@@ -125,6 +125,105 @@ for (const pass of ["intent", "plan", "delivery", "review"] as const) {
   });
 }
 
+for (const pass of ["intent", "plan"] as const) {
+  const codexProvider: ClaimProviderBinding = {
+    provider_id: "frozen-a", revision: 4, engine: "codex", protocol: "openai_responses",
+    base_url: "https://gateway.example.test", auth_style: "bearer", credential: "frozen-provider-key",
+    model_map: { default: { model: "gateway-default", context_window: 8192 } },
+  };
+  const conflicts: Record<string, ClaimProviderBinding> = {
+    id: { ...codexProvider, provider_id: "independent-b" },
+    revision: { ...codexProvider, revision: 5 },
+    key: { ...codexProvider, credential: "independent-provider-key" },
+    url: { ...codexProvider, base_url: "https://other.example.test" },
+    map: { ...codexProvider, model_map: { default: { model: "other-model" } } },
+    context: { ...codexProvider, model_map: { default: { model: "gateway-default", context_window: 16384 } } },
+    engine: claudeProvider,
+    style: { ...claudeProvider, auth_style: "x_api_key" },
+  };
+  for (const [field, provider] of Object.entries(conflicts)) {
+    it(`${pass} refuses a separate provider changing frozen ${field} before dispatch`, async () => {
+      const root = await makeHome("authority-conflict-");
+      let calls = 0;
+      const forbidden = () => { calls++; throw new Error("unexpected dispatch"); };
+      const warnings: unknown[] = [];
+      const runner = new SummaryRunner({ ...nullLogger(), warn: (message, fields) => { warnings.push([message, fields]); } }, {
+        homeRoot: root, queryFn: forbidden, codexAdviceHarnessFactory: forbidden,
+      });
+      const claim = { run_id: "authority", secrets: { provider: field === "style" ? claudeProvider : codexProvider } };
+      const input = { claim, provider, token: "usable-vendor", model: "", issueTitle: "Title", issueBody: "Body", onUsage: forbidden };
+      try {
+        const result = pass === "intent" ? await runner.generateIntentSummary(input)
+          : await runner.generatePlanSummary({ ...input, planMd: "Plan" });
+        assert.equal(result, null);
+        assert.equal(calls, 0);
+        assert.deepEqual(await fs.readdir(root), []);
+        const logged = JSON.stringify(warnings);
+        assert.match(logged, /provider_lane_unsupported/);
+        assert.ok(!logged.includes(provider.credential));
+        assert.ok(!logged.includes(codexProvider.credential));
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+  for (const secrets of [{ anthropic_oauth_token: "usable-vendor" }, { codex: {
+    auth_mode: "api_key", access_token: "vendor-key", capability: "vendor-cap",
+  } }, {}]) {
+    it(`${pass} refuses a separate provider added to vendor claim ${Object.keys(secrets).join() || "empty"}`, async () => {
+      const root = await makeHome("authority-vendor-");
+      let calls = 0;
+      const forbidden = () => { calls++; throw new Error("unexpected dispatch"); };
+      const runner = new SummaryRunner(nullLogger(), {
+        homeRoot: root, queryFn: forbidden, codexAdviceHarnessFactory: forbidden,
+      });
+      const input = { claim: { run_id: "vendor", secrets }, provider: codexProvider,
+        token: "usable-vendor", model: "", issueTitle: "Title", issueBody: "Body", onUsage: forbidden };
+      try {
+        assert.equal(pass === "intent" ? await runner.generateIntentSummary(input)
+          : await runner.generatePlanSummary({ ...input, planMd: "Plan" }), null);
+        assert.equal(calls, 0);
+        assert.deepEqual(await fs.readdir(root), []);
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+  for (const provider of [codexProvider, claudeProvider]) {
+    for (const copy of [false, true]) {
+      it(`${pass} accepts ${provider.engine} claim with ${copy ? "matching copy" : "claim only"}`, async () => {
+        const root = await makeHome("authority-positive-");
+        let turns = 0;
+        const text = JSON.stringify({ summary: "Bound summary.", deltas: [] });
+        const runner = new SummaryRunner(nullLogger(), {
+          homeRoot: root,
+          queryFn: (async function* (...args: Parameters<SdkQueryFn>) {
+            turns++;
+            yield* reply(text)(...args);
+          }) as SdkQueryFn,
+          codexAdviceHarnessFactory: (async (params: Parameters<CodexAdviceHarnessFactory>[0]) => {
+            assert.equal(params.binding.authMode, "provider");
+            assert.ok(params.binding.authMode === "provider");
+            assert.equal(params.binding.providerBinding.provider_id, provider.provider_id);
+            return { kind: "codex", run: async () => {
+              turns++;
+              return { text, end: { kind: "terminal", terminal: {
+                outcome: "success", subtype: "success", errors: [], metrics: { cost: { kind: "unreported" } },
+              } } };
+            } };
+          }) as unknown as CodexAdviceHarnessFactory,
+        });
+        // Reverse field insertion order: comparison is of decoded fields, not raw JSON.
+        const matching = Object.fromEntries(Object.entries(structuredClone(provider)).reverse()) as unknown as ClaimProviderBinding;
+        const input = { claim: { run_id: "positive", secrets: { provider } },
+          ...(copy ? { provider: matching } : {}), token: "", model: provider.engine === "claude" ? "haiku" : "",
+          issueTitle: "Title", issueBody: "Body" };
+        try {
+          assert.ok(pass === "intent" ? await runner.generateIntentSummary(input)
+            : await runner.generatePlanSummary({ ...input, planMd: "Plan" }));
+          assert.equal(turns, 1);
+        } finally { await fs.rm(root, { recursive: true, force: true }); }
+      });
+    }
+  }
+}
+
 const native = { auth_mode: "subscription", access_token: "test-subscription", capability: "test-cap", generation: 7, chatgpt_account_id: "test-account", chatgpt_plan_type: null };
 for (const engine of ["codex", "unknown", "claude"]) {
   for (const codex of [undefined, native]) {

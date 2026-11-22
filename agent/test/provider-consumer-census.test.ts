@@ -83,9 +83,11 @@ const SITES: Site[] = [
   {"file": "sdk-executor.ts", "line": "const em = ctx.provider ? stripProviderCost(raw) : raw;", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
   {"file": "sdk-executor.ts", "line": "if (ctx.provider && isGatewayLimitStatus(terminal.apiErrorStatus)) {", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
   {"file": "summary-runner.ts", "line": "if (claim.secrets.provider) return { provider: claim.secrets.provider, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity for delivery and direct summary passes before Codex advice or Claude dispatch."},
-  {"file": "summary-runner.ts", "line": "harness = { token: input.token, ...(input.provider ? { provider: input.provider } : {}), model: input.model };", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity for delivery and direct summary passes before Codex advice or Claude dispatch."},
+  {"file": "summary-runner.ts", "line": "const secrets = input.claim ? input.claim.secrets : (input.provider ? { provider: input.provider } : {});", "count": 1, "category": "engine-handling", "rationale": "The claim owns execution authority; the separate provider is used only without a claim."},
+  {"file": "summary-runner.ts", "line": "if (input.claim && input.provider !== undefined) {", "count": 1, "category": "engine-handling", "rationale": "A separate provider accompanying a claim must pass decoded equality before dispatch."},
+  {"file": "summary-runner.ts", "line": "const supplied = decodeProviderBinding({ provider: input.provider });", "count": 1, "category": "engine-handling", "rationale": "Decode the separate provider for comparison with the decoded claim; malformed or unequal bindings are refused."},
+  {"file": "summary-runner.ts", "line": "const provider = secrets.provider;", "count": 1, "category": "engine-handling", "rationale": "Claude dispatch uses the authoritative secrets provider after selection and mismatch refusal."},
   {"file": "codex/codex-executor.ts", "line": "baseUrl: binding.providerBinding.base_url, envKey: this.opts.provider.envKey,", "count": 1, "category": "native-config", "rationale": "Validated Codex provider authority supplies root endpoint; native opts.provider supplies only the config env-key name, not provider credential authority."},
-  {"file": "summary-runner.ts", "line": "...((input.provider ?? input.claim?.secrets.provider) ? { provider: input.provider ?? input.claim?.secrets.provider } : {}),", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity for delivery and direct summary passes before Codex advice or Claude dispatch."},
 ];
 
 /** File-relative recursive walk; reject symlinks instead of following them outside src. */
@@ -190,7 +192,7 @@ const HOLDS: Record<string, string[]> = {
   "client.ts": ['this.requireProviderCapability(provider.engine);', 'if (engine === "codex") throw new ProviderLaneUnsupportedError();'],
   "provider-binding.ts": ['if (oauth !== undefined && oauth !== null && oauth !== "") throw new ProviderBindingError("provider next to an anthropic_oauth_token");', 'if (secrets.codex !== undefined && secrets.codex !== null) throw new ProviderBindingError("provider next to a codex block");', 'if (b.engine !== "claude") throw new ProviderLaneUnsupportedError();', 'if (engine !== "claude" && engine !== "codex") throw new ProviderBindingError("unknown engine");', 'if (protocol !== (engine === "claude" ? "anthropic_messages" : "openai_responses")) throw new ProviderBindingError("unknown protocol");'],
   "main.ts": ['return { executor: new FailClosedExecutor("provider_lane_unsupported") };'],
-  "summary-runner.ts": ['const selection = selectCodexExecutionAuthority(claim.secrets);', 'const selection = selectCodexExecutionAuthority({'],
+  "summary-runner.ts": ["const selection = selectCodexExecutionAuthority(claim.secrets);", "const secrets = input.claim ? input.claim.secrets : (input.provider ? { provider: input.provider } : {});", "const selection = selectCodexExecutionAuthority(secrets);", "if (input.claim && input.provider !== undefined) {\ntry {\nconst claimed = decodeProviderBinding(input.claim.secrets);\nconst supplied = decodeProviderBinding({ provider: input.provider });\nif (!claimed || JSON.stringify(claimed) !== JSON.stringify(supplied)) throw new ProviderLaneUnsupportedError();\n} catch {\nthrow new ProviderLaneUnsupportedError();\n}\n}", "const provider = secrets.provider;", "harness = { token: input.token, ...(provider ? { provider } : {}), model: input.model };"],
   "codex/select.ts": ['try { provider = decodeProviderBinding(secrets); }\ncatch { throw new ProviderLaneUnsupportedError(); }', 'return { kind: "codex", binding: createCodexProviderExecutionAuthority(provider) };', 'const snapshot = decodeProviderBinding({ provider: binding });', 'if (snapshot?.engine !== "codex") throw new ProviderBindingError("expected codex engine");'],
   // providerBinding field reads are outside the carrier-name matcher; pin these
   // overrides explicitly: decoded authority supplies identity, endpoint and model.
@@ -241,7 +243,7 @@ describe("M2 provider consumer architectural census (textual scope)", () => {
     for (const file of ["client.ts", "provider-binding.ts", "codex/select.ts", "summary-runner.ts", "review-runner.ts"]) for (const block of HOLDS[file]!) {
       const original = sources.get(file)!;
       assert.ok(holdCount(original, block) > 0, `${file}: live mechanism ${block}`);
-      // The direct summary selector pin is a call prefix; mutate the entire
+      // For any partial-call pin, mutate the entire
       // statement so rejection proves missing evidence rather than a parse error.
       const pattern = block.split("\n").map(line => line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\n\\s*");
       const match = new RegExp(pattern).exec(original);

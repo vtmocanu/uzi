@@ -17,7 +17,7 @@
 // model must never take instructions from (Decision 10).
 
 import os from "node:os";
-import { PROVIDER_LANE_UNSUPPORTED, ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { decodeProviderBinding, PROVIDER_LANE_UNSUPPORTED, ProviderLaneUnsupportedError } from "./provider-binding.js";
 import { diagramEvent, type DiagramParserReason, type DiagramReason } from "./diagram-diagnostic.js";
 
 import { fenceNonce } from "./prompt.js";
@@ -447,10 +447,19 @@ export class SummaryRunner {
     const reportUsage = this.usageReporter(pass, input.onUsage);
     let onCodex = false;
     try {
-      const selection = selectCodexExecutionAuthority({
-        ...input.claim?.secrets,
-        ...((input.provider ?? input.claim?.secrets.provider) ? { provider: input.provider ?? input.claim?.secrets.provider } : {}),
-      });
+      // A claim owns execution authority; a separate binding may only repeat it.
+      const secrets = input.claim ? input.claim.secrets : (input.provider ? { provider: input.provider } : {});
+      const selection = selectCodexExecutionAuthority(secrets);
+      if (input.claim && input.provider !== undefined) {
+        try {
+          const claimed = decodeProviderBinding(input.claim.secrets);
+          const supplied = decodeProviderBinding({ provider: input.provider });
+          if (!claimed || JSON.stringify(claimed) !== JSON.stringify(supplied)) throw new ProviderLaneUnsupportedError();
+        } catch {
+          throw new ProviderLaneUnsupportedError();
+        }
+      }
+      const provider = secrets.provider;
       let harness: Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
         onCodex = true;
@@ -471,7 +480,7 @@ export class SummaryRunner {
           },
         };
       } else {
-        harness = { token: input.token, ...(input.provider ? { provider: input.provider } : {}), model: input.model };
+        harness = { token: input.token, ...(provider ? { provider } : {}), model: input.model };
       }
       return await runReadOnlyModelPass({
         ...harness,
