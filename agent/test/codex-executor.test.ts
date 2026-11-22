@@ -36615,6 +36615,121 @@ describe("Codex repeated actualRunner switching", () => {
 });
 
 describe("M2 provider executor composition", () => {
+  function barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  for (const phase of ["factory", "advice"] as const) {
+    it(`M2 provider epoch retirement fences pending ${phase} through owned lifecycle`, async () => {
+      const rig = makeRig();
+      const binding = createCodexProviderExecutionAuthority(providerClaim());
+      const executor = makeExecutor(rig, binding);
+      const entered = barrier(), release = barrier();
+      let owner: NonNullable<ReturnType<typeof summaryOwnership.get>> | undefined;
+      let launches = 0, turns = 0, publications = 0;
+      const factory = executor.bindCodexSummaryFactory(async params => {
+        owner = summaryOwnership.get(params)!;
+        if (phase === "factory") { entered.resolve(); await release.promise; }
+        return { kind: "codex", run: async () => {
+          turns++;
+          entered.resolve(); await release.promise;
+          return { text: "obsolete", end: { kind: "terminal", terminal: { outcome: "success" } } };
+        } } as never;
+      });
+      const params = { runId: "run-1", binding };
+      summaryCallDeadlines.set(params, Date.now() + 10_000);
+      const call = (async () => {
+        const harness = await factory(params);
+        await harness.run({} as never, {} as never);
+        publications++;
+      })();
+      const rejected = assert.rejects(call, /credential authority retired/);
+      try {
+        await entered.promise;
+        const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
+        assert.deepEqual(authority.binding, binding);
+        authority.retire();
+        assert.equal(authority.isCurrent(), false);
+        assert.throws(() => owner!.guard(), /credential authority retired/);
+        await assert.rejects(owner!.launch(async () => { launches++; return trackedRoot().root as never; }),
+          /credential authority retired/);
+        release.resolve();
+        await rejected;
+        assert.equal(launches, 0);
+        assert.equal(turns, phase === "advice" ? 1 : 0);
+        assert.equal(publications, 0);
+        assert.equal(rig.client.releaseCalls.length, 0);
+        assert.equal(rig.client.refreshCalls.length, 0);
+        assert.equal((await executor.withCredentialFreeCapture(1000, async () => {})).kind, "observed_empty",
+          "retired pending call settles its owned reservation before capture");
+      } finally { release.resolve(); await rejected; }
+    });
+  }
+
+
+  it("M2 provider delivery owned SummaryRunner preserves tuple and default-map sol", async () => {
+    const { buildDeliveryContext } = await import("../src/pr-description-context.js");
+    const rig = makeRig();
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    const output = { summary: "Delivered ***REDACTED*** work.", changes: ["Added proof."], scope_notes: [], review_pointers: [] };
+    const transport = new FakeTransport(defaultResponder);
+    transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(agentMessage(JSON.stringify({ ...output, summary: "Delivered " + binding.providerBinding.credential + " work." }))).push(turnCompleted("completed")).end();
+    let disposed = 0, builds = 0;
+    const noVendor = new Proxy({}, { get: (_target, name) => { throw new Error("unexpected vendor operation " + String(name)); } });
+    const raw = makeProductionCodexAdviceHarnessFactory(noVendor as never, noopLog, "/unused", {
+      launchRoot: async spec => {
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        assert.equal(spec.providerSlot, "default");
+        return { transport, cwd: "/isolated", dispose: async () => { disposed++; } };
+      },
+    });
+    const factory = executor.bindCodexSummaryFactory(async params => {
+      builds++;
+      assert.deepEqual(params.binding, binding);
+      assert.ok(Object.isFrozen(params.binding));
+
+      const harness = await raw(params);
+      const run = harness.run.bind(harness);
+      harness.run = (request, policy) => {
+        assert.equal(request.model, "gpt-6-sol");
+        return run(request, policy);
+      };
+      return harness;
+    });
+    const diagnostics = recordingLogger();
+    const runner = new SummaryRunner(diagnostics.logger, {
+      homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 1000,
+      queryFn: (() => { assert.fail("provider delivery must never use Claude"); }) as never,
+      codexAdviceHarnessFactory: factory,
+    });
+    const context = await buildDeliveryContext({
+      git: {} as never, barePath: "/unused", targetBranch: "main",
+      headSha: "invalid", deadlineMs: Date.now() + 10_000, redact: s => s,
+      issueTitle: "Provider work", issueBody: "Add proof.",
+    });
+    const snapshots: import("../src/harness.js").AdviceUsageSnapshot[] = [];
+    const input = { claim: { run_id: "run-1", secrets: { provider: binding.providerBinding } },
+      context, deadlineMs: Date.now() + 10_000, onUsage: (u: import("../src/harness.js").AdviceUsageSnapshot) => { snapshots.push(u); } };
+    assert.deepEqual(await runner.generateDeliverySummary(input), output, JSON.stringify(diagnostics.lines));
+    assert.equal(builds, 1);
+    assert.equal(disposed, 1);
+    const start = transport.requests.find(c => c.method === "turn/start");
+    assert.ok(start, "delivery dispatches a provider turn");
+    assert.equal((start.params as { model?: string }).model, "corp-code");
+    assert.equal(snapshots[0]!["corp-code"]!.inputTokens, 100);
+    assert.equal(snapshots[0]!["corp-code"]!.outputTokens, 20);
+    assert.equal(snapshots[0]!["corp-code"]!.costStatus, "unreported");
+    assert.equal(snapshots[0]!["corp-code"]!.costUSD, undefined);
+    assert.equal(await runner.generateDeliverySummary({ ...input, claim: { ...input.claim,
+      secrets: { provider: { ...binding.providerBinding, revision: 2 } } } }), null);
+    assert.equal(builds, 1, "mismatched delivery authority refuses before construction");
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
   it("provider Now actual model pass preserves tokens without inventing vendor cost", async () => {
     const { runReadOnlyModelPass } = await import("../src/model-pass.js");
     const binding = createCodexProviderExecutionAuthority(providerClaim());

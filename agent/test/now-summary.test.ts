@@ -176,7 +176,7 @@ function providerNow(ignoreAbort = false) {
 }
 
 describe("provider Now focused proofs", () => {
-  for (const stop of ["cancel", "retirement"] as const) {
+  for (const stop of ["cancel", "claim-fence loss"] as const) {
     it(`provider Now ${stop} aborts pending work and rejects late publication`, async () => {
       const h = providerNow(true);
       await running(h);
