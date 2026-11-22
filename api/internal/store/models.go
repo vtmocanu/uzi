@@ -1741,6 +1741,7 @@ type RunSchedule struct {
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
 	CiArtifacts                []byte             `json:"ci_artifacts"`
+	FireEpoch                  int64              `json:"fire_epoch"`
 }
 
 type RunTerminalContribution struct {
@@ -1876,6 +1877,24 @@ type RunUserInput struct {
 	GateRevision            pgtype.Int8        `json:"gate_revision"`
 	IncludedAt              pgtype.Timestamptz `json:"included_at"`
 	InclusionReported       bool               `json:"inclusion_reported"`
+}
+
+type ScheduleOnceFire struct {
+	ScheduleID   uuid.UUID          `json:"schedule_id"`
+	FireEpoch    int64              `json:"fire_epoch"`
+	EffectiveCap pgtype.Int4        `json:"effective_cap"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type ScheduleOnceFireRun struct {
+	ScheduleID uuid.UUID          `json:"schedule_id"`
+	FireEpoch  int64              `json:"fire_epoch"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	IssueIid   int64              `json:"issue_iid"`
+	IssueTitle string             `json:"issue_title"`
+	WebUrl     string             `json:"web_url"`
+	RunUuid    uuid.UUID          `json:"run_uuid"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type SemanticCandidateHistory struct {

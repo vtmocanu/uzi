@@ -539,9 +539,10 @@ WHERE id = @id AND user_id = @user_id
 RETURNING id, user_id, status;
 
 -- A one-time schedule held on credential_disabled (PRD #1732 D2) records why it waits: only
--- last_fire is written. next_fire_at, status and last_fired_at are untouched, so the row stays
+-- last_fire and its recent_fires entry are written. next_fire_at, status and last_fired_at are untouched, so the row stays
 -- due and fires once the credential is enabled. Guarded to a still-active one-time row so a
--- concurrent edit, disable or fire is never overwritten with a stale hold.
+-- concurrent edit, disable or fire is never overwritten with a stale hold; fire_epoch (issue #4512)
+-- additionally refuses a hold from an occurrence a re-arm has since replaced.
 -- name: RecordScheduleHeldFire :execrows
 UPDATE run_schedules
 SET last_fire = @last_fire,
@@ -551,4 +552,4 @@ SET last_fire = @last_fire,
       THEN jsonb_path_query_array(jsonb_build_array(@last_fire::jsonb) || recent_fires, '$[0 to 9]')
       ELSE recent_fires END,
     updated_at = now()
-WHERE id = @id AND timing = 'once' AND status = 'active';
+WHERE id = @id AND timing = 'once' AND status = 'active' AND fire_epoch = @fire_epoch;

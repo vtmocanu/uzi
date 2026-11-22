@@ -2266,6 +2266,13 @@ type Service struct {
 	// inserted in the open transaction, right before that transaction's COMMIT, on every
 	// transactional create path. Nil in production.
 	createBeforeCommitHook func(run store.Run)
+	// createBeforeCommitErrHook is the error-returning sibling of createBeforeCommitHook, called
+	// right after it on the same transactional create paths: a non-nil error aborts the create
+	// before COMMIT, so the run and everything written with it roll back. Nil in production.
+	createBeforeCommitErrHook func(run store.Run) error
+	// onceFireSummaryAfterReadHook is a test-only seam in WriteOnceFireSummary: it runs with the
+	// schedule row lock held, after the ledger read and before the write. Nil in production.
+	onceFireSummaryAfterReadHook func()
 	// planCrossCheckAfterPreflightHook is a test-only seam in SubmitPlanCrossCheck: it runs right
 	// after the preflight transaction commits, before the checker child is created. Nil in production.
 	planCrossCheckAfterPreflightHook func()
@@ -8149,18 +8156,18 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
 	// user choice is wired in M2. Threaded through the signature now so M2 does not
 	// reopen this seam (the freeze).
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, model, runOverrideSource(model), effort, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, model, runOverrideSource(model), effort, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride, nil /*progress*/)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness, progress *OnceFireProgress) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
 	// schedule's pin or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/, progress)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -8189,17 +8196,17 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// choice, so it inherits the worker binding exactly as before.
 	// explicit is the fresh issue-label selection; nil keeps implicit D11 resolution.
 	// No raw credential override is supplied by the poller.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, modelSourceNone, nil /*effort*/, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, modelSourceNone, nil /*effort*/, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/, nil /*progress*/)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve scheduled issue run. It carries
 // the schedule's wait/model/override choices and effective pin or issue-label harness.
 // The poller supplies only its issue-label harness and inherits the owner defaults.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness, progress *OnceFireProgress) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/, progress)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -8241,7 +8248,18 @@ type SeededPlan struct {
 // inferred from triggerSource: run_override from a manual request's model, schedule_pin from a
 // schedule's, none otherwise. A run_override model is checked against the resolved harness inside
 // the create transaction; effort, when present, is stamped with effort_source run_override.
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride, progress *OnceFireProgress) (store.Run, error) {
+	// Issue #4512: a non-nil progress is a scheduled once-sweep admission. It fails closed (nothing
+	// read, locked or written) without a transaction, or when its context disagrees with the create
+	// arguments; nil is today's behaviour exactly.
+	if progress != nil {
+		if !s.onceFireTxReady() {
+			return store.Run{}, errOnceFireRequiresTx
+		}
+		if err := checkOnceFireArgs(progress, userID, repoID, issueIID); err != nil {
+			return store.Run{}, err
+		}
+	}
 	// PRD #3250: an effort is stored only as an exact canonical level, whichever caller supplied it.
 	if effort != nil && !validRunEffort(*effort) {
 		return store.Run{}, ErrInvalidRunEffort
@@ -8638,7 +8656,22 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if interlockOn {
 			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
-		return q.CreateRun(ctx, store.CreateRunParams{
+		// Issue #4512 steps 6-9 (the identity compare against the create arguments already ran
+		// before any lock, at the top of createRun): repo share lock, schedule row lock, recheck,
+		// header, stored cap and spent-slot checks. After the pinned-secret share lock above and
+		// before CreateRun, so a refusal creates nothing and the whole transaction rolls back.
+		var onceQ *store.Queries
+		if progress != nil {
+			tq, ok := q.(*store.Queries)
+			if !ok {
+				return store.Run{}, errOnceFireRequiresTx
+			}
+			onceQ = tq
+			if err := admitOnceFire(ctx, onceQ, progress, userID, repoID); err != nil {
+				return store.Run{}, err
+			}
+		}
+		created, err := q.CreateRun(ctx, store.CreateRunParams{
 			UserID:                    userID,
 			RepoID:                    repoID,
 			IssueIid:                  pgtype.Int8{Int64: issueIID, Valid: true},
@@ -8723,12 +8756,28 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			CredentialOverrideMode:     pgOverrideMode(effOverride),
 			CredentialOverrideSecretID: pgOverrideSecretID(effOverride),
 		})
+		if err != nil {
+			return store.Run{}, err
+		}
+		// Issue #4512 step 11: the ledger row, with run_uuid the id CreateRun just returned, in
+		// the same transaction.
+		if progress != nil {
+			if err := recordOnceFire(ctx, onceQ, progress, created); err != nil {
+				return store.Run{}, err
+			}
+		}
+		return created, nil
 	}, harnessCreationOrigin{
 		Kind: "issue", TriggerSource: triggerSource, Explicit: explicit, Model: model,
 		AnthropicOverride: credOverride != nil || (rawOverride != nil && rawOverride.Mode != CredentialOverrideModeInherit),
 		ConsumerGateRepo:  gateRepoOf(repoID),
 	})
 	if err != nil {
+		// Issue #4512: a 23505 on the ledger's primary key is a lost race for the same issue,
+		// not an active-run conflict; it must be matched before the generic arm below.
+		if isOnceFireLedgerConflict(err) {
+			return store.Run{}, ErrOnceFireCandidateRecorded
+		}
 		if isUniqueViolation(err) {
 			return store.Run{}, ErrActiveRunExists
 		}

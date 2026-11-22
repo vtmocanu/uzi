@@ -189,7 +189,7 @@ func skipReasonLabel(reason string) string {
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
 	"not_eligible":           "add the configured uzi label or assign the issue to uzi",
-	"consumer_gate_busy":     "start the skipped issue manually; a partial one-time sweep does not retry it",
+	"consumer_gate_busy":     "start the skipped issue manually; a one-time scheduled fire retries its remaining slots",
 	"harness_label_conflict": "match the issue harness label to the schedule pin, or change the pin",
 	"harness_label_invalid":  "keep exactly one of harness::codex or harness::claude and remove other harness::* labels",
 	// PRD #1732 D2/D12: the schedule's pin is kept, never substituted; enabling is web-only.

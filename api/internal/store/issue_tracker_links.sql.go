@@ -165,6 +165,7 @@ SELECT (
  OR EXISTS (SELECT 1 FROM recommendation_filed_issues WHERE recommendation_filed_issues.filed_repo_id = $1 AND recommendation_filed_issues.filed_issue_iid IS NOT NULL)
  OR EXISTS (SELECT 1 FROM finding_dispositions WHERE finding_dispositions.repo_id = $1 AND finding_dispositions.filed_issue_iid IS NOT NULL)
  OR EXISTS (SELECT 1 FROM finding_group_operations WHERE finding_group_operations.repo_id = $1 AND finding_group_operations.issue_iid IS NOT NULL)
+ OR EXISTS (SELECT 1 FROM schedule_once_fire_runs WHERE schedule_once_fire_runs.repo_id = $1 AND schedule_once_fire_runs.issue_iid IS NOT NULL)
 )::boolean AS stores_issue_number
 `
 
