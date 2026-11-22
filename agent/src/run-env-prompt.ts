@@ -4,7 +4,7 @@
 // escapes and invisible or bidi characters, and a plain value is rendered JSON-quoted with the same
 // characters escaped. A secret value NEVER appears: only its name and description do.
 
-import { isUnsafeNameChar } from "./codex/render.js";
+import { isUnsafeNameChar } from "./diagnostic-name.js";
 import { fenceNonce } from "./prompt.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
 import { runEnvNameViolation } from "./run-env-names.js";

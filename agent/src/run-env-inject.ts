@@ -6,7 +6,7 @@
 // its name passes the shared name rules, is not a protected key and is not already set, and every name
 // that is dropped is reported (never its value).
 
-import { sanitizeName } from "./codex/render.js";
+import { sanitizeName } from "./diagnostic-name.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
 import { runEnvNameViolation } from "./run-env-names.js";
 
