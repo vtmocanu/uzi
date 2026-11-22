@@ -223,4 +223,3 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
         AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
 $$;
 -- +goose StatementEnd
-
