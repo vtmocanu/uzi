@@ -25027,7 +25027,7 @@ try {
    * the text plain.
    *
    * The result is NOT capped: the caller secret-scrubs it (redactText) and then caps it
-   * ({@link capReviewDiff}) before it leaves the worker, so a secret straddling the cap is masked first.
+   * ({@link capReviewDiff}) before it leaves the worker.
    * This method does not scrub. Returns `null` on ANY failure (try/catch), so the caller can still
    * report the failed outcome without a patch rather than turning a diff-computation error into a
    * second failure.

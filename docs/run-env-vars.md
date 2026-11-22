@@ -67,10 +67,24 @@ these forms of the value: JSON-escaped (with and without escaped slashes),
 HTML-safe `\u00XX`, percent-encoded, and base64 or base64url text that embeds
 it (such as the entry a registry login stores, or an HTTP Basic header). Each
 form is also registered without a trailing line break, and for a multi-line
-value with LF line endings. Each line of a multi-line value (8 characters or
-more, PEM header and footer lines excluded) is redacted on its own. Redaction is
+value with LF line endings. Each line of a multi-line value is redacted on its
+own when it is at least 8 characters, has a letter or digit and at least 2
+distinct non-space characters, and is not PEM header or footer armor or a public
+line (`Proc-Type` lines and the service-account JSON members `type`, `auth_uri`,
+`token_uri`, `auth_provider_x509_cert_url` and `universe_domain`). Redaction is
 exact-match with an 8-character floor, so it is a net, not a boundary: another
 encoding of the value is not caught.
+
+A run's secret forms are computed once per claim and capped at 40,000,000
+characters (`RUN_ENV_FORM_CHARS_MAX`). A claim over the cap fails before any
+work, with a failure reason starting `run_env_forms_over_budget` (never a
+value), and publishes nothing. A publish with no live flight (held, terminal and
+bundle publication) is withheld with the reason `forms_over_budget`. A
+cross-check child whose claim is over the cap ends as checker unavailable
+instead. A store filled to its limits with multi-line values can pass the cap.
+To get under it, remove or shorten secret variables, multi-line ones first. A
+run keeps counting the older versions it was given; a new run counts only the
+current values, and a cross-check child counts every version its lead was given.
 
 Before work leaves the worker, every commit in the outgoing range is searched
 for those forms, not only the final tree. For a multi-line secret it also
@@ -89,9 +103,22 @@ terminal preservation packs, recovery archives and the preserved patch.
   later, and the work stays on the worker under its recovery hold. At the final
   push the run fails as `push_secret_blocked` instead.
 - A plain value found in tracked files holds nothing.
-- A diff hunk that mixes context lines and added lines of one multi-line secret
-  is not matched as a whole by the check on the preserved patch. Each line is
-  still redacted, and a committed file that holds the secret is still blocked.
+- The preserved patch is withheld, not redacted, when the claim is over the form
+  cap; when a whole-value form occurs in the raw patch or in a rebuilt per-hunk
+  pre-image or post-image (context plus removed or added lines, also with line
+  breaks normalized to LF); when any registered line form occurs in it; or, for
+  a run with secret variables, when the patch cannot be parsed (binary, combined
+  diff, a line-count mismatch, or a stray line such as a non-header line between a file
+  header and its first hunk). The image, line-form and parse checks apply when
+  the run has any secret variable, retired versions included, so such a run
+  loses its preserved patch when the diff touches a binary file. Otherwise the
+  patch is redacted and scanned as before.
+- Gaps that remain: a secret whose lines are all short, public, or without a
+  letter or digit, or with only one distinct non-space character, and that is
+  split across files or by elided context between hunks, and a value that
+  appears only re-encoded, such as each line indented in a YAML block or in an
+  encoding other than those registered. A committed file that holds the whole
+  secret is still blocked.
 - A worker that must look up a finished run's secrets is served them only while
   the run is active or a publication of its work is still in flight. A cross-check
   child is served only while its check is open and before its deadline, or while
@@ -153,8 +180,10 @@ denied:
   `NODE`, `NODE_OPTIONS`, `UV_USE_IO_URING`, `JAVA_TOOL_OPTIONS`, `NETRC`,
   `CURL_CA_BUNDLE`, `RUBYOPT`.
 - Network and cloud endpoint settings the harness reads, such as
-  `AWS_EC2_METADATA_SERVICE_ENDPOINT`, and any `OTEL_EXPORTER_OTLP_*`,
-  `GCE_METADATA_*` or `AWS_ENDPOINT_URL_BEDROCK*` name.
+  `AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AWS_ENDPOINT_URL` (the global AWS
+  endpoint override also routes Bedrock traffic), and any `OTEL_EXPORTER_OTLP_*`,
+  `GCE_METADATA_*` or `AWS_ENDPOINT_URL_BEDROCK*` name. The other non-Bedrock
+  per-service names, such as `AWS_ENDPOINT_URL_STS`, stay allowed.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
 
@@ -165,7 +194,9 @@ are examples; the full list is `fixtures/run-env/name-rules.json`.
 
 Saving or enabling a variable checks the full list. **Disable** and **Delete**
 check only the name's shape, so a stored variable whose name a later rule denies
-can still be removed.
+can still be removed. Names are checked on write only, so a stored variable whose
+name a later rule denies is dropped at injection by a worker that has the rule,
+with a run event naming the rule.
 
 ## Entering a value
 

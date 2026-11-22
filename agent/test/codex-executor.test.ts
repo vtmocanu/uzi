@@ -32814,7 +32814,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: JSON.stringify({ summary: `Plan summary built with ${params.binding.capability}`, deltas: [] }),
+            return { text: JSON.stringify({ summary: `Plan summary built by ${params.binding.capability === next.capability ? "flight B" : "another flight"}`, deltas: [] }),
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
@@ -32838,7 +32838,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: `Intent summary built with ${params.binding.capability}`,
+            return { text: `Intent summary built by ${params.binding.capability === next.capability ? "flight B" : "another flight"}`,
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
@@ -35931,7 +35931,7 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(bInputsAtFinish, 0, "retired A plan callback never builds or posts with B");
               assert.equal(planInputs.filter(input => input.capability === next.capability).length, 1,
                 "only B's own retried gate summarises, with B's credential");
-              assert.deepEqual(planPostRequests, [{ runId: claim.run_id, summary: `Plan summary built with ${next.capability}` }],
+              assert.deepEqual(planPostRequests, [{ runId: claim.run_id, summary: "Plan summary built by flight B" }],
                 "exactly one B plan summary post for this run before cancellation");
             } else {
               // Preconditions, recorded when the executor suspension was entered and when the barrier was released.
@@ -36258,7 +36258,7 @@ describe("M2 actualRunner credential replacement", () => {
               const followInputs = intentInputs.slice(inputsBefore), followBuilds = summaryBuilds.slice(buildsBefore);
               assert.equal(followInputs.length, 1, "B intent summary uses B's credential");
               assert.deepEqual(followInputs[0], { capability: next.capability, authMode: next.auth_mode }, "B intent summary uses B's credential");
-              assert.deepEqual(intentPosts, [`Intent summary built with ${next.capability}`], "exactly one B intent summary post");
+              assert.deepEqual(intentPosts, ["Intent summary built by flight B"], "exactly one B intent summary post");
               assert.equal(followBuilds.length, 1, "exactly one B intent build");
               assert.deepEqual([followBuilds[0]?.capability, followBuilds[0]?.authMode], [next.capability, next.auth_mode], "exactly one B intent build");
               const followFeed = api.messages(claim.run_id).slice(switchedFeedLength);

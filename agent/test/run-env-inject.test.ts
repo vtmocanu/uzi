@@ -2,10 +2,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
-import { buildCommandEnv, withCommandGitTrust } from "../src/codex/codex-executor.js";
-import { foldRunEnv, runEnvDropText } from "../src/run-env-inject.js";
-import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "../src/sdk-env.js";
+import { buildCommandEnv, commandRunEnvInjected, withCommandGitTrust } from "../src/codex/codex-executor.js";
+import { foldRunEnv, runEnvDropText, runEnvInjectedSet } from "../src/run-env-inject.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { RUN_ENV_DENIED_NAMES, RUN_ENV_DENIED_PREFIXES } from "../src/run-env-names.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
@@ -138,6 +138,99 @@ describe("foldRunEnv protected predicate", () => {
   });
 });
 
+describe("runEnvInjectedSet", () => {
+  const names = (vars: readonly ClaimRunEnvVar[]): string[] => vars.map((x) => x.name);
+
+  it("names the same variables and drops, in the same order, as foldRunEnv over the same env", () => {
+    const pre: Record<string, string | undefined> = { PRESET_KEY: "x", UNSET_KEY: undefined, PINNED_KEY: "p" };
+    const vars = [...hostile, v("PRESET_KEY"), v("UNSET_KEY"), v("PINNED_KEY"), v("TWICE_NAMED", "first"), v("TWICE_NAMED", "second"), v("LAST_ONE")];
+    const isProtected = (k: string): boolean => k === "PINNED_KEY";
+    const env = { ...pre };
+    const { drops, onDrop } = collector();
+    const folded = foldRunEnv(env, { vars, onDrop }, isProtected);
+    const set = runEnvInjectedSet(vars, Object.keys(pre), isProtected);
+    assert.deepEqual(set.injected, folded);
+    assert.deepEqual(set.dropped.map((d) => [d.name, d.rule]), drops);
+    assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(pre, k)).sort(), names(set.injected).sort());
+    assert.deepEqual(set.injected.filter((x) => x.name === "TWICE_NAMED").map((x) => x.value), ["first"], "the first of two same-named variables wins");
+    assert.ok(!set.injected.some((x) => ["PRESET_KEY", "UNSET_KEY", "PINNED_KEY"].includes(x.name)));
+  });
+
+  it("foldRunEnv applies exactly a precomputed set and nothing else", () => {
+    const vars = [v("FIRST_ONE"), v("SECOND_ONE")];
+    const target: Record<string, string | undefined> = {};
+    const folded = foldRunEnv(target, { vars, set: { injected: [vars[0]!], dropped: [{ name: "SECOND_ONE", rule: "test rule" }] } }, () => false);
+    assert.deepEqual(names(folded), ["FIRST_ONE"]);
+    assert.deepEqual(Object.keys(target), ["FIRST_ONE"]);
+  });
+
+  it("foldRunEnv throws on a precomputed set that holds a protected, invalid or already-set name, leaving env unchanged", () => {
+    const secretValue = "dummy-secret-run-value-000000";
+    const bad = (name: string): ClaimRunEnvVar => v(name, secretValue);
+    for (const name of ["PINNED_KEY", "PATH", "lower-case", "PRESET_KEY"]) {
+      const target: Record<string, string | undefined> = { PRESET_KEY: "x" };
+      const vars = [v("FIRST_ONE"), bad(name)];
+      assert.throws(
+        () => foldRunEnv(target, { vars, set: { injected: vars, dropped: [] } }, (k) => k === "PINNED_KEY"),
+        (e: Error) => e.message.includes(name) && !e.message.includes(secretValue),
+        name,
+      );
+      assert.deepEqual(target, { PRESET_KEY: "x" }, `${name}: env unchanged`);
+    }
+    const dup = [v("DUP_ONE"), v("DUP_ONE")];
+    const dupTarget: Record<string, string | undefined> = { PRESET_KEY: "x" };
+    assert.throws(
+      () => foldRunEnv(dupTarget, { vars: dup, set: { injected: dup, dropped: [] } }, () => false),
+      (e: Error) => e.message.includes("DUP_ONE"),
+      "duplicate name",
+    );
+    assert.deepEqual(dupTarget, { PRESET_KEY: "x" }, "duplicate name: env unchanged");
+  });
+
+  it("is pure: it reads no env and leaves its inputs unchanged", () => {
+    const vars = [v("A_ONE"), v("PATH")];
+    const keys = ["X_KEY"];
+    const before = JSON.stringify([vars, keys]);
+    runEnvInjectedSet(vars, keys, () => false);
+    assert.equal(JSON.stringify([vars, keys]), before);
+  });
+
+  it("buildSdkEnv injects exactly sdkRunEnvInjected's list, tool-profile shadows included", () => {
+    const cred: SdkCredential = { kind: "oauth", token: "dummy-oauth-token-do-not-scan-0000" };
+    const tool = { NPM_TOKEN: "from-tool-profile", NIX_SSL_CERT_FILE: "/nix/ca.pem" };
+    const vars = [...hostile, v("NPM_TOKEN"), v("REGION")];
+    const base = buildSdkEnv(cred, "/h", tool);
+    const set = sdkRunEnvInjected(vars, cred, "/h", tool);
+    const injected = set.injected;
+    const { drops, onDrop } = collector();
+    const env = buildSdkEnv(cred, "/h", tool, undefined, undefined, undefined, undefined, { vars, set, onDrop });
+    assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(base, k)).sort(), names(injected).sort());
+    assert.ok(names(injected).includes("REGION"), "the set is not empty");
+    assert.ok(!names(injected).includes("NPM_TOKEN"));
+    assert.equal(env.NPM_TOKEN, "from-tool-profile");
+    assert.deepEqual(drops, set.dropped.map((d) => [d.name, d.rule]), "the builder reports the set's drops");
+    assert.deepEqual(sdkRunEnvInjected([], cred, "/h", tool).injected, []);
+    const computed = buildSdkEnv(cred, "/h", tool, undefined, undefined, undefined, undefined, { vars });
+    assert.deepEqual(env, computed, "folding the precomputed set equals folding over the env");
+  });
+
+  it("buildCommandEnv injects exactly commandRunEnvInjected's list, tool-profile shadows included", () => {
+    const tool = { PATH: "/nix/bin", NPM_TOKEN: "from-tool-profile" };
+    const vars = [...hostile, v("NPM_TOKEN"), v("REGION")];
+    const base = buildCommandEnv("/private/tmp", tool);
+    const set = commandRunEnvInjected(vars, "/private/tmp", tool);
+    const injected = set.injected;
+    const { drops, onDrop } = collector();
+    const env = buildCommandEnv("/private/tmp", tool, undefined, false, { vars, set, onDrop });
+    assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(base, k)).sort(), names(injected).sort());
+    assert.ok(names(injected).includes("REGION"), "the set is not empty");
+    assert.ok(!names(injected).includes("NPM_TOKEN"));
+    assert.equal(env.NPM_TOKEN, "from-tool-profile");
+    assert.deepEqual(drops, set.dropped.map((d) => [d.name, d.rule]), "the builder reports the set's drops");
+    assert.deepEqual(env, buildCommandEnv("/private/tmp", tool, undefined, false, { vars }), "folding the precomputed set equals folding over the env");
+  });
+});
+
 describe("dropped-name event text", () => {
   it("sanitizes the name and never carries a value", () => {
     const text = runEnvDropText("BAD\u001b[31mNAME\u0000", "must match the name shape");
@@ -192,11 +285,11 @@ describe("only the lead lane receives run variables", () => {
 });
 
 describe("registered forms of secret variables", () => {
-  const redactor = (runEnv: ClaimRunEnvVar[], redact: ClaimRunEnvRedact[] = []) => makeTextRedactor(runEnvRedactionForms(runEnv, redact));
+  const redactor = (runEnv: ClaimRunEnvVar[], redact: ClaimRunEnvRedact[] = []) => makeTextRedactor(runEnvClaimForms(runEnv, redact).redaction);
   const SECRET = "s3cr3t-pa55word-xyz";
 
   it("hard-coded base64 alignments of a known value", () => {
-    const forms = runEnvRedactionForms([v("X", "abcdefgh", true)], []);
+    const forms = runEnvClaimForms([v("X", "abcdefgh", true)], []).redaction;
     assert.ok(forms.includes("abcdefgh"));
     for (const f of ["YWJjZGVmZ2", "FiY2RlZmdo", "hYmNkZWZna"]) assert.ok(forms.includes(f), f);
   });
@@ -230,7 +323,7 @@ describe("registered forms of secret variables", () => {
   });
 
   it("does not register a plain value", () => {
-    assert.deepEqual(runEnvRedactionForms([v("PLAIN_SETTING", "plain-value-visible", false)], []), []);
+    assert.deepEqual(runEnvClaimForms([v("PLAIN_SETTING", "plain-value-visible", false)], []).redaction, []);
     const text = "the value is plain-value-visible";
     assert.equal(redactor([v("PLAIN_SETTING", "plain-value-visible", false)])(text), text);
   });
@@ -242,8 +335,8 @@ describe("registered forms of secret variables", () => {
   });
 
   it("drops forms shorter than 8 characters and deduplicates", () => {
-    for (const f of runEnvRedactionForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], [])) assert.ok(f.length >= 8);
-    const forms = runEnvRedactionForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []);
+    for (const f of runEnvClaimForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []).redaction) assert.ok(f.length >= 8);
+    const forms = runEnvClaimForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []).redaction;
     assert.equal(new Set(forms).size, forms.length);
   });
 });
@@ -263,10 +356,10 @@ describe("the executors pass the run variables to the env builders", () => {
     assert.equal(cmd.DB_PASSWORD, "dummy-secret-run-value-000000");
   });
 
-  it("the spawn sites of both executors pass ctx.runEnv", () => {
+  it("the spawn sites of both executors pass ctx.runEnv and the precomputed set (call-site pin)", () => {
     const sdkSrc = fs.readFileSync(path.join(srcDir, "sdk-executor.ts"), "utf8");
-    assert.match(sdkSrc, /buildSdkEnv\(credential,[^;]*ctx\.runEnv && ctx\.runEnv\.length > 0\s*\?\s*\{ vars: ctx\.runEnv/s);
+    assert.match(sdkSrc, /buildSdkEnv\(credential,[^;]*ctx\.runEnv && runEnvSet\s*\?\s*\{ vars: ctx\.runEnv, set: runEnvSet/s);
     const codexSrc = fs.readFileSync(path.join(srcDir, "codex", "codex-executor.ts"), "utf8");
-    assert.match(codexSrc, /buildCommandEnv\([\s\S]{0,900}?ctx\.runEnv && ctx\.runEnv\.length > 0\s*\?\s*\{ vars: ctx\.runEnv/s);
+    assert.match(codexSrc, /buildCommandEnv\([\s\S]{0,900}?ctx\.runEnv && runEnvSet\s*\?\s*\{ vars: ctx\.runEnv, set: runEnvSet/s);
   });
 });

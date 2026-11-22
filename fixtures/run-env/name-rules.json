@@ -903,6 +903,11 @@
       "value": "AWS_EC2_METADATA_SERVICE_ENDPOINT",
       "invariant": "network_wiring",
       "note": "metadata endpoint the harness's AWS SDK reads"
+    },
+    {
+      "value": "AWS_ENDPOINT_URL",
+      "invariant": "network_wiring",
+      "note": "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for"
     }
   ],
   "denied_prefixes": [
@@ -1297,8 +1302,8 @@
     {
       "name": "AWS_ENDPOINT_URL",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for; denied as a network_wiring name"
     },
     {
       "name": "AWS_ENDPOINT_URL_BEDROCK",

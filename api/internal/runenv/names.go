@@ -201,6 +201,7 @@ var deniedNames = []deniedRule{
 	{"NODE_PENDING_PIPE_INSTANCES", "process_loader", "Node pipe instance count on Windows"},
 	{"UV_USE_IO_URING", "process_loader", "libuv I/O backend of every Node process, harness included"},
 	{"AWS_EC2_METADATA_SERVICE_ENDPOINT", "network_wiring", "metadata endpoint the harness's AWS SDK reads"},
+	{"AWS_ENDPOINT_URL", "network_wiring", "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for"},
 }
 
 // deniedPrefixes are name prefixes reserved for the worker and the agent harnesses.

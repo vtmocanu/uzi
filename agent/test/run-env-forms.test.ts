@@ -4,7 +4,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { createLogger } from "../src/log.js";
 import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
-import { runEnvRedactionForms, runEnvScanNeedles } from "../src/run-env-forms.js";
+import { RUN_ENV_FORM_CHARS_MAX, runEnvClaimForms } from "../src/run-env-forms.js";
 import { textHitVariables } from "../src/run-env-scan.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { fakeGitlab, git, installHarness, runnerWith } from "./runner-harness.js";
@@ -45,8 +45,8 @@ describe("whole-value encodings are redacted and found", () => {
     "percent lower": encodeURIComponent(VALUE).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()),
     "percent with plus for space": encodeURIComponent(VALUE).replaceAll("%20", "+"),
   };
-  const redact = makeTextRedactor(runEnvRedactionForms([secretVar("SVC_PASSWORD", VALUE)], []));
-  const needles = runEnvScanNeedles([secretVar("SVC_PASSWORD", VALUE)], []);
+  const redact = makeTextRedactor(runEnvClaimForms([secretVar("SVC_PASSWORD", VALUE)], []).redaction);
+  const needles = runEnvClaimForms([secretVar("SVC_PASSWORD", VALUE)], []).needles;
 
   for (const [label, form] of Object.entries(encodings)) {
     it(label, () => {
@@ -58,12 +58,12 @@ describe("whole-value encodings are redacted and found", () => {
 
   it("the three base64url alignments of a value whose base64 uses + and /", () => {
     const value = "pw-???>>>-~~~~???>>>-zz";
-    const redact = makeTextRedactor(runEnvRedactionForms([secretVar("SVC_PASSWORD", value)], []));
+    const redact = makeTextRedactor(runEnvClaimForms([secretVar("SVC_PASSWORD", value)], []).redaction);
     for (let n = 0; n < 3; n++) {
       const embedded = Buffer.from(`${"x".repeat(n)}${value}trailing`);
       assert.ok(/[+/]/.test(embedded.toString("base64")) && /[-_]/.test(embedded.toString("base64url")), "the fixture exercises both alphabets");
       const text = `t=${embedded.toString("base64url")};`;
-      assert.ok(runEnvRedactionForms([secretVar("SVC_PASSWORD", value)], []).some((f) => text.includes(f)), `alignment ${n}`);
+      assert.ok(runEnvClaimForms([secretVar("SVC_PASSWORD", value)], []).redaction.some((f) => text.includes(f)), `alignment ${n}`);
       assert.ok(redact(text).includes("***REDACTED***"), `redacted at alignment ${n}`);
     }
   });
@@ -72,20 +72,40 @@ describe("whole-value encodings are redacted and found", () => {
 describe("a variant of the value shorter than the redaction floor registers no form", () => {
   it("an 8-character value whose line break-stripped variant has 7 characters derives forms from the whole value only", () => {
     const short = "a b&c=d";
-    const forms = runEnvRedactionForms([secretVar("SHORT_VALUE", `${short}\n`)], []);
+    const forms = runEnvClaimForms([secretVar("SHORT_VALUE", `${short}\n`)], []).redaction;
     const seven = [...providerKeyForms(short), Buffer.from(short).toString("base64").slice(0, 9)].filter((f) => f.length >= 8);
     assert.ok(seven.length > 0, "the fixture has encoded forms of the 7-character variant that reach the floor");
     for (const f of seven) assert.ok(!forms.includes(f), `a form of the 7-character variant is registered: ${f}`);
     assert.ok(forms.includes(`${short}\n`), "the whole value is registered");
     assert.ok(forms.includes(encodeURIComponent(`${short}\n`)), "its own percent form is registered");
-    const scan = runEnvScanNeedles([secretVar("SHORT_VALUE", `${short}\n`)], []);
+    const scan = runEnvClaimForms([secretVar("SHORT_VALUE", `${short}\n`)], []).needles;
     for (const f of seven) assert.ok(!scan[0]!.forms.includes(f), `a form of the 7-character variant is a needle: ${f}`);
   });
 });
 
+describe("which lines of a multi-line value are registered alone", () => {
+  const redactOf = (value: string) => makeTextRedactor(runEnvClaimForms([secretVar("BACKUP_CODES", value)], []).redaction);
+  const FILLER = ["Qm9kdXMtZml4dHVyZS1hLQ", "c2Vjb25kLWZpeHR1cmUtYg"] as [string, string];
+
+  for (const code of ["11223344", "90090090"]) {
+    it(`the line ${code} is masked on its own`, () => {
+      const redact = redactOf([FILLER[0], code, FILLER[1]].join("\n"));
+      assert.ok(!redact(`log: ${code} end`).includes(code));
+    });
+  }
+
+  for (const [label, line] of [["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a whitespace run", "        "]] as const) {
+    it(`${label} is not registered alone`, () => {
+      const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
+      assert.equal(redact(`text ${line} end`), `text ${line} end`);
+      assert.ok(!redact(`text ${FILLER[0]} end`).includes(FILLER[0]), "its other lines still are");
+    });
+  }
+});
+
 describe("a multi-line secret in a unified diff", () => {
-  const needles = runEnvScanNeedles([secretVar("SIGNING_KEY", PEM)], []);
-  const redact = makeTextRedactor(runEnvRedactionForms([secretVar("SIGNING_KEY", PEM)], []));
+  const needles = runEnvClaimForms([secretVar("SIGNING_KEY", PEM)], []).needles;
+  const redact = makeTextRedactor(runEnvClaimForms([secretVar("SIGNING_KEY", PEM)], []).redaction);
   const lines = PEM.split("\n");
 
   it("is found when added as lines", () => {
@@ -109,7 +129,7 @@ describe("a multi-line secret in a unified diff", () => {
   });
 
   it("is found for a value that ends in a line break", () => {
-    const withEol = runEnvScanNeedles([secretVar("SIGNING_KEY", `${PEM}\n`)], []);
+    const withEol = runEnvClaimForms([secretVar("SIGNING_KEY", `${PEM}\n`)], []).needles;
     assert.deepEqual(textHitVariables(asPatch(lines), withEol), ["SIGNING_KEY"]);
   });
 
@@ -119,14 +139,14 @@ describe("a multi-line secret in a unified diff", () => {
 
   it("a constant line of a JSON credential is not a hit, while the whole credential is", () => {
     const credential = ["{", '  "type": "service_account",', '  "project_id": "dummy-project-0001",', '  "private_key_id": "0123456789abcdef"', "}"].join("\n");
-    const sa = runEnvScanNeedles([secretVar("GCP_CREDENTIALS", credential)], []);
+    const sa = runEnvClaimForms([secretVar("GCP_CREDENTIALS", credential)], []).needles;
     const publicLine = asPatch(['  "type": "service_account",', '  "client_email": "a@b.example"']);
     assert.deepEqual(textHitVariables(publicLine, sa), []);
     assert.deepEqual(textHitVariables(asPatch(credential.split("\n")), sa), ["GCP_CREDENTIALS"]);
   });
 
   it("registers each line for redaction but never the PEM armor, and never a line as a needle", () => {
-    const forms = runEnvRedactionForms([secretVar("SIGNING_KEY", PEM)], []);
+    const forms = runEnvClaimForms([secretVar("SIGNING_KEY", PEM)], []).redaction;
     for (const line of bodyLines("one")) assert.ok(forms.includes(line), "a body line is registered");
     assert.ok(!forms.includes(BEGIN) && !forms.includes(END), "armor is not registered");
     for (const needle of needles) for (const line of bodyLines("one")) assert.ok(!needle.forms.includes(line), "no per-line needle");
@@ -138,13 +158,13 @@ describe("a multi-line secret in a unified diff", () => {
     assert.ok(out.includes(BEGIN) && out.includes(END));
   });
 
-  it("masks the secret in a preserved patch", () => {
+  it("the redactor masks each line of a multi-line secret inside unified-diff text", () => {
     const out = redact(asPatch(lines));
     for (const line of bodyLines("one")) assert.ok(!out.includes(line));
   });
 
   it("masks the secret in a feed payload (a tool result)", () => {
-    const payloadRedact = makeRedactor(runEnvRedactionForms([secretVar("SIGNING_KEY", PEM)], []));
+    const payloadRedact = makeRedactor(runEnvClaimForms([secretVar("SIGNING_KEY", PEM)], []).redaction);
     const out = payloadRedact({ kind: "tool_result", content: [{ type: "text", text: `cat k.pem\n${PEM}` }], note: JSON.stringify(PEM) });
     const text = JSON.stringify(out);
     for (const line of bodyLines("one")) assert.ok(!text.includes(line));
@@ -203,13 +223,23 @@ describe("the largest claim redacts in bounded time", () => {
   ];
   for (const [label, lineLen, eol, trailing] of cases) {
     it(`${label} values: forms stay under the bound and a 1 MiB text redacts in under 5 s`, () => {
-      const live = Array.from({ length: limits.max_run_env_entries }, (_, i) =>
+      let live = Array.from({ length: limits.max_run_env_entries }, (_, i) =>
         secretVar(`LIVE_${i}`, value(`live-${i}`, Math.floor(limits.max_run_env_total_bytes / limits.max_run_env_entries), i % 5 === 0 ? 0 : lineLen, eol, trailing)));
-      const old = Array.from({ length: limits.max_redact_entries }, (_, i) =>
+      let old = Array.from({ length: limits.max_redact_entries }, (_, i) =>
         retired(`OLD_${i}`, value(`old-${i}`, Math.floor(limits.max_redact_total_bytes / limits.max_redact_entries), i % 5 === 0 ? 0 : lineLen, eol, trailing)));
-      const forms = runEnvRedactionForms(live, old);
+      let claim = runEnvClaimForms(live, old);
+      if (lineLen !== 0) {
+        // Multi-line values at the full store bounds pass the form budget: the claim fails closed, and the
+        // timing below runs on a claim a sixth of that size.
+        assert.ok(claim.overBudget, "the largest multi-line claim is over budget");
+        live = live.slice(0, 8);
+        old = old.slice(0, 50);
+        claim = runEnvClaimForms(live, old);
+      }
+      assert.ok(!claim.overBudget, "the claim measured is within budget");
+      const forms = claim.redaction;
       assert.ok(forms.length < MAX_FORMS, `${forms.length} forms, bound ${MAX_FORMS}`);
-      const needleForms = runEnvScanNeedles(live, old).reduce((n, x) => n + x.forms.length, 0);
+      const needleForms = claim.needles.reduce((n, x) => n + x.forms.length, 0);
       assert.ok(needleForms < MAX_NEEDLE_FORMS, `${needleForms} needle forms, bound ${MAX_NEEDLE_FORMS}`);
 
       const planted = firstLine(old[7]!.value);
@@ -236,7 +266,7 @@ describe("the largest claim redacts in bounded time", () => {
     // whole-value forms; the text repeats armor lines, so that bucket is probed at the start of every BEGIN line.
     const count = limits.max_run_env_entries;
     const pems = Array.from({ length: count }, (_, i) => secretVar(`PEM_${i}`, pem(`dense-${i}`)));
-    const forms = runEnvRedactionForms(pems, []);
+    const forms = runEnvClaimForms(pems, []).redaction;
     const armor = `${BEGIN}\n${END}\n`;
     const text = armor.repeat(Math.ceil((1024 * 1024) / armor.length));
     const started = performance.now();
@@ -257,5 +287,71 @@ describe("the largest claim redacts in bounded time", () => {
     assert.equal(indexed(text), split(text));
     assert.equal(indexed(`x ${secrets[40]} y`), "x ***REDACTED*** y");
     assert.equal(indexed(`x sec​ret-number-041-value y`), "x ***REDACTED*** y", "split by an invisible character");
+  });
+});
+
+// A multi-line value's public lines (constant JSON members, a legacy PEM header, blank padding) are never
+// registered alone, and a high-entropy line of the same value still is. Armor is joined at runtime.
+describe("public lines of a multi-line value stay readable in redacted output", () => {
+  const ENTROPY = bodyLines("one");
+  const PUBLIC = {
+    jsonType: '  "type": "service_account",',
+    authUri: '"auth_uri": "https://accounts.example.test/o/oauth2/auth",',
+    procType: "Proc-Type: 4,ENCRYPTED",
+    padding: " ".repeat(8),
+    flat: "aaaaaaaaaaaaaaaa",
+  };
+  const value = [
+    "{", PUBLIC.jsonType, PUBLIC.authUri, PUBLIC.procType, PUBLIC.padding, PUBLIC.flat,
+    `"client_email": "${ENTROPY[0]}",`, ENTROPY[1]!, ENTROPY[2]!, "}",
+  ].join("\n");
+  const claim = runEnvClaimForms([secretVar("SVC_JSON", value)], []);
+  const redact = makeTextRedactor(claim.redaction);
+
+  for (const [label, line] of Object.entries(PUBLIC)) {
+    it(`${label} is not masked`, () => {
+      const text = `before\n${line}\nafter`;
+      assert.equal(redact(text), text);
+    });
+  }
+
+  it("a high-entropy line of the same value is masked, raw and JSON-escaped", () => {
+    for (const line of [ENTROPY[1]!, ENTROPY[2]!, JSON.stringify(ENTROPY[1]).slice(1, -1)]) {
+      assert.ok(!redact(`x ${line} y`).includes(line.slice(0, 30)), "masked");
+    }
+  });
+
+  it("the per-name line forms hold the entropy lines and no public line", () => {
+    const forms = claim.lineForms.find((n) => n.name === "SVC_JSON")!.forms;
+    assert.ok(forms.includes(ENTROPY[1]!));
+    for (const line of Object.values(PUBLIC)) assert.ok(!forms.includes(line), line);
+  });
+
+  it("a claim with no multi-line value has no line forms", () => {
+    assert.deepEqual(runEnvClaimForms([secretVar("ONE_LINE", "single-line-dummy-value")], []).lineForms, []);
+  });
+});
+
+describe("the form budget", () => {
+  const big = (i: number): string => Array.from({ length: 800 }, (_, n) =>
+    crypto.createHash("sha256").update(`budget-${i}-${n}`).digest("base64")).join("\r\n") + "\r\n";
+
+  it("an over-budget claim reports it, stops building near the cap and registers only raw values", () => {
+    const old = Array.from({ length: 300 }, (_, i) => retired(`OLD_${i % 7}`, big(i)));
+    const claim = runEnvClaimForms([], old);
+    assert.equal(claim.overBudget, true);
+    assert.ok(claim.formChars > RUN_ENV_FORM_CHARS_MAX, "the cap was passed");
+    assert.ok(claim.formChars < RUN_ENV_FORM_CHARS_MAX + 4_000_000, `stopped near the cap: ${claim.formChars}`);
+    assert.deepEqual(claim.needles, []);
+    assert.deepEqual(claim.lineForms, []);
+    assert.ok(claim.redaction.includes(old[0]!.value), "the raw value is registered");
+    assert.ok(claim.redaction.length <= 4 * old.length, "and no encoded form, only each value's variants");
+  });
+
+  it("a claim under the cap is complete", () => {
+    const claim = runEnvClaimForms([secretVar("ONE", big(1))], []);
+    assert.equal(claim.overBudget, false);
+    assert.ok(claim.formChars > 0 && claim.formChars < RUN_ENV_FORM_CHARS_MAX);
+    assert.ok(claim.needles.length === 1 && claim.lineForms.length === 1);
   });
 });

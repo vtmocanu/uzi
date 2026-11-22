@@ -7,6 +7,7 @@ import { WorkerClient } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { nullLogger } from "./helpers.js";
 
 const TIP = "a".repeat(40), FLOOR = "b".repeat(40), DEFAULT = "c".repeat(40);
@@ -24,7 +25,7 @@ function fixture(defaultBranch?: string) {
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
     nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
   const claim = { repo: { default_branch: defaultBranch }, secrets: {}, last_seq: 0, kind: "issue" } as Parameters<RunRunner["buildFlight"]>[0];
-  const initialized = runner["buildFlight"](claim, "test", { run: async () => ({ branch: "task" }) }, undefined, "", []);
+  const initialized = runner["buildFlight"](claim, "test", { run: async () => ({ branch: "task" }) }, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   assert.equal(initialized.owedDefaultBranch, defaultBranch?.trim() || undefined, "custody keeps existing semantics");
   const flight = {
     ...initialized,

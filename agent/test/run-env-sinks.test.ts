@@ -10,18 +10,18 @@ import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { sanitizeNowText, trimToolFrame } from "../src/now-summary.js";
 import type { Executor } from "../src/executor.js";
-import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import type { ClaimRunEnvVar, OutgoingMessage } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
-import { api, fakeGitlab, git, gitlabClaim, installHarness, runner, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import type { SdkQueryFn } from "../src/sdk-executor.js";
+import { ScratchPublicationError } from "../src/git.js";
+import { api, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runner, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 import { nullLogger } from "./helpers.js";
 
 installHarness();
 
 // PRD 4416 M2: sinks that carry agent-authored or model-authored text out of the worker redact it with the
 // run's redactor, so a registered run-variable secret never reaches the outbound payload. Dummy values only.
-// CI evidence is not a sink: ci-evidence.ts and ci-evidence-tools.ts only download evidence and hand it to the
-// model, and no module sends CI evidence notes out of the worker.
 
 const SECRET = "dummy-secret-run-value-000000";
 const redactText = makeTextRedactor([SECRET]);
@@ -124,7 +124,7 @@ describe("the planning diff cap holds after redaction", () => {
 });
 
 describe("source pins: the executors and the runner route these payloads through the redactor", () => {
-  it("both executors post the redacted intent summary", () => {
+  it("both executors post the redacted intent summary (call-site pin)", () => {
     const src = (rel: string): string => fs.readFileSync(path.join(new URL("../src/", import.meta.url).pathname, rel), "utf8");
     for (const rel of ["sdk-executor.ts", path.join("codex", "codex-executor.ts")]) {
       assert.match(src(rel), /postIntentSummary\(ctx\.runId, ctx\.redactText\?\.\(summary\) \?\? summary\)/, rel);
@@ -133,14 +133,14 @@ describe("source pins: the executors and the runner route these payloads through
 
   const src = (rel: string): string => fs.readFileSync(path.join(new URL("../src/", import.meta.url).pathname, rel), "utf8");
 
-  it("both executors post the redacted plan summary and plan text", () => {
+  it("both executors post the redacted plan summary and plan text (call-site pin)", () => {
     for (const rel of ["sdk-executor.ts", path.join("codex", "codex-executor.ts")]) {
       const text = src(rel);
       assert.match(text, /const safe = redactPlanSummary\(result, ctx\.redactText\);\s*await [\w.!]*client[!]?\.postPlanSummary\(ctx\.runId, \{\s*\.\.\.safe, plan_md: \(ctx\.redactText\?\.\(planMd\) \?\? planMd\)/, rel);
     }
   });
 
-  it("the runner redacts the code cross-check repository instructions and passes the redactor to the planning diff", () => {
+  it("the runner redacts the code cross-check repository instructions and passes the redactor to the planning diff (call-site pin)", () => {
     const text = src("runner.ts");
     assert.match(text, /return "text" in read \? flight\.redactText\(read\.text\) : "";/);
     assert.equal((text.match(/this\.captureCheckedPlanningDiff\(.*runLog, flight\.redactText\)/g) ?? []).length, 2);
@@ -156,7 +156,7 @@ describe("questions, now summary, failure reasons and the merge request", () => 
   it("a question reaches the api through the batcher's payload redactor", async () => {
     const sent: OutgoingMessage[] = [];
     const client = { async postMessages(_id: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
-    const forms = runEnvRedactionForms([secretVar("DB_PASSWORD", SECRET)], []);
+    const forms = runEnvClaimForms([secretVar("DB_PASSWORD", SECRET)], []).redaction;
     const batcher = new MessageBatcher(client, "run-q", 0, 0, nullLogger(), makeRedactor(forms), makeTextRedactor(forms));
     batcher.emit({ kind: "question", agent: "lead", payload: { question_id: "q1", questions: [{ header: "h", question: `is ${SECRET} right?`, options: [{ label: `use ${SECRET}` }] }] } });
     await batcher.close();
@@ -168,7 +168,38 @@ describe("questions, now summary, failure reasons and the merge request", () => 
     const frame = trimToolFrame({ kind: "tool_use", agent: "lead", payload: { name: "Bash", input: { description: `deploy ${SECRET}` } } } as never, redactText);
     assert.ok(frame !== undefined && !leaked(frame));
     assert.ok(!leaked(sanitizeNowText(`working on ${SECRET}`, redactText)));
-    assert.match(src("runner.ts"), /new NowSummaryController\(\{[\s\S]{0,1200}?redact: flight\.redactText,/);
+  });
+
+  it("a now summary note the runner posts carries no value from the model's text", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(46104, { secrets: claimSecrets() });
+    api.nowSummary.set(claim.run_id, true);
+    simulateCommittedWork();
+    const HAIKU = "claude-haiku-4-5-20251001";
+    // The value starts inside the 120 rune note cap, so a cut that ran before the redaction would leave a prefix of it.
+    const NOW_FILLER = "filler ".repeat(14);
+    const queryFn = (() => (async function* () {
+      yield { type: "assistant", message: { id: "m1", model: HAIKU, role: "assistant", content: [{ type: "text", text: `${NOW_FILLER}${SECRET} for the api gate` }], usage: { input_tokens: 2, output_tokens: 2 } } };
+      yield { type: "result", subtype: "success", is_error: false, modelUsage: { [HAIKU]: { inputTokens: 2, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0001 } } };
+    })()) as unknown as SdkQueryFn;
+    const notes = () => api.messages(claim.run_id).filter((m) => m.kind === "progress_note");
+    const exec: Executor = {
+      async run(ctx) {
+        await ctx.reportProgress!({ completed: [], in_progress: ["m1"] }, [{ id: "m1", title: "Write the docs" }] as never);
+        const until = Date.now() + 4000;
+        while (notes().length === 0 && Date.now() < until) {
+          ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "task gate:api", description: "Run the api gate" } } });
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        return { branch: ctx.branch };
+      },
+    };
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { nowSummary: { homeRoot: homeDir, queryFn } }).execute(claim);
+    assert.ok(notes().length > 0, "the summary pass posted a note");
+    assert.ok(!leaked(api.messages(claim.run_id)), "no outbound message carries the value");
+    const noteText = JSON.stringify(notes());
+    for (let i = 0; i + 8 <= SECRET.length; i++)
+      assert.ok(!noteText.includes(SECRET.slice(i, i + 8)), `no note carries the fragment at ${i}`);
   });
 
   it("a failed run reports a failure reason without the value", async () => {
@@ -192,29 +223,62 @@ describe("questions, now summary, failure reasons and the merge request", () => 
     for (const call of calls) assert.ok(!(call.body ?? "").includes(SECRET), "no outbound forge body carries the value");
   });
 
-  it("every failure and park reason write goes through the run's redactor", () => {
+  it("a scratch publication failure reports a stable reason without the value in its detail", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(46105, { secrets: claimSecrets() });
+    const detail = `remote rejected ${SECRET}`;
+    const exec: Executor = { run: async () => { throw new ScratchPublicationError("candidate history", undefined, { kind: "exec_failed", step: "object_walk", detail, rawDetail: detail }); } };
+    await runner(exec, gitlab).execute(claim);
+    const reasons = api.states.filter((s) => s.runId === claim.run_id && typeof s.body.failure_reason === "string").map((s) => s.body.failure_reason as string);
+    assert.ok(reasons.some((r) => r.startsWith("scratch_publication_refused:")), JSON.stringify(reasons));
+    assert.ok(!leaked(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body)));
+    assert.ok(!leaked(api.messages(claim.run_id)));
+  });
+
+  it("the terminal journal and the state report choke points call redactFailureReason with the run's redactor (call-site pin)", () => {
     const text = src("runner.ts");
-    // The terminal journal and the state report choke point scrub the reason before it is stored or sent.
     assert.match(text, /body = redactFailureReason\(flight\.redactText, body\);/);
     assert.match(text, /body = redactFailureReason\(redactText, body\);/);
-    // Reasons composed from diff and finding text are redacted where they are composed.
-    assert.match(text, /scratchPublicationFailureReason\(err, redactText\)/);
-    assert.match(text, /composeLocalScanBlockedReason\(findings, \{ redact: redactText/);
-    assert.match(text, /composeLocalScanBlockedReason\(scan\.findings, \{ redact: redactText/);
     assert.match(text, /const reason = sanitizeForLog\(redactText\(rawReason\), Number\.POSITIVE_INFINITY\);/);
   });
 
-  it("the decisions memo, the non-closing reason and the merge request title are redacted where they are built", () => {
+  it("the local scan blocked reasons are composed with the run's redactor (call-site pin)", () => {
     const text = src("runner.ts");
-    assert.match(text, /clampUtf8Bytes\(flight\.redactText\(memo\), DECISIONS_MEMO_MAX_BYTES\)/);
-    assert.match(text, /const effectiveNonClosing = declaration \? \{ reason: flight\.redactText\(declaration\.reason\) \} : undefined;/);
-    assert.match(text, /redactNonClosingReason\(flight\.redactText, effectiveDeclared\.reason\)/);
-    assert.match(text, /redactNonClosingReason\(flight\.redactText, nonClosing\.reason\)/);
-    assert.match(text, /const title = redactText\(mrTitle\(claim, result\.scopeCapped, completionScope\)\);/);
-    assert.match(text, /title: sliceWellFormed\(redactText\(mrTitle\(claim, result\.scopeCapped, completionScope\)\), 1024\)/);
+    assert.match(text, /composeLocalScanBlockedReason\(findings, \{ redact: redactText/);
+    assert.match(text, /composeLocalScanBlockedReason\(scan\.findings, \{ redact: redactText/);
   });
 
-  it("the merge request body is built from redacted inputs", () => {
+  it("the decisions memo the client receives is redacted", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(46103, { secrets: claimSecrets() });
+    simulateCommittedWork();
+    api.decisionsMemo.get = { status: 200, body: { enabled: true, memo: null } };
+    const exec: Executor = { run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "own", agents: ["coder", "reviewer"] }, decisionsMemo: `kept ${SECRET} end` }) };
+    await runner(exec, gitlab).execute(claim);
+    assert.equal(api.decisionsMemoPosts.length, 1, "the memo was saved");
+    const saved = api.decisionsMemoPosts[0]!.body.body ?? "";
+    assert.ok(saved.startsWith("kept ") && saved.endsWith(" end"), saved);
+    assert.ok(!leaked(saved));
+  });
+
+  it("a non-closing reason declared by the executor reaches the merge request without the value", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(46106, { secrets: claimSecrets() });
+    simulateCommittedWork();
+    const exec: Executor = { run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "own", agents: ["coder", "reviewer"] }, nonClosing: { reason: `follow-up needed for ${SECRET}` } }) };
+    await runner(exec, gitlab).execute(claim);
+    assert.ok(calls.length > 0, "a merge request was opened");
+    assert.ok(calls.some((c) => (c.body ?? "").includes("follow-up needed for ")), "the reason is still rendered");
+    for (const call of calls) assert.ok(!(call.body ?? "").includes(SECRET), "no outbound forge body carries the value");
+  });
+
+  it("the completion attempt and checkpoint non-closing reasons are redacted where they are sent (call-site pin)", () => {
+    const text = src("runner.ts");
+    assert.match(text, /redactNonClosingReason\(flight\.redactText, effectiveDeclared\.reason\)/);
+    assert.match(text, /redactNonClosingReason\(flight\.redactText, nonClosing\.reason\)/);
+  });
+
+  it("the merge request body is built from redacted inputs (call-site pin)", () => {
     const text = src("runner.ts");
     assert.match(text, /lead: result\.prSummary \? redactStrings\(result\.prSummary, redactText\) : result\.prSummary,/);
     const ctx = src("pr-description-context.ts");

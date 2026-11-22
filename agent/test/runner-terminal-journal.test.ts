@@ -380,10 +380,9 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     assert.equal(flight.terminalResolved, true, "the terminal-resolved latch is set");
   });
 
-  // A failure reason longer than the 512-character cap with a registered secret that straddles character 512:
-  // the reason is scrubbed BEFORE it is cut, so no fragment of the secret reaches the outbound failure_reason.
-  // Cutting first would leave the secret's first 12 characters ("fixture-forg") in the sent reason, because the
-  // redactor never sees the whole secret. The secret here starts at 500 and ends at 524.
+  // Fixture: a failure reason longer than the 512-character cap whose registered secret spans character 512
+  // (it starts at 500 and ends at 524). The tests below check that no 8-character fragment of the secret
+  // reaches the outbound failure_reason.
   const STRADDLE_PAT = "fixture-forge-pat-000000";
   const straddlingReason = (): string => `${"x".repeat(500)}${STRADDLE_PAT} and a tail that follows the secret`;
   const assertNoFragment = (reason: string | undefined, label: string): void => {

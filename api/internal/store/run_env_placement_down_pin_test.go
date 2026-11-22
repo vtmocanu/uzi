@@ -3,43 +3,156 @@ package store_test
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 )
 
-// createFunctionBlock returns the first CREATE OR REPLACE FUNCTION ... $$ ... $$; block of one
-// section of a migration file (the Up section when down is false, the Down section otherwise).
-func createFunctionBlock(t *testing.T, file string, down bool) string {
+const placementFunction = "fn_placement_admitting_workers"
+
+// migrationSection returns the Up section (down false) or the Down section (down true) of one
+// migration file; ok is false when a Down section is asked for and the file has none.
+func migrationSection(t *testing.T, file string, down bool) (string, bool) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // fixed migrations directory
 	if err != nil {
 		t.Fatal(err)
 	}
 	up, dn, found := strings.Cut(string(raw), "-- +goose Down")
-	section := up
 	if down {
-		if !found {
-			t.Fatalf("%s has no Down section", file)
-		}
-		section = dn
+		return dn, found
 	}
-	_, rest, ok := strings.Cut(section, "CREATE OR REPLACE FUNCTION")
-	if !ok {
-		t.Fatalf("%s has no CREATE OR REPLACE FUNCTION in its %s section", file, map[bool]string{false: "Up", true: "Down"}[down])
-	}
-	end := strings.Index(rest, "$$;")
-	if end < 0 {
-		t.Fatalf("%s: the function has no closing $$;", file)
-	}
-	return "CREATE OR REPLACE FUNCTION" + rest[:end+len("$$;")]
+	return up, true
 }
 
-// The run env placement migration's Down restores the placement function exactly as the phase
-// models migration created it: the Down body equals 00499's Up body.
-func TestRunEnvPlacementDownRestoresPhaseModelsFunction(t *testing.T) {
-	down := createFunctionBlock(t, "00505_run_env_placement.sql", true)
-	prior := createFunctionBlock(t, "00499_placement_phase_models.sql", false)
-	if down != prior {
-		t.Fatalf("00505 Down function (%d bytes) differs from 00499 Up function (%d bytes)", len(down), len(prior))
+// functionBlock returns the CREATE [OR REPLACE] FUNCTION <name>( ... $$; block inside section, or
+// "" when the section does not define that function (a mention or a commented-out definition is
+// not a definition).
+func functionBlock(t *testing.T, file, section, name string) string {
+	t.Helper()
+	block, closed := findFunctionBlock(section, name)
+	if block != "" && !closed {
+		t.Fatalf("%s: the %s definition has no closing $$;", file, name)
+	}
+	return block
+}
+
+// findFunctionBlock is the pure half of functionBlock: the block runs from the start of the first
+// uncommented definition to its closing $$;. closed is false when a definition has no closing $$;
+// (the block then runs to the end of the section).
+func findFunctionBlock(section, name string) (block string, closed bool) {
+	def := regexp.MustCompile(`(?is)\bCREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+(public\.)?` + regexp.QuoteMeta(name) + `\s*\(`)
+	for _, loc := range def.FindAllStringIndex(section, -1) {
+		lineStart := strings.LastIndex(section[:loc[0]], "\n") + 1
+		if strings.Contains(section[lineStart:loc[0]], "--") {
+			continue
+		}
+		rest := section[loc[0]:]
+		end := strings.Index(rest, "$$;")
+		if end < 0 {
+			return rest, false
+		}
+		return rest[:end+len("$$;")], true
+	}
+	return "", false
+}
+
+// fromFunctionKeyword is a definition block from its FUNCTION keyword on, so a CREATE FUNCTION
+// predecessor and a CREATE OR REPLACE FUNCTION Down with the same body compare equal.
+func fromFunctionKeyword(block string) string {
+	loc := regexp.MustCompile(`(?i)\bFUNCTION\b`).FindStringIndex(block)
+	if loc == nil {
+		return block
+	}
+	return block[loc[0]:]
+}
+
+func TestFromFunctionKeyword(t *testing.T) {
+	a := fromFunctionKeyword("CREATE FUNCTION fn_x() AS $$ x $$;")
+	b := fromFunctionKeyword("CREATE OR REPLACE FUNCTION fn_x() AS $$ x $$;")
+	if a != b || a != "FUNCTION fn_x() AS $$ x $$;" {
+		t.Fatalf("got %q and %q", a, b)
+	}
+	if fromFunctionKeyword("CREATE FUNCTION fn_x() AS $$ y $$;") == b {
+		t.Fatal("different bodies compare equal")
+	}
+}
+
+func TestFindFunctionBlock(t *testing.T) {
+	const body = "() RETURNS int AS $$ SELECT 1 $$;"
+	cases := []struct {
+		name, section, want string
+	}{
+		{"plain create function", "-- +goose Up\nCREATE FUNCTION fn_x" + body + "\nSELECT 2;", "CREATE FUNCTION fn_x" + body},
+		{"or replace, schema, spacing", "create  or\treplace function public.fn_x  (" + ") AS $$ x $$;", "create  or\treplace function public.fn_x  (" + ") AS $$ x $$;"},
+		{"mention only", "-- fn_x is defined elsewhere\nSELECT fn_x();\nCOMMENT ON FUNCTION fn_x() IS 'y';", ""},
+		{"commented-out definition", "-- CREATE FUNCTION fn_x" + body + "\nSELECT 1;", ""},
+		{"commented-out then real", "-- CREATE FUNCTION fn_x() $$ old $$;\nCREATE OR REPLACE FUNCTION fn_x() AS $$ new $$;", "CREATE OR REPLACE FUNCTION fn_x() AS $$ new $$;"},
+		{"other function", "CREATE FUNCTION fn_xy" + body, ""},
+	}
+	for _, c := range cases {
+		got, closed := findFunctionBlock(c.section, "fn_x")
+		if got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+		if c.want != "" && !closed {
+			t.Errorf("%s: want closed block", c.name)
+		}
+	}
+}
+
+// The run env placement migration's Down restores fn_placement_admitting_workers exactly as the
+// latest earlier migration that defines it left it. That predecessor is derived, not named: the
+// run env placement migration is the one file matching *_run_env_placement.sql, and the
+// predecessor is the highest-numbered earlier migration whose Up section defines the function.
+func TestRunEnvPlacementDownRestoresPredecessorFunction(t *testing.T) {
+	matches, err := filepath.Glob(filepath.Join("migrations", "*_run_env_placement.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("want exactly one migrations/*_run_env_placement.sql, got %v", matches)
+	}
+	placement := filepath.Base(matches[0])
+
+	all, err := filepath.Glob(filepath.Join("migrations", "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var earlier []string
+	for _, m := range all {
+		if base := filepath.Base(m); base < placement {
+			earlier = append(earlier, base)
+		}
+	}
+	sort.Strings(earlier)
+
+	var prior, priorFile string
+	for i := len(earlier) - 1; i >= 0; i-- {
+		up, _ := migrationSection(t, earlier[i], false)
+		if block := functionBlock(t, earlier[i], up, placementFunction); block != "" {
+			prior, priorFile = block, earlier[i]
+			break
+		}
+	}
+	if prior == "" {
+		t.Fatalf("no migration below %s defines %s in its Up section", placement, placementFunction)
+	}
+	t.Logf("%s Down is compared with the Up of %s", placement, priorFile)
+
+	downSection, found := migrationSection(t, placement, true)
+	if !found {
+		t.Fatalf("%s has no Down section", placement)
+	}
+	down := functionBlock(t, placement, downSection, placementFunction)
+	if down == "" {
+		t.Fatalf("%s Down does not define %s", placement, placementFunction)
+	}
+	if !regexp.MustCompile(`(?is)^CREATE\s+OR\s+REPLACE\s+FUNCTION\b`).MatchString(down) {
+		t.Fatalf("%s Down must redefine %s with CREATE OR REPLACE FUNCTION", placement, placementFunction)
+	}
+	if fromFunctionKeyword(down) != fromFunctionKeyword(prior) {
+		t.Fatalf("%s Down function (%d bytes) differs from %s Up function (%d bytes)", placement, len(down), priorFile, len(prior))
 	}
 }

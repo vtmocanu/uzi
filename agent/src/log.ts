@@ -6,7 +6,7 @@
 // from the final serialized line, so an accidental `log.info("...", { url })`
 // that embedded a token cannot leak it.
 
-import { literalSpanFinder, PER_SECRET_MAX, replaceSpans, type SpanFinder } from "./redact.js";
+import { LiteralIndex, PER_SECRET_MAX, replaceSpans } from "./redact.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -51,16 +51,18 @@ const REDACTED = "***REDACTED***";
 class SecretRegistry {
   private readonly counts = new Map<string, number>();
 
-  /** The single-pass finder over every registered string and its JSON-escaped form, built when a long list
-   *  is first scrubbed against and dropped whenever the set of strings changes. */
-  private indexed: SpanFinder | undefined;
+  /** Every registered string and its JSON-escaped form, built when the registry first passes PER_SECRET_MAX
+   *  strings and kept current by every add and remove after that. Its own reference counts keep a form that
+   *  two registered strings share (the escaped form of one can equal another). */
+  private index: LiteralIndex | undefined;
 
   add(secret: string): void {
     // Guard against short/empty values whose blanket replacement would corrupt
     // unrelated output.
     if (secret && secret.length >= 8) {
-      if (!this.counts.has(secret)) this.indexed = undefined;
-      this.counts.set(secret, (this.counts.get(secret) ?? 0) + 1);
+      const held = this.counts.get(secret);
+      this.counts.set(secret, (held ?? 0) + 1);
+      if (held === undefined) this.indexForms(secret, (form) => this.index?.add(form));
     }
   }
 
@@ -69,19 +71,25 @@ class SecretRegistry {
     if (n === undefined) return; // never added, or already fully evicted
     if (n <= 1) {
       this.counts.delete(secret);
-      this.indexed = undefined;
+      this.indexForms(secret, (form) => this.index?.remove(form));
     } else this.counts.set(secret, n - 1);
   }
 
+  /** Applies `apply` to the secret and, when it differs, its JSON-escaped form. */
+  private indexForms(secret: string, apply: (form: string) => void): void {
+    apply(secret);
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    if (escaped !== secret) apply(escaped);
+  }
+
   scrub(line: string): string {
-    // A run's secret variables register a form per line of every multi-line value: past this many strings one
-    // indexed pass replaces the pass per string.
     if (this.counts.size > PER_SECRET_MAX) {
-      this.indexed ??= literalSpanFinder([...this.counts.keys()].flatMap((s) => {
-        const escaped = JSON.stringify(s).slice(1, -1);
-        return escaped === s ? [s] : [s, escaped];
-      }));
-      return replaceSpans(line, this.indexed(line));
+      if (this.index === undefined) {
+        const index = new LiteralIndex();
+        for (const s of this.counts.keys()) this.indexForms(s, (form) => index.add(form));
+        this.index = index;
+      }
+      return replaceSpans(line, this.index.find(line));
     }
     let out = line;
     for (const s of this.counts.keys()) {

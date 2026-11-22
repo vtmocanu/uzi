@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SecretSet } from "../src/redact.js";
+import { createHash } from "node:crypto";
+import { PER_SECRET_MAX, SecretSet } from "../src/redact.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 
 const REDACTED = "***REDACTED***";
 // Assembled at runtime so no provider-token-shaped literal sits in source.
@@ -58,5 +60,44 @@ describe("SecretSet", () => {
       assert.equal(out, `a ${REDACTED} b`);
       assert.ok(!out.includes(SECOND.slice(0, half)));
     }
+  });
+});
+
+describe("SecretSet over a run's secret variable forms", () => {
+  const ENTROPY = Array.from({ length: 80 }, (_, i) => createHash("sha256").update(`entropy-${i}`).digest("base64"));
+  const value = ["{", '  "type": "service_account",', "Proc-Type: 4,ENCRYPTED", " ".repeat(8), ...ENTROPY, "}"].join("\n");
+  const claim = runEnvClaimForms([
+    { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "SVC_JSON", value, secret: true, description: "" },
+  ], []);
+
+  it("the claim registers more forms than the per-secret path serves", () => {
+    assert.ok(claim.redaction.length > PER_SECRET_MAX, `${claim.redaction.length} forms`);
+  });
+
+  it("leaves public lines and padding unmasked and masks an entropy line, in text and payloads", () => {
+    const set = new SecretSet(claim.redaction);
+    for (const line of ['  "type": "service_account",', "Proc-Type: 4,ENCRYPTED", " ".repeat(8)]) {
+      assert.equal(set.text(`a\n${line}\nb`), `a\n${line}\nb`);
+      assert.deepEqual(set.payload({ k: line }), { k: line });
+    }
+    assert.equal(set.text(`a ${ENTROPY[1]} b`), `a ${REDACTED} b`);
+    assert.deepEqual(set.payload({ k: [ENTROPY[2]] }), { k: [REDACTED] });
+  });
+
+  it("a form added after the redactors were handed out is masked on the indexed path", () => {
+    const set = new SecretSet(claim.redaction);
+    const late = "late-added-form-0123456789";
+    assert.equal(set.text(late), late);
+    set.add(late);
+    assert.equal(set.text(`x ${late} y`), `x ${REDACTED} y`);
+    assert.equal(set.text(`x ${ENTROPY[0]} y`), `x ${REDACTED} y`);
+  });
+
+  it("an invisible separator inside a form added late is still matched on the indexed path", () => {
+    const set = new SecretSet(claim.redaction);
+    set.text("warm the index");
+    const late = "split-by-invisible-0123456789";
+    set.add(late);
+    assert.equal(set.text(`x ${late.slice(0, 8)}​${late.slice(8)} y`), `x ${REDACTED} y`);
   });
 });
