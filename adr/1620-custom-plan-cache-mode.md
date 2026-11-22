@@ -322,7 +322,8 @@ run, and the harness removes it in both measured idle clones per scale).
 2. At every size, `auto` used 5 custom plans and switched to the generic plan on call 6. The custom-plan estimate was about the generic estimate + 11.5 at 1k runs and + 27 from 10k up.
 3. At (c), generic execution was never slower than custom by median: 6.9-7.4 ms vs 7.9-8.4 ms.
 
-So `auto` never stayed custom, and steady-state idle `ClaimRun` is about 0.95 ms. The cost is
+So `auto` never stayed custom, and steady-state idle `ClaimRun` is about 1 ms (T3: 0.12-0.16 ms
+planning plus about 0.8 ms execution). The cost is
 per fresh connection or per re-prepare: 5 custom plans plus the generic build, about 420 ms
 over the first 11 calls.
 
@@ -340,7 +341,7 @@ causal effect was not established.
 | Scenario | base | C2 | Note |
 |---|---|---|---|
 | (b) queued run this worker cannot claim | 2.27 ms | 2.40 ms | `ClaimRun` still runs: the stated residual |
-| (d) backlog of 300 queued runs | 28.55 ms | 29.43 ms (+0.9 ms, +3%) | isolated statement unchanged, about 27.1 ms |
+| (d) backlog of 300 queued runs | 28.55 ms | 29.43 ms (+0.9 ms, +3%) | isolated statement unchanged, about 27.1 ms (indicative, see method note 2) |
 | (e) row locked by another session | 6.74 ms | 6.94 ms | |
 
 All outcomes were correct: (d) claimed and (e) idle.
@@ -367,11 +368,12 @@ owner accepted about 0.25 ms (about 3%) of extra cost on claimable polls. The en
 figure is +0.88 ms (+4%), recorded as measured: larger in absolute terms than the M1 segment
 estimate, similar in relative terms.
 
-**Improvement target, stated after measurement.** On an idle-empty owner queue, end-to-end
-`Service.Claim` p50 falls by at least 40% and a fresh connection's first 11 polls by at least
-90%, with `ClaimRun` sent 0 times. Measured: -45.6% and -94%, with 0 `ClaimRun`, so the target
-is met. Accepted cost on non-empty queues: one extra round trip, at most about 1 ms per poll end
-to end. Measured: +0.88 ms (+4.0%) for claimable and +0.15 ms (+5.3%) for
+**Improvement target (post hoc, proposed for owner review).** These thresholds were set after
+measurement, so meeting them is a description of the result rather than independent evidence.
+On an idle-empty owner queue, end-to-end `Service.Claim` p50 falls by at least 40% and a fresh
+connection's first 11 polls by at least 90%, with `ClaimRun` sent 0 times; measured -45.6% and
+-94%, with 0 `ClaimRun`. Proposed bound on non-empty queues: one extra round trip, at most about
+1 ms per poll end to end. Measured: +0.88 ms (+4.0%) for claimable and +0.15 ms (+5.3%) for
 queued-but-ineligible polls, inside that absolute bound. The claimable figure exceeds the about 0.25 ms
 segment estimate the owner accepted before M3, and is reported with this PR rather than
 treated as pre-approved.
@@ -379,13 +381,13 @@ treated as pre-approved.
 **Method notes and deviations.**
 
 1. Stage F (a fixture feasibility check: 13 cell clones, plus 4 profile-capture clones) and stage S (the scale diagnostic: 6 templates, each with 2 measured clones and 2 EXPLAIN clones, plus 1 capture clone per invocation) ran in addition to the pre-registered 119-cell table. Together with the table they exceed the plan's 120-cell cap. That expansion was not reported to the owner beforehand; the owner was told about S's results when choosing the fix, and F produced no timing claim.
-2. When this record was taken, the harness also ran an isolated-statement pass in each M1 cell. That roughly doubled the `ClaimRun` executions above the plan's stated bound of 11,861, and it shared the cell's clone. The pass is now off by default (`UZI_CLAIMRUN_PLAN_ISOLATED=1` enables it), so a default reproduction stays within the bound and never measures on a clone that carries rolled-back writes.
+2. When this record was taken, the harness also ran an isolated-statement pass in each M1 cell. That roughly doubled the `ClaimRun` executions above the plan's stated bound of 11,861, and it ran on the cell's clone after the segment phase, inheriting that phase's residue. The pass is now off by default (`UZI_CLAIMRUN_PLAN_ISOLATED=1` enables it), so a default reproduction stays within the execution bound and drops that second phase's extra residue. Within a claimable segment phase, each rolled-back call still leaves dead tuples for the next (autovacuum is off), equally for every candidate.
 3. The harness re-runs ANALYZE on `runs`, `workers` and `cross_checks` in each clone after the scenario change (`UZI_CLAIMRUN_PLAN_CLONE_ANALYZE`, on by default).
 4. Profile p1 replays lane `''`, while the real service sends `'run'`. The SQL treats them identically.
 5. The backlog (d) used 300 runs.
 6. The fallback reserve R was not needed.
 
 **Residual and limits.** A queued run this worker cannot claim (b) still pays a full
-`ClaimRun` per poll. The production cause of the per-call planning cost is not established,
+`ClaimRun` per poll. Whether production pays per-call planning, and why, is not established,
 so the precheck removes the idle-queue cost but is not shown to remove the production
 symptom in general.

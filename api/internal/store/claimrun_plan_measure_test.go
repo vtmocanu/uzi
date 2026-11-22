@@ -506,7 +506,8 @@ func (e *cpEnv) binding(ctx context.Context, p *cpProfile) *cpBinding {
 	t := e.t
 	var args []any
 	e.lab.withClone(ctx, "cap_"+p.name, func(_, dsn string, obs *pmObserver) {
-		// Bindings do not depend on which run is queued. Capture with exactly one queued run this
+		// No binding reads this seeded run's columns (it has no reserve exemption, so
+		// ReserveOverrideEnded stays empty). Capture with exactly one queued run this
 		// worker can never claim (a required capability it lacks): the owner's queue is non-empty,
 		// so the #4602 idle precheck (HasQueuedRunForUser) passes on a fixed tree and ClaimRun
 		// executes authoritatively on base and fix alike, yet claims nothing.
