@@ -36966,6 +36966,151 @@ describe("M2 provider executor composition", () => {
     assert.equal(rig.client.refreshCalls.length, 0);
   });
 
+  for (const sensitive of [false, true]) {
+    it(`M2 bounded provider failed root diagnostic sensitive=${sensitive}`, async () => {
+      const key = ["failure-fixture", '"', "/", "<>&", "tail"].join("");
+      const inputs = sensitive ? [key, 'failure-fixture\\"/<>&tail',
+        'failure-fixture\\"\\/<>&tail', "failure-fixture%22%2F%3C%3E%26tail",
+        'failure-fixture\\"/\\u003c\\u003e\\u0026tail'] : ["clean-alpha", "clean-beta"];
+      const payload = { control: "failure-control",
+        ...Object.fromEntries(inputs.map((value, ordinal) => [value, { value, ordinal }])) };
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+      const forms = providerKeyForms(key);
+      if (sensitive) for (const input of inputs) assert.ok(forms.includes(input));
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) => {
+        transport.push({
+          kind: "turn_completed", method: "turn/completed", threadId: th, turnId: tn, status: "failed",
+          params: { threadId: th, turn: { id: tn, status: "failed",
+            error: { codexErrorInfo: "badRequest", message: JSON.stringify(payload), additionalDetails: payload } } },
+        });
+      }) });
+      const { logger, lines } = recordingLogger();
+      const posted: OutgoingMessage[] = [];
+      const batcher = new MessageBatcher({ postMessages: async (_id: string, messages: OutgoingMessage[]) => {
+        posted.push(...messages);
+      } } as unknown as WorkerClient, "run-1", 0, 5, logger, makeRedactor(forms), makeTextRedactor(forms));
+      const { ctx, emitted } = makeCtx({ redactText: makeTextRedactor(forms) });
+      const capture = ctx.emit;
+      ctx.emit = message => { capture(message); batcher.emit(message); };
+      let failure: unknown;
+      try { await makeExecutor(rig, binding, logger).run(ctx); }
+      catch (error) { failure = error; }
+      finally { rig.transport.end(); await batcher.close(); }
+      assert.ok(failure instanceof Error);
+      assert.equal(failure.message, "codex turn failed: failed (badRequest)");
+      assert.equal(rig.transport.turnStartCount, 1, "the admitted failed turn settles without retries");
+      const results = emitted.filter(m => m.kind === "error" && m.payload.event === "result");
+      assert.equal(results.length, 1, "one classified failed terminal");
+      assert.ok(posted.some(m => m.kind === "error" && m.payload.event === "result"), "failure reaches batcher posts");
+      assert.match(JSON.stringify(results), /badRequest/);
+      assert.doesNotMatch(JSON.stringify({ posted, lines }), /failure-control|clean-alpha|clean-beta/,
+        "even clean provider diagnostics are withheld from the failure projection");
+      for (const [sink, value] of Object.entries({ posted, lines, error: failure.message })) {
+        const visible = JSON.stringify(value);
+        for (const form of forms) {
+          assert.ok(!visible.includes(form), `provider key escaped ${sink}`);
+          assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), `escaped provider key escaped ${sink}`);
+        }
+      }
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
+
+  it("M2 bounded provider actual runner posts classified failure_reason", async () => {
+    const key = ["runner-failure", '"', "/", "<>&", "tail"].join("");
+    const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+    const forms = providerKeyForms(key);
+    const diagnostic = { control: "runner-failure-control",
+      ...Object.fromEntries(forms.map(value => [value, { value }])) };
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) => {
+      transport.push({
+        kind: "turn_completed", method: "turn/completed", threadId: th, turnId: tn, status: "failed",
+        params: { threadId: th, turn: { id: tn, status: "failed",
+          error: { codexErrorInfo: "badRequest", message: JSON.stringify(diagnostic), additionalDetails: diagnostic } } },
+      });
+    }) });
+    const { logger, lines } = recordingLogger();
+    const executor = makeExecutor(rig, binding, logger);
+    const claim = m2Runner.gitlabClaim(45092, {
+      plan_approved: true, plan_md: "Approved failure proof", plan_source: "seeded",
+      secrets: { forge_pat: "fixture-forge-pat-000000", provider: binding.providerBinding },
+    });
+    const forge = m2Runner.fakeGitlab();
+    await m2Runner.runnerWith(() => ({ executor }), forge.gitlab, undefined, logger).execute(claim);
+    const states = m2Runner.api.states.filter(s => s.runId === claim.run_id);
+    const failed = states.filter(s => s.body.status === "failed");
+    assert.equal(failed.length, 1, JSON.stringify(states));
+    assert.equal(failed[0]!.body.failure_reason, "codex turn failed: failed (badRequest)");
+    assert.ok(!states.some(s => s.body.status === "completed"));
+    assert.equal(rig.transport.turnStartCount, 1);
+    const messages = m2Runner.api.messages(claim.run_id);
+    assert.ok(messages.some(m => m.kind === "error" && m.payload.event === "result"),
+      "real runner batcher posts the failed result");
+    assert.ok(lines.some(line => JSON.stringify(line).includes("run failed")), "runner diagnostic was captured");
+    const visible = JSON.stringify({ states, messages, lines });
+    assert.doesNotMatch(visible, /runner-failure-control/);
+    for (const form of forms) {
+      assert.ok(!visible.includes(form), "provider key escaped actual runner sinks");
+      assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), "encoded provider key escaped actual runner sinks");
+    }
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("M2 bounded provider default root drains stderr without publishing it", async () => {
+    const rig = makeRig();
+    const { launchProviderRoot: unused, ...rest } = rig.deps;
+    void unused;
+    const key = ["stderr-fixture", '"', "/", "<>&", "tail"].join("");
+    const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+    const forms = providerKeyForms(key);
+    const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+    let requests = "", initialized = false, disposed = false;
+    stdin.on("data", chunk => {
+      requests += chunk.toString();
+      let newline: number;
+      while ((newline = requests.indexOf("\n")) >= 0) {
+        const line = JSON.parse(requests.slice(0, newline)); requests = requests.slice(newline + 1);
+        if (line.method === "initialize") {
+          initialized = true;
+          // End only our injected streams. No real provider process is launched.
+          stderr.end(JSON.stringify({ control: "stderr-private-control",
+            ...Object.fromEntries(forms.map(value => [value, value])) }).repeat(256));
+          stdout.write(JSON.stringify({ id: line.id, error: { code: -32000, message: "fixture initialization refused" } }) + "\n");
+        }
+      }
+    });
+    const { logger, lines } = recordingLogger();
+    rig.deps = { ...rest, launchCodexRootForTest: async () => ({
+      started: { event: "started", supervisorPid: 1234, childPid: 1235, subreaper: true,
+        nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 1234, transport: { stdin, stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+      dispose: async () => {
+        disposed = true; stdin.end(); stdout.end(); stderr.end();
+        return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+      },
+    }) };
+    const { ctx, emitted } = makeCtx({ redactText: makeTextRedactor(forms) });
+    try { await assert.rejects(makeExecutor(rig, binding, logger).run(ctx)); }
+    finally { stdin.end(); stdout.end(); stderr.end(); }
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(initialized, true, "production transport attempted initialization");
+    assert.equal(disposed, true, "failed initialization disposed our root");
+    assert.equal(stderr.readableEnded, true, "production default adapter drained the injected stderr");
+    assert.equal(stderr.readableLength, 0);
+    const visible = JSON.stringify({ emitted, lines });
+    assert.doesNotMatch(visible, /stderr-private-control/);
+    for (const form of forms) {
+      assert.ok(!visible.includes(form));
+      assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)));
+    }
+  });
+
   it("derives provider-only intent and plan claims from the frozen epoch", async () => {
     const done = epochResponder("th-1", "tn-1", (t, th, tn) =>
       t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
