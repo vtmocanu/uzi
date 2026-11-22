@@ -1056,9 +1056,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e  # v5
         with:
-          version: v4.3.1
+          version: v4.3.2
       - name: helm dependency build
         # Bundles the CNPG `cluster` subchart (oci://ghcr.io/cloudnative-pg/charts,
         # public) per Chart.lock, so the render below is self-contained.
@@ -1225,9 +1225,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e  # v5
         with:
-          version: v4.3.1
+          version: v4.3.2
       - uses: ./.github/actions/setup-task
       # Pulls the digest-pinned nginx image from web/Dockerfile itself (Docker Hub, one
       # pull per run); yq, curl, gzip and cmp come with ubuntu-latest.

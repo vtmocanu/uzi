@@ -62,16 +62,35 @@ template's prompt only tunes its persona and workflow; the primary-directive
 guardrails (never touch `main`, no `git push`, the plan gate) are enforced by
 the worker regardless.
 
-The list and detail page name both harnesses, for example **Claude: sonnet ·
-Codex: gpt-6-sol**. Empty pins use the same honest **Default · …** labels in the
-editor, builtin diff and agent-source review:
+The list has a **Model & effort** column that names both harnesses with
+per-family lines: **Claude: sonnet**, then **effort: high**, and the same for
+Codex. The detail page uses the same per-family lines. Empty pins use the same honest
+**Default · …** labels in the editor, builtin diff and agent-source review:
 
-- Subagents: **Default · lead's model** for either harness.
-- Lead (or orchestrator), Claude: **Default · SDK/account default (built-in)**.
-- Lead (or orchestrator), Codex: **Default · built-in (gpt-6.1-sol)**.
+- Subagent model: **Default · follows lead**, for either harness.
+- Subagent effort: **Default · follows the run's effort**, for either harness.
+- Lead (or orchestrator), Claude model: **Default · SDK/account default (built-in)**.
+- Lead (or orchestrator), Codex model: **Default · built-in (gpt-6.1-sol)**.
+- Lead (or orchestrator), effort, either harness: **Default · built-in (medium)**.
 
-Your worker model (**Settings → Run defaults**) takes precedence over the
-matching lead-template pin for your runs.
+A subagent whose four pins are all empty collapses to the two Default lines
+plus **both harnesses**. A lead or orchestrator template never collapses.
+
+The list also shows a personalized lead line, **For your Claude runs: …** (and
+the Codex equivalent), built from your effective settings: the worker model and
+effort with their source. It appears only for harnesses you can use. It sits on
+the lead row when exactly one lead template is enabled for you; otherwise it is
+a note above the table (**For your lead runs**). It refreshes after you change
+**In my runs** or **Global default**, and is hidden if the read fails. The
+stored-pin cells are shared and never change per viewer.
+
+For the lead, the editor help states the precedence. Model: a model chosen when
+starting the run or a schedule's model, then your **Run defaults** model, beat
+the pin; with none and no pin, Claude uses the SDK/account default and Codex
+uses gpt-6.1-sol. Effort: an effort chosen when starting the run, then your
+**Run defaults** effort (a level or Runtime default), beat the pin; otherwise
+the built-in medium. The subagent help keeps that **Use the run's resolved model
+for subagents too** overrides model pins only.
 
 ## Model pins
 
@@ -148,7 +167,8 @@ effort** and `codex_effort` is the **Codex effort**. A run receives the pin for
 its own harness only; the other family's pin is never sent.
 
 - **Levels.** `low`, `medium`, `high`, `xhigh` or `max`. The editor's
-  **Default · follows the run's effort** leaves the pin empty.
+  **Default · follows the run's effort** leaves a subagent's pin empty; for the
+  lead it reads **Default · built-in (medium)**.
   `runtime` (Runtime default) is not a template effort. The API rejects it, and
   any other value, with HTTP 400 naming `effort` or `codex_effort`; the CLI
   refuses it before sending anything (exit 2), and the editor offers only the

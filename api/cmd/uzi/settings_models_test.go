@@ -413,6 +413,32 @@ func TestSettingsGetPlanningRowsBuiltinModelAndRuntimeEffort(t *testing.T) {
 	}
 }
 
+func TestSettingsGetPlanningRowsLeadTemplateEffort(t *testing.T) {
+	high := "high"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		PlanningModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", DefaultSource: "builtin", Source: "builtin"},
+		},
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", DefaultEffort: "high", DefaultSource: "template", ResolvedEffort: &high, Source: "template", Mode: "explicit"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got []string
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, "planning effort") {
+			got = append(got, f)
+		}
+	}
+	want := "planning effort claude Default high high lead template"
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("planning effort rows = %q, want %q", got, want)
+	}
+}
+
 func TestSettingsModelRowsOmitAbsentPlanningCells(t *testing.T) {
 	for _, r := range settingsModelRows(apitypes.UserSettingsDTO{}) {
 		if strings.HasPrefix(r.Setting, "planning") {

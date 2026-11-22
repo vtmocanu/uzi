@@ -1643,8 +1643,8 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
     expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
     expect(optionTexts(screen.getByLabelText("Claude summary model"))[0]).toBe("Default");
-    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · medium (built-in)");
-    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
     expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
   });
 
@@ -2912,6 +2912,13 @@ describe("Run defaults — Claude planning model and effort (PRD #3252)", () => 
     renderPage();
     expect(((await screen.findByLabelText("Claude planning model")) as HTMLSelectElement).options[0].text)
       .toBe("Same as the run · opus (lead template)");
+    cleanup();
+    mockApi.getMySettings.mockResolvedValue(settings({
+      planning_efforts: [effortCell({ default_effort: "high", default_source: "template", resolved_effort: "high", source: "template" })],
+    }));
+    renderPage();
+    expect(((await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement).options[0].text)
+      .toBe("Same as the run · high (lead template)");
   });
 
   it("refreshes the Same as the run effort label after the Claude effort is saved", async () => {

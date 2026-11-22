@@ -3509,7 +3509,8 @@ exit 2 without a request.
 `effort ... runtime` is the explicit **Runtime default** mode: uzi sends no
 effort and the runtime picks its own level (see [Runtime
 default](./worker-effort.md#runtime-default)). It is not a reset. A reset
-removes your choice so the default applies (built-in medium); `runtime` is a
+removes your choice so the default applies (for the lead, the lead template's
+effort when it has one, else built-in medium); `runtime` is a
 stored choice that `uzi settings get` shows as `runtime default`.
 
 Human output prints the changed row of the **Model settings** table from a fresh

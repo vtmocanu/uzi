@@ -231,7 +231,7 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get user settings: %w", err)
 	}
-	pins, _, _, err := h.crossCheckPinSettings(ctx, userID)
+	pins, _, _, _, _, err := h.crossCheckPinSettings(ctx, userID)
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get cross-check pins: %w", err)
 	}
@@ -387,8 +387,8 @@ func planningModelCell(lead workersvc.LeadPrediction, stored *string) apitypes.E
 	}
 }
 
-// planningEffortCell builds an effective planning effort cell from the resolved lead, including
-// its template effort tier. The /me/settings planningEffortCells remain preference-only (#3262).
+// planningEffortCell builds the effective planning effort from the resolved lead, including
+// its template tier, matching the per-harness /me/settings planning cell.
 func planningEffortCell(lead workersvc.LeadPrediction, stored *string) apitypes.EffectiveEffortCellDTO {
 	return apitypes.EffectiveEffortCellDTO{
 		EffortSettingCellDTO: planningEffortCellFromOrdinary(stored, leadEffortSettingCell(string(lead.Harness), lead)),

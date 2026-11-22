@@ -8,19 +8,21 @@ import type { RunOutcomes, SelfUsage } from "../lib/api";
 import { failOriginLabel } from "../lib/failOriginLabel";
 import type { aggregateDisclosure } from "../lib/costStatus";
 import { cx } from "./ui";
+import { InfoTip } from "./InfoTip";
 import type { UsageWindow } from "../lib/usageByUser";
 
 // Presentation pieces for the Overview's OverviewUsageCard.
 
 // Issues #4209 and #4577: the Runs count covers primary work; tokens and cost also include
-// helper runs. One literal for both Usage cards, rendered under the KPI grid.
+// helper runs. Shown in the info tip beside the Overview Usage card's title.
 export const USAGE_SCOPE_NOTE =
   "Runs count primary work: issues, tasks, prompts, jobs and self-improve. Cost and tokens also include helper runs (judge, cross-check, PR rework, CI fix).";
 
 // Issue #4577: outcomes count every non-chat run kind, unlike the primary-only Runs count.
 // Run history does not list judge or cross_check runs, so their failures are explained here.
+// Shown in the info tip beside the failed-of-finished line.
 export const OUTCOME_SCOPE_NOTE =
-  "Runs counts primary work with recorded usage. Outcomes also include reworks, CI fixes, cross-checks and judge runs. Judge and cross-check failures show on their parent run.";
+  "The Runs count covers primary work with recorded usage. Outcomes also include reworks, CI fixes, cross-checks and judge runs. Judge and cross-check failures show on their parent run.";
 
 // Issue #4209: run_count counts only primary work runs, so a helper-only user has
 // run_count 0 yet real spend. "Nothing recorded" is true only when tokens, cost, the
@@ -92,7 +94,10 @@ export function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes;
   return (
     <div className="space-y-2.5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs">
-        <p className="text-muted"><span className="tabular-nums text-fg">{outcomes.failed.toLocaleString("en-US")}</span> failed of <span className="tabular-nums text-fg">{outcomes.finished.toLocaleString("en-US")}</span> finished runs</p>
+        <p className="flex items-center gap-1.5 text-muted">
+          <span><span className="tabular-nums text-fg">{outcomes.failed.toLocaleString("en-US")}</span> failed of <span className="tabular-nums text-fg">{outcomes.finished.toLocaleString("en-US")}</span> finished runs</span>
+          <InfoTip label="About run outcomes" tip={OUTCOME_SCOPE_NOTE} />
+        </p>
         {personal && <Link className="text-brand hover:underline" to="/runs/history?status=failed">Your failed runs →</Link>}
       </div>
       <div className="flex h-2 gap-0.5 overflow-hidden rounded" role="img" aria-label={"Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ")}>
@@ -108,7 +113,6 @@ export function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes;
           </li>
         ))}
       </ul>
-      <p className="text-[11px] leading-relaxed text-muted">{OUTCOME_SCOPE_NOTE}</p>
     </div>
   );
 }

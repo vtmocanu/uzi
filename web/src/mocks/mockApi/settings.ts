@@ -639,14 +639,22 @@ function mockPlanningModelCells(planning: string | null | undefined, lane: strin
     resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source }];
 }
 
-function mockPlanningEffortCells(planning: string | null | undefined, effort: string | null | undefined, harness: Harness = "claude"): (EffortSettingCell & { source: "builtin" | "user_default" | "user_planning_default" })[] {
-  const ordinary = mockEffortCell(harness, effort);
+function mockPlanningEffortCells(
+  planning: string | null | undefined,
+  effort: string | null | undefined,
+  harness: Harness = "claude",
+  leadEffort: string | null = null,
+): (EffortSettingCell & { source: "builtin" | "user_default" | "user_planning_default" | "template" })[] {
+  let ordinary = mockEffortCell(harness, effort);
+  if (leadEffort && (effort ?? "").trim() === "") {
+    ordinary = { ...ordinary, resolved_effort: leadEffort, source: "template", mode: "explicit" };
+  }
   const level = (planning ?? "").trim();
   const set = ["low", "medium", "high", "xhigh", "max"].includes(level);
   return [{ harness, effort: planning ?? null,
     default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source,
     resolved_effort: set ? level : ordinary.resolved_effort,
-    source: set ? "user_planning_default" : ordinary.source === "user_default" ? "user_default" : "builtin",
+    source: set ? "user_planning_default" : ordinary.source === "template" ? "template" : ordinary.source === "user_default" ? "user_default" : "builtin",
     mode: set ? "explicit" : ordinary.mode }];
 }
 
@@ -699,8 +707,9 @@ function mySettingsResponse(): { settings: UserSettings } {
     mockEffortCell("claude", userSettings.default_effort),
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
+  const leadEfforts = state.session ? mockLeadTemplateEfforts() : { claude: null, codex: null };
   const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex")];
-  const planning_efforts = [...mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort), ...mockPlanningEffortCells(userSettings.planning_codex_effort, userSettings.default_codex_effort, "codex")];
+  const planning_efforts = [...mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort, "claude", leadEfforts.claude), ...mockPlanningEffortCells(userSettings.planning_codex_effort, userSettings.default_codex_effort, "codex", leadEfforts.codex)];
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
   const me = state.session;
@@ -966,7 +975,7 @@ function withPlanning(view: EffectiveSettings): EffectiveSettings {
     }
     if (effort !== undefined) {
       const lane = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
-      const [e] = mockPlanningEffortCells(effort, lane, harness);
+      const [e] = mockPlanningEffortCells(effort, lane, harness, mockLeadTemplateEfforts()[harness]);
       const inherited = lane != null ? e : view.efforts.find(c => c.setting === "worker_effort" && c.harness === harness) ?? e;
       const resolved = effort === null ? inherited : e;
       view.efforts = view.efforts.map(c => c.setting !== "planning_effort" || c.harness !== harness ? c

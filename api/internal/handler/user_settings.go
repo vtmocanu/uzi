@@ -158,7 +158,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		slog.Error("get user settings", "error", err)
 		return userSettingsDTO{}, err
 	}
-	pins, leadCodexPin, leadClaudePin, err := h.crossCheckPinSettings(r.Context(), userID)
+	pins, leadCodexPin, leadClaudePin, leadClaudeEffort, leadCodexEffort, err := h.crossCheckPinSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get cross-check pins", "error", err)
 		return userSettingsDTO{}, err
@@ -262,12 +262,30 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 			textPtrValue(leadClaudePin.Valid, leadClaudePin.String), planningCodexModel,
 			textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
 			textPtrValue(leadCodexPin.Valid, leadCodexPin.String)),
-		PlanningEfforts:           planningEffortCells(planningEffort, textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String), planningCodexEffort, textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			planningEffortCellFor(workersvc.HarnessClaude, planningEffort, s.DefaultEffort, leadClaudeEffort),
+			planningEffortCellFor(workersvc.HarnessCodex, planningCodexEffort, s.DefaultCodexEffort, leadCodexEffort),
+		},
 		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		CodexAccountMode:          codexMode,
 		HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
 	}, nil
+}
+
+// planningEffortCellFor composes the same per-harness lead and planning resolutions as
+// claim assembly and the effective view, including the selected lead template's effort tier.
+func planningEffortCellFor(harness workersvc.Harness, planning *string, userEffort, rawTemplateEffort pgtype.Text) apitypes.EffortSettingCellDTO {
+	var template pgtype.Text
+	if rawTemplateEffort.Valid && agenttmpl.IsEffortLevel(rawTemplateEffort.String) {
+		template = rawTemplateEffort
+	}
+	effort, source := workersvc.LeadEffortWithTemplate(harness, userEffort, template)
+	lead := workersvc.LeadPrediction{
+		Harness: harness, UserEffort: textPtrValue(userEffort.Valid, userEffort.String),
+		TemplateEffort: textPtrValue(template.Valid, template.String), Effort: effort, EffortSource: source,
+	}
+	return planningEffortCellFromOrdinary(planning, leadEffortSettingCell(string(harness), lead))
 }
 
 // GetMySettings returns the current user's own settings. Session-authenticated
