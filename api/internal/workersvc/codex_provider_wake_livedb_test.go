@@ -41,13 +41,15 @@ func frozenCodexWakeRun(t *testing.T, p *provFix) store.Run {
 }
 
 func codexWakeCaps() []string {
-	return []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1}
+	return []string{capability.RepoAgentSourceV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1}
 }
 
 func setWakeCaps(f *hibFx, id uuid.UUID, caps []string) {
 	f.t.Helper()
-	if caps == nil {
-		caps = []string{}
+	// CreateRun stamps repo_agent_source_required; keep that independent fence
+	// satisfied even for workers deliberately missing a Codex protocol.
+	if !slices.Contains(caps, capability.RepoAgentSourceV1) {
+		caps = append([]string{capability.RepoAgentSourceV1}, caps...)
 	}
 	f.env.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, id, caps)
 }
