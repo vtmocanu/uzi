@@ -85,7 +85,7 @@ caught beyond the PRD list:
   `AWS_ENDPOINT_URL_SSO_OIDC` (`network_wiring`), by exact name: the global AWS endpoint override
   also routes Bedrock traffic. The STS, SSO and SSO OIDC names override the endpoints of the AWS
   credential exchange that the Bedrock harness's AWS SDK credential chain can use; they are denied
-  for consistency with `AWS_ENDPOINT_URL` (owner decision, 2026-11-22). The other per-service names
+  for consistency with `AWS_ENDPOINT_URL`. The other per-service names
   (for example `AWS_ENDPOINT_URL_S3`) stay allowed. Names are checked on write only, so a stored
   variable whose name a later rule denies is dropped at injection by a worker that has the rule,
   with a run event naming the rule.
@@ -205,11 +205,13 @@ and three standard and three URL-safe base64 alignments trimmed to the character
 depend on neighbouring bytes. Each is also registered for the value without its trailing line
 break and, for a multi-line value, with line endings normalized to LF. A multi-line value also
 registers each of its lines for redaction (and for the preserved-patch line check) only, never as a
-scan needle, because a public line would hit unrelated files. A line is registered only when it is at
-least 8 characters, has a letter or digit, has at least 2 distinct non-space characters, and is neither
-PEM armor nor on the public-line list (`Proc-Type` lines and the service-account JSON members `type`,
-`auth_uri`, `token_uri`, `auth_provider_x509_cert_url`, `universe_domain`; `lineForms` and
-`PUBLIC_LINES` in `run-env-forms.ts`). The scan needles instead add
+scan needle, because a public line would hit unrelated files. A line that is not PEM armor is
+registered only when its value part holds a token (`lineForms` in `run-env-forms.ts`). The value part
+is the line without a leading `key:` or `key=` (optionally after `- ` and quotes; an `=` that only
+pads the end and a `:` followed by `//` are not key separators), with the scheme and host[:port] of
+each URL removed (userinfo, path and query stay). Tokens are maximal runs of `A-Z a-z 0-9 + = _ -`
+(`/` separates). A token qualifies with at least 8 characters and 5 distinct ones, and is all digits,
+or has both letter cases, or has a letter and at least 2 digits. The scan needles instead add
 diff-shaped forms of the value, its lines joined by `\n+`, `\n-` and `\n ` (LF and CRLF). Plain
 values are never registered. The forms join the run's existing redactor, so every sink it already
 covers masks them; the plan, the plan summary, the intent summary and
@@ -226,10 +228,12 @@ value), and nothing is published. A lane with no live flight (held, terminal, bu
 withholds with the reason `forms_over_budget`. A cross-check child over the cap ends as
 `checker_unavailable`. To keep a claim under the cap, a variable save is refused at write time with
 409 `env_forms_budget` when it would raise the repo's counted secret value bytes above
-`MaxClaimSecretBytes` (207,253 = 40,000,000 / 193 form units per byte, `api/internal/runenv/form_budget.go`,
+`MaxClaimSecretBytes` (116,959 = 40,000,000 / 342 form units per byte, `api/internal/runenv/form_budget.go`,
 `fixtures/run-env/form-budget.json`). Counted: every secret row of the repo and the user scope in any
-state (`GetRunEnvFormBudgetUsage`); plain values do not count. A save that does not raise the count is
-never refused; Disable, Enable and Delete are never refused for budget reasons. The per-byte bound is analytic, pinned
+state (`GetRunEnvFormBudgetUsage`); plain values do not count. The unit count includes the logger's
+JSON-escaped copy of every redaction form; 342 is the control-character worst case. A save is refused
+only when it raises the count and leaves it above the cap, so a repo already above it can shrink but not
+grow; Disable, Enable and Delete are never refused for budget reasons. The per-byte bound is analytic, pinned
 by `agent/test/run-env-forms-budget.test.ts` for the form counts it assumes, not proved for every value.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
@@ -302,11 +306,12 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
-- **Patch gaps.** The patch check misses a secret whose lines are all short, public, or without a letter or digit, or with only one
-  distinct non-space character, and that is split across files or by elided context between hunks, and a value that appears only re-encoded
+- **Patch gaps.** The patch check misses a secret whose lines hold no qualifying token (single-case
+  letters, letters with one digit, digits with fewer than 5 distinct, formatted codes such as
+  `8462-9137`, non-ASCII text, a secret that is the line's leading key) and that is split across files or by elided context between hunks, and a value that appears only re-encoded
   (each line indented in a YAML block, or an encoding other than those registered). The blob scan
   still blocks a committed file.
-- **Path gap in two sinks (deferred, reviewer finding).** The planning diff sent to a cross-check
+- **Path gap in two sinks.** The planning diff sent to a cross-check
   and the PR description diff context are redacted, not path-scanned: a secret with non-ASCII
   characters used as a path name reaches them C-quoted (octal-escaped) and unredacted.
 - **Marker coverage.** The absent-route fallback relies on the per-run marker, which exists only

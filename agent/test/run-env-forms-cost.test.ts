@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // PRD 4416 M2: the memory and time a claim's forms cost at the store's bounds, measured in a child node process
-// with a capped old space and explicit gc. Every value is derived from a hash: no value reads as a credential.
+// with a capped old space and explicit gc. Every value is derived from a hash.
 
 const HEAP_GROWTH_MAX_MIB = 128;
 const ONE_ADD_MAX_MS = 2000;
@@ -41,7 +41,7 @@ const claim = runEnvClaimForms(live, old);
 const planted = claim.overBudget ? old[3].value : old[3].value.split("\r\n")[2];
 const buildMs = performance.now() - started;
 const set = new SecretSet(claim.redaction);
-const setMasked = !set.text("x " + planted + " y").includes(planted);
+const setMasked = !set.text("x\t" + planted + "\ty").includes(planted);
 const log = createLogger("error");
 for (const f of claim.redaction) log.addSecret(f);
 const logMasked = !log.redactDiagnostic("x " + planted + " y").includes(planted);

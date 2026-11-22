@@ -67,12 +67,17 @@ these forms of the value: JSON-escaped (with and without escaped slashes),
 HTML-safe `\u00XX`, percent-encoded, and base64 or base64url text that embeds
 it (such as the entry a registry login stores, or an HTTP Basic header). Each
 form is also registered without a trailing line break, and for a multi-line
-value with LF line endings. Each line of a multi-line value is redacted on its
-own when it is at least 8 characters, has a letter or digit and at least 2
-distinct non-space characters, and is not PEM header or footer armor or a public
-line (`Proc-Type` lines and the service-account JSON members `type`, `auth_uri`,
-`token_uri`, `auth_provider_x509_cert_url` and `universe_domain`). Redaction is
-exact-match with an 8-character floor, so it is a net, not a boundary: another
+value with LF line endings. Each line of a multi-line value that is not PEM header or footer armor is
+redacted on its own when its value part holds a token. The value part is the
+line without a leading `key:` or `key=` (optionally after `- ` and quotes; an
+`=` that only pads the end and a `:` followed by `//` are not key separators),
+and with the scheme and host (and port) of each URL removed; userinfo, path and
+query stay. Tokens are maximal runs of `A-Z a-z 0-9 + = _ -` (`/` separates
+them). A token qualifies with at least 8 characters and at least 5 distinct
+ones, and is either all digits, or has both letter cases, or has a letter and at
+least 2 digits. This over-masks identifier-like values with letters and several
+digits (such as a cloud kubeconfig context name) and CamelCase values of 8 or
+more characters. Redaction is exact-match with an 8-character floor, so it is a net, not a boundary: another
 encoding of the value is not caught.
 
 A run's secret forms are computed once per claim and capped at 40,000,000
@@ -89,14 +94,17 @@ cross-check child counts every version its lead was given.
 ### Secret size budget
 
 A save is refused with 409 `env_forms_budget` when it would raise the repo's
-counted secret value bytes above 207,253 bytes (40,000,000 form characters
-divided by a conservative bound of 193 form characters per value byte).
+counted secret value bytes above 116,959 bytes (40,000,000 form characters
+divided by a conservative bound of 342 form characters per value byte). The
+count includes the copy of each redaction form that the worker's logger
+indexes JSON-escaped, and the bound is the worst case, a control character.
 
 - Counted: every secret row of the repo and of the user scope, in any state
   (live, disabled, pending deletion or retired). Plain values do not count.
-- A save that does not raise the count is never refused, so a store already over
-  the budget can shrink. **Disable**, **Enable** and **Delete** are never
-  refused for budget reasons.
+- A save is refused only when it would raise the count and leave it above the
+  budget, so a store already over the budget can shrink or stay the same size,
+  but not grow.
+  **Disable**, **Enable** and **Delete** are never refused for budget reasons.
 - Disabling a secret frees no budget. Deleting a secret that a run still holds
   frees it once the held version is released and the sweeper removes it.
 - The bound is analytic: `fixtures/run-env/form-budget.json` carries the numbers
@@ -139,16 +147,23 @@ terminal preservation packs, recovery archives and the preserved patch.
   the run has any secret variable, retired versions included, so such a run
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
-- Gaps that remain: a secret whose lines are all short, public, or without a
-  letter or digit, or with only one distinct non-space character, and that is
-  split across files or by elided context between hunks, and a value that
-  appears only re-encoded, such as each line indented in a YAML block or in an
+- Gaps that remain: a secret whose lines hold no qualifying token (tokens of
+  single-case letters, letters with one digit, digits with fewer than 5 distinct,
+  formatted codes such as `8462-9137`, non-ASCII text, or a secret that is the
+  line's leading key) and that is split across files or by elided context between
+  hunks, and a value that appears only re-encoded, such as each line indented in a YAML block or in an
   encoding other than those registered. A committed file that holds the whole
   secret is still blocked.
-- Known gap (deferred): the planning diff sent to a cross-check and the diff
-  context in a pull request description are only redacted, not path-scanned. A
-  secret with non-ASCII characters used as a path name reaches them
-  octal-escaped (C-quoted) and unredacted.
+- Known gap: the planning diff sent to a cross-check and the diff context in a
+  pull request description are only redacted, not path-scanned. A secret with
+  non-ASCII characters used as a path name reaches them octal-escaped
+  (C-quoted) and unredacted.
+- The list of changed files sent with a plan turn, the file paths in capability
+  inference evidence, and a proposal's repo path and id pass the run's redactor
+  (a quoted path is decoded first). Park and recovery reports carry only fixed
+  values (cause and reason codes, counts, SHAs, booleans, rate-limit type and
+  reset time), never run variables. Judge and task-review runs never receive
+  variables.
 - A worker that must look up a finished run's secrets is served them only while
   the run is active or a publication of its work is still in flight. A cross-check
   child is served only while its check is open and before its deadline, or while
