@@ -1198,7 +1198,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	if len(cfg.workerCABundle()) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch
 		// with no custom dispatcher, so trusting the cluster CA (plus any extra CA) is
-		// pure pod spec — nothing in agent/ parses a CA today and nothing needs to.
+		// pure pod spec. Codex provider trust uses the separate extra-only bundle below.
 		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
 	}
 	if !w.Isolated && len(cfg.ExtraCAPEM) > 0 {
