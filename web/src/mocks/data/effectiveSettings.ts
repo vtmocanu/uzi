@@ -201,9 +201,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -1969,9 +1967,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -2686,9 +2682,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -3294,9 +3288,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [

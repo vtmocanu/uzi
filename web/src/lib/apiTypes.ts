@@ -574,6 +574,13 @@ export interface UserSettings {
   /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   summary_models?: ModelSettingCell[];
+  /** Per-user task-review model for the optional `uzi handoff --review` pass (PRD #1570);
+   *  null inherits the built-in default. Claude lane: any non-Codex model id. */
+  task_review_model?: string | null;
+  /** Per-user Codex task-review model (PRD #1570); null inherits the built-in default. */
+  codex_task_review_model?: string | null;
+  /** Read-only resolved view of both task-review lanes (PRD #1570), claude then codex. */
+  task_review_models?: ModelSettingCell[] | null;
   /** Per-user Claude planning model and effort (PRD #3252); null inherits. Optional for
    *  older servers. */
   planning_claude_model?: string | null;
@@ -669,6 +676,9 @@ export interface UserSettingsPatch {
   summary_model?: string | null;
   /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
   codex_summary_model?: string | null;
+  /** Per-user task-review models (PRD #1570); present-null clears back to the built-in. */
+  task_review_model?: string | null;
+  codex_task_review_model?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it

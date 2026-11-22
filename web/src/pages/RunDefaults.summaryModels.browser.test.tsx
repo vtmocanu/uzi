@@ -7,6 +7,7 @@ import { RunDefaults } from "./RunDefaults";
 import { api, type User } from "../lib/api";
 import type { UserSettings, UserSettingsPatch } from "../lib/apiTypes";
 import { mockSummaryModelCells } from "../mocks/mockApi/summaryModels";
+import { mockTaskReviewModelCells } from "../mocks/mockApi/taskReviewModels";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -72,4 +73,30 @@ it("a Codex-only user picks a Codex summary model, saves it, and sees it in effe
   await waitFor(() => expect(document.getElementById("codex-summary-model-effect")?.textContent)
     .toBe("In effect: gpt-6-astra · your choice"));
   expect(select.value).toBe("gpt-6-astra");
+});
+
+it("a Codex-only user saves and resets the Codex task-review model (PRD #1570)", async () => {
+  const taskSettings = (codex: string | null): UserSettings => ({
+    ...settings(null),
+    codex_task_review_model: codex,
+    task_review_models: mockTaskReviewModelCells(null, codex),
+  });
+  mockApi.getMySettings.mockImplementation(async () => ({ settings: taskSettings(null) }));
+  let stored: string | null = null;
+  mockApi.putMySettings.mockImplementation(async (patch: UserSettingsPatch) => {
+    stored = patch.codex_task_review_model ?? null;
+    return { settings: taskSettings(stored) };
+  });
+  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  const select = (await screen.findByLabelText("Codex task-review model")) as HTMLSelectElement;
+  await waitFor(() => expect(document.getElementById("codex-task-review-model-effect")?.textContent)
+    .toBe("In effect: gpt-6-sol · built-in"));
+  await userEvent.selectOptions(select, "gpt-6-astra");
+  await userEvent.click(screen.getByRole("button", { name: "Save Codex task-review model" }));
+  await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_task_review_model: "gpt-6-astra" }));
+  await waitFor(() => expect(document.getElementById("codex-task-review-model-effect")?.textContent)
+    .toBe("In effect: gpt-6-astra · your choice"));
+  await userEvent.selectOptions(select, "inherit");
+  await userEvent.click(screen.getByRole("button", { name: "Save Codex task-review model" }));
+  await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ codex_task_review_model: null }));
 });
