@@ -216,6 +216,12 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if r.ReserveHoldReason != nil && *r.ReserveHoldReason != "" {
 		rows = append(rows, []string{"RESERVE", sanitizeTTY(*r.ReserveHoldReason)})
 	}
+	// WEEKLY_LIMIT / FIX (PRD #4123): the server-built weekly-limit block, emit-only-when-set. The
+	// labels are owner-authored and bounded; the FIX command is sanitized but never truncated.
+	if cell := weeklyLimitCell(r.WeeklyLimit); cell != "" {
+		rows = append(rows, []string{"WEEKLY_LIMIT", cell})
+		rows = append(rows, weeklyLimitFixRows(r.WeeklyLimit)...)
+	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}

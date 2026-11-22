@@ -318,6 +318,15 @@ A few worth knowing:
   schedule get`.
   There's no CLI setter for your own default harness; that's a **Settings →
   Run defaults** web-only control (see [Worker model](./worker-model.md)).
+- **`run get` explains a 7-day park.** For a run parked at `limit_wait` on the
+  `seven_day` window, or paused by the weekly usage reserve, `uzi run get`
+  adds a `WEEKLY_LIMIT` row (the credential, its reason in plain words and what
+  happens if you do nothing) and one `FIX` row per copyable fix command (`FIX_FUTURE_RUNS` for advice that only affects runs you start later).
+  Both rows are absent on any other run, including 5-hour and per-model parks,
+  and for the owner only. A token label that cannot be copied safely shows a
+  hint to rename the token in Settings instead of a command. `--json` carries
+  the same block as `weekly_limit`. Reasons, wait statements and fix commands
+  are described in [Why the run did not move to another token](./run-limit-wait.md#why-the-run-did-not-move-to-another-token).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own
   version (the `v*` release this binary was built from). When a server URL is
   configured it additionally reports that server's build info — version, full

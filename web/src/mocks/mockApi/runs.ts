@@ -356,9 +356,20 @@ function toSummary(item: RunListItem): RunSummaryItem {
     repo_agents: _repoAgents,
     issue_description: _issueDescription,
     preserved_patch: _preservedPatch,
+    weekly_limit: weeklyLimit,
     ...summary
   } = item;
-  return summary;
+  // PRD #4123: the summary row carries only the compact weekly-limit projection.
+  return weeklyLimit
+    ? {
+        ...summary,
+        weekly_limit: {
+          tier: weeklyLimit.tier,
+          credential_key: weeklyLimit.credential_key,
+          credential_label: weeklyLimit.credential_label,
+        },
+      }
+    : summary;
 }
 
 // PRD #4040: the server sets `pending_question` only on the caller's own awaiting_input rows

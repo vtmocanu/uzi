@@ -1996,6 +1996,26 @@ export const mockRuns: Run[] = [
     retry_not_before: minsAgo(3),
     limit_wait_count: 1,
     rate_limit_type: "seven_day",
+    // PRD #4123: a seven_day park gets the server's weekly-limit block. Warning tier: the
+    // owner's other token has headroom but is outside the auto-select pool, so the fix is
+    // pooling it; switching this run directly is offered too.
+    weekly_limit: {
+      credential_label: "console-key",
+      credential_key: "anthropic:sec-console",
+      harness: "claude",
+      pct: 100,
+      effective_limit: 100,
+      resets_at: minsAhead(6 * 24 * 60),
+      tier: "warning",
+      reason: "headroom_outside_pool",
+      alternative_label: "ultra-key",
+      fix: [
+        { kind: "pool_on", target_id: "sec-seven-only", target_label: "ultra-key", command: "uzi token pool ultra-key --on" },
+        { kind: "set_token", target_id: "sec-seven-only", target_label: "ultra-key", command: "uzi run set-token run-limit-wait-due ultra-key" },
+      ],
+      future_runs: [],
+      wait: "waits",
+    },
     recovery_wait_cause: null,
     codex_account_action: null,
     codex_secret_id: null,

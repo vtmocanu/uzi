@@ -217,6 +217,10 @@ just refused it back up. Its meter also reads 100% for the window it hit as
 soon as the pause happens, so every other run's claim ranks it as exhausted
 too — see [Paused on a usage limit](run-limit-wait.md).
 
+### When a parked run did not switch
+
+A run parked on the 7-day window says why it stayed on its token: pinned, not auto, a usable token outside the pool, an exhausted pool, or no alternative at all. If the reason is that another token has headroom but is not pooled, `uzi token pool --on --kind anthropic -- <label>` adds it to the pool; a pinned run is switched with `uzi run set-token <run-id> -- <label>`. See [Why the run did not move to another token](run-limit-wait.md#why-the-run-did-not-move-to-another-token).
+
 ### "Auto" means "only my pool"
 
 **An `auto` worker never spends a token you have not opted into the pool** —

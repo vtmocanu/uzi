@@ -153,9 +153,6 @@ func vaultLockedNote(gf *globalFlags) string {
 		"\n  " + uzicli.CellText(cmd)
 }
 
-// shellQuote is the CLI-local spelling of shellquote.Quote, kept for its pinning test.
-func shellQuote(s string) string { return shellquote.Quote(s) }
-
 // runEnvValueCell is the VALUE column: a secret never shows a value, a plain value
 // the server withheld says so without guessing why (the vault may be locked, absent,
 // or unable to open the value; the list's vault_locked is only a fail-closed hint,

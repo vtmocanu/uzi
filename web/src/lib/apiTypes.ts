@@ -3940,7 +3940,55 @@ export interface HarnessDecision {
   other_weekly_reset_at: string | null;
 }
 
+/** PRD #4123: one allowlisted action in a weekly-limit block (Go WeeklyLimitFixDTO). `command`
+ *  is rendered once by the server, the same string on every surface; it is absent with
+ *  command_unavailable "label" when the target label is not command-safe, and absent for a
+ *  Settings-only fix (edit_reserve). target_label is OWNER text: render as plain text. */
+export interface WeeklyLimitFix {
+  kind: "set_token" | "auto_select" | "pool_on" | "resume_reserve" | "edit_reserve";
+  target_id?: string;
+  target_label?: string;
+  command?: string;
+  command_unavailable?: "label";
+}
+
+/** PRD #4123: the owner-only weekly-limit block on run detail (Go WeeklyLimitDTO), computed
+ *  on read by the server; the web renders it and derives nothing. Labels are owner text. */
+export interface WeeklyLimit {
+  credential_label: string;
+  /** Owner-scoped grouping identity ("anthropic:<secret id>" / "codex:<account id>"), never shown. */
+  credential_key: string;
+  harness: string;
+  /** Weekly utilisation in percent; null when no fresh reading exists. */
+  pct: number | null;
+  /** The reserve when set, else 100. */
+  effective_limit: number;
+  resets_at: string | null;
+  /** warning when the run itself has a fix, else notice. */
+  tier: "warning" | "notice";
+  /** A workersvc NextClaimReason: pinned | not_auto | can_switch | selection_unchanged |
+   *  headroom_outside_pool | pool_exhausted | no_alternative | account_bound | switch_pending |
+   *  unknown. Typed as string so a future value degrades to the unknown wording. */
+  reason: string;
+  alternative_label?: string;
+  /** Advice for runs created afterwards. */
+  future_runs: WeeklyLimitFix[];
+  /** Advice for this run. */
+  fix: WeeklyLimitFix[];
+  wait: "waits" | "fails" | "reserve_pause" | "unknown";
+}
+
+/** PRD #4123: the compact projection on a run summary row (Go WeeklyLimitSummaryDTO). */
+export interface WeeklyLimitSummary {
+  tier: "warning" | "notice";
+  credential_key: string;
+  credential_label: string;
+}
+
 export interface Run {
+  /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on or
+   *  near its weekly limit. */
+  weekly_limit?: WeeklyLimit;
   policy_hold?: {
     preserve_required: boolean;
     pending_fresh: boolean;
@@ -5110,7 +5158,11 @@ export type RunSummaryItem = Omit<
   | "capability_provenance" | "lead_config" | "created_issues"
   // PRD #3250: the start-time choice is on the run page and the list, not the polling shape.
   | "effort" | "model_source" | "effort_source"
->;
+  // PRD #4123: the summary row carries only the compact projection.
+  | "weekly_limit"
+> & {
+  weekly_limit?: WeeklyLimitSummary;
+};
 
 /** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer
  *  queue plus, only on an admin run debug read of another user's run, admin_debug_read=true. */
