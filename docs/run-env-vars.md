@@ -81,10 +81,27 @@ work, with a failure reason starting `run_env_forms_over_budget` (never a
 value), and publishes nothing. A publish with no live flight (held, terminal and
 bundle publication) is withheld with the reason `forms_over_budget`. A
 cross-check child whose claim is over the cap ends as checker unavailable
-instead. A store filled to its limits with multi-line values can pass the cap.
-To get under it, remove or shorten secret variables, multi-line ones first. A
-run keeps counting the older versions it was given; a new run counts only the
-current values, and a cross-check child counts every version its lead was given.
+instead. To stay under it, uzi refuses a save at write time: see
+[Secret size budget](#secret-size-budget). A run keeps counting the older
+versions it was given; a new run counts only the current values, and a
+cross-check child counts every version its lead was given.
+
+### Secret size budget
+
+A save is refused with 409 `env_forms_budget` when it would raise the repo's
+counted secret value bytes above 207,253 bytes (40,000,000 form characters
+divided by a conservative bound of 193 form characters per value byte).
+
+- Counted: every secret row of the repo and of the user scope, in any state
+  (live, disabled, pending deletion or retired). Plain values do not count.
+- A save that does not raise the count is never refused, so a store already over
+  the budget can shrink. **Disable**, **Enable** and **Delete** are never
+  refused.
+- Deleting or disabling a secret that a run still holds does not free budget
+  until the held version is released.
+- The bound is analytic: `fixtures/run-env/form-budget.json` carries the numbers
+  and an agent test pins the form counts it assumes, but it is not proved for
+  every value. The claim-time cap above stays as the backstop.
 
 Before work leaves the worker, every commit in the outgoing range is searched
 for those forms, not only the final tree. For a multi-line secret it also
@@ -93,6 +110,12 @@ searches for the value as it reads inside a diff, with its lines joined by
 (including parked, paused and shutdown checkpoints), the final push, held and
 terminal preservation packs, recovery archives and the preserved patch.
 
+- The search covers paths too. Every scan above (and the provider-key scan)
+  matches the forms against the full path of every tree entry an outgoing commit
+  introduces, including empty trees and submodule entries. Paths are read as raw
+  NUL-separated names, so git path quoting does not hide a value, and a merge is
+  read through its combined diff. A finding on a path shows `[path withheld]`
+  in place of the file name.
 - A hit blocks the publish and names the **variable**, never the value. At the
   final push the run fails as `push_secret_blocked`; a checkpoint hit is held by
   the existing secret-remediation hold. A secret that is a common word can
@@ -101,10 +124,13 @@ terminal preservation packs, recovery archives and the preserved patch.
   unreadable range, a scanner error, or the run's secret history cannot be
   looked up), a checkpoint, pack or recovery upload is withheld and retried
   later, and the work stays on the worker under its recovery hold. At the final
-  push the run fails as `push_secret_blocked` instead.
+  push the run fails as `push_secret_blocked` instead. Path enumeration is
+  bounded at 1,000,000 paths, 256 MiB of path bytes and the scan deadline; past
+  any of them the publish is withheld with the reason `path_scan_incomplete`.
 - A plain value found in tracked files holds nothing.
 - The preserved patch is withheld, not redacted, when the claim is over the form
-  cap; when a whole-value form occurs in the raw patch or in a rebuilt per-hunk
+  cap; when a git-quoted header path decodes to a secret form (reason
+  `header_path`); when a whole-value form occurs in the raw patch or in a rebuilt per-hunk
   pre-image or post-image (context plus removed or added lines, also with line
   breaks normalized to LF); when any registered line form occurs in it; or, for
   a run with secret variables, when the patch cannot be parsed (binary, combined
@@ -119,6 +145,10 @@ terminal preservation packs, recovery archives and the preserved patch.
   appears only re-encoded, such as each line indented in a YAML block or in an
   encoding other than those registered. A committed file that holds the whole
   secret is still blocked.
+- Known gap (deferred): the planning diff sent to a cross-check and the diff
+  context in a pull request description are only redacted, not path-scanned. A
+  secret with non-ASCII characters used as a path name reaches them
+  octal-escaped (C-quoted) and unredacted.
 - A worker that must look up a finished run's secrets is served them only while
   the run is active or a publication of its work is still in flight. A cross-check
   child is served only while its check is open and before its deadline, or while
@@ -133,6 +163,8 @@ retained work has been released, and 24 hours have passed. Until then:
 
 - a write that would exceed the retired-value limit is refused with
   `env_history_full`, and the panel lists the runs holding versions;
+- a save that would raise the repo's secret value bytes above the form budget is
+  refused with `env_forms_budget` (see [Secret size budget](#secret-size-budget));
 - **Disable** and **Delete** always work. A deleted secret that runs still need
   shows **Pending deletion**.
 
@@ -182,8 +214,10 @@ denied:
 - Network and cloud endpoint settings the harness reads, such as
   `AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AWS_ENDPOINT_URL` (the global AWS
   endpoint override also routes Bedrock traffic), `AWS_ENDPOINT_URL_STS`,
-  `AWS_ENDPOINT_URL_SSO` and `AWS_ENDPOINT_URL_SSO_OIDC` (they redirect AWS
-  credential acquisition), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
+  `AWS_ENDPOINT_URL_SSO` and `AWS_ENDPOINT_URL_SSO_OIDC` (they override the
+  endpoints of the AWS credential exchange, STS, IAM Identity Center and SSO
+  OIDC, that the Bedrock harness's AWS SDK credential chain can use; denied for
+  consistency with `AWS_ENDPOINT_URL`, an owner decision), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
   `AWS_ENDPOINT_URL_BEDROCK*` name. The other per-service names, such as
   `AWS_ENDPOINT_URL_S3`, stay allowed.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,

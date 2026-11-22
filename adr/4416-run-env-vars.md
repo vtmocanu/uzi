@@ -83,9 +83,12 @@ caught beyond the PRD list:
   `GCE_METADATA_*` are denied as network wiring because the harness reads them.
 - `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL_SSO` and
   `AWS_ENDPOINT_URL_SSO_OIDC` (`network_wiring`), by exact name: the global AWS endpoint override
-  also routes Bedrock traffic, and the STS and SSO overrides redirect credential acquisition. The
-  other per-service names (for example `AWS_ENDPOINT_URL_S3`) stay allowed. Names are checked on write only, so a stored variable whose name a later rule denies is
-  dropped at injection by a worker that has the rule, with a run event naming the rule.
+  also routes Bedrock traffic. The STS, SSO and SSO OIDC names override the endpoints of the AWS
+  credential exchange that the Bedrock harness's AWS SDK credential chain can use; they are denied
+  for consistency with `AWS_ENDPOINT_URL` (owner decision, 2026-11-22). The other per-service names
+  (for example `AWS_ENDPOINT_URL_S3`) stay allowed. Names are checked on write only, so a stored
+  variable whose name a later rule denies is dropped at injection by a worker that has the rule,
+  with a run event naming the rule.
 
 Names that a harness also reads but that are application configuration (`AWS_REGION`, cloud
 credentials, `CLOUD_ML_REGION`) stay allowed and are recorded in the fixture's `overlaps` with the
@@ -220,8 +223,14 @@ A claim's forms are computed once (`runEnvClaimForms`) and capped at `RUN_ENV_FO
 LF variants) are registered for redaction, with no scan needles or line forms: the claim
 fails before the clone and any output with a failure reason starting `run_env_forms_over_budget` (no
 value), and nothing is published. A lane with no live flight (held, terminal, bundle publication)
-withholds with the reason `forms_over_budget`. A store filled to its bounds with multi-line values
-can pass the cap. A cross-check child over the cap ends as `checker_unavailable`.
+withholds with the reason `forms_over_budget`. A cross-check child over the cap ends as
+`checker_unavailable`. To keep a claim under the cap, a variable save is refused at write time with
+409 `env_forms_budget` when it would raise the repo's counted secret value bytes above
+`MaxClaimSecretBytes` (207,253 = 40,000,000 / 193 form units per byte, `api/internal/runenv/form_budget.go`,
+`fixtures/run-env/form-budget.json`). Counted: every secret row of the repo and the user scope in any
+state (`GetRunEnvFormBudgetUsage`); plain values do not count. A save that does not raise the count is
+never refused; Disable, Enable and Delete are never refused. The per-byte bound is analytic, pinned
+by `agent/test/run-env-forms-budget.test.ts` for the form counts it assumes, not proved for every value.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
 (`agent/src/run-env-scan.ts`): every object reachable from the candidate tip and not from the
@@ -297,6 +306,9 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   distinct non-space character, and that is split across files or by elided context between hunks, and a value that appears only re-encoded
   (each line indented in a YAML block, or an encoding other than those registered). The blob scan
   still blocks a committed file.
+- **Path gap in two sinks (deferred, reviewer finding).** The planning diff sent to a cross-check
+  and the PR description diff context are redacted, not path-scanned: a secret with non-ASCII
+  characters used as a path name reaches them C-quoted (octal-escaped) and unredacted.
 - **Marker coverage.** The absent-route fallback relies on the per-run marker, which exists only
   for runs this worker received variables for, as described above.
 - **Migration Down refuses** rather than losing data: it raises when any version-2 row or any receipt
