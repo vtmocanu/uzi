@@ -294,3 +294,63 @@ describe("a claim over the form budget", () => {
     });
   });
 });
+
+// PRD 4416: a retained secret history can hold hundreds of thousands of redaction forms under the char budget. The
+// claim path must neither overflow the stack registering them nor lose the normal failure report when over the cap.
+describe("a large retained secret history", () => {
+  // 8-char [A-Za-z0-9] lines, distinct across every entry, LF-separated, no trailing newline (a trailing newline or
+  // CRLF would multiply the variants). 7,200 lines is 64,799 bytes, under the 65,536 per-value decoder limit.
+  const LINES = 7200;
+  const history = (versions: number): ClaimRunEnvRedact[] =>
+    Array.from({ length: versions }, (_, e) => ({
+      var_id: UUID, scope: "repo" as const, rev: e + 1, name: `OLD_${e % 5}`,
+      value: Array.from({ length: LINES }, (_, i) => `${e.toString(36).padStart(2, "0")}${i.toString(36).padStart(6, "0")}`).join("\n"),
+    }));
+  const claimSecrets = (versions: number) => ({ forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env_redact: history(versions) });
+
+  it("a retained history of 200k+ line forms under the cap starts and completes the run", async () => {
+    const redact = history(28);
+    const pre = runEnvClaimForms(undefined, redact);
+    assert.ok(pre.redaction.length >= 200_000, `forms: ${pre.redaction.length}`);
+    assert.equal(pre.overBudget, false);
+
+    const { gitlab } = fakeGitlab();
+    const { logger, added, removed } = secretRecordingLogger();
+    const claim = gitlabClaim(iid++, { secrets: claimSecrets(28) as never });
+    let ran = 0;
+    const exec: Executor = { run: async (ctx) => { ran++; return { branch: ctx.branch, reportOnly: true, summary: "ok" }; } };
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+
+    assert.equal(ran, 1, "the executor ran");
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    const addedSet = new Set(added);
+    const removedSet = new Set(removed);
+    let missingAdded = 0;
+    let missingRemoved = 0;
+    for (const f of pre.redaction) {
+      if (!addedSet.has(f)) missingAdded++;
+      if (!removedSet.has(f)) missingRemoved++;
+    }
+    assert.equal(missingAdded, 0, "every form registered");
+    assert.equal(missingRemoved, 0, "every form evicted at terminal");
+  });
+
+  it("a retained history over the form cap fails with run_env_forms_over_budget through the normal failure report", async () => {
+    const redact = history(36);
+    assert.equal(runEnvClaimForms(undefined, redact).overBudget, true);
+
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: claimSecrets(36) as never });
+    let ran = 0;
+    const exec: Executor = { run: async (ctx) => { ran++; return { branch: ctx.branch, reportOnly: true, summary: "ok" }; } };
+    await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
+
+    assert.equal(ran, 0, "the executor never ran");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.ok(failed, "the run failed through the normal report");
+    assert.match(String(failed.failure_reason), new RegExp(RUN_ENV_FORMS_OVER_BUDGET));
+    const json = JSON.stringify(failed);
+    for (const e of [0, 35]) assert.ok(!json.includes(redact[e]!.value.slice(0, 40)), "the report carries no value sample");
+    assert.equal(api.states.filter((s) => s.runId === claim.run_id && s.body.status === "completed").length, 0);
+  });
+});

@@ -4875,8 +4875,11 @@ export class GitCache {
       const cwd = args[gitPosition] === "-C" ? args[gitPosition + 1] : undefined;
       const present = new Set(args.flatMap((arg, i) => arg === "-c" ? [args[i + 1]!] : []));
       const attr = `--attr-source=${EPOCH_EMPTY_TREE_OID}`;
-      args.splice(position, 0, ...(state.attrSource === true && !versionOnly && !args.includes(attr) ? [attr] : []),
-        ...this.epochNativePins(cwd, state).filter(pin => !present.has(pin)).flatMap(pin => ["-c", pin]));
+      // Array-literal rebuild, not a splice with an argument spread: the pin count is data-derived.
+      args = [...args.slice(0, position),
+        ...(state.attrSource === true && !versionOnly && !args.includes(attr) ? [attr] : []),
+        ...this.epochNativePins(cwd, state).filter(pin => !present.has(pin)).flatMap(pin => ["-c", pin]),
+        ...args.slice(position)];
       this.requireEpochNativePins(args, gitPosition, state, versionOnly);
       args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
         "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
@@ -11191,7 +11194,7 @@ export class GitCache {
           const sourceKey = shape?.key ?? path.basename(journal.clonePath);
           await this.attributedRecovery(barePath, branch, sourceKey, journal, journal, false, snapshot);
         }
-        relevant.push(...protectedRecords.map(r => r.journal));
+        for (const r of protectedRecords) relevant.push(r.journal);
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
           fail("identity", "restriction record branch mismatch");
         return { activeRaw, protectedRaw, relevant, activeSource };
@@ -12883,7 +12886,7 @@ export class GitCache {
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
           if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound", true);
-          queue.push(...commit.parents);
+          for (const parent of commit.parents) queue.push(parent);
           continue;
         }
         leaves.add(sha);
@@ -12891,7 +12894,7 @@ export class GitCache {
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
       if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound", true);
-      queue.push(...commit.parents);
+      for (const parent of commit.parents) queue.push(parent);
     }
     if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound", true);
     const markerLeaves = new Set<string>();
@@ -20126,7 +20129,7 @@ export class GitCache {
         if (run.kind === "deadline") return untrusted("deadline", { mode: "git" });
         if (run.kind === "unreadable") return untrusted("scan_untrusted", { mode: "git", why: run.why });
         const scannedCommits = commitsScannedFromStderr(run.stderr);
-        findings.push(...run.findings);
+        for (const finding of run.findings) findings.push(finding);
         if (!scanIsTrustworthy({ stderr: run.stderr, scannedCommits, expectedCommits, execOk: run.execOk }) || /\bskipp/i.test(run.stderr)) {
           if (findings.length > 0) return { trusted: false, findings, reason: "scan_untrusted" };
           return untrusted("scan_untrusted", { mode: "git", expectedCommits, scannedCommits, execOk: run.execOk });
@@ -20139,7 +20142,7 @@ export class GitCache {
           if (findings.length > 0) return { trusted: false, findings, reason: res.reason };
           return untrusted(res.reason, { merge });
         }
-        findings.push(...res.findings);
+        for (const finding of res.findings) findings.push(finding);
       }
       this.log.debug(`${label} complete`, { barePath, expectedCommits, merges: merges.length, findings: findings.length });
       return { trusted: true, findings };
@@ -31029,7 +31032,10 @@ try {
         const after = await read(() => fs.lstat(dir));
         if (st.dev !== after.dev || st.ino !== after.ino || st.mtimeMs !== after.mtimeMs ||
             st.ctimeMs !== after.ctimeMs) throw new Error("owed directory changed");
-      } else names.push(...await fs.readdir(dir));
+      } else {
+        const entries = await fs.readdir(dir);
+        for (const entry of entries) names.push(entry);
+      }
       for (const name of names) {
         if (!/^(?:context-[0-9a-f]{64}|candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-[0-9a-f]{64}|(?:governed|receipt)-[0-9a-f]{64})\.json$/.test(name) &&
             !/^\.tmp-[0-9a-f-]{36}$/.test(name)) throw new Error("unknown owed metadata entry");
@@ -31738,7 +31744,7 @@ try {
           if (commit.tree !== tree) return undefined;
           aggregates.push({ round: Number(m[1]), batch: Number(m[2]), body: commit.body });
           if (aggregates.length > MAX_AGGREGATES) return undefined;
-          queue.push(...commit.parents);
+          for (const parent of commit.parents) queue.push(parent);
         }
         if (!aggregates.length || [...leaves].sort().join(",") !== heads.join(",")) return undefined;
         const current = await readCommit(currentSha);

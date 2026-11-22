@@ -272,7 +272,7 @@ function cUnquote(body: string): string {
     if (c !== "\\") {
       // Read by code point, so an astral character is encoded as one UTF-8 sequence.
       const cp = body.codePointAt(i)!;
-      bytes.push(...Buffer.from(String.fromCodePoint(cp), "utf8"));
+      for (const b of Buffer.from(String.fromCodePoint(cp), "utf8")) bytes.push(b);
       if (cp > 0xffff) i += 1;
       continue;
     }

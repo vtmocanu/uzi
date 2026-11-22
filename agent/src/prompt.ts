@@ -1616,8 +1616,14 @@ export function depsProvisionImplementNote(
     if (shown !== d.dir) lossy.push(i + 1);
     (d.ok ? installed : failed).push(`${i + 1}. ${shown}`);
   });
-  if (installed.length > 0) rows.push("installed:", ...installed);
-  if (failed.length > 0) rows.push("failed:", ...failed);
+  if (installed.length > 0) {
+    rows.push("installed:");
+    for (const row of installed) rows.push(row);
+  }
+  if (failed.length > 0) {
+    rows.push("failed:");
+    for (const row of failed) rows.push(row);
+  }
 
   const lines = [
     "The worker attempted to provision this repo's JS dependencies. Between the tags below, the",
@@ -2116,7 +2122,8 @@ export function renderFollowUpBatch(bodies: readonly string[]): string[] {
     `The user sent ${n} follow-ups, oldest first; each is in its own fenced block below.`,
   ];
   bodies.forEach((body, i) => {
-    lines.push("", `Follow-up ${i + 1} of ${n}:`, ...renderFollowUpBlock(body));
+    lines.push("", `Follow-up ${i + 1} of ${n}:`);
+    for (const line of renderFollowUpBlock(body)) lines.push(line);
   });
   lines.push("", FOLLOW_UP_TRAILER);
   return lines;
@@ -2185,7 +2192,8 @@ export function renderPriorOwnerHistory(bodies: readonly string[]): string[] {
     "server-reported scope and progress, take precedence.",
   ];
   bodies.forEach((body, i) => {
-    lines.push("", `Earlier follow-up ${i + 1} of ${n}:`, ...renderPriorOwnerHistoryBlock(body));
+    lines.push("", `Earlier follow-up ${i + 1} of ${n}:`);
+    for (const line of renderPriorOwnerHistoryBlock(body)) lines.push(line);
   });
   lines.push("", PRIOR_OWNER_HISTORY_TRAILER);
   return lines;
@@ -2330,9 +2338,14 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     );
   }
   // Issue #3149: earlier owner follow-ups read BEFORE any live follow-up, so a live correction wins.
-  if (input.priorOwnerFollowUps?.length) lines.push(...renderPriorOwnerHistory(input.priorOwnerFollowUps));
-  if (input.followUp) lines.push(...renderFollowUpBlock(input.followUp));
-  else if (input.ownerFollowUps?.length) lines.push(...renderFollowUpBatch(input.ownerFollowUps));
+  if (input.priorOwnerFollowUps?.length) {
+    for (const line of renderPriorOwnerHistory(input.priorOwnerFollowUps)) lines.push(line);
+  }
+  if (input.followUp) {
+    for (const line of renderFollowUpBlock(input.followUp)) lines.push(line);
+  } else if (input.ownerFollowUps?.length) {
+    for (const line of renderFollowUpBatch(input.ownerFollowUps)) lines.push(line);
+  }
   if (input.completionRework) lines.push("", input.completionRework.text);
   if (input.ownerDecisionEligible && !input.completionRework) lines.push("", COMPLETION_CONTRACT_GUIDANCE);
   lines.push(

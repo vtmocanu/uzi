@@ -93,7 +93,9 @@ const MODEL_PASS_AGE_MARGIN_MS = 15 * 60_000;
  *    every writer stopped. Removal remains descriptor-pinned even after the age guard.
  */
 export function modelPassMinAgeMs(timeoutsMs: readonly number[]): number {
-  return Math.max(0, ...timeoutsMs) + MODEL_PASS_AGE_MARGIN_MS;
+  let longest = 0;
+  for (const timeoutMs of timeoutsMs) longest = Math.max(longest, timeoutMs);
+  return longest + MODEL_PASS_AGE_MARGIN_MS;
 }
 
 /** The bound with the built-in timeouts (judge and review 5 min, summary 60 s), for tests. */

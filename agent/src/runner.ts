@@ -6443,18 +6443,21 @@ export class RunRunner {
     // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
     // this registration (with the redactors' below) is the only protection for it.
     // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
-    if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
+    if (claim.secrets.provider?.credential) {
+      for (const form of providerKeyForms(claim.secrets.provider.credential)) runScopedSecrets.push(form);
+    }
     // PRD #4416 M2: the forms of every secret run variable (live and older versions), rebuilt from each
     // claim and evicted with the other per-run secrets at terminal. Plain variables are not registered.
     // An over-budget claim registers its raw values only: it fails below, before the executor starts.
     const runEnvForms = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact);
-    runScopedSecrets.push(...runEnvForms.redaction);
+    // A loop, not an argument spread: the form count is data-sized and a spread past the engine's call-argument limit throws RangeError.
+    for (const form of runEnvForms.redaction) runScopedSecrets.push(form);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
     // exactly ONCE yet still evicted at the terminal (removeSecret is ref-counted, so a
     // second add here would leave a dangling registration the single eviction can't clear).
-    runScopedSecrets.push(...codexCanaries);
+    for (const canary of codexCanaries) runScopedSecrets.push(canary);
 
     const flight = this.buildFlight(
       claim,

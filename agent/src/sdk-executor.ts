@@ -418,7 +418,7 @@ export function fillOwnerBatch(
   }
   if (queuedOwner.length === 0) {
     const pulled = ctx.pullFollowUps?.(remaining, batch.length === 0);
-    if (pulled !== undefined) batch.push(...pulled);
+    if (pulled !== undefined) for (const item of pulled) batch.push(item);
   }
   return batch.length > 0 ? batch : undefined;
 }

@@ -765,7 +765,7 @@ function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bod
     if (!doc.quoted || bodyEnd === n) {
       const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false, depth);
       if (inner === undefined || bodies.length + inner.length > MAX_SUBST_BODIES) return -1;
-      bodies.push(...inner);
+      for (const body of inner) bodies.push(body);
     }
     pos = resume;
     if (pos >= n) return n;

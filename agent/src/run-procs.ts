@@ -465,7 +465,7 @@ function summaryReasons(summary: { truncated?: unknown; unresolved?: unknown; pr
   const flag = (set: boolean, allowed: ReadonlySet<string>, fallback: IncompleteReason): void => {
     if (!set) return;
     const named = tokens.filter((t) => allowed.has(t)) as IncompleteReason[];
-    out.push(...(named.length > 0 ? named : [fallback]));
+    for (const reason of named.length > 0 ? named : [fallback]) out.push(reason);
   };
   flag(summary.truncated !== false, TRUNCATION_TOKENS, "truncated");
   flag(summary.unresolved !== 0, UNRESOLVED_TOKENS, "unresolved");

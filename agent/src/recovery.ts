@@ -4425,7 +4425,7 @@ export class RecoveryCoordinator {
     const priorityEntry = index >= 0 ? this.bootOwed.splice(index, 1)[0] : undefined;
     const batch = this.bootOwed.splice(0, this.liveMaxPerPass - (priorityEntry ? 1 : 0));
     if (priorityEntry) batch.unshift(priorityEntry);
-    this.bootOwed.push(...batch); // rotate retained discoveries behind siblings; no internal retries
+    for (const owed of batch) this.bootOwed.push(owed); // rotate retained discoveries behind siblings; no internal retries
     for (const entry of batch) {
       if (signal?.aborted) break;
       const ctx = entry.context;
@@ -5902,7 +5902,10 @@ export class RecoveryCoordinator {
     try {
       const records = [...(snapshot ?? await this.snapshotBootRecords())];
       if (discover) {
-        try { records.push(...await this.materializeBootInventory(signal, this.isExecuting, attempts)); }
+        try {
+          const materialized = await this.materializeBootInventory(signal, this.isExecuting, attempts);
+          for (const record of materialized) records.push(record);
+        }
         catch (err) {
           MaintenanceBudget.current()?.check();
           this.log.warn("recovery: boot materialization failed; independent journals still retried", { error: errText(err) });

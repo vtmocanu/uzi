@@ -2701,12 +2701,12 @@ export class CodexExecutor implements Executor {
         try {
           if (!sibling) {
             const settled = await registry.settleForCapture(remaining(), undefined, true);
-            if (settled.kind === "incomplete") drainErrors.push(...settled.errors);
+            if (settled.kind === "incomplete") for (const err of settled.errors) drainErrors.push(err);
             drainErrors.push({ category: "protocol", message: "codex capture: half-built epoch lacks clean teardown" });
           } else if (sibling !== safety) {
             this.completedCaptures.delete(registry);
             const settled = await sibling.withCredentialFreeCapture(remaining(), async () => undefined, signal);
-            if (settled.kind === "incomplete") drainErrors.push(...settled.errors);
+            if (settled.kind === "incomplete") { for (const err of settled.errors) drainErrors.push(err); }
             else this.completedCaptures.set(registry, settled.proof);
           }
         } catch {
