@@ -280,11 +280,6 @@ trap - EXIT  # explicit restore confirmed; drop the fail-safe
   || fail "could not restore the admin token rate-limit gauge at its current revision (missing secret or seed failed)"
 pass "restored the admin's default anthropic_token ($CX_NEW_ANTH_ID) and its 55/12 rate-limit gauge (phase 47's values)"
 
-# The cancelled codex-only run left a capture-less source_only generation hold open that the
-# worker settles only slowly; resolve it explicitly once the admin's default token is back
-# (the CLI authenticates with the admin's uzc_ token, not the anthropic secret).
-resolve_fixture_source_hold "$CX_ONLY_RUN" "$CX_ONLY_GEN"
-
 # --- (7) teardown: leave admin secrets exactly as this phase found them -----------
 curl -fsS -b "$JAR" -X DELETE "$BASE/api/me/secrets/openai_api_key/$CX_OPENAI_ID" \
   -H "X-CSRF-Token: $(csrf)" >/dev/null \
@@ -295,6 +290,12 @@ apiget /api/me/secrets | jq -e '
   ' >/dev/null \
   || fail "the codex-activation phase leaked a secret; admin should hold exactly one anthropic_token and zero codex-kind secrets: $(apiget /api/me/secrets | jq -c .)"
 pass "teardown: admin secrets end exactly as found (one anthropic_token, zero codex-kind secrets)"
+
+# The cancelled codex-only run left a capture-less source_only generation hold open that the
+# worker settles only slowly; resolve it explicitly after the dummy-key teardown, so a capture
+# that never settles cannot leave that key behind (the CLI authenticates with the admin's
+# uzc_ token, not the anthropic or openai secret).
+resolve_fixture_source_hold "$CX_ONLY_RUN" "$CX_ONLY_GEN"
 
 # --- (8) no dummy credential leak, in container logs or on the worker's disk -------
 # Same idiom as 23-secret-hygiene.sh: a positive control BEFORE the absence check (an

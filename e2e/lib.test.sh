@@ -1631,6 +1631,7 @@ fixture_owner_decision() {
       *) fail 'unexpected fixture read' ;;
     esac
   }
+  apiget_before() { apiget "$2"; }
   uzi_cli() {
     [ "$*" = "run discard $UUID --hold $target --yes --json" ] || fail 'unscoped fixture disposition'
     echo $(( $(cat "$SEQ_DIR/dispositions") + 1 )) > "$SEQ_DIR/dispositions"
@@ -1719,6 +1720,7 @@ fixture_archive_receipt() {
       *) fail 'unexpected fixture receipt route' ;;
     esac
   }
+  apiget_before() { apiget "$2"; }
   uzi_cli() { fail 'captured hold must never be discarded'; }
   db_psql() {
     [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unexpected receipt SQL mutation'
@@ -1757,11 +1759,117 @@ custody_case "captured fixture timeout retains row worker and recreation log" fa
 custody_case "capturing fixture that never settles times out on the shared deadline" fail 'still capturing after 2s' fixture_archive_receipt capturing-timeout
 custody_case "capturing fixture that becomes available waits for archive FINAL" pass 'fixture archive custody receipt:' fixture_archive_receipt capturing-available
 
+# The shared deadline is enforced by the real bounded reader. Extract it, then drive
+# the helper through holds reads that block (curl --max-time expiry) or that observe
+# the capturing -> source_only transition only at the deadline: neither may discard.
+eval "$(awk '/^apiget_before\(\) \{/,/^\}/' "$LIB")"
+apiget_before_unit() {
+  local mode="$1" JAR=fixture-jar BASE=http://fixture rc=0
+  : > "$SEQ_DIR/curl-argv"
+  echo 0 > "$SEQ_DIR/curl-calls"
+  curl() {
+    local calls
+    calls=$(( $(cat "$SEQ_DIR/curl-calls") + 1 ))
+    echo "$calls" > "$SEQ_DIR/curl-calls"
+    printf '%s\n' "$*" >> "$SEQ_DIR/curl-argv"
+    case "$mode" in
+      retry) [ "$calls" -ge 2 ] || return 7; echo '{"ok":true}' ;;
+      *) return 28 ;;
+    esac
+  }
+  case "$mode" in
+    retry)
+      apiget_before 5 /api/recovery/holds >/dev/null || fail 'bounded read did not retry to success'
+      [ "$(cat "$SEQ_DIR/curl-argv")" = "$(printf '%s\n%s' \
+        '-fsS --max-time 5 -b fixture-jar http://fixture/api/recovery/holds' \
+        '-fsS --max-time 4 -b fixture-jar http://fixture/api/recovery/holds')" ] \
+        || fail "bounded read budgets not recomputed: $(cat "$SEQ_DIR/curl-argv")" ;;
+    expired)
+      SECONDS=7
+      apiget_before 5 /api/recovery/holds || rc=$?
+      [ "$rc" != 0 ] || fail 'expired deadline read succeeded'
+      [ "$(cat "$SEQ_DIR/curl-calls")" = 0 ] || fail 'expired deadline still called curl' ;;
+    exhaust)
+      apiget_before 2 /api/recovery/holds || rc=$?
+      [ "$rc" = 28 ] || fail "deadline-exhausted read returned rc=$rc"
+      [ "$(cat "$SEQ_DIR/curl-argv")" = "$(printf '%s\n%s' \
+        '-fsS --max-time 2 -b fixture-jar http://fixture/api/recovery/holds' \
+        '-fsS --max-time 1 -b fixture-jar http://fixture/api/recovery/holds')" ] \
+        || fail "retries outlived the deadline: $(cat "$SEQ_DIR/curl-argv")" ;;
+  esac
+  echo "bounded holds read $mode honoured its deadline"
+}
+for mode in retry expired exhaust; do
+  custody_case "bounded holds read: $mode" pass "bounded holds read $mode honoured" apiget_before_unit "$mode"
+done
+
+fixture_hold_deadline() {
+  # shellcheck disable=SC2034  # JAR and BASE are read by the extracted real apiget_before
+  local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 JAR=fixture-jar BASE=http://fixture output
+  echo 0 > "$SEQ_DIR/deadline-discards"
+  echo 0 > "$SEQ_DIR/deadline-reads"
+  : > "$SEQ_DIR/deadline-budgets"
+  deadline_holds() {
+    jq -nc --arg run "$UUID" --arg id "$target" --arg attention "$1" \
+      '{holds:[{id:$id,run_id:$run,generation:1,state:"open",attention:$attention,has_available_capture:false}
+        | if $attention=="capturing" then .capture_state="uploading" else . end]}'
+  }
+  apiget() {
+    case "$1" in
+      "/api/runs/$UUID/archives") echo '{"archives":[]}' ;;
+      "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
+      *) fail 'unexpected deadline read' ;;
+    esac
+  }
+  case "$mode" in
+    blocked-read)
+      # The real bounded reader: the first holds read answers capturing; every later
+      # one blocks (3s) and, like curl, gives up at --max-time with rc 28.
+      curl() {
+        local reads budget=""
+        reads=$(( $(cat "$SEQ_DIR/deadline-reads") + 1 ))
+        echo "$reads" > "$SEQ_DIR/deadline-reads"
+        [ "$1 $2" = '-fsS --max-time' ] && budget="$3"
+        echo "$budget" >> "$SEQ_DIR/deadline-budgets"
+        [[ "$budget" =~ ^[1-9][0-9]*$ ]] || fail "holds read was not time-bounded: $*"
+        if [ "$reads" = 1 ]; then deadline_holds capturing; return 0; fi
+        if [ "$budget" -lt 3 ]; then command sleep "$budget"; return 28; fi
+        command sleep 3; deadline_holds source_only
+      } ;;
+    late-transition)
+      # Fast reads; the capture only turns source_only on the poll taken at the deadline.
+      apiget_before() {
+        if [ "$SECONDS" -ge "$1" ]; then deadline_holds source_only; else deadline_holds capturing; fi
+      } ;;
+  esac
+  uzi_cli() {
+    echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
+    echo '{"discarded":true}'
+  }
+  if output="$(resolve_fixture_source_hold "$UUID" 1 2 2>&1)"; then
+    fail "deadline overrun resolved the hold: $output"
+  fi
+  [ "$(cat "$SEQ_DIR/deadline-discards")" = 0 ] || fail "discarded after the deadline: $output"
+  case "$mode" in
+    blocked-read)
+      [[ "$output" == *'exceeded the 2s deadline'* ]] || fail "blocked read missed the deadline diagnostic: $output"
+      [ "$(sort -n "$SEQ_DIR/deadline-budgets" | tail -n 1)" -le 2 ] \
+        || fail "a holds read budget exceeded the 2s deadline: $(cat "$SEQ_DIR/deadline-budgets")" ;;
+    late-transition)
+      [[ "$output" == *'changed after the 2s deadline'* ]] || fail "late transition missed the deadline diagnostic: $output" ;;
+  esac
+  echo "deadline $mode failed closed with zero discards"
+}
+custody_case "a blocked holds read past the deadline fails with zero discards" pass 'deadline blocked-read failed closed with zero discards' \
+  fixture_hold_deadline blocked-read
+custody_case "a capturing to source_only transition seen at the deadline fails with zero discards" pass 'deadline late-transition failed closed with zero discards' \
+  fixture_hold_deadline late-transition
+
 # Execute the actual owning phase boundaries against the real owner helper. The
 # fixture holds every phase's runs plus the completed outage case (which must
 # remain open); a phase may end ONLY its own (run, generation) obligations.
 fixture_phase_boundary() {
-  local phase="$1" want="$2" intended="$3" before after n=0 entry name gen run
+  local phase="$1" want="$2" intended="$3" mutate="${4:-}" before after n=0 entry name gen run keys='[]'
   local X=b4dec5cf-e6d4-413b-b3a8-0005a2835701 ED=b4dec5cf-e6d4-413b-b3a8-0005a2835702
   local RUN_KA=b4dec5cf-e6d4-413b-b3a8-0005a2835703 RUN_KB=b4dec5cf-e6d4-413b-b3a8-0005a2835704
   local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
@@ -1799,6 +1907,7 @@ fixture_phase_boundary() {
       *) fail 'unexpected boundary read' ;;
     esac
   }
+  apiget_before() { apiget "$2"; }
   uzi_cli() {
     [ "$1 $2 $4 $6 $7" = 'run discard --hold --yes --json' ] || fail 'unexpected fixture command'
     [ "$3" != "$UUID" ] || fail 'completed outage case was discarded'
@@ -1806,6 +1915,11 @@ fixture_phase_boundary() {
       || fail 'fixture command targeted a foreign hold'
     jq --arg id "$5" '(.holds[]|select(.id==$id)).state="discarded"' "$SEQ_DIR/boundary-holds" > "$SEQ_DIR/boundary-next"
     mv "$SEQ_DIR/boundary-next" "$SEQ_DIR/boundary-holds"
+    if [ "$mutate" = mutate ]; then
+      # Control: an unrelated row changes a field a state-only comparison never reads.
+      jq --arg run "$UUID" '(.holds[]|select(.run_id==$run)).attention="needs_action"' "$SEQ_DIR/boundary-holds" > "$SEQ_DIR/boundary-next"
+      mv "$SEQ_DIR/boundary-next" "$SEQ_DIR/boundary-holds"
+    fi
     echo '{"discarded":true}'
   }
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
@@ -1821,7 +1935,17 @@ fixture_phase_boundary() {
     jq -e --arg run "$run" --argjson gen "$gen" \
       '[.holds[]|select(.run_id==$run and .generation==$gen)] | length==1 and (.[0].state|IN("discarded","released"))' \
       "$SEQ_DIR/boundary-holds" >/dev/null || fail "$phase: intended hold $name generation $gen was not resolved"
+    keys="$(jq -c --arg run "$run" --argjson gen "$gen" '. + [{run_id:$run,generation:$gen}]' <<<"$keys")"
   done
+  # Every non-intended row is the complete boundary-initial JSON row; intended rows
+  # differ only in state; no row appears or disappears.
+  jq -e --argjson initial "$(cat "$SEQ_DIR/boundary-initial")" '([.holds[].id]|sort) == ([$initial.holds[].id]|sort)' \
+    "$SEQ_DIR/boundary-holds" >/dev/null || fail "$phase: the hold id set changed"
+  jq -e --argjson keys "$keys" --argjson initial "$(cat "$SEQ_DIR/boundary-initial")" '
+    . as $cur | all($initial.holds[]; . as $i | ([$keys[] | select(.run_id==$i.run_id and .generation==$i.generation)] | length) as $k
+      | ([$cur.holds[] | select(.id==$i.id)][0]) as $now
+      | if $k > 0 then ($now|del(.state)) == ($i|del(.state)) else $now == $i end)' \
+    "$SEQ_DIR/boundary-holds" >/dev/null || fail "$phase: a non-intended hold row changed or an intended row changed beyond state"
   jq -e --argjson want "$want" --argjson initial "$(cat "$SEQ_DIR/boundary-initial")" \
     '([.holds[] | . as $h | select(($initial.holds[]|select(.id==$h.id)).state != $h.state)] | length) == $want' \
     "$SEQ_DIR/boundary-holds" >/dev/null || fail "$phase: the number of changed holds is not exactly $want"
@@ -1841,6 +1965,8 @@ fixture_phase_case 52-api-outage-outbox 3 'RUN_F1:1 RUN_F2:1 RUN_F2:3'
 fixture_phase_case 48-auto-selection 4 'AS_RUN:1 AS_RUN_RF:1 AS_RUN2:1 AS_RUN3:2'
 fixture_phase_case 73-forge-unreachable-park 2 'RUN_D:1 RUN_E:1'
 fixture_phase_case 74-codex-activation 1 'CX_ONLY_RUN:1'
+custody_case "phase boundary catches a non-state change to a non-intended hold" fail 'a non-intended hold row changed' \
+  fixture_phase_boundary 74-codex-activation 1 'CX_ONLY_RUN:1' mutate
 
 # The previous cleanup failed with a capture FK and silently removed source-only
 # evidence when no capture existed. Pin all three phase seams to read-only admission.

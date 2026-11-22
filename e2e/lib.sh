@@ -1049,6 +1049,22 @@ login() {
     -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}" >/dev/null
 }
 apiget()  { retry_read curl -fsS -b "$JAR" "$BASE$1"; }
+# apiget_before DEADLINE PATH: apiget bounded by an absolute $SECONDS deadline. Each
+# attempt (at most 3, like retry_read) gets curl --max-time of the time remaining, and
+# none starts once the deadline has passed, so a blocked read cannot outlive its caller.
+apiget_before() {
+  local deadline="$1" path="$2" n=1 rem rc
+  [[ "$deadline" =~ ^[0-9]+$ ]] || return 2
+  while :; do
+    rem=$((deadline - SECONDS))
+    [ "$rem" -gt 0 ] || return 28
+    curl -fsS --max-time "$rem" -b "$JAR" "$BASE$path" && return 0
+    rc=$?
+    [ "$n" -ge 3 ] && return "$rc"
+    n=$((n + 1))
+    sleep 0.5
+  done
+}
 apipost() { curl -fsS -b "$JAR" -X POST "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/json' \
@@ -1414,12 +1430,17 @@ remove_fixture_ephemeral_worker() {
 # FINAL; only capture-less holds use owner discard. Available archives are preserved.
 resolve_fixture_source_hold() {
   local run="$1" generation="$2" view hold id state before after reply
-  local timeout="${3:-120}" restored_at="${4:-}" start=$SECONDS snapshot
+  local timeout="${3:-120}" restored_at="${4:-}" start=$SECONDS snapshot attention
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture receipt timeout: $timeout"
+  # One deadline for the whole call: the capture wait and the archive receipt share it,
+  # and every holds read is bounded by what remains (apiget_before), never reset.
+  local deadline=$((start + timeout))
   [[ "$run" =~ ^[0-9a-fA-F-]{36}$ && "$generation" =~ ^[1-9][0-9]*$ ]] \
     || fail "invalid fixture hold identity: run=$run generation=$generation"
   apiget "/api/runs/$run" | jq -e --arg run "$run" '.run.id==$run and (.run.status|IN("completed","failed","cancelled"))' >/dev/null \
     || fail "fixture hold run is not terminal: $run"
-  view="$(apiget /api/recovery/holds)"
+  view="$(apiget_before "$deadline" /api/recovery/holds)" \
+    || fail "fixture hold read failed or exceeded the ${timeout}s deadline: run=$run generation=$generation"
   hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
     '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
   [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
@@ -1432,11 +1453,18 @@ resolve_fixture_source_hold() {
       fail "fixture hold still capturing after ${timeout}s: run=$run generation=$generation hold=$id"
     fi
     sleep 1
-    view="$(apiget /api/recovery/holds)"
+    view="$(apiget_before "$deadline" /api/recovery/holds)" \
+      || fail "fixture hold read failed or exceeded the ${timeout}s deadline: run=$run generation=$generation hold=$id"
     hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
       '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
     [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
     [ "$(printf '%s' "$hold" | jq -r '.[0].id')" = "$id" ] || fail "fixture hold identity changed: run=$run generation=$generation $hold"
+    # A transition first observed at or past the deadline is never acted on; a hold
+    # still capturing falls through to the loop's own timeout diagnostic.
+    attention="$(printf '%s' "$hold" | jq -r '.[0].attention // ""')"
+    if [ "$SECONDS" -ge "$deadline" ] && [ "$attention" != capturing ]; then
+      fail "fixture hold changed after the ${timeout}s deadline: run=$run generation=$generation hold=$id $hold"
+    fi
   done
   state="$(printf '%s' "$hold" | jq -r '.[0].state')"
   case "$state" in
@@ -1447,7 +1475,6 @@ resolve_fixture_source_hold() {
   if printf '%s' "$hold" | jq -e '.[0] | .has_available_capture==true and .capture_state=="available"' >/dev/null; then
     before="$(apiget "/api/runs/$run/archives" | jq -ce '.archives|select(type=="array")|[.[]|select(.state=="available")|{id,checksum,byte_size}]')" \
       || fail "fixture archive listing malformed: run=$run hold=$id"
-    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture receipt timeout: $timeout"
     while :; do
       snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'run_status',r.status,
         'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'run_id',h.run_id,'generation',h.generation,
@@ -1483,7 +1510,7 @@ resolve_fixture_source_hold() {
       printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null
         and (.captures|type=="array" and any(.[]; .state=="available"))' >/dev/null \
         || fail "fixture receipt has unexpected disposition or capture state: $snapshot"
-      if [ $((SECONDS - start)) -ge "$timeout" ]; then
+      if [ "$SECONDS" -ge "$deadline" ]; then
         printf 'fixture receipt timeout evidence: restore_at=%s snapshot=%s\n' "${restored_at:-unknown}" "$snapshot"
         if [ -n "$restored_at" ]; then
           "${COMPOSE[@]}" logs --no-color --since "$restored_at" --tail 80 agent || true
@@ -1499,6 +1526,9 @@ resolve_fixture_source_hold() {
   printf '%s' "$before" | jq -e --arg id "$id" '.archives|type=="array" and all(.[]; .hold_id!=$id)' >/dev/null \
     || fail "fixture hold has capture evidence: $id"
   before="$(printf '%s' "$before" | jq -c '[.archives[]|select(.state=="available")|{id,checksum,byte_size}]')"
+  # Immediately before the owner disposition: past the deadline nothing is discarded.
+  [ "$SECONDS" -lt "$deadline" ] \
+    || fail "fixture hold deadline of ${timeout}s passed before the owner disposition: run=$run generation=$generation hold=$id"
   reply="$(uzi_cli run discard "$run" --hold "$id" --yes --json)" || fail "fixture owner disposition failed: run=$run hold=$id"
   printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "fixture owner disposition not acknowledged: $reply"
   view="$(apiget /api/recovery/holds)"
