@@ -74,6 +74,11 @@ package store_test
 // a SEPARATE observer connection, so the measured backend is not perturbed by its own
 // measurement. The throwaway role is a superuser.
 //
+// plan_cache_mode: the primary workload runs at the default auto. A role- or database-level
+// plan_cache_mode now fails the run (the AfterConnect check in poolConfig reads the
+// backend's startup value), as does a DSN whose default_query_exec_mode or
+// statement_cache_capacity would defeat the candidate's capacity label (pmCheckPoolConfig).
+//
 // Design (see the ADR this feeds for the interpretation):
 //   - One api-style pool per candidate (MaxConns 1), built from pgxpool.ParseConfig (not
 //     OpenPool; candidate A is raw pgx defaults and corresponds to the api's unchanged
@@ -411,6 +416,9 @@ func (pmArgTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndDa
 // execution nor as a statement identity.
 func pmSkip(ctx context.Context) context.Context { return context.WithValue(ctx, pmSkipKey, true) }
 
+// pmPID's Peak* fields are interval-sampler readings only, from the sampler's start: they
+// exclude the baseline sample, evictionDemo and the post-round samples. HWMKB (vmhwm) mixes
+// sampler and held samples.
 type pmPID struct {
 	PID           uint32
 	ConnectedAt   time.Time
@@ -561,10 +569,17 @@ func pmParseMem(smaps, status string) (pmMem, error) {
 	return m, nil
 }
 
+// pmObserverReadTimeout bounds one observer read once it holds the observer lock.
+const pmObserverReadTimeout = 30 * time.Second
+
 // read samples one backend. raw, when non-nil, receives the three raw file bodies.
 func (o *pmObserver) read(ctx context.Context, pid uint32, raw *[3]string) (pmMem, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// The bound starts after o.mu is taken, so time spent waiting for another reader never
+	// eats into this read's own budget. It also lets a sampler join (pmSampler.Stop) finish.
+	ctx, cancel := context.WithTimeout(ctx, pmObserverReadTimeout)
+	defer cancel()
 	var smaps, status string
 	if err := o.conn.QueryRow(ctx, `SELECT pg_read_file($1::text), pg_read_file($2::text)`,
 		fmt.Sprintf("/proc/%d/smaps_rollup", pid), fmt.Sprintf("/proc/%d/status", pid)).Scan(&smaps, &status); err != nil {
@@ -762,10 +777,55 @@ func (e *pmEnv) pidGone(pid uint32) bool {
 
 // openPool builds the candidate's api-style pool: pgxpool.ParseConfig, then the candidate's
 // fields set directly, MaxConns 1, with the tracer and PID-recording hooks.
+//
+// Only the memory and wide phases use openPool; the explain and discover phases build their
+// own connections and are not covered by the guards in poolConfig. The wide phase's
+// SET plan_cache_mode = force_generic_plan runs after acquire, so the AfterConnect mode check
+// (which sees the connection's startup state) is unaffected by it. The guards are a harness
+// guard only and do not restrict production OpenPool.
 func (e *pmEnv) openPool(ctx context.Context) {
+	cfg, err := e.poolConfig()
+	if err != nil {
+		e.t.Fatalf("%s: pool config: %v", e.cand.Name, err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		e.t.Fatalf("%s: new pool: %v", e.cand.Name, err)
+	}
+	e.pool, e.q = pool, store.New(pool)
+}
+
+// pmCheckPoolConfig fails when the parsed DSN left the pool unable to measure the candidate:
+// a non-default default_query_exec_mode (exec, simple_protocol, describe_exec) caches no
+// prepared statement, and a statement_cache_capacity in the DSN that the candidate does not
+// then override would make the capacity labels not measure the statement cache.
+func pmCheckPoolConfig(cfg *pgxpool.Config, cand pmCand) error {
+	if cfg.ConnConfig.DefaultQueryExecMode != pgx.QueryExecModeCacheStatement {
+		return fmt.Errorf("default_query_exec_mode is %v, want cache_statement: the capacity labels would not measure the statement cache",
+			cfg.ConnConfig.DefaultQueryExecMode)
+	}
+	if got := cfg.ConnConfig.StatementCacheCapacity; got != cand.capacity() {
+		return fmt.Errorf("statement cache capacity is %d, candidate %s wants %d: the capacity labels would not measure the statement cache",
+			got, cand.Name, cand.capacity())
+	}
+	return nil
+}
+
+// pmCheckPlanCacheMode fails unless the backend's startup plan_cache_mode is auto, so a role-
+// or database-level setting cannot silently change what the primary workload measures.
+func pmCheckPlanCacheMode(mode string) error {
+	if mode != "auto" {
+		return fmt.Errorf("plan_cache_mode is %q on the measured connection, want auto (a role- or database-level setting?)", mode)
+	}
+	return nil
+}
+
+// poolConfig builds the candidate's pool configuration: ParseConfig, MaxConns 1, the
+// candidate's fields, the tracer and the PID-recording hooks, then pmCheckPoolConfig.
+func (e *pmEnv) poolConfig() (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(e.dsn)
 	if err != nil {
-		e.t.Fatalf("%s: parse config: %v", e.cand.Name, err)
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.MaxConns = 1
 	if e.cand.StmtCap > 0 {
@@ -778,11 +838,17 @@ func (e *pmEnv) openPool(ctx context.Context) {
 	if e.cand.Health > 0 {
 		cfg.HealthCheckPeriod = e.cand.Health
 	}
+	if err := pmCheckPoolConfig(cfg, e.cand); err != nil {
+		return nil, err
+	}
 	cfg.ConnConfig.Tracer = pmTracer{env: e}
 	cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
 		ctx = pmSkip(ctx)
 		var mode string
 		if err := c.QueryRow(ctx, `SHOW plan_cache_mode`, pgx.QueryExecModeSimpleProtocol).Scan(&mode); err != nil {
+			return err
+		}
+		if err := pmCheckPlanCacheMode(mode); err != nil {
 			return err
 		}
 		// Effective jit setting, read once per backend on the simple protocol (prepares
@@ -812,11 +878,7 @@ func (e *pmEnv) openPool(ctx context.Context) {
 		e.pidRec(pid).ClosedAt = time.Now()
 		e.mu.Unlock()
 	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		e.t.Fatalf("%s: new pool: %v", e.cand.Name, err)
-	}
-	e.pool, e.q = pool, store.New(pool)
+	return cfg, nil
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1225,6 +1287,10 @@ func (e *pmEnv) postRoundSample(ctx context.Context, kind string, round int) pmS
 	return e.sampleHeld(ctx, c, kind, round)
 }
 
+// pmSamplerResult summarizes the interval sampler's own readings. The Peak* fields are
+// interval-sampler readings only, taken from the sampler's start: they exclude the baseline
+// sample, evictionDemo and the post-round samples (sampleHeld), so they are not a process
+// high-water mark. VmHWM (HWMKB elsewhere) mixes sampler and held samples.
 type pmSamplerResult struct {
 	N            int     `json:"samples"`
 	Errors       int     `json:"errors"`
@@ -1241,78 +1307,147 @@ type pmSamplerResult struct {
 	PeakAgeS     float64 `json:"peak_private_conn_age_s"`
 }
 
+// pmSamplerJoinWait is how long Stop waits for the sampler goroutine to finish on its own
+// before cancelling its context. It exceeds the per-read timeout in pmObserver.read, so a
+// healthy read in flight is never cancelled by a graceful Stop.
+const pmSamplerJoinWait = 35 * time.Second
+
 type pmSampler struct {
-	e     *pmEnv
-	stop  chan struct{}
-	done  chan struct{}
+	e      *pmEnv
+	read   func(ctx context.Context, pid uint32) (pmMem, error)
+	cancel context.CancelFunc
+	stop   chan struct{}
+	done   chan struct{}
+	once   sync.Once
+	// joinWait bounds Stop's wait for done before it cancels the goroutine's context.
+	joinWait time.Duration
+	// res and times are written only by the goroutine and read only after done is closed.
 	res   pmSamplerResult
 	times []time.Time
+	// final is the cached result, set once inside once.Do.
+	final pmSamplerResult
 }
 
 func (e *pmEnv) startSampler(ctx context.Context) *pmSampler {
-	s := &pmSampler{e: e, stop: make(chan struct{}), done: make(chan struct{})}
-	go func() {
-		defer close(s.done)
-		tick := time.NewTicker(pmSampleInterval)
-		defer tick.Stop()
-		for {
-			select {
-			case <-s.stop:
-				return
-			case <-tick.C:
-			}
-			pid := e.curPID.Load()
-			if pid == 0 {
-				continue
-			}
-			now := time.Now()
-			mem, err := e.obs.read(ctx, pid, nil)
-			if err != nil {
-				if e.pidGone(pid) || e.curPID.Load() != pid {
-					s.res.Dropped++
-				} else {
-					s.res.Errors++
-					if s.res.FirstError == "" {
-						s.res.FirstError = err.Error()
-					}
-				}
-				continue
-			}
-			age, execs, idents := e.pidStats(pid)
-			smp := pmSample{Cand: e.cand.Name, Kind: "sampler", PID: pid, ConnAgeS: age, Executions: execs,
-				Identities: idents, Mem: mem, TMs: now.Sub(e.start).Milliseconds()}
-			s.times = append(s.times, now)
-			s.res.N++
-			e.mu.Lock()
-			p := e.pidRec(pid)
-			if mem.PrivateKB > p.PeakPrivateKB {
-				p.PeakPrivateKB, p.PeakSampleAge = mem.PrivateKB, age
-			}
-			if mem.AnonymousKB > p.PeakAnonKB {
-				p.PeakAnonKB, p.PeakAnonAge = mem.AnonymousKB, age
-			}
-			if mem.VmHWMKB > p.HWMKB {
-				p.HWMKB = mem.VmHWMKB
-			}
-			e.mu.Unlock()
-			if mem.PrivateKB > s.res.PeakKB {
-				s.res.PeakKB, s.res.PeakPID, s.res.PeakAgeS = mem.PrivateKB, pid, age
-			}
-			if mem.AnonymousKB > s.res.PeakAnonKB {
-				s.res.PeakAnonKB, s.res.PeakAnonPID, s.res.PeakAnonAgeS = mem.AnonymousKB, pid, age
-			}
-			e.out.emit("sampler", map[string]any{"cand": e.cand.Name, "rep": e.rep, "t_ms": smp.TMs, "pid": pid, "conn_age_s": age,
-				"executions_served": execs, "identities_cumulative": idents, "private_kb": mem.PrivateKB,
-				"private_clean_kb": mem.PrivateCleanKB, "private_dirty_kb": mem.PrivateDirtyKB, "anonymous_kb": mem.AnonymousKB, "rss_kb": mem.RssKB, "pss_kb": mem.PssKB,
-				"vmhwm_kb_includes_shared": mem.VmHWMKB, "cgroup_memory_current_bytes": mem.CgroupCurrentB})
-		}
-	}()
+	return newPMSampler(ctx, e, func(ctx context.Context, pid uint32) (pmMem, error) {
+		return e.obs.read(ctx, pid, nil)
+	}, pmSampleInterval)
+}
+
+// newPMSampler starts the sampler goroutine. read is the memory read (the observer in
+// production, a fake in tests) and interval the tick period.
+func newPMSampler(ctx context.Context, e *pmEnv, read func(ctx context.Context, pid uint32) (pmMem, error), interval time.Duration) *pmSampler {
+	sctx, cancel := context.WithCancel(ctx)
+	s := &pmSampler{e: e, read: read, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{}), joinWait: pmSamplerJoinWait}
+	go s.loop(sctx, interval)
 	return s
 }
 
+func (s *pmSampler) stopRequested() bool {
+	select {
+	case <-s.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *pmSampler) loop(sctx context.Context, interval time.Duration) {
+	e := s.e
+	defer close(s.done)
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-tick.C:
+		}
+		// A tick and a stop can be ready together; do not start a read after Stop.
+		if s.stopRequested() {
+			return
+		}
+		pid := e.curPID.Load()
+		if pid == 0 {
+			continue
+		}
+		now := time.Now()
+		mem, err := s.read(sctx, pid)
+		if err != nil {
+			// A read that failed because the sampler is being stopped or cancelled is not a
+			// sampling error.
+			if sctx.Err() != nil || s.stopRequested() || e.pidGone(pid) || e.curPID.Load() != pid {
+				s.res.Dropped++
+			} else {
+				s.res.Errors++
+				if s.res.FirstError == "" {
+					s.res.FirstError = err.Error()
+				}
+			}
+			continue
+		}
+		age, execs, idents := e.pidStats(pid)
+		smp := pmSample{Cand: e.cand.Name, Kind: "sampler", PID: pid, ConnAgeS: age, Executions: execs,
+			Identities: idents, Mem: mem, TMs: now.Sub(e.start).Milliseconds()}
+		s.times = append(s.times, now)
+		s.res.N++
+		e.mu.Lock()
+		p := e.pidRec(pid)
+		if mem.PrivateKB > p.PeakPrivateKB {
+			p.PeakPrivateKB, p.PeakSampleAge = mem.PrivateKB, age
+		}
+		if mem.AnonymousKB > p.PeakAnonKB {
+			p.PeakAnonKB, p.PeakAnonAge = mem.AnonymousKB, age
+		}
+		if mem.VmHWMKB > p.HWMKB {
+			p.HWMKB = mem.VmHWMKB
+		}
+		e.mu.Unlock()
+		if mem.PrivateKB > s.res.PeakKB {
+			s.res.PeakKB, s.res.PeakPID, s.res.PeakAgeS = mem.PrivateKB, pid, age
+		}
+		if mem.AnonymousKB > s.res.PeakAnonKB {
+			s.res.PeakAnonKB, s.res.PeakAnonPID, s.res.PeakAnonAgeS = mem.AnonymousKB, pid, age
+		}
+		e.out.emit("sampler", map[string]any{"cand": e.cand.Name, "rep": e.rep, "t_ms": smp.TMs, "pid": pid, "conn_age_s": age,
+			"executions_served": execs, "identities_cumulative": idents, "private_kb": mem.PrivateKB,
+			"private_clean_kb": mem.PrivateCleanKB, "private_dirty_kb": mem.PrivateDirtyKB, "anonymous_kb": mem.AnonymousKB, "rss_kb": mem.RssKB, "pss_kb": mem.PssKB,
+			"vmhwm_kb_includes_shared": mem.VmHWMKB, "cgroup_memory_current_bytes": mem.CgroupCurrentB})
+	}
+}
+
+// Stop is the graceful path: request a stop, wait up to joinWait for the goroutine (so a
+// healthy in-flight read completes), cancel and join if it overstays, then compute and cache
+// the result. Whichever of Stop and Close runs first wins; later calls return the cache.
 func (s *pmSampler) Stop() pmSamplerResult {
+	s.once.Do(func() { s.finish(false) })
+	return s.final
+}
+
+// Close is the failure teardown: it cancels the read context immediately, joins without a
+// bound, and caches the result, unless Stop already did.
+func (s *pmSampler) Close() pmSamplerResult {
+	s.once.Do(func() { s.finish(true) })
+	return s.final
+}
+
+func (s *pmSampler) finish(cancelFirst bool) {
+	if cancelFirst {
+		s.cancel()
+	}
 	close(s.stop)
-	<-s.done
+	if cancelFirst {
+		<-s.done
+	} else {
+		select {
+		case <-s.done:
+		case <-time.After(s.joinWait):
+			s.cancel()
+			<-s.done
+		}
+	}
+	s.cancel()
+	// done is closed, so res and times are no longer written.
 	var gaps []float64
 	for i := 1; i < len(s.times); i++ {
 		gaps = append(gaps, float64(s.times[i].Sub(s.times[i-1]).Microseconds())/1e3)
@@ -1326,7 +1461,42 @@ func (s *pmSampler) Stop() pmSamplerResult {
 		s.res.P95Ms = pmQuantile(gaps, 0.95)
 		s.res.MaxMs = pmQuantile(gaps, 1)
 	}
-	return s.res
+	s.final = s.res
+}
+
+// pmWithSampler runs body with a sampler from start and always closes it afterwards, so a
+// t.Fatalf (runtime.Goexit) or panic in body still cancels and joins the goroutine before the
+// caller's earlier defers run. body should call Stop itself on the success path.
+func pmWithSampler(start func() *pmSampler, body func(s *pmSampler)) {
+	s := start()
+	defer s.Close()
+	body(s)
+}
+
+// pmRoundLoop runs rounds until the stop rule holds. round(r) runs round r and returns the
+// number of backend pids seen so far. Without recycle it stops once r >= minRounds. With
+// recycle it stops once r >= minRounds and at least four recycles happened (pids-1 >= 4);
+// otherwise, past maxWait it stops cleanly only when minRounds rounds are done, and returns
+// an error if the deadline cut the run short of minRounds. It returns the rounds completed.
+func pmRoundLoop(minRounds int, recycle bool, maxWait time.Duration, elapsed func() time.Duration, round func(r int) int) (int, error) {
+	for r := 1; ; r++ {
+		pids := round(r)
+		if !recycle {
+			if r >= minRounds {
+				return r, nil
+			}
+			continue
+		}
+		if r >= minRounds && pids-1 >= 4 {
+			return r, nil
+		}
+		if elapsed() > maxWait {
+			if r < minRounds {
+				return r, fmt.Errorf("recycling deadline %s reached after %d of %d requested rounds", maxWait, r, minRounds)
+			}
+			return r, nil
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2514,6 +2684,9 @@ type pmRoundRec struct {
 	BreadthCursor int     `json:"breadth_cursor"`
 }
 
+// pmMemSummary's SampledPeakAnonKB and SampledPeakKB are interval-sampler readings only, from
+// the sampler's start; they exclude the baseline sample, evictionDemo and the post-round
+// samples. VmHWMMaxKB mixes sampler and held samples.
 type pmMemSummary struct {
 	Cand               string           `json:"cand"`
 	Rep                int              `json:"rep"`
@@ -2579,185 +2752,182 @@ func (e *pmEnv) runMemory(ctx context.Context) pmMemSummary {
 	e.start = candStart
 	base := e.postRoundSample(ctx, "baseline_empty_cache", 0)
 	e.evictionDemo(ctx)
-	sampler := e.startSampler(ctx)
+	// Everything from the sampler start through the candidate_summary is the body of
+	// pmWithSampler, so every exit (including a t.Fatalf) cancels and joins the sampler before
+	// the deferred closePool above and before the caller's clone closes the observer.
+	var sum pmMemSummary
+	pmWithSampler(func() *pmSampler { return e.startSampler(ctx) }, func(sampler *pmSampler) {
 
-	minRounds := pmEnvMinInt(t, "UZI_POOL_MEMORY_ROUNDS", 20, 1)
-	maxWait := pmEnvDuration("UZI_POOL_MEMORY_MAX_RECYCLE_WAIT", 12*time.Minute)
-	var post []pmSample
-	rounds := 0
-	for r := 1; ; r++ {
-		t0 := time.Now()
-		e.hotMix(ctx, pmHotReps)
-		lat := e.latencyLoop(ctx, pmLatencyN, 1, r == 1)
-		e.verifyFixture(ctx)
-		s := e.postRoundSample(ctx, "post_round", r)
-		post = append(post, s)
-		rounds = r
+		minRounds := pmEnvMinInt(t, "UZI_POOL_MEMORY_ROUNDS", 20, 1)
+		maxWait := pmEnvDuration("UZI_POOL_MEMORY_MAX_RECYCLE_WAIT", 12*time.Minute)
+		var post []pmSample
+		rounds, rerr := pmRoundLoop(minRounds, e.cand.Recycle, maxWait, func() time.Duration { return time.Since(candStart) },
+			func(r int) int {
+				t0 := time.Now()
+				e.hotMix(ctx, pmHotReps)
+				lat := e.latencyLoop(ctx, pmLatencyN, 1, r == 1)
+				e.verifyFixture(ctx)
+				s := e.postRoundSample(ctx, "post_round", r)
+				post = append(post, s)
+				e.mu.Lock()
+				npids := len(e.order)
+				e.mu.Unlock()
+				e.out.emit("round", pmRoundRec{Cand: name, Rep: e.rep, Round: r, DurationS: time.Since(t0).Seconds(),
+					ClaimMeanUS: pmMean(lat.ClaimUS), InsertMeanUS: pmMean(lat.InsertUS), PIDsSoFar: npids, BreadthCursor: e.cursor})
+				return npids
+			})
+		if rerr != nil {
+			t.Fatalf("%s: %v", name, rerr)
+		}
+		sres := sampler.Stop()
+		if sres.N == 0 || sres.Errors > 0 {
+			t.Fatalf("%s: sampler took %d samples with %d errors (first: %s)", name, sres.N, sres.Errors, sres.FirstError)
+		}
+
 		e.mu.Lock()
-		npids := len(e.order)
+		sum = pmMemSummary{Cand: name, Rep: e.rep, Database: e.dbName, Desc: e.cand.Desc, Rounds: rounds, DurationS: time.Since(candStart).Seconds(),
+			BackendPIDs: len(e.order), Sampler: sres, SampledPeakKB: sres.PeakKB, JITSetting: e.jitSetting}
+		var pidRecs []pmPID
+		llvmUnion := map[string]struct{}{}
+		for _, pid := range e.order {
+			p := *e.pids[pid]
+			p.Idents = nil
+			pidRecs = append(pidRecs, p)
+			sum.JITOnBackends = append(sum.JITOnBackends, p.JIT)
+			if p.LLVMSeen {
+				sum.LLVMMapped = true
+				if sum.LLVMFirstRound == nil || p.LLVMRound < *sum.LLVMFirstRound {
+					r, a := p.LLVMRound, p.LLVMAgeS
+					sum.LLVMFirstRound, sum.LLVMFirstConnAgeS = &r, &a
+				}
+				for lp := range p.LLVMPaths {
+					llvmUnion[lp] = struct{}{}
+				}
+			}
+			if n := len(e.pids[pid].Idents); n > sum.MaxIdentities {
+				sum.MaxIdentities = n
+			}
+			if p.HWMKB > sum.VmHWMMaxKB {
+				sum.VmHWMMaxKB = p.HWMKB
+			}
+		}
 		e.mu.Unlock()
-		e.out.emit("round", pmRoundRec{Cand: name, Rep: e.rep, Round: r, DurationS: time.Since(t0).Seconds(),
-			ClaimMeanUS: pmMean(lat.ClaimUS), InsertMeanUS: pmMean(lat.InsertUS), PIDsSoFar: npids, BreadthCursor: e.cursor})
-		enoughRounds := r >= minRounds
-		if !e.cand.Recycle {
-			if enoughRounds {
-				break
+		sum.LLVMPaths = pmSortedKeys(llvmUnion)
+		sum.Recycles = len(pidRecs) - 1
+		for _, p := range pidRecs[1:] {
+			sum.RecycleAtS = append(sum.RecycleAtS, p.ConnectedAt.Sub(candStart).Seconds())
+		}
+		for _, p := range pidRecs {
+			life := time.Since(p.ConnectedAt)
+			if !p.ClosedAt.IsZero() {
+				life = p.ClosedAt.Sub(p.ConnectedAt)
 			}
-			continue
+			// The peak_* fields are interval-sampler readings only (from sampler start, excluding the
+			// baseline, evictionDemo and post-round samples); vmhwm mixes sampler and held samples.
+			e.out.emit("pid", map[string]any{"cand": name, "rep": e.rep, "pid": p.PID, "connected_at": p.ConnectedAt, "closed_at": p.ClosedAt,
+				"lifetime_s": life.Seconds(), "executions_served": p.Executions, "identities": len(e.pids[p.PID].Idents),
+				"peak_sampled_anonymous_kb": p.PeakAnonKB, "peak_anonymous_at_conn_age_s": p.PeakAnonAge,
+				"peak_sampled_private_kb": p.PeakPrivateKB, "peak_private_at_conn_age_s": p.PeakSampleAge, "vmhwm_kb_includes_shared": p.HWMKB,
+				"statement_cache_capacity": p.StmtCapacity, "plan_cache_mode": p.PlanCacheMode, "show_jit": p.JIT,
+				"llvm_mapped": p.LLVMSeen, "llvm_first_round": p.LLVMRound, "llvm_first_conn_age_s": p.LLVMAgeS, "llvm_paths": pmSortedKeys(p.LLVMPaths)})
+			if p.StmtCapacity != e.cand.capacity() || p.PlanCacheMode != "auto" {
+				t.Fatalf("%s: pid %d ran with statement cache capacity %d (want %d), plan_cache_mode %q (want auto)",
+					name, p.PID, p.StmtCapacity, e.cand.capacity(), p.PlanCacheMode)
+			}
 		}
-		if enoughRounds && npids-1 >= 4 {
-			break
-		}
-		if time.Since(candStart) > maxWait {
-			break
-		}
-	}
-	sres := sampler.Stop()
-	if sres.N == 0 || sres.Errors > 0 {
-		t.Fatalf("%s: sampler took %d samples with %d errors (first: %s)", name, sres.N, sres.Errors, sres.FirstError)
-	}
 
-	e.mu.Lock()
-	sum := pmMemSummary{Cand: name, Rep: e.rep, Database: e.dbName, Desc: e.cand.Desc, Rounds: rounds, DurationS: time.Since(candStart).Seconds(),
-		BackendPIDs: len(e.order), Sampler: sres, SampledPeakKB: sres.PeakKB, JITSetting: e.jitSetting}
-	var pidRecs []pmPID
-	llvmUnion := map[string]struct{}{}
-	for _, pid := range e.order {
-		p := *e.pids[pid]
-		p.Idents = nil
-		pidRecs = append(pidRecs, p)
-		sum.JITOnBackends = append(sum.JITOnBackends, p.JIT)
-		if p.LLVMSeen {
-			sum.LLVMMapped = true
-			if sum.LLVMFirstRound == nil || p.LLVMRound < *sum.LLVMFirstRound {
-				r, a := p.LLVMRound, p.LLVMAgeS
-				sum.LLVMFirstRound, sum.LLVMFirstConnAgeS = &r, &a
-			}
-			for lp := range p.LLVMPaths {
-				llvmUnion[lp] = struct{}{}
-			}
-		}
-		if n := len(e.pids[pid].Idents); n > sum.MaxIdentities {
-			sum.MaxIdentities = n
-		}
-		if p.HWMKB > sum.VmHWMMaxKB {
-			sum.VmHWMMaxKB = p.HWMKB
-		}
-	}
-	e.mu.Unlock()
-	sum.LLVMPaths = pmSortedKeys(llvmUnion)
-	sum.Recycles = len(pidRecs) - 1
-	for _, p := range pidRecs[1:] {
-		sum.RecycleAtS = append(sum.RecycleAtS, p.ConnectedAt.Sub(candStart).Seconds())
-	}
-	for _, p := range pidRecs {
-		life := time.Since(p.ConnectedAt)
-		if !p.ClosedAt.IsZero() {
-			life = p.ClosedAt.Sub(p.ConnectedAt)
-		}
-		e.out.emit("pid", map[string]any{"cand": name, "rep": e.rep, "pid": p.PID, "connected_at": p.ConnectedAt, "closed_at": p.ClosedAt,
-			"lifetime_s": life.Seconds(), "executions_served": p.Executions, "identities": len(e.pids[p.PID].Idents),
-			"peak_sampled_anonymous_kb": p.PeakAnonKB, "peak_anonymous_at_conn_age_s": p.PeakAnonAge,
-			"peak_sampled_private_kb": p.PeakPrivateKB, "peak_private_at_conn_age_s": p.PeakSampleAge, "vmhwm_kb_includes_shared": p.HWMKB,
-			"statement_cache_capacity": p.StmtCapacity, "plan_cache_mode": p.PlanCacheMode, "show_jit": p.JIT,
-			"llvm_mapped": p.LLVMSeen, "llvm_first_round": p.LLVMRound, "llvm_first_conn_age_s": p.LLVMAgeS, "llvm_paths": pmSortedKeys(p.LLVMPaths)})
-		if p.StmtCapacity != e.cand.capacity() || p.PlanCacheMode != "auto" {
-			t.Fatalf("%s: pid %d ran with statement cache capacity %d (want %d), plan_cache_mode %q (want auto)",
-				name, p.PID, p.StmtCapacity, e.cand.capacity(), p.PlanCacheMode)
-		}
-	}
-
-	// Steady state: post-round samples whose backend has executed the full working set,
-	// the later half of them.
-	var qual []pmSample
-	for _, s := range post {
-		if s.Identities >= pmMinIdentities {
-			qual = append(qual, s)
-		}
-	}
-	if len(qual) < 3 {
-		t.Fatalf("%s: only %d post-round samples have >= %d distinct identities on their backend", name, len(qual), pmMinIdentities)
-	}
-	if sum.MaxIdentities < pmMinIdentities {
-		t.Fatalf("%s: max identities per backend %d < %d", name, sum.MaxIdentities, pmMinIdentities)
-	}
-	if e.cand.Recycle && sum.Recycles < 3 {
-		t.Fatalf("%s: only %d recycles in %.0fs, want >= 3", name, sum.Recycles, sum.DurationS)
-	}
-	steady := qual[len(qual)/2:]
-	sum.QualifiedSamples = len(steady)
-	sum.SteadyPrivateKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateKB })
-	sum.SteadyPrivateMin, sum.SteadyPrivateMax = steady[0].Mem.PrivateKB, steady[0].Mem.PrivateKB
-	for _, s := range steady {
-		if s.Mem.PrivateKB < sum.SteadyPrivateMin {
-			sum.SteadyPrivateMin = s.Mem.PrivateKB
-		}
-		if s.Mem.PrivateKB > sum.SteadyPrivateMax {
-			sum.SteadyPrivateMax = s.Mem.PrivateKB
-		}
-	}
-	sum.SteadyAnonymousKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.AnonymousKB })
-	sum.SteadyAnonMinKB, sum.SteadyAnonMaxKB = steady[0].Mem.AnonymousKB, steady[0].Mem.AnonymousKB
-	for _, s := range steady {
-		sum.SteadyAnonMinKB = min(sum.SteadyAnonMinKB, s.Mem.AnonymousKB)
-		sum.SteadyAnonMaxKB = max(sum.SteadyAnonMaxKB, s.Mem.AnonymousKB)
-	}
-	sum.SampledPeakAnonKB = sres.PeakAnonKB
-	sum.SteadyPrivCleanKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateCleanKB })
-	sum.SteadyPrivDirtyKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateDirtyKB })
-	if steady[0].Mem.PssShmemKB != nil {
-		v := pmMedianOf(steady, func(s pmSample) int64 {
-			if s.Mem.PssShmemKB == nil {
-				return 0
-			}
-			return *s.Mem.PssShmemKB
-		})
-		sum.SteadyPssShmemKB = &v
-	}
-	sum.SteadyRssKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.RssKB })
-	sum.SteadyPssKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PssKB })
-	if steady[0].Mem.CgroupCurrentB != nil {
-		v := pmMedianOf(steady, func(s pmSample) int64 {
-			if s.Mem.CgroupCurrentB == nil {
-				return 0
-			}
-			return *s.Mem.CgroupCurrentB
-		})
-		sum.SteadyCgroupB = &v
-	} else {
-		sum.CgroupNote = steady[0].Mem.CgroupNote
-	}
-	sum.SteadyCtxTotalB = pmMedianOf(steady, func(s pmSample) int64 { return s.Ctx.TotalBytes })
-	sum.SteadyCtxUsedB = pmMedianOf(steady, func(s pmSample) int64 { return s.Ctx.UsedBytes })
-	sum.SteadyCacheCtxB = pmMedianOf(steady, func(s pmSample) int64 { return s.Ctx.CacheMemoryBytes })
-	sum.SteadyRetained = int(pmMedianOf(steady, func(s pmSample) int64 { return int64(*s.Retained) }))
-	sum.SteadyGeneric = pmMedianOf(steady, func(s pmSample) int64 { return *s.Generic })
-	sum.SteadyCustom = pmMedianOf(steady, func(s pmSample) int64 { return *s.Custom })
-	for _, s := range post {
-		if *s.Retained > sum.MaxRetained {
-			sum.MaxRetained = *s.Retained
-		}
-	}
-	sum.BaselineCtxTotalB = base.Ctx.TotalBytes
-	if sum.SteadyRetained > 0 {
-		sum.BytesPerStmtApprox = float64(sum.SteadyCtxTotalB-sum.BaselineCtxTotalB) / float64(sum.SteadyRetained)
-	}
-	if e.cand.Recycle {
-		buckets := map[string][]int64{}
-		anonBuckets := map[string][]int64{}
+		// Steady state: post-round samples whose backend has executed the full working set,
+		// the later half of them.
+		var qual []pmSample
 		for _, s := range post {
-			b := fmt.Sprintf("%02d-%02ds", int(s.ConnAgeS)/10*10, int(s.ConnAgeS)/10*10+10)
-			buckets[b] = append(buckets[b], s.Mem.PrivateKB)
-			anonBuckets[b] = append(anonBuckets[b], s.Mem.AnonymousKB)
+			if s.Identities >= pmMinIdentities {
+				qual = append(qual, s)
+			}
 		}
-		sum.AgeBucketsPrivate = map[string]int64{}
-		sum.AgeBucketsAnon = map[string]int64{}
-		for b, xs := range buckets {
-			sum.AgeBucketsPrivate[b] = pmMedianInt(xs)
-			sum.AgeBucketsAnon[b] = pmMedianInt(anonBuckets[b])
+		if len(qual) < 3 {
+			t.Fatalf("%s: only %d post-round samples have >= %d distinct identities on their backend", name, len(qual), pmMinIdentities)
 		}
-	}
-	e.out.emit("candidate_summary", sum)
+		if sum.MaxIdentities < pmMinIdentities {
+			t.Fatalf("%s: max identities per backend %d < %d", name, sum.MaxIdentities, pmMinIdentities)
+		}
+		if e.cand.Recycle && sum.Recycles < 3 {
+			t.Fatalf("%s: only %d recycles in %.0fs, want >= 3", name, sum.Recycles, sum.DurationS)
+		}
+		steady := qual[len(qual)/2:]
+		sum.QualifiedSamples = len(steady)
+		sum.SteadyPrivateKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateKB })
+		sum.SteadyPrivateMin, sum.SteadyPrivateMax = steady[0].Mem.PrivateKB, steady[0].Mem.PrivateKB
+		for _, s := range steady {
+			if s.Mem.PrivateKB < sum.SteadyPrivateMin {
+				sum.SteadyPrivateMin = s.Mem.PrivateKB
+			}
+			if s.Mem.PrivateKB > sum.SteadyPrivateMax {
+				sum.SteadyPrivateMax = s.Mem.PrivateKB
+			}
+		}
+		sum.SteadyAnonymousKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.AnonymousKB })
+		sum.SteadyAnonMinKB, sum.SteadyAnonMaxKB = steady[0].Mem.AnonymousKB, steady[0].Mem.AnonymousKB
+		for _, s := range steady {
+			sum.SteadyAnonMinKB = min(sum.SteadyAnonMinKB, s.Mem.AnonymousKB)
+			sum.SteadyAnonMaxKB = max(sum.SteadyAnonMaxKB, s.Mem.AnonymousKB)
+		}
+		sum.SampledPeakAnonKB = sres.PeakAnonKB
+		sum.SteadyPrivCleanKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateCleanKB })
+		sum.SteadyPrivDirtyKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PrivateDirtyKB })
+		if steady[0].Mem.PssShmemKB != nil {
+			v := pmMedianOf(steady, func(s pmSample) int64 {
+				if s.Mem.PssShmemKB == nil {
+					return 0
+				}
+				return *s.Mem.PssShmemKB
+			})
+			sum.SteadyPssShmemKB = &v
+		}
+		sum.SteadyRssKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.RssKB })
+		sum.SteadyPssKB = pmMedianOf(steady, func(s pmSample) int64 { return s.Mem.PssKB })
+		if steady[0].Mem.CgroupCurrentB != nil {
+			v := pmMedianOf(steady, func(s pmSample) int64 {
+				if s.Mem.CgroupCurrentB == nil {
+					return 0
+				}
+				return *s.Mem.CgroupCurrentB
+			})
+			sum.SteadyCgroupB = &v
+		} else {
+			sum.CgroupNote = steady[0].Mem.CgroupNote
+		}
+		sum.SteadyCtxTotalB = pmMedianOf(steady, func(s pmSample) int64 { return s.Ctx.TotalBytes })
+		sum.SteadyCtxUsedB = pmMedianOf(steady, func(s pmSample) int64 { return s.Ctx.UsedBytes })
+		sum.SteadyCacheCtxB = pmMedianOf(steady, func(s pmSample) int64 { return s.Ctx.CacheMemoryBytes })
+		sum.SteadyRetained = int(pmMedianOf(steady, func(s pmSample) int64 { return int64(*s.Retained) }))
+		sum.SteadyGeneric = pmMedianOf(steady, func(s pmSample) int64 { return *s.Generic })
+		sum.SteadyCustom = pmMedianOf(steady, func(s pmSample) int64 { return *s.Custom })
+		for _, s := range post {
+			if *s.Retained > sum.MaxRetained {
+				sum.MaxRetained = *s.Retained
+			}
+		}
+		sum.BaselineCtxTotalB = base.Ctx.TotalBytes
+		if sum.SteadyRetained > 0 {
+			sum.BytesPerStmtApprox = float64(sum.SteadyCtxTotalB-sum.BaselineCtxTotalB) / float64(sum.SteadyRetained)
+		}
+		if e.cand.Recycle {
+			buckets := map[string][]int64{}
+			anonBuckets := map[string][]int64{}
+			for _, s := range post {
+				b := fmt.Sprintf("%02d-%02ds", int(s.ConnAgeS)/10*10, int(s.ConnAgeS)/10*10+10)
+				buckets[b] = append(buckets[b], s.Mem.PrivateKB)
+				anonBuckets[b] = append(anonBuckets[b], s.Mem.AnonymousKB)
+			}
+			sum.AgeBucketsPrivate = map[string]int64{}
+			sum.AgeBucketsAnon = map[string]int64{}
+			for b, xs := range buckets {
+				sum.AgeBucketsPrivate[b] = pmMedianInt(xs)
+				sum.AgeBucketsAnon[b] = pmMedianInt(anonBuckets[b])
+			}
+		}
+		e.out.emit("candidate_summary", sum)
+	})
 	return sum
 }
 
@@ -2967,85 +3137,90 @@ func pmRunWide(ctx context.Context, t *testing.T, out *pmOut, dsn string, fx *pm
 	}
 	e.start = time.Now()
 	base := e.sampleHeld(ctx, conn, "wide_baseline", 0)
-	sampler := e.startSampler(ctx)
-	rec := pmWideRec{Mode: mode, Config: cand.Desc, Capacity: cand.capacity(), QueryTexts: len(order), Baseline: base,
-		Note: "NULL for every parameter inside BEGIN READ ONLY: reads build and cache their plans, writes are refused after planning; statements pgx saw fail are invalidated and deallocated, so retained counts only statements that executed. Lower-bound wide-read sample (writes are refused and never retained, NULL arguments plan small); not an upper bound and not the decision basis."}
-	simple("BEGIN READ ONLY")
-	defer cleanup("ROLLBACK")
-	for _, name := range order {
-		sql := pmSQLTexts()[name]
-		simple("SAVEPOINT env")
-		sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		sd, perr := conn.Conn().Prepare(pmSkip(sctx), "", sql)
-		if perr != nil {
-			var pe *pgconn.PgError
-			if errors.As(perr, &pe) {
-				rec.ParseFailures++
-				if len(rec.ParseFailSample) < 10 {
-					rec.ParseFailSample = append(rec.ParseFailSample, fmt.Sprintf("%s: %s %s", name, pe.Code, pe.Message))
+	// Everything from the sampler start through the last observer use (sampleHeld "wide_final"
+	// and the record assembly) runs inside pmWithSampler's body, so every exit, including a
+	// t.Fatalf, cancels and joins the sampler before the deferred conn.Release and closePool
+	// above and before the caller's clone closes the observer.
+	pmWithSampler(func() *pmSampler { return e.startSampler(ctx) }, func(sampler *pmSampler) {
+		rec := pmWideRec{Mode: mode, Config: cand.Desc, Capacity: cand.capacity(), QueryTexts: len(order), Baseline: base,
+			Note: "NULL for every parameter inside BEGIN READ ONLY: reads build and cache their plans, writes are refused after planning; statements pgx saw fail are invalidated and deallocated, so retained counts only statements that executed. Lower-bound wide-read sample (writes are refused and never retained, NULL arguments plan small); not an upper bound and not the decision basis."}
+		simple("BEGIN READ ONLY")
+		defer cleanup("ROLLBACK")
+		for _, name := range order {
+			sql := pmSQLTexts()[name]
+			simple("SAVEPOINT env")
+			sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			sd, perr := conn.Conn().Prepare(pmSkip(sctx), "", sql)
+			if perr != nil {
+				var pe *pgconn.PgError
+				if errors.As(perr, &pe) {
+					rec.ParseFailures++
+					if len(rec.ParseFailSample) < 10 {
+						rec.ParseFailSample = append(rec.ParseFailSample, fmt.Sprintf("%s: %s %s", name, pe.Code, pe.Message))
+					}
+				} else {
+					t.Fatalf("wide-read sample %s: prepare transport error: %v", name, perr)
 				}
 			} else {
-				t.Fatalf("wide-read sample %s: prepare transport error: %v", name, perr)
-			}
-		} else {
-			args := make([]any, len(sd.ParamOIDs))
-			for rep := 0; rep < 2; rep++ {
-				rec.Runs++
-				rows, qerr := conn.Conn().Query(context.WithValue(sctx, pmViaQueryKey, true), sql, args...)
-				if qerr == nil {
-					for rows.Next() {
-					}
-					qerr = rows.Err()
-					rows.Close()
-				}
-				if qerr == nil {
-					if rep == 0 {
-						rec.ExecutedOK++
-					}
-					continue
-				}
-				var pe *pgconn.PgError
-				switch {
-				case errors.As(qerr, &pe) && pe.Code == "25006":
-					if rep == 0 {
-						rec.ReadOnlyBlocked++
-					}
-				case errors.As(qerr, &pe):
-					if rep == 0 {
-						rec.OtherErrors++
-						if len(rec.OtherErrSample) < 10 {
-							rec.OtherErrSample = append(rec.OtherErrSample, fmt.Sprintf("%s: %s %s", name, pe.Code, pe.Message))
+				args := make([]any, len(sd.ParamOIDs))
+				for rep := 0; rep < 2; rep++ {
+					rec.Runs++
+					rows, qerr := conn.Conn().Query(context.WithValue(sctx, pmViaQueryKey, true), sql, args...)
+					if qerr == nil {
+						for rows.Next() {
 						}
+						qerr = rows.Err()
+						rows.Close()
 					}
-				default:
-					cancel()
-					t.Fatalf("wide-read sample %s: non-database error: %v", name, qerr)
+					if qerr == nil {
+						if rep == 0 {
+							rec.ExecutedOK++
+						}
+						continue
+					}
+					var pe *pgconn.PgError
+					switch {
+					case errors.As(qerr, &pe) && pe.Code == "25006":
+						if rep == 0 {
+							rec.ReadOnlyBlocked++
+						}
+					case errors.As(qerr, &pe):
+						if rep == 0 {
+							rec.OtherErrors++
+							if len(rec.OtherErrSample) < 10 {
+								rec.OtherErrSample = append(rec.OtherErrSample, fmt.Sprintf("%s: %s %s", name, pe.Code, pe.Message))
+							}
+						}
+					default:
+						cancel()
+						t.Fatalf("wide-read sample %s: non-database error: %v", name, qerr)
+					}
+					// A failed statement aborted the transaction: recover to the savepoint.
+					simple("ROLLBACK TO SAVEPOINT env")
 				}
-				// A failed statement aborted the transaction: recover to the savepoint.
-				simple("ROLLBACK TO SAVEPOINT env")
 			}
+			cancel()
+			simple("ROLLBACK TO SAVEPOINT env")
+			simple("RELEASE SAVEPOINT env")
 		}
-		cancel()
-		simple("ROLLBACK TO SAVEPOINT env")
-		simple("RELEASE SAVEPOINT env")
-	}
-	simple("ROLLBACK")
-	if rec.ExecutedOK+rec.ReadOnlyBlocked+rec.OtherErrors+rec.ParseFailures != len(order) {
-		t.Fatalf("wide-read sample accounting: %d ok + %d read-only + %d other + %d parse != %d texts",
-			rec.ExecutedOK, rec.ReadOnlyBlocked, rec.OtherErrors, rec.ParseFailures, len(order))
-	}
-	rec.Sampler = sampler.Stop()
-	if rec.Sampler.Errors > 0 {
-		t.Fatalf("wide-read sample sampler errors: %s", rec.Sampler.FirstError)
-	}
-	fin := e.sampleHeld(ctx, conn, "wide_final", 1)
-	rec.Final = fin
-	rec.Retained, rec.Identities = *fin.Retained, fin.Identities
-	rec.VmHWMKB = fin.Mem.VmHWMKB
-	if rec.Retained > 0 {
-		rec.BytesPerStmt = float64(fin.Ctx.TotalBytes-base.Ctx.TotalBytes) / float64(rec.Retained)
-	}
-	out.emit("wide_read_sample", rec)
+		simple("ROLLBACK")
+		if rec.ExecutedOK+rec.ReadOnlyBlocked+rec.OtherErrors+rec.ParseFailures != len(order) {
+			t.Fatalf("wide-read sample accounting: %d ok + %d read-only + %d other + %d parse != %d texts",
+				rec.ExecutedOK, rec.ReadOnlyBlocked, rec.OtherErrors, rec.ParseFailures, len(order))
+		}
+		rec.Sampler = sampler.Stop()
+		if rec.Sampler.Errors > 0 {
+			t.Fatalf("wide-read sample sampler errors: %s", rec.Sampler.FirstError)
+		}
+		fin := e.sampleHeld(ctx, conn, "wide_final", 1)
+		rec.Final = fin
+		rec.Retained, rec.Identities = *fin.Retained, fin.Identities
+		rec.VmHWMKB = fin.Mem.VmHWMKB
+		if rec.Retained > 0 {
+			rec.BytesPerStmt = float64(fin.Ctx.TotalBytes-base.Ctx.TotalBytes) / float64(rec.Retained)
+		}
+		out.emit("wide_read_sample", rec)
+	})
 }
 
 // ---------------------------------------------------------------------------------------
