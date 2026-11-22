@@ -2,11 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import type { Logger } from "../src/log.js";
 import { capReviewDiff } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
+import { patchScanVerdict } from "../src/run-env-scan.js";
 import type { GitHubClient } from "../src/forge.js";
 import type { ClaimRunEnvVar } from "../src/protocol.js";
 import { api, client, fakeGitHub, fx, git, gitlabClaim, installHarness } from "./runner-harness.js";
@@ -109,6 +111,75 @@ const SHORT_LINES = ["ab12", "cd34", "ef56"];
 const multiVar = (lines: string[]): ClaimRunEnvVar => ({ ...var1, name: "SVC_BLOB", value: lines.join("\n") });
 const hunkPatch = (...body: string[]): string =>
   `${header}index 1111111..2222222 100644\n--- a/${WORKFLOW}\n+++ b/${WORKFLOW}\n${body.join("\n")}\n`;
+
+// git C-quotes a header path with default settings: "\303\251" for a non-ASCII byte, "\t", "\"" and "\\". The raw
+// patch then never holds the decoded value, so the header lines are decoded and searched too. The diffs below
+// come from a real `git diff` of a throwaway repository.
+function realDiff(files: Array<{ name: string; body?: string; rename?: string }>): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-header-patch-"));
+  try {
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+    const g = (...args: string[]): string => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { env, encoding: "utf8" });
+    g("init", "-q", "-b", "main");
+    fs.writeFileSync(path.join(dir, "README.md"), "seed\n");
+    g("add", "-A");
+    g("commit", "-q", "-m", "seed");
+    for (const f of files) {
+      if (f.rename) g("mv", "README.md", f.name);
+      else { fs.mkdirSync(path.dirname(path.join(dir, f.name)), { recursive: true }); fs.writeFileSync(path.join(dir, f.name), f.body ?? "harmless\n"); }
+    }
+    g("add", "-A");
+    return g("diff", "--cached", "-M");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("the preserved patch decodes quoted header paths", () => {
+  const cases: Array<[string, string]> = [
+    ["a non-ASCII letter", ["café", "Kq7Zp2mXw9Lt4s"].join("-")],
+    ["a TAB", ["tab", "Kq7Zp2mXw9Lt4s"].join("\t")],
+    ["a double quote", ["q", "Kq7Zp2mXw9Lt4s"].join('"')],
+    ["a backslash", ["back", "Kq7Zp2mXw9Lt4s"].join("\\")],
+  ];
+  for (const [label, value] of cases) {
+    it(`withholds a patch whose header path carries ${label}`, async () => {
+      const full = realDiff([{ name: value }]);
+      assert.ok(full.includes('"'), "git quoted the header path");
+      assert.ok(!full.includes(value), "the raw patch never holds the decoded value");
+      const failed = await failedReport(46230 + cases.findIndex((c) => c[0] === label), full, [{ ...var1, value }]);
+      assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
+      assert.equal(failed.preserved_patch, undefined);
+      // The registered forms already include a JSON-escaped one that equals git's C-quoting of a TAB, quote or
+      // backslash, so those may be caught as raw_value; the octal bytes of a non-ASCII letter are caught only by the decoding.
+      const reasons = withholdReasons(failed.logged);
+      assert.equal(reasons.length, 1);
+      assert.ok(reasons[0] === "header_path" || (label !== "a non-ASCII letter" && reasons[0] === "raw_value"), String(reasons[0]));
+    });
+
+    it(`decodes the header path carrying ${label} when the only needle form is the value itself`, () => {
+      const full = realDiff([{ name: value }]);
+      assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], []),
+        { withhold: true, reason: "header_path", variables: ["DB_PASSWORD"] });
+      assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: ["no-such-value-anywhere"] }], []).withhold, false);
+    });
+  }
+
+  it("withholds a rename header (rename to) whose target is quoted", async () => {
+    const value = ["café", "Kq7Zp2mXw9Lt4s"].join("-");
+    const full = realDiff([{ name: value, rename: "README.md" }]);
+    assert.match(full, /^rename to "/m);
+    const failed = await failedReport(46240, full, [{ ...var1, value }]);
+    assert.equal(failed.preserved_patch, undefined);
+    assert.deepEqual(withholdReasons(failed.logged), ["header_path"]);
+  });
+
+  it("keeps a patch whose quoted header path carries no value", async () => {
+    const failed = await failedReport(46241, realDiff([{ name: "café-other.txt" }]), [var1]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.match(failed.preserved_patch ?? "", /harmless/);
+  });
+});
 
 describe("the preserved patch fails closed on what the raw text cannot show", () => {
   it("withholds a mixed hunk that carries the secret's lines as context and as added lines", async () => {

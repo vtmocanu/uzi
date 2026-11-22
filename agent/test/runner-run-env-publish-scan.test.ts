@@ -310,6 +310,121 @@ describe("run variable scan: the final branch push (every forge)", () => {
   });
 });
 
+// PRD 4416 M3: a secret containing "/" can be published as a git PATH, which no single tree object holds.
+// Every case commits harmless content under a harmless message; only the path joins to the value.
+describe("run variable scan: a secret published as a git path", () => {
+  const PATH_VALUE = ["rv-Ab3k", "Mq7w-Zx2n", "Fe9t"].join("/");
+  const FLAT_VALUE = ["rv-Ab3k-Mq7w", "Zx2n-Fe9t"].join("/");
+  const SINGLE_VALUE = ["rv-Ab3k", "Mq7w", "Zx2n", "Fe9t"].join("-");
+  const pathVars = (value: string) => ({
+    forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "vendor-oauth-token-000000",
+    run_env: [{ var_id: UUID, scope: "repo", rev: 1, name: "DB_PASSWORD", value, secret: true, description: "" }] as ClaimRunEnvVar[],
+  });
+  const G_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+  const g = (dir: string, ...args: string[]): string =>
+    execFileSync("git", ["-C", dir, "-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", ...args],
+      { env: G_ENV, encoding: "utf8", input: "" }).trim();
+  const write = (dir: string, name: string, body = "harmless\n"): void => {
+    fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+    fs.writeFileSync(path.join(dir, name), body);
+  };
+  const addCommit = (dir: string, name: string): void => { write(dir, name); g(dir, "add", "-A"); g(dir, "commit", "-m", "update"); };
+
+  const onOrigin = (n: number): boolean => {
+    try {
+      execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "--quiet", `refs/heads/agent/issue-${n}`], { stdio: "pipe" });
+      return true;
+    } catch { return false; }
+  };
+  async function finalizeWith(value: string, work: (ctx: RunContext) => void) {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: pathVars(value) as never });
+    const exec: Executor = { run: async (ctx) => { work(ctx); return { branch: ctx.branch }; } };
+    await runner(exec, gitlab, JOIN_TOKEN).execute(claim);
+    return claim;
+  }
+  const failedBody = (runId: string) => api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
+  function assertBlocked(claim: { run_id: string; issue_iid?: number | null }, value: string): void {
+    assert.equal(onOrigin(claim.issue_iid!), false, "the branch never reached origin");
+    const body = failedBody(claim.run_id);
+    assert.ok(body, "the run failed");
+    assert.equal(body.fail_origin, "push_secret_blocked", String(body.failure_reason));
+    assert.match(String(body.failure_reason), /secret variable DB_PASSWORD/);
+    for (const text of [JSON.stringify(body), JSON.stringify(api.messages(claim.run_id))]) assert.ok(!text.includes(value), "no value in any report");
+  }
+
+  const cases: Array<[string, string, (ctx: RunContext, value: string) => void]> = [
+    ["a nested path whose components join to the value", PATH_VALUE, (ctx, v) => addCommit(ctx.worktreePath, v)],
+    ["a file named after a value with no slash", SINGLE_VALUE, (ctx, v) => addCommit(ctx.worktreePath, v)],
+    ["a rename of an already-public file to such a path", FLAT_VALUE, (ctx, v) => {
+      g(ctx.worktreePath, "mv", "README.md", "moved.md");
+      fs.mkdirSync(path.dirname(path.join(ctx.worktreePath, v)), { recursive: true });
+      g(ctx.worktreePath, "mv", "moved.md", v);
+      g(ctx.worktreePath, "commit", "-m", "update");
+    }],
+    ["a path an evil merge introduces", PATH_VALUE, (ctx, v) => {
+      const dir = ctx.worktreePath;
+      g(dir, "checkout", "-q", "-b", "side");
+      addCommit(dir, "side.txt");
+      g(dir, "checkout", "-q", ctx.branch);
+      addCommit(dir, "mine.txt");
+      g(dir, "merge", "--no-commit", "--no-ff", "side");
+      write(dir, v);
+      g(dir, "add", "-A");
+      g(dir, "commit", "-m", "merge");
+    }],
+    ["an empty-tree entry at such a path", PATH_VALUE, (ctx, v) => {
+      const dir = ctx.worktreePath;
+      addCommit(dir, "src/unrelated.txt"); // an empty tree alone is not a change the run could finish with
+      const empty =g(dir, "hash-object", "-t", "tree", "/dev/null");
+      const [a, mid, leaf] = v.split("/") as [string, string, string];
+      const mk = (input: string): string => execFileSync("git", ["-C", dir, "mktree"], { env: G_ENV, encoding: "utf8", input }).trim();
+      const inner = mk(`040000 tree ${empty}\t${leaf}\n`);
+      const middle = mk(`040000 tree ${inner}\t${mid}\n`);
+      const root = mk(`${g(dir, "ls-tree", "HEAD")}\n040000 tree ${middle}\t${a}\n`);
+      const c = g(dir, "commit-tree", root, "-p", "HEAD", "-m", "update");
+      g(dir, "reset", "--hard", c);
+    }],
+  ];
+  for (const [label, value, work] of cases) {
+    it(`withholds the final push of ${label}, naming the variable and nothing else`, async () => {
+      assertBlocked(await finalizeWith(value, (ctx) => work(ctx, value)), value);
+    });
+  }
+
+  it("a control publish of an unrelated path still succeeds", async () => {
+    const claim = await finalizeWith(PATH_VALUE, (ctx) => addCommit(ctx.worktreePath, "src/app/unrelated.txt"));
+    assert.equal(onOrigin(claim.issue_iid!), true);
+  });
+
+  it("withholds a checkpoint upload of such a path, and the run keeps going", async () => {
+    const seen = spyPublish();
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: pathVars(PATH_VALUE) as never });
+    let continued = false;
+    const exec: Executor = {
+      run: async (ctx) => {
+        addCommit(ctx.worktreePath, PATH_VALUE);
+        await ctx.checkpoint!({ reap: false });
+        continued = true;
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 }).execute(claim);
+    assert.equal(seen.uploads, 0, "ZERO checkpoint uploads");
+    assert.equal(continued, true);
+  });
+
+  it("FAILS CLOSED: an incomplete path pass (path cap reached) pushes nothing", async (t) => {
+    const real = git.scanObjectsForRunEnv.bind(git);
+    t.mock.method(git, "scanObjectsForRunEnv", (b: string, r: never, n: never, o: { caps?: object } = {}) =>
+      real(b, r, n, { ...o, caps: { ...o.caps, maxPaths: 1 } } as never));
+    const claim = await finalizeWith(PATH_VALUE, (ctx) => addCommit(ctx.worktreePath, "src/app/unrelated.txt"));
+    assert.equal(onOrigin(claim.issue_iid!), false, "ZERO pushes");
+    assert.equal(failedBody(claim.run_id)?.fail_origin, "push_secret_blocked");
+  });
+});
+
 describe("run variable scan: held publication and the recovery archive", () => {
   async function held(secrets: object, content: Content) {
     const claim = gitlabClaim(iid++, { claim_generation: 50, inventory_guarded: true, secrets: secrets as never });

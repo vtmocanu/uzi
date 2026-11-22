@@ -96,6 +96,31 @@ function coordinator(client: RecoveryArchiveClient, scanNeedlesFor?: (runId: str
 const only = async (c: RecoveryCoordinator, runId: string): Promise<RecoveryRecord> => (await c.inspect(runId))[0]!;
 const pin = (c: RecoveryCoordinator) => c.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
 
+describe("the restart re-upload of a recovery bundle: a value published as a path", () => {
+  it("is withheld when only a nested PATH joins to the value, and keeps the bundle as local custody", async () => {
+    const pathValue = ["rv-Ab3k", "Mq7w-Zx2n", "Fe9t"].join("/");
+    const work = path.join(base, "work");
+    git(work, ["checkout", "-q", "-b", "agent/issue-2", "main"]);
+    fs.mkdirSync(path.dirname(path.join(work, pathValue)), { recursive: true });
+    fs.writeFileSync(path.join(work, pathValue), "harmless\n");
+    git(work, ["add", "."]);
+    git(work, ["commit", "-m", "update"]);
+    const pathSha = git(work, ["rev-parse", "HEAD"]);
+    git(work, ["push", path.join(base, "data", "repos", BARE_DIR), "agent/issue-2:refs/uzi-runner/agent/issue-2"]);
+    const client = new FakeClient();
+    const pinned = coordinator(client);
+    await pinned.pin({ runId: "r2", sourceSha: pathSha, kind: "issue", branch: "agent/issue-2", generation: 7, ...FIN });
+    const needles = runEnvClaimForms([{ var_id: UUID, scope: "repo", rev: 1, name: "DB_PASSWORD", value: pathValue, secret: true, description: "" }], []).needles;
+    const restarted = coordinator(client, async () => ({ kind: "needles", needles }));
+    await restarted.resumePending();
+    assert.equal(client.uploadCalls, 0, "nothing uploaded");
+    const held = await only(restarted, "r2");
+    assert.equal(held.state, "needs_action");
+    assert.equal(held.reason, "publish_scan_secret_found");
+    assert.ok(held.bundlePath && fs.existsSync(held.bundlePath), "the bundle stays as local custody");
+  });
+});
+
 describe("the restart re-upload of a recovery bundle", () => {
   it("is withheld when a middle commit carries a secret value, keeps the record and the bundle, and uploads once clean", async () => {
     const client = new FakeClient();

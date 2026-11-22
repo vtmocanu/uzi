@@ -185,8 +185,9 @@ describe("fail closed: anything that cannot be proven clean is a withhold, never
   it("an unresolved ref", async () => {
     const tip = commitFile(work, "a.txt", "a\n");
     syncFeature();
-    assert.equal(withheld(await scan(tip, ["f".repeat(40)])), "scan_failed");
-    assert.equal(withheld(await scan("f".repeat(40), [base])), "scan_failed");
+    // The path pass (the first git work of a scan) meets the unresolvable revision first.
+    assert.equal(withheld(await scan(tip, ["f".repeat(40)])), "path_scan_incomplete");
+    assert.equal(withheld(await scan("f".repeat(40), [base])), "path_scan_incomplete");
   });
 
   it("a malformed range", async () => {
@@ -199,7 +200,7 @@ describe("fail closed: anything that cannot be proven clean is a withhold, never
   it("a git error (a bare that does not exist)", async () => {
     const tip = commitFile(work, "a.txt", "a\n");
     const v = await scanRunEnvRange(cache, path.join(fx.dataDir, "no-such-bare"), { tip, excludes: [base] }, NEEDLES, { deadlineMs: 30_000 });
-    assert.equal(withheld(v), "scan_failed");
+    assert.equal(withheld(v), "path_scan_incomplete");
   });
 
   it("a timeout of the git child", async (t) => {
@@ -208,7 +209,7 @@ describe("fail closed: anything that cannot be proven clean is a withhold, never
     t.mock.method(cache as unknown as { execScoped: () => Promise<never> }, "execScoped", async () => {
       throw Object.assign(new Error("Command failed: timed out"), { killed: true, signal: "SIGTERM" });
     });
-    assert.equal(withheld(await scan(tip, [base])), "scan_failed");
+    assert.equal(withheld(await scan(tip, [base])), "path_scan_incomplete");
   });
 
   it("more bytes than maxBytes (counted over the objects) and more objects than the cap", async () => {
@@ -443,6 +444,20 @@ describe("scanBundleForRunEnv", () => {
     const res = await cache.scanBundleForRunEnv(bundleOf(tip, base), tip, NEEDLES);
     assert.ok(res.trusted && res.findings.length === 1, JSON.stringify(res));
     if (res.trusted) assert.equal(res.findings[0]!.variable, "DB_PASSWORD");
+  });
+
+  it("finds a value published only as a nested PATH (no object holds it whole)", async () => {
+    const pathValue = ["rv-Ab3k", "Mq7w-Zx2n", "Fe9t"].join("/");
+    const needles = runEnvClaimForms([secretVar("DB_PASSWORD", pathValue)], []).needles;
+    commitFile(work, pathValue, "harmless\n");
+    const tip = git(work, "rev-parse", "HEAD");
+    const res = await cache.scanBundleForRunEnv(bundleOf(tip, base), tip, needles);
+    assert.ok(res.trusted && res.findings.length === 1, JSON.stringify(res));
+    if (res.trusted) {
+      assert.equal(res.findings[0]!.variable, "DB_PASSWORD");
+      assert.equal(res.findings[0]!.file, "[path withheld]");
+      assert.ok(!JSON.stringify(res).includes(pathValue));
+    }
   });
 
   it("is clean for a clean bundle", async () => {

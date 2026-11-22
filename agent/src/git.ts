@@ -1229,6 +1229,14 @@ interface WipMarkerOptions {
 const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 /** Most distinct blob oids (old + new side) the scanned commits may touch. */
 const CHECKPOINT_SCAN_MAX_OBJECTS = 100_000;
+/** Most paths (one per name emitted by the commit-diff path pass of scanObjectsGrouped, tree entries included). */
+const CHECKPOINT_SCAN_MAX_PATHS = 1_000_000;
+/** Most path bytes the commit-diff path pass reads (streamed, never buffered whole). */
+const CHECKPOINT_SCAN_MAX_PATH_BYTES = 256 * 1024 * 1024;
+/** Longest single path the path pass accepts; a longer token is garbled framing, not a path. */
+const CHECKPOINT_SCAN_MAX_PATH_TOKEN_BYTES = 1024 * 1024;
+/** The only file name a path-pass finding carries: the path itself may be the secret. */
+const PATH_WITHHELD = "[path withheld]";
 /** Most merge commits whose own contribution is scanned separately (see scanMergeContribution). */
 const CHECKPOINT_SCAN_MAX_MERGES = 32;
 /** A gitleaks run that lasted to within this margin of the scan deadline is classed `deadline`. */
@@ -20139,9 +20147,11 @@ export class GitCache {
   /**
    * Exact-literal scan of every object a publication of `range.tip` would carry: the objects of
    * `rev-list --objects tip --not excludes` (plus, with `excludeRemoteTracking`, everything reachable
-   * from `refs/remotes/origin/*`), read whole (commits, trees and blobs, so messages, filenames,
-   * binary files and merge results are all covered) and searched for any of `literals` (the encoded
-   * forms of the run's bound provider key; gitleaks cannot detect a prefixless key).
+   * from `refs/remotes/origin/*`), read whole (commits, trees and blobs, so messages, single path
+   * components, binary files and merge results are covered) and searched for any of `literals` (the
+   * encoded forms of the run's bound provider key; gitleaks cannot detect a prefixless key). A tree
+   * object stores one path component, so a value containing "/" is not in any single object: a second,
+   * path pass searches the FULL path of every entry each outgoing commit adds (see scanObjectsGrouped).
    *
    * Empty `literals` is clean and spawns NO git child. Otherwise: the listing (capped at
    * CHECKPOINT_SCAN_MAX_OBJECTS), a `cat-file --batch-check` size total (capped at
@@ -20156,7 +20166,7 @@ export class GitCache {
     barePath: string,
     range: { tip: string; excludes: readonly string[]; excludeRemoteTracking?: boolean },
     literals: readonly string[],
-    opts: { deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number } } = {},
+    opts: { deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number } } = {},
   ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
     return this.scanObjectsGrouped(barePath, range, [{ forms: literals }], opts, PROVIDER_KEY_RULE_ID, "provider key scan");
   }
@@ -20166,13 +20176,16 @@ export class GitCache {
    * {@link scanObjectsForLiterals}. `needles` carries one entry per variable name with every registered
    * form of its values; a finding names the variable (never the value) under `uzi-run-env`. Fails closed:
    * a deadline, a git error, an unresolved revision, a cap or `maxBytes` (counted over the streamed bytes)
-   * is `trusted: false`. `tips` lets one scan walk several heads (a bundle's refs).
+   * is `trusted: false`. `tips` lets one scan walk several heads (a bundle's refs). The scan also
+   * searches the full path of every entry each outgoing commit adds (a value containing "/" can be
+   * published as a path, which no single tree object holds); a path hit is a finding whose file is
+   * "[path withheld]", and an incomplete path pass is `trusted: false, reason: "path_scan_incomplete"`.
    */
   async scanObjectsForRunEnv(
     barePath: string,
     range: { tip: string; tips?: readonly string[]; excludes: readonly string[]; excludeRemoteTracking?: boolean },
     needles: ReadonlyArray<{ name: string; forms: readonly string[] }>,
-    opts: { deadlineMs?: number; maxBytes?: number; caps?: { maxObjects?: number; maxTotalBytes?: number } } = {},
+    opts: { deadlineMs?: number; maxBytes?: number; caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number } } = {},
   ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
     return this.scanObjectsGrouped(barePath, range,
       needles.map((n) => ({ label: n.name, forms: n.forms })), opts, RUN_ENV_RULE_ID, "run variable scan");
@@ -20231,7 +20244,7 @@ export class GitCache {
     barePath: string,
     range: { tip: string; tips?: readonly string[]; excludes: readonly string[]; excludeRemoteTracking?: boolean },
     groups: ReadonlyArray<{ label?: string; forms: readonly string[] }>,
-    opts: { deadlineMs?: number; maxBytes?: number; caps?: { maxObjects?: number; maxTotalBytes?: number } },
+    opts: { deadlineMs?: number; maxBytes?: number; caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number } },
     ruleId: string,
     what: string,
   ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
@@ -20255,6 +20268,23 @@ export class GitCache {
     try {
       this.checkCheckpointCooperation();
       const revs = [...tips, "--not", ...range.excludes, ...(range.excludeRemoteTracking ? ["--remotes=origin"] : []), "--"];
+      // PATH PASS (runs first, over exactly the revisions of the object pass below). A tree object stores one
+      // path COMPONENT, so a secret containing "/" published as a path ("dirA/dirB/file") is in no single
+      // object the object pass reads. Completeness: every full path in an outgoing commit C is either present
+      // in a parent of C (an excluded parent is already public; an in-range parent is itself scanned) or is
+      // listed by C's own diff. A root commit diffs against the empty tree; `-t` lists tree entries (empty
+      // trees and gitlinks included); for a merge `-c` lists every path that differs from EVERY parent, a
+      // superset of the paths absent from all parents. Each such path is searched whole.
+      const pathPass = await this.scanPathsForGroups(barePath, revs, active, {
+        maxPaths: opts.caps?.maxPaths ?? CHECKPOINT_SCAN_MAX_PATHS,
+        maxPathBytes: opts.caps?.maxPathBytes ?? CHECKPOINT_SCAN_MAX_PATH_BYTES,
+        maxCommits: maxObjects,
+      }, remaining);
+      if (!pathPass.complete) return untrusted("path_scan_incomplete");
+      const pathFindings: SecretFinding[] = pathPass.hits.map((h) => ({
+        file: PATH_WITHHELD, startLine: 0, commit: h.commit, ruleId, ...(h.label === undefined ? {} : { variable: h.label }),
+      }));
+      this.checkCheckpointCooperation();
       const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--objects", ...revs]), {
         env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (maxObjects + 1) * 4096,
       });
@@ -20267,7 +20297,7 @@ export class GitCache {
         if (m[2]) paths.set(m[1]!, m[2]);
       }
       if (oids.length > maxObjects) return untrusted("too_many_objects");
-      if (oids.length === 0) return { trusted: true, findings: [] };
+      if (oids.length === 0) return { trusted: true, findings: pathFindings };
       const input = oids.join("\n") + "\n";
 
       this.checkCheckpointCooperation();
@@ -20352,7 +20382,7 @@ export class GitCache {
           return untrusted("read_failed");
         }
       }
-      if (hits.length === 0) return { trusted: true, findings: [] };
+      if (hits.length === 0) return { trusted: true, findings: pathFindings };
 
       const findings: SecretFinding[] = [];
       for (const hit of hits) {
@@ -20378,13 +20408,137 @@ export class GitCache {
         if (labels.length === 0) findings.push({ file, startLine: 0, commit, ruleId });
         else for (const variable of labels) findings.push({ file, startLine: 0, commit, ruleId, variable });
       }
-      return { trusted: true, findings };
+      return { trusted: true, findings: [...findings, ...pathFindings] };
     } catch (err) {
       if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited.catch(() => -1); }
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
       return untrusted(`scan_failed`);
+    }
+  }
+
+  /**
+   * The path pass of {@link scanObjectsGrouped}: the full path of every entry each commit of `revs` adds
+   * (see the completeness argument there), searched for the groups' forms. Two git children at most, no
+   * child per commit: `rev-list --parents` (commit ids; a commit with two or more parents is a merge),
+   * then `diff-tree --stdin --root -r -t --no-renames --name-only -z` over the non-merges and
+   * `diff-tree --stdin -c -r -t --name-only -z` over the merges, each with `--ignore-submodules=none`
+   * (so a repository's diff.ignoreSubmodules cannot hide a gitlink) and `--no-replace-objects`.
+   *
+   * Framing of the `-z` output: "<commit id>\0" then "<path>\0" per entry, the next commit's id following
+   * directly; a commit with no diff prints nothing. Paths are raw bytes (-z, so core.quotePath is moot).
+   * A token that is a listed commit id starts that commit's paths; every token, such an id included, is
+   * searched as a path, so the attribution can never hide a path. The stream is parsed incrementally and
+   * never buffered whole. A path is searched as "/" + path + "/", which contains the path, "/" + path and
+   * path + "/" and so matches a form with a leading or trailing "/" against a root directory or tree entry.
+   *
+   * Incomplete (a path or byte cap, the deadline, a git error, garbled framing) is `complete: false`: the
+   * caller fails closed. Only a boundary abort propagates. At most 16 hits are collected.
+   */
+  private async scanPathsForGroups(
+    barePath: string,
+    revs: readonly string[],
+    active: ReadonlyArray<{ label: string | undefined; forms: readonly string[] }>,
+    caps: { maxPaths: number; maxPathBytes: number; maxCommits: number },
+    remaining: () => number,
+  ): Promise<{ complete: true; hits: Array<{ label: string | undefined; commit: string }> } | { complete: false }> {
+    const incomplete = { complete: false } as const;
+    const matchers = active.map((g) => ({ label: g.label, matcher: literalMatcher(g.forms) }));
+    const hits: Array<{ label: string | undefined; commit: string }> = [];
+    const seen = new Set<string>();
+    let paths = 0;
+    let pathBytes = 0;
+    let producer: { stdout: Readable; exited: Promise<number>; cancel: () => void } | undefined;
+    try {
+      this.checkCheckpointCooperation();
+      const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--parents", ...revs]), {
+        env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (caps.maxCommits + 1) * 4096,
+      });
+      const plain: string[] = [];
+      const merges: string[] = [];
+      for (const line of listing.stdout.split("\n")) {
+        if (line === "") continue;
+        const ids = line.split(" ");
+        if (ids.some((id) => !SHA40_RE.test(id))) return incomplete;
+        (ids.length > 2 ? merges : plain).push(ids[0]!);
+      }
+      if (plain.length + merges.length > caps.maxCommits) return incomplete;
+      const passes: Array<{ ids: string[]; args: string[] }> = [
+        { ids: plain, args: ["--root", "-r", "-t", "--no-renames"] },
+        { ids: merges, args: ["-c", "-r", "-t"] },
+      ];
+      for (const pass of passes) {
+        if (pass.ids.length === 0) continue;
+        this.checkCheckpointCooperation();
+        const known = new Set(pass.ids);
+        const spawned = await this.spawnGit(barePath, [
+          "--no-replace-objects", "diff-tree", "--stdin", ...pass.args, "--ignore-submodules=none", "--name-only", "-z",
+        ], pass.ids.join("\n") + "\n", {
+          timeoutMs: Math.max(1, remaining()), stdoutCategory: "artifactBytes", stderrMaxBytes: 4096, cancelOnAbandon: true,
+        });
+        producer = spawned;
+        let carry: Buffer = Buffer.alloc(0);
+        let current: string | undefined;
+        let garbled = false;
+        const take = (token: Buffer): boolean => {
+          paths++;
+          pathBytes += token.length;
+          if (paths > caps.maxPaths || pathBytes > caps.maxPathBytes) return false;
+          if (token.length === 40) {
+            const id = token.toString("latin1");
+            if (known.has(id)) current = id;
+          }
+          if (current === undefined) { garbled = true; return false; }
+          const padded = Buffer.concat([Buffer.from("/"), token, Buffer.from("/")]);
+          for (const g of matchers) {
+            g.matcher.reset();
+            if (!g.matcher.push(padded)) continue;
+            const key = `${current}\0${g.label ?? ""}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            hits.push({ label: g.label, commit: current });
+          }
+          return true;
+        };
+        let stop = false;
+        for await (const raw of spawned.stdout) {
+          this.checkCheckpointCooperation();
+          if (remaining() <= 0) { stop = true; break; }
+          let chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+          while (chunk.length > 0) {
+            const nul = chunk.indexOf(0);
+            if (nul < 0) {
+              carry = Buffer.concat([carry, chunk]);
+              if (carry.length > CHECKPOINT_SCAN_MAX_PATH_TOKEN_BYTES) stop = true;
+              break;
+            }
+            const token = carry.length > 0 ? Buffer.concat([carry, chunk.subarray(0, nul)]) : chunk.subarray(0, nul);
+            carry = Buffer.alloc(0);
+            chunk = chunk.subarray(nul + 1);
+            if (!take(token)) { stop = true; break; }
+          }
+          if (stop || hits.length >= 16) break;
+        }
+        if (stop || garbled) {
+          producer.cancel(); producer.stdout.destroy(); await producer.exited;
+          return incomplete;
+        }
+        if (hits.length >= 16) {
+          producer.cancel(); producer.stdout.destroy(); await producer.exited;
+          return { complete: true, hits };
+        }
+        const code = await producer.exited;
+        producer = undefined;
+        if (code !== 0 || carry.length > 0) return incomplete;
+      }
+      return { complete: true, hits };
+    } catch (err) {
+      if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited.catch(() => -1); }
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
+      return incomplete;
     }
   }
 

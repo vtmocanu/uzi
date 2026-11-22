@@ -258,7 +258,51 @@ export function patchImages(patch: string): { images: string[] } | "unparseable"
 
 export type PatchVerdict =
   | { withhold: false }
-  | { withhold: true; reason: "raw_value" | "hunk_image_value" | "unparseable_patch" | "line_form"; variables: string[] };
+  | { withhold: true; reason: "raw_value" | "hunk_image_value" | "unparseable_patch" | "line_form" | "header_path"; variables: string[] };
+
+/** The file header lines of a diff that name a path (git C-quotes such a path unless core.quotePath is off). */
+const PATH_HEADER_PREFIXES = ["diff --git ", "--- ", "+++ ", "rename from ", "rename to ", "copy from ", "copy to ", "Binary files "];
+const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/** Git's C-style unquoting of one quoted path body (the text between the quotes): the escapes `\a \b \t \n \v
+ *  \f \r \" \\` and three-digit octal bytes, the resulting bytes decoded as UTF-8. */
+function cUnquote(body: string): string {
+  const bytes: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]!;
+    if (c !== "\\") { bytes.push(...Buffer.from(c, "utf8")); continue; }
+    const next = body[i + 1] ?? "";
+    const octal = /^[0-3][0-7]{2}/.exec(body.slice(i + 1, i + 4));
+    if (octal) { bytes.push(parseInt(octal[0], 8)); i += 3; }
+    else if (next in C_ESCAPES) { bytes.push(C_ESCAPES[next]!); i += 1; }
+    else bytes.push(92);
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** The names of the variables whose forms occur in a path named by a diff header line, quoted or not. A path is
+ *  matched as "/" + path + "/" so a form with a leading or trailing "/" meets a root directory or a leaf too. */
+function headerPathHits(patch: string, needles: readonly ScanNeedle[]): string[] {
+  const hit = new Set<string>();
+  const forms = needles.map((n) => ({ name: n.name, forms: n.forms.filter((f) => f.length > 0) }));
+  for (const line of patch.split("\n")) {
+    const prefix = PATH_HEADER_PREFIXES.find((p) => line.startsWith(p));
+    if (prefix === undefined) continue;
+    const quoted: string[] = [];
+    const decoded = line.slice(prefix.length).replace(/"((?:[^"\\]|\\.)*)"/g, (_m, body: string) => {
+      const text = cUnquote(body);
+      quoted.push(text);
+      return text;
+    });
+    // The decoded line, each quoted path alone, and the sides of a `diff --git a/.. b/..` or `Binary files .. and ..` line.
+    const candidates = [decoded, ...quoted, ...decoded.split(/ (?=b\/)| and /)];
+    for (const candidate of candidates) {
+      const padded = `/${candidate.replace(/\t$/, "")}/`;
+      for (const n of forms) if (n.forms.some((f) => padded.includes(f))) hit.add(n.name);
+    }
+  }
+  return [...hit];
+}
 
 /**
  * Whether a raw (uncapped, unredacted) preserved patch may be redacted and shipped. It must not carry a
@@ -272,6 +316,9 @@ export function patchScanVerdict(
   const raw = textHitVariables(rawPatch, needles);
   if (raw.length > 0) return { withhold: true, reason: "raw_value", variables: raw };
   if (needles.length === 0 && lineForms.length === 0) return { withhold: false };
+  // git C-quotes a header path ("\303\251", "\t", "\"", "\\"), so the raw text above does not hold the decoded value.
+  const header = headerPathHits(rawPatch, needles);
+  if (header.length > 0) return { withhold: true, reason: "header_path", variables: header };
   const rebuilt = patchImages(rawPatch);
   if (rebuilt === "unparseable") return { withhold: true, reason: "unparseable_patch", variables: [] };
   const present = literalsPresent(needles.flatMap((n) => n.forms));
