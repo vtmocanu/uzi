@@ -16,5 +16,6 @@
       "last_error": "x",
       "refusal_reason": "x"
     }
-  ]
+  ],
+  "admin_debug_read": true
 }

@@ -5129,6 +5129,9 @@ export interface RunInputsEnvelope {
 export interface AdminRunsDebug {
   runs: RunSummaryItem[];
   truncated: boolean;
+  /** Echo of the applied ?status= filter. Absent when no filter was sent, and also from an
+   *  older server that ignored the filter, so a client that asked for one can detect that. */
+  status_filter?: string[];
 }
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -6524,10 +6527,13 @@ export interface HeldPublication {
   refusal_reason?: string;
 }
 
-// HeldPublications is the owner GET /api/runs/{id}/held-publications response. publications
-// is always an array on the wire, never null.
+// HeldPublications is the owner GET /api/runs/{id}/held-publications response, also served to
+// an admin_ro token on another user's run as an audited admin debug read (admin_debug_read).
+// publications is always an array on the wire, never null.
 export interface HeldPublications {
   publications: HeldPublication[];
+  /** True only on an admin run debug read of another user's run (issue #4198); absent otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the

@@ -9008,11 +9008,15 @@ func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRuns
 // ListRunsAdminDebug returns up to maxRows runs of every status across all users (or
 // one user when userID is non-nil), newest first, optionally created at or after since,
 // excluding chat, judge, and cross-check runs (issue #4198 admin run debug listing).
-func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
+// statuses narrows to those run statuses: nil means unfiltered (pgx encodes a nil slice
+// as NULL), while an empty non-nil slice matches nothing, so callers pass nil when the
+// filter is absent.
+func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, statuses []string, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
 	return s.q.ListRunsAdminDebug(ctx, store.ListRunsAdminDebugParams{
 		BackgroundGraceCutoff: s.activeRunsPriorityCutoff(),
 		UserID:                pgconv.UUIDPtr(userID),
 		Since:                 pgconv.TimePtr(since),
+		Statuses:              statuses,
 		MaxRows:               maxRows,
 	})
 }

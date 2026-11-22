@@ -14833,14 +14833,16 @@ JOIN users u ON u.id = r.user_id
 WHERE r.kind NOT IN ('chat', 'judge', 'cross_check')
   AND ($2::uuid IS NULL OR r.user_id = $2::uuid)
   AND ($3::timestamptz IS NULL OR r.created_at >= $3::timestamptz)
+  AND ($4::text[] IS NULL OR r.status = ANY($4::text[]))
 ORDER BY r.created_at DESC, r.id DESC
-LIMIT $4
+LIMIT $5
 `
 
 type ListRunsAdminDebugParams struct {
 	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
 	UserID                pgtype.UUID        `json:"user_id"`
 	Since                 pgtype.Timestamptz `json:"since"`
+	Statuses              []string           `json:"statuses"`
 	MaxRows               int32              `json:"max_rows"`
 }
 
@@ -14860,6 +14862,8 @@ type ListRunsAdminDebugRow struct {
 // Issue #4198: the admin run debug listing. Runs in EVERY status (terminal included),
 // newest first (created_at, then id as the tiebreak), across all users or one @user_id,
 // optionally created at or after @since, excluding chat, judge, and cross-check runs.
+// @statuses (NULL = every status) narrows to runs whose status is in the array; the filter
+// applies before LIMIT so a rare status is not crowded out by newer rows of other statuses.
 // The caller asks for one row more than it serves so it can report truncation.
 // Keep in step with ListActiveRunsAll (select list, joins, cross-check flags) and
 // ListRunsForUser (has_available_capture).
@@ -14870,6 +14874,7 @@ func (q *Queries) ListRunsAdminDebug(ctx context.Context, arg ListRunsAdminDebug
 		arg.BackgroundGraceCutoff,
 		arg.UserID,
 		arg.Since,
+		arg.Statuses,
 		arg.MaxRows,
 	)
 	if err != nil {
