@@ -131,13 +131,35 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
               !fs.readFileSync(file).includes(Buffer.from(input.pem));
           });
         }
-        return { configClean: !config.includes(input.source) && !config.includes(input.key),
+        return { root: path.join(parent, n), configClean: !config.includes(input.source) && !config.includes(input.key),
           exists, uid: stat?.uid, mode: stat && (stat.mode & 511),
           regular: stat?.isFile(), exact: exists && fs.readFileSync(ca).equals(Buffer.from(input.pem)),
           outsideSessions: !ca.startsWith(sessions + "/"), sessionsClean: clean(sessions) };
       });
       process.stdout.write(JSON.stringify({ uid: process.getuid(), results }));
     `;
+    let ownedRoots: string[] = [];
+    const probeRoots = (roots?: string[]) => {
+      const probe = runnerCommand(process.execPath, ["-e", `
+        const fs = require("node:fs"), path = require("node:path");
+        const input = JSON.parse(fs.readFileSync(0, "utf8"));
+        const roots = input.roots ?? fs.readdirSync(input.parent)
+          .filter(n => n.includes("-epoch-"))
+          .map(n => path.join(input.parent, n));
+        const results = roots.map(root => {
+          try { return { root, directory: fs.lstatSync(root).isDirectory() }; }
+          catch (error) { return { root, error: error.code }; }
+        });
+        process.stdout.write(JSON.stringify({ uid: process.getuid(), results }));
+      `]);
+      const result = JSON.parse(execFileSync(probe.command, probe.args, {
+        env: { PATH: "/usr/bin:/bin" }, encoding: "utf8", timeout: 5000,
+        input: JSON.stringify({ parent: `/data/agent-home/${id}/codex-data`, roots }),
+        stdio: ["pipe", "pipe", "pipe"],
+      }));
+      assert.equal(result.uid, 10002, "root probe runs as runner");
+      return result.results as { root: string; directory?: boolean; error?: string }[];
+    };
     let ownedObserved = false;
     let ownedObservationError: unknown;
     const observeOwned = () => {
@@ -164,6 +186,7 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
             assert.equal(observed.outsideSessions, true, "staged CA outside sessions");
           }
         }
+        ownedRoots = result.results.map((observed: { root: string }) => observed.root);
         ownedObserved = true;
         console.log("owned-filesystem-observed", row);
       } catch (error) { ownedObservationError = error; }
@@ -365,15 +388,32 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         assert.ok(executor?.safety, "native safety cleanup required");
         if (executor?.safety) {
           try {
-            console.log("await-boundary", trusted, "settleForCredentialFreeCapture");
-            const settled = await executor.settleForCredentialFreeCapture(10000, "cancel");
-            console.log("settlement", JSON.stringify(settled));
-            assert.equal(settled.kind, "observed_empty");
+            // Retain live-probe paths; other rows enumerate only their own epochs.
+            const roots = probeRoots(ownedRoots.length ? ownedRoots : undefined);
+            assert.ok(roots.length > 0, "positive owned-root existence before cleanup");
+            for (const observed of roots) {
+              assert.equal(observed.directory, true, "owned epoch exists before cleanup");
+              assert.equal(observed.error, undefined);
+            }
+            ownedRoots = roots.map(observed => observed.root);
+            console.log("owned-roots-present", row, ownedRoots.length);
+            console.log("await-boundary", row, "withCredentialFreeCapture");
+            const captured = await executor.withCredentialFreeCapture(10000, async () => undefined, "cancel");
+            console.log("capture", JSON.stringify(captured));
+            assert.equal(captured.kind, "observed_empty");
           } finally {
             console.log("await-boundary", trusted, "safety.dispose");
             const disposed = await executor.safety.dispose({ boundary: "shutdown", deadlineMs: 10000 });
             console.log("disposal", JSON.stringify(disposed));
             assert.equal(executor.safety.acceptsTerminalDisposal(disposed), true);
+            assert.ok(ownedRoots.length > 0, "previously observed owned roots required");
+            const removed = probeRoots(ownedRoots);
+            assert.equal(removed.length, ownedRoots.length);
+            for (const observed of removed) {
+              assert.equal(observed.error, "ENOENT", "previously observed owned epoch removed");
+            }
+            console.log("owned-roots-absent", row, removed.length,
+              row === "no-extra" ? "no-staged-ca-control" : "staged-ca-gone-with-root");
           }
         }
       } finally {
