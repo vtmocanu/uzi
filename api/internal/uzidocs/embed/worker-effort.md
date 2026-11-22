@@ -82,7 +82,7 @@ The lead's effort for a harness resolves in this order:
 
 On Claude, a configured [planning effort](#planning-effort) overrides steps 2 through 4 for the plan phase.
 
-The template tier is lead-only: the judge, chat and jobs use medium. It applies only when your preference is unset or blank, so
+The template tier is lead-only: with an unset preference, everything outside the lead lane (judge, chat, jobs, isolated and review runs) uses medium. It applies only when your preference is unset or blank, so
 choosing **Runtime default** keeps sending no level even when the lead template
 pins one. It reaches the worker as the claimed default effort. `uzi settings get` and
 `GET /api/me/effective-settings` show it with the source `template`. The
@@ -169,7 +169,7 @@ With Runtime default, uzi sends no effort: the Claude CLI gets no `--effort`
 and Codex thread and turn requests carry no effort, so the runtime picks its
 own level. This applies to ordinary issue and lead runs and their subagents,
 the judge, chat, job and isolated runs. It differs from **Default · lead template's effort, else medium (built-in)**: for
-the judge, chat and jobs an unset preference still means an explicit medium, and
+runs outside the lead lane (judge, chat, jobs, isolated and review runs) an unset preference still means an explicit medium, and
 for the lead it means the lead template's effort when it has one, else medium. A stored value uzi does not
 recognise falls back to medium and is never forwarded, and workers drop any
 claimed default effort outside the five levels when decoding the claim,

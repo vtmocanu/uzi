@@ -64,7 +64,7 @@ the worker regardless.
 
 The list has a **Model & effort** column that names both harnesses with
 per-family lines: **Claude: sonnet**, then **effort: high**, and the same for
-Codex. The detail page uses the same layout. Empty pins use the same honest
+Codex. The detail page uses the same per-family lines. Empty pins use the same honest
 **Default · …** labels in the editor, builtin diff and agent-source review:
 
 - Subagent model: **Default · follows lead**, for either harness.
