@@ -341,8 +341,8 @@ closed by the `multi_line_secret` rule above. These exceptions remain from this 
   still masked, since redaction matches it as a substring. The blob scan still blocks a committed file
   that holds the whole value.
 - **(b) Redaction cost for periodic secret lines.** The radix-trie index removes the cost of many
-  forms sharing a prefix, but for long periodic secret lines the cost is still text length x longest literal, a
-  bound that held before the trie as well.
+  forms sharing a prefix, but for long periodic secret lines the cost is still text length x longest literal; that
+  periodic worst case predates the trie.
 - **(c) A replayed terminal report keeps its patch.** A terminal report journaled with a patch by an
   older worker and replayed after an upgrade keeps that patch.
 - **(d) Whitespace-only lines use `\s`.** The whitespace-only exemption uses JavaScript's `\s`, which
