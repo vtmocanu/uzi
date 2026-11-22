@@ -37387,6 +37387,9 @@ describe("B2 cold approval model handoff", () => {
           assert.equal(await lease.teardown(bounds), true);
           await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
           assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          // Pin the replacement wire pair before the coordinator returns: a stale
+          // planning request must fail here even if the later epoch guard also refuses it.
+          assertImplementationResume(rig.epochs[2]!.transport);
           assert.deepEqual(accounting.cuts, [], "replacement preparation has no cut");
           assert.deepEqual(accounting.order, ["live:100"], "discarded approval replay has not been consumed");
           await lease.finishB(bounds);
