@@ -37276,7 +37276,16 @@ describe("M2 provider executor composition", () => {
           assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), "JSON-escaped provider form escaped output boundary");
         }
       } else {
-        for (const input of inputs) assert.ok(visible.includes(input), "clean member and value survive");
+        const shellReply = rec(rec(rig.transport.responses.find(r => r.requestId === 11)?.response).result);
+        assert.equal(shellReply.success, true, "child shell callback succeeds");
+        const shellOutput = rec(JSON.parse(String(rec((shellReply.contentItems as unknown[])[0]).text)));
+        assert.equal(typeof shellOutput.stdout, "string");
+        assert.ok(shellOutput.stdout, "child shell stdout is nonempty");
+        assert.deepEqual(JSON.parse(String(shellOutput.stdout)), {
+          control: "child-output-control",
+          "clean-alpha": { value: "clean-alpha", ordinal: 0 },
+          "clean-beta": { value: "clean-beta", ordinal: 1 },
+        }, "clean shell JSON member names and values survive");
       }
     });
   }
