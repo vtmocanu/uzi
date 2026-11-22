@@ -161,17 +161,15 @@ describe("Agents page per-harness pins", () => {
   });
 });
 
-function eff(
-  claude: { model: string; msrc: string; effort: string | null; esrc: string } | null,
-  codex: { model: string; msrc: string; effort: string | null; esrc: string } | null,
-): EffectiveSettings {
+type Cell = { model: string; msrc: string; effort: string | null; esrc: string; defaultModel?: string; catalog?: object };
+function eff(claude: Cell | null, codex: Cell | null): EffectiveSettings {
   const cells = [["claude", claude], ["codex", codex]] as const;
   return {
     version: 1,
     harnesses: cells.map(([harness, c]) => ({ harness, usable: c !== null, refusal: null, refusal_detail: null, credential: null })),
     models: cells.flatMap(([harness, c]) =>
       c
-        ? [{ harness, model: null, default_model: "", default_source: "builtin", resolved_model: c.model, source: c.msrc, setting: "worker_model", fixed_at: "claim", ignored: null, notes: [] }]
+        ? [{ harness, model: null, default_model: c.defaultModel ?? "", default_source: "builtin", resolved_model: c.model, source: c.msrc, setting: "worker_model", fixed_at: "claim", ignored: null, notes: [] }]
         : [],
     ),
     efforts: cells.flatMap(([harness, c]) =>
@@ -179,6 +177,7 @@ function eff(
         ? [{
             harness, effort: null, default_effort: "", default_source: "builtin", resolved_effort: c.effort, source: c.esrc,
             mode: c.effort === null ? "runtime_default" : "explicit", setting: "worker_effort", fixed_at: "claim", notes: [],
+            ...(c.catalog ? { catalog_default: c.catalog } : {}),
           }]
         : [],
     ),
@@ -196,7 +195,8 @@ const LEAD_ALLOCS = [
 const CLAUDE_A = { model: "opus-a", msrc: "user_default", effort: "high", esrc: "user_default" };
 const CODEX_A = { model: "gpt-a", msrc: "builtin", effort: null, esrc: "builtin" };
 const LINE_CLAUDE_A = "For your Claude runs: opus-a · your choice; effort high · your choice";
-const LINE_CODEX_A = "For your Codex runs: gpt-a · built-in; effort Runtime default · built-in";
+const LINE_CODEX_A =
+  "For your Codex runs: gpt-a · built-in; effort Runtime default · catalog default unknown until a Codex run reports it · built-in";
 
 function seedLead(templates = LEAD_TMPLS, allocs = LEAD_ALLOCS) {
   mockApi.listAgentTemplates.mockResolvedValue({ templates });
@@ -238,10 +238,36 @@ describe("Agents page personalized lead line (#3262)", () => {
     expect(screen.queryByText(/For your Codex runs/)).toBeNull();
   });
 
+  it("shows the Codex catalog default for a runtime-default effort", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    seedLead();
+    const catalog = { state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0" };
+    mockApi.getEffectiveSettings.mockResolvedValue(eff(CLAUDE_A, { ...CODEX_A, catalog }));
+    renderPage();
+    expect(await screen.findByText(
+      "For your Codex runs: gpt-a · built-in; effort Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0) · built-in",
+    )).toBeTruthy();
+  });
+
+  it("names the Codex default model, else built-in, for an empty Codex model; never SDK/account default", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    seedLead();
+    mockApi.getEffectiveSettings.mockResolvedValue(eff(CLAUDE_A, { ...CODEX_A, model: "", defaultModel: "gpt-d" }));
+    const first = renderPage();
+    expect(await screen.findByText(/^For your Codex runs: gpt-d · built-in;/)).toBeTruthy();
+    first.unmount();
+    mockApi.getEffectiveSettings.mockResolvedValue(eff(CLAUDE_A, { ...CODEX_A, model: "" }));
+    renderPage();
+    expect(await screen.findByText(/^For your Codex runs: built-in · built-in;/)).toBeTruthy();
+    expect(screen.queryByText(/For your Codex runs: SDK\/account default/)).toBeNull();
+  });
+
   it.each([
     ["rejected", () => mockApi.getEffectiveSettings.mockRejectedValue(new Error("nope"))],
     ["undefined", () => mockApi.getEffectiveSettings.mockResolvedValue(undefined as never)],
-    ["malformed", () => mockApi.getEffectiveSettings.mockResolvedValue({ models: {}, efforts: [], harnesses: [] } as never)],
+    ["models not an array", () => mockApi.getEffectiveSettings.mockResolvedValue({ models: {}, efforts: [], harnesses: [{ harness: "claude", usable: true }] } as never)],
+    ["efforts not an array", () => mockApi.getEffectiveSettings.mockResolvedValue({ models: [], efforts: {}, harnesses: [{ harness: "claude", usable: true }] } as never)],
+    ["harnesses not an array", () => mockApi.getEffectiveSettings.mockResolvedValue({ models: [], efforts: [], harnesses: {} } as never)],
   ])("shows no line when the response is %s, and the list still renders", async (_n, arrange) => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
     seedLead();
@@ -318,9 +344,15 @@ describe("Agents page personalized lead line (#3262)", () => {
 
       renderPage();
       await screen.findByText(LINE_CLAUDE_A);
+      const second = deferred<EffectiveSettings>();
+      mockApi.getEffectiveSettings.mockImplementationOnce(() => second.promise);
       await act(async () => { fireEvent.click(screen.getByLabelText("Make coder a global default")); });
       await waitFor(() => expect(mockApi.getEffectiveSettings).toHaveBeenCalledTimes(2));
-      expect(await screen.findByText(LINE_CLAUDE_A)).toBeTruthy();
+      expect(screen.queryByText(/For your/)).toBeNull();
+      await act(async () => {
+        second.resolve(eff({ ...CLAUDE_A, model: "opus-new" }, null));
+      });
+      expect(await screen.findByText("For your Claude runs: opus-new · your choice; effort high · your choice")).toBeTruthy();
     });
 
     it("does not refetch after a failed PUT and keeps the line", async () => {
@@ -391,6 +423,36 @@ describe("Agents page personalized lead line (#3262)", () => {
       const leadRow = screen.getByRole("link", { name: "lead" }).closest("tr")!;
       expect(within(leadRow).queryByText(/For your/)).toBeNull();
     });
+  });
+
+  it("hides the previous viewer's line while the new viewer's fetch is pending", async () => {
+    seedLead();
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    const pending = deferred<EffectiveSettings>();
+    mockApi.getEffectiveSettings
+      .mockResolvedValueOnce(eff(CLAUDE_A, null))
+      .mockImplementationOnce(() => pending.promise);
+    const view = renderPage();
+    await screen.findByText(LINE_CLAUDE_A);
+    mockUseAuth.mockReturnValue({ user: { ...MEMBER, id: "u-other" } } as ReturnType<typeof useAuth>);
+    view.rerender(<MemoryRouter><Agents /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.getEffectiveSettings).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText(/For your/)).toBeNull();
+    expect(screen.queryByText(/opus-a/)).toBeNull();
+  });
+
+  it("shows no personal line or note when the list fails to load", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockRejectedValue(new Error("list failed"));
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+    mockApi.getEffectiveSettings.mockResolvedValue(eff(CLAUDE_A, CODEX_A));
+    renderPage();
+    await screen.findByText(/list failed|Failed to load templates/);
+    await waitFor(() => expect(mockApi.getEffectiveSettings).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByText(/For your/)).toBeNull();
+    expect(screen.queryByTestId("personal-lead-note")).toBeNull();
+    expect(screen.queryByTestId("personal-lead-line")).toBeNull();
   });
 
   it("drops a late response for the previous viewer", async () => {

@@ -9,7 +9,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
 import type { EffectiveSettings } from "../lib/apiTypes";
-import { modelSettingSourceLabel } from "../lib/modelSettings";
+import { codexRuntimeDefaultLabel, modelSettingSourceLabel } from "../lib/modelSettings";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { agentCountModel, isShadowedTemplate, sharedTemplateNames } from "../lib/agentCounts";
@@ -293,10 +293,13 @@ function personalHarnessLines(data: EffectiveSettings, prefix: (family: string) 
     if (!m && !e) continue;
     const family = h === "claude" ? "Claude" : "Codex";
     const parts: string[] = [];
-    if (m) parts.push(`${m.resolved_model || "SDK/account default"} · ${modelSettingSourceLabel("model", m.source)}`);
+    if (m) {
+      const unset = h === "claude" ? "SDK/account default" : m.default_model || "built-in";
+      parts.push(`${m.resolved_model || unset} · ${modelSettingSourceLabel("model", m.source)}`);
+    }
     if (e) {
       const runtime = e.mode === "runtime_default" || !e.resolved_effort;
-      const label = runtime ? "Runtime default" : e.resolved_effort;
+      const label = !runtime ? e.resolved_effort : h === "codex" ? codexRuntimeDefaultLabel(e) : "Runtime default";
       parts.push(`effort ${label} · ${modelSettingSourceLabel("effort", e.source)}`);
     }
     out.push(<div key={h}>{`${prefix(family)}${parts.join("; ")}`}</div>);
@@ -410,7 +413,7 @@ function AgentRow({
       <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
       <td className="px-4 py-3 text-muted">
         {pins.collapsed ? (
-          <div role="group" aria-label="Model and effort for both harnesses" className="space-y-0.5">
+          <div role="group" aria-label="Claude and Codex model and effort" className="space-y-0.5">
             <div>{pins.rows[0].model.label}</div>
             <div>{pins.rows[0].effort.label}</div>
             <div className="text-xs text-faint">both harnesses</div>

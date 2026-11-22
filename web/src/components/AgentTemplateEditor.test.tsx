@@ -46,7 +46,7 @@ describe("AgentTemplateEditor model Default label (#3255)", () => {
     expect(screen.queryByText(MODEL_HELP)).toBeNull();
   });
 
-  it("names the lead's model for a subagent and omits the lead-only help", () => {
+  it("says Default · follows lead for a subagent and omits the lead-only help", () => {
     const select = renderEditor("coder");
     expect(select.options[0]?.text).toBe("Default · follows lead");
     expect((screen.getByLabelText("Claude effort") as HTMLSelectElement).options[0]?.text).toBe("Default · follows the run's effort");
