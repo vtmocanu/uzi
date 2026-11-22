@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -276,14 +277,14 @@ func TestWeeklyReservePauseOffersResumeAndSettings(t *testing.T) {
 
 func TestHostileLabelsAreQuotedOrWithheld(t *testing.T) {
 	// Assembled at runtime so no scanner sees a literal payload.
-	tick, dollar := "`", "$"
+	dollar := "$"
 	quoted := map[string]string{
-		"it's":                   `'it'\''s'`,
-		"a" + tick + "id" + tick: `'a` + "`id`" + `'`,
-		dollar + "(touch x)":     `'$(touch x)'`,
-		"--default":              "--default",
-		"-x":                     "-x",
-		"two words":              "'two words'",
+		"it's":               `'it'\''s'`,
+		dollar + "(touch x)": `'$(touch x)'`,
+		"--default":          "--default",
+		"-x":                 "-x",
+		"two words":          "'two words'",
+		"_prod_":             "_prod_",
 	}
 	for label, want := range quoted {
 		f := twoTokens(label)
@@ -298,7 +299,7 @@ func TestHostileLabelsAreQuotedOrWithheld(t *testing.T) {
 		}
 	}
 	// Grandfathered labels that CellText would change get no command, and no other label's command.
-	legacy := []string{"tab\tlabel", "line\nbreak", "esc\x1b[31mred", "zero​width", "bad\xffbyte", "repl�char", " padded"}
+	legacy := []string{"tab\tlabel", "line\nbreak", "esc\x1b[31mred", "zero\u200bwidth", "bad\xffbyte", "repl�char", " padded"}
 	for _, label := range legacy {
 		f := twoTokens(label)
 		run := parkedRun("seven_day")
@@ -308,7 +309,7 @@ func TestHostileLabelsAreQuotedOrWithheld(t *testing.T) {
 			t.Errorf("%q: set_token = %+v; want no command, command_unavailable=label", label, st)
 			continue
 		}
-		if strings.ContainsAny(st.TargetLabel, "\t\n\x1b​") {
+		if strings.ContainsAny(st.TargetLabel, "\t\n\x1b\u200b") {
 			t.Errorf("%q: display label not sanitised: %q", label, st.TargetLabel)
 		}
 		if as := fixOf(got, FixAutoSelect); as == nil || as.Command == "" {
@@ -336,8 +337,10 @@ func TestBlockJSONShape(t *testing.T) {
 	}
 }
 
-func TestParkedCodexRunIsAccountBound(t *testing.T) {
-	aliasA, aliasB := uuid.New(), uuid.New()
+// codexFixture is an owner with two linked Codex accounts: cx-a at 97% of its weekly window and
+// cx-b at 10%. Workers come from twoTokens (default bind, no Codex capabilities).
+func codexFixture() (f *fakeStore, aliasA, aliasB, acctA uuid.UUID) {
+	aliasA, aliasB = uuid.New(), uuid.New()
 	acctA, acctB := uuid.New(), uuid.New()
 	weekly := func(pct float64) []byte {
 		secs, reset := int64(604800), now.Add(48*time.Hour).Unix()
@@ -346,7 +349,7 @@ func TestParkedCodexRunIsAccountBound(t *testing.T) {
 		}}})
 		return b
 	}
-	f := twoTokens("spare")
+	f = twoTokens("spare")
 	f.codex = &codexData{
 		secrets: []store.ListUserSecretsForKindRow{{ID: aliasA, Kind: "codex_auth", Label: "cx-a"}, {ID: aliasB, Kind: "codex_auth", Label: "cx-b"}},
 		links: []store.ListCodexAliasAccountsForUserRow{
@@ -358,10 +361,20 @@ func TestParkedCodexRunIsAccountBound(t *testing.T) {
 			{ProviderAccountID: acctB, Aliases: []string{"cx-b"}, Buckets: weekly(10), LastSuccessAt: pgconv.Time(now.Add(-time.Minute))},
 		},
 	}
+	return f, aliasA, aliasB, acctA
+}
+
+func codexRun(aliasA uuid.UUID) store.Run {
 	run := parkedRun("seven_day")
 	run.Harness = "codex"
 	run.CodexSecretID = pgtype.UUID{Bytes: aliasA, Valid: true}
 	run.CredentialOverrideMode, run.CredentialOverrideSecretID = pgtype.Text{}, pgtype.UUID{}
+	return run
+}
+
+func TestParkedCodexRunIsAccountBound(t *testing.T) {
+	f, aliasA, _, acctA := codexFixture()
+	run := codexRun(aliasA)
 	got := newLoader(t, f).ForRuns(context.Background(), owner, []store.Run{run})[run.ID]
 	if got == nil {
 		t.Fatal("no block for a parked Codex run")
@@ -380,5 +393,64 @@ func TestParkedCodexRunIsAccountBound(t *testing.T) {
 	}
 	if !foundPool {
 		t.Fatalf("future_runs lacks the codex pool_on command: %+v", got.FutureRuns)
+	}
+}
+
+// codexCapableWorker makes the twoTokens worker advertise the Codex switch protocol, as a current
+// worker does.
+func codexCapableWorker(f *fakeStore) {
+	f.workers[0].ProtocolCapabilities = []string{capability.CodexCredentialSwitchV1, capability.CodexSwitchStoppedV1}
+	f.workers[0].SnapshotRegisterNonce = pgtype.Text{String: "n1", Valid: true}
+	f.workers[0].CredentialSwitchApplyNonce = pgtype.Text{String: "n1", Valid: true}
+}
+
+func TestCodexSetTokenFixOnlyForALiveRunWithAnAlternativeAccount(t *testing.T) {
+	ctx := context.Background()
+	f, aliasA, aliasB, _ := codexFixture()
+	codexCapableWorker(f)
+	l := newLoader(t, f)
+
+	// A live Codex run on a capable worker: the owner can switch it, so the fix is offered.
+	live := codexRun(aliasA)
+	live.Status = "running"
+	live.RateLimitType, live.RetryNotBefore, live.LimitResetsAt = pgtype.Text{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}
+	snap, err := l.svc.LoadNextClaimSnapshot(ctx, owner, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := l.svc.NextClaimReason(live, snap)
+	if res == nil || !res.ManualSwitch || res.Alternative == nil || res.Alternative.ID != aliasB {
+		t.Fatalf("live run result = %+v; want a manual switch to cx-b", res)
+	}
+	runFix, _ := fixes(live, res, snap)
+	var st *apitypes.WeeklyLimitFixDTO
+	for i := range runFix {
+		if runFix[i].Kind == FixSetToken {
+			st = &runFix[i]
+		}
+	}
+	if want := "uzi run set-token " + live.ID.String() + " -- cx-b"; st == nil || st.Command != want || st.TargetID != aliasB.String() {
+		t.Fatalf("set_token fix = %+v; want command %q", st, want)
+	}
+
+	// The same account parked on its weekly window is not switchable in place: no set_token fix.
+	parked := codexRun(aliasA)
+	got := l.ForRuns(ctx, owner, []store.Run{parked})[parked.ID]
+	if got == nil {
+		t.Fatal("no block for a parked Codex run")
+	}
+	if fixOf(got, FixSetToken) != nil {
+		t.Fatalf("parked Codex run offered set_token: %+v", got.Fix)
+	}
+}
+
+func TestBacktickLabelGetsNoCommand(t *testing.T) {
+	label := "a" + "`" + "id" + "`"
+	f := twoTokens(label)
+	run := parkedRun("seven_day")
+	got := newLoader(t, f).ForRuns(context.Background(), owner, []store.Run{run})[run.ID]
+	st := fixOf(got, FixSetToken)
+	if st == nil || st.Command != "" || st.CommandUnavailable != apitypes.WeeklyFixCommandLabel {
+		t.Fatalf("set_token = %+v; want no command, command_unavailable=label", st)
 	}
 }

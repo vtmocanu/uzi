@@ -6,6 +6,7 @@ package weeklylimit
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -32,7 +33,6 @@ const (
 const (
 	rateLimitSevenDay = "seven_day"
 	holdWeeklyReserve = "weekly_reserve"
-	codexAuthModeKey  = "api_key"
 	harnessCodex      = "codex"
 )
 
@@ -55,12 +55,8 @@ func (l *Loader) now() time.Time {
 
 // excluded reports a run the block never speaks for, decided from its frozen run-row binding alone
 // (so no read is needed): a provider-bound run and a Codex API-key run have no subscription window.
-func excluded(run store.Run) bool {
-	if run.ModelProviderID.Valid {
-		return true
-	}
-	return run.Harness == harnessCodex && run.CodexAuthMode.Valid && run.CodexAuthMode.String == codexAuthModeKey
-}
+// It is the workersvc predicate itself, so the preview and the block never disagree.
+func excluded(run store.Run) bool { return workersvc.ExcludedFromNextClaim(run) }
 
 // parked reports the M1 presence condition: a weekly-window limit_wait park, or a weekly-reserve pause.
 func parked(run store.Run) bool {
@@ -96,7 +92,11 @@ func (l *Loader) ForRuns(ctx context.Context, ownerID uuid.UUID, runs []store.Ru
 		return nil
 	}
 	snap, err := l.svc.LoadNextClaimSnapshot(ctx, ownerID, l.now())
-	if err != nil || l.svc.LoadNextClaimSettling(ctx, snap, eligible) != nil {
+	if err == nil {
+		err = l.svc.LoadNextClaimSettling(ctx, snap, eligible)
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "weeklylimit: next-claim snapshot unavailable; omitting the weekly-limit block", "owner", ownerID, "err", err)
 		return nil
 	}
 	out := make(map[uuid.UUID]*apitypes.WeeklyLimitDTO, len(eligible))
@@ -244,9 +244,10 @@ func labelFix(kind string, id uuid.UUID, label string, build func(quoted string)
 	return fix
 }
 
+// commandSafe also refuses a backtick, which would end the Slack code span the command is shown in.
 func commandSafe(label string) bool {
 	return label != "" && termsafe.CellText(label) == label && termsafe.Validate("label", label) == nil &&
-		!strings.ContainsRune(label, utf8.RuneError)
+		!strings.ContainsRune(label, utf8.RuneError) && !strings.ContainsRune(label, '`')
 }
 
 // ForRunID is the Slack park notifier's entry: it reads the run by id and returns its block (owner

@@ -10,6 +10,10 @@ import (
 // #4123), which names a run's credential, its worker's bind mode and the owner's effective limit
 // without reaching into the snapshot's unexported fields.
 
+// ExcludedFromNextClaim reports a run the next-claim preview and the weekly-limit block never speak
+// for: a provider-bound run or a Codex API-key run. It is the one copy of that predicate.
+func ExcludedFromNextClaim(run store.Run) bool { return nextClaimExcluded(run) }
+
 // EffectiveLimit is the percent at which the owner's weekly reserve holds, or 100 with no threshold.
 func (n *NextClaimSnapshot) EffectiveLimit() float64 { return n.effectiveLimit() }
 

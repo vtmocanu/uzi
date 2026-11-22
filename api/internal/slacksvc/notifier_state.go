@@ -150,12 +150,23 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		holdAnnounced := announced && existing.ParkKind.String == announcedKind &&
 			existing.LimitPausedAt.Valid && announcedAt.Valid &&
 			existing.LimitPausedAt.Time.Equal(announcedAt.Time)
-		tblocks, tfallback, tok := renderThreadBlocks(rc, base, n.weeklyLimitFor(ctx, rc))
-		if pp != nil {
-			tblocks, tfallback, tok = publicationThreadBlocks(rc, *pp, base)
-		} else if tok && rc.Status == "completed" {
-			// Issue #3813: disclose a failed advisory Code cross-check on this same message.
-			tblocks, tfallback = withCodeCrossCheckAdvisory(tblocks, tfallback, n.codeCrossCheckAdvisory(ctx, rc))
+		// The thread line is composed only when it can be posted: an already-announced hold
+		// posts nothing, so it loads no weekly-limit snapshot either.
+		var (
+			tblocks   []slack.Block
+			tfallback string
+			tok       bool
+		)
+		if !holdAnnounced {
+			if pp != nil {
+				tblocks, tfallback, tok = publicationThreadBlocks(rc, *pp, base)
+			} else {
+				tblocks, tfallback, tok = renderThreadBlocks(rc, base, n.weeklyLimitFor(ctx, rc))
+				if tok && rc.Status == "completed" {
+					// Issue #3813: disclose a failed advisory Code cross-check on this same message.
+					tblocks, tfallback = withCodeCrossCheckAdvisory(tblocks, tfallback, n.codeCrossCheckAdvisory(ctx, rc))
+				}
+			}
 		}
 		if tok && !holdAnnounced {
 			if _, perr := n.poster.PostBlocks(ctx, existing.ChannelID, existing.RootTs, tfallback, tblocks); perr != nil {
@@ -1186,8 +1197,9 @@ func limitWaitDetail(rc store.GetSlackRunContextRow, wl *apitypes.WeeklyLimitDTO
 	return b.String()
 }
 
-// weeklyLimitSuffix is the park line's weekly-limit addition: " · <reason> · <command>", each part
-// escaped for mrkdwn (the reason and the command carry owner-authored labels). It is empty for a nil
+// weeklyLimitSuffix is the park line's weekly-limit addition: " · <reason> · `<command>`", each part
+// escaped for mrkdwn (the reason and the command carry owner-authored labels) and the command set in
+// a code span so a label's own markers stay literal. It is empty for a nil
 // block, so a park without one renders byte-identically to before. omitCommand names a command the
 // line already shows; it is skipped in favour of the next fix with one. A fix whose label is not
 // command-safe has no command, and the line then carries the reason alone.
@@ -1198,7 +1210,10 @@ func weeklyLimitSuffix(wl *apitypes.WeeklyLimitDTO, omitCommand string) string {
 	out := " · " + EscapeMrkdwn(wl.ReasonText())
 	for _, f := range wl.Fix {
 		if f.Command != "" && f.Command != omitCommand {
-			return out + " · " + EscapeMrkdwn(f.Command)
+			// A Slack code span: the label inside the command may carry mrkdwn markers (a
+			// label like _prod_ would otherwise render italic, and a copied command would then
+			// name a different credential). Inside backticks the text is literal.
+			return out + " · `" + EscapeMrkdwn(f.Command) + "`"
 		}
 	}
 	return out
@@ -1210,7 +1225,7 @@ func (n *Notifier) weeklyLimitFor(ctx context.Context, rc store.GetSlackRunConte
 	if n.weeklyLimit == nil {
 		return nil
 	}
-	if !weeklyReserveHold(rc) && !(rc.Status == "limit_wait" && rc.RateLimitType.Valid && rc.RateLimitType.String == "seven_day") {
+	if !weeklyReserveHold(rc) && (rc.Status != "limit_wait" || !rc.RateLimitType.Valid || rc.RateLimitType.String != "seven_day") {
 		return nil
 	}
 	return n.weeklyLimit(ctx, rc.ID)

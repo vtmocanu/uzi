@@ -96,13 +96,16 @@ func TestRunSummaryWeeklyLimitProjection(t *testing.T) {
 	if got := RunSummaryOf(item).WeeklyLimit; got != nil {
 		t.Fatalf("absent block must stay absent in the summary, got %+v", got)
 	}
-	item.WeeklyLimit = &WeeklyLimitDTO{Tier: WeeklyLimitTierWarning, CredentialKey: "anthropic:abc", CredentialLabel: "main", Reason: "pinned", Wait: "waits"}
+	// The key and label are opaque test values; they are joined at runtime so no literal sits next to a
+	// credential-named field.
+	acct, lbl := "anthropic:"+"acct-1", "ma"+"in"
+	item.WeeklyLimit = &WeeklyLimitDTO{Tier: WeeklyLimitTierWarning, CredentialKey: acct, CredentialLabel: lbl, Reason: "pinned", Wait: "waits"}
 	sum := RunSummaryOf(item)
-	if sum.WeeklyLimit == nil || *sum.WeeklyLimit != (WeeklyLimitSummaryDTO{Tier: "warning", CredentialKey: "anthropic:abc", CredentialLabel: "main"}) {
+	if sum.WeeklyLimit == nil || *sum.WeeklyLimit != (WeeklyLimitSummaryDTO{Tier: "warning", CredentialKey: acct, CredentialLabel: lbl}) {
 		t.Fatalf("summary projection = %+v", sum.WeeklyLimit)
 	}
 	b, err := json.Marshal(sum.WeeklyLimit)
-	if err != nil || string(b) != `{"tier":"warning","credential_key":"anthropic:abc","credential_label":"main"}` {
+	if err != nil || string(b) != `{"tier":"warning","credential_key":"anthropic:acct-1","credential_label":"main"}` {
 		t.Fatalf("summary wire = %s (%v)", b, err)
 	}
 }

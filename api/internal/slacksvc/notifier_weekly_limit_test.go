@@ -122,3 +122,16 @@ func TestHostileLabelIsEscapedInSlackBlocksAndFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestCommandIsInACodeSpanSoAMarkedUpLabelStaysLiteral(t *testing.T) {
+	rc := parkedCtx("seven_day", 2*time.Hour, 1)
+	cmd := "uzi run set-token " + rc.ID.String() + " -- _prod_"
+	blocks, fallback, ok := renderThreadBlocks(rc, "", weeklyBlock(rc.ID, cmd))
+	if !ok {
+		t.Fatal("park must thread")
+	}
+	want := "`" + cmd + "`"
+	if !strings.Contains(contextText(blocks), want) || !strings.Contains(fallback, want) {
+		t.Fatalf("command not in a code span:\n block: %s\n fallback: %s", contextText(blocks), fallback)
+	}
+}
