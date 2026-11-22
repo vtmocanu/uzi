@@ -25,7 +25,13 @@ export const CODEX_REFRESH_BRIDGE_BUDGET_MS = 9_000;
 export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined): (() => number) | undefined {
   if (mode !== "provider") return undefined;
   const end = performance.now() + 10_000;
-  return () => Math.max(1, Math.ceil(end - performance.now()));
+  return () => {
+    const remaining = end - performance.now();
+    if (remaining <= 0) {
+      throw new CodexTransportError({ category: "timeout", message: "codex provider setup deadline exceeded" });
+    }
+    return Math.ceil(remaining);
+  };
 }
 
 const INITIALIZE_METHOD = "initialize";

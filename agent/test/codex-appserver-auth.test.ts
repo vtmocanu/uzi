@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 
 import {
   CODEX_REFRESH_BRIDGE_BUDGET_MS,
+  codexConnectionBudget,
   CodexAppServerAuthError,
   createCodexAppServerAuth,
   type CodexSubscriptionRefreshBridge,
@@ -19,6 +20,22 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 }
+
+it("expired provider setup budget refuses before any RPC or credential send", async (t) => {
+  let now = 1_000;
+  t.mock.method(performance, "now", () => now);
+  const budget = codexConnectionBudget("provider");
+  assert.ok(budget);
+  now += 10_000;
+  const transport = new FakeTransport();
+  const auth = createCodexAppServerAuth({ mode: "provider", apiKey: "fixture-key" });
+  await assert.rejects(auth.authenticate(transport, undefined, budget), error =>
+    error instanceof CodexTransportError && error.failure.category === "timeout");
+  assert.deepEqual(transport.calls, []);
+  for (const mode of [undefined, "api_key", "subscription"] as const) {
+    assert.equal(codexConnectionBudget(mode), undefined);
+  }
+});
 
 it("provider pending initialize keeps the typed connection deadline", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
