@@ -11,6 +11,7 @@ import type { WorkerClient } from "../src/client.js";
 import type { GitCache } from "../src/git.js";
 import type { DeliveryContext } from "../src/pr-description-context.js";
 import { nullLogger } from "./helpers.js";
+import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
@@ -61,6 +62,65 @@ for (const pass of ["intent", "plan", "review"] as const) {
         assert.ok(pass === "intent" ? await runner.generateIntentSummary(input)
           : await runner.generatePlanSummary({ ...input, planMd: "Plan" }));
       }
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+}
+
+for (const pass of ["intent", "plan", "delivery", "review"] as const) {
+  it(`${pass} executes a frozen Codex provider authority without vendor work`, async () => {
+    const root = await makeHome("m2-codex-positive-");
+    const provider: ClaimProviderBinding = {
+      provider_id: "codex-gateway", revision: 4, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example.test", auth_style: "bearer", credential: "provider/secret-key",
+      model_map: { default: { model: "gateway-default" } },
+    };
+    let builds = 0;
+    let turns = 0;
+    let posted = false;
+    const warnings: unknown[] = [];
+    const log = { ...nullLogger(), warn: (message: string, fields?: Record<string, unknown>) => { warnings.push([message, fields]); } };
+    const factory = (async (params: Parameters<CodexAdviceHarnessFactory>[0]) => {
+      builds++;
+      assert.equal(params.binding.authMode, "provider");
+      assert.ok(params.binding.authMode === "provider");
+      assert.ok(Object.isFrozen(params.binding.providerBinding));
+      assert.ok(Object.isFrozen(params.binding.providerBinding.model_map.default));
+      assert.equal(params.binding.providerBinding.revision, 4);
+      return { kind: "codex", run: async (req: import("../src/harness.js").AdviceRequest) => {
+        turns++;
+        assert.equal(req.model, pass === "review" || pass === "delivery" ? "gpt-6-sol" : "gpt-6-luna");
+        const summary = "Safe " + encodeURIComponent(provider.credential);
+        const text = pass === "intent" ? summary : JSON.stringify({ summary, findings: [], deltas: [], changes: [], scope_notes: [], review_pointers: [] });
+        return { text, end: { kind: "terminal", terminal: {
+          outcome: "success", subtype: "success", errors: [], metrics: { cost: { kind: "unreported" } },
+        } } };
+      } };
+    }) as unknown as CodexAdviceHarnessFactory;
+    const forbidden = () => { throw new Error("unexpected vendor operation"); };
+    const claim = { run_id: "provider-pass", review_target_run_id: "target", branch: "branch", base_branch: "main",
+      repo: { clone_url: "/origin" }, secrets: { forge_pat: "test-pat", provider } };
+    try {
+      let result: unknown;
+      if (pass === "review") {
+        const client = { reportState: async () => {}, postTaskReview: async (_id: string, review: { status: string }) => {
+          assert.equal(review.status, "complete"); posted = true; result = review;
+        }, checkCodexOperationAdmission: forbidden, retainCodexOperationFlight: forbidden } as unknown as WorkerClient;
+        const git = { ensureClone: async () => "/bare", reviewDiff: async () => "+change" } as unknown as GitCache;
+        await new ReviewRunner(client, git, log, { homeRoot: root, queryFn: forbidden, codexAdviceHarnessFactory: factory })
+          .execute(claim as unknown as ClaimResponse);
+        assert.ok(posted);
+      } else {
+        const runner = new SummaryRunner(log, { homeRoot: root, queryFn: forbidden, codexAdviceHarnessFactory: factory });
+        const input = { claim, token: "", model: "", issueTitle: "Title", issueBody: "Body" };
+        result = pass === "intent" ? await runner.generateIntentSummary(input)
+          : pass === "plan" ? await runner.generatePlanSummary({ ...input, planMd: "Plan" })
+          : await runner.generateDeliverySummary({ claim, context: deliveryContext, deadlineMs: Date.now() + 10000 });
+      }
+      assert.ok(result);
+      assert.equal(builds, 1);
+      assert.equal(turns, 1);
+      assert.ok(!JSON.stringify([result, warnings]).includes(encodeURIComponent(provider.credential)));
+      assert.ok(!JSON.stringify([result, warnings]).includes(provider.credential));
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 }

@@ -25,7 +25,7 @@ import { defaultQueryFn } from "./sdk-messages.js";
 import { ModelPassCredentialError, runReadOnlyModelPass, type ModelPassCredentialReason, type ReadOnlyModelPassOpts } from "./model-pass.js";
 import { extractJsonObject } from "./judge-runner.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
+import { selectCodexExecutionAuthority } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only: the injected seam, never constructed here
 import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; // leaf value import (no runtime dep on codex-executor)
 import { CODEX_SUMMARY_EFFORT, DEFAULT_CODEX_SUMMARY_MODEL } from "./codex/summary-model.js"; // leaf value import
@@ -98,7 +98,7 @@ export interface PlanSummaryResult {
 export interface IntentSummaryInput {
   /** Claim shape selects Codex when present and valid; malformed Codex fails closed.
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
-  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
+  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown; readonly provider?: ClaimProviderBinding; readonly anthropic_oauth_token?: string } };
   token: string;
   /** PRD #4320: the provider binding of a provider-bound run; the pass then runs under it (not `token`) and
    *  its model resolves through the bound map, so an unmapped summary model skips the pass. */
@@ -357,10 +357,7 @@ export class SummaryRunner {
     fail: (reason: "Codex claim but no Codex advice-harness factory is wired" | "the claim carries no Anthropic token") => null,
     claimGeneration?: number,
   ): Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "codex"> | null {
-    if (claim.secrets.provider && (claim.secrets.provider.engine !== "claude" || claim.secrets.codex !== undefined)) {
-      throw new ProviderLaneUnsupportedError();
-    }
-    const selection = selectCodexBinding({ codex: claim.secrets.codex });
+    const selection = selectCodexExecutionAuthority(claim.secrets);
     if (selection.kind === "codex") {
       if (!this.codexAdviceHarnessFactory) return fail("Codex claim but no Codex advice-harness factory is wired");
       return {
@@ -446,13 +443,14 @@ export class SummaryRunner {
    *  throws into the caller. Returns the accumulated text; THROWS on timeout or an error
    *  result so the public methods can catch → null. */
   private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
-    if (input.provider && (input.provider.engine !== "claude" || input.claim?.secrets.codex !== undefined)) {
-      throw new ProviderLaneUnsupportedError();
-    }
+
     const reportUsage = this.usageReporter(pass, input.onUsage);
     let onCodex = false;
     try {
-      const selection = selectCodexBinding({ codex: input.claim?.secrets.codex });
+      const selection = selectCodexExecutionAuthority({
+        ...input.claim?.secrets,
+        ...((input.provider ?? input.claim?.secrets.provider) ? { provider: input.provider ?? input.claim?.secrets.provider } : {}),
+      });
       let harness: Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
         onCodex = true;

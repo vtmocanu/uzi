@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { parseSync } from "oxc-parser";
 
-// M2 textual architecture census, re-enumerated at e7ffe477e3cfbcb6ec3f84cb5546f5c1ceb45983.
+// M2 textual architecture census, reconciled against 7c1e7405c plus current consumer edits.
 // Pins are reviewed source lines, NOT generated at test time. No per-file budgets.
 // Parser use excludes comments/string lookalikes/types and handles optional chains.
 // Literal computed members and direct provider destructuring are included. Dynamic
@@ -28,7 +28,8 @@ const SITES: Site[] = [
   {"file": "claude-cross-check.ts", "line": "if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);", "count": 1, "category": "lane-refusal", "rationale": "Provider presence refuses this unsupported lane regardless of engine."},
   {"file": "client.ts", "line": "claim.secrets.provider = provider;", "count": 2, "category": "admission-write", "rationale": "Decoded binding written only after requireProviderCapability engine hold."},
   {"file": "codex/config.ts", "line": "const { model, provider, projectPath } = opts;", "count": 1, "category": "native-config", "rationale": "CodexConfigProvider config builder input is not ClaimProviderBinding and grants no provider execution permission."},
-  {"file": "codex/codex-advice-harness.ts", "line": "this.provider = opts.provider;", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
+  {"file": "codex/codex-advice-harness.ts", "line": "this.provider = opts.providerBinding ? { ...opts.provider,", "count": 1, "category": "native-config", "rationale": "Native CodexProviderConfig supplies defaults; decoded providerBinding overrides identity, endpoint and default model for isolated advice roots."},
+  {"file": "codex/codex-advice-harness.ts", "line": "} : opts.provider;", "count": 1, "category": "native-config", "rationale": "Native CodexProviderConfig supplies defaults; decoded providerBinding overrides identity, endpoint and default model for isolated advice roots."},
   {"file": "codex/codex-executor.ts", "line": "? this.opts.provider", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
   {"file": "codex/codex-executor.ts", "line": "...this.opts.provider,", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
   {"file": "codex/codex-executor.ts", "line": "providerDefaultModel: this.opts.provider.model,", "count": 1, "category": "native-config", "rationale": "opts is native CodexProviderConfig, not ClaimProviderBinding; no claim-provider execution permission."},
@@ -42,29 +43,33 @@ const SITES: Site[] = [
   {"file": "job-runner.ts", "line": "if (claim.secrets?.provider) {", "count": 1, "category": "lane-refusal", "rationale": "Provider presence refuses this unsupported lane regardless of engine."},
   {"file": "judge-runner.ts", "line": "} else if (claim.secrets?.provider) {", "count": 1, "category": "lane-refusal", "rationale": "Provider presence refuses this unsupported lane regardless of engine."},
   {"file": "judge-runner.ts", "line": "const providerKeys = providerKeyForms(claim.secrets.provider.credential);", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
-  {"file": "main.ts", "line": "if (addr.provider && (addr.provider.engine !== \"claude\" || codex !== undefined)) {", "count": 1, "category": "engine-handling", "rationale": "buildRunExecutor explicitly refuses non-Claude/mixed credentials before native or stub selection."},
-  {"file": "model-pass.ts", "line": "if (opts.provider && (opts.provider.engine !== \"claude\" || opts.codex !== undefined)) throw new ProviderLaneUnsupportedError();", "count": 1, "category": "engine-handling", "rationale": "Early explicit engine/mixed-credential refusal precedes scope and SDK credential construction."},
-  {"file": "model-pass.ts", "line": "if (!token && !opts.provider) {", "count": 1, "category": "engine-handling", "rationale": "Early explicit engine/mixed-credential refusal precedes scope and SDK credential construction."},
-  {"file": "model-pass.ts", "line": "const scope = opts.provider ? providerScope(opts.provider.credential, opts.log, opts.label) : undefined;", "count": 1, "category": "engine-handling", "rationale": "Early explicit engine/mixed-credential refusal precedes scope and SDK credential construction."},
-  {"file": "model-pass.ts", "line": "credential: opts.provider ? sdkCredentialFromBinding(opts.provider) : { kind: \"oauth\", token: token! },", "count": 1, "category": "engine-handling", "rationale": "Early explicit engine/mixed-credential refusal precedes scope and SDK credential construction."},
+  {"file": "main.ts", "line": "if (addr.provider && (!([\"claude\", \"codex\"] as string[]).includes(addr.provider.engine) || codex !== undefined)) {", "count": 1, "category": "engine-handling", "rationale": "Factory refuses unknown engines and mixed native Codex credentials; Codex provider claims mint validated authority before native executor selection."},
+  {"file": "main.ts", "line": "selection = addr.provider?.engine === \"codex\"", "count": 1, "category": "engine-handling", "rationale": "Factory refuses unknown engines and mixed native Codex credentials; Codex provider claims mint validated authority before native executor selection."},
+  {"file": "main.ts", "line": "? { kind: \"codex\" as const, binding: createCodexProviderExecutionAuthority(addr.provider) }", "count": 1, "category": "engine-handling", "rationale": "Factory refuses unknown engines and mixed native Codex credentials; Codex provider claims mint validated authority before native executor selection."},
+  {"file": "model-pass.ts", "line": "if (opts.provider && (opts.codex", "count": 1, "category": "engine-handling", "rationale": "Claude-only SDK accessor remains guarded; a provider plus Codex pass requires matching frozen Codex-provider authority; unrelated or mixed authority is refused."},
+  {"file": "model-pass.ts", "line": "? opts.provider.engine !== \"codex\" || opts.codex.binding.authMode !== \"provider\" || opts.codex.binding.providerBinding !== opts.provider || !Object.isFrozen(opts.provider)", "count": 1, "category": "engine-handling", "rationale": "Claude-only SDK accessor remains guarded; a provider plus Codex pass requires matching frozen Codex-provider authority; unrelated or mixed authority is refused."},
+  {"file": "model-pass.ts", "line": ": opts.provider.engine !== \"claude\")) throw new ProviderLaneUnsupportedError();", "count": 1, "category": "engine-handling", "rationale": "Claude-only SDK accessor remains guarded; a provider plus Codex pass requires matching frozen Codex-provider authority; unrelated or mixed authority is refused."},
+  {"file": "model-pass.ts", "line": "if (!token && !opts.provider) {", "count": 1, "category": "engine-handling", "rationale": "Claude-only SDK accessor remains guarded; a provider plus Codex pass requires matching frozen Codex-provider authority; unrelated or mixed authority is refused."},
+  {"file": "model-pass.ts", "line": "const scope = opts.provider ? providerScope(opts.provider.credential, opts.log, opts.label) : undefined;", "count": 1, "category": "engine-handling", "rationale": "Claude-only SDK accessor remains guarded; a provider plus Codex pass requires matching frozen Codex-provider authority; unrelated or mixed authority is refused."},
+  {"file": "model-pass.ts", "line": "credential: opts.provider ? sdkCredentialFromBinding(opts.provider) : { kind: \"oauth\", token: token! },", "count": 1, "category": "engine-handling", "rationale": "Claude-only SDK accessor remains guarded; a provider plus Codex pass requires matching frozen Codex-provider authority; unrelated or mixed authority is refused."},
   {"file": "provider-binding.ts", "line": "const raw = secrets.provider;", "count": 1, "category": "engine-handling", "rationale": "Decoder validates wire engine/protocol; sdkCredentialFromBinding independently refuses non-Claude."},
   {"file": "provider-binding.ts", "line": "if (def.model !== undefined && def.model !== \"\" && def.model !== \"inherit\") resolveProviderModel(def.model, modelMap);", "count": 1, "category": "engine-handling", "rationale": "Decoder validates wire engine/protocol; sdkCredentialFromBinding independently refuses non-Claude."},
   {"file": "review-runner.ts", "line": "const credential = claim.secrets?.provider?.credential;", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
   {"file": "review-runner.ts", "line": "const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
-  {"file": "review-runner.ts", "line": "if (claim.secrets.provider && (claim.secrets.provider.engine !== \"claude\" || claim.secrets.codex !== undefined)) {", "count": 1, "category": "engine-handling", "rationale": "ReviewRunner.execute refuses non-Claude/mixed claims before executeClaim; forwarded review reaches guarded model-pass."},
-  {"file": "review-runner.ts", "line": "if (selection.kind === \"claude\" && !claim.secrets?.provider && !hasProviderCostForEveryModel(snapshot)) {", "count": 1, "category": "engine-handling", "rationale": "ReviewRunner.execute refuses non-Claude/mixed claims before executeClaim; forwarded review reaches guarded model-pass."},
-  {"file": "review-runner.ts", "line": "if (!token && !claim.secrets?.provider) {", "count": 1, "category": "engine-handling", "rationale": "ReviewRunner.execute refuses non-Claude/mixed claims before executeClaim; forwarded review reaches guarded model-pass."},
-  {"file": "review-runner.ts", "line": "review = await this.review(claim, diff, token ?? \"\", onUsage, claim.secrets?.provider);", "count": 1, "category": "engine-handling", "rationale": "ReviewRunner.execute refuses non-Claude/mixed claims before executeClaim; forwarded review reaches guarded model-pass."},
+  {"file": "review-runner.ts", "line": "try { if (claim.secrets.provider) selectCodexExecutionAuthority(claim.secrets); }", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity before task-review engine dispatch; Claude forwarding reaches guarded model-pass."},
+  {"file": "review-runner.ts", "line": "if (selection.kind === \"claude\" && !claim.secrets?.provider && !hasProviderCostForEveryModel(snapshot)) {", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity before task-review engine dispatch; Claude forwarding reaches guarded model-pass."},
+  {"file": "review-runner.ts", "line": "if (!token && !claim.secrets?.provider) {", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity before task-review engine dispatch; Claude forwarding reaches guarded model-pass."},
+  {"file": "review-runner.ts", "line": "review = await this.review(claim, diff, token ?? \"\", onUsage, claim.secrets?.provider);", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity before task-review engine dispatch; Claude forwarding reaches guarded model-pass."},
   {"file": "review-runner.ts", "line": "const providerCredential = claim.secrets?.provider?.credential;", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
   {"file": "runner.ts", "line": "...(addr?.provider ? providerKeyForms(addr.provider.credential) : []),", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
   {"file": "runner.ts", "line": "const providerForms = claim.secrets.provider ? providerKeyForms(claim.secrets.provider.credential) : [];", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
-  {"file": "runner.ts", "line": "claim.secrets.provider ? { provider: claim.secrets.provider } : undefined);", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches buildRunExecutor hold; Now eligibility explicitly requires Claude and passes reach guarded model-pass."},
+  {"file": "runner.ts", "line": "claim.secrets.provider ? { provider: claim.secrets.provider } : undefined);", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches engine-aware buildRunExecutor selection. Now remains NOT WIRED for Codex providers: eligibility requires Claude and its passes reach guarded model-pass."},
   {"file": "runner.ts", "line": "...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []),", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
   {"file": "runner.ts", "line": "providerKeyForms: claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [],", "count": 1, "category": "neutral-secrecy", "rationale": "Engine-independent redaction/upload key material, including refused keys; no engine filter."},
-  {"file": "runner.ts", "line": "claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || claim.secrets.provider?.engine === \"claude\"),", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches buildRunExecutor hold; Now eligibility explicitly requires Claude and passes reach guarded model-pass."},
-  {"file": "runner.ts", "line": "...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),", "count": 2, "category": "engine-handling", "rationale": "Factory forwarding reaches buildRunExecutor hold; Now eligibility explicitly requires Claude and passes reach guarded model-pass."},
-  {"file": "runner.ts", "line": "const built = this.makeClaimExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation, ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}) });", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches buildRunExecutor hold; Now eligibility explicitly requires Claude and passes reach guarded model-pass."},
-  {"file": "runner.ts", "line": "flight.executor = publicationOnlyExecutor(claim, this.makeClaimExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex, claim.secrets.provider ? { provider: claim.secrets.provider } : undefined).executor);", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches buildRunExecutor hold; Now eligibility explicitly requires Claude and passes reach guarded model-pass."},
+  {"file": "runner.ts", "line": "claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || claim.secrets.provider?.engine === \"claude\"),", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches engine-aware buildRunExecutor selection. Now remains NOT WIRED for Codex providers: eligibility requires Claude and its passes reach guarded model-pass."},
+  {"file": "runner.ts", "line": "...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),", "count": 2, "category": "engine-handling", "rationale": "Factory forwarding reaches engine-aware buildRunExecutor selection. Now remains NOT WIRED for Codex providers: eligibility requires Claude and its passes reach guarded model-pass."},
+  {"file": "runner.ts", "line": "const built = this.makeClaimExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation, ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}) });", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches engine-aware buildRunExecutor selection. Now remains NOT WIRED for Codex providers: eligibility requires Claude and its passes reach guarded model-pass."},
+  {"file": "runner.ts", "line": "flight.executor = publicationOnlyExecutor(claim, this.makeClaimExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex, claim.secrets.provider ? { provider: claim.secrets.provider } : undefined).executor);", "count": 1, "category": "engine-handling", "rationale": "Factory forwarding reaches engine-aware buildRunExecutor selection. Now remains NOT WIRED for Codex providers: eligibility requires Claude and its passes reach guarded model-pass."},
   {"file": "sdk-executor.ts", "line": "if (!isRunSummaryKind(ctx.kind) || (!token && !ctx.provider) || !this.client || !prdInputP ||", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
   {"file": "sdk-executor.ts", "line": "token, ...(ctx.provider ? { provider: ctx.provider } : {}), model: ctx.summaryModel ?? \"\", issueTitle: ctx.issueTitle,", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
   {"file": "sdk-executor.ts", "line": "if (!oauthToken && !ctx.provider) {", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
@@ -77,10 +82,10 @@ const SITES: Site[] = [
   {"file": "sdk-executor.ts", "line": "if (ctx.provider) throw new Error(REASON_PROVIDER_SWITCH_REFUSED);", "count": 2, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
   {"file": "sdk-executor.ts", "line": "const em = ctx.provider ? stripProviderCost(raw) : raw;", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
   {"file": "sdk-executor.ts", "line": "if (ctx.provider && isGatewayLimitStatus(terminal.apiErrorStatus)) {", "count": 1, "category": "engine-handling", "rationale": "Claude setup uses sdkCredentialFromBinding; summaries reach guarded model-pass; switching is refused."},
-  {"file": "summary-runner.ts", "line": "if (claim.secrets.provider && (claim.secrets.provider.engine !== \"claude\" || claim.secrets.codex !== undefined)) {", "count": 1, "category": "engine-handling", "rationale": "deliveryHarness and runModel explicitly refuse non-Claude or mixed native credentials before forwarding."},
-  {"file": "summary-runner.ts", "line": "if (claim.secrets.provider) return { provider: claim.secrets.provider, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };", "count": 1, "category": "engine-handling", "rationale": "deliveryHarness and runModel explicitly refuse non-Claude or mixed native credentials before forwarding."},
-  {"file": "summary-runner.ts", "line": "if (input.provider && (input.provider.engine !== \"claude\" || input.claim?.secrets.codex !== undefined)) {", "count": 1, "category": "engine-handling", "rationale": "deliveryHarness and runModel explicitly refuse non-Claude or mixed native credentials before forwarding."},
-  {"file": "summary-runner.ts", "line": "harness = { token: input.token, ...(input.provider ? { provider: input.provider } : {}), model: input.model };", "count": 1, "category": "engine-handling", "rationale": "deliveryHarness and runModel explicitly refuse non-Claude or mixed native credentials before forwarding."},
+  {"file": "summary-runner.ts", "line": "if (claim.secrets.provider) return { provider: claim.secrets.provider, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity for delivery and direct summary passes before Codex advice or Claude dispatch."},
+  {"file": "summary-runner.ts", "line": "harness = { token: input.token, ...(input.provider ? { provider: input.provider } : {}), model: input.model };", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity for delivery and direct summary passes before Codex advice or Claude dispatch."},
+  {"file": "codex/codex-executor.ts", "line": "baseUrl: binding.providerBinding.base_url, envKey: this.opts.provider.envKey,", "count": 1, "category": "native-config", "rationale": "Validated Codex provider authority supplies root endpoint; native opts.provider supplies only the config env-key name, not provider credential authority."},
+  {"file": "summary-runner.ts", "line": "...((input.provider ?? input.claim?.secrets.provider) ? { provider: input.provider ?? input.claim?.secrets.provider } : {}),", "count": 1, "category": "engine-handling", "rationale": "Shared selectCodexExecutionAuthority validates decoder/exclusivity for delivery and direct summary passes before Codex advice or Claude dispatch."},
 ];
 
 /** File-relative recursive walk; reject symlinks instead of following them outside src. */
@@ -183,10 +188,14 @@ function holdCount(source: string, block: string): number {
 // bodies and admission calls (a condition alone would not establish refusal).
 const HOLDS: Record<string, string[]> = {
   "client.ts": ['this.requireProviderCapability(provider.engine);', 'if (engine === "codex") throw new ProviderLaneUnsupportedError();'],
-  "provider-binding.ts": ['if (b.engine !== "claude") throw new ProviderLaneUnsupportedError();', 'if (engine !== "claude" && engine !== "codex") throw new ProviderBindingError("unknown engine");', 'if (protocol !== (engine === "claude" ? "anthropic_messages" : "openai_responses")) throw new ProviderBindingError("unknown protocol");'],
+  "provider-binding.ts": ['if (oauth !== undefined && oauth !== null && oauth !== "") throw new ProviderBindingError("provider next to an anthropic_oauth_token");', 'if (secrets.codex !== undefined && secrets.codex !== null) throw new ProviderBindingError("provider next to a codex block");', 'if (b.engine !== "claude") throw new ProviderLaneUnsupportedError();', 'if (engine !== "claude" && engine !== "codex") throw new ProviderBindingError("unknown engine");', 'if (protocol !== (engine === "claude" ? "anthropic_messages" : "openai_responses")) throw new ProviderBindingError("unknown protocol");'],
   "main.ts": ['return { executor: new FailClosedExecutor("provider_lane_unsupported") };'],
-  "summary-runner.ts": ['throw new ProviderLaneUnsupportedError();'],
-  "review-runner.ts": ['await safeReportFailed(this.client, this.log, "review", claim.run_id,\nPROVIDER_LANE_UNSUPPORTED, undefined, claim.claim_generation, this.terminalDeps);\nreturn;'],
+  "summary-runner.ts": ['const selection = selectCodexExecutionAuthority(claim.secrets);', 'const selection = selectCodexExecutionAuthority({'],
+  "codex/select.ts": ['try { provider = decodeProviderBinding(secrets); }\ncatch { throw new ProviderLaneUnsupportedError(); }', 'return { kind: "codex", binding: createCodexProviderExecutionAuthority(provider) };', 'const snapshot = decodeProviderBinding({ provider: binding });', 'if (snapshot?.engine !== "codex") throw new ProviderBindingError("expected codex engine");'],
+  // providerBinding field reads are outside the carrier-name matcher; pin these
+  // overrides explicitly: decoded authority supplies identity, endpoint and model.
+  "codex/codex-advice-harness.ts": ['this.providerBinding = opts.providerBinding;', 'name: "uzi-provider-" + createHash("sha256").update(JSON.stringify([opts.providerBinding.provider_id, opts.providerBinding.revision])).digest("hex"),', 'baseUrl: opts.providerBinding.base_url, model: opts.providerBinding.model_map.default.model,'],
+  "review-runner.ts": ['const selection = selectCodexExecutionAuthority(claim.secrets);', 'await safeReportFailed(this.client, this.log, "review", claim.run_id,\nPROVIDER_LANE_UNSUPPORTED, undefined, claim.claim_generation, this.terminalDeps);\nreturn;'],
   "job-runner.ts": ['await this.fail(runId, generation, PROVIDER_LANE_UNSUPPORTED);\nreturn;'],
   "judge-runner.ts": ['await safeReportFailed(this.client, this.log, "judge", judgeRunId, PROVIDER_LANE_UNSUPPORTED, undefined,'],
   "now-summary.ts": ['...this.deps.pass,'],
@@ -209,7 +218,7 @@ function offenders(sources: Map<string, string>): string[] {
   for (const [file, blocks] of Object.entries(HOLDS)) {
     const text = sources.get(file) ?? "";
     for (const block of blocks) {
-      const expected = file === "client.ts" && block.startsWith("this.require") ? 2 : file === "summary-runner.ts" ? 2 : 1;
+      const expected = file === "client.ts" && block.startsWith("this.require") ? 2 : 1;
       if (holdCount(text, block) !== expected) report(`${file}: missing/duplicated hold: ${block.slice(0, 200)}`);
     }
   }
@@ -228,37 +237,39 @@ describe("M2 provider consumer architectural census (textual scope)", () => {
     const site = SITES.find(s => s.file === "chat-runner.ts")!;
     assert.ok(offenders(new Map(sources).set(site.file, `${sources.get(site.file)}\n${site.line}`)).length);
   });
-  it("self-test: deleted guard body and presence-means-Claude assumption fail", () => {
+  it("self-test: removing or commenting any dispatch/guard mechanism fails", () => {
+    for (const file of ["client.ts", "provider-binding.ts", "codex/select.ts", "summary-runner.ts", "review-runner.ts"]) for (const block of HOLDS[file]!) {
+      const original = sources.get(file)!;
+      assert.ok(holdCount(original, block) > 0, `${file}: live mechanism ${block}`);
+      // The direct summary selector pin is a call prefix; mutate the entire
+      // statement so rejection proves missing evidence rather than a parse error.
+      const pattern = block.split("\n").map(line => line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\n\\s*");
+      const match = new RegExp(pattern).exec(original);
+      assert.ok(match, `${file}: source block located`);
+      const start = match.index;
+      const target = block.endsWith("({")
+        ? original.slice(start, original.indexOf("});", start) + 3)
+        : match[0];
+      for (const replacement of ["", `/* ${target} */`]) {
+        const changed = original.replaceAll(target, replacement);
+        assert.ok(changed !== original, `${file}: mutation applied`);
+        assert.equal(holdCount(changed, block), 0, `${file}: syntax evidence removed`);
+        assert.ok(offenders(new Map(sources).set(file, changed)).length, `${file}: missing mechanism rejected`);
+      }
+    }
     const file = "model-pass.ts";
     const original = sources.get(file)!;
-    const guard = SITES.find(s => s.file === file && s.line.includes('engine !== "claude"'))!.line;
-    assert.ok(original.includes(guard));
-    assert.ok(offenders(new Map(sources).set(file, original.replace(guard, ""))).length);
-    assert.ok(offenders(new Map(sources).set(file, original.replace('opts.provider.engine !== "claude"', "false"))).length);
-    const summary = sources.get("summary-runner.ts")!;
-    assert.ok(offenders(new Map(sources).set("summary-runner.ts", summary.replace("throw new ProviderLaneUnsupportedError();", "return null;"))).length);
-    assert.ok(offenders(new Map(sources).set("provider-binding.ts", sources.get("provider-binding.ts")!.replace('if (b.engine !== "claude") throw new ProviderLaneUnsupportedError();', ""))).length);
+    const condition = 'opts.provider.engine !== "codex"';
+    assert.ok(original.includes(condition));
+    assert.ok(offenders(new Map(sources).set(file, original.replace(condition, "false"))).length);
   });
-  it("self-test: commented summary refusals cannot satisfy holds", () => {
-    const file = "summary-runner.ts";
-    const original = sources.get(file)!;
-    const guard = "throw new ProviderLaneUnsupportedError();";
-    assert.equal(original.split(guard).length - 1, 2);
-    assert.ok(offenders(new Map(sources).set(file, original.replaceAll(guard, `// ${guard}`))).length);
-  });
-  it("self-test: comments, strings and template text cannot replace guard evidence", () => {
-    const file = "summary-runner.ts";
-    const original = sources.get(file)!;
-    const guard = "throw new ProviderLaneUnsupportedError();";
-    for (const replacement of [`/* ${guard} */`, JSON.stringify(guard) + ";", "`" + guard + "`;"]) {
-      const changed = original.replaceAll(guard, replacement);
-      assert.equal(holdCount(changed, guard), 0);
-      assert.ok(offenders(new Map(sources).set(file, changed)).length);
+  it("self-test: strings, comments and templates cannot replace syntax evidence", () => {
+    for (const pin of ['throw new ProviderLaneUnsupportedError();', 'const selection = selectCodexExecutionAuthority(claim.secrets);', 'this.requireProviderCapability(provider.engine);']) {
+      assert.equal(holdCount(pin, pin), 1, "shared AST starts count once");
+      for (const fake of [`// ${pin}`, `/* ${pin} */`, JSON.stringify(pin) + ";", "`" + pin + "`;"]) {
+        assert.equal(holdCount(fake, pin), 0);
+      }
     }
-    assert.equal(holdCount(guard, guard), 1);
-    const call = "this.requireProviderCapability(provider.engine);";
-    assert.equal(holdCount(call, call), 1, "shared AST starts count once");
-    assert.equal(holdCount("`" + call + "`;", call), 0);
   });
   it("self-test: exact-source cache reuses facts but never changed-source evidence", () => {
     const before = "void ctx.provider;";

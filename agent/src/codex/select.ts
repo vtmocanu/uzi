@@ -13,7 +13,7 @@
 // makeExecutor / runner.ts / main.ts is a separate later unit.
 
 import type { ClaimCodexProviderBinding, ClaimProviderModel } from "../protocol.js";
-import { decodeProviderBinding, ProviderBindingError } from "../provider-binding.js";
+import { decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "../provider-binding.js";
 
 // --- Branded validated binding ------------------------------------------------
 // A module-private brand: the ONLY way to obtain a `CodexBinding` is through
@@ -90,6 +90,19 @@ export function createCodexProviderExecutionAuthority(
 /** The dark selection decision. `claude` is the exact legacy Claude path (absence);
  *  `codex` carries a validated binding (a complete server-owned Codex block). */
 export type CodexSelection = { kind: "claude" } | { kind: "codex"; binding: CodexBinding };
+
+/** Consumer selection validates credential exclusivity before choosing an engine. */
+export function selectCodexExecutionAuthority(
+  secrets: CodexClaimView & { readonly provider?: unknown; readonly anthropic_oauth_token?: string },
+): { kind: "claude" } | { kind: "codex"; binding: CodexExecutionAuthority } {
+  let provider;
+  try { provider = decodeProviderBinding(secrets); }
+  catch { throw new ProviderLaneUnsupportedError(); }
+  if (provider?.engine === "codex") {
+    return { kind: "codex", binding: createCodexProviderExecutionAuthority(provider) };
+  }
+  return selectCodexBinding(secrets);
+}
 
 // --- Bounded, secret-free failure ---------------------------------------------
 

@@ -34,8 +34,8 @@ import {
 import type { Outbox } from "./outbox.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
-import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
-import type { CodexBinding } from "./codex/select.js";
+import { selectCodexExecutionAuthority } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
+import type { CodexExecutionAuthority } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { CODEX_TASK_REVIEW_MODEL } from "./codex/task-review-model.js"; // PRD #1551 M2: leaf value import (no runtime dep on the heavy codex-executor)
 import { errMessage } from "./util.js";
@@ -156,7 +156,8 @@ export class ReviewRunner {
     const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
     for (const k of providerKeys) this.log.addSecret(k);
     try {
-      if (claim.secrets.provider && (claim.secrets.provider.engine !== "claude" || claim.secrets.codex !== undefined)) {
+      try { if (claim.secrets.provider) selectCodexExecutionAuthority(claim.secrets); }
+      catch {
         await safeReportFailed(this.client, this.log, "review", claim.run_id,
           PROVIDER_LANE_UNSUPPORTED, undefined, claim.claim_generation, this.terminalDeps);
         return;
@@ -267,7 +268,7 @@ export class ReviewRunner {
         // Anthropic-token check — the SAME pure, fail-closed discriminator the run lane
         // uses (agent/src/main.ts's makeExecutor). A malformed codex block falls through
         // to the outer catch's failed-review fallback exactly like any other prep failure.
-        const selection = selectCodexBinding({ codex: claim.secrets.codex });
+        const selection = selectCodexExecutionAuthority(claim.secrets);
         const onUsage = (snapshot: AdviceUsageSnapshot): void => {
           // The Claude result fold assumes a provider cost. Token-only interrupted
           // evidence would otherwise fabricate metered zero; keep that gap explicit.
@@ -422,7 +423,7 @@ export class ReviewRunner {
    *  factory (a wiring gap) fails closed the same way any other model failure does: a
    *  `failed` review still lands, never a silent Claude substitution. */
   private async reviewCodex(
-    claim: ClaimResponse, diff: string, binding: CodexBinding,
+    claim: ClaimResponse, diff: string, binding: CodexExecutionAuthority,
     onUsage: (snapshot: AdviceUsageSnapshot) => void,
     signal?: AbortSignal,
   ): Promise<TaskReviewRequest> {
