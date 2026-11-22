@@ -36939,6 +36939,152 @@ describe("M2 provider executor composition", () => {
     model_map: { default: { model: "corp-code", context_window: 32768 } },
   });
 
+  for (const mode of ["provider", "subscription", "api_key"] as const) {
+    it(`M2 meter isolation actual executor: ${mode}`, async () => {
+      const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+      const key = ["meter-fixture", '"', "/", "<>&", "tail"].join("");
+      const forms = [key, 'meter-fixture\\"/<>&tail', 'meter-fixture\\"\\/<>&tail',
+        "meter-fixture%22%2F%3C%3E%26tail", 'meter-fixture\\"/\\u003c\\u003e\\u0026tail'];
+      const model = "gpt-6.1-sol";
+      const binding = mode === "provider"
+        ? createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+          model_map: { default: { model, context_window: 32768 } } })
+        : bindingOf(mode === "subscription" ? SUBSCRIPTION : API_KEY);
+      const rig = makeRig({ responder: c => c.method === "model/list"
+        ? { data: [{ id: model, model, supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+          defaultReasoningEffort: "high" }] } : defaultResponder(c) });
+      const signals: unknown[] = [], operations: unknown[] = [], reports: CodexCatalogDefaultBody[] = [];
+      let getters = 0;
+      const reporter = new CodexAdmissionReporter(7, () => true, async body => { signals.push(body); return 204; });
+      Object.assign(rig.client, {
+        codexAdmissionReporter: () => { getters++; return reporter; },
+        hasFeature: (name: string) => name === "codex_account_operation_admission_v1",
+        codexOperationNegotiation: 1,
+        checkCodexOperationAdmission: async (_run: string, request: { operation_id: string; claim_generation: number }) => {
+          operations.push(request);
+          return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+        },
+      });
+      const { logger, lines } = recordingLogger();
+      const { ctx, emitted } = makeCtx({ claimGeneration: 7, config: { default_effort: "high", default_model: model },
+        codexCatalogReport: new CodexCatalogReporter({
+          client: { recordCodexCatalogDefault: async (_run, body) => { reports.push(body); return { kind: "ok" }; } },
+          runId: "run-1", claimGeneration: 7, catalogContext: "a".repeat(64), logger,
+        }),
+      });
+      rig.transport.push(threadStarted())
+        .push({ kind: "rate_limits_updated", method: "account/rateLimits/updated", params: {},
+          rateLimits: { limitId: "codex", primary: { usedPercent: 100, windowDurationMins: 300,
+            resetsAt: 2000000000 }, rateLimitReachedType: "rate_limit_reached", limitName: forms[1], planType: forms[2],
+            credits: { balance: forms[3] },
+            ...Object.fromEntries(forms.map((form, i) => [`extra${i}`, form])) } })
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 1000, cachedInputTokens: 600,
+          cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 }))
+        .push(signalDone()).push(turnCompleted()).end();
+      try {
+        await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "meter isolation");
+        await new Promise(r => setImmediate(r));
+        const usage = rec(lastResultModelUsage(emitted)![model]);
+        assert.equal(usage.inputTokens, 300);
+        assert.equal(usage.outputTokens, 200);
+        assert.equal(usage.costStatus, mode === "provider" ? "unreported" : "metered");
+        if (mode === "provider") assert.equal(usage.costUSD, undefined);
+        else assert.equal(Math.round((usage.costUSD as number) * 1e6), 2910);
+        assert.equal(getters, mode === "provider" ? 0 : 1);
+        assert.equal(operations.length, mode === "subscription" ? 1 : 0);
+        assert.equal(rig.client.releaseCalls.length, mode === "provider" ? 0 : 1);
+        assert.equal(rig.client.refreshCalls.length, 0);
+        assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, mode === "provider" ? 0 : 1);
+        assert.equal(reports.length, mode === "provider" ? 0 : 1);
+        assert.equal(rig.transport.requests.filter(r => r.method === "account/rateLimits/read").length, 0);
+        assert.deepEqual(signals, []);
+        assert.equal(emitted.some(m => /limit.*wait|wait.*limit/.test(String(m.payload.event))), false);
+        for (const form of forms) assert.ok(!JSON.stringify({ emitted, lines, reports, signals }).includes(JSON.stringify(form).slice(1, -1)));
+      } finally { reporter.seal(true); }
+    });
+  }
+
+  for (const mode of ["provider", "subscription", "api_key"] as const) {
+    it(`M2 meter classification on failed actual turn: ${mode}`, async () => {
+      const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+      const { LimitReachedError } = await import("../src/limit.js");
+      const key = ["limit", "fixture", "secret"].join("-");
+      const rig = makeRig();
+      const binding = mode === "provider"
+        ? createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key })
+        : bindingOf(mode === "subscription" ? SUBSCRIPTION : API_KEY);
+      const signals: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+      let getters = 0;
+      const reporter = new CodexAdmissionReporter(7, () => true, async body => { signals.push(body); return 204; });
+      Object.assign(rig.client, { codexAdmissionReporter: () => { getters++; return reporter; } });
+      const { logger, lines } = recordingLogger();
+      const { ctx, emitted } = makeCtx({ claimGeneration: 7 });
+      rig.transport.push(threadStarted())
+        .push({ kind: "rate_limits_updated", method: "account/rateLimits/updated", params: {},
+          rateLimits: { limitId: "codex", primary: { usedPercent: 100, windowDurationMins: 300,
+            resetsAt: 2000000000 }, rateLimitReachedType: "rate_limit_reached", extra: key } })
+        .push({ kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: true,
+          params: { threadId: "th-1", turnId: "tn-1", willRetry: true,
+            error: { codexErrorInfo: "rateLimitExceeded", message: key } } })
+        .push({ ...turnCompleted("failed"), params: { threadId: "th-1", turn: { id: "tn-1", status: "failed",
+          error: { codexErrorInfo: "usageLimitExceeded", message: key } } } }).end();
+      try {
+        let failure: unknown;
+        try { await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "limit classification"); }
+        catch (error) { failure = error; }
+        assert.ok(failure instanceof Error);
+        assert.equal(failure instanceof LimitReachedError, mode === "subscription",
+          "only native subscription exhaustion becomes a vendor limit wait");
+        assert.equal(getters, mode === "provider" ? 0 : 1);
+        await new Promise(r => setImmediate(r));
+        assert.equal(signals.length, mode === "provider" ? 0 : 1);
+        if (mode !== "provider") assert.equal(signals[0]!.class, "rate_limit");
+        assert.ok(!JSON.stringify({ emitted, lines, signals, error: String(failure) }).includes(key));
+        assert.equal(rig.transport.requests.filter(r => r.method === "account/rateLimits/read").length, 0);
+      } finally { reporter.seal(true); }
+    });
+  }
+
+  for (const mode of ["provider", "api_key"] as const) for (const sensitive of [false, true]) {
+    it(`M2 catalog default model key overlap ${mode} sensitive=${sensitive}`, async () => {
+      // Prefixless credential is also a syntactically valid model ID.
+      const key = ["catalog", "overlap", "fixture"].join("-");
+      const model = sensitive ? key : "catalog-clean-control";
+      const reports: CodexCatalogDefaultBody[] = [];
+      const rig = makeRig({ token: key, responder: c => c.method === "model/list"
+        ? { data: [{ id: model, model, supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+          defaultReasoningEffort: "high" }] } : defaultResponder(c) });
+      const { logger, lines } = recordingLogger();
+      const { ctx } = makeCtx({ config: { default_model: mode === "provider" ? "default" : model }, redactText: makeTextRedactor([key]),
+        codexCatalogReport: new CodexCatalogReporter({
+          client: { recordCodexCatalogDefault: async (_run, body) => { reports.push(body); return { kind: "ok" }; } },
+          runId: "run-1", claimGeneration: 7, catalogContext: "b".repeat(64), logger,
+        }),
+      });
+      const posted: OutgoingMessage[] = [];
+      const batcher = new MessageBatcher({ postMessages: async (_run: string, messages: OutgoingMessage[]) => {
+        posted.push(...messages);
+      } } as unknown as WorkerClient, "run-1", 0, 5, logger, makeRedactor([key]), makeTextRedactor([key]));
+      const capture = ctx.emit;
+      ctx.emit = message => { capture(message); batcher.emit(message); };
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+      const binding = mode === "provider" ? createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+        model_map: { default: { model, context_window: 32768 } } }) : bindingOf(API_KEY);
+      try { await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "catalog key overlap"); }
+      finally { await batcher.close(); }
+      await new Promise(r => setImmediate(r));
+      assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, mode === "provider" ? 0 : 1);
+      if (mode === "provider") assert.deepEqual(reports, []);
+      if (!sensitive && mode !== "provider") {
+        assert.equal(reports.length, 1);
+        assert.equal(reports[0]!.model, model);
+        assert.equal(reports[0]!.default_effort, "high");
+      }
+      assert.ok(!JSON.stringify(reports).includes(key), "released key must not escape catalog default report.model");
+      assert.ok(!JSON.stringify({ posted, lines }).includes(key), "released key must not escape public output");
+    });
+  }
+
   it("refuses changed provider summary authority before factory construction", async () => {
     const rig = makeRig();
     const binding = createCodexProviderExecutionAuthority(providerClaim());
