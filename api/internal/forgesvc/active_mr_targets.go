@@ -47,6 +47,9 @@ func (s *Service) SyncActiveMRTargets(ctx context.Context, repoID uuid.UUID, for
 
 	summaries := make(map[int64]*forge.MergeRequestSummary, len(rows))
 	for _, row := range rows {
+		// The cursor already moved past this page, so a deadline hit mid-page leaves the rest of
+		// it for the next wrap-around. Accepted: the next page is always reached, and a skipped
+		// run is re-enumerated within one full rotation.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

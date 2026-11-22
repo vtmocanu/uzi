@@ -584,12 +584,14 @@ func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, 
 // cancel, in order, and can be forced to fail (err) to exercise the leave-unadvanced
 // retry contract on the opened->closed / ->merged cancel path.
 type fakeReworkCanceller struct {
-	calls []int64 // mrIIDs cancelled, in order
-	err   error   // when non-nil, forces every CancelReworkForMR to fail
+	calls   []int64  // mrIIDs cancelled, in order
+	reasons []string // the reason passed with each call, in order (issue #4616)
+	err     error    // when non-nil, forces every CancelReworkForMR to fail
 }
 
-func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, mrIID int64, _ string) error {
+func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, mrIID int64, reason string) error {
 	c.calls = append(c.calls, mrIID)
+	c.reasons = append(c.reasons, reason)
 	return c.err
 }
 

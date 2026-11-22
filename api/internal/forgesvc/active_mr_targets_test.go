@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -261,5 +262,77 @@ func TestSyncActiveMRTargetsCursorRotatesPastPageSize(t *testing.T) {
 	}
 	if st.activeTargetArgs[1].AfterID != runs[31].ID || st.activeTargetArgs[2].AfterID != (uuid.UUID{}) {
 		t.Fatalf("cursor args = %+v", st.activeTargetArgs)
+	}
+}
+
+// The legacy watchers pass the state-specific server stop reason (issue #4616), so a
+// merged MR and a closed MR record distinct reasons on the cancelled rework.
+func TestLegacyReworkCancelPassesStateSpecificReason(t *testing.T) {
+	for _, observed := range []string{forge.MRStateMerged, forge.MRStateClosed} {
+		t.Run(observed, func(t *testing.T) {
+			runID, repoID := uuid.New(), uuid.New()
+			st := &fakeStore{
+				candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("locked"))},
+				issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnHumanReview),
+				columns:    mrCols(),
+			}
+			f := &fakeForge{mr: forgeMR(13, observed)}
+			canceller := &fakeReworkCanceller{}
+			svc := newTestService(st)
+			svc.SetReworkCanceller(canceller)
+			if err := svc.SyncMRStates(context.Background(), repoID, testProjectID, f, f); err != nil {
+				t.Fatalf("SyncMRStates: %v", err)
+			}
+			want := workersvc.TerminalTargetStopReason(observed)
+			if len(canceller.reasons) != 1 || canceller.reasons[0] != want {
+				t.Fatalf("issue-lane reasons = %q, want [%q]", canceller.reasons, want)
+			}
+
+			opened := forge.MRStateOpened
+			bst := &fakeStore{boardFreeCandidates: []store.ListBoardFreeMRStateWatchCandidatesRow{
+				boardFreeCand(uuid.New(), 13, &opened),
+			}}
+			bc := &fakeReworkCanceller{}
+			bsvc := newTestService(bst)
+			bsvc.SetReworkCanceller(bc)
+			if err := bsvc.SyncBoardFreeMRStates(context.Background(), repoID, testProjectID, &fakeForge{mr: forgeMR(13, observed)}); err != nil {
+				t.Fatalf("SyncBoardFreeMRStates: %v", err)
+			}
+			if len(bc.reasons) != 1 || bc.reasons[0] != want {
+				t.Fatalf("board-free reasons = %q, want [%q]", bc.reasons, want)
+			}
+		})
+	}
+	if workersvc.TerminalTargetStopReason(forge.MRStateMerged) == workersvc.TerminalTargetStopReason(forge.MRStateClosed) {
+		t.Fatal("merged and closed must record distinct reasons")
+	}
+}
+
+// A failed summary read affects only its own MR: a healthy MR later in the same pass is
+// still cancelled, and the failing MR is read once per pass (not once per bound run).
+func TestSyncActiveMRTargetsReadErrorDoesNotStarvePass(t *testing.T) {
+	badA := activeRow(uuid.MustParse("00000000-0000-0000-0000-000000000001"), "ci_fix", 41, activeTestBranch)
+	badB := activeRow(uuid.MustParse("00000000-0000-0000-0000-000000000002"), "mr_rework", 41, activeTestBranch)
+	good := activeRow(uuid.MustParse("00000000-0000-0000-0000-000000000003"), "ci_fix", 42, activeTestBranch)
+	st := &fakeStore{activeTargetRuns: []store.ListActiveMRTargetRunsRow{badA, badB, good}}
+	f := &summaryForge{
+		byIID: map[int64]forge.MergeRequestSummary{42: goodSummary(42, forge.MRStateMerged)},
+		errs:  map[int64]error{41: errors.New("forge 502")},
+	}
+	c := &fakeTerminalCanceller{}
+	svc := newTestService(st)
+	svc.SetTerminalTargetCanceller(c)
+	if err := svc.SyncActiveMRTargets(context.Background(), uuid.New(), testProjectID, f); err != nil {
+		t.Fatalf("a read error must not fail the pass: %v", err)
+	}
+	reads := map[int64]int{}
+	for _, iid := range f.calls {
+		reads[iid]++
+	}
+	if reads[41] != 1 || reads[42] != 1 {
+		t.Fatalf("summary reads = %v, want 41 once and 42 once", reads)
+	}
+	if len(c.obs) != 1 || c.obs[0].RunID != good.ID {
+		t.Fatalf("cancel calls = %+v, want exactly the healthy run %s", c.obs, good.ID)
 	}
 }

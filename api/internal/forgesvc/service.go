@@ -490,7 +490,7 @@ func (s *Service) SetReworkCanceller(c ReworkCanceller) { s.reworkCanceller = c 
 
 // SetTerminalTargetCanceller wires the terminal-target cancel collaborator (issue #4616).
 // Call once at startup, before the poller runs. A nil canceller (the default) disables
-// SyncActiveMRTargets. A typed-nil pointer is also treated as unset.
+// SyncActiveMRTargets. A typed-nil *workersvc.Service is also treated as unset.
 func (s *Service) SetTerminalTargetCanceller(c TerminalTargetCanceller) {
 	if v, ok := c.(*workersvc.Service); ok && v == nil {
 		c = nil
