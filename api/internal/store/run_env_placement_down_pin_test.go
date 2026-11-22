@@ -37,9 +37,9 @@ func createFunctionBlock(t *testing.T, file string, down bool) string {
 // The run env placement migration's Down restores the placement function exactly as the phase
 // models migration created it: the Down body equals 00499's Up body.
 func TestRunEnvPlacementDownRestoresPhaseModelsFunction(t *testing.T) {
-	down := createFunctionBlock(t, "00502_run_env_placement.sql", true)
+	down := createFunctionBlock(t, "00505_run_env_placement.sql", true)
 	prior := createFunctionBlock(t, "00499_placement_phase_models.sql", false)
 	if down != prior {
-		t.Fatalf("00502 Down function (%d bytes) differs from 00499 Up function (%d bytes)", len(down), len(prior))
+		t.Fatalf("00505 Down function (%d bytes) differs from 00499 Up function (%d bytes)", len(down), len(prior))
 	}
 }
