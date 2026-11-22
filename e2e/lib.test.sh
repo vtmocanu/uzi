@@ -1805,7 +1805,7 @@ done
 
 fixture_hold_deadline() {
   # shellcheck disable=SC2034  # JAR and BASE are read by the extracted real apiget_before
-  local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 JAR=fixture-jar BASE=http://fixture output
+  local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 JAR=fixture-jar BASE=http://fixture output timeout=2
   echo 0 > "$SEQ_DIR/deadline-discards"
   echo 0 > "$SEQ_DIR/deadline-reads"
   : > "$SEQ_DIR/deadline-budgets"
@@ -1824,7 +1824,7 @@ fixture_hold_deadline() {
   case "$mode" in
     blocked-read)
       # The real bounded reader: the first holds read answers capturing; every later
-      # one blocks (3s) and, like curl, gives up at --max-time with rc 28.
+      # one is blocked and, like curl, gives up at its --max-time budget with rc 28.
       curl() {
         local reads budget=""
         reads=$(( $(cat "$SEQ_DIR/deadline-reads") + 1 ))
@@ -1833,20 +1833,31 @@ fixture_hold_deadline() {
         echo "$budget" >> "$SEQ_DIR/deadline-budgets"
         [[ "$budget" =~ ^[1-9][0-9]*$ ]] || fail "holds read was not time-bounded: $*"
         if [ "$reads" = 1 ]; then deadline_holds capturing; return 0; fi
-        if [ "$budget" -lt 3 ]; then command sleep "$budget"; return 28; fi
-        command sleep 3; deadline_holds source_only
+        return 28
       } ;;
     late-transition)
       # Fast reads; the capture only turns source_only on the poll taken at the deadline.
       apiget_before() {
         if [ "$SECONDS" -ge "$1" ]; then deadline_holds source_only; else deadline_holds capturing; fi
       } ;;
+    slow-archives)
+      # Real wall clock (no custody_case reset): the hold is already source_only, but the
+      # pre-discard archive listing takes 2s against a 1s budget.
+      apiget_before() { deadline_holds source_only; }
+      apiget() {
+        case "$1" in
+          "/api/runs/$UUID/archives") command sleep 2; echo '{"archives":[]}' ;;
+          "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
+          *) fail 'unexpected deadline read' ;;
+        esac
+      }
+      timeout=1 ;;
   esac
   uzi_cli() {
     echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
     echo '{"discarded":true}'
   }
-  if output="$(resolve_fixture_source_hold "$UUID" 1 2 2>&1)"; then
+  if output="$(resolve_fixture_source_hold "$UUID" 1 "$timeout" 2>&1)"; then
     fail "deadline overrun resolved the hold: $output"
   fi
   [ "$(cat "$SEQ_DIR/deadline-discards")" = 0 ] || fail "discarded after the deadline: $output"
@@ -1857,6 +1868,8 @@ fixture_hold_deadline() {
         || fail "a holds read budget exceeded the 2s deadline: $(cat "$SEQ_DIR/deadline-budgets")" ;;
     late-transition)
       [[ "$output" == *'changed after the 2s deadline'* ]] || fail "late transition missed the deadline diagnostic: $output" ;;
+    slow-archives)
+      [[ "$output" == *'passed before the owner disposition'* ]] || fail "slow pre-discard read missed the deadline diagnostic: $output" ;;
   esac
   echo "deadline $mode failed closed with zero discards"
 }
@@ -1864,6 +1877,11 @@ custody_case "a blocked holds read past the deadline fails with zero discards" p
   fixture_hold_deadline blocked-read
 custody_case "a capturing to source_only transition seen at the deadline fails with zero discards" pass 'deadline late-transition failed closed with zero discards' \
   fixture_hold_deadline late-transition
+# Deliberately outside custody_case: SECONDS must keep its wall-clock behaviour here.
+cases=$((cases + 1))
+if output="$(fixture_hold_deadline slow-archives 2>&1)" && [[ "$output" == *'deadline slow-archives failed closed with zero discards'* ]]; then
+  passed=$((passed + 1)); echo "PASS: a read that outlives the deadline before the owner disposition discards nothing"
+else echo "FAIL: a read that outlives the deadline before the owner disposition discards nothing: output [$output]"; fi
 
 # Execute the actual owning phase boundaries against the real owner helper. The
 # fixture holds every phase's runs plus the completed outage case (which must
