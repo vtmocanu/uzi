@@ -938,18 +938,16 @@ function withLeadTemplateEffort(view: EffectiveSettings, efforts: { claude: stri
     return next;
   });
   // Planning inherits the resolved run effort, including the template tier, unless pinned.
-  {
-    view.efforts = view.efforts.map(c => {
-      if (c.setting !== "planning_effort") return c;
-      const h = c.harness as "claude" | "codex";
-      const ordinary = view.efforts.find(o => o.setting === "worker_effort" && o.harness === h);
-      if (!efforts[h] || !ordinary) return c;
-      const next = { ...c, default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source };
-      return c.effort === null
-        ? { ...next, resolved_effort: ordinary.resolved_effort, source: ordinary.source, mode: ordinary.mode }
-        : next;
-    });
-  }
+  view.efforts = view.efforts.map(c => {
+    if (c.setting !== "planning_effort") return c;
+    const h = c.harness as "claude" | "codex";
+    const ordinary = view.efforts.find(o => o.setting === "worker_effort" && o.harness === h);
+    if (!efforts[h] || !ordinary) return c;
+    const next = { ...c, default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source };
+    return c.effort === null
+      ? { ...next, resolved_effort: ordinary.resolved_effort, source: ordinary.source, mode: ordinary.mode }
+      : next;
+  });
   return view;
 }
 

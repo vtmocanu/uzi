@@ -55,9 +55,9 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                  -- PRD #4320 module 5: the provider claim clause (see ClaimRun's NON-BYPASSABLE provider clause): a
                  -- provider-bound run is placeable only on a worker reporting 'claude_provider_v1'.
                  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
-                 -- PRD #3252: the Claude planning-phase claim clause (see ClaimRun's NON-BYPASSABLE phase-models clause): a
-                 -- Claude lead-lane run whose owner has a planning value set is placeable only on a worker
-                 -- reporting 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test.
+                 -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
+                 -- requires its harness's phase-models capability. ClaimRun enforces the same clause;
+                 -- the kind list is pinned to leadcfg.LeadLane by a test.
                  AND (NOT (r.harness IN ('claude', 'codex')
                            AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
                            AND r.review_target_run_id IS NULL
