@@ -37,6 +37,19 @@ it("native registered redactor sanitizes nested causes while preserving error cl
   assert.ok(caught instanceof TypeError);
   assert.deepEqual(caught.cause, { [safe]: safe });
 });
+it("native registered redactor scrubs hidden and inherited non-Error messages", async () => {
+  for (const form of providerKeyForms(key)) {
+    for (const diagnostic of [
+      Object.defineProperty({}, "message", { value: form }),
+      Object.create(Object.defineProperty({}, "message", { value: form })),
+    ]) {
+      await assert.rejects(runReadOnlyModelPass(opts(async () => { throw diagnostic; })), caught => {
+        assert.equal((caught as { message: string }).message, safe);
+        return true;
+      });
+    }
+  }
+});
 it("native no-matching-key errors retain identity", async () => {
   const err = new RangeError("clean");
   await assert.rejects(runReadOnlyModelPass(opts(async () => { throw err; }, false)), e => e === err);

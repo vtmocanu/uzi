@@ -326,6 +326,9 @@ function sanitizeDiagnostic(value: object, text: TextRedactor): object {
       // would duplicate every nested-array subtree before discarding that work.
       if (Array.isArray(v)) return Array.from(v, project);
       const keys = new Set(Object.keys(v));
+      // SDKs may throw non-Error diagnostics with hidden or inherited messages.
+      // Include that diagnostic surface even when Object.keys omits it.
+      if ("message" in v) keys.add("message");
       if (v instanceof Error) {
         for (const k of ["message", "stack", "name", "cause"]) if (k in v) keys.add(k);
       }
