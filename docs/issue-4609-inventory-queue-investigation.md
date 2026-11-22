@@ -204,7 +204,7 @@ Setup:
   before the target's selection pass. 12 of them fall on passes 2 to 4, after
   the target arrived.
 - **[Measured]** The target is first selected on pass 5, which is the 4th
-  pass after its arrival, and it produces a real capture and upload.
+  pass after its arrival, and the real coordinator runs its capture and upload through the fixture's fake Git and API seams.
 - **[Measured]** On pass 5, 11 of the 14 hold RPCs and all 10 ownership calls
   are the target's own.
 - **[Code]** One of the target's hold RPCs is its selection-time check
@@ -289,7 +289,7 @@ Setup: 8 retained contexts, with the target first in discovery order.
 ### What the probe proves
 
 - **[Measured]** In scenarios 1 and 4 and in the executing variants of
-  scenario 5, the proof is a produced capture and upload (`f.state.produced`
+  scenario 5, the proof is a capture and upload that the real coordinator produces against the fixture's fake Git and API seams (`f.state.produced`
   and `f.state.uploads` each rise by 1 on the selection pass). The
   `inventory_not_inactive` variant asserts only the produced capture. None of
   them uses the capture fallback.
@@ -341,7 +341,7 @@ wall-clock guarantee.
 | C | Bounded skip-ahead: a `hold_unavailable` visit does not consume a capped opportunity. Selection keeps scanning up to K extra entries per pass, and every visited entry rotates. | About `ceil((L+1)/(cap+K))` passes when the entries ahead have no hold. | Up to K extra selection-time journal reads and K extra hold RPCs per pass, on top of the unchanged hint reads and capture-path re-checks. The extra calls lengthen the pass, and the next pass is scheduled from its end. No new memory and no staleness, because every visit is fresh. | Unchanged: no cache, and membership is kept. | Changes the #3614 opportunity contract ("rotates raw contexts … before execution/hold checks"). It also raises the per-pass selection budget, so it falls within the issue's out-of-scope "timer/cap increases". It needs an explicit owner scope decision, not only a policy choice. |
 | D | First-arrival reservation: one slot per pass for a context never visited since it entered the queue, analogous to #3614. | With A first arrivals ahead of it, a new arrival is selected within A+1 passes. That helps only if it is ready when selected: an arrival still executing or without an open hold spends its reservation and rotates behind the survivors, unless "visited" is defined as passing the checks, which then needs its own bound. | No added scheduling probes or selected opportunities per pass. The worst-case per-pass bound is unchanged, but moving a ready arrival earlier can move its capture and upload work (scenario 1's selection pass made 14 hold RPCs and 10 ownership calls, against 4 hold RPCs on a no-hold pass) into a previously cheap pass, lengthening that pass. Memory is one visited-key set, bounded by the queue. No staleness. | A context removed and re-added is a new arrival again (as #3614 already treats it), so discovery churn can earn repeat priority. | New fairness contract. With cap ≥ 3, ordinary survivors slow to `ceil(N/(cap-2))` when both reservations are active. Owner decision plus an ADR-1296 amendment. |
 | H | Demote instead of keeping position: a context that just reported `hold_unavailable` rotates behind fresh arrivals, not behind its siblings. | New arrivals overtake no-hold contexts. | Memory is one flag per queued entry. No staleness. | Membership is kept, so a context whose hold appears later still progresses. | Fairness change. Under continuous arrivals, demoted contexts can starve, so it needs its own bound. Owner decision plus an ADR-1296 amendment. |
-| E | Skip or back off a context in scheduling. Variant E1 caches the absence of a listed hold. Variant E2 (with G) caches only a positively observed closure. | Faster while the cache holds. | Memory is one entry per cached context. E1 needs a staleness bound and invalidation. E2 caches a terminal state, because closed holds never reopen (`agent/src/recovery.ts:4426`). | E1 is unsafe: the tester's cross-pass absence-cache mutant hid a scenario 4 context whose hold appeared later. E2 is not refuted by scenario 4, but it must still never hide a context that a later generation or a custody move makes eligible. | Needs a closed-hold cache decision. Closed custody alone grants no FINAL or cleanup authority (`api/internal/apitypes/recovery.go:327`). A closed context with pins left is #2823's pruning input, so E2 borders that boundary. Named as a dependency, not proposed. |
+| E | Skip or back off a context in scheduling. Variant E1 caches the absence of a listed hold. Variant E2 (with G) caches only a positively observed closure. | Faster while the cache holds. | Memory is one entry per cached context. E1 needs a staleness bound and invalidation. E2 caches a terminal state, because closed holds never reopen (`agent/src/recovery.ts:4426`). | The tested E1 shape is unsafe: the tester's unbounded cross-pass absence-cache mutant hid a scenario 4 context whose hold appeared later. Bounded expiry or revisit variants were not assessed. E2 is not refuted by scenario 4, but it must still never hide a context that a later generation or a custody move makes eligible. | Needs a closed-hold cache decision. Closed custody alone grants no FINAL or cleanup authority (`api/internal/apitypes/recovery.go:327`). A closed context with pins left is #2823's pruning input, so E2 borders that boundary. Named as a dependency, not proposed. |
 
 ## 5. Recommendation
 
@@ -361,7 +361,7 @@ accepts it.
   fairness or opportunity contract. C also raises the per-pass selection
   budget, which the issue rules out of scope.
 - Option E needs a closed-hold cache decision and touches #2823's boundary.
-  Its absence-cache variant (E1) is unsafe.
+  The tested absence-cache variant (E1, an unbounded cross-pass cache) is unsafe; bounded expiry or revisit designs were not assessed.
 
 The recommendation is to **keep the current policy (A)**.
 
