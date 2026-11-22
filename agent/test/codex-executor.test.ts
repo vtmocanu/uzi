@@ -36939,6 +36939,76 @@ describe("M2 provider executor composition", () => {
     model_map: { default: { model: "corp-code", context_window: 32768 } },
   });
 
+  for (const mode of ["provider", "subscription"] as const) {
+    it(`M2 refresh isolation actual executor clean fence: ${mode}`, async () => {
+      const input = providerClaim();
+      const binding = mode === "provider"
+        ? createCodexProviderExecutionAuthority(input) : bindingOf(SUBSCRIPTION);
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      const entered = installerBarrier(), released = installerBarrier();
+      const events: string[] = [];
+      const release = rig.client.releaseCodex.bind(rig.client);
+      const refresh = rig.client.refreshCodex.bind(rig.client);
+      rig.client.releaseCodex = async (...args) => {
+        events.push("release");
+        return release(...args);
+      };
+      rig.client.refreshCodex = async (...args) => {
+        assert.equal(rig.reaped(), 0, "boundary reconciles before provider-root reap");
+        events.push("refresh-enter");
+        entered.resolve();
+        await released.promise;
+        const result = await refresh(...args);
+        events.push("refresh-settled");
+        return result;
+      };
+      let getters = 0;
+      Object.assign(rig.client, { codexAdmissionReporter: () => { getters++; return undefined; } });
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+      const exec = makeExecutor(rig, binding);
+      input.credential = "changed-after-authority";
+      let boundary: Promise<unknown> | undefined;
+      let sinks = 0;
+      try {
+        await withTimeout(exec.run(makeCtx().ctx), 3000, "refresh isolation run");
+        assert.equal(rig.reaped(), 0, "deferred run leaves settlement to the boundary");
+        assert.equal(rig.client.refreshCalls.length, 0);
+        boundary = exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {
+          assert.ok(rig.reaped() > 0);
+          assert.ok(rig.effectDisposes() > 0);
+          events.push("sink");
+          sinks++;
+        });
+        if (mode === "subscription") {
+          await withTimeout(entered.promise, 3000, "real boundary refresh entered");
+          assert.equal(sinks, 0, "sink cannot overtake the in-flight vendor refresh");
+          released.resolve();
+        }
+        await withTimeout(boundary, 3000, "refresh isolation boundary");
+        assert.equal(sinks, 1);
+        assert.equal(rig.client.releaseCalls.length, mode === "provider" ? 0 : 1);
+        assert.equal(rig.client.refreshCalls.length, mode === "provider" ? 0 : 1);
+        assert.equal(getters, mode === "provider" ? 0 : 1);
+        assert.deepEqual(events, mode === "provider" ? ["sink"]
+          : ["release", "refresh-enter", "refresh-settled", "sink"]);
+        const login = rig.transport.requests.find(r => r.method === "account/login/start");
+        if (mode === "provider") {
+          assert.deepEqual(login?.params, { type: "apiKey", apiKey: providerClaim().credential });
+        } else {
+          assert.equal(rec(login?.params).type, "chatgptAuthTokens");
+          assert.equal(rig.client.refreshCalls[0]!.observed_generation, 3);
+        }
+        assert.equal(rig.transport.requests.filter(r => r.method === "account/rateLimits/read").length, 0,
+          "runtime receives notifications; neither authority issues polling requests");
+      } finally {
+        released.resolve();
+        if (boundary) await boundary;
+        await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      }
+    });
+  }
+
   for (const mode of ["provider", "subscription", "api_key"] as const) {
     it(`M2 meter isolation actual executor: ${mode}`, async () => {
       const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
