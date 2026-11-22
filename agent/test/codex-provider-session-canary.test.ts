@@ -28,8 +28,8 @@ test("provider auth-state canaries stay outside persisted and per-root session s
   const finalHome = path.join(root, "epoch", "codex");
   const rollout = "sessions/2026/rollout-safe.jsonl";
   const transcript = '{"type":"session_meta","payload":{"id":"controlled-session"}}\n';
-  const canaries = ["auth", "config", "cache"].map(kind => ["canary", kind, "distinct-private-value"].join("-"));
-  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json"].entries()) {
+  const canaries = ["auth", "config", "cache", "extra-ca"].map(kind => ["canary", kind, "distinct-private-value"].join("-"));
+  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json", "provider-extra-ca.crt"].entries()) {
     const file = path.join(home, rel);
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.writeFile(file, canaries[index]!);
@@ -55,13 +55,13 @@ test("provider auth-state canaries stay outside persisted and per-root session s
     const content = await fs.readFile(path.join(subset, rollout), "utf8");
     assert.equal(content, transcript);
     for (const canary of canaries) assert.equal(content.includes(canary), false);
-    for (const rel of ["auth.json", "config.toml", "cache/state.json"]) {
+    for (const rel of ["auth.json", "config.toml", "cache/state.json", "provider-extra-ca.crt"]) {
       await assert.rejects(fs.stat(path.join(subset, rel)), { code: "ENOENT" });
     }
   }
   // Source presence is a positive control: absence downstream cannot be explained
-  // by a fixture that never planted auth/config/cache state.
-  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json"].entries()) {
+  // by a fixture that never planted auth/config/cache/CA state.
+  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json", "provider-extra-ca.crt"].entries()) {
     assert.equal(await fs.readFile(path.join(home, rel), "utf8"), canaries[index]);
   }
 });
@@ -72,13 +72,25 @@ test("provider auth-state outside repository is absent from actual Git recovery 
   const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
   Object.assign(env, { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" });
   const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { env, encoding: "utf8", stdio: "pipe" }).trim();
-  const authHome = path.join(fx.dataDir, "provider-home");
-  const canaries = ["auth", "config", "cache"].map(kind => ["bundle-private", kind, "canary"].join("-"));
-  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json"].entries()) {
+  const authHome = path.join(fx.dataDir, "agent-home", "run", "codex-data", "namespace-epoch-0", "codex");
+  assert.equal(path.relative(fx.originPath, authHome).startsWith(".." + path.sep), true, "provider home is outside the repository");
+  const canaries = ["auth", "config", "cache", "extra-ca"].map(kind => ["bundle-private", kind, "canary"].join("-"));
+  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json", "provider-extra-ca.crt"].entries()) {
     const file = path.join(authHome, rel);
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.writeFile(file, canaries[index]!);
   }
+  // Independent session-store positive control: Git recovery packages repository
+  // objects only; this nonempty persisted JSONL is NOT part of the bundle.
+  const rollout = "sessions/rollout-controlled.jsonl";
+  const transcript = '{"type":"session_meta","payload":{"id":"bundle-control-session"}}\n';
+  await fs.mkdir(path.dirname(path.join(authHome, rollout)), { recursive: true });
+  await fs.writeFile(path.join(authHome, rollout), transcript);
+  const store = path.join(fx.dataDir, "codex-session-store");
+  assert.equal((await CodexSessionStore.persist(authHome, store)).files, 1);
+  const generation = (await fs.readFile(path.join(store, "current"), "utf8")).trim();
+  assert.match(generation, /^g[0-9a-f]{24}$/);
+  assert.deepEqual(await fs.readFile(path.join(store, "generations", generation, rollout)), Buffer.from(transcript));
   const bare = path.join(fx.dataDir, "worker.git");
   git(fx.dataDir, "clone", "--bare", fx.originPath, bare);
   const sourceSha = git(bare, "rev-parse", "HEAD");
@@ -97,9 +109,9 @@ test("provider auth-state outside repository is absent from actual Git recovery 
   for (const oid of objects) {
     assert.match(oid, /^[0-9a-f]{40,64}$/);
     const content = git(imported, "cat-file", "-p", oid);
-    for (const canary of canaries) assert.equal(content.includes(canary), false);
+    for (const canary of canaries) assert.equal(content.includes(canary), false, "private canary absent from every recovery object");
   }
-  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json"].entries())
+  for (const [index, rel] of ["auth.json", "config.toml", "cache/state.json", "provider-extra-ca.crt"].entries())
     assert.equal(await fs.readFile(path.join(authHome, rel), "utf8"), canaries[index]);
   // No content scanning is asserted: a credential echoed into committed repository
   // content could enter this Git archive. This is not a CODEX_HOME archive.
