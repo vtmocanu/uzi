@@ -34,7 +34,7 @@ var deniedPrefixes = []string{
 	"UZI_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_",
 	"GH_", "GITHUB_", "GITLAB_", "GLAB_",
 	"GIT_", "SSH_",
-	"LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
+	"LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_", "BUN_",
 }
 
 var deniedSuffixes = []string{"_PROXY"}

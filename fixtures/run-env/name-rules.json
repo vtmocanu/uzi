@@ -89,12 +89,31 @@
     "PYTHON",
     "PERL5",
     "NIX_",
-    "DEVBOX_"
+    "DEVBOX_",
+    "BUN_"
   ],
   "denied_suffixes": [
     "_PROXY"
   ],
   "overlaps": [
+    {
+      "name": "BUN_CONFIG_HTTP_IDLE_TIMEOUT",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the other denied prefixes: idle timeout of the Bun HTTP client inside the bundled CLI; denied by the BUN_ prefix"
+    },
+    {
+      "name": "BUN_OPTIONS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control: Bun runtime flags for the bundled CLI process (the Bun counterpart of NODE_OPTIONS); denied by the BUN_ prefix"
+    },
+    {
+      "name": "BUN_INSTALL",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "application configuration for Bun projects, refused as a repo variable by the BUN_ prefix (owner decision #4611): the bundled CLI is a Bun executable and the prefix denies every Bun runtime control"
+    },
     {
       "name": "AWS_REGION",
       "harness": "claude",

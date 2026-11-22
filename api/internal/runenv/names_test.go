@@ -108,8 +108,8 @@ func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 	}
 	for _, p := range fx.DeniedPrefixes {
 		n := p + "SOMETHING"
-		if err := ValidateName(n); err == nil {
-			t.Errorf("ValidateName(%q) accepted a name under denied prefix %q", n, p)
+		if err := ValidateName(n); err == nil || !strings.Contains(err.Error(), "denied prefix "+p) {
+			t.Errorf("ValidateName(%q) = %v, want the denied prefix %q rule", n, err, p)
 		}
 	}
 	for _, s := range fx.DeniedSuffixes {
