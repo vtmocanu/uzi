@@ -104,14 +104,10 @@ func planningModelCells(planning, claudeLane, leadClaudePin *string) []apitypes.
 	return []apitypes.ModelSettingCellDTO{cell}
 }
 
-// planningEffortCells builds the read-only Claude planning effort cell (PRD #3252). The default
-// pair is the ordinary Claude effort cell's resolution (including Runtime default mode, where no
-// level is sent and DefaultEffort carries the preference token); a stored planning level resolves
-// with user_planning_default and explicit mode.
-func planningEffortCells(planning, claudeEffort *string) []apitypes.EffortSettingCellDTO {
-	return []apitypes.EffortSettingCellDTO{planningEffortCellFromOrdinary(planning, effortSettingCell("claude", claudeEffort))}
-}
-
+// planningEffortCellFromOrdinary builds the read-only Claude planning effort cell (PRD #3252). The
+// default pair is the ordinary Claude effort cell's resolution (including Runtime default mode,
+// where no level is sent and DefaultEffort carries the preference token); a stored planning level
+// resolves with user_planning_default and explicit mode.
 func planningEffortCellFromOrdinary(planning *string, ordinary apitypes.EffortSettingCellDTO) apitypes.EffortSettingCellDTO {
 	cell := apitypes.EffortSettingCellDTO{
 		Harness: "claude", Effort: planning,

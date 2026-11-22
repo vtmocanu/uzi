@@ -231,7 +231,7 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get user settings: %w", err)
 	}
-	pins, _, _, err := h.crossCheckPinSettings(ctx, userID)
+	pins, _, _, _, err := h.crossCheckPinSettings(ctx, userID)
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get cross-check pins: %w", err)
 	}
@@ -386,7 +386,8 @@ func planningModelCell(lead workersvc.LeadPrediction, stored *string) apitypes.E
 }
 
 // planningEffortCell is the Claude planning effort cell (PRD #3252), the shared planning effort
-// cell of /me/settings (planningEffortCells) as an effective cell.
+// cell of /me/settings (built in buildUserSettingsDTO from the same planningEffortCellFromOrdinary
+// and leadEffortSettingCell composition) as an effective cell.
 func planningEffortCell(lead workersvc.LeadPrediction, stored *string) apitypes.EffectiveEffortCellDTO {
 	return apitypes.EffectiveEffortCellDTO{
 		EffortSettingCellDTO: planningEffortCellFromOrdinary(stored, leadEffortSettingCell("claude", lead)),

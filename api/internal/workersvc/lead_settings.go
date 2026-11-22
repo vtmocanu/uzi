@@ -147,6 +147,14 @@ func leadEffortWithTemplate(harness Harness, runEffort, runEffortSource, userEff
 	return leadEffortFor(harness, runEffort, runEffortSource, userEffort)
 }
 
+// LeadEffortWithTemplate is the exported, pure form of leadEffortWithTemplate for callers with no
+// run override (the /me/settings planning cell): it returns the effort and its source string. The
+// unhonorable result is only possible with a run override, so dropping it here is safe.
+func LeadEffortWithTemplate(harness Harness, userEffort, templateEffort pgtype.Text) (*string, string) {
+	effort, source, _ := leadEffortWithTemplate(harness, pgtype.Text{}, pgtype.Text{}, userEffort, templateEffort)
+	return effort, string(source)
+}
+
 // leadTemplateEffort is the effort pin of the lead template among the delivered templates for the
 // run's harness (issue #3258 N3), "invalid" when there is none. The lead is picked with
 // agenttmpl.SelectLead, the same first-lead-shaped-name rule as the worker's selectLeadTemplate.
