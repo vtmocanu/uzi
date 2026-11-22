@@ -1993,7 +1993,7 @@ fixture_hold_deadline() {
           # exec hangs for 10s and must be killed at the remaining budget.
           sleep() { :; }
           eval "$(awk '/^db_psql_rows\(\) \(/,/^\)/' "$LIB")"
-          printf '#!/bin/sh\nexec sleep 10\n' > "$SEQ_DIR/compose-hang"
+          printf '#!/bin/sh\n: > "$0.started"\nsleep 10\n: > "$0.finished"\n' > "$SEQ_DIR/compose-hang"
           chmod +x "$SEQ_DIR/compose-hang"
           # shellcheck disable=SC2034  # read by the extracted real db_psql_rows
           local COMPOSE=("$SEQ_DIR/compose-hang") PGPW=fixture ENVFILE="$SEQ_DIR/no-envfile" ;;
@@ -2045,8 +2045,16 @@ fixture_hold_deadline() {
       [[ "$output" == *'receipt read failed (rc=1) before the 2s deadline'* && "$output" != *'receipt timeout'* ]] \
         || fail "fast receipt SQL error was misreported: $output" ;;
     slow-receipt-sql-real)
-      [[ "$output" == *'read_rc=137'* && "$output" == *'snapshot=none'* && "$output" == *'receipt timeout after 2s'* ]] \
+      # Limiters can report their timeout status (124) or the SIGKILL status (137).
+      # Neither alone proves a kill: the real child must have started, not finished,
+      # and the helper must have spent its budget before returning within the bound.
+      [[ ( "$output" == *'read_rc=124'* || "$output" == *'read_rc=137'* ) \
+        && "$output" == *'snapshot=none'* && "$output" == *'receipt timeout after 2s'* ]] \
         || fail "hung receipt SQL was not killed at the deadline: $output"
+      [ -f "$SEQ_DIR/compose-hang.started" ] && [ ! -e "$SEQ_DIR/compose-hang.finished" ] \
+        || fail "receipt SQL child did not start or ran to completion: $output"
+      [ $((SECONDS - start_wall)) -ge "$timeout" ] \
+        || fail "receipt SQL failed before spending its deadline: $output"
       [ $((SECONDS - start_wall)) -lt 8 ] || fail "hung receipt SQL outlived the deadline: $((SECONDS - start_wall))s" ;;
   esac
   case "$mode" in
