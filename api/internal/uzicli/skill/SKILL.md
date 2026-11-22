@@ -2059,7 +2059,7 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   read writes one audit log line. A `uzc_` token masks admin, so use `uza_`; a refusal prints a
   hint naming the flag and token. `run get|logs|plan|lead-config` and `review show` are owner-or-admin
   regardless of the flag. Steers and writes, archive download, `run export`, `run discard` and
-  `run held expire` stay owner-only. Detail: `uzi docs cli`, "Admin run debug".
+  `run held expire` stay owner-only. Detail: `uzi docs show cli`, "Admin run debug".
 
 ### PR and CI views
 
