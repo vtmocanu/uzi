@@ -873,6 +873,36 @@
       "value": "SWE_BENCH_TASK_ID",
       "invariant": "harness_control",
       "note": "debug, telemetry or control switch read by the Node runtime or the Claude CLI"
+    },
+    {
+      "value": "NODE",
+      "invariant": "process_loader",
+      "note": "node executable path read by npm scripts and tools that spawn Node"
+    },
+    {
+      "value": "NODE_NO_WARNINGS",
+      "invariant": "harness_control",
+      "note": "suppresses Node process warnings, harness included"
+    },
+    {
+      "value": "NODE_SKIP_PLATFORM_CHECK",
+      "invariant": "process_loader",
+      "note": "skips the Node platform check at startup"
+    },
+    {
+      "value": "NODE_PENDING_PIPE_INSTANCES",
+      "invariant": "process_loader",
+      "note": "Node pipe instance count on Windows"
+    },
+    {
+      "value": "UV_USE_IO_URING",
+      "invariant": "process_loader",
+      "note": "libuv I/O backend of every Node process, harness included"
+    },
+    {
+      "value": "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+      "invariant": "network_wiring",
+      "note": "metadata endpoint the harness's AWS SDK reads"
     }
   ],
   "denied_prefixes": [
@@ -1035,6 +1065,21 @@
       "value": "GCM_",
       "invariant": "git_authority",
       "note": "Git Credential Manager configuration"
+    },
+    {
+      "value": "OTEL_EXPORTER_OTLP_",
+      "invariant": "network_wiring",
+      "note": "telemetry exporter endpoints and headers the harness reads"
+    },
+    {
+      "value": "GCE_METADATA_",
+      "invariant": "network_wiring",
+      "note": "metadata server address the harness's Google auth reads"
+    },
+    {
+      "value": "AWS_ENDPOINT_URL_BEDROCK",
+      "invariant": "network_wiring",
+      "note": "Bedrock endpoint the harness reads; covers AWS_ENDPOINT_URL_BEDROCK_RUNTIME"
     }
   ],
   "denied_suffixes": [
@@ -1240,8 +1285,8 @@
     {
       "name": "AWS_EC2_METADATA_SERVICE_ENDPOINT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "metadata endpoint the harness's AWS SDK reads; denied as a network_wiring name"
     },
     {
       "name": "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
@@ -1258,14 +1303,14 @@
     {
       "name": "AWS_ENDPOINT_URL_BEDROCK",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "Bedrock endpoint the harness reads; denied by the AWS_ENDPOINT_URL_BEDROCK prefix"
     },
     {
       "name": "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "Bedrock endpoint the harness reads; denied by the AWS_ENDPOINT_URL_BEDROCK prefix"
     },
     {
       "name": "AWS_ENDPOINT_URL_SSO",
@@ -1684,20 +1729,20 @@
     {
       "name": "GCE_METADATA_HOST",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "metadata server address the harness's Google auth reads; denied by the GCE_METADATA_ prefix"
     },
     {
       "name": "GCE_METADATA_IP",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "metadata server address the harness's Google auth reads; denied by the GCE_METADATA_ prefix"
     },
     {
       "name": "GCE_METADATA_ROOT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "metadata server address the harness's Google auth reads; denied by the GCE_METADATA_ prefix"
     },
     {
       "name": "GCLOUD_PROJECT",
@@ -1864,8 +1909,8 @@
     {
       "name": "NODE",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "node executable path some npm scripts read; set by npm itself in scripts"
+      "decision": "denied",
+      "reason": "node executable path read by npm scripts and tools that spawn Node; denied as a process_loader name"
     },
     {
       "name": "OSTYPE",
@@ -1882,110 +1927,110 @@
     {
       "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_HEADERS",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_INSECURE",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_PROTOCOL",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_TIMEOUT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "standard OpenTelemetry SDK setting of the application under test; the CLI's own telemetry switches are denied by the CLAUDE_ and OTEL_LOG_ prefixes"
+      "decision": "denied",
+      "reason": "telemetry exporter setting the harness reads; denied by the OTEL_EXPORTER_OTLP_ prefix"
     },
     {
       "name": "OTEL_EXPORTER_PROMETHEUS_HOST",

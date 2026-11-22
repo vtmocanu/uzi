@@ -202,6 +202,12 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "SWE_BENCH_INSTANCE_ID", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
   { value: "SWE_BENCH_RUN_ID", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
   { value: "SWE_BENCH_TASK_ID", invariant: "harness_control", note: "debug, telemetry or control switch read by the Node runtime or the Claude CLI" },
+  { value: "NODE", invariant: "process_loader", note: "node executable path read by npm scripts and tools that spawn Node" },
+  { value: "NODE_NO_WARNINGS", invariant: "harness_control", note: "suppresses Node process warnings, harness included" },
+  { value: "NODE_SKIP_PLATFORM_CHECK", invariant: "process_loader", note: "skips the Node platform check at startup" },
+  { value: "NODE_PENDING_PIPE_INSTANCES", invariant: "process_loader", note: "Node pipe instance count on Windows" },
+  { value: "UV_USE_IO_URING", invariant: "process_loader", note: "libuv I/O backend of every Node process, harness included" },
+  { value: "AWS_EC2_METADATA_SERVICE_ENDPOINT", invariant: "network_wiring", note: "metadata endpoint the harness's AWS SDK reads" },
 ];
 
 /** Name prefixes reserved for the worker and the agent harnesses. */
@@ -238,6 +244,9 @@ export const RUN_ENV_DENIED_PREFIXES: readonly RunEnvDeniedRule[] = [
   { value: "OTEL_LOG_", invariant: "harness_control", note: "Claude CLI telemetry content switches (OTEL_LOG_RAW_API_BODIES, OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_CONTENT)" },
   { value: "LC_", invariant: "shell_semantics", note: "locale of the commands the worker runs (LC_ALL, LC_CTYPE), like LANG" },
   { value: "GCM_", invariant: "git_authority", note: "Git Credential Manager configuration" },
+  { value: "OTEL_EXPORTER_OTLP_", invariant: "network_wiring", note: "telemetry exporter endpoints and headers the harness reads" },
+  { value: "GCE_METADATA_", invariant: "network_wiring", note: "metadata server address the harness's Google auth reads" },
+  { value: "AWS_ENDPOINT_URL_BEDROCK", invariant: "network_wiring", note: "Bedrock endpoint the harness reads; covers AWS_ENDPOINT_URL_BEDROCK_RUNTIME" },
 ];
 
 /** Name suffixes that change network routing. */

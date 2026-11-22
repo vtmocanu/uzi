@@ -195,6 +195,12 @@ var deniedNames = []deniedRule{
 	{"SWE_BENCH_INSTANCE_ID", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
 	{"SWE_BENCH_RUN_ID", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
 	{"SWE_BENCH_TASK_ID", "harness_control", "debug, telemetry or control switch read by the Node runtime or the Claude CLI"},
+	{"NODE", "process_loader", "node executable path read by npm scripts and tools that spawn Node"},
+	{"NODE_NO_WARNINGS", "harness_control", "suppresses Node process warnings, harness included"},
+	{"NODE_SKIP_PLATFORM_CHECK", "process_loader", "skips the Node platform check at startup"},
+	{"NODE_PENDING_PIPE_INSTANCES", "process_loader", "Node pipe instance count on Windows"},
+	{"UV_USE_IO_URING", "process_loader", "libuv I/O backend of every Node process, harness included"},
+	{"AWS_EC2_METADATA_SERVICE_ENDPOINT", "network_wiring", "metadata endpoint the harness's AWS SDK reads"},
 }
 
 // deniedPrefixes are name prefixes reserved for the worker and the agent harnesses.
@@ -231,6 +237,9 @@ var deniedPrefixes = []deniedRule{
 	{"OTEL_LOG_", "harness_control", "Claude CLI telemetry content switches (OTEL_LOG_RAW_API_BODIES, OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_CONTENT)"},
 	{"LC_", "shell_semantics", "locale of the commands the worker runs (LC_ALL, LC_CTYPE), like LANG"},
 	{"GCM_", "git_authority", "Git Credential Manager configuration"},
+	{"OTEL_EXPORTER_OTLP_", "network_wiring", "telemetry exporter endpoints and headers the harness reads"},
+	{"GCE_METADATA_", "network_wiring", "metadata server address the harness's Google auth reads"},
+	{"AWS_ENDPOINT_URL_BEDROCK", "network_wiring", "Bedrock endpoint the harness reads; covers AWS_ENDPOINT_URL_BEDROCK_RUNTIME"},
 }
 
 // deniedSuffixes are name suffixes that change network routing.
@@ -273,7 +282,7 @@ func deniedBy(name string) string {
 }
 
 // ValidateNameShape applies the name shape only. It is the check for a name that already exists
-// (disable, enable, delete): a stored variable whose name a later denylist entry denies stays
+// (disable, delete): a stored variable whose name a later denylist entry denies stays
 // manageable.
 func ValidateNameShape(name string) error {
 	if !NameRegexp.MatchString(name) {
