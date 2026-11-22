@@ -17,6 +17,7 @@
 // model must never take instructions from (Decision 10).
 
 import os from "node:os";
+import { PROVIDER_LANE_UNSUPPORTED, ProviderLaneUnsupportedError } from "./provider-binding.js";
 import { diagramEvent, type DiagramParserReason, type DiagramReason } from "./diagram-diagnostic.js";
 
 import { fenceNonce } from "./prompt.js";
@@ -289,6 +290,7 @@ export class SummaryRunner {
       "Codex claim but no Codex advice-harness factory is wired": "missing_factory",
       "the claim carries no Anthropic token": "missing_credential",
       "the model pass failed": "pass_failed",
+      [PROVIDER_LANE_UNSUPPORTED]: "pass_failed",
       "unparseable output": "unparseable",
       "the output had no usable summary": "missing_summary",
     } as const satisfies Record<string, DiagramReason>;
@@ -307,6 +309,7 @@ export class SummaryRunner {
     try {
       harness = this.deliveryHarness(input.claim, fail, input.claimGeneration);
     } catch (err) {
+      if (err instanceof ProviderLaneUnsupportedError) return fail(PROVIDER_LANE_UNSUPPORTED);
       return fail("the claim's codex block is invalid", err);
     }
     if (harness === null) return null;
@@ -354,6 +357,9 @@ export class SummaryRunner {
     fail: (reason: "Codex claim but no Codex advice-harness factory is wired" | "the claim carries no Anthropic token") => null,
     claimGeneration?: number,
   ): Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "codex"> | null {
+    if (claim.secrets.provider && (claim.secrets.provider.engine !== "claude" || claim.secrets.codex !== undefined)) {
+      throw new ProviderLaneUnsupportedError();
+    }
     const selection = selectCodexBinding({ codex: claim.secrets.codex });
     if (selection.kind === "codex") {
       if (!this.codexAdviceHarnessFactory) return fail("Codex claim but no Codex advice-harness factory is wired");
@@ -440,6 +446,9 @@ export class SummaryRunner {
    *  throws into the caller. Returns the accumulated text; THROWS on timeout or an error
    *  result so the public methods can catch → null. */
   private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
+    if (input.provider && (input.provider.engine !== "claude" || input.claim?.secrets.codex !== undefined)) {
+      throw new ProviderLaneUnsupportedError();
+    }
     const reportUsage = this.usageReporter(pass, input.onUsage);
     let onCodex = false;
     try {

@@ -405,9 +405,9 @@ function safeStringify(value: unknown): string {
  * so the Claude path stays byte-identical to before this change.
  */
 export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise<string> {
-  // Provider execution is held for every non-Claude engine, including callers that
-  // also supply native Codex options. Refuse before dispatch or HOME/timer setup.
-  if (opts.provider && opts.provider.engine !== "claude") throw new ProviderLaneUnsupportedError();
+  // Non-Claude provider execution is held. A provider cannot be combined with
+  // native Codex authority either. Refuse before dispatch or HOME/timer setup.
+  if (opts.provider && (opts.provider.engine !== "claude" || opts.codex !== undefined)) throw new ProviderLaneUnsupportedError();
   if (opts.codex) return runCodexAdviceModelPass(opts, opts.codex);
 
   const token = opts.token;

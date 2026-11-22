@@ -2,28 +2,33 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
 import { decodeProviderBinding, ProviderLaneUnsupportedError } from "../src/provider-binding.js";
 import type { Logger } from "../src/log.js";
 
-for (const engine of ["codex", "unknown"]) {
+const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+
+for (const engine of ["codex", "unknown", "claude"]) {
   for (const withCodex of [false, true]) {
+    if (engine === "claude" && !withCodex) continue;
     it(`refuses ${engine} provider before side effects (native Codex options: ${withCodex})`, async (t) => {
       const provider = decodeProviderBinding({ provider: {
         provider_id: "held-provider",
         revision: 1,
-        engine: "codex",
-        protocol: "openai_responses",
+        engine: engine === "claude" ? "claude" : "codex",
+        protocol: engine === "claude" ? "anthropic_messages" : "openai_responses",
         base_url: "https://gateway.example/v1",
         auth_style: "bearer",
         credential: "held-provider-fixture-key",
-        model_map: { default: { model: "gateway-model" } },
+        model_map: engine === "claude" ? { haiku: { model: "gateway-model" } } : { default: { model: "gateway-model" } },
       } });
       assert.ok(provider);
       // Exercise the runtime boundary even for callers that bypass the claim decoder.
       if (engine === "unknown") Object.assign(provider, { engine });
-      const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/model-pass-hold-"));
+      await fs.mkdir(scratch, { recursive: true });
+      const root = await fs.mkdtemp(path.join(scratch, "model-pass-hold-"));
       const effects: string[] = [];
       const record = (name: string) => () => { effects.push(name); };
       const log: Logger = {

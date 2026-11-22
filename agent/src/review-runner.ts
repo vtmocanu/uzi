@@ -13,6 +13,7 @@ import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./c
 // the structured findings POSTed to `POST /worker/runs/{target}/task-review`.
 
 import os from "node:os";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 
 import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
@@ -151,15 +152,21 @@ export class ReviewRunner {
    *  run failed (and, where possible, posts a `failed` review) and returns, so the
    *  worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
-    const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
-    scope?.own();
-    // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
+    // PRD #4320: key redaction is independent of provider engine, including refused claims.
     const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
     for (const k of providerKeys) this.log.addSecret(k);
-    try { await this.executeClaim(claim, signal); }
-    finally {
-      scope?.close();
+    try {
+      if (claim.secrets.provider && (claim.secrets.provider.engine !== "claude" || claim.secrets.codex !== undefined)) {
+        await safeReportFailed(this.client, this.log, "review", claim.run_id,
+          PROVIDER_LANE_UNSUPPORTED, undefined, claim.claim_generation, this.terminalDeps);
+        return;
+      }
+      const scope = claim.secrets.codex?.auth_mode === "subscription"
+        ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
+      scope?.own();
+      try { await this.executeClaim(claim, signal); }
+      finally { scope?.close(); }
+    } finally {
       for (const k of providerKeys) this.log.removeSecret(k);
     }
   }
