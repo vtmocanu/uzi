@@ -28,6 +28,7 @@ const (
 	adminRunDebugRouteFetches  adminRunDebugRoute = "runs.fetches"
 	adminRunDebugRouteHolds    adminRunDebugRoute = "recovery.holds"
 	adminRunDebugRouteRuns     adminRunDebugRoute = "admin.runs"
+	adminRunDebugRouteWriters  adminRunDebugRoute = "admin.run_writers"
 )
 
 // adminRunDebugLogger returns the logger the audit records go to. A variable so
@@ -121,5 +122,18 @@ func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID
 		attrs = append(attrs, "since", since.UTC().Format(time.RFC3339Nano))
 	}
 	attrs = append(attrs, "returned", returned)
+	adminRunDebugLogger().InfoContext(r.Context(), adminRunDebugMessage, attrs...)
+}
+
+// auditRunWritersDebugRead records an all-owners run-writers lookup. The branch text is
+// never logged, only its byte length; mrIID nil is recorded as "none".
+func auditRunWritersDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, repoID uuid.UUID, mrIID *int64, branchBytes, returned int, complete bool) {
+	var mr any = "none"
+	if mrIID != nil {
+		mr = int(*mrIID)
+	}
+	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, route),
+		"repo_id", repoID.String(), "mr_iid", mr, "branch_bytes", branchBytes,
+		"returned", returned, "complete", complete)
 	adminRunDebugLogger().InfoContext(r.Context(), adminRunDebugMessage, attrs...)
 }

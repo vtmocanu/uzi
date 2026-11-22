@@ -405,6 +405,7 @@ var wantRouteMounts = []routeMount{
 	// call, no token spend) in the admin read group → noLimiter, like /rate-limits beside it.
 	{"GET", "/api/admin/codex-rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
+	{"GET", "/api/admin/run-writers", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},
 	// PRD #836 M3: the admin Updates-card data source — a cache-backed read, no forge
 	// call → noLimiter, like the agent-source GET beside it.
