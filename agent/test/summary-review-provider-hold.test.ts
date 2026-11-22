@@ -19,6 +19,14 @@ async function makeHome(prefix: string): Promise<string> {
   return fs.mkdtemp(path.join(scratch, prefix));
 }
 
+// Keep prompt construction valid so removing the delivery guard reaches dispatch.
+const deliveryContext: DeliveryContext = {
+  issue: "Title\nBody", prd: null, plan: null, previous: null, claims: null,
+  commits: "A change", paths: "src/example.ts", diff: "+change", bytes: 39,
+  truncated: { issue: false, prd: false, plan: false, previous: false,
+    claims: false, commits: false, paths: false, diff: false },
+};
+
 const claudeProvider: ClaimProviderBinding = {
   provider_id: "provider-test", revision: 1, engine: "claude", protocol: "anthropic_messages",
   base_url: "https://gateway.example.test", auth_style: "bearer", credential: "test-provider-key",
@@ -75,7 +83,7 @@ for (const engine of ["codex", "unknown", "claude"]) {
         const input = { claim, provider, token: "usable-vendor", model: "haiku", issueTitle: "Title", issueBody: "Body", onUsage: forbidden };
         try {
           const result = pass === "delivery"
-            ? await runner.generateDeliverySummary({ claim, context: {} as DeliveryContext, deadlineMs: Date.now() + 10000, onUsage: forbidden })
+            ? await runner.generateDeliverySummary({ claim, context: deliveryContext, deadlineMs: Date.now() + 10000, onUsage: forbidden })
             : pass === "intent" ? await runner.generateIntentSummary(input)
             : await runner.generatePlanSummary({ ...input, planMd: "Plan" });
           assert.equal(result, null);
