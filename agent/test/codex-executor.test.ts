@@ -36688,29 +36688,41 @@ describe("M2 provider executor composition", () => {
     assert.equal(rig.client.refreshCalls.length, 0);
   });
 
-  it("passes exclusive provider authority through the actual default launcher", async () => {
-    const rig = makeRig();
-    const { launchProviderRoot: unused, ...rest } = rig.deps;
-    void unused;
-    const binding = createCodexProviderExecutionAuthority(providerClaim());
-    let reached = false;
-    rig.deps = { ...rest, launchCodexRootForTest: async spec => {
-      reached = true;
-      assert.deepEqual(spec.providerBinding, binding.providerBinding);
-      assert.equal(spec.provider, undefined);
-      assert.equal(spec.authMode, "provider");
-      assert.equal(spec.useAppServerAuth, true);
-      assert.equal(spec.model, "default");
-      assert.equal(spec.codeModeHost, true);
-      assert.equal(Object.hasOwn(spec, "credentialValue"), false);
-      throw new Error("provider launcher sentinel");
-    } };
-    const { ctx } = makeCtx();
-    await assert.rejects(makeExecutor(rig, binding).run(ctx), /provider launcher sentinel/);
-    assert.equal(reached, true);
-    assert.equal(rig.client.releaseCalls.length, 0);
-    assert.equal(rig.client.refreshCalls.length, 0);
-  });
+  for (const slot of ["default", "gpt-6-astra"] as const) {
+    it(`passes exclusive provider authority and ${slot} context through the actual default launcher`, async () => {
+      const rig = makeRig();
+      const { launchProviderRoot: unused, ...rest } = rig.deps;
+      void unused;
+      const binding = createCodexProviderExecutionAuthority({
+        ...providerClaim(),
+        model_map: {
+          default: { model: "corp-code", context_window: 32768 },
+          ...(slot === "gpt-6-astra" ? { "gpt-6-astra": { model: "corp-code", context_window: 131072 } } : {}),
+        },
+      });
+      let reached = false;
+      rig.deps = { ...rest, launchCodexRootForTest: async spec => {
+        reached = true;
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        assert.equal(spec.provider, undefined);
+        assert.equal(spec.authMode, "provider");
+        assert.equal(spec.useAppServerAuth, true);
+        assert.equal(spec.model, slot);
+        assert.equal(spec.providerBinding?.model_map[spec.model!]?.context_window,
+          slot === "gpt-6-astra" ? 131072 : 32768);
+        assert.equal(spec.codeModeHost, true);
+        assert.equal(Object.hasOwn(spec, "credentialValue"), false);
+        throw new Error("provider launcher sentinel");
+      } };
+      const { ctx } = makeCtx(slot === "gpt-6-astra"
+        ? { config: { default_model: "gpt-6-astra", default_model_source: "run_override" } }
+        : {});
+      await assert.rejects(makeExecutor(rig, binding).run(ctx), /provider launcher sentinel/);
+      assert.equal(reached, true);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
 
   it("refuses unmapped explicit models before login or vendor release", async () => {
     const rig = makeRig();

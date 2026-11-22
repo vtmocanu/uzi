@@ -6006,7 +6006,13 @@ export class CodexExecutor implements Executor {
         admissionReporter: binding.authMode !== "provider" ? this.opts.client.codexAdmissionReporter?.(ctx.runId, ctx.claimGeneration) : undefined,
         registry,
         launchRoot: async (spec) => {
-          if (binding.authMode === "provider") spec = { ...spec, providerBinding: binding.providerBinding, model: Object.entries(binding.providerBinding.model_map).find(([, entry]) => entry?.model === spec.model)?.[0] ?? providerSlot! };
+          if (binding.authMode === "provider") {
+            const modelMap = binding.providerBinding.model_map;
+            const slot = modelMap[providerSlot!]?.model === spec.model
+              ? providerSlot!
+              : Object.entries(modelMap).find(([, entry]) => entry?.model === spec.model)?.[0] ?? providerSlot!;
+            spec = { ...spec, providerBinding: binding.providerBinding, model: slot };
+          }
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
           const root = this.trackProviderRoot(await providerLaunchSeam(spec));
