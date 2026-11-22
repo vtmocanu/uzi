@@ -3,7 +3,8 @@
 // PRD #3254 M2: the demo serves the server's RECORDED effective-settings behavior
 // (fixtures/api-contract/effective_settings.behavior.json), per mock scenario.
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EffectiveSettings, Harness } from "../lib/apiTypes";
 import behavior from "../../../fixtures/api-contract/effective_settings.behavior.json";
 import { MODEL_SETTING_SOURCE_LABELS } from "../lib/modelSettings";
 import { RECORDED_EFFECTIVE_SCENARIOS } from "./data/effectiveSettings";
@@ -148,6 +149,107 @@ describe("getEffectiveSettings", () => {
     first.harnesses.length = 0;
     expect((await mockApi.getEffectiveSettings()).harnesses).toHaveLength(2);
   });
+});
+
+describe("recorded planning resets", () => {
+  async function reload() {
+    vi.resetModules();
+    return (await import("./mockApi")).mockApi;
+  }
+
+  function expectOtherCellsUnchanged(got: EffectiveSettings, before: EffectiveSettings, harness: Harness) {
+    const otherCells = (view: EffectiveSettings) => ({
+      ...view,
+      models: view.models.filter(c => c.setting !== "planning_model" || c.harness !== harness),
+      efforts: view.efforts.filter(c => c.setting !== "planning_effort" || c.harness !== harness),
+    });
+    expect(otherCells(got)).toEqual(otherCells(before));
+  }
+
+  afterEach(() => vi.resetModules());
+
+  it("serves every untouched GET recording verbatim, including both planning scenarios", async () => {
+    const scenarios: Record<string, string> = { default: "", codexOnly: "codex-only", overflowCodexDefault: "overflow-codex-default", planning: "planning-pair", planningCodex: "planning-codex-pair" };
+    for (const s of behavior.scenarios) {
+      setScenario(scenarios[s.name]);
+      const api = await reload();
+      expect(await api.getEffectiveSettings(), s.name).toEqual(s.get);
+      expect((await api.getMySettings()).settings).toMatchObject({
+        planning_claude_model: null, planning_claude_effort: null,
+        planning_codex_model: null, planning_codex_effort: null,
+      });
+    }
+  });
+
+  for (const { scenario, harness, workerModel, workerEffort, effortSource, mode } of [
+    { scenario: "planning-pair", harness: "claude", workerModel: "opus", workerEffort: "medium", effortSource: "builtin", mode: "explicit" },
+    { scenario: "planning-codex-pair", harness: "codex", workerModel: "gpt-6-sol", workerEffort: null, effortSource: "user_default", mode: "runtime_default" },
+  ] as const) {
+    describe(scenario, () => {
+      beforeEach(() => setScenario(scenario));
+
+      it.each([false, true])("clears the model while retaining effort (explicit effort: %s)", async (saveEffort) => {
+        const api = await reload();
+        const before = await api.getEffectiveSettings();
+        await api.putMySettings({
+          [`planning_${harness}_model`]: null,
+          ...(saveEffort ? { [`planning_${harness}_effort`]: "high" } : {}),
+        });
+        const got = await api.getEffectiveSettings();
+        expect(got.models.find(c => c.setting === "planning_model" && c.harness === harness))
+          .toMatchObject({ model: null, resolved_model: workerModel, source: "template" });
+        expect(got.efforts).toEqual(before.efforts);
+        expectOtherCellsUnchanged(got, before, harness);
+      });
+
+      it("clears only effort, inheriting the worker resolution and runtime mode", async () => {
+        const api = await reload();
+        const before = await api.getEffectiveSettings();
+        await api.putMySettings({ [`planning_${harness}_effort`]: null });
+        const got = await api.getEffectiveSettings();
+        expect(got.efforts.find(c => c.setting === "planning_effort" && c.harness === harness))
+          .toMatchObject({ effort: null, resolved_effort: workerEffort, source: effortSource, mode });
+        expect(got.models).toEqual(before.models);
+        expectOtherCellsUnchanged(got, before, harness);
+      });
+
+      it("clears both fields and preserves the saved reset through a storage-backed reload", async () => {
+        const api = await reload();
+        const before = await api.getEffectiveSettings();
+        const reset = { [`planning_${harness}_model`]: null, [`planning_${harness}_effort`]: null };
+        await api.putMySettings(reset);
+        expect(JSON.parse(localStorage.getItem("uzi.mock.v4")!).userSettings).toMatchObject(reset);
+        const saved = await api.getEffectiveSettings();
+        expect(saved.models.find(c => c.setting === "planning_model" && c.harness === harness))
+          .toMatchObject({ model: null, resolved_model: workerModel, source: "template" });
+        expect(saved.efforts.find(c => c.setting === "planning_effort" && c.harness === harness))
+          .toMatchObject({ effort: null, resolved_effort: workerEffort, source: effortSource, mode });
+        expectOtherCellsUnchanged(saved, before, harness);
+
+        const reloaded = await reload();
+        expect((await reloaded.getMySettings()).settings).toMatchObject(reset);
+        expect(await reloaded.getEffectiveSettings()).toEqual(saved);
+      });
+
+      it.each(["low", "runtime"])("inherits an explicit ordinary user lane (%s) when both planning fields clear", async (effort) => {
+        const api = await reload();
+        const before = await api.getEffectiveSettings();
+        const model = harness === "claude" ? "sonnet" : "custom-worker";
+        await api.putMySettings({
+          [`default_${harness}_model`]: model,
+          [harness === "claude" ? "default_effort" : "default_codex_effort"]: effort,
+          [`planning_${harness}_model`]: null,
+          [`planning_${harness}_effort`]: null,
+        });
+        const got = await api.getEffectiveSettings();
+        expect(got.models.find(c => c.setting === "planning_model" && c.harness === harness))
+          .toMatchObject({ model: null, resolved_model: model, source: "user_default" });
+        expect(got.efforts.find(c => c.setting === "planning_effort" && c.harness === harness))
+          .toMatchObject({ effort: null, resolved_effort: effort === "runtime" ? null : "low", source: "user_default", mode: effort === "runtime" ? "runtime_default" : "explicit" });
+        expectOtherCellsUnchanged(got, before, harness);
+      });
+    });
+  }
 });
 
 describe("previewStartSettings", () => {

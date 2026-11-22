@@ -89,12 +89,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_codex_model: null,
   default_effort: null,
   default_codex_effort: null,
-  // PRD #3252: the planning pairs; null = "Same as the run". Resolved into
-  // planning_models / planning_efforts (mockPlanningModelCells / mockPlanningEffortCells).
-  planning_claude_model: null,
-  planning_claude_effort: null,
-  planning_codex_model: null,
-  planning_codex_effort: null,
+  // Planning fields stay absent until saved: undefined preserves the recording,
+  // while an explicit null resets that field to "Same as the run".
   judge_model: null,
   // PRD #3245: the Codex judge lane; null = inherit. Resolved per harness into
   // judge_models (mockJudgeModelCells) and edited on Run defaults.
@@ -305,7 +301,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // provides it going forward (like judge_model).
     (u.default_effort === undefined || u.default_effort === null || typeof u.default_effort === "string") &&
     (u.default_codex_effort === undefined || u.default_codex_effort === null || typeof u.default_codex_effort === "string") &&
-    // Optional so a pre-#3252 blob stays valid; absent reads as "Same as the run".
+    // Optional so a pre-#3252 blob stays valid; preserve absent versus explicit null
+    // for withPlanning, while mySettingsResponse projects either as null.
     (u.planning_claude_model === undefined || u.planning_claude_model === null || typeof u.planning_claude_model === "string") &&
     (u.planning_codex_model === undefined || u.planning_codex_model === null || typeof u.planning_codex_model === "string") &&
     (u.planning_codex_effort === undefined || u.planning_codex_effort === null || typeof u.planning_codex_effort === "string") &&
@@ -717,7 +714,12 @@ function mySettingsResponse(): { settings: UserSettings } {
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, planning_models, planning_efforts, default_model: projected ?? null } };
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, planning_models, planning_efforts,
+    planning_claude_model: userSettings.planning_claude_model ?? null,
+    planning_claude_effort: userSettings.planning_claude_effort ?? null,
+    planning_codex_model: userSettings.planning_codex_model ?? null,
+    planning_codex_effort: userSettings.planning_codex_effort ?? null,
+    default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -919,17 +921,27 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
   return view;
 }
 
-// Apply each stored planning pair only to its own harness and setting.
+// Apply only saved fields to their own harness. Null inherits the recorded worker
+// resolution unless an explicit ordinary user preference governs that lane.
 function withPlanning(view: EffectiveSettings): EffectiveSettings {
   for (const harness of ["claude", "codex"] as const) {
     const model = userSettings[`planning_${harness}_model`], effort = userSettings[`planning_${harness}_effort`];
-    if (model == null && effort == null) continue;
-    const [m] = mockPlanningModelCells(model, userSettings[`default_${harness}_model`], harness);
-    const [e] = mockPlanningEffortCells(effort, harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort, harness);
-    view.models = view.models.map(c => c.setting !== "planning_model" || c.harness !== harness ? c
-      : m.source === "user_planning_default" ? { ...c, model: m.model, resolved_model: m.resolved_model, source: m.source } : { ...c, model: m.model });
-    view.efforts = view.efforts.map(c => c.setting !== "planning_effort" || c.harness !== harness ? c
-      : e.source === "user_planning_default" ? { ...c, effort: e.effort, resolved_effort: e.resolved_effort, source: e.source, mode: e.mode } : { ...c, effort: e.effort });
+    if (model !== undefined) {
+      const lane = userSettings[`default_${harness}_model`];
+      const [m] = mockPlanningModelCells(model, lane, harness);
+      const inherited = lane != null ? m : view.models.find(c => c.setting === "worker_model" && c.harness === harness) ?? m;
+      const resolved = model === null ? inherited : m;
+      view.models = view.models.map(c => c.setting !== "planning_model" || c.harness !== harness ? c
+        : { ...c, model: m.model, resolved_model: resolved.resolved_model, source: resolved.source });
+    }
+    if (effort !== undefined) {
+      const lane = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+      const [e] = mockPlanningEffortCells(effort, lane, harness);
+      const inherited = lane != null ? e : view.efforts.find(c => c.setting === "worker_effort" && c.harness === harness) ?? e;
+      const resolved = effort === null ? inherited : e;
+      view.efforts = view.efforts.map(c => c.setting !== "planning_effort" || c.harness !== harness ? c
+        : { ...c, effort: e.effort, resolved_effort: resolved.resolved_effort, source: resolved.source, mode: resolved.mode });
+    }
   }
   return view;
 }
