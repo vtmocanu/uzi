@@ -69,13 +69,47 @@ it (such as the entry a registry login stores, or an HTTP Basic header). Each
 form is also registered without a trailing line break, and for a multi-line
 value with LF line endings. Every line of a multi-line value that is at least 8
 characters long is redacted on its own, with no condition on letter case,
-digits or key name. The only lines left out are PEM header and footer armor
-(`-----BEGIN ...-----`, `-----END ...-----`) and whitespace-only lines; both
-exclusions are carve-outs proposed for owner approval (pending owner decision).
+digits or key name. Two kinds of line are left out, both accepted carve-outs:
+
+- **PEM armor.** Only a line exactly equal to `-----BEGIN <LABEL>-----` or
+  `-----END <LABEL>-----` for one of these labels: `PRIVATE KEY`,
+  `RSA PRIVATE KEY`, `EC PRIVATE KEY`, `DSA PRIVATE KEY`,
+  `ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`, `PUBLIC KEY`,
+  `RSA PUBLIC KEY`, `CERTIFICATE`, `TRUSTED CERTIFICATE`,
+  `CERTIFICATE REQUEST`, `NEW CERTIFICATE REQUEST`, `X509 CRL`, `PKCS7`, `CMS`,
+  `EC PARAMETERS`, `DH PARAMETERS`, `ATTRIBUTE CERTIFICATE`. A marker with any
+  other label (PGP armor, for example), an indented marker, or a line that
+  carries anything besides the marker is redacted like any other line.
+- **Whitespace-only lines.** Only lines made of ASCII spaces and tabs. A line of
+  NBSP or another Unicode space (U+2000 to U+200A, U+3000 and so on) that is 8
+  or more characters long is redacted like any other line.
+
 So structural lines of a secret file, such as `apiVersion: v1` or
 `"type": "service_account",`, are masked wherever they appear in run output.
 Redaction is exact-match with an 8-character floor, so it is a net, not a boundary: another
-encoding of the value is not caught.
+encoding of the value is not caught, and a fragment of a line shorter than 8
+characters is not masked (accepted limitations; see the end of
+[Redaction and the publish scan](#redaction-and-the-publish-scan)).
+
+Redaction work is bounded by a step count, not a clock. The matcher charges each
+literal comparison against a budget of 2^26 units per redacted string (one
+shared budget per payload), so a string costs at most the budget plus one plus
+the longest literal. When a string passes it, the whole string is replaced by
+`[withheld: redaction work budget exceeded]`, never shown raw or half
+redacted, and the rest fails closed:
+
+- Payload strings that still need a comparison are withheld the same way; the
+  worker log writes one fixed JSON record (timestamp, level and a fixed message,
+  with no other fields) in place of the record.
+- Secret scans treat every form as present, so the publish is withheld, and the
+  preserved patch is not shipped.
+- The run's status, id, claim generation and failure origin never pass through
+  the redactor and still reach uzi; the failure reason becomes the marker.
+- The charge is a conservative bound, so very large or prefix-dense text with no
+  secret in it can also be withheld.
+- The git object and path scans are not redaction. They are capped by a
+  deadline and by bytes, and fail closed (the publish is withheld), so input
+  with a repeating pattern can exhaust their deadline but cannot make them pass.
 
 A run's secret forms are computed once per claim and capped at 40,000,000
 characters (`RUN_ENV_FORM_CHARS_MAX`). A claim over the cap fails before any
@@ -152,15 +186,15 @@ terminal preservation packs, recovery archives and the preserved patch.
 - A run with a multi-line secret therefore has no preserved patch. Its work is
   not lost: it stays in the run's custody, as a held ref (`uzi run held`, then
   `git fetch`) or a recovery capture (`uzi run export`).
-- Pending owner decision, gaps that remain: a fragment of a secret line shorter
-  than 8 characters, or a line whose own characters change on the way out (for example
+- Accepted limitations: a fragment of a secret line shorter than 8
+  characters, or a line whose own characters change on the way out (for example
   re-indented to less indentation, folded, or in an encoding other than those
-  registered), is not masked in run output; for long periodic secret lines the
-  redaction cost is the text length times the longest literal; a terminal report journaled
-  with a patch by an older worker and replayed after an upgrade keeps that patch;
-  and the whitespace-only exemption uses JavaScript's `\s`, which includes
-  Unicode spaces such as NBSP. A committed file that holds the whole secret is
-  still blocked.
+  registered), is not masked in run output. A committed file that holds the
+  whole secret is still blocked.
+- A terminal report that a worker built before this change had already
+  journaled with a patch can still replay with that patch after an upgrade. An
+  upgraded worker never creates a new patch for a run holding a multi-line
+  secret.
 - Known gap: the planning diff sent to a cross-check and the diff context in a
   pull request description are only redacted, not path-scanned. A secret with
   non-ASCII characters used as a path name reaches them octal-escaped

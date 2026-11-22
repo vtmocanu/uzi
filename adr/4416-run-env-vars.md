@@ -208,11 +208,23 @@ registers each of its lines for redaction (and for the preserved-patch line chec
 scan needle, because a public line would hit unrelated files. Every line of 8 or more characters is
 registered (`lineForms` in `run-env-forms.ts`), with no condition on letter case, token, digits or
 key name; the token rule, the leading-key strip and the URL scheme and host carve-out are removed.
-The only lines excluded are PEM armor (`-----BEGIN ...-----` and `-----END ...-----`) and
-whitespace-only lines. Structural lines of a secret file, such as `apiVersion: v1` or
-`"type": "service_account",`, are therefore masked wherever they appear in run output. The two
-exclusions are carve-outs proposed for owner approval (pending owner decision): PEM armor is public
-text that carries no secret, and a whitespace-only line holds nothing to mask. The scan needles instead add
+The only lines excluded are two carve-outs, both accepted by the owner (PRD #4416 Decision Log,
+2026-11-22) and both tightened to a closed definition:
+
+- **PEM armor.** Only a line exactly equal to `-----BEGIN <LABEL>-----` or `-----END <LABEL>-----`
+  for a label in the finite list `PEM_STANDARD_LABELS` (`agent/src/run-env-forms.ts`) is exempt:
+  `PRIVATE KEY`, `RSA PRIVATE KEY`, `EC PRIVATE KEY`, `DSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`,
+  `OPENSSH PRIVATE KEY`, `PUBLIC KEY`, `RSA PUBLIC KEY`, `CERTIFICATE`, `TRUSTED CERTIFICATE`,
+  `CERTIFICATE REQUEST`, `NEW CERTIFICATE REQUEST`, `X509 CRL`, `PKCS7`, `CMS`, `EC PARAMETERS`,
+  `DH PARAMETERS`, `ATTRIBUTE CERTIFICATE`. A marker with an unknown label (including PGP armor), an
+  indented marker, or any line that carries more than the fixed marker keeps normal line protection.
+- **Whitespace-only lines.** Only a line of ASCII space (0x20) and tab (0x09) is exempt
+  (`WHITESPACE_ONLY = /^[ \t]*$/`). A line of NBSP or other Unicode spaces (U+2000 to U+200A, U+3000
+  and so on) at or above the 8-character floor is a normal line form. This closes the earlier
+  residual that the exemption used JavaScript's `\s`.
+
+Structural lines of a secret file, such as `apiVersion: v1` or
+`"type": "service_account",`, are therefore masked wherever they appear in run output. The scan needles instead add
 diff-shaped forms of the value, its lines joined by `\n+`, `\n-` and `\n ` (LF and CRLF). Plain
 values are never registered. The forms join the run's existing redactor, so every sink it already
 covers masks them; the plan, the plan summary, the intent summary and
@@ -236,6 +248,47 @@ JSON-escaped copy of every redaction form; 342 is the control-character worst ca
 only when it raises the count and leaves it above the cap, so a repo already above it can shrink but not
 grow; Disable, Enable and Delete are never refused for budget reasons. The per-byte bound is analytic, pinned
 by `agent/test/run-env-forms-budget.test.ts` for the form counts it assumes, not proved for every value.
+
+### Redaction work guard (owner decision B3, fixed)
+
+The redactor used to cost text length times the longest literal for long periodic secret lines
+(measured at about 2.15 s for one such string, which motivated the guard). The matcher now has a
+**step-counted** guard, not a wall-clock one: a deadline cannot interrupt synchronous matching, so
+every literal comparison is charged against a counter (`RedactionWork`) before it runs, in
+`agent/src/redact.ts`.
+
+- **Budget and bound.** `REDACTION_WORK_BUDGET` is 2^26 charged units. The charge is one unit per
+  text position whose first unit can start a literal, plus the label length of each trie edge compared in `LiteralIndex`, and
+  `1 + secret.length` per candidate in `spansOfEach`. The charged work of one redacted string never
+  exceeds the budget + 1 + the longest single literal, whatever the host's speed.
+- **One budget per message payload.** For the run's message-payload redactors (`makeRedactor`,
+  `SecretSet.payload`, which every `MessageBatcher` uses), `redactPayloadWithin` redacts every string
+  and member name of a payload against one shared counter, so the bound holds per payload, not per
+  string. Other structured walks (`redactStrings` with a text redactor, e.g. a PR summary or a review
+  verdict) stay bounded per string. After the
+  budget is spent, each further string that still needs a charged comparison is replaced by the
+  marker; strings that need none pass through.
+- **On overflow, fail closed.** The whole string becomes the fixed marker `REDACTION_WITHHELD`
+  (`[withheld: redaction work budget exceeded]`), never the raw text and never a partly redacted
+  one (`runWithinBudget` returns undefined and the caller withholds). The logger
+  (`agent/src/log.ts`) writes a fixed valid JSON record with `ts`, `level` and a fixed `msg`
+  (`log record withheld: redaction work budget exceeded`); the base fields and the record's own
+  fields are dropped. Secret scans (`literalsPresent`, used by `run-env-scan.ts`) report every form
+  as present on overflow, so the publish or patch verdict withholds. A preserved patch whose text
+  redaction overflows is not shipped (`runner.ts`, `scanGatedPatch`).
+- **What stays visible to the api.** The run status, run id, claim generation and `fail_origin` do not
+  pass through the redactor, so a state report still reaches the api; `failure_reason` is
+  redacted and becomes the marker on overflow.
+- **Conservative charging.** The charge is an upper bound of the native work, so very large or
+  prefix-dense benign text can be withheld although no secret is in it. That fails closed and is
+  accepted.
+- **Not redaction.** The git object scan and the path scan (`literalMatcher` in
+  `agent/src/secret-scan-guard.ts`, used by the object and path passes in `agent/src/git.ts`) are
+  not subject to this budget. They are bounded by a deadline and byte and path caps and fail closed
+  (`trusted: false`, so the publication is withheld). Periodic input can exhaust their deadline but
+  cannot make them pass.
+
+Tests: `agent/test/redaction-work-guard.test.ts` and `agent/test/redaction-work-guard-runner.test.ts`.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
 (`agent/src/run-env-scan.ts`): every object reachable from the candidate tip and not from the
@@ -332,21 +385,43 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   `checker_unavailable`, which forces a human gate.
 - Neither of the last two is a leak: both withhold or force a human decision.
 
-Pending owner decision (not accepted). The split-across-files and elided-context patch gaps are
-closed by the `multi_line_secret` rule above. These exceptions remain from this change:
+Owner decisions of 2026-11-22 on the exceptions that earlier sat as pending (PRD #4416 Decision Log).
+The split-across-files and elided-context patch gaps are closed by the `multi_line_secret` rule above.
 
-- **(a) Short fragments and re-encoded lines.** A fragment of a secret line shorter than 8
-  characters, or a line whose own characters change on the way out (re-indented to less indentation, folded, or
-  in an unregistered encoding), is not masked in run output. A line copied with extra indentation is
-  still masked, since redaction matches it as a substring. The blob scan still blocks a committed file
-  that holds the whole value.
-- **(b) Redaction cost for periodic secret lines.** The radix-trie index removes the cost of many
-  forms sharing a prefix, but for long periodic secret lines the cost is still text length x longest literal; that
-  periodic worst case predates the trie.
-- **(c) A replayed terminal report keeps its patch.** A terminal report journaled with a patch by an
-  older worker and replayed after an upgrade keeps that patch.
-- **(d) Whitespace-only lines use `\s`.** The whitespace-only exemption uses JavaScript's `\s`, which
-  includes Unicode spaces such as NBSP, so a line made only of such characters is not registered.
+- **Accepted, tightened: the PEM armor and whitespace-only carve-outs** (B1, B2), as defined under
+  "Redaction and the exact-value scan". The whitespace-only carve-out uses ASCII space and tab only,
+  which closes the earlier residual that it used JavaScript's `\s` (NBSP and other Unicode spaces).
+- **Fixed: the redaction cost for periodic secret lines** (B3), by the step-counted work guard
+  described under "Redaction work guard". It is no longer a residual; the radix-trie index (PRD
+  Decision Log) and the guard together bound the cost.
+- **Accepted as documented exact-match limitations: short and re-encoded fragments** (B4). A
+  fragment of a secret line shorter than 8 characters, or a line whose own characters change on the
+  way out (re-indented to less indentation, folded, or in an unregistered encoding), is not masked in run
+  output. A line copied with extra indentation is still masked, since redaction matches it as a
+  substring. The blob scan still blocks a committed file that holds the whole value.
+- **Accepted with explicit grandfathering: a replayed terminal report from an older worker** (B5).
+  Only terminal reports already journaled before this change, including by pre-release builds, may
+  replay with the preserved patch they carry. An upgraded worker never mints a new multi-line-secret
+  patch: `patchScanVerdict` (`agent/src/run-env-scan.ts`) withholds it with reason
+  `multi_line_secret`. The immutable-journal and retry contract is unchanged: the terminal journal
+  `terminal-<claim_generation>.json` under `<dataDir>/outbox/<runId>/` (`agent/src/outbox.ts`) is
+  MAC-authenticated, the first durable writer for a generation wins, and the body is replayed
+  verbatim by `listPendingTerminals` then `resolvePendingTerminal` (`agent/src/terminal-resolve.ts`).
+  A fully drained run's subtree is age-deleted after `WORKER_OUTBOX_RETENTION` (default 7 days,
+  `docs/configuration.md`); a run with an undrained segment is never removed by retention.
+
+  Identification procedure for affected pre-release deployment journals (steps to follow; none has
+  been run by this change):
+
+  1. On each pre-release worker data volume that may still hold journals within the retention
+     window, list the pending terminal journals under `<dataDir>/outbox/<runId>/`.
+  2. A journal is affected when its `body.preserved_patch` is non-empty, its run's repo held a
+     multi-line secret run variable, and it was written by a worker build from before this change.
+  3. Record a disposition per affected journal (replayed and landed, discarded, or left to age out)
+     without copying the report's contents.
+
+  Deployment check: pending - maintainers supply the evidence; no fleet check has been performed by
+  this change.
 
 ## Not shipped in M2
 

@@ -55,9 +55,10 @@ export function providerKeyForms(key: string): string[] {
 
 export type TextRedactor = (s: string) => string;
 
-/** Charged units one redacted string may spend (PRD 4416, owner decision B3). A unit is one consulted text
- *  position or one UTF-16 unit a literal comparison may touch: a deterministic upper bound of the native work, so
- *  the guard bounds the periodic worst case (a long literal against long periodic output) whatever the host's
+/** Charged units one redacted string, or one message payload walked by a payload redactor, may spend (PRD 4416,
+ *  owner decision B3). A unit is one consulted text position or one UTF-16 unit a literal comparison may touch:
+ *  every comparison is charged before it runs, and the uncharged work left (the 8-unit prefix search, the skipped
+ *  positions) is linear in the text, so the guard bounds the periodic worst case (a long literal against long periodic output) whatever the host's
  *  speed. A wall deadline cannot interrupt synchronous matching, hence a counter. */
 export const REDACTION_WORK_BUDGET = 2 ** 26;
 
