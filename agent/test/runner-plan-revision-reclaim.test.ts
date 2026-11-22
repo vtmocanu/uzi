@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { api, client, fakeGitlab, installHarness, runner } from "./runner-harness.js";
 import { feed, freshClaim, gates, newApi, row, send, until } from "./gate-revision-harness.js";
 import { providerFixture } from "./plan-revision-provider-fixture.js";
+import { waitForTestEvent } from "./helpers.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { RunContext } from "../src/executor.js";
 
@@ -35,6 +36,8 @@ for (const harness of ["claude", "codex"] as const) {
       const arrived = barrier();
       const nextRevision = barrier();
       const nextRevisionBlocked = barrier();
+      const appliedReceipt = barrier();
+      let releaseApplied = () => {};
       let restore = () => {};
       const oldFlight = runner(old.executor, fakeGitlab().gitlab, undefined, {
         planRevisionRetryPolicy: { random: () => 0, sleep: async (ms, signal) => {
@@ -120,6 +123,18 @@ for (const harness of ["claude", "codex"] as const) {
         const before = gates(id).length;
         const receiptStart = api.inputReceiptCalls.length;
         const waits: number[] = [];
+        if (harness === "codex" && stage === "expired") {
+          // Publishing the gate and applying its input are separate requests. Force the
+          // gate to be observable first, and observe the receipt's own acknowledgement.
+          releaseApplied = api.holdNextInputReceipt("applied");
+          const apply = client.applyInputs.bind(client);
+          t.mock.method(client, "applyInputs", async (...args: Parameters<typeof apply>) => {
+            const receipt = await apply(...args);
+            if (args[0] === id && args[2] === 2 && receipt.active && receipt.inputs.some(input => input.id === i!.id))
+              appliedReceipt.release();
+            return receipt;
+          });
+        }
         nextFlight = runner(successor.executor, fakeGitlab().gitlab, undefined, {
           planRevisionRetryPolicy: { random: () => 0, sleep: async (ms, signal) => {
             signal.throwIfAborted();
@@ -155,6 +170,8 @@ for (const harness of ["claude", "codex"] as const) {
               const prompt = successor.starts[0]!.prompt;
               assert.ok(prompt.includes(SOURCE), "the revision uses the persisted source plan");
               assert.equal(prompt.split("old I").length - 1, 1, "pending feedback is replayed exactly once");
+              queueMicrotask(releaseApplied);
+              await waitForTestEvent(appliedReceipt.promise, "reclaimed revise APPLIED receipt");
               assert.equal(api.isApplied(id, i!.id), true, "the persisted revised plan applies the pending input");
               assert.equal(api.isInputSuperseded(id, i!.id), false, "replay is application, not stale disposal");
               assert.equal(feed(id).some(t => /ignored.*re-send/.test(t)), false, "replayed feedback needs no re-send notice");
@@ -205,6 +222,7 @@ for (const harness of ["claude", "codex"] as const) {
         nextRevision.release();
         await nextDone;
       } finally {
+        releaseApplied();
         hold.release();
         oldFlight.shutdown();
         await oldDone;

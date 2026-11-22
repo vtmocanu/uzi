@@ -122,8 +122,9 @@ func saveCrossCheckPinsTx(ctx context.Context, q *store.Queries, patches []store
 // crossCheckPinSettings returns the four pin cells and, as second and third values, the lead
 // template's Codex pin (template_codex_model) and Claude pin (template_model) from the same rows: the LATERAL
 // lead/orchestrator selection is the one rule, identical on every row, so the first
-// row carries it (invalid when there are no rows or no pin). The fourth value is the lead
-// template's raw Claude effort (template_effort), unfiltered; invalid when there are no rows.
+// row carries it (invalid when there are no rows or no pin). The fourth and fifth values are the
+// lead template's raw Claude effort (template_effort) and Codex effort (template_codex_effort),
+// unfiltered; invalid when unset or there are no rows.
 func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, pgtype.Text, pgtype.Text, pgtype.Text, pgtype.Text, error) {
 	rows, err := h.q.ListUserCrossCheckPins(ctx, userID)
 	if err != nil {
