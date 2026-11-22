@@ -17,7 +17,7 @@ import (
 )
 
 // Bounds the repo_issue_tracker_states and repo_issue_tracker_column_states CHECKs
-// (migration 00504) enforce on every stored name, and the most columns one mapping may
+// (migration 00508) enforce on every stored name, and the most columns one mapping may
 // carry (the board's own column cap).
 const (
 	maxStateNameLen     = 200
@@ -192,7 +192,7 @@ func (s *Service) SetStateMapping(ctx context.Context, userID, repoID uuid.UUID,
 	return in, nil
 }
 
-// validStateName holds a State name to what migration 00504 checks (1 to 200 characters, no
+// validStateName holds a State name to what migration 00508 checks (1 to 200 characters, no
 // control character) and to the rule ListStates applies (issuetracker.StateNameProblem: no
 // invisible, blank-filler or variation-selector character). A brace is allowed: a State is
 // written by id and never goes into a query.
@@ -204,7 +204,7 @@ func validStateName(name string) bool {
 // validColumnLabel holds a board column label to the rule a linked repo's ConfigureColumns
 // applies (issuetracker.LabelNameProblem: at most 200 bytes, no brace, no invisible,
 // blank-filler or variation-selector character), which is stricter than the 1 to 200
-// character CHECK of migration 00504.
+// character CHECK of migration 00508.
 func validColumnLabel(name string) bool { return !issuetracker.LabelNameProblem(name) }
 
 // validateMappingShape is the part of the validation that needs no issue tracker read:

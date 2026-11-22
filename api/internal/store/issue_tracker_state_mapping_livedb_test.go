@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// issue_tracker_state_mapping_livedb_test.go proves migration 00504 (PRD #4173 M5) and its
+// issue_tracker_state_mapping_livedb_test.go proves migration 00508 (PRD #4173 M5) and its
 // queries against a real Postgres on an isolated database: the name and pair CHECKs, the
 // one-column-per-State uniqueness, the cascades, the owner-and-linked scoping of the upsert
 // and the lock, the resolver row's new columns, the prune and the issues column.
