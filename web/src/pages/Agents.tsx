@@ -4,7 +4,7 @@
 // admins additionally toggle which builtin/global templates are global defaults.
 // Anyone can author a private ("Mine") agent; admins can also publish globals.
 
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
@@ -92,6 +92,10 @@ export function Agents() {
   // keyed by allocVersion + viewer: a response is shown only for the allocations
   // and user it was requested for. allocVersion bumps on every successful PUT.
   const [allocVersion, setAllocVersion] = useState(0);
+  const viewerRef = useRef(userId);
+  useEffect(() => {
+    viewerRef.current = userId;
+  }, [userId]);
   const [personal, setPersonal] = useState<{
     forVersion: number;
     forUserId: string;
@@ -144,6 +148,7 @@ export function Agents() {
   // Replace-set writes: the PUT fully replaces the half it carries, so each
   // toggle recomputes the whole set from current state and changes just one entry.
   const setMyOverride = async (id: string, enabled: boolean) => {
+    const initiator = userId;
     setBusy(true);
     setError("");
     setNotice("");
@@ -152,6 +157,9 @@ export function Agents() {
         .filter((a) => a.id === id || a.my_override !== null)
         .map((a) => ({ template_id: a.id, enabled: a.id === id ? enabled : (a.my_override as boolean) }));
       const { templates: next } = await api.setTemplateAllocations({ my_overrides });
+      // The viewer changed while the PUT was in flight: its response belongs to
+      // the previous viewer and must not replace the new viewer's allocations.
+      if (viewerRef.current !== initiator) return;
       setAllocations(next);
       setAllocVersion((v) => v + 1);
     } catch (err) {
@@ -162,6 +170,7 @@ export function Agents() {
   };
 
   const setGlobalDefault = async (id: string, on: boolean) => {
+    const initiator = userId;
     setBusy(true);
     setError("");
     setNotice("");
@@ -171,6 +180,9 @@ export function Agents() {
         .filter((a) => (a.id === id ? on : a.global_default))
         .map((a) => a.id);
       const { templates: next } = await api.setTemplateAllocations({ global_default_ids });
+      // The viewer changed while the PUT was in flight: its response belongs to
+      // the previous viewer and must not replace the new viewer's allocations.
+      if (viewerRef.current !== initiator) return;
       setAllocations(next);
       setAllocVersion((v) => v + 1);
     } catch (err) {

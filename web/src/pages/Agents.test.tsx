@@ -496,6 +496,54 @@ describe("Agents page personalized lead line (#3262)", () => {
     expect((screen.getByLabelText("Include lead in my runs") as HTMLInputElement).disabled).toBe(false);
   });
 
+  it("ignores an allocation PUT that resolves after the viewer changed", async () => {
+    const tmpls = [
+      tmpl({ id: "b-lead", name: "lead", scope: "builtin" }),
+      tmpl({ id: "b-coder", name: "coder", scope: "builtin" }),
+    ];
+    const allocsA = [
+      alloc({ id: "b-lead", name: "lead", scope: "builtin" }),
+      alloc({ id: "b-coder", name: "coder", scope: "builtin" }),
+    ];
+    const allocsB = [
+      alloc({ id: "b-lead", name: "lead", scope: "builtin", effective: false, my_override: false }),
+      alloc({ id: "b-coder", name: "coder", scope: "builtin", effective: true, my_override: true }),
+    ];
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: tmpls });
+    mockApi.getTemplateAllocations
+      .mockResolvedValueOnce({ templates: allocsA })
+      .mockResolvedValueOnce({ templates: allocsB });
+    const putA = deferred<{ templates: TemplateAllocation[] }>();
+    mockApi.setTemplateAllocations.mockImplementationOnce(() => putA.promise);
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    const view = renderPage();
+    await screen.findByRole("link", { name: "lead" });
+    await act(async () => { fireEvent.click(screen.getByLabelText("Include coder in my runs")); });
+    expect(mockApi.setTemplateAllocations).toHaveBeenCalledTimes(1);
+
+    mockUseAuth.mockReturnValue({ user: { ...MEMBER, id: "u-other" } } as ReturnType<typeof useAuth>);
+    view.rerender(<MemoryRouter><Agents /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((screen.getByLabelText("Include coder in my runs") as HTMLInputElement).checked).toBe(true));
+
+    // A's PUT lands late with A's rows (coder switched off).
+    await act(async () => {
+      putA.resolve({ templates: allocsA.map((a) => (a.id === "b-coder" ? { ...a, effective: false, my_override: false } : a)) });
+    });
+    expect((screen.getByLabelText("Include coder in my runs") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Include lead in my runs") as HTMLInputElement).checked).toBe(false);
+
+    // B's next toggle sends B's set, not A's.
+    mockApi.setTemplateAllocations.mockResolvedValueOnce({ templates: allocsB });
+    await act(async () => { fireEvent.click(screen.getByLabelText("Include lead in my runs")); });
+    expect(mockApi.setTemplateAllocations).toHaveBeenLastCalledWith({
+      my_overrides: [
+        { template_id: "b-lead", enabled: true },
+        { template_id: "b-coder", enabled: true },
+      ],
+    });
+  });
+
   it("shows no personal line or note when the list fails to load", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
     mockApi.listAgentTemplates.mockRejectedValue(new Error("list failed"));
