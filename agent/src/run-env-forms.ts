@@ -78,10 +78,10 @@ function usable(forms: readonly string[]): string[] {
 /** The value as a file may hold it: as given, with its trailing line breaks stripped (a command
  *  substitution drops them, and a token often carries one it was never meant to), and, for a multi-line
  *  value, with every line break normalized to LF (a checkout normalizes CRLF), with and without the trailing
- *  line breaks. */
+ *  line breaks. A variant shorter than {@link MIN_SECRET_LEN} is dropped, so it derives no encoded form. */
 function valueVariants(value: string): string[] {
   const lf = value.replace(/\r\n?/g, "\n");
-  return [...new Set([value, value.replace(/[\r\n]+$/, ""), lf, lf.replace(/\n+$/, "")])].filter((v) => v.length > 0);
+  return [...new Set([value, value.replace(/[\r\n]+$/, ""), lf, lf.replace(/\n+$/, "")])].filter((v) => v.length >= MIN_SECRET_LEN);
 }
 
 function variantForms(value: string): string[] {

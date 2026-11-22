@@ -377,6 +377,27 @@ describe("run variable scan: preserved_patch", () => {
       assert.ok(!(s.body.failure_reason ?? "").includes(pat), "the outbound reason carries no registered secret");
       assert.ok((s.body.failure_reason ?? "").includes("***REDACTED***"), "the secret is masked in place");
     }
+
+    // A long path puts the secret across the display cut (the quoted path is cut to 79 characters, and the
+    // secret starts at character 69 of it): no prefix of the secret may survive in the reason or the status.
+    const longClaim = gitlabClaim(iid++, { config: GUARD, secrets: withVars() as never });
+    const longPath = `.forgejo/workflows/${"y".repeat(49)}${pat}.yml`;
+    const longExec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, longPath, "name: ci\n");
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(longExec, fakeGitlab().gitlab).execute(longClaim);
+    const longFailed = api.states.filter((s) => s.runId === longClaim.run_id && s.body.status === "failed");
+    assert.ok(longFailed.length > 0, "the guard refused the long-path run");
+    const outbound = [...longFailed.map((s) => s.body.failure_reason ?? ""), JSON.stringify(api.messages(longClaim.run_id))];
+    for (const text of outbound) {
+      for (let i = 0; i + 8 <= pat.length; i++) {
+        assert.ok(!text.includes(pat.slice(i, i + 8)), `a fragment of the secret survives: ${pat.slice(i, i + 8)}`);
+      }
+    }
+    assert.match(longFailed[0]!.body.failure_reason ?? "", /CI-config guard/);
   });
 
   it("withholds a patch carrying the base64 form", async () => {

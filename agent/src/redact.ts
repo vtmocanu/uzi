@@ -96,9 +96,9 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
       return out;
     };
   }
+  const findEach = spansOfEach(list);
   return (s) => {
-    let out = s;
-    for (const secret of list) out = out.split(secret).join(REDACTED);
+    let out = replaceSpans(s, findEach(s));
     if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, spansOfEach(visible));
     return out;
   };

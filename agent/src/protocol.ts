@@ -3404,7 +3404,7 @@ export interface StateRequest {
    *  cannot push, so the run fails early with `fail_origin: "workflow_scope_missing"`
    *  instead of face-planting into the push rejection and discarding the work. Additive +
    *  optional and carried ONLY on that `failed` report (worker→api); the worker already
-   *  secret-scrubs and size-caps it (git.workflowScopeDiff + redactText), and the server
+   *  secret-scrubs it (redactText) and then size-caps it (capReviewDiff in scanGatedPatch), and the server
    *  clamps it again before storing. Absent on every other report. */
   preserved_patch?: string;
   /** issue #559 M2: the worker-provided wake-guard watermark, sent ONLY on the

@@ -12104,7 +12104,7 @@ export class RunRunner {
       if (ciConfigGuardReported) return;
       ciConfigGuardReported = true;
       const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
-      const reason = composeCIConfigGuardReason(paths, patch !== undefined);
+      const reason = composeCIConfigGuardReason(paths === null ? null : paths.map((p) => redactText(p)), patch !== undefined);
       batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
       runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
       await closeBatcher();
@@ -23382,7 +23382,7 @@ export class RunRunner {
     const changed = await this.git.changedFilesNoRenames(barePath, sha);
     const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
     if (flagged !== null && flagged.length === 0) return "clear";
-    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
+    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map((p) => displayGuardPath(flight.redactText(p))).join(", ") +
       (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
     this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
       `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });

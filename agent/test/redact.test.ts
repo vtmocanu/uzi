@@ -43,6 +43,13 @@ describe("makeTextRedactor", () => {
     );
   });
 
+  it("redacts two secrets that overlap in the text in full, whichever is listed first", () => {
+    const text = "x alphaalpha1234betabetabeta y";
+    assert.strictEqual(makeTextRedactor(["alphaalpha1234", "1234betabetabeta"])(text), `x ${REDACTED} y`);
+    assert.strictEqual(makeTextRedactor(["1234betabetabeta", "alphaalpha1234"])(text), `x ${REDACTED} y`);
+    assert.strictEqual(makeTextRedactor(["alphaalpha1234", "1234betabetabeta"])("a alphaalpha1234 b 1234betabetabeta c"), `a ${REDACTED} b ${REDACTED} c`);
+  });
+
   it("is an identity when no usable secret is supplied", () => {
     const redact = makeTextRedactor([undefined, null, "", "short"]);
     assert.strictEqual(redact(`keeps ${TOKEN}`), `keeps ${TOKEN}`);

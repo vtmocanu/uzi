@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { createLogger } from "../src/log.js";
-import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
 import { runEnvRedactionForms, runEnvScanNeedles } from "../src/run-env-forms.js";
 import { textHitVariables } from "../src/run-env-scan.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
@@ -66,6 +66,20 @@ describe("whole-value encodings are redacted and found", () => {
       assert.ok(runEnvRedactionForms([secretVar("SVC_PASSWORD", value)], []).some((f) => text.includes(f)), `alignment ${n}`);
       assert.ok(redact(text).includes("***REDACTED***"), `redacted at alignment ${n}`);
     }
+  });
+});
+
+describe("a variant of the value shorter than the redaction floor registers no form", () => {
+  it("an 8-character value whose line break-stripped variant has 7 characters derives forms from the whole value only", () => {
+    const short = "a b&c=d";
+    const forms = runEnvRedactionForms([secretVar("SHORT_VALUE", `${short}\n`)], []);
+    const seven = [...providerKeyForms(short), Buffer.from(short).toString("base64").slice(0, 9)].filter((f) => f.length >= 8);
+    assert.ok(seven.length > 0, "the fixture has encoded forms of the 7-character variant that reach the floor");
+    for (const f of seven) assert.ok(!forms.includes(f), `a form of the 7-character variant is registered: ${f}`);
+    assert.ok(forms.includes(`${short}\n`), "the whole value is registered");
+    assert.ok(forms.includes(encodeURIComponent(`${short}\n`)), "its own percent form is registered");
+    const scan = runEnvScanNeedles([secretVar("SHORT_VALUE", `${short}\n`)], []);
+    for (const f of seven) assert.ok(!scan[0]!.forms.includes(f), `a form of the 7-character variant is a needle: ${f}`);
   });
 });
 
@@ -159,46 +173,81 @@ describe("the largest claim redacts in bounded time", () => {
   const limits = JSON.parse(fs.readFileSync(new URL("../../fixtures/run-env/claim-limits.json", import.meta.url), "utf8")) as {
     max_run_env_entries: number; max_run_env_total_bytes: number; max_redact_entries: number; max_redact_total_bytes: number;
   };
-  const value = (seed: string, bytes: number, lineLen: number): string => {
+  const value = (seed: string, bytes: number, lineLen: number, eol = "\n", trailing = false): string => {
     let text = "";
     for (let i = 0; text.length < bytes; i++) text += crypto.createHash("sha512").update(`${seed}-${i}`).digest("base64").replace(/=+$/, "");
     text = text.slice(0, bytes);
-    if (lineLen === 0) return text;
-    return text.match(new RegExp(`.{1,${lineLen}}`, "g"))!.join("\n");
+    const body = lineLen === 0 ? text : text.match(new RegExp(`.{1,${lineLen}}`, "g"))!.join(eol);
+    return trailing ? body + eol : body;
   };
-  // The most forms a claim can register: every value of the claim split into the shortest registrable lines
-  // (8 characters and a line break: 9 bytes per line, one form per line) plus the whole-value forms.
-  const MAX_FORMS = Math.ceil((limits.max_run_env_total_bytes + limits.max_redact_total_bytes) / 9) + 10 * (limits.max_run_env_entries + limits.max_redact_entries);
+  const firstLine = (v: string): string => v.split(/\r?\n/)[0]!;
+  // The most forms a claim can register, per entry and per line.
+  // Per entry: a value has at most 4 variants (as given, trailing breaks stripped, breaks normalized to LF, and
+  // that stripped), and each variant has at most 8 key forms (raw, JSON, JSON with escaped slashes, HTML-safe in
+  // two hex cases, percent in two hex cases, percent with plus for a space) and 6 base64 forms (3 alignments, in
+  // two alphabets): 4 * (8 + 6) = 56. The scan needles add the diff-shaped forms of a multi-line value: 3 prefixes
+  // with 2 line breaks = 6, so 62 per entry.
+  // Per line: a line is registered raw and JSON-escaped (2 forms), and the shortest registrable line is 8
+  // characters and a line break (9 bytes), so a value of B bytes has at most B / 9 lines.
+  const ENTRIES = limits.max_run_env_entries + limits.max_redact_entries;
+  const TOTAL_BYTES = limits.max_run_env_total_bytes + limits.max_redact_total_bytes;
+  const MAX_FORMS = 2 * Math.ceil(TOTAL_BYTES / 9) + 56 * ENTRIES;
+  const MAX_NEEDLE_FORMS = 62 * ENTRIES;
 
-  for (const [label, lineLen] of [["single-line", 0], ["64-column", 64], ["9-column", 9]] as const) {
+  const cases: Array<[string, number, string, boolean]> = [
+    ["single-line", 0, "\n", false],
+    ["64-column", 64, "\n", false],
+    ["9-column", 9, "\n", false],
+    ["64-column CRLF with a trailing CRLF", 64, "\r\n", true],
+    ["9-column CRLF with a trailing CRLF", 9, "\r\n", true],
+  ];
+  for (const [label, lineLen, eol, trailing] of cases) {
     it(`${label} values: forms stay under the bound and a 1 MiB text redacts in under 5 s`, () => {
       const live = Array.from({ length: limits.max_run_env_entries }, (_, i) =>
-        secretVar(`LIVE_${i}`, value(`live-${i}`, Math.floor(limits.max_run_env_total_bytes / limits.max_run_env_entries), i % 5 === 0 ? 0 : lineLen)));
+        secretVar(`LIVE_${i}`, value(`live-${i}`, Math.floor(limits.max_run_env_total_bytes / limits.max_run_env_entries), i % 5 === 0 ? 0 : lineLen, eol, trailing)));
       const old = Array.from({ length: limits.max_redact_entries }, (_, i) =>
-        retired(`OLD_${i}`, value(`old-${i}`, Math.floor(limits.max_redact_total_bytes / limits.max_redact_entries), i % 5 === 0 ? 0 : lineLen)));
+        retired(`OLD_${i}`, value(`old-${i}`, Math.floor(limits.max_redact_total_bytes / limits.max_redact_entries), i % 5 === 0 ? 0 : lineLen, eol, trailing)));
       const forms = runEnvRedactionForms(live, old);
-      assert.ok(forms.length < MAX_FORMS, `${forms.length} forms`);
+      assert.ok(forms.length < MAX_FORMS, `${forms.length} forms, bound ${MAX_FORMS}`);
       const needleForms = runEnvScanNeedles(live, old).reduce((n, x) => n + x.forms.length, 0);
-      assert.ok(needleForms < 16 * (limits.max_run_env_entries + limits.max_redact_entries), `${needleForms} needle forms`);
+      assert.ok(needleForms < MAX_NEEDLE_FORMS, `${needleForms} needle forms, bound ${MAX_NEEDLE_FORMS}`);
 
-      const planted = old[7]!.value;
-      const text = `${"ordinary output line with no secret 0123456789\n".repeat(Math.ceil((1024 * 1024) / 46))}${planted.split("\n")[0]}\n`;
+      const planted = firstLine(old[7]!.value);
+      const text = `${"ordinary output line with no secret 0123456789\n".repeat(Math.ceil((1024 * 1024) / 46))}${planted}\n`;
       const started = performance.now();
       const out = makeTextRedactor(forms)(text);
       const elapsed = performance.now() - started;
       assert.ok(elapsed < 5000, `redacting took ${elapsed.toFixed(0)} ms`);
-      assert.ok(!out.includes(planted.split("\n")[0]!), "the planted form is masked");
+      assert.ok(!out.includes(planted), "the planted form is masked");
 
       const log = createLogger("error");
       for (const f of forms) log.addSecret(f);
-      const line = JSON.stringify({ msg: "x".repeat(200), planted: planted.split("\n")[0] });
+      const line = JSON.stringify({ msg: "x".repeat(200), planted });
       const logStarted = performance.now();
       const scrubbed = log.redactDiagnostic!(line);
       const logElapsed = performance.now() - logStarted;
       assert.ok(logElapsed < 5000, `scrubbing one log line took ${logElapsed.toFixed(0)} ms`);
-      assert.ok(!scrubbed.includes(planted.split("\n")[0]!));
+      assert.ok(!scrubbed.includes(planted));
     });
   }
+
+  it("dense PEM armor text against many PEM-valued secrets that share the armor key redacts in under 5 s", () => {
+    // Every PEM value begins with the same 8-unit key ("-----BEG"), so one table bucket holds every value's
+    // whole-value forms and the text is dense with armor lines that hit that bucket at nearly every position.
+    const count = limits.max_run_env_entries;
+    const pems = Array.from({ length: count }, (_, i) => secretVar(`PEM_${i}`, pem(`dense-${i}`)));
+    const forms = runEnvRedactionForms(pems, []);
+    const armor = `${BEGIN}\n${END}\n`;
+    const text = armor.repeat(Math.ceil((1024 * 1024) / armor.length));
+    const started = performance.now();
+    const out = makeTextRedactor(forms)(text);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 5000, `redacting dense armor took ${elapsed.toFixed(0)} ms`);
+    assert.equal(out, text, "armor is public text and stays");
+    const planted = `${text}${pem("dense-3")}\n`;
+    const plantedOut = makeTextRedactor(forms)(planted);
+    for (const line of bodyLines("dense-3")) assert.ok(!plantedOut.includes(line), "a planted body line is masked");
+  });
 
   it("the indexed redactor agrees with the per-secret redactor on a mixed text", () => {
     const secrets = Array.from({ length: 80 }, (_, i) => `secret-number-${String(i).padStart(3, "0")}-value`);
