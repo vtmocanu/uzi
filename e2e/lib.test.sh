@@ -1757,8 +1757,10 @@ fixture_archive_receipt() {
       && "$output" == *'read_rc=28'* ]] \
       || fail "timeout diagnostic omitted evidence: $output"
     # Polls at 0s and 1s; at the 2s deadline no receipt SQL starts at all.
-    [ "$(cat "$SEQ_DIR/receipt-polls")" -eq 2 ] || fail "receipt SQL started at or past the deadline: $(cat "$SEQ_DIR/receipt-polls") polls"
-    printf '%s\n' "$output"
+    [ "$(cat "$SEQ_DIR/receipt-polls")" -eq 2 ] || fail "expected exactly 2 receipt polls before the deadline: $(cat "$SEQ_DIR/receipt-polls")"
+    # A marker only this path prints: the failure message above embeds the helper's own
+    # output, so matching on any evidence text would let a missing conjunct read green.
+    echo 'receipt timeout evidence complete'
     return 1
   fi
   resolve_fixture_source_hold "$UUID" 1 "$budget" '2026-10-08T09:08:20Z'
@@ -1768,7 +1770,7 @@ custody_case "captured fixture waits for exact archive FINAL without discard" pa
 custody_case "captured fixture refuses mid-wait discard" fail 'unexpected disposition' fixture_archive_receipt discarded
 custody_case "captured fixture requires matching archive proof" fail 'lacks archive proof' fixture_archive_receipt no-proof
 custody_case "captured fixture preserves exact hold identity" fail 'changed identity' fixture_archive_receipt wrong-id
-custody_case "captured fixture timeout retains row worker and recreation log" fail 'recreated agent log tail' fixture_archive_receipt timeout
+custody_case "captured fixture timeout retains row worker and recreation log" fail 'receipt timeout evidence complete' fixture_archive_receipt timeout
 custody_case "capturing fixture that never settles times out on the shared deadline" fail 'still capturing after 2s' fixture_archive_receipt capturing-timeout
 custody_case "capturing fixture that becomes available waits for archive FINAL" pass 'fixture archive custody receipt:' fixture_archive_receipt capturing-available
 
