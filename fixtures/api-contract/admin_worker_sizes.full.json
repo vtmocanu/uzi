@@ -1,0 +1,73 @@
+{
+  "sizes": [
+    {
+      "name": "x",
+      "cpu_request_millicores": 1,
+      "cpu_limit_millicores": 1,
+      "memory_request_mib": 1,
+      "memory_limit_mib": 1,
+      "data_gib": 1,
+      "dind_data_gib": 1,
+      "display_order": 1,
+      "builtin": true,
+      "customized": true,
+      "shipped": {
+        "cpu_request_millicores": 1,
+        "cpu_limit_millicores": 1,
+        "memory_request_mib": 1,
+        "memory_limit_mib": 1,
+        "data_gib": 1,
+        "dind_data_gib": 1
+      },
+      "updated_at": "2020-01-02T03:04:05Z"
+    }
+  ],
+  "ceilings": {
+    "cpu_limit_millicores": {
+      "value": 1,
+      "chart_path": "x"
+    },
+    "memory_limit_mib": {
+      "value": 1,
+      "chart_path": "x"
+    },
+    "data_gib": {
+      "value": 1,
+      "chart_path": "x"
+    },
+    "dind_data_gib": {
+      "value": 1,
+      "chart_path": "x"
+    },
+    "dind_overridden": true,
+    "enabled_tiers": [
+      "x"
+    ]
+  },
+  "editable": true,
+  "read_only_reason": "x",
+  "read_only_code": "x",
+  "advisories": [
+    {
+      "size": "x",
+      "tier": "x",
+      "kind": "x",
+      "field": "x",
+      "message": "x"
+    }
+  ],
+  "max_sizes": 1,
+  "refusals": [
+    {
+      "size": "x",
+      "worker_id": "x",
+      "worker_name": "x",
+      "kind": "x",
+      "reason": "x",
+      "reported_at": "2020-01-02T03:04:05Z"
+    }
+  ],
+  "refusal_totals": {
+    "x": 1
+  }
+}

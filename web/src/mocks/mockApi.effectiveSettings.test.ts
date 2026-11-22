@@ -9,6 +9,7 @@ import behavior from "../../../fixtures/api-contract/effective_settings.behavior
 import { MODEL_SETTING_SOURCE_LABELS } from "../lib/modelSettings";
 import { RECORDED_EFFECTIVE_SCENARIOS } from "./data/effectiveSettings";
 import { mockApi } from "./mockApi";
+import { templates } from "./mockApi/agents";
 
 function installStorage(): void {
   const m = new Map<string, string>();
@@ -141,6 +142,79 @@ describe("getEffectiveSettings", () => {
       expect(await mockApi.getEffectiveSettings()).toEqual(behavior.scenarios[0].get);
     } finally {
       await mockApi.putMySettings({ judge_runs_on: null });
+    }
+  });
+
+  // Issue #3258 N3: the recordings carry no lead-template effort; a delivered mock lead
+  // template's effort is applied at response time, as leadEffortSettingCell derives it.
+  it("shows a delivered lead template's effort with source template when the preference is unset", async () => {
+    // The demo ships no lead row and "lead" is reserved at create, so seed a builtin one directly.
+    const template = {
+      ...templates[0]!, id: "b-lead-3258", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: null, codex_effort: "high",
+    };
+    templates.push(template);
+    try {
+      await mockApi.setTemplateAllocations({ my_overrides: [{ template_id: template.id, enabled: true }] });
+      const got = await mockApi.getEffectiveSettings();
+      const worker = got.efforts.filter((c) => c.setting === "worker_effort");
+      expect(worker.find((c) => c.harness === "codex")).toMatchObject({
+        effort: null, default_effort: "high", default_source: "template",
+        resolved_effort: "high", source: "template", mode: "explicit",
+      });
+      const recorded = behavior.scenarios[0].get.efforts.find((c) => c.setting === "worker_effort" && c.harness === "claude");
+      expect(worker.find((c) => c.harness === "claude")).toEqual(recorded);
+      expect(MODEL_SETTING_SOURCE_LABELS.some((l) => l.field === "effort" && l.token === "template")).toBe(true);
+    } finally {
+      await mockApi.setTemplateAllocations({ my_overrides: [] });
+      templates.splice(templates.indexOf(template), 1);
+    }
+    expect(await mockApi.getEffectiveSettings()).toEqual(behavior.scenarios[0].get);
+  });
+
+  it("keeps the recorded resolution when a preference is set, naming the template only as the default", async () => {
+    const template = {
+      ...templates[0]!, id: "b-lead-3258b", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: null, codex_effort: "high",
+    };
+    templates.push(template);
+    const recorded = behavior.scenarios[0].get.efforts.find((c) => c.setting === "worker_effort" && c.harness === "codex")!;
+    try {
+      await mockApi.setTemplateAllocations({ my_overrides: [{ template_id: template.id, enabled: true }] });
+      for (const pref of ["low", "runtime"]) {
+        await mockApi.putMySettings({ default_codex_effort: pref });
+        const got = await mockApi.getEffectiveSettings();
+        const codex = got.efforts.find((c) => c.setting === "worker_effort" && c.harness === "codex");
+        expect(codex).toEqual({ ...recorded, default_effort: "high", default_source: "template" });
+      }
+    } finally {
+      await mockApi.putMySettings({ default_codex_effort: null });
+      await mockApi.setTemplateAllocations({ my_overrides: [] });
+      templates.splice(templates.indexOf(template), 1);
+    }
+  });
+
+  it.each(["claude", "codex"] as const)("%s planning effort inherits the lead template unless pinned", async (harness) => {
+    const template = {
+      ...templates[0]!, id: "b-lead-planning-effort", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: harness === "claude" ? "low" : null, codex_effort: harness === "codex" ? "low" : null,
+    };
+    templates.push(template);
+    try {
+      await mockApi.setTemplateAllocations({ my_overrides: [{ template_id: template.id, enabled: true }] });
+      const inherited = await mockApi.getEffectiveSettings();
+      expect(inherited.efforts.find(c => c.setting === "planning_effort" && c.harness === harness)).toMatchObject({
+        default_effort: "low", default_source: "template", resolved_effort: "low", source: "template",
+      });
+      await mockApi.putMySettings({ [`planning_${harness}_effort`]: "high" });
+      const pinned = await mockApi.getEffectiveSettings();
+      expect(pinned.efforts.find(c => c.setting === "planning_effort" && c.harness === harness)).toMatchObject({
+        default_effort: "low", default_source: "template", resolved_effort: "high", source: "user_planning_default",
+      });
+    } finally {
+      await mockApi.putMySettings({ [`planning_${harness}_effort`]: null });
+      await mockApi.setTemplateAllocations({ my_overrides: [] });
+      templates.splice(templates.indexOf(template), 1);
     }
   });
 

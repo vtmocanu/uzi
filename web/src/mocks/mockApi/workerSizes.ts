@@ -88,8 +88,26 @@ const REFUSALS: WorkerSizeRefusal[] = [{
   reported_at: "2026-11-18T14:20:00Z",
 }];
 
-function refusals(): WorkerSizeRefusal[] {
-  return REFUSALS.filter((r) => rows.some((row) => row.name === r.size));
+const byteOrder = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+// The api's per-size cap on refusal details; the totals count every refusal before it.
+const MAX_REFUSALS_PER_SIZE = 3;
+
+// The api's shape for the sizes the card can show: listed sizes only (the api may also return
+// unlisted sizes, which have no row), sorted by size, worker name, then id in code-unit order (Go's
+// byte order for ASCII names), at most three details per size, and per size the count before that cap.
+function refusals(): { refusals: WorkerSizeRefusal[]; refusal_totals: Record<string, number> } {
+  const listed = REFUSALS.filter((r) => rows.some((row) => row.name === r.size)).sort(
+    (a, b) => byteOrder(a.size, b.size) || byteOrder(a.worker_name, b.worker_name) || byteOrder(a.worker_id, b.worker_id),
+  );
+  const refusal_totals: Record<string, number> = {};
+  const kept: WorkerSizeRefusal[] = [];
+  for (const r of listed) {
+    const n = refusal_totals[r.size] ?? 0;
+    refusal_totals[r.size] = n + 1;
+    if (n < MAX_REFUSALS_PER_SIZE) kept.push(r);
+  }
+  return { refusals: kept, refusal_totals };
 }
 
 // Each field's unit, and the api's absolute cap per unit (api/internal/workersize/builtin),
@@ -237,16 +255,23 @@ export const workerSizesApi = {
       read_only_code: readOnly() ? READ_ONLY_CODE : null,
       advisories: advisories(),
       max_sizes: MAX_WORKER_SIZES,
-      refusals: refusals(),
+      ...refusals(),
     });
   },
-  // Both verbs are the api's one PUT: an existing name is edited, an absent one created.
+  // Both verbs are the api's one PUT. Without a precondition an existing name is edited and an
+  // absent one created (update); the create verb sends If-None-Match: * and so is create-only.
   updateAdminWorkerSize: async (name: string, spec: WorkerSizeSpec): Promise<AdminWorkerSizeWrite> => {
     requireAdmin();
     return delay(put(name, pick(spec)));
   },
   createAdminWorkerSize: async (name: string, spec: WorkerSizeSpec): Promise<AdminWorkerSizeWrite> => {
     requireAdmin();
+    refuseIfReadOnly();
+    if (!SIZE_NAME_PATTERN.test(name)) throw new ApiError(400, INVALID_NAME);
+    if (rows.some((r) => r.name === name)) {
+      const error = `worker size ${name} already exists`;
+      throw new ApiError(412, error, { error, reason: "size_exists" });
+    }
     return delay(put(name, pick(spec)));
   },
   deleteAdminWorkerSize: async (name: string): Promise<{ deleted: string }> => {

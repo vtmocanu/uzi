@@ -188,11 +188,24 @@ so you can review both pins before approving changes to shared templates.
 Staged snapshots retain the raw `model` value for compatibility; snapshots
 staged before the upgrade use this mapping when applied too.
 
+### How a source's effort maps
+
+A source role may carry an optional `effort:` line. When it is exactly `low`,
+`medium`, `high`, `xhigh` or `max` it becomes the role's **Claude effort** pin;
+a source never sets a Codex effort. The staged review shows it as a **Claude
+effort** row, with **Default** when the source has none. Any other value is
+ignored: the role still stages with no effort pin, and the review flags the
+ignored value without showing it. Snapshots staged before this upgrade carry no
+effort and apply with none until the source's commit changes, since an
+unchanged commit is not re-parsed.
+
 ### What approving does
 
 - Approving a synced role replaces both stored model pins with the mapped
   values, including a locally set Codex pin. A pin left on **Default** by
-  the source clears the corresponding stored pin.
+  the source clears the corresponding stored pin. Effort pins follow the same
+  rule: the role's Claude effort is replaced with the source's (or cleared when
+  it has none), and a locally set Codex effort is cleared.
 - A synced role sharing a name with an existing **builtin** overrides that
   builtin's body — the synced body is what's shown and run, not the shipped
   default. It stays a builtin — still labeled and grouped as one, still
@@ -278,5 +291,6 @@ settings → Agent source** in the browser.
 
 `uzi admin agent-source status --json` includes derived `claude_model` and
 `codex_model` fields for staged roles, using the same mapping shown in the
-approval review. It keeps `model` as the raw source value for compatibility.
+approval review, plus the staged `effort`. It keeps `model` as the raw source
+value for compatibility.
 The command's text output is unchanged.

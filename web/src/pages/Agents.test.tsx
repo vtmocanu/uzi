@@ -128,6 +128,20 @@ describe("Agents page per-harness pins", () => {
     render(<MemoryRouter><Agents /></MemoryRouter>);
     expect(await screen.findByText(label)).toBeTruthy();
   });
+
+  it("shows effort pins under the models and nothing extra when unpinned (#3258)", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockResolvedValue({
+      templates: [
+        tmpl({ id: "b-coder", name: "coder", scope: "builtin", codex_effort: "high" }),
+        tmpl({ id: "b-tester", name: "tester", scope: "builtin" }),
+      ],
+    });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    expect(await screen.findByText("Claude effort: Default · Codex effort: high")).toBeTruthy();
+    expect(screen.getAllByText(/Claude effort:/)).toHaveLength(1);
+  });
 });
 
 describe("Agents page shadowed hint (PRD #18 M7/M8)", () => {

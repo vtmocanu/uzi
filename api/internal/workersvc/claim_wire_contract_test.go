@@ -172,7 +172,10 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 				PromptBody:  "you code",
 				Tools:       []string{"Read", "Edit"},
 				Model:       strptr("opus"),
-				Skills:      []string{"team-runbook", "team-kb"},
+				// Issue #3258: a delivered subagent effort pin. The unpinned reviewer below omits the
+				// key (omitempty), so an older worker's wire is unchanged.
+				Effort: strptr("high"),
+				Skills: []string{"team-runbook", "team-kb"},
 			},
 			{
 				Name:        "reviewer",
@@ -527,5 +530,29 @@ func TestClaimSkillsWireContractRoundTrips(t *testing.T) {
 	re = append(re, '\n')
 	if string(re) != string(raw) {
 		t.Errorf("golden file is not canonical for ClaimPayload; regenerate with UPDATE_GOLDEN=1")
+	}
+}
+
+// TestClaimAgentEffortWire pins issue #3258's claim addition: agents[].effort is present for a
+// pinned agent and ABSENT (not null) for an unpinned one.
+func TestClaimAgentEffortWire(t *testing.T) {
+	raw, err := json.Marshal(sampleClaimPayloadWithSkills())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		Agents []map[string]any `json:"agents"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Agents) != 2 {
+		t.Fatalf("agents = %d", len(body.Agents))
+	}
+	if got := body.Agents[0]["effort"]; got != "high" {
+		t.Errorf("coder effort = %v, want high", got)
+	}
+	if _, present := body.Agents[1]["effort"]; present {
+		t.Error("unpinned agent must omit the effort key")
 	}
 }

@@ -186,7 +186,7 @@ func TestCIArtifactsRevalidationErrorsFailClosed(t *testing.T) {
 				}
 				return r, nil
 			}
-			_, err := h.sched.fireOne(context.Background(), h.schedule())
+			_, err := h.sched.fireOne(context.Background(), h.schedule(), false)
 			if !errors.Is(err, want) || len(h.runs.ciTransitions) != 0 {
 				t.Fatalf("err=%v transitions=%v", err, h.runs.ciTransitions)
 			}
@@ -202,7 +202,7 @@ func TestCIArtifactsEmptyAndMalformedSelectors(t *testing.T) {
 			h := newCIHarness(t, ciRed("wf", 100, 0))
 			s := h.schedule()
 			s.CiArtifacts = []byte(raw)
-			_, err := h.sched.fireOne(context.Background(), s)
+			_, err := h.sched.fireOne(context.Background(), s, false)
 			invalid := raw == `{"bad":true}` || raw == `["["]`
 			if (err != nil) != invalid {
 				t.Fatalf("err=%v", err)

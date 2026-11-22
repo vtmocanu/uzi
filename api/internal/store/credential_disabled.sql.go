@@ -824,20 +824,22 @@ SET last_fire = $1,
       THEN jsonb_path_query_array(jsonb_build_array($1::jsonb) || recent_fires, '$[0 to 9]')
       ELSE recent_fires END,
     updated_at = now()
-WHERE id = $2 AND timing = 'once' AND status = 'active'
+WHERE id = $2 AND timing = 'once' AND status = 'active' AND fire_epoch = $3
 `
 
 type RecordScheduleHeldFireParams struct {
-	LastFire []byte    `json:"last_fire"`
-	ID       uuid.UUID `json:"id"`
+	LastFire  []byte    `json:"last_fire"`
+	ID        uuid.UUID `json:"id"`
+	FireEpoch int64     `json:"fire_epoch"`
 }
 
 // A one-time schedule held on credential_disabled (PRD #1732 D2) records why it waits: only
-// last_fire is written. next_fire_at, status and last_fired_at are untouched, so the row stays
+// last_fire and its recent_fires entry are written. next_fire_at, status and last_fired_at are untouched, so the row stays
 // due and fires once the credential is enabled. Guarded to a still-active one-time row so a
-// concurrent edit, disable or fire is never overwritten with a stale hold.
+// concurrent edit, disable or fire is never overwritten with a stale hold; fire_epoch (issue #4512)
+// additionally refuses a hold from an occurrence a re-arm has since replaced.
 func (q *Queries) RecordScheduleHeldFire(ctx context.Context, arg RecordScheduleHeldFireParams) (int64, error) {
-	result, err := q.db.Exec(ctx, recordScheduleHeldFire, arg.LastFire, arg.ID)
+	result, err := q.db.Exec(ctx, recordScheduleHeldFire, arg.LastFire, arg.ID, arg.FireEpoch)
 	if err != nil {
 		return 0, err
 	}

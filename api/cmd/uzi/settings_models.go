@@ -37,6 +37,7 @@ var modelSettingLabels = map[[2]string]string{
 	{"model", "template"}:                        "lead template",
 	{"model", "cross_check_pin"}:                 "checker pin",
 	{"model", "cross_check_worker_default"}:      "worker default",
+	{"effort", "template"}:                       "lead template",
 	{"effort", "cross_check_pin"}:                "checker pin",
 	{"effort", "cross_check_default"}:            "cross-check default",
 	{"model", "run_override"}:                    "this run",
@@ -73,6 +74,7 @@ var modelSettingLabels = map[[2]string]string{
 	{"planning_effort", "user_planning_default"}: "your choice",
 	{"planning_effort", "user_default"}:          "your choice",
 	{"planning_effort", "builtin"}:               "built-in",
+	{"planning_effort", "template"}:              "lead template",
 }
 
 // modelSettingSource labels a provenance token for a settings field. An unknown

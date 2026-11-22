@@ -14,14 +14,15 @@ describe("Codex TOML model projection", () => {
       assert.equal(parsed.ok, true);
       if (!parsed.ok) return;
       assert.deepEqual(parsed, { ok: true, template: {
-        name: "coder", description: "Works.", prompt_body: "Implement.", model,
+        name: "coder", description: "Works.", prompt_body: "Implement.", model, effort: "high",
       }, notes: [] });
       Object.freeze(parsed.template);
       const codex = filterRepoAgentModel(parsed.template, "codex");
       const claude = filterRepoAgentModel(parsed.template, "claude");
       assert.equal(codex.model, model);
       assert.equal(Object.hasOwn(claude, "model"), false);
-      assert.deepEqual(claude, { name: "coder", description: "Works.", prompt_body: "Implement." });
+      // The model projection leaves effort alone; the family-by-folder drop is projectForHarness's.
+      assert.deepEqual(claude, { name: "coder", description: "Works.", prompt_body: "Implement.", effort: "high" });
       assert.equal(parsed.template.model, model);
       assert.notEqual(codex, parsed.template);
     });
@@ -38,6 +39,41 @@ describe("Codex TOML model projection", () => {
       }
     });
   }
+
+  for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+    it(`keeps model_reasoning_effort ${level} as the template effort`, () => {
+      const parsed = parseCodexAgentFile(source(`model_reasoning_effort = "${level}"`), "file");
+      assert.deepEqual(parsed, { ok: true, template: {
+        name: "coder", description: "Works.", prompt_body: "Implement.", effort: level,
+      }, notes: [] });
+    });
+  }
+
+  for (const literal of ['"HIGH"', '"runtime"', '"ultra"', '" high"', '"high\\n"', "3", "true", '["high"]']) {
+    it(`drops an invalid model_reasoning_effort ${literal} with a note that never echoes it`, () => {
+      const parsed = parseCodexAgentFile(source(`model_reasoning_effort = ${literal}`), "file");
+      assert.deepEqual(parsed, { ok: true, template: {
+        name: "coder", description: "Works.", prompt_body: "Implement.",
+      }, notes: [{ name: "coder", reason: "effort_ignored" }] });
+      if (!parsed.ok) return;
+      const text = describeRepoAgentNote(parsed.notes[0]!);
+      assert.equal(text, 'repo agent "coder" declared an invalid effort; it follows the run\'s effort');
+    });
+  }
+
+  it("treats an empty model_reasoning_effort as inherit, without a note", () => {
+    const parsed = parseCodexAgentFile(source('model_reasoning_effort = ""'), "file");
+    assert.deepEqual(parsed, { ok: true, template: {
+      name: "coder", description: "Works.", prompt_body: "Implement.",
+    }, notes: [] });
+  });
+
+  it("describes an effort note with its file clause only when a file is present", () => {
+    assert.equal(
+      describeRepoAgentNote({ name: "coder", reason: "effort_ignored", file: "coder-file" }),
+      'repo agent "coder" (file "coder-file") declared an invalid effort; it follows the run\'s effort',
+    );
+  });
 
   const hostile: { literal: string; raw?: string }[] = [
     ...["1", "1.5", "true", "[]", '["gpt-6-astra"]', '{ pin = "gpt-6-astra" }',

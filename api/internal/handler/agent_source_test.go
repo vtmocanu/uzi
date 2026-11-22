@@ -89,6 +89,20 @@ func TestStagedToDTOBodySanitizedFlag(t *testing.T) {
 	}
 }
 
+// Issue #3258: the review panel shows the effort apply would store (trimmed exact level),
+// and nothing for a value apply would refuse.
+func TestStagedToDTOEffortMatchesApply(t *testing.T) {
+	for raw, want := range map[string]string{"high": "high", " high ": "high", "": "", "HIGH": "", "SECRET": "", "runtime": ""} {
+		roles, err := json.Marshal([]agentsource.StagedRole{{Name: "coder", OK: true, Effort: raw, PromptBody: "b\n"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := stagedToDTO(store.AgentSourceStaged{Roles: roles}, "").Roles[0].Effort; got != want {
+			t.Errorf("effort %q shown as %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestStagedToDTODerivedModelPins(t *testing.T) {
 	for _, tc := range []struct {
 		name, raw, model, claude, codex string

@@ -34,12 +34,12 @@ func TestScheduleOriginRunsStampSchedulePinLiveDB(t *testing.T) {
 	model := "opus"
 	t.Run("CreateScheduledRun", func(t *testing.T) {
 		fx := newOverflowFix(t)
-		with, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, &model, false, nil, nil, nil)
+		with, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, &model, false, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		wantPair(t, "with model", mustRun(t, fx.env, with.ID), "opus", "schedule_pin")
-		without, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, nil, false, nil, nil, nil)
+		without, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, nil, false, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -51,12 +51,12 @@ func TestScheduleOriginRunsStampSchedulePinLiveDB(t *testing.T) {
 	})
 	t.Run("CreateScheduledAutopilotRun", func(t *testing.T) {
 		fx := newOverflowFix(t)
-		with, err := fx.svc.CreateScheduledAutopilotRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, &model, false, nil, nil)
+		with, err := fx.svc.CreateScheduledAutopilotRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, &model, false, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		wantPair(t, "with model", mustRun(t, fx.env, with.ID), "opus", "schedule_pin")
-		without, err := fx.svc.CreateScheduledAutopilotRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, nil, false, nil, nil)
+		without, err := fx.svc.CreateScheduledAutopilotRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "d", nil, nil, nil, false, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

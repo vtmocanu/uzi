@@ -12,8 +12,8 @@ import (
 
 // Request cases of fixtures/lead-config/contract.json the current server claim cannot produce,
 // each with the reason. A case is either listed here or carries a `server` block; never both.
-// Phase never matters to the server today (no planning default is resolved), so the plan-phase
-// cases are not listed for their phase.
+// The server ships plan_phase when planning defaults apply; the cases pin that pair as well as
+// the implementation defaults.
 const (
 	reasonEffortlessBuiltin = "config ships default_effort_source builtin without default_effort; the server always ships the builtin level, only the owner's `runtime` choice ships no level (and then the source is user_default)"
 	reasonEmptyConfig       = "config is empty; the server always ships default_effort_source on a lead-lane claim"
@@ -80,7 +80,7 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 			got := resolveLeadSettings(LeadSettingsInput{
 				Harness: harness, RunModel: text(s.RunModel), RunModelSource: text(s.RunModelSource),
 				RunEffort: text(s.RunEffort), RunEffortSource: text(s.RunEffortSource),
-				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort),
+				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort), TemplateEffort: text(s.TemplateEffort),
 				PlanningModel: text(s.PlanningModel), PlanningEffort: text(s.PlanningEffort),
 			})
 

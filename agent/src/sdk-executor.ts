@@ -60,6 +60,7 @@ import {
 } from "./js-deps.js";
 import {
   applySubagentModelOverride,
+  fillSubagentEffort,
   assembleAgents,
   planTurnSubagents,
   selectSubagents,
@@ -1893,9 +1894,8 @@ export class SdkExecutor implements Executor {
     // keys feed the Agent guard's allow set and the delegation lines below.
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
-    const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
-    // `planAgents` holds copies (planTurnSubagents spreads each def), so this never reaches the
-    // own roster the implement phase selects from.
+    // Fill a copy from this phase; explicit effort pins remain unchanged.
+    const planAgents = fillSubagentEffort(planShaped ? planShaped.agents : planTurn.subagents, planRequest.effort);
     if (ctx.config?.override_subagent_model && planLeadModel) {
       applySubagentModelOverride(planAgents, planLeadModel);
     }
@@ -3128,19 +3128,21 @@ export class SdkExecutor implements Executor {
       // full survivor set, since a repo roster has no template rows to allocate
       // against. survivorNames is the filter in both cases, so a skill dropped by
       // the cap or a collision is unreachable either way.
-      const selectedSubagents = selectSubagents(
-        selection.source,
-        assembled.subagents,
-        ctx.repoAgents ?? [],
-        selection.exclusions,
-        survivorNames,
-        prepared.repoSurvivorNames,
+      // Template effort (N2/N5): fill from the lead's resolved effort on a copy; the
+      // `assembled.subagents` entries selectSubagents may return by reference stay untouched.
+      const selectedSubagents = fillSubagentEffort(
+        selectSubagents(
+          selection.source,
+          assembled.subagents,
+          ctx.repoAgents ?? [],
+          selection.exclusions,
+          survivorNames,
+          prepared.repoSurvivorNames,
+        ),
+        state.implementRequest.effort,
       );
-      // PRD #305: repo-source defs are freshly built from repo files here and were NOT
-      // touched by the own-roster override above; apply it so the flag covers the repo
-      // roster (the primary case: an auto-approved scheduled run resolves to the repo
-      // roster). Own-source defs alias assembled.subagents, which setup left untouched
-      // (the plan turn got its own copies), so this is where they take the IMPLEMENT lead model.
+      // PRD #305: apply the implementation model override to either source's copied roster.
+      // The plan roster used its own copy; effort pins and this phase's effort are preserved.
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
@@ -3168,8 +3170,8 @@ export class SdkExecutor implements Executor {
       // `assembled.subagents` — because the repo-source path's defs come from the repo
       // roster and are absent from `assembled.subagents`, so reusing the plan map would
       // miss every repo name and mislabel a write-capable repo subagent read-only.
-      // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
-      // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
+      // `selectedSubagents` is pre-strip on both sources (effort-filled copies of the assembled
+      // or freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
       drive.enableImplementationSignals();
       const implementConfig: ClaudeTurnConfig = {

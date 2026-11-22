@@ -471,6 +471,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			RunEffort:       run.Effort,
 			RunEffortSource: run.EffortSource,
 			LaneModel:       laneModel,
+			TemplateEffort:  leadTemplateEffort(templates, harness),
 		}
 		// Only lead-lane claims read planning defaults; errors fail the claim.
 		if leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
@@ -501,6 +502,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		defaultModel = pgconv.TextPtr(checkerResolution.Model)
 	}
 
+	// Issue #3258 N6: stored subagent effort pins ride the claim only to a worker advertising
+	// template_effort_v1. The withheld-pins feed line is recorded at the end of assembly, once no
+	// later refusal or isolation strip can make it misleading.
+	templateEffortSupported := slices.Contains(wkr.ProtocolCapabilities, capability.TemplateEffortV1)
+
 	// PRD #1551 M4 (D6): post-claim custom-Codex capability re-check. ClaimRun commits BEFORE
 	// assembleClaim runs (service.go), so the owner's Codex lane could have flipped to a CUSTOM
 	// (non-curated) id in the window between the claim's SQL gate and here. For an ordinary
@@ -516,12 +522,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, errCustomModelCapabilityMissing
 	}
 
-	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
-	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
+	// The run owner's per-user default reasoning effort (PRD #617). Ordinary lanes resolve NULL
+	// to the built-in medium; the lead lane also applies its template tier below the user's choice.
+	// An explicit level is carried and
 	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. A start-time
 	// run_override effort frozen onto the run (runs.effort, PRD #3250) wins over the owner's value
-	// through leadEffortFor; otherwise the owner's per-user value is the only source, except for a
+	// through leadEffortFor (or the lead-specific helper below), except for a
 	// checker child, which carries its frozen cross-check
 	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
 	// is always a canonical level (validated pin or high), never `runtime`, so it
@@ -538,7 +544,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
 	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
-	// ships leadEffortFor's value as DefaultEffort (nil for the owner's runtime default), so the
+	// ships leadEffortWithTemplate's value as DefaultEffort (nil for the owner's runtime default), so the
 	// value and its source come from one resolver.
 	var defaultModelSource, defaultEffortSource *string
 	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
@@ -553,7 +559,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		shippedEffort = eff
 	}
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
+		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortWithTemplate(harness, run.Effort, run.EffortSource, defaultEffort, leadTemplateEffort(templates, harness))
 		// PRD #3252: re-derive the plan pair over the same input with the late-read user effort; the
 		// precedence rule stays in resolvePlanPhase.
 		leadInput.UserEffort = defaultEffort
@@ -989,7 +995,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			AnthropicOAuthToken: string(anthropic),
 			Provider:            providerBinding,
 		},
-		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
+		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness, templateEffortSupported),
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{
@@ -1178,6 +1184,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	payload.PublicationResume = resume
 	if err := assertClaimSecretsExclusive(payload.Secrets); err != nil {
 		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
+	// Issue #3258 N6: last, so no refusal above and no isolation strip (payload.Agents empty)
+	// leaves a feed line naming pins the claim never carried.
+	if !templateEffortSupported && !isolated && len(payload.Agents) > 0 && hasWithheldTemplateEffort(templates, run.Harness) {
+		payload.LastSeq = s.recordTemplateEffortOmittedNote(ctx, run, payload.LastSeq)
 	}
 	return payload, nil
 }

@@ -779,3 +779,35 @@ func TestParseRejectsBadVersion(t *testing.T) {
 		t.Errorf("parse(version: 3) gave Version = %d, want 3", def.Version)
 	}
 }
+
+// TestParseAndRenderEffort pins PRD #3258 N8: a builtin may carry an optional
+// Claude-family `effort:` line; only the five exact levels parse, anything else
+// (blank, wrong case, runtime) is a parse error, and Render emits the pin after
+// model so a render-then-parse round trip keeps it. CodexEffort is never emitted.
+func TestParseAndRenderEffort(t *testing.T) {
+	mk := func(effort string) []byte {
+		return []byte("---\nname: example\ndescription: an example.\nmodel: sonnet\neffort: " + effort +
+			"\n---\n\nBody.\n")
+	}
+	for _, level := range EffortLevels {
+		def, err := parse(mk(level))
+		if err != nil {
+			t.Fatalf("parse(effort: %s) unexpected error: %v", level, err)
+		}
+		if def.Effort != level || def.CodexEffort != "" {
+			t.Fatalf("parse(effort: %s) gave Effort=%q CodexEffort=%q", level, def.Effort, def.CodexEffort)
+		}
+		if got := Render(def); string(got) != string(mk(level)) {
+			t.Errorf("render round trip for %s\n got: %q\nwant: %q", level, got, mk(level))
+		}
+	}
+	for _, bad := range []string{"", "HIGH", "runtime", " high", "ultra"} {
+		if _, err := parse(mk(bad)); err == nil {
+			t.Errorf("parse(effort: %q) returned nil error, want a rejection", bad)
+		}
+	}
+	codexOnly := Render(Definition{Name: "x", Description: "d.", CodexEffort: "high", PromptBody: "B.\n"})
+	if strings.Contains(string(codexOnly), "effort") {
+		t.Errorf("Render emitted a Codex effort: %q", codexOnly)
+	}
+}

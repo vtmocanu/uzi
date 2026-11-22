@@ -26,7 +26,7 @@ import type {
 } from "../src/codex/broker.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import type { CodexNotification } from "../src/codex/transport.js";
-import type { HarnessItem } from "../src/harness.js";
+import type { HarnessEffort, HarnessItem } from "../src/harness.js";
 
 // PRD #1171 (M3, milestone 2) — the synchronous child-thread delegation runner. Every
 // external effect is a FAKE: a scripted {@link ChildThreadController}, spy shell/file
@@ -197,6 +197,30 @@ describe("TOML model delegation delivery", () => {
       assert.equal(b.startSpecs.length, 1);
       assert.equal(b.startSpecs[0]!.model, pin === 'model = "gpt-6-luna"' ? "gpt-6-luna" : "gpt-6-astra");
       assert.equal(b.startSpecs[0]!.effort, "low");
+    }
+  });
+
+  it("delivers a TOML effort pin, and the request effort for an unpinned role, into StartChildTurnSpec", async () => {
+    for (const [pin, expected] of [['model_reasoning_effort = "high"', "high"], ["", "low"]] as const) {
+      const parsed = parseCodexAgentFile(
+        'name = "coder"\ndescription = "Works."\ndeveloper_instructions = "Implement."\n' + pin, "file",
+      );
+      assert.equal(parsed.ok, true);
+      if (!parsed.ok) return;
+      const plan = buildCodexRunPlan({
+        phase: "implement", prompt: "task", systemPrompt: "lead", signal: new AbortController().signal,
+        model: "gpt-6-astra", effort: "low", leadSkills: [],
+        agents: { coder: {
+          description: parsed.template.description, prompt: parsed.template.prompt_body,
+          ...(parsed.template.effort ? { effort: parsed.template.effort as HarnessEffort } : {}),
+          tools: { kind: "inherit" }, deniedTools: [], skills: [], toolServers: [],
+        } },
+      });
+      const controller = new FakeController({ notes: [] });
+      withNotes(controller, [turnCompletedNote(controller, "completed")]);
+      const b = makeRunner({ roles: new Map(plan.roles), controller });
+      assert.equal((await b.runner.run(delegReq())).ok, true);
+      assert.equal(b.startSpecs[0]!.effort, expected);
     }
   });
 });

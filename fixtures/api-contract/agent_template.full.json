@@ -4,6 +4,8 @@
   "description": "x",
   "model": "x",
   "codex_model": "x",
+  "effort": "x",
+  "codex_effort": "x",
   "tools": [
     "x"
   ],

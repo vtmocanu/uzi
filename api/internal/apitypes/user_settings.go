@@ -67,7 +67,7 @@ type UserSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
-	// SidebarMotion and EffectiveSidebarMotion mirror the animated-sidebar-icons opt-in
+	// SidebarMotion and EffectiveSidebarMotion mirror the animated-sidebar-icons choice
 	// (issue #4510): the raw choice (null = not chosen) and the resolved flag. Fidelity
 	// only; there is no CLI setter.
 	SidebarMotion          *bool `json:"sidebar_motion"`

@@ -3780,17 +3780,16 @@ Once retirement is on, you may see:
   proceed, answers `503` with `Retry-After: 1`. Nothing was created; retry. The
   pollers and issue schedules treat it the same way: the trigger is not used up
   and is tried again on the next pass. A sweep schedule that has started no run
-  in that fire is retried the same way; one that already started runs stops,
-  records the busy issue with the visible `consumer_gate_busy` reason
-  ("repository busy") and advances. A one-time sweep is then done; start the
-  skipped issue manually or explicitly re-fire the sweep as a new fire. A
-  recurring sweep considers it at its next fire. Later candidates were not
-  attempted. Resuming partial progress without replay or exceeding the original
-  cap needs the durable per-fire progress design deferred to
-  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
-  The final outcome gets a bounded write after a canceled wait, but advancement
-  is separate from run creation: a crash or failed advance can still leave the
-  schedule due and replay work.
+  in that fire is retried the same way. A recurring sweep that already started
+  runs stops, records the busy issue with the visible `consumer_gate_busy`
+  reason ("repository busy") and advances; it considers that issue at its next
+  fire. A scheduled one-time sweep that already started runs is not advanced:
+  it stays due and the next tick resumes the same fire from a durable per-fire
+  ledger, so it never re-starts an issue it already started and never exceeds
+  its original cap. The same holds after a crash or a failed advance. Later
+  candidates were not attempted in the interrupted tick. Run-now is a separate
+  manual fire that records no progress. See
+  [ADR-4007](../adr/4007-terminal-preservation.md) (T3a, #4512).
 - **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
   run start was in progress, so retirement kept the ref and tries again later.
 - **A potentially longer worker report.** Each shared-gate acquisition has a

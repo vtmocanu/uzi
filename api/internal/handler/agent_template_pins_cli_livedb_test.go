@@ -53,6 +53,7 @@ func pinsSeedTemplate(t *testing.T, pool *pgxpool.Pool, scope string, owner uuid
 
 type pinsRow struct {
 	model, codex         *string
+	effort, codexEffort  *string
 	desc, tools, prompt  string
 	customized           bool
 	updatedBy            *uuid.UUID
@@ -65,9 +66,9 @@ func pinsReadRow(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) pinsRow {
 	var r pinsRow
 	var origin *string
 	if err := pool.QueryRow(context.Background(),
-		`SELECT model, codex_model, description, tools::text, prompt_body, customized, updated_by, updated_at::text, created_at::text, name, scope, origin
+		`SELECT model, codex_model, effort, codex_effort, description, tools::text, prompt_body, customized, updated_by, updated_at::text, created_at::text, name, scope, origin
 		 FROM agent_templates WHERE id=$1`, id).
-		Scan(&r.model, &r.codex, &r.desc, &r.tools, &r.prompt, &r.customized, &r.updatedBy, &r.updatedAt, &r.createdAt, &r.name, &r.scope, &origin); err != nil {
+		Scan(&r.model, &r.codex, &r.effort, &r.codexEffort, &r.desc, &r.tools, &r.prompt, &r.customized, &r.updatedBy, &r.updatedAt, &r.createdAt, &r.name, &r.scope, &origin); err != nil {
 		t.Fatalf("read template row: %v", err)
 	}
 	if origin != nil {
@@ -220,7 +221,14 @@ func TestAgentTemplateModelPinsRejectionsWriteNothingLiveDB(t *testing.T) {
 		{"prompt_body", `{"prompt_body":"x"}`, "prompt_body"},
 		{"scope", `{"scope":"global"}`, "scope"},
 		{"user_id", `{"user_id":"` + uuid.NewString() + `"}`, "user_id"},
-		{"effort", `{"effort":"max"}`, "effort"},
+		{"effort is not a template effort", `{"effort":"runtime"}`, "effort"},
+		{"effort wrong case", `{"effort":"High"}`, "effort"},
+		{"effort unknown level", `{"effort":"extreme"}`, "effort"},
+		{"codex effort runtime", `{"codex_effort":"runtime"}`, "codex_effort"},
+		{"effort wrong type", `{"effort":5}`, "effort"},
+		{"codex effort wrong type", `{"codex_effort":true}`, "codex_effort"},
+		{"valid effort beside invalid codex effort", `{"effort":"high","codex_effort":"ultra"}`, "codex_effort"},
+		{"valid model beside invalid effort", `{"model":"opus","effort":"nope"}`, "effort"},
 		{"description", `{"description":"x"}`, "description"},
 		{"tools", `{"tools":["Read"]}`, "tools"},
 		{"valid pin beside unsupported field", `{"model":"opus","prompt_body":"x"}`, "prompt_body"},
@@ -259,6 +267,107 @@ func TestAgentTemplateModelPinsRejectionsWriteNothingLiveDB(t *testing.T) {
 		t.Fatalf("a rejected request wrote something:\nbefore %+v\nafter  %+v", before, after)
 	}
 	pinsAssertContentUnchanged(t, after)
+}
+
+// TestAgentTemplateEffortPinsSetResetLiveDB drives PRD #3258's CLI effort pins through the real
+// router: each lane alone, both lanes, clear with null, blank clears, an omitted key keeps, and a
+// pin write leaves customized, origin and the content columns untouched.
+func TestAgentTemplateEffortPinsSetResetLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	id := pinsSeedTemplate(t, pool, "user", user, strp("sonnet"), strp("gpt-6-sol"))
+
+	dto := pinsOKTemplate(t, pinsPut(router, uzc, id, `{"effort":"high"}`))
+	if pinStr(dto.Effort) != "high" || dto.CodexEffort != nil || pinStr(dto.Model) != "sonnet" || pinStr(dto.CodexModel) != "gpt-6-sol" {
+		t.Fatalf("after effort set: %+v", dto)
+	}
+	dto = pinsOKTemplate(t, pinsPut(router, uzc, id, `{"codex_effort":" xhigh "}`))
+	if pinStr(dto.Effort) != "high" || pinStr(dto.CodexEffort) != "xhigh" {
+		t.Fatalf("after codex effort set (padded value is trimmed): %+v", dto)
+	}
+	// Model and effort in one request; each lane is independent.
+	dto = pinsOKTemplate(t, pinsPut(router, uzc, id, `{"model":"opus","effort":"max","codex_model":"gpt-6-luna","codex_effort":"low"}`))
+	if pinStr(dto.Model) != "opus" || pinStr(dto.Effort) != "max" || pinStr(dto.CodexModel) != "gpt-6-luna" || pinStr(dto.CodexEffort) != "low" {
+		t.Fatalf("all four: %+v", dto)
+	}
+	// A model-only write keeps both efforts (omitted keeps).
+	dto = pinsOKTemplate(t, pinsPut(router, uzc, id, `{"model":"haiku"}`))
+	if pinStr(dto.Effort) != "max" || pinStr(dto.CodexEffort) != "low" {
+		t.Fatalf("model-only write moved an effort: %+v", dto)
+	}
+	// null clears one effort and keeps the other; blank and whitespace clear too.
+	dto = pinsOKTemplate(t, pinsPut(router, uzc, id, `{"effort":null}`))
+	if dto.Effort != nil || pinStr(dto.CodexEffort) != "low" || pinStr(dto.Model) != "haiku" {
+		t.Fatalf("after effort reset: %+v", dto)
+	}
+	for _, blank := range []string{`""`, `"   "`} {
+		pinsOKTemplate(t, pinsPut(router, uzc, id, `{"effort":"high"}`))
+		dto = pinsOKTemplate(t, pinsPut(router, uzc, id, `{"effort":`+blank+`}`))
+		if dto.Effort != nil {
+			t.Fatalf("blank %s must clear: %+v", blank, dto)
+		}
+	}
+	dto = pinsOKTemplate(t, pinsPut(router, uzc, id, `{"codex_effort":null}`))
+	if dto.Effort != nil || dto.CodexEffort != nil {
+		t.Fatalf("after codex effort reset: %+v", dto)
+	}
+	r := pinsReadRow(t, pool, id)
+	if r.effort != nil || r.codexEffort != nil {
+		t.Fatalf("reset must store NULL, got %s/%s", pinStr(r.effort), pinStr(r.codexEffort))
+	}
+	pinsAssertContentUnchanged(t, r)
+	if r.customized || r.origin_ != "" {
+		t.Fatalf("a pin write must leave customized and origin untouched: customized=%v origin=%q", r.customized, r.origin_)
+	}
+	listed := pinsList(t, router, uzc)[id.String()]
+	if listed.ID == "" || listed.Effort != nil || listed.CodexEffort != nil {
+		t.Fatalf("list after reset: %+v", listed)
+	}
+	if raw := bearerReq(router, http.MethodGet, "/api/me/agent-templates", uzc).Body.String(); !strings.Contains(raw, `"effort":null`) || !strings.Contains(raw, `"codex_effort":null`) {
+		t.Fatalf("list must carry explicit nulls: %s", raw)
+	}
+	// The stored value is what the list reports.
+	pinsOKTemplate(t, pinsPut(router, uzc, id, `{"codex_effort":"medium"}`))
+	if listed := pinsList(t, router, uzc)[id.String()]; pinStr(listed.CodexEffort) != "medium" {
+		t.Fatalf("list after set: %+v", listed)
+	}
+}
+
+// TestAgentTemplateEffortPinsRejectionsWriteNothingLiveDB: an invalid effort, including beside a
+// valid pin, is a 400 naming the field and writes nothing; builtin and global rows stay 403.
+func TestAgentTemplateEffortPinsRejectionsWriteNothingLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	id := pinsSeedTemplate(t, pool, "user", user, strp("sonnet"), strp("gpt-6-sol"))
+	pinsOKTemplate(t, pinsPut(router, uzc, id, `{"effort":"high","codex_effort":"low"}`))
+	before := pinsReadRow(t, pool, id)
+	for _, tc := range []struct{ body, field string }{
+		{`{"effort":"runtime"}`, "effort"},
+		{`{"effort":"HIGH"}`, "effort"},
+		{`{"effort":"hi gh"}`, "effort"},
+		{`{"codex_effort":"runtime"}`, "codex_effort"},
+		{`{"model":"opus","effort":"none"}`, "effort"},
+		{`{"effort":"max","codex_effort":"none"}`, "codex_effort"},
+	} {
+		rec := pinsPut(router, uzc, id, tc.body)
+		if rec.Code != http.StatusBadRequest || pinsErrBody(t, rec)["field"] != tc.field {
+			t.Errorf("%s: status %d body %s, want 400 field %q", tc.body, rec.Code, rec.Body.String(), tc.field)
+		}
+	}
+	if after := pinsReadRow(t, pool, id); !reflect.DeepEqual(before, after) {
+		t.Fatalf("a rejected effort write wrote something:\nbefore %+v\nafter  %+v", before, after)
+	}
+	for _, scope := range []string{"builtin", "global"} {
+		other := pinsSeedTemplate(t, pool, scope, uuid.Nil, nil, nil)
+		if rec := pinsPut(router, uzc, other, `{"effort":"high"}`); rec.Code != http.StatusForbidden {
+			t.Errorf("%s effort write: status %d, want 403", scope, rec.Code)
+		}
+		if r := pinsReadRow(t, pool, other); r.effort != nil || r.customized {
+			t.Errorf("%s row changed by a refused write: %+v", scope, r)
+		}
+	}
 }
 
 func TestAgentTemplateModelPinsAuthorizationLiveDB(t *testing.T) {
@@ -394,7 +503,7 @@ func TestAgentTemplateListScopeAndEditableLiveDB(t *testing.T) {
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"codex_model", "customized", "editable", "id", "model", "name", "scope"}
+	want := []string{"codex_effort", "codex_model", "customized", "editable", "effort", "id", "model", "name", "scope"}
 	for _, m := range generic.Templates {
 		keys := make([]string, 0, len(m))
 		for k := range m {

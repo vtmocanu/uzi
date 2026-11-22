@@ -3362,6 +3362,70 @@ describe("SdkExecutor reasoning effort on baseOptions (PRD #617)", () => {
   });
 });
 
+describe("SdkExecutor template effort on subagents (issue #3258)", () => {
+  const pinnedReviewer: AgentTemplate = { ...reviewer, effort: "high" };
+  const pinnedRepoAuditor: AgentTemplate = { ...repoAuditor, effort: "low" };
+
+  async function runTurns(overrides: Partial<RunContext>, verdict?: PlanVerdict) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = verdict === undefined ? makeCtx(overrides) : makeCtx(overrides, verdict);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return turns;
+  }
+
+  it("own roster: a pinned subagent keeps its pin and an unpinned one follows the run effort, on BOTH turns", async () => {
+    const turns = await runTurns(
+      { agents: [lead, coder, pinnedReviewer], config: { default_effort: "medium" } },
+      approveWith("own"),
+    );
+    for (const o of [turns[0]!.options, turns[1]!.options]) {
+      assert.strictEqual(o.agents!.reviewer!.effort, "high");
+      assert.strictEqual(o.agents!.coder!.effort, "medium");
+    }
+  });
+
+  it("own roster under the Runtime default: the pin survives and an unpinned subagent carries no effort key", async () => {
+    const turns = await runTurns(
+      { agents: [lead, coder, pinnedReviewer], config: { default_model: "sonnet" } },
+      approveWith("own"),
+    );
+    for (const o of [turns[0]!.options, turns[1]!.options]) {
+      assert.strictEqual(o.agents!.reviewer!.effort, "high");
+      assert.ok(!("effort" in o.agents!.coder!), "no effort key is added under the Runtime default");
+    }
+  });
+
+  it("repo roster: an unpinned repo agent follows the run effort and a pinned one keeps its pin", async () => {
+    const turns = await runTurns({
+      agents: [lead, coder, reviewer],
+      repoAgents: [repoCoder, pinnedRepoAuditor],
+      config: { default_effort: "medium" },
+    });
+    const impl = turns[1]!.options;
+    assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(impl.agents!.coder!.effort, "medium");
+    assert.strictEqual(impl.agents!.auditor!.effort, "low");
+  });
+
+  it("the schedule model override leaves each subagent's effort as is", async () => {
+    const turns = await runTurns(
+      {
+        agents: [lead, coder, pinnedReviewer],
+        config: { default_model: "fable", default_effort: "medium", override_subagent_model: true },
+      },
+      approveWith("own"),
+    );
+    for (const o of [turns[0]!.options, turns[1]!.options]) {
+      assert.strictEqual(o.agents!.reviewer!.model, "fable");
+      assert.strictEqual(o.agents!.reviewer!.effort, "high");
+      assert.strictEqual(o.agents!.coder!.effort, "medium");
+    }
+  });
+});
+
 describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
   const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
   const revise: PlanVerdict = { kind: "revise", feedback: "tighten it" };
@@ -3462,7 +3526,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 25, "all Claude request cases loaded");
+    assert.equal(cases.length, 32, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3516,7 +3580,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 25);
+    assert.equal(visited.length, 32);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
@@ -10455,6 +10519,23 @@ describe("SdkExecutor Claude planning phase model/effort (PRD #3252 M3)", () => 
     assert.deepEqual(row("plan"), [["opus", "user_planning_default", "high", "explicit", "user_planning_default"]]);
     assert.deepEqual(row("implement"), [["sonnet", "user_default", "medium", "explicit", "user_default"]]);
     assert.deepEqual(turns.map(sent), [PLAN_PAIR, IMPL_PAIR]);
+  });
+
+  it("planning and template effort compose without leaking plan effort into implement subagents", async () => {
+    const { queryFn, turns } = phaseTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder, { ...reviewer, effort: "max" }],
+      config: { ...PHASE_CONFIG, default_effort: "low", default_effort_source: "template", override_subagent_model: true },
+    }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    const plan = turns[0]!.options;
+    const implement = turns[1]!.options;
+    assert.equal(plan.agents!.coder!.effort, "high");
+    assert.equal(implement.agents!.coder!.effort, "low");
+    assert.equal(plan.agents!.coder!.model, "opus");
+    assert.equal(implement.agents!.coder!.model, "sonnet");
+    assert.equal(plan.agents!.reviewer!.effort, "max");
+    assert.equal(implement.agents!.reviewer!.effort, "max");
   });
 
   it("a revise round and the implement turn after it: plan pair on every plan-block turn, implement pair after approval", async () => {

@@ -1799,8 +1799,8 @@ func TestSidebarMotionNullUserResolvesToInstanceDefault(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 	}
 	raw, eff := decodeSidebarMotion(t, rec.Body.Bytes())
-	if raw != nil || eff {
-		t.Fatalf("NULL user: raw=%v effective=%v, want nil/false", raw, eff)
+	if raw != nil || !eff {
+		t.Fatalf("NULL user: raw=%v effective=%v, want nil/true", raw, eff)
 	}
 }
 
@@ -1834,9 +1834,9 @@ func TestSidebarMotionPutNullClears(t *testing.T) {
 	if db.sidebarMotion.Valid {
 		t.Fatalf("stored sidebar_motion should be NULL, got %+v", db.sidebarMotion)
 	}
-	raw, _ := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
-	if raw != nil {
-		t.Fatalf("raw after clear = %v, want nil", *raw)
+	raw, eff := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw != nil || !eff {
+		t.Fatalf("after clear: raw=%v effective=%v, want nil/true", raw, eff)
 	}
 }
 

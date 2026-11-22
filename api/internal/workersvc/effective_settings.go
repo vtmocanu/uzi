@@ -310,6 +310,9 @@ type LeadPrediction struct {
 	// Effort is the claim's default_effort (nil: nothing is sent); EffortSource its provenance.
 	Effort       *string
 	EffortSource string
+	// TemplateEffort is the lead template's valid effort for the harness (nil: none), what an unset
+	// preference resolves to.
+	TemplateEffort *string
 	// Plan is the claim's plan_phase pair (PRD #3252), nil unless the owner's Claude planning lane
 	// contributes a value; it is exactly what resolveLeadSettings ships on the claim.
 	Plan *ClaimPhaseSettings
@@ -394,7 +397,13 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 	}
 	tClaude, tCodex := textPtr(row.TemplateModel), textPtr(row.TemplateCodexModel)
 
-	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort}
+	// Issue #3258 N3: the lead template's effort for this harness's family, the tier below the
+	// owner's default (the same value a claim derives from agenttmpl.SelectLead over its templates).
+	var templateEffort pgtype.Text
+	if e := agenttmpl.EffortForHarness(string(harness), derefString(textPtr(row.TemplateEffort)), derefString(textPtr(row.TemplateCodexEffort))); e != "" {
+		templateEffort = pgtype.Text{String: e, Valid: true}
+	}
+	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort, TemplateEffort: templateEffort}
 	// Read the same harness-specific planning columns as claim assembly.
 	planningModel, planningEffort, perr := s.readPlanningDefaults(ctx, userID, harness)
 	if perr != nil {
@@ -410,6 +419,7 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 		Harness: harness, LaneModel: textPtr(lane), UserEffort: textPtr(effort),
 		Effort: settings.Effort, EffortSource: string(settings.EffortSource),
 		DroppedRunModel: textPtr(settings.DroppedRunModel),
+		TemplateEffort:  textPtr(templateEffort),
 		Plan:            settings.Plan,
 	}
 	out.DefaultModel, out.DefaultModelSource = agenttmpl.ResolveWorkerDefaultModel(string(harness), nil, tClaude, tCodex)

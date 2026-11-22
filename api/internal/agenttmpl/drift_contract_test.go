@@ -39,6 +39,8 @@ type driftContent struct {
 	Description string   `json:"description"`
 	Model       string   `json:"model"`
 	CodexModel  string   `json:"codex_model"`
+	Effort      string   `json:"effort"`
+	CodexEffort string   `json:"codex_effort"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
 }
@@ -50,6 +52,8 @@ func (c driftContent) definition() agenttmpl.Definition {
 		Description: c.Description,
 		Model:       c.Model,
 		CodexModel:  c.CodexModel,
+		Effort:      c.Effort,
+		CodexEffort: c.CodexEffort,
 		Tools:       c.Tools,
 		PromptBody:  c.PromptBody,
 	}
@@ -129,6 +133,10 @@ func TestDriftFixtureIsWellFormed(t *testing.T) {
 		"codex-model-value-change",
 		"codex-model-null-vs-empty-agree",
 		"model-moved-between-harnesses",
+		"effort-value-change",
+		"codex-effort-value-change",
+		"effort-null-equals-null",
+		"effort-moved-between-harnesses",
 	} {
 		if !names[required] {
 			t.Errorf("load-bearing case %q is missing -- do not tidy the fixture", required)

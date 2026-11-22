@@ -126,6 +126,7 @@ import {
   type BoundaryProcessRequest,
   type CodexExecutionSafety,
   type HarnessAgent,
+  type HarnessEffort,
   type HarnessContextHook,
   type HarnessError,
   type CredentialFreeCaptureContext,
@@ -196,7 +197,7 @@ import {
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
 import { resolveChildTurnDeadlineMs } from "./child-budget.js";
-import { codexSubagentWriteCapabilities, renderCodexRun, sanitizeName } from "./render.js";
+import { codexSubagentWriteCapabilities, renderCodexRun, sanitizeName, type CodexRenderDiagnostic } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -636,11 +637,39 @@ function toHarnessAgent(t: AgentTemplate, repoSkills?: readonly string[]): Harne
     description: t.description,
     prompt: t.prompt_body,
     model: t.model ?? undefined,
+    // A string is passed through unvalidated on purpose: renderCodexRun's resolveEffort drops an
+    // out-of-contract value with an `unknown_effort` diagnostic the executor reports. A non-string
+    // (never sent by the api) is no pin, so it cannot reach the renderer's string sanitizer.
+    ...(typeof t.effort === "string" ? { effort: t.effort as HarnessEffort } : {}),
     tools: t.tools == null ? { kind: "inherit" } : { kind: "allow", names: t.tools },
     deniedTools: repoSkills ? [...REPO_AGENT_DENIED_TOOLS] : [],
     toolServers: [],
     skills: repoSkills ? [...repoSkills] : (t.skills ?? []),
   };
+}
+
+/** Roles already told about an out-of-contract effort pin, per run. buildPhaseBroker runs per
+ *  turn and is rebuilt per epoch, so the notice dedupes here, keyed by the run's context. */
+const unknownEffortNoticed = new WeakMap<RunContext, Set<string>>();
+
+/** Emit one `status` run message per subagent role whose template effort was dropped by the
+ *  renderer (an `unknown_effort` diagnostic on a non-lead role). The text carries the sanitized
+ *  role name only, never the raw effort value. Lead diagnostics are out of scope here: the lead's
+ *  effort arrives already closed-set from the claim guard. */
+function emitUnknownEffortNotices(ctx: RunContext, diagnostics: readonly CodexRenderDiagnostic[]): void {
+  for (const d of diagnostics) {
+    if (d.kind !== "unknown_effort" || d.role === "lead") continue;
+    let seen = unknownEffortNoticed.get(ctx);
+    if (!seen) {
+      seen = new Set<string>();
+      unknownEffortNoticed.set(ctx, seen);
+    }
+    if (seen.has(d.role)) continue;
+    seen.add(d.role);
+    ctx.emit({ kind: "status", agent: "worker", payload: {
+      text: `Subagent ${sanitizeName(d.role)} declares a reasoning effort outside low, medium, high, xhigh and max. uzi ignores it and the subagent follows the run's effort.`,
+    } });
+  }
 }
 
 // ─── A single-consumer child-frame queue (part C consumer side) ─────────────────
@@ -3362,16 +3391,20 @@ export class CodexExecutor implements Executor {
       const generation = supersedePlanSummary();
       // A later accepted candidate may start fresh after a refused capture/switch.
       this.summaryLifecycleClosed = false;
+      // The callback belongs to the credential authority current when it was created: after a switch
+      // replaces it, this retired callback must not start work (summaryInputs reads the live authority).
+      const admittedAuthority = currentAuthority;
+      const authorityCurrent = (): boolean => currentAuthority === admittedAuthority;
       let flight: CodexExecutor["planFlight"];
       return planMd => {
         if (flight) return flight.done;
-        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
+        if (!summariesOn || !authorityCurrent() || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
         flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false,
           abandoned: false, closed: false, generation };
         const owned = flight;
         this.planFlight = owned;
         this.planFlights.add(owned);
-        const allowed = (): boolean => summaryAllowed() && generation === planGeneration
+        const allowed = (): boolean => authorityCurrent() && summaryAllowed() && generation === planGeneration
           && this.planFlight === owned && !owned.closed && !owned.abandoned && !owned.ctrl.signal.aborted;
         owned.done = (async () => {
           try {
@@ -5998,6 +6031,7 @@ export class CodexExecutor implements Executor {
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current, repoInstructions),
         );
+        emitUnknownEffortNotices(ctx, runPlan.diagnostics);
         const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
           ...result, command: scrubProjected(result.command),
           tool_id: scrubProjected(result.tool_id), attempt_id: scrubProjected(result.attempt_id),

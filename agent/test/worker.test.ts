@@ -991,6 +991,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     assert.ok(caps?.includes("job_files_v1"), "job_files_v1 (PRD #1909 M1 rollout gate) is on the register wire next to job_runner_v1");
     assert.ok(caps?.includes("cross_check_v1"), "cross_check_v1 is advertised even when Codex is unavailable on this worker");
     assert.ok(caps?.includes("cross_check_pins_v1"), "cross-check pins are advertised independently of Codex availability");
+    assert.ok(caps?.includes("template_effort_v1"), "template effort pins (issue #3258) are advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_codex_lead_v1"), "the Claude checker capability is advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_gated_v1"), "the gated plan cross-check capability (PRD #3708 M2) is advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_semantic_plan_v1") && caps?.includes("completion_semantic_publication_v1"), "the dormant semantic capabilities are advertised independently of Codex availability");
@@ -1046,6 +1047,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_v1",
     "cross_check_rounds_v1",
     "cross_check_pins_v1",
+    "template_effort_v1",
     "cross_check_codex_lead_v1",
     "cross_check_gated_v1",
     "cross_check_semantic_plan_v1",

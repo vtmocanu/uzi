@@ -177,7 +177,8 @@ export const MAX_WORKER_SIZES = 16;
 
 /**
  * Why a typed name cannot be a NEW size, or null when it can. A name already in the list is
- * refused here because the api's PUT on an existing name edits that size instead of adding one.
+ * refused here for a fast answer; the api also refuses it (412 size_exists) on the create
+ * PUT, which carries If-None-Match: *, so a stale list cannot overwrite an existing size.
  */
 export function newSizeNameError(text: string, existing: readonly string[]): string | null {
   if (text === "") return "Enter a name for the size, such as xs";

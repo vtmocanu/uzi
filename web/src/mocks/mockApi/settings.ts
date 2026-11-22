@@ -15,6 +15,7 @@ import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
   isAppearanceMode,
+  DEFAULT_SIDEBAR_MOTION,
   isDarkTheme,
   isLightTheme,
   isTheme,
@@ -37,7 +38,7 @@ import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "..
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
-import { mockDefaultClaudeModel } from "./agents";
+import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
 
@@ -106,7 +107,7 @@ const SEED_USER_SETTINGS: UserSettings = {
   light_theme: null,
   dark_theme: null,
   typeface: null,
-  // Opt-in animated sidebar icons; null = inherit the (off) instance default.
+  // Animated sidebar icons are on by default; null follows that default.
   sidebar_motion: null,
   sidebar_token_ids: [],
   // PRD #1209 M3: LINKED Codex subscription accounts surfaced on the sidebar rail — the
@@ -664,10 +665,6 @@ export function setMockCodexCatalogSample(sample: MockCodexCatalogSample): void 
   mockCodexCatalogSample = sample;
 }
 
-// The mock's compiled default for animated sidebar icons (off), the value a null
-// override resolves against; mirrors the server's compiled default.
-const MOCK_SIDEBAR_MOTION_DEFAULT = false;
-
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -713,7 +710,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
-  const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
+  const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
   return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, planning_models, planning_efforts,
     planning_claude_model: userSettings.planning_claude_model ?? null,
     planning_claude_effort: userSettings.planning_claude_effort ?? null,
@@ -863,7 +860,7 @@ export function sessionBody() {
       light_theme: resolved.light,
       dark_theme: resolved.dark,
       typeface: resolved.typeface,
-      sidebar_motion: userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT,
+      sidebar_motion: userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION,
       overrides: {
         mode: userSettings.appearance_mode,
         light_theme: userSettings.light_theme,
@@ -876,7 +873,7 @@ export function sessionBody() {
         light_theme: appSettings.default_light_theme,
         dark_theme: appSettings.default_dark_theme,
         typeface: appSettings.default_typeface,
-        sidebar_motion: MOCK_SIDEBAR_MOTION_DEFAULT,
+        sidebar_motion: DEFAULT_SIDEBAR_MOTION,
       },
     },
     // Deprecated single-theme trio (PRD #21), derived from the resolved appearance so
@@ -918,6 +915,41 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
       ? { ...c, notes: [...c.notes, "not_used"] }
       : c,
   );
+  return view;
+}
+
+// Issue #3258 N3: the recordings carry no lead-template effort, so the delivered mock lead
+// template's effort is applied at response time, mirroring how leadEffortSettingCell derives it: when
+// the owner's preference for the harness is NULL or blank, the worker_effort cell resolves to the
+// template's level with source template, and its default names the template. The demo ships no
+// lead row, so without a delivered lead template effort the recording is served unchanged. The
+// extra `c.effort === null` check only keeps a recorded stored preference authoritative.
+function withLeadTemplateEffort(view: EffectiveSettings, efforts: { claude: string | null; codex: string | null }, prefs: { claude: unknown; codex: unknown }): EffectiveSettings {
+  view.efforts = view.efforts.map(c => {
+    if (c.setting !== "worker_effort") return c;
+    const h = c.harness as "claude" | "codex";
+    const level = efforts[h];
+    if (!level) return c;
+    const next = { ...c, default_effort: level, default_source: "template" };
+    const pref = prefs[h];
+    if (c.effort === null && (pref === null || pref === undefined || (typeof pref === "string" && pref.trim() === ""))) {
+      return { ...next, resolved_effort: level, source: "template", mode: "explicit" as const };
+    }
+    return next;
+  });
+  // Planning inherits the resolved run effort, including the template tier, unless pinned.
+  {
+    view.efforts = view.efforts.map(c => {
+      if (c.setting !== "planning_effort") return c;
+      const h = c.harness as "claude" | "codex";
+      const ordinary = view.efforts.find(o => o.setting === "worker_effort" && o.harness === h);
+      if (!efforts[h] || !ordinary) return c;
+      const next = { ...c, default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source };
+      return c.effort === null
+        ? { ...next, resolved_effort: ordinary.resolved_effort, source: ordinary.source, mode: ordinary.mode }
+        : next;
+    });
+  }
   return view;
 }
 
@@ -1682,7 +1714,11 @@ export const settingsApi = {
   // planning one (an owner with a Claude planning pair, PRD #3252); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(withPlanning(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on)), 60);
+    const view = withLeadTemplateEffort(
+      withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on),
+      mockLeadTemplateEfforts(),
+      { claude: userSettings.default_effort, codex: userSettings.default_codex_effort });
+    return delay(withPlanning(view), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();

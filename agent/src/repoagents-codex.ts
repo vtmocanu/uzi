@@ -4,8 +4,10 @@
 // turns the TOML text of ONE file into a template or a skip reason.
 //
 // The template is built FRESH from validated fields (`name`, `description`,
-// `developer_instructions`, optional `model`) and never spread from the parsed object.
-// Models must be supported Codex role pins. `model_reasoning_effort`, `nickname_candidates`,
+// `developer_instructions`, optional `model` and `effort`) and never spread from the parsed
+// object. Models must be supported Codex role pins. `model_reasoning_effort` becomes the agent's
+// effort when it is exactly one of low, medium, high, xhigh or max; any other value is dropped
+// with an `effort_ignored` note and the agent is kept. `nickname_candidates`,
 // `config_file`, `includes` and every other key are ignored. Only the four keys in
 // CODEX_RESTRICTION_KEYS (`features`, `skills`, `sandbox_mode`, `tools`) skip a file,
 // rather than run it without the restriction its author asked for; any other Codex
@@ -15,7 +17,8 @@ import { parse } from "smol-toml";
 import { isValidModel } from "./models.js";
 import { isCodexRoleModel } from "./codex/render.js";
 import type { AgentTemplate } from "./protocol.js";
-import { isValidAgentName, isValidDescription, type ParsedAgentFile } from "./repoagents.js";
+import { isHarnessEffort } from "./harness.js";
+import { isValidAgentName, isValidDescription, type ParsedAgentFile, type RepoAgentNote } from "./repoagents.js";
 
 /** Codex config keys that restrict what an agent may do. uzi does not translate
  *  them, so their presence (with any value) skips the agent. Our own constants:
@@ -56,5 +59,13 @@ export function parseCodexAgentFile(raw: string, slug: string): ParsedAgentFile 
 
   const template: AgentTemplate = { name, description, prompt_body: instructions };
   if (typeof model === "string" && model !== "") template.model = model;
-  return { ok: true, template, notes: [] };
+
+  // `model_reasoning_effort` is the agent's Codex effort. Exactly one of the five levels is kept;
+  // an exact empty string inherits (like `model`); anything else is dropped with a note and the
+  // agent stays. The note never carries the value; the shared loader adds the file's basename.
+  const notes: RepoAgentNote[] = [];
+  const effort = doc["model_reasoning_effort"];
+  if (isHarnessEffort(effort)) template.effort = effort;
+  else if (effort !== undefined && effort !== "") notes.push({ name, reason: "effort_ignored" });
+  return { ok: true, template, notes };
 }
