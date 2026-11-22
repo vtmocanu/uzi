@@ -4,13 +4,21 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { createInterface } from "node:readline";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { launchCodexRoot, CODEX_BIN, SUPERVISOR_BIN, type SupervisorProcess } from "../src/codex/launcher.js";
+import { createCodexTransport } from "../src/codex/transport.js";
+import { createCodexAppServerAuth } from "../src/codex/appserver-auth.js";
 import { GitCache, RECOVERY_BUNDLE_REF } from "../src/git.js";
 import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { CodexSessionStore, seedCodexSessionArtifacts } from "../src/codex/session-state.js";
 
 // This is a path-selection proof for a controlled, non-echoing transcript.
-// It is deliberately NOT a general secret-content scan. The separate Git bundle\n// test below exercises repository recovery, not CODEX_HOME packaging.
+// It is deliberately NOT a general secret-content scan. The separate Git bundle
+// test below exercises repository recovery, not CODEX_HOME packaging.
 test("provider auth-state canaries stay outside persisted and per-root session subsets", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "provider-session-canary-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -96,6 +104,150 @@ test("provider auth-state outside repository is absent from actual Git recovery 
   // No content scanning is asserted: a credential echoed into committed repository
   // content could enter this Git archive. This is not a CODEX_HOME archive.
 });
+
+// Real launcher, auth owner, JSONL transport and filesystem. Only privileged tree
+// operations and the supervisor/app-server peer are injected. The peer models an
+// auth write on login; it makes no assertion about pinned Codex's on-disk format,
+// uid isolation, real process drainage or the executor's orchestration.
+for (const terminal of ["drained", "unconfirmed"] as const) {
+  test(`provider login auth-state cleanup follows launcher disposal: ${terminal}`, async (t) => {
+    assert.ok(process.env.TMPDIR && path.isAbsolute(process.env.TMPDIR), "use an absolute scratch TMPDIR");
+    const parent = await fs.mkdtemp(path.join(process.env.TMPDIR, "provider-launch-auth-"));
+    t.after(() => fs.rm(parent, { recursive: true, force: true }));
+    const root = path.join(parent, "epoch");
+    const home = path.join(root, "codex");
+    const binding = {
+      provider_id: "canary-provider", revision: 1, engine: "codex" as const,
+      protocol: "openai_responses" as const, base_url: "https://gateway.example/v1",
+      auth_style: "bearer" as const, credential: "distinct-private-auth-canary",
+      model_map: { default: { model: "gateway-model", context_window: 64000 } },
+    };
+    const peer = new EventEmitter();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const control = new PassThrough();
+    const evidence = new PassThrough();
+    const streams = [stdin, stdout, stderr, control, evidence];
+    t.after(() => { for (const stream of streams) stream.destroy(); });
+    const send = (value: unknown) => stdout.write(JSON.stringify(value) + "\n");
+    const lifecycle = (value: unknown) => evidence.write(JSON.stringify(value) + "\n");
+    const methods: string[] = [];
+    const rpc = createInterface({ input: stdin });
+    const commands = createInterface({ input: control });
+    t.after(() => { rpc.close(); commands.close(); });
+    rpc.on("line", line => {
+      const frame = JSON.parse(line);
+      methods.push(frame.method);
+      if (frame.method === "initialize") {
+        send({ id: frame.id, result: {
+          userAgent: "simulated-app-server", codexHome: home,
+          platformFamily: "simulated", platformOs: "simulated",
+        } });
+      } else if (frame.method === "account/login/start") {
+        assert.deepEqual(frame.params, { type: "apiKey", apiKey: binding.credential });
+        // Model the peer persisting the credential only after it receives login.
+        writeFileSync(path.join(home, "auth.json"), frame.params.apiKey);
+        send({ id: frame.id, result: { type: "apiKey" } });
+      } else assert.equal(frame.method, "initialized");
+    });
+    let disposalRequests = 0;
+    commands.on("line", line => {
+      const frame = JSON.parse(line);
+      assert.equal(frame.op, "dispose");
+      disposalRequests++;
+      lifecycle({
+        event: "dispose", id: frame.id, state: terminal,
+        ...(terminal === "drained" ? { authority: "ECHILD+__WALL" } : { reason: "deadline" }),
+        killed: [], reaped: [],
+      });
+      if (terminal === "drained") {
+        setImmediate(() => {
+          peer.emit("exit", 0, null);
+          stdout.end(); stderr.end(); evidence.end();
+          setImmediate(() => peer.emit("close", 0, null));
+        });
+      }
+    });
+    let removals = 0;
+    const handle = await launchCodexRoot({
+      ownedDataRoot: root, providerBinding: binding, model: "default",
+      codexBin: CODEX_BIN, supervisorBin: SUPERVISOR_BIN,
+      kind: "provider", childArgv: ["app-server"], cwd: path.join(parent, "work"),
+      useAppServerAuth: true, authMode: "provider",
+    }, {
+      env: { UZI_UID_SPLIT: "1" }, resolveRunnerUid: () => 10002,
+      rootStartTime: () => 1, assertNoUnexpectedSystemConfig: () => {},
+      makeRunnerTrees: request => {
+        assert.equal(request.root, root);
+        assert.equal(request.sharedSessionRead?.codexHome, home);
+        for (const dir of request.dirs) mkdirSync(dir, { recursive: true });
+        for (const file of request.files) writeFileSync(file.path, file.content, { mode: file.mode });
+      },
+      removeRunnerTree: request => {
+        assert.equal(disposalRequests, 1, "removal follows supervisor disposal");
+        assert.equal(request.root, root);
+        removals++;
+        rmSync(request.root, { recursive: true });
+      },
+      spawnSupervisor: (_command, _args, options) => {
+        assert.equal(JSON.stringify(options.env).includes(binding.credential), false);
+        lifecycle({
+          event: "started", supervisorPid: 4242, childPid: 4243,
+          subreaper: true, nondumpable: true, uid: 10002,
+          liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true,
+        });
+        return Object.assign(peer, { pid: 4242, stdin, stdout, stderr, stdio: streams }) as unknown as SupervisorProcess;
+      },
+    });
+    const transport = createCodexTransport({ inbound: handle.transport.stdout!, outbound: handle.transport.stdin! });
+    t.after(() => transport.close());
+    const auth = createCodexAppServerAuth({ mode: "provider", apiKey: binding.credential });
+    let outcome: Awaited<ReturnType<typeof handle.dispose>> | undefined;
+    try {
+      await assert.rejects(fs.stat(path.join(home, "auth.json")), { code: "ENOENT" });
+      await auth.authenticate(transport);
+      assert.deepEqual(methods, ["initialize", "initialized", "account/login/start"]);
+      assert.equal(await fs.readFile(path.join(home, "auth.json"), "utf8"), binding.credential);
+      const config = await fs.readFile(path.join(home, "config.toml"), "utf8");
+      assert.match(config, /requires_openai_auth = true/);
+      assert.equal(config.includes(binding.credential), false);
+      await fs.mkdir(path.join(home, "cache"));
+      await fs.writeFile(path.join(home, "cache/state.json"), "distinct-private-cache-canary");
+      await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+      const transcript = '{"type":"session_meta","payload":{"id":"safe-session"}}\n';
+      await fs.writeFile(path.join(home, "sessions/rollout-safe.jsonl"), transcript);
+      const store = path.join(parent, "store");
+      const staging = path.join(parent, "staging");
+      assert.equal((await CodexSessionStore.persist(home, store)).files, 1);
+      assert.equal((await CodexSessionStore.adopt(store, staging, { destination: "runner-seed" })).files, 1);
+      const names = (await fs.readdir(staging, { recursive: true, withFileTypes: true }))
+        .filter(entry => entry.isFile())
+        .map(entry => path.relative(staging, path.join(entry.parentPath, entry.name)));
+      assert.deepEqual(names, ["sessions/rollout-safe.jsonl"]);
+      assert.equal(await fs.readFile(path.join(staging, names[0]!), "utf8"), transcript);
+    } finally {
+      auth.closeAdmissionAndCancel();
+      await transport.close();
+      outcome = await handle.dispose(1000);
+      await auth.drainInterceptedRequests();
+    }
+    assert.equal(outcome.clean, terminal === "drained", JSON.stringify(outcome));
+    assert.equal(disposalRequests, 1);
+    assert.equal(removals, terminal === "drained" ? 1 : 0);
+    if (terminal === "drained") {
+      await assert.rejects(fs.stat(root), { code: "ENOENT" });
+      assert.equal((await handle.dispose(1000)).clean, true);
+      assert.equal(removals, 1, "repeated disposal does not remove twice");
+    } else {
+      assert.equal(await fs.readFile(path.join(home, "auth.json"), "utf8"), binding.credential);
+      assert.ok(await fs.stat(path.join(home, "config.toml")));
+      assert.equal(await fs.readFile(path.join(home, "cache/state.json"), "utf8"), "distinct-private-cache-canary");
+    }
+    assert.equal(await fs.readFile(path.join(parent, "staging/sessions/rollout-safe.jsonl"), "utf8"),
+      '{"type":"session_meta","payload":{"id":"safe-session"}}\n', "safe session survives root disposal");
+  });
+}
 
 test("allowed transcripts retain echoed private content: no general content-scan guarantee", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "provider-session-echo-"));
