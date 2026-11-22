@@ -8,7 +8,7 @@ import {
 } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { useAsyncData } from "../../lib/useAsyncData";
-import { templateModelDefaultLabel } from "../../lib/agentTemplates";
+import { templateEffortDefaultLabel, templateModelDefaultLabel } from "../../lib/agentTemplates";
 import {
   Alert,
   Badge,
@@ -164,7 +164,7 @@ function AgentSourceStagedReview({
                     <dd className="text-muted">{role.codex_model || templateModelDefaultLabel(role.name, "codex")}</dd>
                     <dt className="text-faint">Claude effort</dt>
                     <dd className="text-muted">
-                      {role.effort || "Default · follows the run's effort"}
+                      {role.effort || templateEffortDefaultLabel(role.name)}
                       {role.notes?.includes("effort_ignored") && (
                         <span className="text-warn"> (the source's effort is not one of low, medium, high, xhigh or max, so it was ignored)</span>
                       )}

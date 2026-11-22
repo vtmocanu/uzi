@@ -113,7 +113,8 @@ describe("AgentDetail read-only model label (#3255)", () => {
 
     renderPage();
 
-    expect(await screen.findByText("Claude: Default · follows lead · Codex: Default · follows lead")).toBeTruthy();
+    expect(await screen.findByText("Default · follows lead · Default · follows the run's effort (Claude and Codex)")).toBeTruthy();
+    expect(screen.getByText("Model & effort", { selector: "dt" })).toBeTruthy();
     expect(screen.queryByText(/^inherit$/i)).toBeNull();
   });
 });
@@ -228,14 +229,15 @@ describe("AgentDetail real editor model pins", () => {
 
 describe("AgentDetail read-only pin labels match the Agents list", () => {
   it.each([
-    { name: "coder", model: null, codex_model: "gpt-6-luna", label: "Claude: Default · follows lead · Codex: gpt-6-luna" },
-    { name: "coder", model: "sonnet", codex_model: "gpt-6-sol", label: "Claude: sonnet · Codex: gpt-6-sol" },
-    { name: "lead", model: null, codex_model: null, label: "Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)" },
-  ])("renders $label", async ({ label, ...pins }) => {
+    { name: "coder", model: null, codex_model: "gpt-6-luna", claude: "Default · follows lead · Default · follows the run's effort", codex: "gpt-6-luna · Default · follows the run's effort" },
+    { name: "coder", model: "sonnet", codex_model: "gpt-6-sol", effort: "high", claude: "sonnet · high", codex: "gpt-6-sol · Default · follows the run's effort" },
+    { name: "lead", model: null, codex_model: null, claude: "Default · SDK/account default (built-in) · Default · built-in (medium)", codex: "Default · built-in (gpt-6.1-sol) · Default · built-in (medium)" },
+  ])("renders $name Claude and Codex rows", async ({ claude, codex, ...pins }) => {
     mockUseAuth.mockReturnValue({ user: { ...ADMIN, is_admin: false } } as ReturnType<typeof useAuth>);
     mockApi.getAgentTemplate.mockResolvedValue({ template: row(pins) });
     renderPage();
-    expect(await screen.findByText(label)).toBeTruthy();
+    expect((await screen.findByText("Claude", { selector: "dt" })).nextElementSibling?.textContent).toBe(claude);
+    expect(screen.getByText("Codex", { selector: "dt" }).nextElementSibling?.textContent).toBe(codex);
     expect(screen.queryByRole("combobox")).toBeNull();
     expect(mockApi.getBuiltinAgentTemplate).not.toHaveBeenCalled();
     expect(mockApi.updateAgentTemplate).not.toHaveBeenCalled();
@@ -277,20 +279,23 @@ describe("AgentDetail effort pins (#3258)", () => {
     mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
     renderPage();
     const diff = (await screen.findByText("Codex effort", { selector: "span" })).parentElement!;
-    expect(diff.textContent).toBe("Codex effortDefault → low");
+    expect(diff.textContent).toBe("Codex effortDefault · follows the run's effort → low");
   });
 
   it("shows read-only effort pins for a non-admin and nothing extra when unpinned", async () => {
     mockUseAuth.mockReturnValue({ user: { ...ADMIN, is_admin: false } } as ReturnType<typeof useAuth>);
     mockApi.getAgentTemplate.mockResolvedValue({ template: row({ codex_effort: "high" }) });
     renderPage();
-    expect(await screen.findByText("Claude effort: Default · Codex effort: high")).toBeTruthy();
+    expect((await screen.findByText("Codex", { selector: "dt" })).nextElementSibling?.textContent)
+      .toBe("Default · follows lead · high");
+    expect(screen.getByText("Claude", { selector: "dt" }).nextElementSibling?.textContent)
+      .toBe("Default · follows lead · Default · follows the run's effort");
     cleanup();
 
     mockApi.getAgentTemplate.mockResolvedValue({ template: row() });
     renderPage();
-    expect(await screen.findByText("Claude: Default · follows lead · Codex: Default · follows lead")).toBeTruthy();
-    expect(screen.queryByText(/Claude effort:/)).toBeNull();
+    expect(await screen.findByText("Default · follows lead · Default · follows the run's effort (Claude and Codex)")).toBeTruthy();
+    expect(screen.queryByText("Claude", { selector: "dt" })).toBeNull();
   });
 });
 

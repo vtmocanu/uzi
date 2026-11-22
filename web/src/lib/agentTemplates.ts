@@ -287,20 +287,6 @@ export function templatePinRows(
   return { collapsed: !isLeadTemplateName(t.name) && allEmpty, rows };
 }
 
-// templateModelsLabel is shared by the list and detail surfaces so both pins
-// and their harness-specific Default labels have one presentation.
-export function templateModelsLabel(t: Pick<AgentTemplate, "name" | "model" | "codex_model">): string {
-  return `Claude: ${t.model || templateModelDefaultLabel(t.name, "claude")} · Codex: ${t.codex_model || templateModelDefaultLabel(t.name, "codex")}`;
-}
-
-// templateEffortsLabel is the sibling of templateModelsLabel for the per-harness
-// reasoning-effort pins, shared by the list and detail surfaces. It returns ""
-// when neither harness is pinned so an unpinned template shows nothing extra.
-export function templateEffortsLabel(t: Pick<AgentTemplate, "effort" | "codex_effort">): string {
-  if (!t.effort && !t.codex_effort) return "";
-  return `Claude effort: ${t.effort || "Default"} · Codex effort: ${t.codex_effort || "Default"}`;
-}
-
 // looseSecretWarning returns a warning string if the text looks like it might
 // carry an Anthropic credential, or "" otherwise. This is deliberately looser
 // than the server guardrail (which rejects only a full token): it nudges on

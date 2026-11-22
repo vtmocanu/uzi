@@ -9,7 +9,6 @@ import {
   templateScopeBadgeTone,
   templateModelDefaultLabel,
   templateModelFieldWarning,
-  templateModelsLabel,
   templateEffortDefaultLabel,
   templatePinRows,
 } from "./agentTemplates";
@@ -52,27 +51,6 @@ describe("templateModelFieldWarning", () => {
     expect(templateModelFieldWarning("é".repeat(51), "claude")).toMatch(/100 bytes/);
     expect(modelFieldWarning("é".repeat(51))).toBe("");
     expect(templateModelFieldWarning("x".repeat(100), "claude")).toBe("");
-  });
-});
-
-describe("templateModelsLabel", () => {
-  it("shows both stored pins in harness order", () => {
-    expect(templateModelsLabel({ name: "coder", model: "sonnet", codex_model: "gpt-6-sol" }))
-      .toBe("Claude: sonnet · Codex: gpt-6-sol");
-  });
-
-  it.each(["lead", "ORCHESTRATOR"])("shows the built-in defaults for %s", (name) => {
-    expect(templateModelsLabel({ name, model: null, codex_model: "" }))
-      .toBe("Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)");
-  });
-
-  it("shows inherited and explicitly pinned lanes independently", () => {
-    expect(templateModelsLabel({ name: "coder", model: "", codex_model: null }))
-      .toBe("Claude: Default · follows lead · Codex: Default · follows lead");
-    expect(templateModelsLabel({ name: "coder", model: "haiku", codex_model: null }))
-      .toBe("Claude: haiku · Codex: Default · follows lead");
-    expect(templateModelsLabel({ name: "coder", model: null, codex_model: "gpt-6-luna" }))
-      .toBe("Claude: Default · follows lead · Codex: gpt-6-luna");
   });
 });
 
