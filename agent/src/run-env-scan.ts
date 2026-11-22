@@ -266,7 +266,7 @@ const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 1
 
 /** Git's C-style unquoting of one quoted path body (the text between the quotes): the escapes `\a \b \t \n \v
  *  \f \r \" \\` and three-digit octal bytes, the resulting bytes decoded as UTF-8. */
-function cUnquote(body: string): string {
+export function cUnquote(body: string): string {
   const bytes: number[] = [];
   for (let i = 0; i < body.length; i++) {
     const c = body[i]!;
@@ -284,6 +284,20 @@ function cUnquote(body: string): string {
     else bytes.push(92);
   }
   return Buffer.from(bytes).toString("utf8");
+}
+
+/** Redact one raw `git status --porcelain` line. Git C-quotes a path with special or non-ASCII characters, so a
+ *  secret value inside such a path is split by escapes and the redactor misses it in the quoted form: each
+ *  quoted segment is decoded first, and a segment whose decoded text meets the redactor is replaced, quotes
+ *  included, by the redacted decoded text. The status columns and an unquoted rename side stay as git wrote them.
+ *  With no match the line is returned unchanged (the same string). */
+export function redactPorcelainLine(line: string, redactText: (text: string) => string): string {
+  const decodedHit = line.replace(/"((?:[^"\\]|\\.)*)"/g, (whole, body: string) => {
+    const decoded = cUnquote(body);
+    const redacted = redactText(decoded);
+    return redacted !== decoded ? redacted : whole;
+  });
+  return redactText(decodedHit);
 }
 
 /** The names of the variables whose forms occur in a path named by a diff header line, quoted or not. A path is

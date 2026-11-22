@@ -1,5 +1,5 @@
 import { RUN_ENV_FORM_CHARS_MAX, RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms, type RunEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
-import { hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, FORMS_OVER_BUDGET, patchScanVerdict, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
+import { redactPorcelainLine, hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, FORMS_OVER_BUDGET, patchScanVerdict, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
 import { runEnvContextField } from "./run-env-lane.js";
 import { markRunEnvSeen, runEnvSeen } from "./run-env-seen.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
@@ -349,6 +349,17 @@ const RECEIPT_REPAIR_NEEDED_MESSAGE = "recovery source does not belong to this k
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** Redact the trigger paths of a toolchain detection's capability evidence (agent-chosen repo paths) once, so every
+ *  report that carries `detection.evidence` sees the redacted form. */
+function redactToolchainEvidence(detection: ToolchainDetection, redactText: (text: string) => string): ToolchainDetection {
+  const evidence: ToolchainDetection["evidence"] = {};
+  for (const cap of ["docker", "jvm"] as const) {
+    const entry = detection.evidence[cap];
+    if (entry) evidence[cap] = { ...entry, triggers: entry.triggers.map((t) => ({ ...t, path: redactText(t.path) })) };
+  }
+  return { ...detection, evidence };
+}
 
 /** `body` with its `failure_reason` scrubbed of the run's secrets, then capped to MAX_FAILURE_REASON_LEN. The
  *  scrub sees the whole reason, so a secret that straddles the cap is masked before the cut. The same object
@@ -16233,7 +16244,7 @@ export class RunRunner {
     // the FROZEN set on the autopilot running report — threaded through gatePlan below.
     let toolchainDetection: ToolchainDetection | undefined;
     try {
-      toolchainDetection = await detectToolchain(runnerClone.path);
+      toolchainDetection = redactToolchainEvidence(await detectToolchain(runnerClone.path), flight.redactText);
     } catch (err) {
       runLog.warn("toolchain detection failed; continuing without a requirement set", {
         error: errMessage(err),
@@ -18598,6 +18609,7 @@ export class RunRunner {
           gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
             claimGeneration: flight.claimGeneration } : undefined,
           claim.requested_agent_source,
+          (text) => flight.redactText(text),
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (error instanceof CredentialSwitchSignal) {
@@ -32848,6 +32860,8 @@ export class RunRunner {
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
     presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
     requestedSource?: AgentSource | null,
+    // The run's redactor: plan_changed_files are raw porcelain lines naming agent-chosen paths.
+    redactText: (text: string) => string = (text) => text,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -32999,7 +33013,7 @@ export class RunRunner {
     // PRD #212: surface the plan turn's worktree writes at the gate. Runner-uid status,
     // best-effort (planChangedFiles swallows errors → []), computed EVERY round so a
     // revision gate reflects that round's tree (a revert between rounds clears the list).
-    const planChangedFiles = await this.git.planChangedFiles(worktreePath);
+    const planChangedFiles = (await this.git.planChangedFiles(worktreePath)).map((line) => redactPorcelainLine(line, redactText));
     // PRD #1795 (decision 9): this gate waits on a human (a CI-config ci_fix plan forces one even on
     // an auto-approve claim), so bound/unbound verdict handling applies.
     steering.setHumanGated(true);
