@@ -94,7 +94,14 @@ describe("which lines of a multi-line value are registered alone", () => {
     });
   }
 
-  for (const [label, line] of [["a digits-only line", "11223344"], ["a one-digit mixed token", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a whitespace run", "        "]] as const) {
+  for (const code of ["84629137", "5083619274"]) {
+    it(`the digits-only line ${code} (8+ digits, 5+ distinct) is masked on its own`, () => {
+      const redact = redactOf([FILLER[0], code, FILLER[1]].join("\n"));
+      assert.ok(!redact(`log: ${code} end`).includes(code));
+    });
+  }
+
+  for (const [label, line] of [["a digits-only line with 4 distinct digits", "11223344"], ["a one-digit mixed token", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a whitespace run", "        "]] as const) {
     it(`${label} is not registered alone`, () => {
       const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
       assert.equal(redact(`text ${line} end`), `text ${line} end`);
@@ -324,6 +331,24 @@ describe("lines of a multi-line value are registered only when they hold a secre
     const forms = claim.lineForms[0]!.forms;
     assert.ok(forms.includes(JSON.stringify(ENTROPY[1]).slice(1, -1)), "the JSON-escaped form is kept");
     assert.ok(!makeTextRedactor(claim.redaction)(`x ${JSON.stringify(ENTROPY[1]).slice(1, -1)} y`).includes(ENTROPY[1]!.slice(0, 30)));
+  });
+
+  it("a URL's host is not examined: a host label that reads like a token leaves the line public", () => {
+    const host = ["ec2", "54", "12", "34", "56"].join("-") + ".compute-1.ExampleCloud.com";
+    assertLineClasses(["kind: Config", `    server: https://${host}:6443`, ENTROPY[0]!], [`    server: https://${host}:6443`], [ENTROPY[0]!]);
+  });
+
+  it("a mixed-case token with fewer than 5 distinct characters is not registered", () => {
+    assertLineClasses(["AaBbAaBbAaBb", ENTROPY[0]!], ["AaBbAaBbAaBb"], [ENTROPY[0]!]);
+  });
+
+  it("a 64 KiB line of scheme characters builds its forms in linear time", () => {
+    const long = hex("long-line", 64).repeat(1024);
+    const started = performance.now();
+    const claim = runEnvClaimForms([secretVar("LONG_HEX", `${long}\n${ENTROPY[0]}\n`)], []);
+    const ms = performance.now() - started;
+    assert.ok(claim.lineForms[0]!.forms.includes(long), "the long line is a line form");
+    assert.ok(ms < 1500, `forms built in ${ms.toFixed(0)} ms`);
   });
 
   it("a kubeconfig keeps its structure readable and masks its data lines", () => {

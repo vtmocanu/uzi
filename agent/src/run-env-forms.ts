@@ -45,8 +45,9 @@ const PEM_ARMOR = /^-----(BEGIN|END) [^-]+-----$/;
 /** A leading `key:` or `key=` (optionally after a YAML `- `, with the key optionally quoted). An `=` that
  *  only pads the end of the line (base64 padding) and a `:` that starts `//` (a URL scheme) are not a key. */
 const LEADING_KEY = /^\s*(?:-\s+)?["']?[A-Za-z0-9_.-]+["']?\s*(?::|=(?!=*\s*$))(?!\/\/)\s*/;
-/** A URL's `scheme://` and host[:port]; an optional `userinfo@` between them is captured. */
-const URL_SCHEME_HOST = /[A-Za-z][A-Za-z0-9+.-]*:\/\/((?:[^\s/@]*@)?)[A-Za-z0-9.-]+(?::\d+)?/g;
+/** A URL's `scheme://` and host[:port]; an optional `userinfo@` between them is captured. The scheme starts where
+ *  no scheme character precedes it, so a long run of scheme characters is scanned once. */
+const URL_SCHEME_HOST = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/((?:[^\s/@]*@)?)[A-Za-z0-9.-]+(?::\d+)?/g;
 /** A maximal run of token characters; `/` and every other character separate tokens. */
 const TOKEN = /[A-Za-z0-9+=_-]+/g;
 const MIN_DISTINCT_CHARS = 5;
@@ -55,10 +56,11 @@ function isMultiLine(value: string): boolean {
   return value.includes("\r") || value.includes("\n");
 }
 
-/** Whether a token is long enough, varied enough, and mixes upper- and lower-case letters or a letter with
- *  at least two digits. */
+/** Whether a token is long enough and has at least {@link MIN_DISTINCT_CHARS} distinct characters, and is
+ *  either all digits (a backup code) or mixes upper- and lower-case letters or a letter with at least two digits. */
 function isSecretToken(token: string): boolean {
   if (token.length < MIN_SECRET_LEN || new Set(token).size < MIN_DISTINCT_CHARS) return false;
+  if (/^[0-9]+$/.test(token)) return true;
   const upper = /[A-Z]/.test(token);
   const lower = /[a-z]/.test(token);
   const digits = (token.match(/[0-9]/g) ?? []).length;
