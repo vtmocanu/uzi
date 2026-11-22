@@ -50,6 +50,21 @@ describe("redactPorcelainLine", () => {
     assert.ok(out.startsWith("?? ") && out.includes("REDACTED"), out);
     assert.ok(!out.includes(QUOTED_SECRET));
   });
+  it("keeps a rename with a quoted side unambiguous: the redacted side is re-quoted, the other side stays", () => {
+    const line = `R  "old/rv-\\303\\234n\\303\\257-Hn3b-Yc6v.txt" -> new/ok.txt`;
+    const out = redactPorcelainLine(line, redact);
+    assert.ok(out.includes("REDACTED") && !out.includes(QUOTED_SECRET), out);
+    assert.match(out, /^R {2}".*REDACTED.*" -> new\/ok\.txt$/);
+  });
+  it("redacts a value that spans a rename arrow when one side is quoted", () => {
+    const arrowValue = ["naïve", "deploy-key-1"].join(" -> ");
+    const arrowRedact = makeTextRedactor([arrowValue]);
+    const line = `R  "na\\303\\257ve" -> deploy-key-1`;
+    assert.equal(arrowRedact(line), line, "neither the raw line nor a decoded segment holds the value");
+    const out = redactPorcelainLine(line, arrowRedact);
+    assert.ok(out.includes("REDACTED"), out);
+    assert.ok(!out.includes("deploy-key-1") && !out.includes("ve ->"), out);
+  });
 });
 
 describe("the plan gate report redacts plan_changed_files", () => {
@@ -125,13 +140,21 @@ describe("chat propose_issue redacts the repo selector", () => {
   });
 });
 
-describe("a park reports no value in any state body", () => {
-  it("a limit park whose work and error text carry the value", async () => {
+describe("a limit park reports no value in a state body or a run message", () => {
+  it("work committed with the value in its path and content, and a limit error naming it, reach neither", async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-re-park-sink-"));
     const { gitlab } = fakeGitlab();
     const claim = freshClaim(1, { wait_on_limit: true, secrets: secrets() as never });
+    const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+    let committed = "";
     const exec: Executor = {
       run: async (ctx: RunContext) => {
+        const file = `notes-${PLAIN_SECRET}.txt`;
+        fs.writeFileSync(path.join(ctx.worktreePath, file), `token=${PLAIN_SECRET}\n`);
+        const ident = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+        execFileSync("git", ["-C", ctx.worktreePath, "add", file], { env: gitEnv, stdio: "pipe" });
+        execFileSync("git", ["-C", ctx.worktreePath, ...ident, "commit", "-m", `work using ${PLAIN_SECRET}`], { env: gitEnv, stdio: "pipe" });
+        committed = execFileSync("git", ["-C", ctx.worktreePath, "log", "-1", "--format=%s"], { env: gitEnv, encoding: "utf8" }).trim();
         fs.mkdirSync(path.join(homeRoot, ctx.runId), { recursive: true });
         throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour", message: `limit while using ${PLAIN_SECRET}` } as never);
       },
@@ -141,8 +164,12 @@ describe("a park reports no value in any state body", () => {
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
+    assert.ok(committed.includes(PLAIN_SECRET), "the executor committed work carrying the value");
     const bodies = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
     assert.ok(bodies.some((b) => b.status === "limit_wait"), "the run parked");
     assertNoValue("every reported state body", bodies);
+    const messages = api.messages(claim.run_id);
+    assert.ok(messages.length > 0, "the run posted messages");
+    assertNoValue("every posted run message", messages);
   });
 });

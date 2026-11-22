@@ -18563,6 +18563,7 @@ export class RunRunner {
           steering,
           semanticCompiled ? reportSemanticState : checkedHuman || checkedApproval ? reportCheckedState : reportState,
           runLog,
+          (text) => flight.redactText(text),
           effectiveAutoApprove,
           crossCheckReason,
           repoAgents,
@@ -18609,7 +18610,6 @@ export class RunRunner {
           gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
             claimGeneration: flight.claimGeneration } : undefined,
           claim.requested_agent_source,
-          (text) => flight.redactText(text),
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (error instanceof CredentialSwitchSignal) {
@@ -32823,6 +32823,8 @@ export class RunRunner {
     // narrowed the return would make the park branch unable to reuse this closure.
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
+    // The run's redactor (required: no identity default): plan_changed_files are raw porcelain lines naming agent-chosen paths.
+    redactText: (text: string) => string,
     autoApprove: boolean,
     crossCheckReason: string | undefined,
     repoAgents: AgentTemplate[],
@@ -32860,8 +32862,6 @@ export class RunRunner {
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
     presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
     requestedSource?: AgentSource | null,
-    // The run's redactor: plan_changed_files are raw porcelain lines naming agent-chosen paths.
-    redactText: (text: string) => string = (text) => text,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on

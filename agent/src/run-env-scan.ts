@@ -266,7 +266,7 @@ const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 1
 
 /** Git's C-style unquoting of one quoted path body (the text between the quotes): the escapes `\a \b \t \n \v
  *  \f \r \" \\` and three-digit octal bytes, the resulting bytes decoded as UTF-8. */
-export function cUnquote(body: string): string {
+function cUnquote(body: string): string {
   const bytes: number[] = [];
   for (let i = 0; i < body.length; i++) {
     const c = body[i]!;
@@ -286,18 +286,42 @@ export function cUnquote(body: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
+const QUOTED_SEGMENT = /"((?:[^"\\]|\\.)*)"/g;
+const C_QUOTE_NAMES: Record<number, string> = { 7: "\\a", 8: "\\b", 9: "\\t", 10: "\\n", 11: "\\v", 12: "\\f", 13: "\\r", 34: '\\"', 92: "\\\\" };
+
+/** Quote text the way git quotes a path: wrapped in `"`, with `\`, `"` and control characters escaped. */
+function cQuote(text: string): string {
+  let out = '"';
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (code in C_QUOTE_NAMES) out += C_QUOTE_NAMES[code];
+    else if (code < 0x20 || code === 0x7f) out += `\\${code.toString(8).padStart(3, "0")}`;
+    else out += ch;
+  }
+  return `${out}"`;
+}
+
+/** The line with every quoted segment replaced by its decoded text. */
+function decodeAllQuoted(line: string): string {
+  return line.replace(QUOTED_SEGMENT, (_whole, body: string) => cUnquote(body));
+}
+
 /** Redact one raw `git status --porcelain` line. Git C-quotes a path with special or non-ASCII characters, so a
- *  secret value inside such a path is split by escapes and the redactor misses it in the quoted form: each
- *  quoted segment is decoded first, and a segment whose decoded text meets the redactor is replaced, quotes
- *  included, by the redacted decoded text. The status columns and an unquoted rename side stay as git wrote them.
- *  With no match the line is returned unchanged (the same string). */
+ *  secret value inside such a path is split by escapes and the redactor misses it in the quoted form. Each
+ *  quoted segment is decoded first, and a segment whose decoded text meets the redactor is replaced by the
+ *  redacted decoded text, re-quoted so a rename stays unambiguous. A value can also span two sides of a rename
+ *  (one side quoted), so the result is accepted only when its fully decoded form (every quoted segment
+ *  unquoted) and its raw form hold nothing for the redactor; otherwise the redacted fully decoded line is
+ *  returned instead, a single unquoted line. With no match the line is returned unchanged (the same string). */
 export function redactPorcelainLine(line: string, redactText: (text: string) => string): string {
-  const decodedHit = line.replace(/"((?:[^"\\]|\\.)*)"/g, (whole, body: string) => {
+  const segmented = line.replace(QUOTED_SEGMENT, (whole, body: string) => {
     const decoded = cUnquote(body);
     const redacted = redactText(decoded);
-    return redacted !== decoded ? redacted : whole;
+    return redacted !== decoded ? cQuote(redacted) : whole;
   });
-  return redactText(decodedHit);
+  const decodedSegmented = decodeAllQuoted(segmented);
+  if (redactText(decodedSegmented) === decodedSegmented && redactText(segmented) === segmented) return segmented;
+  return redactText(decodeAllQuoted(line));
 }
 
 /** The names of the variables whose forms occur in a path named by a diff header line, quoted or not. A path is
