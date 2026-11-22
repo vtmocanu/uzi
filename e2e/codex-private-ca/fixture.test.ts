@@ -105,6 +105,69 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
     assert.throws(() => execFileSync(read.command, read.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" }),
       (error: any) => error.status !== 0 && /Permission denied/.test(error.stderr.toString()));
     const credential = ["cdr", "synthetic", "provider", "claim"].join("-");
+    const id = `ca-${row}`;
+    // A literal filesystem-only program: no process, environment or cross-run inspection.
+    // Input and output stay private; only fixed assertion labels reach the test log.
+    const inspectOwned = `
+      const fs = require("node:fs"), path = require("node:path");
+      const input = JSON.parse(fs.readFileSync(0, "utf8"));
+      const parent = input.root + "/codex-data";
+      const epochs = fs.readdirSync(parent).filter(n => n.includes("-epoch-") &&
+        fs.lstatSync(path.join(parent, n)).isDirectory());
+      const results = epochs.map(n => {
+        const home = path.join(parent, n, "codex");
+        const config = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        const ca = path.join(home, "provider-extra-ca.crt");
+        const exists = fs.existsSync(ca);
+        const stat = exists ? fs.lstatSync(ca) : undefined;
+        const sessions = path.join(home, "sessions");
+        function clean(dir) {
+          if (!fs.existsSync(dir)) return true;
+          return fs.readdirSync(dir).every(name => {
+            const file = path.join(dir, name), s = fs.lstatSync(file);
+            if (s.isSymbolicLink()) return false;
+            if (s.isDirectory()) return clean(file);
+            return name !== "provider-extra-ca.crt" &&
+              !fs.readFileSync(file).includes(Buffer.from(input.pem));
+          });
+        }
+        return { configClean: !config.includes(input.source) && !config.includes(input.key),
+          exists, uid: stat?.uid, mode: stat && (stat.mode & 511),
+          regular: stat?.isFile(), exact: exists && fs.readFileSync(ca).equals(Buffer.from(input.pem)),
+          outsideSessions: !ca.startsWith(sessions + "/"), sessionsClean: clean(sessions) };
+      });
+      process.stdout.write(JSON.stringify({ uid: process.getuid(), results }));
+    `;
+    let ownedObserved = false;
+    let ownedObservationError: unknown;
+    const observeOwned = () => {
+      if (ownedObserved || ownedObservationError) return;
+      try {
+        const probe = runnerCommand(process.execPath, ["-e", inspectOwned]);
+        const result = JSON.parse(execFileSync(probe.command, probe.args, {
+          env: { PATH: "/usr/bin:/bin" }, encoding: "utf8", timeout: 5000,
+          input: JSON.stringify({ root: `/data/agent-home/${id}`, source: caFile,
+            key: credential, pem: execFileSync("cat", [caFile], { encoding: "utf8" }) }),
+          stdio: ["pipe", "pipe", "pipe"],
+        }));
+        assert.equal(result.uid, 10002, "filesystem probe runs as runner");
+        assert.equal(result.results.length, 1, "one live owned epoch observed");
+        for (const observed of result.results) {
+          assert.equal(observed.configClean, true, "config excludes mount source and runtime key");
+          assert.equal(observed.sessionsClean, true, "live sessions exclude configured public PEM");
+          assert.equal(observed.exists, row !== "no-extra", "staging follows configured extra CA");
+          if (row !== "no-extra") {
+            assert.equal(observed.uid, 10002, "staged CA owner");
+            assert.equal(observed.mode, 0o600, "staged CA mode");
+            assert.equal(observed.regular, true, "staged CA is a regular file");
+            assert.equal(observed.exact, true, "staged CA has exact configured public PEM bytes");
+            assert.equal(observed.outsideSessions, true, "staged CA outside sessions");
+          }
+        }
+        ownedObserved = true;
+        console.log("owned-filesystem-observed", row);
+      } catch (error) { ownedObservationError = error; }
+    };
     const receipts: unknown[] = [], unexpected: unknown[] = [], apiRequests: string[] = [];
     let tlsErrors = 0, connections = 0, httpRequests = 0;
     const sockets = new Set<Socket>();
@@ -153,6 +216,7 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
           res.writeHead(400).end();
           return;
         }
+        if (row === "trusted" && receipts.length === 0) observeOwned();
         receipts.push(receipt);
         const id = `cdr-ca-${receipts.length}`;
         const done = parsed.tools?.find((tool: { type?: string; name?: string }) =>
@@ -175,7 +239,11 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         res.end(frames.map(f => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join(""));
       });
     });
-    server.on("tlsClientError", error => { tlsErrors++; console.log("tlsClientError", error.message); });
+    server.on("tlsClientError", error => {
+      tlsErrors++;
+      if (row === "no-extra") observeOwned();
+      console.log("tlsClientError", error.message);
+    });
     const observe = (stage: string) => console.log("fixture-stage", row, stage,
       { api: api.listening, server: server.listening, stalled: stalled.listening });
     observe("await-api-listen");
@@ -190,7 +258,6 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
       const cfg = loadConfig({ UZI_API_URL: `http://127.0.0.1:${(api.address() as any).port}`,
         UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"), UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk",
         ...(row !== "no-extra" ? { UZI_CODEX_CA_FILE: caFile } : {}) });
-      const id = `ca-${row}`;
       const workspace = `/data/${id}-work`;
       await fs.mkdir(workspace, { mode: 0o2770 });
       await fs.chown(workspace, 10001, 10002);
@@ -243,6 +310,10 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         assert.equal(httpRequests, 0, "zero HTTP requests, including rejected routes");
         if (row === "no-extra" || row === "unrelated") assert.ok(tlsErrors > 0, "our listener observed failed handshakes");
         else assert.ok(connections > 0, "our stalled listener accepted TCP");
+      }
+      if (ownedObservationError) throw ownedObservationError;
+      if (row === "trusted" || row === "no-extra") {
+        assert.equal(ownedObserved, true, "live filesystem observation before completion/disposal");
       }
       assert.deepEqual(unexpected, []);
       assert.deepEqual(apiRequests, [], "zero vendor/control API requests");
