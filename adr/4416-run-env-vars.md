@@ -80,8 +80,7 @@ caught beyond the PRD list:
   `GCE_METADATA_` and `AWS_ENDPOINT_URL_BEDROCK` and the name `AWS_EC2_METADATA_SERVICE_ENDPOINT`
   (all `network_wiring`). The `AWS_ENDPOINT_URL_BEDROCK` prefix has no trailing underscore on
   purpose, so it also covers `AWS_ENDPOINT_URL_BEDROCK_AGENT*`. `OTEL_EXPORTER_OTLP_*` and
-  `GCE_METADATA_*` were first treated as allowed application settings and are now denied network
-  wiring, because the harness reads them.
+  `GCE_METADATA_*` are denied as network wiring because the harness reads them.
 
 Names that a harness also reads but that are application configuration (`AWS_REGION`, cloud
 credentials, `CLOUD_ML_REGION`) stay allowed and are recorded in the fixture's `overlaps` with the
@@ -139,8 +138,8 @@ later rule denies can still be removed.
   identities no row and no receipt references.
 - **`var_id` identity guard.** `run_env_var_ids` binds each `var_id` to one
   `(user, repo, scope, name)` and is never reused while referenced. The identity is deleted by the
-sweeper once no row and no receipt references it (`DeleteRunEnvSweepIdentities`), after which the
-id may be issued again; var_ids are random UUIDs. A trigger
+  sweeper once no row and no receipt references it (`DeleteRunEnvSweepIdentities`), after which the
+  id may be issued again; var_ids are random UUIDs. A trigger
   on `run_env_vars` creates the identity on first insert and refuses, with `check_violation`, any
   insert under another owner, repo, scope or name and any update of those columns. A receipt that
   names a `var_id` can therefore never be satisfied by a row of another variable. The migration refuses
@@ -201,8 +200,8 @@ registers each of its lines (8 characters or more, PEM armor lines excluded) for
 never as a scan needle, because a public line would hit unrelated files. The scan needles instead add
 diff-shaped forms of the value, its lines joined by `\n+`, `\n-` and `\n ` (LF and CRLF). Plain
 values are never registered. The forms join the run's existing redactor, so every sink it already
-covers masks them; this change also routes the plan, the plan summary, the intent summary and
-the planning diff through it. The lead's prompt lists only the variables the executor actually
+covers masks them; the plan, the plan summary, the intent summary and
+the planning diff also go through it. The lead's prompt lists only the variables the executor actually
 injected: a name dropped as protected or already set by the tool profile is not listed.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
@@ -214,9 +213,9 @@ to forge push protection that cannot know these values. A clean verdict is bound
 and exclusion set that is then published (`scanCoversCandidate`).
 
 Needle resolution (`resolveScanNeedles`): a publish with a live claim uses its needles. With no
-live flight the worker asks the redact route. A 404 carrying `run_env_run_not_found` or a 409
-withholds. A 404 without that code (an api that lacks the route) resolves to no needles only when no
-durable per-run marker exists. The worker writes the marker (`agent/src/run-env-seen.ts`: temp
+live flight the worker asks the redact route. A 409 withholds, and so does a 404 that carries any
+code, including `run_env_run_not_found`. Only a 404 with no code (an api that lacks the route)
+reaches the marker check, and it resolves to no needles only when no durable per-run marker exists. The worker writes the marker (`agent/src/run-env-seen.ts`: temp
 file, fsync, rename, fsync of the directory) before any variable reaches an executor, for every
 claim carrying `run_env` or `run_env_redact`, and a failed write stops the run from starting.
 Markers are never removed. The marker proves only that this worker never received variables for the
@@ -244,7 +243,7 @@ Recorded so the PRD's plan is not read as the shipped mechanism.
 - The PRD listed a salvage-ref publish as a separate worker path. The salvage ref is an API-side
   copy of the last published checkpoint, so scanning the checkpoint covers it; there is no
   worker-side salvage publish to scan.
-- Before this change the park, shutdown, pause and overlay checkpoints were not gitleaks-scanned.
+- Before M2 the park, shutdown, pause and overlay checkpoints were not gitleaks-scanned.
   They now pass the exact-value scan for secret variables through the single `publishCheckpoint`
   call. gitleaks behaviour is unchanged.
 - Recovery bundle uploads were unscanned and are now scanned.
@@ -285,7 +284,7 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   `checker_unavailable`, which forces a human gate.
 - Neither of the last two is a leak: both withhold or force a human decision.
 
-## Not shipped by this change
+## Not shipped in M2
 
 M3 (a per-run Docker client configuration directory, so a registry login lasts for the run) and
 M4 (user-level variables) are not implemented; the user doc says logins do not persist across

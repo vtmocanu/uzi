@@ -93,7 +93,8 @@ terminal preservation packs, recovery archives and the preserved patch.
   is not matched as a whole by the check on the preserved patch. Each line is
   still redacted, and a committed file that holds the secret is still blocked.
 - A worker that must look up a finished run's secrets is served them only while
-  the run is active or a publication of its work is still in flight. Otherwise
+  the run is active or a publication of its work is still in flight. A cross-check
+  child is served only while its check is open and before its deadline. Otherwise
   the publish is withheld.
 
 ## Rotating and deleting while runs are active

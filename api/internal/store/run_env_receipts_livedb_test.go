@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 )
 
-// PRD #4416 M2: delivery receipts, the never-reused variable identity, the claim-time
+// PRD #4416 M2: delivery receipts, the variable identity guard, the claim-time
 // reads and the lead-lane predicate, against a real PostgreSQL. Skipped without
 // UZI_TEST_DATABASE_URL (see codexJudgeMigrationDB).
 
@@ -38,7 +38,7 @@ func wantCheckViolation(t *testing.T, err error) {
 	wantConstraint(t, err, "23514", "")
 }
 
-func TestRunEnvVarIdentityIsNeverReusedLiveDB(t *testing.T) {
+func TestRunEnvVarIdentityRefusesReuseWhileReferencedLiveDB(t *testing.T) {
 	pool, _ := envRunDB(t)
 	user, other := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
@@ -57,7 +57,7 @@ func TestRunEnvVarIdentityIsNeverReusedLiveDB(t *testing.T) {
 	wantCheckViolation(t, envInsert(pool, user, uuid.Nil, "TOKEN", true, 3, varID, "live"))
 	wantCheckViolation(t, envInsert(pool, other, s.repo, "TOKEN", true, 3, varID, "live"))
 
-	// Deleting every row of the variable does not free its id.
+	// Deleting every row of the variable leaves its identity row, which still binds the id.
 	cjExec(t, pool, `DELETE FROM run_env_vars WHERE var_id=$1`, varID)
 	wantCheckViolation(t, envInsert(pool, user, s.repo, "RENAMED", true, 1, varID, "live"))
 	if err := envInsert(pool, user, s.repo, "TOKEN", true, 1, varID, "live"); err != nil {

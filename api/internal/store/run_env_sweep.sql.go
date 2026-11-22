@@ -31,7 +31,7 @@ type DeleteRunEnvSweepIdentitiesParams struct {
 }
 
 // One bounded batch of the owner's variable identities that no version row and no receipt
-// references. The identity only mattered while something could still name its var_id.
+// references.
 func (q *Queries) DeleteRunEnvSweepIdentities(ctx context.Context, arg DeleteRunEnvSweepIdentitiesParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteRunEnvSweepIdentities, arg.UserID, arg.Batch)
 	if err != nil {

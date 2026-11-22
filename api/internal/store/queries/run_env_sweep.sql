@@ -44,7 +44,7 @@ WHERE v.id = d.id;
 
 -- name: DeleteRunEnvSweepIdentities :execrows
 -- One bounded batch of the owner's variable identities that no version row and no receipt
--- references. The identity only mattered while something could still name its var_id.
+-- references.
 DELETE FROM run_env_var_ids i
 USING (
     SELECT x.var_id FROM run_env_var_ids x

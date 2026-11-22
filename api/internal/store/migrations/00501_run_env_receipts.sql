@@ -4,14 +4,13 @@ SET LOCAL lock_timeout = '5s';
 LOCK TABLE runs, users IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE run_env_vars IN ACCESS EXCLUSIVE MODE;
 
--- PRD #4416 M2: delivery receipts, the never-reused variable identity, the version-2 AAD
+-- PRD #4416 M2: delivery receipts, the variable identity table, the version-2 AAD
 -- discriminator and the lead-lane predicate.
 --
 -- run_env_receipts: one row per (run, variable version) a claim delivered, plain and
 -- secret alike (the run page names what ran). Retention, the retire/pending-delete
 -- decisions and the finish gate read the SECRET receipts only (the partial index).
--- There is no foreign key to run_env_vars (a receipt outlives the version it names, so a
--- deleted or purged row stays visible as missing) and no value or hash is ever stored.
+-- There is no foreign key to run_env_vars, and no value or hash is ever stored.
 -- user_id is the run owner, carried so the receipt can be matched to the owner's rows
 -- without a join. first/last_claim_generation bound which claims delivered the version.
 CREATE TABLE run_env_receipts (
@@ -29,14 +28,12 @@ CREATE TABLE run_env_receipts (
 );
 CREATE INDEX run_env_receipts_secret_version_idx
     ON run_env_receipts (var_id, rev, run_id) WHERE secret;
--- The sweeper's orphan-identity checks look receipts up by var_id, plain and secret alike; the
--- primary key leads with run_id and the index above is partial, so neither serves them.
+-- Looks receipts up by var_id, plain and secret alike, for the sweeper's orphan-identity checks.
 CREATE INDEX run_env_receipts_var_idx ON run_env_receipts (var_id);
 
--- run_env_var_ids: the identity of every variable ever created, kept after its rows and
--- its repo are gone. A var_id is bound to one (user, repo, scope, name) for good, so a
--- receipt that names a var_id can never be satisfied by a row of another variable. repo_id
--- has no foreign key.
+-- run_env_var_ids: the identity of a variable. A var_id is bound to one (user, repo, scope,
+-- name) while its identity row exists; the sweep deletes an identity that no run_env_vars row
+-- and no receipt references. repo_id has no foreign key.
 CREATE TABLE run_env_var_ids (
     var_id  uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -72,7 +69,7 @@ ORDER BY var_id, rev DESC;
 
 -- The identity guard. On INSERT the identity row is created if absent and the stored
 -- (user, repo, scope, name) must equal the new row's, which refuses a reused var_id
--- under another name, repo, scope or owner even after every row of it was deleted. On
+-- under another name, repo, scope or owner while the identity row exists. On
 -- UPDATE the identity columns may not change. check_violation (23514) is raised.
 -- +goose StatementBegin
 CREATE FUNCTION run_env_vars_identity_guard() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -111,8 +108,7 @@ CREATE TRIGGER run_env_vars_identity_guard
     FOR EACH ROW EXECUTE FUNCTION run_env_vars_identity_guard();
 
 -- aad_version names the sealing context a row was sealed under: 1 is the M1 context
--- (scope, repo, secret flag, name), 2 adds the owner, var_id and rev so a ciphertext cannot
--- be moved between versions. Existing rows stay 1; every new seal writes 2.
+-- (scope, repo, secret flag, name), 2 adds the owner, var_id and rev. Existing rows stay 1; every new seal writes 2.
 ALTER TABLE run_env_vars
     ADD COLUMN aad_version smallint NOT NULL DEFAULT 1,
     ADD CONSTRAINT run_env_vars_aad_version_check CHECK (aad_version IN (1, 2));
