@@ -194,7 +194,7 @@ done
 # A failed or malformed fallback refuses; so does a malformed row that does not match the branch.
 UZI_RUNS_RC=1 UZI_RUNS_JSON='[]' run cifix 110 --gate none --no-push
 [ "$rc" -eq 4 ] || fail "failed fallback not refused, rc=$rc"
-for bad in '[{}]' '[1]' '[{"id":"x","kind":"mr_rework","repo_id":"repo-1","mr_iid":"7","status":"running"}]' '[{"id":"o","kind":"issue","repo_id":"elsewhere","status":"RUNNING"}]'; do
+for bad in '[][]' '[] []' '[{}]' '[1]' '[{"id":"x","kind":"mr_rework","repo_id":"repo-1","mr_iid":"7","status":"running"}]' '[{"id":"o","kind":"issue","repo_id":"elsewhere","status":"RUNNING"}]'; do
   UZI_RUNS_JSON=$bad run cifix 110 --gate none --no-push
   [ "$rc" -eq 4 ] || fail "malformed fallback $bad not refused, rc=$rc: $(cat "$WORK/out.110")"
 done

@@ -72,6 +72,9 @@ if ci_fix_snapshot "$future" repo x "$now" 2>/dev/null; then fail 'accepted a fi
 helpers='[{"id":"fix","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"running"},{"id":"rework","kind":"mr_rework","repo_id":"repo","mr_iid":42,"status":"paused"},{"id":"other","kind":"mr_rework","repo_id":"repo","mr_iid":43,"status":"running"}]'
 [ "$(branch_helper_active_runs "$helpers" repo x 42 | jq -r 'map(.id)|join(" ")')" = 'fix rework' ] || fail 'shared helper predicate lost or widened writers'
 if branch_helper_active_runs '[{"id":null,"kind":"mr_rework","repo_id":"repo","mr_iid":42,"status":"running"}]' repo x 42 2>/dev/null; then fail 'malformed matching rework accepted'; fi
+for docs in '[][]' '[] []' ''; do
+  if branch_helper_active_runs "$docs" repo x 42 >/dev/null 2>&1; then fail "run list '$docs' (not one document) accepted"; fi
+done
 # Whole-list validation: a malformed row that does NOT match the target still fails closed.
 for bad in '[{}]' '[1]' '[{"id":"o","kind":"issue","repo_id":"elsewhere","status":"Running"}]' \
   '[{"id":"o","kind":7,"repo_id":"repo","status":"running"}]' '[{"id":"o","kind":"issue","repo_id":3,"status":"running"}]' \

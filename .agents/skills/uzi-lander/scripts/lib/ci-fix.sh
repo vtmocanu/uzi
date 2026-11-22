@@ -5,8 +5,10 @@
 
 branch_helper_active_runs() {
   [ -n "$2" ] && [ -n "$3" ] || return 1
-  printf '%s' "$1" | jq -ce --arg repo "$2" --arg br "$3" --argjson pr "${4:-0}" '
-    def matching:
+  printf '%s' "$1" | jq -sce --arg repo "$2" --arg br "$3" --argjson pr "${4:-0}" '
+    # Exactly one JSON document: concatenated or empty input is malformed, never "no writers".
+    if length != 1 then error("expected one run list document") else .[0] end
+    | def matching:
       .repo_id==$repo and
       ((.kind=="ci_fix" and .pipeline_ref==$br) or
        (.kind=="mr_rework" and $pr>0 and .mr_iid==$pr));
