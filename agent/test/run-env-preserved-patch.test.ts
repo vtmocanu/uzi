@@ -152,8 +152,11 @@ describe("the preserved patch and the structural lines of a secret file", () => 
     });
   }
 
-  it("is not withheld when it adds a whitespace-only line", () => {
+  it("the line-form check alone does not withhold a whitespace-only line", () => {
     assert.deepEqual(patchScanVerdict(added(" ".repeat(8)), claim.needles, claim.lineForms, []), { withhold: false });
+    // The run holds a multi-line secret, so the patch is withheld on that ground.
+    assert.deepEqual(patchScanVerdict(added(" ".repeat(8)), claim.needles, claim.lineForms, ["KUBECONFIG_FILE"]),
+      { withhold: true, reason: "multi_line_secret", variables: ["KUBECONFIG_FILE"] });
   });
 
   it("is withheld as line_form when it adds the key line", () => {

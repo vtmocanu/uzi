@@ -4,7 +4,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { createLogger } from "../src/log.js";
 import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
-import { RUN_ENV_FORM_CHARS_MAX, runEnvClaimForms } from "../src/run-env-forms.js";
+import { RUN_ENV_FORM_CHARS_MAX, multiLineSecretVariables, runEnvClaimForms } from "../src/run-env-forms.js";
 import { textHitVariables } from "../src/run-env-scan.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { fakeGitlab, git, installHarness, runnerWith } from "./runner-harness.js";
@@ -297,6 +297,83 @@ describe("the largest claim redacts in bounded time", () => {
     for (const line of bodyLines("dense-3")) assert.ok(!plantedOut.includes(line), "a planted body line is masked");
   });
 
+  it("an indented YAML/JSON secret (thousands of forms sharing the 8-space key) redacts, logs and scans in under 5 s", () => {
+    // Every line of 8+ characters is a form, so a deeply indented file puts its lines into one 8-space bucket.
+    // The claim holds as many distinct lines as the claim's secret-byte bound (116,959 bytes) allows: the
+    // shortest registrable lines, a few at deeper indents and with key shapes.
+    const SECRET_BYTES_MAX = 116_959;
+    const ALNUM = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const offset = crypto.createHash("sha256").update("indented-offset").digest().readUInt32BE(0);
+    // A permutation of the tokens of each length, keyed by a hash-derived offset: 2 characters first, then 3.
+    const tokenAt = (n: number, salt: number): string => {
+      const len = n < 62 * 62 ? 2 : 3;
+      const space = 62 ** len;
+      const idx = (((n - (len === 2 ? 0 : 62 * 62)) * 40503 + offset + salt) % space + space) % space;
+      let out = "";
+      for (let k = 0, v = idx; k < len; k++, v = Math.floor(v / 62)) out += ALNUM[v % 62];
+      return out;
+    };
+    const shape = (n: number, tok: string): string => {
+      switch (n % 10) {
+        case 7: return `${" ".repeat(10)}${tok}`;
+        case 8: return `${" ".repeat(12)}- ${tok}`;
+        case 9: return `${" ".repeat(8)}k:${tok}`;
+        default: return `${" ".repeat(8)}${tok}`;
+      }
+    };
+    const SEPARATOR = "=".repeat(64);
+    const lineOf = (n: number, salt: number): string => shape(n, tokenAt(n, salt));
+    const lines: string[] = [SEPARATOR];
+    for (let n = 0, bytes = SEPARATOR.length + 1; ; n++) {
+      const line = lineOf(n, 0);
+      if (bytes + line.length + 1 > SECRET_BYTES_MAX) break;
+      lines.push(line);
+      bytes += line.length + 1;
+    }
+    const ENTRY_COUNT = 4;
+    const perEntry = Math.ceil(lines.length / ENTRY_COUNT);
+    const entries = Array.from({ length: ENTRY_COUNT }, (_, e) =>
+      secretVar(`INDENTED_${e}`, lines.slice(e * perEntry, (e + 1) * perEntry).join("\n")));
+    const claim = runEnvClaimForms(entries, []);
+    assert.ok(!claim.overBudget, "the claim is within the form budget");
+    const eightSpaces = claim.redaction.filter((f) => f.startsWith(" ".repeat(8))).length;
+    assert.ok(eightSpaces >= 9_000, `${eightSpaces} forms start with 8 spaces`);
+    console.log(`indented claim: ${claim.redaction.length} forms, ${eightSpaces} starting with 8 spaces`);
+
+    const body: string[] = [];
+    for (let n = 0; n < lines.length; n++) body.push(lineOf(n, 1_000_003));
+    const shaped = body.join("\n") + "\n";
+    const text = shaped.repeat(Math.ceil((1024 * 1024) / shaped.length)).slice(0, 1024 * 1024 - 150_000) + `\n${"=".repeat(150_000)}\n`;
+    const planted = lines[5]!;
+    const full = `${text}${planted}\n`;
+
+    const before = process.memoryUsage().heapUsed;
+    const redact = makeTextRedactor(claim.redaction);
+    const log = createLogger("error");
+    for (const f of claim.redaction) log.addSecret(f);
+    const heapGrowthMiB = (process.memoryUsage().heapUsed - before) / (1024 * 1024);
+    console.log(`heap growth building the indexes: ${heapGrowthMiB.toFixed(1)} MiB (informational)`);
+
+    let started = performance.now();
+    const out = redact(full);
+    const redactMs = performance.now() - started;
+    assert.ok(redactMs < 5000, `makeTextRedactor took ${redactMs.toFixed(0)} ms`);
+    assert.ok(out.endsWith("***REDACTED***\n"), "the planted last line is masked");
+
+    started = performance.now();
+    const scrubbed = log.redactDiagnostic!(full);
+    const logMs = performance.now() - started;
+    assert.ok(logMs < 5000, `redactDiagnostic took ${logMs.toFixed(0)} ms`);
+    assert.ok(scrubbed.endsWith("***REDACTED***\n"), "the logger masks the planted last line");
+
+    started = performance.now();
+    const hits = textHitVariables(full, claim.lineForms);
+    const scanMs = performance.now() - started;
+    assert.ok(scanMs < 5000, `textHitVariables took ${scanMs.toFixed(0)} ms`);
+    assert.ok(hits.includes("INDENTED_0"), "the planted line is found");
+    console.log(`1 MiB: redact ${redactMs.toFixed(0)} ms, logger ${logMs.toFixed(0)} ms, scan ${scanMs.toFixed(0)} ms`);
+  });
+
   it("the indexed redactor agrees with the per-secret redactor on a mixed text", () => {
     const secrets = Array.from({ length: 80 }, (_, i) => `secret-number-${String(i).padStart(3, "0")}-value`);
     const split = makeTextRedactor(secrets.slice(0, 5));
@@ -415,5 +492,25 @@ describe("the form budget", () => {
     assert.equal(claim.overBudget, false);
     assert.ok(claim.formChars > 0 && claim.formChars < RUN_ENV_FORM_CHARS_MAX);
     assert.ok(claim.needles.length === 1 && claim.lineForms.length === 1);
+  });
+});
+
+describe("multiLineSecretVariables", () => {
+  const live = (name: string, value: string, secret = true): ClaimRunEnvVar => ({ ...secretVar(name, value), secret });
+  it("lists the distinct names of multi-line secrets with no length floor", () => {
+    const names = multiLineSecretVariables(
+      [
+        live("PLAIN_NOTE", "first line of a note\nsecond line", false),
+        live("CR_ONLY", "one\rtwo"),
+        live("TINY_MULTI", "a\nb"),
+        live("DUP", "x\ny"),
+        live("SINGLE", "single-line-dummy-value"),
+      ],
+      [retired("DUP", "p\nq"), retired("RETIRED_FILE", "r\ns"), retired("RETIRED_ONE", "single-line-dummy-value")],
+    );
+    assert.deepEqual([...names].sort(), ["CR_ONLY", "DUP", "RETIRED_FILE", "TINY_MULTI"]);
+  });
+  it("is empty with no claim", () => {
+    assert.deepEqual(multiLineSecretVariables(undefined, undefined), []);
   });
 });

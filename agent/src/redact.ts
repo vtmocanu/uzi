@@ -111,15 +111,32 @@ export const PER_SECRET_MAX = 64;
 /** Finds the [start, end) spans of registered literals in a text. */
 export type SpanFinder = (text: string) => Array<[number, number]>;
 
+/** A node of a bucket's compressed radix trie: the literal ending here (if any) and the edges below, keyed by the
+ *  first UTF-16 unit of each edge's label. */
+interface TrieNode {
+  terminal: string | undefined;
+  children: Map<number, TrieEdge> | undefined;
+}
+interface TrieEdge {
+  label: string;
+  node: TrieNode;
+}
+
+function newNode(terminal?: string): TrieNode {
+  return { terminal, children: undefined };
+}
+
 /**
  * A mutable, reference-counted index of literals for single-pass matching. Every literal is at least
  * MIN_SECRET_LEN long, so the first MIN_SECRET_LEN UTF-16 units of a literal key a table: at each text position
- * the table is consulted once and only the literals sharing that key are compared, longest first. Adding a
- * literal twice and removing it once keeps it; add and remove touch only that literal's key bucket.
+ * the table is consulted once. The literals sharing a key form a compressed radix trie over their units after the
+ * key, so one walk compares each edge label natively and the cost per position is bounded by the longest
+ * literal, not by the number of literals sharing the key. Adding a literal twice and removing it once keeps it;
+ * add and remove touch only that literal's key bucket, and the trie shape depends only on the live set.
  */
 export class LiteralIndex {
   private readonly counts = new Map<string, number>();
-  private readonly buckets = new Map<string, string[]>();
+  private readonly buckets = new Map<string, TrieNode>();
   private readonly firstUnit = new Uint32Array(0x10000);
 
   /** The distinct literals held. */
@@ -133,20 +150,35 @@ export class LiteralIndex {
     this.counts.set(literal, (held ?? 0) + 1);
     if (held !== undefined) return;
     const key = literal.slice(0, MIN_SECRET_LEN);
-    const bucket = this.buckets.get(key);
-    if (bucket === undefined) {
-      this.buckets.set(key, [literal]);
-    } else {
-      let lo = 0;
-      let hi = bucket.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (bucket[mid]!.length >= literal.length) lo = mid + 1; else hi = mid;
+    let node: TrieNode = this.buckets.get(key) ?? newNode();
+    this.buckets.set(key, node);
+    let pos = MIN_SECRET_LEN;
+    for (;;) {
+      if (pos === literal.length) {
+        node.terminal = literal;
+        break;
       }
-      bucket.splice(lo, 0, literal);
+      const unit = literal.charCodeAt(pos);
+      const edge: TrieEdge | undefined = node.children?.get(unit);
+      if (edge === undefined) {
+        (node.children ??= new Map()).set(unit, { label: literal.slice(pos), node: newNode(literal) });
+        break;
+      }
+      const label = edge.label;
+      let k = 1;
+      const max = Math.min(label.length, literal.length - pos);
+      while (k < max && label.charCodeAt(k) === literal.charCodeAt(pos + k)) k++;
+      if (k < label.length) {
+        const mid = newNode();
+        mid.children = new Map([[label.charCodeAt(k), { label: label.slice(k), node: edge.node }]]);
+        edge.label = label.slice(0, k);
+        edge.node = mid;
+      }
+      node = edge.node;
+      pos += k;
     }
-    const unit = literal.charCodeAt(0);
-    this.firstUnit[unit] = (this.firstUnit[unit] ?? 0) + 1;
+    const first = literal.charCodeAt(0);
+    this.firstUnit[first] = (this.firstUnit[first] ?? 0) + 1;
   }
 
   remove(literal: string): void {
@@ -158,13 +190,39 @@ export class LiteralIndex {
     }
     this.counts.delete(literal);
     const key = literal.slice(0, MIN_SECRET_LEN);
-    const bucket = this.buckets.get(key);
-    if (bucket !== undefined) {
-      bucket.splice(bucket.indexOf(literal), 1);
-      if (bucket.length === 0) this.buckets.delete(key);
+    const root = this.buckets.get(key);
+    if (root !== undefined) {
+      const path: Array<{ parent: TrieNode; unit: number; edge: TrieEdge }> = [];
+      let node = root;
+      let pos = MIN_SECRET_LEN;
+      while (pos < literal.length) {
+        const unit = literal.charCodeAt(pos);
+        const edge = node.children?.get(unit);
+        if (edge === undefined) break;
+        path.push({ parent: node, unit, edge });
+        pos += edge.label.length;
+        node = edge.node;
+      }
+      if (pos === literal.length && node.terminal === literal) {
+        node.terminal = undefined;
+        // Prune empty leaves, then merge a non-terminal single-child node into its child.
+        while (path.length > 0 && node.terminal === undefined && node.children === undefined) {
+          const { parent, unit } = path.pop()!;
+          parent.children!.delete(unit);
+          if (parent.children!.size === 0) parent.children = undefined;
+          node = parent;
+        }
+        const last = path[path.length - 1];
+        if (last !== undefined && node.terminal === undefined && node.children !== undefined && node.children.size === 1) {
+          const [child] = node.children.values();
+          last.edge.label += child!.label;
+          last.edge.node = child!.node;
+        }
+        if (root.terminal === undefined && root.children === undefined) this.buckets.delete(key);
+      }
     }
-    const unit = literal.charCodeAt(0);
-    this.firstUnit[unit] = (this.firstUnit[unit] ?? 1) - 1;
+    const first = literal.charCodeAt(0);
+    this.firstUnit[first] = (this.firstUnit[first] ?? 1) - 1;
   }
 
   /** The [start, end) span of the longest literal at each position where one occurs: sorted by start, and
@@ -186,14 +244,23 @@ export class LiteralIndex {
     const last = text.length - MIN_SECRET_LEN;
     for (let i = 0; i <= last; i++) {
       if (this.firstUnit[text.charCodeAt(i)] === 0) continue;
-      const bucket = this.buckets.get(text.slice(i, i + MIN_SECRET_LEN));
-      if (bucket === undefined) continue;
-      for (const literal of bucket) {
-        if (text.startsWith(literal, i)) {
-          hit(literal, i);
-          if (longestOnly) break;
+      const start = this.buckets.get(text.slice(i, i + MIN_SECRET_LEN));
+      if (start === undefined) continue;
+      let node: TrieNode = start;
+      let best = node.terminal;
+      if (!longestOnly && best !== undefined) hit(best, i);
+      let j = i + MIN_SECRET_LEN;
+      while (node.children !== undefined) {
+        const edge = node.children.get(text.charCodeAt(j));
+        if (edge === undefined || !text.startsWith(edge.label, j)) break;
+        j += edge.label.length;
+        node = edge.node;
+        if (node.terminal !== undefined) {
+          best = node.terminal;
+          if (!longestOnly) hit(best, i);
         }
       }
+      if (longestOnly && best !== undefined) hit(best, i);
     }
   }
 }
