@@ -96,9 +96,9 @@ divided by a conservative bound of 193 form characters per value byte).
   (live, disabled, pending deletion or retired). Plain values do not count.
 - A save that does not raise the count is never refused, so a store already over
   the budget can shrink. **Disable**, **Enable** and **Delete** are never
-  refused.
-- Deleting or disabling a secret that a run still holds does not free budget
-  until the held version is released.
+  refused for budget reasons.
+- Disabling a secret frees no budget. Deleting a secret that a run still holds
+  frees it once the held version is released and the sweeper removes it.
 - The bound is analytic: `fixtures/run-env/form-budget.json` carries the numbers
   and an agent test pins the form counts it assumes, but it is not proved for
   every value. The claim-time cap above stays as the backstop.
@@ -110,9 +110,9 @@ searches for the value as it reads inside a diff, with its lines joined by
 (including parked, paused and shutdown checkpoints), the final push, held and
 terminal preservation packs, recovery archives and the preserved patch.
 
-- The search covers paths too. Every scan above (and the provider-key scan)
-  matches the forms against the full path of every tree entry an outgoing commit
-  introduces, including empty trees and submodule entries. Paths are read as raw
+- The search covers paths too. Every commit scan above except the preserved
+  patch (and the provider-key scan) matches the forms against the full path of
+  every tree entry an outgoing commit introduces, including empty trees and submodule entries. Paths are read as raw
   NUL-separated names, so git path quoting does not hide a value, and a merge is
   read through its combined diff. A finding on a path shows `[path withheld]`
   in place of the file name.

@@ -229,7 +229,7 @@ withholds with the reason `forms_over_budget`. A cross-check child over the cap 
 `MaxClaimSecretBytes` (207,253 = 40,000,000 / 193 form units per byte, `api/internal/runenv/form_budget.go`,
 `fixtures/run-env/form-budget.json`). Counted: every secret row of the repo and the user scope in any
 state (`GetRunEnvFormBudgetUsage`); plain values do not count. A save that does not raise the count is
-never refused; Disable, Enable and Delete are never refused. The per-byte bound is analytic, pinned
+never refused; Disable, Enable and Delete are never refused for budget reasons. The per-byte bound is analytic, pinned
 by `agent/test/run-env-forms-budget.test.ts` for the form counts it assumes, not proved for every value.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
