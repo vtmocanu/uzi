@@ -444,6 +444,41 @@ func TestCodexSetTokenFixOnlyForALiveRunWithAnAlternativeAccount(t *testing.T) {
 	}
 }
 
+// TestAnthropicPoolOnCommandGrammar pins the pool_on command the CLI round-trip test replays: an
+// Anthropic run in an auto lane whose only headroom is an unpooled token is told to pool it.
+func TestAnthropicPoolOnCommandGrammar(t *testing.T) {
+	f := &fakeStore{}
+	for _, c := range []struct {
+		id     uuid.UUID
+		label  string
+		pooled bool
+		pct    int16
+	}{{tokA, "work", true, 96}, {tokB, "spare", false, 20}} {
+		cand, res := tok(c.id, c.label, c.pooled, c.pct)
+		f.cands, f.tokens = append(f.cands, cand), append(f.tokens, res)
+	}
+	f.workers = []store.ListWorkersByUserRow{{
+		ID: wkr, UserID: owner, Name: "w1", AnthropicBindMode: "auto",
+		LastHeartbeatAt: pgconv.Time(now.Add(-time.Second)),
+	}}
+	run := parkedRun("seven_day")
+	run.CredentialOverrideMode, run.CredentialOverrideSecretID = pgtype.Text{}, pgtype.UUID{}
+	got := newLoader(t, f).ForRuns(context.Background(), owner, []store.Run{run})[run.ID]
+	if got == nil {
+		t.Fatal("no block")
+	}
+	all := append(append([]apitypes.WeeklyLimitFixDTO{}, got.Fix...), got.FutureRuns...)
+	for _, fx := range all {
+		if fx.Kind == FixPoolOn {
+			if want := "uzi token pool --on --kind anthropic -- spare"; fx.Command != want {
+				t.Fatalf("pool_on command = %q; want %q", fx.Command, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("no pool_on fix: %+v", all)
+}
+
 func TestBacktickLabelGetsNoCommand(t *testing.T) {
 	label := "a" + "`" + "id" + "`"
 	f := twoTokens(label)

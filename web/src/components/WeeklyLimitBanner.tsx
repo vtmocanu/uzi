@@ -1,5 +1,5 @@
 // WeeklyLimitBanner renders the server's weekly-limit block (PRD #4123) beside the run's
-// credential chip: which credential is at or near its weekly limit, why uzi keeps the run
+// credential chip: which credential the run is parked on at its weekly limit (from M2, also one near it), why uzi keeps the run
 // on it, what the run will do (wait or fail), and the commands that would change that.
 //
 // Render-only by design. The server computes reason, wait and fixes once for every

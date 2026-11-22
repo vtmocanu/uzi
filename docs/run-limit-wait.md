@@ -103,7 +103,7 @@ A run parked on a **7-day** window (`limit_wait` with window `seven_day`), or pa
 
 - `waits`: the run resumes on its own after the reset.
 - `fails`: the run will fail on this limit rather than wait (waiting is off for the run, the wait count is spent, or the park would exceed the maximum park, see [Configuration](configuration.md)).
-- `reserve_pause`: a weekly-reserve pause, which waits for you to resume it.
+- `reserve_pause`: a weekly-reserve pause. It releases itself once a fresh reading is below the reserve (or the reserve or "Also pause running runs" is cleared), or when you resume it; see [Paused by the weekly usage reserve](./run-pause.md#paused-by-the-weekly-usage-reserve).
 - `unknown`: no usable reset time is known.
 
 `fails` and `unknown` never promise a resume.

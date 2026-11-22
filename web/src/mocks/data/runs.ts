@@ -2010,8 +2010,8 @@ export const mockRuns: Run[] = [
       reason: "headroom_outside_pool",
       alternative_label: "ultra-key",
       fix: [
-        { kind: "pool_on", target_id: "sec-seven-only", target_label: "ultra-key", command: "uzi token pool ultra-key --on" },
-        { kind: "set_token", target_id: "sec-seven-only", target_label: "ultra-key", command: "uzi run set-token run-limit-wait-due ultra-key" },
+        { kind: "pool_on", target_id: "sec-seven-only", target_label: "ultra-key", command: "uzi token pool --on --kind anthropic -- ultra-key" },
+        { kind: "set_token", target_id: "sec-seven-only", target_label: "ultra-key", command: "uzi run set-token run-limit-wait-due -- ultra-key" },
       ],
       future_runs: [],
       wait: "waits",

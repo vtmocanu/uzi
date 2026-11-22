@@ -12,6 +12,13 @@ import (
 // is never bounded: a truncated command is one that names another credential.
 const weeklyLabelCap = 60
 
+// weeklyFixEditReserve is the server's edit_reserve fix kind (apitypes.WeeklyLimitFixDTO.Kind). It
+// carries no command; the CLI offers the Settings route and `uzi settings reserve` for it.
+const weeklyFixEditReserve = "edit_reserve"
+
+const weeklyEditReserveText = "raise or turn off the weekly reserve in Settings → Run defaults " +
+	"(or `uzi settings reserve --threshold <1-100|off>`)"
+
 // weeklyLimitCell is the WEEKLY_LIMIT row (PRD #4123): the credential, its weekly use against the
 // effective limit, the reset time, the server-built reason and whether the run waits. Empty for a
 // run without the block (emit-only-when-set). Labels are owner-authored, so they go through cellText
@@ -75,6 +82,8 @@ func weeklyLimitFixRows(w *apitypes.WeeklyLimitDTO) [][]string {
 	add := func(key string, fixes []apitypes.WeeklyLimitFixDTO) {
 		for _, f := range fixes {
 			switch {
+			case f.Kind == weeklyFixEditReserve:
+				rows = append(rows, []string{key, weeklyEditReserveText})
 			case f.Command != "":
 				rows = append(rows, []string{key, uzicli.CellText(f.Command)})
 			case f.CommandUnavailable != "":
@@ -96,7 +105,8 @@ func weeklyLimitTUILine(r apitypes.RunDTO) string {
 		return ""
 	}
 	line := "weekly limit: " + weeklyLimitCell(w)
-	if len(w.Fix) > 0 {
+	// Only when `uzi run get` would print at least one run-level FIX row (future-run advice does not count).
+	if len(weeklyLimitFixRows(&apitypes.WeeklyLimitDTO{Fix: w.Fix})) > 0 {
 		line += " (fix: uzi run get " + cellText(r.ID) + ")"
 	}
 	return line

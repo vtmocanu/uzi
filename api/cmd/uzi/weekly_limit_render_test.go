@@ -18,8 +18,10 @@ func weeklyF(v float64) *float64 { return &v }
 
 func weeklyBlock() *apitypes.WeeklyLimitDTO {
 	reset := time.Date(2026, 11, 27, 9, 30, 0, 0, time.UTC)
+	// Held in plain locals: gosec G101 reads a literal under a Credential-named field as a secret.
+	owner, key := "team-a", "anthropic:s1"
 	return &apitypes.WeeklyLimitDTO{
-		CredentialLabel: "team-a", CredentialKey: "anthropic:s1", Harness: "claude",
+		CredentialLabel: owner, CredentialKey: key, Harness: "claude",
 		Pct: weeklyF(96), EffectiveLimit: 90, ResetsAt: &reset,
 		Tier: apitypes.WeeklyLimitTierWarning, Reason: "can_switch", AlternativeLabel: "team-b",
 		Fix: []apitypes.WeeklyLimitFixDTO{
@@ -64,8 +66,21 @@ func TestRenderRunDetailWeeklyLimitRows(t *testing.T) {
 	if fut := lineWith(t, out, "FIX_FUTURE_RUNS"); !strings.Contains(fut, "rename this token in Settings to get a copyable command") || !strings.Contains(fut, "odd") {
 		t.Errorf("future-run row = %q", fut)
 	}
-	if strings.Count(out, "edit_reserve") != 0 {
-		t.Errorf("a Settings-only fix must not render a command row:\n%s", out)
+	fixRows := 0
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Fields(l); len(f) > 0 && f[0] == "FIX" {
+			fixRows++
+			if strings.Contains(l, "edit_reserve") {
+				t.Errorf("the raw fix kind leaked into a row: %q", l)
+			}
+		}
+	}
+	// set_token and edit_reserve: the Settings-only fix has no command but still gets a row.
+	if fixRows != 2 {
+		t.Errorf("FIX rows = %d, want 2:\n%s", fixRows, out)
+	}
+	if !strings.Contains(out, "raise or turn off the weekly reserve in Settings → Run defaults (or `uzi settings reserve --threshold <1-100|off>`)") {
+		t.Errorf("edit_reserve row text missing:\n%s", out)
 	}
 	plain := weeklyRun()
 	plain.WeeklyLimit = nil
@@ -79,12 +94,12 @@ func TestRenderRunDetailWeeklyLimitRows(t *testing.T) {
 func TestRenderRunDetailWeeklyLimitHostileAndLongCommand(t *testing.T) {
 	r := weeklyRun()
 	w := weeklyBlock()
-	w.CredentialLabel = "evil\x1b[2J‮x\n" + strings.Repeat("L", 300)
+	w.CredentialLabel = "evil\x1b[2J\u202ex\n" + strings.Repeat("L", 300)
 	longCmd := "uzi run set-token r1 -- " + strings.Repeat("c", 400)
 	w.Fix = []apitypes.WeeklyLimitFixDTO{{Kind: "set_token", Command: longCmd + "\x1b]0;x\x07"}}
 	r.WeeklyLimit = w
 	out := weeklyDetailString(t, r)
-	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, 0x07) || strings.ContainsRune(out, '‮') {
+	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, 0x07) || strings.ContainsRune(out, '\u202e') {
 		t.Errorf("control bytes reached the output: %q", out)
 	}
 	if !strings.Contains(lineWith(t, out, "FIX "), longCmd) {
@@ -203,9 +218,9 @@ func posixSplit(t *testing.T, s string) []string {
 	return args
 }
 
-// TestWeeklyFixCommandsRoundTripThroughRealCLI: the copyable commands the server renders (built with
-// shellquote.Quote exactly as weeklylimit's labelFix does) shell-split and run through the real
-// command tree, and each request targets the advertised credential and kind. Option-like labels
+// TestWeeklyFixCommandsRoundTripThroughRealCLI: commands in the grammar weeklylimit emits (built
+// with shellquote.Quote; the weeklylimit tests pin the exact server-side strings) shell-split and
+// run through the real command tree, and each request targets the advertised credential and kind. Option-like labels
 // (--default, --auto, -x), a hostile label and a label shared by an Anthropic token and a Codex
 // login are the cases a naive command would send somewhere else.
 func TestWeeklyFixCommandsRoundTripThroughRealCLI(t *testing.T) {

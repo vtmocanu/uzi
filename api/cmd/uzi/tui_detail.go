@@ -1051,13 +1051,13 @@ func (m tuiModel) renderDetail() string {
 	// cap matches the board's second line (the full sentence is longer than 120), and
 	// clampVisual is the narrow-terminal backstop keeping it one physical row, which
 	// transcriptViewport charges (the #379 invariant).
-	// The weekly-limit line (PRD #4123): one row after the park line, same wait ink. Owner-authored
-	// labels reach it only through renderer.Plain; clampVisual keeps it one physical row, which
-	// transcriptBudgetWithoutDiskGuidance charges (the #379 invariant).
-	if line := weeklyLimitTUILine(d.run); line != "" {
+	if line := fitVaultParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
-	if line := fitVaultParkLine(d.run, m.width); line != "" {
+	// The weekly-limit line (PRD #4123): one row after the vault park line, same wait ink.
+	// Owner-authored labels reach it only through renderer.Plain; clampVisual keeps it one physical
+	// row, which transcriptBudgetWithoutDiskGuidance charges (the #379 invariant).
+	if line := weeklyLimitTUILine(d.run); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
 	// The disk park line (PRD #1809 M5), same slot, ink and shedding as the vault park line: a

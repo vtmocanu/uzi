@@ -185,17 +185,32 @@ func TestGetRunWeeklyLimitHostileLabelInDetail(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	run := wlRun(owner.ID, "seven_day")
 	h := wlRunsHandler(t, &runsStore{ownerID: owner.ID, run: run})
-	label := "x'" + "$" + "(id)" + "`y`"
-	h.SetWeeklyLimit(wlLoader(t, newWLStore(label, owner.ID)))
-	_, got, raw := getRunWeekly(t, h, owner, run.ID)
-	if got == nil {
-		t.Fatalf("no block: %s", raw)
-	}
-	want := "uzi run set-token " + run.ID.String() + " -- 'x'\\''$(id)`y`'"
-	for _, f := range got.Fix {
-		if f.Kind == weeklylimit.FixSetToken && f.Command != want {
-			t.Fatalf("command = %q; want %q", f.Command, want)
+	setToken := func(label string) *apitypes.WeeklyLimitFixDTO {
+		t.Helper()
+		h.SetWeeklyLimit(wlLoader(t, newWLStore(label, owner.ID)))
+		_, got, raw := getRunWeekly(t, h, owner, run.ID)
+		if got == nil {
+			t.Fatalf("no block: %s", raw)
 		}
+		for i := range got.Fix {
+			if got.Fix[i].Kind == weeklylimit.FixSetToken {
+				return &got.Fix[i]
+			}
+		}
+		t.Fatalf("no set_token fix: %s", raw)
+		return nil
+	}
+
+	// Quotes and a command substitution are quoted, so the command still copies safely.
+	st := setToken("x'" + "$" + "(id)" + "\"y\"")
+	if want := "uzi run set-token " + run.ID.String() + " -- 'x'\\''$(id)\"y\"'"; st.Command != want {
+		t.Fatalf("command = %q; want %q", st.Command, want)
+	}
+
+	// A backtick label gets no command (it would end the Slack code span), and says why.
+	st = setToken("x" + "`y`")
+	if st.Command != "" || st.CommandUnavailable != apitypes.WeeklyFixCommandLabel {
+		t.Fatalf("backtick label: command %q unavailable %q; want none and %q", st.Command, st.CommandUnavailable, apitypes.WeeklyFixCommandLabel)
 	}
 }
 

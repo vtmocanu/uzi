@@ -25,7 +25,7 @@ function block(over: Partial<WeeklyLimit> = {}): WeeklyLimit {
     reason: "headroom_outside_pool",
     alternative_label: "ultra-key",
     future_runs: [],
-    fix: [{ kind: "pool_on", target_id: "sec-u", target_label: "ultra-key", command: "uzi token pool ultra-key --on" }],
+    fix: [{ kind: "pool_on", target_id: "sec-u", target_label: "ultra-key", command: "uzi token pool --on --kind anthropic -- ultra-key" }],
     wait: "waits",
     ...over,
   };
@@ -56,7 +56,7 @@ describe("WeeklyLimitBanner (PRD #4123)", () => {
     expect(text).toContain("To change this run:");
     expect(text).toContain("Add “ultra-key” to the auto-select pool");
     const code = r.querySelector("[data-weekly-command]");
-    expect(code?.textContent).toBe("uzi token pool ultra-key --on");
+    expect(code?.textContent).toBe("uzi token pool --on --kind anthropic -- ultra-key");
     expect(within(r).getByRole("button", { name: "Copy command" })).toBeTruthy();
   });
 

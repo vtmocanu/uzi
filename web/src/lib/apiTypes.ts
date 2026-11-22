@@ -3986,8 +3986,8 @@ export interface WeeklyLimitSummary {
 }
 
 export interface Run {
-  /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on or
-   *  near its weekly limit. */
+  /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on its weekly
+   *  limit (and, from M2, near it). */
   weekly_limit?: WeeklyLimit;
   policy_hold?: {
     preserve_required: boolean;
