@@ -13,7 +13,7 @@ import (
 // a fully bound Codex task-review run ships the owner's Codex review model to a worker advertising
 // task_review_settings_v1 (omitted, so the worker runs its gpt-6-sol built-in, when unset or when the stored value is no longer a
 // Codex role model), withholds it with a feed notice from one that does not, never ships the Claude
-// column, and ships the Codex columns to no non-review run. Skipped unless UZI_TEST_DATABASE_URL
+// column. (Non-review claims are covered by TestNonReviewClaimNeverCarriesTaskReviewModel.) Skipped unless UZI_TEST_DATABASE_URL
 // points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
 func TestTaskReviewCodexClaimLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
@@ -60,7 +60,7 @@ func TestTaskReviewCodexClaimLiveDB(t *testing.T) {
 		env.exec(`UPDATE users SET task_review_model = NULLIF($2,''), codex_task_review_model = NULLIF($3,'') WHERE id = $1`, userID, claude, codex)
 	}
 
-	// Unset: the built-in is shipped to a capable worker; an incapable worker runs the same built-in,
+	// Unset: the field is omitted for a capable worker (it runs its built-in); an incapable worker runs the same built-in,
 	// so there is nothing withheld and no notice.
 	set("", "")
 	if got := derefOr(assemble(capable, 1).TaskReviewModel, "<omitted>"); got != "<omitted>" {

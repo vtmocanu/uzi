@@ -177,6 +177,8 @@ func TestReviewClaimReadFailureFailsTheClaim(t *testing.T) {
 
 func TestNonReviewClaimNeverCarriesTaskReviewModel(t *testing.T) {
 	for _, kind := range []string{"issue", "task", "prompt"} {
+		// Claude only: this fake claims no Codex run (no Codex binding). The isReviewRun gate does not
+		// depend on the harness, so a Codex non-review claim is not separately exercised here.
 		for _, harness := range []string{"claude"} {
 			fs := leadClaimFake(t, kind, func(r *store.Run) { r.Harness = harness })
 			fs.taskReviewModel = pgconv.TextOrNull("opus")
