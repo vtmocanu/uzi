@@ -177,6 +177,14 @@ describe("runEnvInjectedSet", () => {
       );
       assert.deepEqual(target, { PRESET_KEY: "x" }, `${name}: env unchanged`);
     }
+    const dup = [v("DUP_ONE"), v("DUP_ONE")];
+    const dupTarget: Record<string, string | undefined> = { PRESET_KEY: "x" };
+    assert.throws(
+      () => foldRunEnv(dupTarget, { vars: dup, set: { injected: dup, dropped: [] } }, () => false),
+      (e: Error) => e.message.includes("DUP_ONE"),
+      "duplicate name",
+    );
+    assert.deepEqual(dupTarget, { PRESET_KEY: "x" }, "duplicate name: env unchanged");
   });
 
   it("is pure: it reads no env and leaves its inputs unchanged", () => {

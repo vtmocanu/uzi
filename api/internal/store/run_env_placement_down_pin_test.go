@@ -3,6 +3,7 @@ package store_test
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -25,20 +26,59 @@ func migrationSection(t *testing.T, file string, down bool) (string, bool) {
 	return up, true
 }
 
-// functionBlock returns the CREATE OR REPLACE FUNCTION <name>( ... $$; block inside section, or
-// "" when the section does not define that function (a mention is not a definition).
+// functionBlock returns the CREATE [OR REPLACE] FUNCTION <name>( ... $$; block inside section, or
+// "" when the section does not define that function (a mention or a commented-out definition is
+// not a definition).
 func functionBlock(t *testing.T, file, section, name string) string {
 	t.Helper()
-	head := "CREATE OR REPLACE FUNCTION " + name + "("
-	_, rest, ok := strings.Cut(section, head)
-	if !ok {
-		return ""
-	}
-	end := strings.Index(rest, "$$;")
-	if end < 0 {
+	block, closed := findFunctionBlock(section, name)
+	if block != "" && !closed {
 		t.Fatalf("%s: the %s definition has no closing $$;", file, name)
 	}
-	return head + rest[:end+len("$$;")]
+	return block
+}
+
+// findFunctionBlock is the pure half of functionBlock: the block runs from the start of the first
+// uncommented definition to its closing $$;. closed is false when a definition has no closing $$;
+// (the block then runs to the end of the section).
+func findFunctionBlock(section, name string) (block string, closed bool) {
+	def := regexp.MustCompile(`(?is)\bCREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+(public\.)?` + regexp.QuoteMeta(name) + `\s*\(`)
+	for _, loc := range def.FindAllStringIndex(section, -1) {
+		lineStart := strings.LastIndex(section[:loc[0]], "\n") + 1
+		if strings.Contains(section[lineStart:loc[0]], "--") {
+			continue
+		}
+		rest := section[loc[0]:]
+		end := strings.Index(rest, "$$;")
+		if end < 0 {
+			return rest, false
+		}
+		return rest[:end+len("$$;")], true
+	}
+	return "", false
+}
+
+func TestFindFunctionBlock(t *testing.T) {
+	const body = "() RETURNS int AS $$ SELECT 1 $$;"
+	cases := []struct {
+		name, section, want string
+	}{
+		{"plain create function", "-- +goose Up\nCREATE FUNCTION fn_x" + body + "\nSELECT 2;", "CREATE FUNCTION fn_x" + body},
+		{"or replace, schema, spacing", "create  or\treplace function public.fn_x  (" + ") AS $$ x $$;", "create  or\treplace function public.fn_x  (" + ") AS $$ x $$;"},
+		{"mention only", "-- fn_x is defined elsewhere\nSELECT fn_x();\nCOMMENT ON FUNCTION fn_x() IS 'y';", ""},
+		{"commented-out definition", "-- CREATE FUNCTION fn_x" + body + "\nSELECT 1;", ""},
+		{"commented-out then real", "-- CREATE FUNCTION fn_x() $$ old $$;\nCREATE OR REPLACE FUNCTION fn_x() AS $$ new $$;", "CREATE OR REPLACE FUNCTION fn_x() AS $$ new $$;"},
+		{"other function", "CREATE FUNCTION fn_xy" + body, ""},
+	}
+	for _, c := range cases {
+		got, closed := findFunctionBlock(c.section, "fn_x")
+		if got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+		if c.want != "" && !closed {
+			t.Errorf("%s: want closed block", c.name)
+		}
+	}
 }
 
 // The run env placement migration's Down restores fn_placement_admitting_workers exactly as the

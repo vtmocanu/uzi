@@ -73,7 +73,8 @@ export function foldRunEnv(
   if (injection === undefined) return [];
   const { injected, dropped } = injection.set ?? runEnvInjectedSet(injection.vars, Object.keys(env), isProtected);
   if (injection.set !== undefined) {
-    // Defence in depth: a precomputed set must equal what the fold would compute. Check every entry before
+    // Defence in depth: every injected entry of a precomputed set must be one the fold would inject (valid name, not protected,
+    // not already set, not duplicated). Check every entry before
     // touching `env`, so a bad set leaves it unchanged. The error names the variable, never its value.
     const seen = new Set<string>();
     for (const v of injected) {

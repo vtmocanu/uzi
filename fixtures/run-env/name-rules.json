@@ -1303,7 +1303,7 @@
       "name": "AWS_ENDPOINT_URL",
       "harness": "claude",
       "decision": "denied",
-      "reason": "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for"
+      "reason": "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for; denied as a network_wiring name"
     },
     {
       "name": "AWS_ENDPOINT_URL_BEDROCK",
