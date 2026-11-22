@@ -76,7 +76,21 @@ describe("SecretSet over a run's secret variable forms", () => {
     assert.ok(claim.redaction.length > PER_SECRET_MAX, `${claim.redaction.length} forms`);
   });
 
-  it("leaves whitespace-only padding unmasked and masks every other line of 8+ characters, in text and payloads", () => {
+  it("masks a Unicode-space padding line (NBSP, U+3000) of a multi-line secret in text and payloads", () => {
+    for (const ch of [" ", "　"]) {
+      const pad = ch.repeat(8);
+      const c = runEnvClaimForms([
+        { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "SVC_PAD", value: [...STRUCTURAL_LINES, pad, ...ENTROPY.slice(0, 5)].join("\n"), secret: true, description: "" },
+      ], []);
+      const set = new SecretSet(c.redaction);
+      const out = set.text(`a\n${pad}\nb`);
+      assert.ok(!out.includes(pad), "the padding line does not survive");
+      assert.equal(out, `a\n${REDACTED}\nb`);
+      assert.deepEqual(set.payload({ k: pad }), { k: REDACTED });
+    }
+  });
+
+  it("leaves ASCII space/tab-only padding unmasked and masks every other line of 8+ characters, in text and payloads", () => {
     const set = new SecretSet(claim.redaction);
     assert.equal(set.text(`a\n${PADDING}\nb`), `a\n${PADDING}\nb`);
     assert.deepEqual(set.payload({ k: PADDING }), { k: PADDING });

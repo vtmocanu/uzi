@@ -4,7 +4,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { createLogger } from "../src/log.js";
 import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
-import { RUN_ENV_FORM_CHARS_MAX, multiLineSecretVariables, runEnvClaimForms } from "../src/run-env-forms.js";
+import { PEM_STANDARD_LABELS, RUN_ENV_FORM_CHARS_MAX, multiLineSecretVariables, runEnvClaimForms } from "../src/run-env-forms.js";
 import { textHitVariables } from "../src/run-env-scan.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { fakeGitlab, git, installHarness, runnerWith } from "./runner-harness.js";
@@ -21,8 +21,9 @@ const secretVar = (name: string, value: string): ClaimRunEnvVar =>
   ({ var_id: UUID, scope: "repo", rev: 1, name, value, secret: true, description: "" });
 const retired = (name: string, value: string): ClaimRunEnvRedact => ({ var_id: UUID, scope: "repo", rev: 1, name, value });
 
-const BEGIN = ["-----BEGIN ", "DUMMY KEY", "-----"].join("");
-const END = ["-----END ", "DUMMY KEY", "-----"].join("");
+const marker = (kind: "BEGIN" | "END", label: string): string => ["-----", kind, " ", label, "-----"].join("");
+const BEGIN = marker("BEGIN", "PRIVATE KEY");
+const END = marker("END", "PRIVATE KEY");
 const bodyLines = (seed: string): string[] =>
   Array.from({ length: 5 }, (_, i) => crypto.createHash("sha256").update(`${seed}-${i}`).digest("base64").replace(/=+$/, "").padEnd(44, "x"));
 const pem = (seed: string): string => [BEGIN, ...bodyLines(seed), END].join("\n");
@@ -109,12 +110,24 @@ describe("which lines of a multi-line value are registered alone", () => {
     });
   }
 
-  it("a whitespace-only line is not registered alone", () => {
-    const line = "        ";
-    const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
-    assert.equal(redact(`text ${line} end`), `text ${line} end`);
-    assert.ok(!redact(`text ${FILLER[0]} end`).includes(FILLER[0]), "its other lines still are");
-  });
+  for (const [label, line] of [["spaces", " ".repeat(8)], ["tabs", "\t".repeat(8)], ["spaces and tabs", "\t \t \t \t "]] as const) {
+    it(`a line of only ${label} is not registered alone`, () => {
+      const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
+      assert.equal(redact(`text ${line} end`), `text ${line} end`);
+      assert.ok(!redact(`text ${FILLER[0]} end`).includes(FILLER[0]), "its other lines still are");
+    });
+  }
+
+  const unicodeSpaces: [string, string][] = [["U+00A0", " "], ["U+3000", "　"],
+    ...Array.from({ length: 11 }, (_, i): [string, string] => [`U+${(0x2000 + i).toString(16).toUpperCase()}`, String.fromCharCode(0x2000 + i)])];
+  for (const [label, ch] of unicodeSpaces) {
+    it(`a line of 8 ${label} is a normal line form and is masked alone`, () => {
+      const line = ch.repeat(8);
+      const claim = runEnvClaimForms([secretVar("BACKUP_CODES", [FILLER[0], line, FILLER[1]].join("\n"))], []);
+      assert.ok(claim.lineForms[0]!.forms.includes(line), "a line form");
+      assert.ok(!makeTextRedactor(claim.redaction)(`text ${line} end`).includes(line), "masked");
+    });
+  }
 });
 
 describe("a multi-line secret in a unified diff", () => {
@@ -409,7 +422,7 @@ function assertLineClasses(lines: string[], excluded: string[], registered: stri
   }
 }
 
-describe("every line of 8+ characters of a multi-line value is registered, except PEM armor and whitespace-only lines", () => {
+describe("every line of 8+ characters of a multi-line value is registered, except standard PEM markers and ASCII space/tab-only lines", () => {
   const ENTROPY = bodyLines("one");
 
   it("lowercase-only, single-case one-digit, legacy PEM header, leading-key, URL host and rule lines are registered; armor and whitespace-only are not", () => {
@@ -426,8 +439,9 @@ describe("every line of 8+ characters of a multi-line value is registered, excep
     assertLineClasses(["abcdefg", ENTROPY[0]!], ["abcdefg"], [ENTROPY[0]!]);
   });
 
-  it("an 8-space line and a tab-and-space line are excluded", () => {
+  it("an 8-space line and a tab-and-space line are excluded; an 8-NBSP line is not", () => {
     assertLineClasses([" ".repeat(8), "\t \t \t \t ", ENTROPY[0]!], [" ".repeat(8), "\t \t \t \t "], [ENTROPY[0]!]);
+    assertLineClasses([" ".repeat(8), ENTROPY[0]!], [], [" ".repeat(8), ENTROPY[0]!]);
   });
 
   it("a 256 KiB line builds its forms in linear time", () => {
@@ -462,8 +476,24 @@ describe("every line of 8+ characters of a multi-line value is registered, excep
     assertLineClasses([BEGIN, ...bodyLines("pad"), last, END], [BEGIN, END], [last]);
   });
 
-  it("PEM armor lines are never registered", () => {
+  it("PEM armor lines of the standard labels are never registered", () => {
     assertLineClasses([BEGIN, ENTROPY[0]!, END], [BEGIN, END], [ENTROPY[0]!]);
+  });
+
+  it("the BEGIN and END marker of every listed standard label is exempt", () => {
+    assert.equal(PEM_STANDARD_LABELS.length, 18);
+    const markers = PEM_STANDARD_LABELS.flatMap((label) => [marker("BEGIN", label), marker("END", label)]);
+    assertLineClasses([...markers, ENTROPY[0]!], markers, [ENTROPY[0]!]);
+  });
+
+  it("an unknown label, a mismatched kind and a lower-case label are normal line forms", () => {
+    const lines = [marker("BEGIN", "SECRET STUFF"), marker("END", "SECRET STUFF"), marker("BEGIN", "private key"), "-----BEGIN PRIVATE KEY----", "-----BEGIN-----"];
+    assertLineClasses([...lines, ENTROPY[0]!], [], [...lines, ENTROPY[0]!]);
+  });
+
+  it("a marker with a leading space, trailing content or a trailing space is a normal line form", () => {
+    const lines = [` ${BEGIN}`, `${BEGIN}abc`, `${BEGIN} x`, `${END} `, `\t${END}`, `${BEGIN} `];
+    assertLineClasses([...lines, ENTROPY[0]!], [], [...lines, ENTROPY[0]!]);
   });
 
   it("a claim with no multi-line value has no line forms", () => {

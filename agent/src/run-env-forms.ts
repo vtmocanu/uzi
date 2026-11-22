@@ -12,7 +12,8 @@
 // alignments are also kept in the URL-safe alphabet.
 //
 // A multi-line value (a PEM key, a JSON credential file) is also split by line: every line of at least
-// MIN_SECRET_LEN characters, except PEM armor and whitespace-only lines, is registered for REDACTION and for
+// MIN_SECRET_LEN characters, except a standard PEM marker line (PEM_STANDARD_LABELS, exact match) and a line of
+// only ASCII spaces and tabs, is registered for REDACTION and for
 // the preserved-patch line check, because a line of it can appear alone in output. A line is never a scan
 // needle. The scan instead gets the value as it reads inside a unified diff, where every line after the
 // first carries a `+`, `-` or ` ` prefix.
@@ -42,19 +43,32 @@ function wholeValueForms(value: string): string[] {
 }
 
 const LINE_BREAK = /\r\n|\r|\n/;
-const PEM_ARMOR = /^-----(BEGIN|END) [^-]+-----$/;
-const WHITESPACE_ONLY = /^\s*$/;
+
+/** The standard PEM labels (RFC 7468 and the common OpenSSL/OpenSSH ones). A line that is exactly
+ *  `-----BEGIN <label>-----` or `-----END <label>-----` for one of these is public armor and is not registered
+ *  alone. Any other label, or any extra character on the line, keeps the line's normal protection. */
+export const PEM_STANDARD_LABELS: readonly string[] = [
+  "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "DSA PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "OPENSSH PRIVATE KEY",
+  "PUBLIC KEY", "RSA PUBLIC KEY", "CERTIFICATE", "TRUSTED CERTIFICATE", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST",
+  "X509 CRL", "PKCS7", "CMS", "EC PARAMETERS", "DH PARAMETERS", "ATTRIBUTE CERTIFICATE",
+];
+const PEM_MARKER_LINES: ReadonlySet<string> = new Set(
+  PEM_STANDARD_LABELS.flatMap((label) => [`-----BEGIN ${label}-----`, `-----END ${label}-----`]),
+);
+/** Only ASCII space and tab: a line of any other (Unicode) space is a normal line form. */
+const WHITESPACE_ONLY = /^[ \t]*$/;
 
 function isMultiLine(value: string): boolean {
   return value.includes("\r") || value.includes("\n");
 }
 
 /** The lines of a multi-line value that are registered alone: every line at least {@link MIN_SECRET_LEN} long
- *  except PEM armor and whitespace-only lines. No condition on letter case, token variety, digits or key name. */
+ *  except a standard PEM marker line (exactly one of {@link PEM_STANDARD_LABELS}) and a line of only ASCII spaces
+ *  and tabs. No condition on letter case, token variety, digits or key name. */
 function lineForms(value: string): string[] {
   const out: string[] = [];
   for (const line of value.split(LINE_BREAK)) {
-    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line) || WHITESPACE_ONLY.test(line)) continue;
+    if (line.length < MIN_SECRET_LEN || PEM_MARKER_LINES.has(line) || WHITESPACE_ONLY.test(line)) continue;
     out.push(line, JSON.stringify(line).slice(1, -1));
   }
   return out;

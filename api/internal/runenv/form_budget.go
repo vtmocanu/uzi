@@ -29,7 +29,7 @@ package runenv
 //	  escaped copies: raw 6N, the 4 JSON-family forms 4 x 7N = 28N; a percent or base64
 //	  form holds no character JSON escapes, so its copy is itself and adds nothing
 //	                                      34N, so 4 variants 136N
-//	line forms of a multi-line value (every line except PEM armor and whitespace-only lines
+//	line forms of a multi-line value (every line except the standard PEM markers on the agent's list and ASCII space/tab-only lines
 //	  registers, raw and JSON-escaped; the lines total at most N)
 //	                                      N + 6N = 7N
 //	  escaped copies of the two line forms 6N + 7N = 13N
