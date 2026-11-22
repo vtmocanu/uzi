@@ -14,7 +14,7 @@ WHERE r.id = @repo_id;
 -- Runs are matched by forge identity, never by owner: two owners' connections to the same
 -- project are the same project. The instance base URL is compared canonically on both
 -- sides (a trailing :443 is dropped; for github only, https://api.github.com is
--- https://github.com), mirroring settings.canonicalInstance. The status list is spelled
+-- https://github.com), mirroring settings.CanonicalInstance. The status list is spelled
 -- exactly as the uq_runs_one_active_* partial indexes spell it. A ci_fix matches by its
 -- pipeline_ref (the branch); an mr_rework matches only by the supplied MR iid.
 SELECT r.id, r.kind, r.status, r.user_id, r.repo_id, r.pipeline_ref, r.mr_iid, r.created_at

@@ -23,11 +23,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -44,11 +46,43 @@ func rwlProject() int64 {
 
 type rwlOwner struct{ user, conn, repo uuid.UUID }
 
+// rwlPurgeUsers registers a cleanup that deletes the users returned by idsSQL (resolved when
+// the cleanup runs, before anything is deleted) together with their runs, repos and forge
+// connections, so the shared test database keeps no rows of this test. A failed delete is
+// logged, not fatal: the test's own verdict stands.
+func rwlPurgeUsers(t *testing.T, pool *pgxpool.Pool, idsSQL string, arg any) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		rows, err := pool.Query(ctx, idsSQL, arg)
+		if err != nil {
+			t.Logf("purge: resolve users: %v", err)
+			return
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+		if err != nil {
+			t.Logf("purge: collect users: %v", err)
+			return
+		}
+		for _, stmt := range []string{
+			`DELETE FROM runs WHERE user_id = ANY($1)`,
+			`DELETE FROM repos WHERE connection_id IN (SELECT id FROM forge_connections WHERE user_id = ANY($1))`,
+			`DELETE FROM forge_connections WHERE user_id = ANY($1)`,
+			`DELETE FROM users WHERE id = ANY($1)`,
+		} {
+			if _, err := pool.Exec(ctx, stmt, ids); err != nil {
+				t.Logf("purge %q: %v", stmt, err)
+			}
+		}
+	})
+}
+
 // rwlSeedOwner inserts a non-admin user with one forge connection and one repo of the
 // given forge identity.
 func rwlSeedOwner(t *testing.T, pool *pgxpool.Pool, forgeType, baseURL string, project int64) rwlOwner {
 	t.Helper()
 	o := rwlOwner{user: cliSeedUser(t, pool, false), conn: uuid.New(), repo: uuid.New()}
+	rwlPurgeUsers(t, pool, `SELECT $1::uuid`, o.user)
 	cliMustExec(t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, $3, $4, 'bot', 1, $5)`, o.conn, o.user, forgeType, baseURL, []byte{0x1})
@@ -109,6 +143,7 @@ func rwlNewFixture(t *testing.T) *rwlFixture {
 	h.cfg.AdminRunDebug = true
 	f := &rwlFixture{h: h, router: router, pool: pool}
 	f.admin = cliSeedUser(t, pool, true)
+	rwlPurgeUsers(t, pool, `SELECT $1::uuid`, f.admin)
 	f.uza, f.uzaID = cliInsertToken(t, pool, f.admin, clitoken.ScopeAdminRO, nil, false)
 	f.uzc = cliMintToken(t, pool, f.admin, clitoken.ScopeUser)
 	f.jwt = cliMintJWT(t, pool, f.admin)
@@ -167,7 +202,7 @@ func rwlWantExactly(t *testing.T, label string, dto apitypes.RunWritersDTO, want
 func TestRunWritersOlderThan200LiveDB(t *testing.T) {
 	f := rwlNewFixture(t)
 	o := rwlSeedOwner(t, f.pool, "gitlab", "https://forge.e2e", rwlProject())
-	base := time.Now().UTC().Add(30 * 24 * time.Hour)
+	base := time.Now().UTC().Add(-30 * 24 * time.Hour)
 	writer := rwlSeedCIFix(t, f.pool, o, "agent/issue-1", "running", base)
 	rwlSeedFiller(t, f.pool, o, 250, base)
 
@@ -176,6 +211,9 @@ func TestRunWritersOlderThan200LiveDB(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ListRunsForUser: %v", err)
+	}
+	if len(rows) != 200 {
+		t.Fatalf("baseline vacuous: the owner run list returned %d rows, want a full 200", len(rows))
 	}
 	for _, r := range rows {
 		if r.Run.ID == writer {
@@ -193,7 +231,7 @@ func TestRunWritersBehind500LiveDB(t *testing.T) {
 	target := rwlSeedOwner(t, f.pool, "gitlab", "https://forge.e2e", project)
 	foreign := rwlSeedOwner(t, f.pool, "gitlab", "https://forge.e2e", project)
 	noise := rwlSeedOwner(t, f.pool, "gitlab", "https://forge.e2e", rwlProject())
-	base := time.Now().UTC().Add(60 * 24 * time.Hour)
+	base := time.Now().UTC().Add(-30 * 24 * time.Hour)
 	writer := rwlSeedCIFix(t, f.pool, foreign, "agent/issue-2", "queued", base)
 	rwlSeedFiller(t, f.pool, noise, 600, base)
 
@@ -202,6 +240,9 @@ func TestRunWritersBehind500LiveDB(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ListRunsAdminDebug: %v", err)
+	}
+	if len(rows) != 501 {
+		t.Fatalf("baseline vacuous: admin debug listing returned %d rows, want 501 before truncating", len(rows))
 	}
 	if len(rows) > 500 {
 		rows = rows[:500]
@@ -254,17 +295,6 @@ func mustFirstWriter(t *testing.T, f *rwlFixture, o rwlOwner) uuid.UUID {
 	return id
 }
 
-// rwlCanonicalInstanceMirror is a fixed copy of settings.canonicalInstance (settings_review_bots.go),
-// the Go rule the SQL instance comparison mirrors; it is unexported there. A change to the
-// original must be copied here and into queries/run_writers.sql.
-func rwlCanonicalInstanceMirror(s string) string {
-	s = strings.TrimSuffix(s, ":443")
-	if s == "https://api.github.com" {
-		return "https://github.com"
-	}
-	return s
-}
-
 // The instance base URL is compared canonically: a trailing :443 is the same instance, and
 // for github only api.github.com is github.com. Other ports and other hosts are not.
 func TestRunWritersInstanceSpellingsLiveDB(t *testing.T) {
@@ -299,10 +329,10 @@ func TestRunWritersInstanceSpellingsLiveDB(t *testing.T) {
 			if found != tc.want {
 				t.Errorf("writer on %q found from a repo on %q = %v, want %v", tc.other, tc.target, found, tc.want)
 			}
-			// Parity with the Go rule: github rows must agree with canonicalInstance.
+			// Parity with the Go rule: github rows must agree with settings.CanonicalInstance.
 			if tc.forge == "github" {
-				if goMatch := rwlCanonicalInstanceMirror(tc.target) == rwlCanonicalInstanceMirror(tc.other); goMatch != found {
-					t.Errorf("SQL match = %v but Go canonicalInstance match = %v", found, goMatch)
+				if goMatch := settings.CanonicalInstance(tc.target) == settings.CanonicalInstance(tc.other); goMatch != found {
+					t.Errorf("SQL match = %v but Go CanonicalInstance match = %v", found, goMatch)
 				}
 			}
 		})
@@ -317,6 +347,11 @@ func TestRunWritersBranchAndMRMatchingLiveDB(t *testing.T) {
 	ci := rwlSeedCIFix(t, f.pool, o, "agent/issue-7", "running", now)
 	mrw := rwlSeedMRRework(t, f.pool, o, "agent/issue-9", 77, "queued", now.Add(time.Second))
 	mr77, mr78 := int64(77), int64(78)
+	// An active mr_rework with the same MR number on another project (a fork) is a different
+	// MR: every case below, counted exactly, must exclude it.
+	fork := rwlSeedOwner(t, f.pool, "gitlab", "https://forge.e2e", rwlProject())
+	forkMRW := rwlSeedMRRework(t, f.pool, fork, "agent/issue-9", 77, "running", now.Add(2*time.Second))
+	rwlWantExactly(t, "fork sees only its own mr", f.get(t, fork.repo, "agent/issue-9", &mr77), forkMRW)
 
 	cases := []struct {
 		name   string
@@ -352,16 +387,23 @@ func TestRunWritersStatusesLiveDB(t *testing.T) {
 	for _, s := range append(append([]string{}, active...), terminal...) {
 		ids[s] = rwlSeedCIFix(t, f.pool, o, "st-"+s, s, now)
 	}
+	// An mr_rework in every status, each with its own MR, follows the same rule.
+	mrIDs := map[string]uuid.UUID{}
+	mrOf := map[string]int64{}
+	for i, s := range append(append([]string{}, active...), terminal...) {
+		mrOf[s] = int64(100 + i)
+		mrIDs[s] = rwlSeedMRRework(t, f.pool, o, "mrw-"+s, mrOf[s], s, now)
+	}
 	for _, s := range active {
+		mr := mrOf[s]
 		rwlWantExactly(t, "status "+s, f.get(t, o.repo, "st-"+s, nil), ids[s])
+		rwlWantExactly(t, "mr_rework status "+s, f.get(t, o.repo, "no-such-branch", &mr), mrIDs[s])
 	}
 	for _, s := range terminal {
+		mr := mrOf[s]
 		rwlWantExactly(t, "status "+s, f.get(t, o.repo, "st-"+s, nil))
+		rwlWantExactly(t, "mr_rework status "+s, f.get(t, o.repo, "no-such-branch", &mr))
 	}
-	// An mr_rework in each kind of status follows the same rule.
-	mr := int64(5)
-	rwlSeedMRRework(t, f.pool, o, "mrw-done", mr, "completed", now)
-	rwlWantExactly(t, "terminal mr_rework", f.get(t, o.repo, "mrw", &mr))
 }
 
 // 501 matching writers serve 500 with complete=false; an empty result is complete.
@@ -370,6 +412,7 @@ func TestRunWritersOverflowLiveDB(t *testing.T) {
 	project := rwlProject()
 	target := rwlSeedOwner(t, f.pool, "gitlab", "https://forge.e2e", project)
 	const branch = "overflow-branch"
+	rwlPurgeUsers(t, f.pool, `SELECT c.user_id FROM repos r JOIN forge_connections c ON c.id = r.connection_id WHERE r.forge_project_id = $1`, project)
 	cliMustExec(t, f.pool, `
 		WITH n AS (SELECT g, gen_random_uuid() AS uid, gen_random_uuid() AS cid, gen_random_uuid() AS rid FROM generate_series(1, 501) g),
 		u AS (INSERT INTO users (id, email, password_hash, is_admin, vault_mode)
@@ -379,7 +422,7 @@ func TestRunWritersOverflowLiveDB(t *testing.T) {
 		r AS (INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		      SELECT rid, cid, $1, 'g/r', 'https://forge.e2e/g/r', 'main', true FROM n)
 		INSERT INTO runs (user_id, repo_id, kind, issue_title, issue_description, status, pipeline_id, pipeline_ref, created_at)
-		SELECT uid, rid, 'ci_fix', 't', 'd', 'queued', 1, $2, now() + g * interval '1 second' FROM n`, project, branch)
+		SELECT uid, rid, 'ci_fix', 't', 'd', 'queued', 1, $2, now() - interval '30 days' + g * interval '1 second' FROM n`, project, branch)
 
 	dto := f.get(t, target.repo, branch, nil)
 	if len(dto.Writers) != 500 || dto.Complete {
@@ -438,17 +481,23 @@ func TestRunWritersRouteLiveDB(t *testing.T) {
 		t.Errorf("body lacks the writer: %s", rec.Body.String())
 	}
 
+	// A valid uzc_ or cookie credential authenticates (RequireUser) and is then refused as
+	// non-admin_ro, so exactly 403. Only a request with no credential at all is 401: it is
+	// refused by RequireUser before RequireAdminRO (middleware/cli_auth.go) is reached.
 	refused := []struct {
 		name string
+		want int
 		rec  func() int
 	}{
-		{"uzc_", func() int { return bearerReq(f.router, http.MethodGet, rwlPath(o.repo, "b", nil), f.uzc).Code }},
-		{"cookie", func() int { return cookieReq(t, f.router, http.MethodGet, rwlPath(o.repo, "b", nil), f.jwt, "").Code }},
-		{"no credential", func() int { return bearerReq(f.router, http.MethodGet, rwlPath(o.repo, "b", nil), "").Code }},
+		{"uzc_", http.StatusForbidden, func() int { return bearerReq(f.router, http.MethodGet, rwlPath(o.repo, "b", nil), f.uzc).Code }},
+		{"cookie", http.StatusForbidden, func() int {
+			return cookieReq(t, f.router, http.MethodGet, rwlPath(o.repo, "b", nil), f.jwt, "").Code
+		}},
+		{"no credential", http.StatusUnauthorized, func() int { return bearerReq(f.router, http.MethodGet, rwlPath(o.repo, "b", nil), "").Code }},
 	}
 	for _, tc := range refused {
-		if code := tc.rec(); code != http.StatusForbidden && code != http.StatusUnauthorized {
-			t.Errorf("%s = %d, want 401/403", tc.name, code)
+		if code := tc.rec(); code != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, code, tc.want)
 		}
 	}
 	if rec := bearerReq(f.router, http.MethodGet, rwlPath(uuid.New(), "b", nil), f.uza); rec.Code != http.StatusUnprocessableEntity {

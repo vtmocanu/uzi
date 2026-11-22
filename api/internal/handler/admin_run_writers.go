@@ -51,16 +51,27 @@ func parseCanonicalPositiveInt64(s string) (int64, bool) {
 }
 
 // AdminRunWriters serves GET /api/admin/run-writers?repo=<uuid>&branch=<ref>[&mr_iid=<n>]
-// (issue #4618): the active ci_fix / mr_rework runs, of every owner, that write the branch
-// of the repo's forge project. The admin-debug predicate is checked before any parameter is
-// read, so a caller who may not debug learns nothing about which parameters were acceptable.
+// (issue #4618): the active ci_fix / mr_rework runs, of every owner, on the repo's forge
+// project: ci_fix runs matched by branch, mr_rework runs matched by MR (mr_iid) only. The
+// admin-debug predicate is checked before any parameter is read, so a caller who may not
+// debug learns nothing about which parameters were acceptable.
 func (h *Handler) AdminRunWriters(w http.ResponseWriter, r *http.Request) {
 	actor, tokenID, ok := h.adminRunDebugActor(r)
 	if !ok {
 		httpx.Error(w, http.StatusForbidden, adminRunDebugRefusal)
 		return
 	}
-	q := r.URL.Query()
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "malformed query string")
+		return
+	}
+	for key := range q {
+		if key != "repo" && key != "branch" && key != "mr_iid" {
+			httpx.Error(w, http.StatusBadRequest, "unknown query parameter; use repo, branch and mr_iid")
+			return
+		}
+	}
 	repoRaw, ok1 := runWritersSingleParam(q, "repo")
 	branch, ok2 := runWritersSingleParam(q, "branch")
 	mrRaw, ok3 := runWritersSingleParam(q, "mr_iid")

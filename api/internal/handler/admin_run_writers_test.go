@@ -173,6 +173,10 @@ func TestAdminRunWritersValidation(t *testing.T) {
 		{"repeated repo", "repo=" + good + "&repo=" + good + "&branch=b"},
 		{"repeated branch", "repo=" + good + "&branch=b&branch=b"},
 		{"repeated mr_iid", "repo=" + good + "&branch=b&mr_iid=5&mr_iid=5"},
+		{"semicolon pair would be dropped", "repo=" + good + "&branch=b&mr_iid=7;"},
+		{"bad percent escape would be dropped", "repo=" + good + "&branch=b&mr_iid=%G7"},
+		{"semicolon in a repeated branch", "repo=" + good + "&branch=a;b&branch=B"},
+		{"unknown key", "repo=" + good + "&branch=b&mr=7"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
