@@ -131,8 +131,14 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility
 	// label (PRD #764), NEVER autopilot and NEVER from the request body — the API
 	// surface gives the client no way to attach a trigger label.
-	uziLabel, _ := h.settings.UziLabel(ctx)
-	labels := []string{uziLabel}
+	// On a linked repo the link's stored eligibility name (PRD #4173 D14); a label settings
+	// read error there is refused before the claim and before any write (PRD #4173 M5 review).
+	labels, err := h.createLabels(ctx, repo)
+	if err != nil {
+		slog.Error("file issue: read the label settings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 
 	// Claim-first (Decision 7): atomic INSERT ... ON CONFLICT DO NOTHING on the coordinate
 	// BEFORE the forge write, so of two concurrent POSTs exactly one reaches CreateIssue.
@@ -160,7 +166,7 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, h.createLabelsFor(ctx, repo, labels))
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, labels)
 	if err != nil {
 		// Forge rejected the write (mock state E): the claim reverts, nothing is
 		// persisted, the draft stays open. err is already PAT-redacted by the driver.

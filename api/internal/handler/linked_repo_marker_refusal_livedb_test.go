@@ -300,3 +300,58 @@ func TestFileFindingFailsClosedWhenTheLabelSettingsCannotBeReadLiveDB(t *testing
 		f.dispositionIsOpenAndUnclaimed(t)
 	})
 }
+
+// PRD #4173 M5 review (Greptile on 9bcd89761): the other routes that create an issue on a
+// linked repo (the board's new issue, a run-review recommendation, an admin judge
+// recommendation) read the uzi and autopilot labels to rewrite the set for the link. When
+// those settings cannot be read the defaults would stand in for the saved names, so each
+// route answers 500 before any issue tracker write and leaves no filing claim behind.
+func TestLinkedRepoIssueCreationFailsClosedWhenTheLabelSettingsCannotBeReadLiveDB(t *testing.T) {
+	unreadable := func(f *neverEnabledFixture) {
+		f.h.settings = settings.New(&settingsStore{
+			rows: []store.AppSetting{{Key: settings.KeyUziLabel, Value: "start"}},
+			err:  errors.New("settings store down"),
+		}, time.Minute)
+	}
+	claims := func(t *testing.T, f *neverEnabledFixture) int {
+		t.Helper()
+		var n int
+		if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM recommendation_filed_issues WHERE filed_by_user_id = $1`, f.admin.ID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	cases := []struct {
+		name string
+		call func(f *neverEnabledFixture, w http.ResponseWriter)
+	}{
+		{"CreateIssue", func(f *neverEnabledFixture, w http.ResponseWriter) {
+			f.h.CreateIssue(w, f.request(http.MethodPost, map[string]string{"title": "t", "description": "d"}, map[string]string{"id": f.repoID.String()}))
+		}},
+		{"FileIssue", func(f *neverEnabledFixture, w http.ResponseWriter) {
+			f.h.FileIssue(w, f.request(http.MethodPost, map[string]string{"repo_id": f.repoID.String(), "title": "t", "description": "d"},
+				map[string]string{"id": f.runID.String(), "recID": f.recID.String()}))
+		}},
+		{"AdminFileJudgeIssue", func(f *neverEnabledFixture, w http.ResponseWriter) {
+			f.h.AdminFileJudgeIssue(w, f.request(http.MethodPost, adminFileIssueRequest{
+				Category: "improve_agent", Target: "ne-" + f.repoID.String(), RepoID: f.repoID.String(), Title: "t", Description: "d",
+			}, nil))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := seedNeverEnabledFixture(t)
+			srv := linkNeverEnabledFixture(t, f)
+			unreadable(f)
+			rr := httptest.NewRecorder()
+			tc.call(f, rr)
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d body = %s, want 500", rr.Code, rr.Body.String())
+			}
+			wantNoTrackerWrite(t, srv)
+			if n := claims(t, f); n != 0 {
+				t.Errorf("%d filing claim(s) left behind, want 0", n)
+			}
+		})
+	}
+}

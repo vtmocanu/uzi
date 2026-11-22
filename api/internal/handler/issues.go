@@ -63,12 +63,16 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// The created issue carries the configured uzi run-eligibility label (PRD #764):
-	// best-effort — a cold settings read yields the compiled-in default ("uzi"),
-	// never an empty label.
-	uziLabel, _ := h.settings.UziLabel(r.Context())
-	// On a linked repo the label is the link's stored eligibility name (PRD #4173 D14).
-	created, err := tr.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, h.createLabelsFor(r.Context(), repo, []string{uziLabel}))
+	// The created issue carries the configured uzi run-eligibility label (PRD #764); on a
+	// linked repo the link's stored eligibility name (PRD #4173 D14), refused with a 500
+	// before the write when the label settings cannot be read.
+	labels, err := h.createLabels(r.Context(), repo)
+	if err != nil {
+		slog.Error("create issue: read the label settings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	created, err := tr.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, labels)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		if writeIssueWriteNotOffered(w, err) {

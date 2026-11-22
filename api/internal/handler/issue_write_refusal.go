@@ -9,7 +9,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
-	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -25,31 +24,25 @@ func linkedEligibility(repo store.GetRepoForUserRow) (string, bool) {
 	return repo.EligibilityTagName.String, true
 }
 
-// createLabelsFor returns the labels an issue uzi creates on repo carries: labels
-// untouched for an unlinked repo, and for a linked one the set with the configured uzi
-// label replaced by the stored eligibility name and the autopilot label dropped (PRD
-// #4173 D12, D14).
-func (h *Handler) createLabelsFor(ctx context.Context, repo store.GetRepoForUserRow, labels []string) []string {
+// createLabels returns the labels an issue uzi creates on repo carries: the configured
+// uzi run-eligibility label (PRD #764). For an unlinked repo the read stays best-effort,
+// as before: a cold settings read yields the compiled-in default, never an empty label.
+// For a linked repo the uzi and autopilot labels come from one settings snapshot, the uzi
+// label is replaced by the stored eligibility name and the autopilot label is dropped (PRD
+// #4173 D12, D14); a settings read error is returned there, since the default names cannot
+// say which label the owner saved, and the caller refuses before any write (PRD #4173 M5
+// review).
+func (h *Handler) createLabels(ctx context.Context, repo store.GetRepoForUserRow) ([]string, error) {
 	eligibility, linked := linkedEligibility(repo)
 	if !linked {
-		return labels
+		uzi, _ := h.settings.UziLabel(ctx)
+		return []string{uzi}, nil
 	}
-	uzi, autopilot := h.runLabelNames(ctx)
-	return issuesource.LinkedLabels(labels, uzi, autopilot, eligibility)
-}
-
-// runLabelNames returns the configured uzi and autopilot labels, each falling back to
-// its compiled-in default when unset.
-func (h *Handler) runLabelNames(ctx context.Context) (uzi, autopilot string) {
-	uzi, _ = h.settings.UziLabel(ctx)
-	if uzi == "" {
-		uzi = settings.DefaultUziLabel
+	names, err := h.settings.FilingLabels(ctx)
+	if err != nil {
+		return nil, err
 	}
-	autopilot, _ = h.settings.AutopilotLabel(ctx)
-	if autopilot == "" {
-		autopilot = settings.DefaultAutopilotLabel
-	}
-	return uzi, autopilot
+	return issuesource.LinkedLabels([]string{names.Uzi}, names.Uzi, names.Autopilot, eligibility), nil
 }
 
 // writeIssueWriteNotOffered answers the typed refusal the linked-repo write guard
