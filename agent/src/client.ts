@@ -4804,9 +4804,9 @@ export class WorkerClient {
    *  `{protected:false}` when the run holds no secret receipt or has no governing run (not lead-lane, not
    *  a cross-check child). Throws a RequestError on 404 and 409 (`vault_locked`, `run_env_history_unavailable`,
    *  `run_env_redact_closed`), and a decoder error on a malformed body. A 404 whose JSON body carries the code
-   *  `run_env_run_not_found` (not this worker's run, or deleted) and a 409 withhold the publish; a 404 without
-   *  that code (the route is absent) withholds unless the worker's local marker proves the run never received
-   *  variables here (resolveScanNeedles). Every other throw also withholds. The body carries plaintext secrets
+   *  `run_env_run_not_found` (not this worker's run, or deleted) and a 409 withhold the publish; a 404 with no
+   *  code (the route is absent) withholds unless the worker's local marker proves the run never received
+   *  variables here (resolveScanNeedles). A 404 with another code, and every other throw, withholds. The body carries plaintext secrets
    *  and is never logged. */
   async getRunEnvRedact(runId: string, signal?: AbortSignal): Promise<RunEnvRedactResponse> {
     const timeout = AbortSignal.timeout(RUN_ENV_REDACT_TIMEOUT_MS);

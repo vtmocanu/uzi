@@ -38,7 +38,7 @@ func wantCheckViolation(t *testing.T, err error) {
 	wantConstraint(t, err, "23514", "")
 }
 
-func TestRunEnvVarIdentityRefusesReuseWhileReferencedLiveDB(t *testing.T) {
+func TestRunEnvVarIdentityRefusesReuseWhileIdentityRowExistsLiveDB(t *testing.T) {
 	pool, _ := envRunDB(t)
 	user, other := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)

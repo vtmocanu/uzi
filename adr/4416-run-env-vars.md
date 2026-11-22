@@ -137,7 +137,7 @@ later rule denies can still be removed.
   (`FOR SHARE NOWAIT`, a busy owner is skipped), deletes in bounded batches, then deletes variable
   identities no row and no receipt references.
 - **`var_id` identity guard.** `run_env_var_ids` binds each `var_id` to one
-  `(user, repo, scope, name)` and is never reused while referenced. The identity is deleted by the
+  `(user, repo, scope, name)` and is never reused while its identity row exists. The identity is deleted by the
   sweeper once no row and no receipt references it (`DeleteRunEnvSweepIdentities`), after which the
   id may be issued again; var_ids are random UUIDs. A trigger
   on `run_env_vars` creates the identity on first insert and refuses, with `check_violation`, any

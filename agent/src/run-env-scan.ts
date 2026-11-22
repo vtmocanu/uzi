@@ -109,7 +109,7 @@ export type NeedleResolution =
  *  - A 404 carrying the code `run_env_run_not_found` (the run is deleted or is not this worker's) withholds.
  *    A 409 carrying `run_env_redact_closed` (the protection window is closed) withholds, as does any other
  *    409 (vault locked, a receipted version unavailable), a network or decode error, and any other status.
- *  - A 404 WITHOUT that code means the route itself is absent (a proxy or an older api answered). It yields
+ *  - A 404 with any other code withholds. A 404 with no code means the route itself is absent (a proxy or an older api answered). It yields
  *    no needles only when the local marker proves this worker never handed the run variables
  *    (`runEnvSeen` resolves `false`); a marker that exists, a read error (`"unknown"`) or a missing check
  *    withholds.
