@@ -101,8 +101,8 @@ redacted, and the rest fails closed:
 - Payload strings that still need a comparison are withheld the same way; the
   worker log writes one fixed JSON record (timestamp, level and a fixed message,
   with no other fields) in place of the record.
-- Secret scans treat every form as present, so the publish is withheld, and the
-  preserved patch is not shipped.
+- The preserved-patch secret check treats every form as present, so its verdict
+  withholds, and the preserved patch is not shipped.
 - The run's status, id, claim generation and failure origin never pass through
   the redactor and still reach uzi; the failure reason becomes the marker.
 - The charge is a conservative bound, so very large or prefix-dense text with no

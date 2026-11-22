@@ -252,7 +252,7 @@ by `agent/test/run-env-forms-budget.test.ts` for the form counts it assumes, not
 ### Redaction work guard (owner decision B3, fixed)
 
 The redactor used to cost text length times the longest literal for long periodic secret lines
-(measured at about 2.15 s for one such string, which motivated the guard). The matcher now has a
+(the owner's review measured about 2.15 s for one such string on one host, which motivated the guard). The matcher now has a
 **step-counted** guard, not a wall-clock one: a deadline cannot interrupt synchronous matching, so
 every literal comparison is charged against a counter (`RedactionWork`) before it runs, in
 `agent/src/redact.ts`.
@@ -273,8 +273,8 @@ every literal comparison is charged against a counter (`RedactionWork`) before i
   one (`runWithinBudget` returns undefined and the caller withholds). The logger
   (`agent/src/log.ts`) writes a fixed valid JSON record with `ts`, `level` and a fixed `msg`
   (`log record withheld: redaction work budget exceeded`); the base fields and the record's own
-  fields are dropped. Secret scans (`literalsPresent`, used by `run-env-scan.ts`) report every form
-  as present on overflow, so the publish or patch verdict withholds. A preserved patch whose text
+  fields are dropped. The preserved-patch scan (`literalsPresent`, used only by `run-env-scan.ts`'s
+  `patchScanVerdict`) reports every form as present on overflow, so the patch verdict withholds. A preserved patch whose text
   redaction overflows is not shipped (`runner.ts`, `scanGatedPatch`).
 - **What stays visible to the api.** The run status, run id, claim generation and `fail_origin` do not
   pass through the redactor, so a state report still reaches the api; `failure_reason` is
