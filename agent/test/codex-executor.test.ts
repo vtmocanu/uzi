@@ -37387,6 +37387,59 @@ describe("M2 provider executor composition", () => {
     });
   }
 
+
+  // Explicit claim-redactor fixture: proves executor/harness posting, not runner registration.
+  const runtimeKey = ["runtime-fixture", '"', "/", "<>&", "tail"].join("");
+  const runtimeForms = [runtimeKey, 'runtime-fixture\\"/<>&tail',
+    'runtime-fixture\\"\\/<>&tail', "runtime-fixture%22%2F%3C%3E%26tail",
+    'runtime-fixture\\"/\\u003c\\u003e\\u0026tail'];
+
+  for (const route of ["thread/start", "thread/resume"] as const) {
+    for (const [index, model] of ["corp-observed-clean", ...runtimeForms].entries()) {
+      it(`bounded provider runtime report ${route} form=${index} redacts at client boundary`, async () => {
+        const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: runtimeKey });
+        assert.ok(Object.isFrozen(binding.providerBinding));
+        const posts: LeadConfigReportBody[] = [];
+        const { logger, lines } = recordingLogger();
+        const config = { default_effort_source: "builtin" as const };
+        const reporter = new LeadConfigReporter({
+          client: { async recordLeadConfig(_id, body) {
+            posts.push(structuredClone(body)); return { kind: "ok" };
+          } },
+          runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger,
+        });
+        const rig = makeRig({ responder: c => {
+          const answer = c.method === "thread/resume" ? { thread: { id: "th-1" } } : defaultResponder(c);
+          return c.method === route ? { ...rec(answer), model, reasoningEffort: "medium",
+            // Unknown names are not admitted observation fields.
+            [runtimeKey]: runtimeKey } : answer;
+        } });
+        rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+        const { ctx } = makeCtx({ config, leadConfig: reporter,
+          ...(route === "thread/resume" ? { sessionId: "th-1" } : {}),
+          redactText: makeTextRedactor(providerKeyForms(runtimeKey)) });
+        await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "bounded runtime report");
+        assert.equal(rig.transport.requests.filter(r => r.method === route).length, 1);
+        assert.equal(rig.transport.turnStartCount, 1, "observation follows accepted turn/start");
+        assert.equal(posts.length, 2, "requested and observed rows reached report client");
+        assert.equal(posts[0]!.requested_model, provider.model, "requested row retains logical provider default");
+        assert.equal(rec(rig.transport.requests.find(r => r.method === "turn/start")!.params).model, "corp-code", "wire uses mapped provider default");
+        assert.equal(posts[0]!.requested_model_source, "builtin");
+        assert.equal(posts[1]!.observed_effort, "medium");
+        assert.equal(posts[1]!.observed_effort_evidence, "codex_runtime_default");
+        if (index === 0) {
+          assert.equal(posts[1]!.observed_model, "corp-observed-clean");
+          assert.equal(posts[1]!.observed_model_evidence, "codex_thread_response");
+        }
+        for (const [sink, value] of Object.entries({ posts, logs: lines })) {
+          const serialized = JSON.stringify(value);
+          for (const form of runtimeForms) assert.ok(!serialized.includes(JSON.stringify(form).slice(1, -1)),
+            `provider credential escaped ${sink}; observation form=${index}`);
+        }
+      });
+    }
+  }
+
   it("refuses unmapped explicit models before login or vendor release", async () => {
     const rig = makeRig();
     const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()));

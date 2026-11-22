@@ -144,7 +144,7 @@ import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from ".
 import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
-import { makeTextRedactor } from "../redact.js";
+import { makeTextRedactor, redactStrings } from "../redact.js";
 import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
@@ -6414,10 +6414,12 @@ export class CodexExecutor implements Executor {
       let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
       if (ctx.leadConfig?.enabled) {
         const reporter = ctx.leadConfig;
-        const entry = await reporter.enterPhase(phase, this.leadRequestFor(ctx, phase));
+        // Scrub reporting copies before validation or reporter retention; execution keeps
+        // the original request. scrubLeadText combines claim and runtime-released secrets.
+        const entry = await reporter.enterPhase(phase, redactStrings(this.leadRequestFor(ctx, phase), scrubLeadText));
         onRuntimeConfig = (obs) => {
           try {
-            reporter.observe(entry, toLeadObservation(obs));
+            reporter.observe(entry, toLeadObservation(redactStrings(obs, scrubLeadText)));
           } catch {
             /* an observation is best-effort and never reaches the turn */
           }
