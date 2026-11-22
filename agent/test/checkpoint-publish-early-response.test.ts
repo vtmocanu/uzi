@@ -102,7 +102,7 @@ async function child(mode: Mode): Promise<void> {
     owedContext: Promise.resolve(context),
     lastCheckpointRefTip: "OLD_CONFIRMED",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
-    reportedPublishOutcomes: new Set<string>(mode === "success-refused" ? ["error"] : []),
+    providerKeyForms: [], reportedPublishOutcomes: new Set<string>(mode === "success-refused" ? ["error"] : []),
     runLog: log,
     batcher,
   };

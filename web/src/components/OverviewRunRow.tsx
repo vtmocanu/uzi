@@ -1,4 +1,4 @@
-// One run row of the Overview's run list, shared by both Overview pages (PRD #3878). It is
+// One run row of the Overview's run list, rendered by the Overview (PRD #3878). It is
 // the Overview's own anatomy, deliberately NOT RunsList's RunRow: that one adds duration,
 // tokens, cost and Expedite, and its "now" line lacks the held-status check below, so a
 // parked run would show a stale, pulsing activity line.

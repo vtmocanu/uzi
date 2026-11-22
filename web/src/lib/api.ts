@@ -616,7 +616,7 @@ const realApi = {
   getReleaseCheck: () =>
     request<{ release_check: ReleaseCheckStatus }>("GET", "/admin/release-check"),
   // Admin-health document (PRD #1484 M1): the closed registry of checks with the overall
-  // verdict, tally and evidence, backing the Admin > Health tab and the Overview card.
+  // verdict, tally and evidence, backing the Admin > Health tab and the Overview HealthChip.
   // RequireAdminRO (a uza_ CLI token or an admin session); unlike release-check it returns
   // the document unwrapped. The endpoint caches one evaluation for 5s server-side.
   getAdminHealth: () => request<HealthDoc>("GET", "/admin/health"),
@@ -1317,10 +1317,13 @@ const realApi = {
     request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
   resetAdminWorkerSize: (name: string) =>
     request<AdminWorkerSizeWrite>("POST", `/admin/worker-sizes/${encodeURIComponent(name)}/reset`),
-  // PRD #4213 M3: PUT on an absent name creates the size (201); the editor checks locally
-  // that the name is new, since the same PUT on an existing name edits it.
+  // PRD #4213 M3: PUT on an absent name creates the size (201). `If-None-Match: *` makes it
+  // create-only: an existing name is refused 412 {reason: "size_exists"} instead of edited,
+  // so a stale local list cannot turn an add into a silent overwrite.
   createAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
-    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec, {
+      "If-None-Match": "*",
+    }),
   // 409 {reason: "builtin" | "in_use", used_by: {workers, settings}} when the size cannot go.
   deleteAdminWorkerSize: (name: string) =>
     request<{ deleted: string }>("DELETE", `/admin/worker-sizes/${encodeURIComponent(name)}`),
@@ -1436,7 +1439,7 @@ const realApi = {
   getRunHeldPublications: (id: string) =>
     request<HeldPublications>("GET", `/runs/${id}/held-publications`),
   // Owner custody holds (PRD #1349 M5/M6, D7/D8; #1371): the owner-wide hold listing plus the
-  // aggregate safety-slot/decision/blocked counts that drive the board alert and the
+  // aggregate safety-slot/decision/blocked counts that drive the Overview Held work card and the
   // Workers resolution surface. RequireUser (session cookie OR owner CLI Bearer), so it is
   // NOT the per-run getRunArchives strict-owner-404 path — it returns the caller's own
   // holds across every run. Best-effort at the call sites: a fetch failure hides the alert.

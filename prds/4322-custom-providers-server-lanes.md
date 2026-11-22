@@ -3,8 +3,8 @@
 **Issue**: [#4322](https://github.com/vtmocanu/uzi/issues/4322)
 **Umbrella**: #4319
 **Priority / area**: High / runtime (isolated network-policy trust is part of the reviewed scope)
-**Status**: Draft refresh after Opus/xhigh and Astra/high review
-**Entry prerequisite**: #4320 is merged (PR #4464). #4505 must merge before any milestone with its final activation, exact-key redaction and all-upload scan contract. Re-read the merged code and ADR-4320 at dispatch: neither activation alone nor the current issue body proves every later scan requirement landed. Pending hosted acceptance is separate from unfinished implementation. No relay, #4509, #4323 or #50 dependency. Preparation is authorized, but dispatch requires the user's explicit go and final high-priority architecture approval.
+**Status**: Reviewed draft refresh against main `f99e8a84`; re-verify anchors and shared helpers after #4323 M1 lands, before M1a dispatch.
+**Entry prerequisite**: #4320 merged in PR #4464; #4505 activation, exact-key redaction and all-upload scan merged in PR #4551 (`edf9e0b1`). M1a is sequenced after #4323 M1 because both change provider helpers and placement SQL. Re-read that merged code and ADR-4320 before dispatch. Pending hosted acceptance is separate from implementation. No relay or #50 dependency. Preparation is not dispatch authority: each slice requires the applicable user go and final high-priority architecture/scope approval.
 
 ## Problem and outcome
 
@@ -14,8 +14,8 @@ Deliver provider execution on all four lanes while preserving their separate cre
 
 Examples:
 
-1. A provider-only user with Claude judge mode default/auto gets a provider-frozen judge at creation (today skipped as provider_lane_unsupported). A valid explicitly pinned vendor judge still uses that token on the provider run's trace. A Codex judge uses only its Codex vendor authority until #4323; the Claude source is not consulted for that choice.
-2. A Codex lead's Claude plan or code checker freezes the user's Claude source and uses only it. A Claude provider lead's Codex checker uses its independent Codex vendor authority. Provider mappings cannot silently move a checker to another credential or engine.
+1. A provider-only user with Claude judge mode default/auto gets a provider-frozen judge at creation (today skipped as provider_lane_unsupported). A valid explicitly pinned vendor judge still uses that token on the provider run's trace. A Codex judge ignores the Claude source: with Codex source unset it preserves vendor behavior; with Codex source set it preserves #4323's refusal until #4574.
+2. A Codex lead's Claude plan or code checker freezes the user's Claude source and uses only it. A Claude provider lead's Codex checker uses its independently resolved Codex authority: vendor when the owner's Codex source is unset; refused per #4323 until the Codex judge/checker follow-up (#4574) when it is set. Provider mappings cannot silently move a checker to another credential or engine.
 3. A provider-sourced owner's Claude job freezes the source and runs without a vendor credential. A revoked binding at assembly or the final delivery recheck fails terminally with the typed reason, never parked. Gateway overload is provider_gateway_limit, not a vendor reset or pool fallback.
 4. An operator lists a public gateway host for the isolated lane; a site-list job can execute through it with no general network client and with agent-initiated URL fetching still confined to the fetcher. The operator accepts the separate model/content-channel residual below. Real CNI/gateway behavior is hosted acceptance, not an in-run claim.
 
@@ -41,11 +41,13 @@ Add one protocol capability per newly wired consumer, alongside #4505's claude_p
 
 Update applicable placement, demand, wake and reap predicates, including isolated job paths. Preserve #4505 provider-only demand and capable-worker suppression, saturation checks, paired old-image reap predicates and busy/custody guards, and provider-chat wake filtering. `LockUnservableEphemeralJobWorkers` must account for both provider and new lane capabilities on provider-bound jobs: an incapable bound ephemeral job worker leads to terminal no_job_capable_worker through that job path, rather than endless generic provider reprovisioning. Vendor jobs and ordinary issue/chat rules remain unchanged. No image-proof service, version floor or provisioning subsystem.
 
-fn_placement_admitting_workers is replaced by a migration (draft number; its Down restores the 00486 body). ClaimRun's provider clause (runtime.sql, claude_provider_v1) gains the lane capability. The provider queued-reason rung in health.go (CountOnlineWorkersSatisfyingClaudeProvider) counts lane-capable workers for provider-bound lane runs, so a run waiting on a #4505-only fleet names the missing capability. Sweep e2e/ for any changed string.
+For each placement migration, Up is the head definition at landing plus the lane clause; Down restores that head definition, preserving merged Codex predicates. Never restore a fixed historical 00486 body. Serialize M1a and M1b, which both replace fn_placement_admitting_workers and ClaimRun predicates. The capability census includes ClaimRun's primary provider clause and fleet-spread peer mirror (`runtime.sql` ~1801), CountOnlineWorkersClaimableForRun (~11930), placement/demand/saturation and health counts, and Go backstops in `judge.go` ~1128 and `provider_claim.go` ~225 before vault opening. Health names the missing lane capability; sweep E2E strings.
+
+Extend old-image reap arm (g) in BOTH LockReapableEphemeralWorkers and DeleteLockedEphemeralWorkers (`hosted_workers.sql` ~343/~402), keeping their predicates byte-identical: a bound nonterminal provider judge also requires claude_provider_judge_v1. Preserve every busy/custody guard. Otherwise an incapable worker holds the unique ephemeral-run slot and owner cap indefinitely. As in #4505, bounded reprovision churn until the image pin updates is accepted; never force-roll busy workers. Old persistent workers can leave provider judges queued without expiry, still consuming judge cooldown/daily budget. Keep API-downgrade refusal before vault open (`claim_assembly.go` ~225), with a regression. Do not absorb #4047's retained-continuation upgrade problem.
 
 ### Exact-key redaction and output publication
 
-Register providerKeyForms with each lane runner's logger/redactor for the **whole claim**, not only refusal branches. Reuse #4505 redaction before parsing, truncation, persistence or output, including internal catch-and-log paths, model IDs/metadata and errors. Judge onResult and limit/usage facts receive only scope-redacted values, never the raw SDK frame; pass provider usage through stripProviderCost so cost_status stays unreported and no vendor prices/headroom/reset is fabricated.
+Register providerKeyForms with each lane runner's logger/redactor for the **whole claim**, before reportState or fetchTrace, not only refusal branches. Reuse #4505 redaction before parsing, truncation, persistence or output, including internal catch-and-log paths, model IDs/metadata and errors. Judge onResult and limit/usage facts receive only scope-redacted values, never the raw SDK frame; pass provider usage through stripProviderCost so cost_status stays unreported and no vendor prices/headroom/reset is fabricated.
 
 Before uploadJobOutputs, scan the exact immutable bytes to be uploaded for every providerKeyForms value. A hit or inability to validate prevents that file upload and records existing `worker_unreadable`, as unsafe names already do; the job can still complete with its other result/files. Do not rewrite binary content, scan one path then reopen different bytes, or turn optional-file refusal into a parked job. Test opaque key in filename/content, scanner failure, replacement between capture/upload and a clean-file control. Structured job results/findings/errors are separately redacted before their existing parse/size/persistence boundaries.
 
@@ -56,17 +58,19 @@ Preserve #4505 exact-bound-key scanning before every GitHub/GitLab/Forgejo final
 Apply this matrix to assembly errors **and** the final locked authority recheck in claim_recovery.go; generic provider holds must not accidentally park repo-less evaluators:
 
 - Ordinary custody-holding runs keep existing provider hold behavior.
-- Judge/job/checker provider binding revocation fails the child terminally with its typed failure_reason and fail_origin credential_unavailable; no new fail-origin enum. Judge's existing vendor disabled-token behavior stays unchanged; provider refusals do not inherit generic provider parking.
+- Judge/job/checker provider binding revocation fails the child terminally with its typed failure_reason and fail_origin credential_unavailable; no new fail-origin enum. In `claim_recovery.go` ~474, branch provider judges to terminal settlement before the generic provider-park arm, as jobs already do. Judge's existing vendor disabled-token behavior stays unchanged.
 - A failed plan checker leads to the existing human gate without a synthetic verdict. A code checker records the existing unavailable/failure result through RecordCodeCrossCheckFailure; there is no plan gate at code completion and no fabricated approval.
 - Gateway 429/529 fails judge/job with provider_gateway_limit, with no vendor reset/pool fallback. A checker uses existing model_error settlement and its stage-specific lead outcome. Jobs never park.
 
-Test rotation/revocation between assembly and final delivery for judge, job, plan checker and code checker, including exact claim/lead generation fencing. New judge creation skip reasons and display strings require additive judge_skips CHECK changes in the existing NOT VALID/validate/guarded-Down pattern and CLI rendering; historical lane_unsupported rows remain honest history. Do not confuse an enqueue skip with a later created judge's terminal failure.
+Test rotation/revocation between assembly and final delivery for judge, job, plan checker and code checker, including exact claim/lead generation fencing. Add judge creation skip values `provider_source_unusable` and `provider_model_unmapped` to judge_skips using the 00484/00485 NOT VALID/validate/guarded-Down pattern. Update JudgePanel.tsx (~119), mocks and `api/cmd/uzi/review_render.go` (~188); historical provider_lane_unsupported copy is engine-neutral and past-tense. Do not confuse an enqueue skip with a created judge's terminal failure.
 
 ## Lane modules
 
 ### Judge
 
-At both judge creation sites (`judge_enqueue.go` and manual `judge_read.go`), choose the judge harness and provider-versus-vendor authority independently of the target and ordinary run resolver. A real pinned vendor token remains vendor even if the Claude source is set/unusable. Pinned with a NULL pointer is effective default (00197; effectiveBindMode), so it follows the default row: the provider when the Claude source is set, the vendor default otherwise. Behaviour matches what clients already display. Test it explicitly. For Claude default/auto mode with a source, freeze that provider/key/revision at judge creation and bypass the vendor-token-presence prerequisite; a bad selected provider skips/refuses explicitly instead of spending vendor tokens. Null source leaves the entire existing vendor judge ladder, auto fallback and disabled-token behavior intact. A Codex judge ignores Claude source and stays Codex-vendor until #4323.
+At both judge creation sites (`judge_enqueue.go` and manual `judge_read.go`), reuse resolveRunHarnessMode (`harness_resolver.go` ~337-405) with judge-specific authority, not a new resolver. Replace RefuseProviderOwner on judge origins with a judge policy: vendorOnly only for a Claude judge with pinned mode and a non-NULL bind pointer, read inside the create transaction. That pin remains vendor even when the Claude source is set/unusable. Pinned-with-NULL is effective default (00197; effectiveBindMode): use the selected Claude provider, otherwise vendor default. Null source preserves the vendor ladder, auto fallback and disabled-token behavior. Codex judges ignore Claude source; Codex source unset preserves vendor authority, set preserves #4323's refusal until #4574.
+
+For the provider branch only, bypass the Anthropic-token-presence checks (`judge_enqueue.go` ~285, `judge_read.go` ~278). Freeze provider/key/revision atomically and stamp all five binding columns in CreateJudgeRun (`judge.sql` ~20-22). In verifyRunBinding, replace ordinary checkProviderModels with validation of the actual ResolveJudgeModel result. Unusable source or unmapped judge model skips/refuses explicitly before insert, never vendor fallback. The built-in Claude judge model is opus (`model_resolve.go` ~15), so a haiku-only map cannot serve a default judge: document the required mapping in docs/providers.md (~136) and docs/judge.md (~422).
 
 Later source/policy edits affect new provider-judge rows only; claims of a provider-frozen judge never call judgeChoice or reread the owner's current source. Vendor-frozen rows retain their existing claim-time vendor policy and never cross into provider resolution. Preserve independent model/effort settings and validate the actual judge model against the frozen map.
 
@@ -96,25 +100,42 @@ Both policies are required: Antrea exact FQDN Allows after the last Drop on TCP 
 
 ## Verification and milestones
 
-Each unit has watched regressions and focused review. Each milestone is one PR. M1a and M1b are independent. M2 and M2b ship in one PR, so provider checkers never run without the guard. M3 depends on M1b. These are independently shippable slices within this PRD, not external unfinished-PRD dependencies. Before each gated run, freeze the permitted slice in its dispatch scope (M1a, M1b, M2+M2b or M3); do not ask one run to ship all remaining milestones as one PR. Partial deliveries remain non-closing until the remaining PRD work and recorded acceptance are complete. No milestone advertises another consumer's capability. The user reviews this decomposition before go; this is not an on-deck task.
+Each unit has watched regressions and focused review; each milestone is one PR, except M2+M2b which ship together so provider checkers never run without the guard. Sequence #4323 M1 → M1a → M1b; #4574 M1 follows M1a and reuses its judge seam. Rebase each shared-function migration on its immediate predecessor; do not run conflicting replacement migrations in parallel. Before each gated run, freeze one permitted slice (M1a, M1b, M2+M2b or M3); do not send all remaining milestones as one PR. Partial deliveries remain non-closing. No milestone advertises another consumer's capability. The user reviews this decomposition before go; this is not an on-deck task.
 
 ### M1a: Independent provider judge authority
 
-Creation/freeze at enqueue/manual sites, policy table including pinned-null and Codex controls, lane-aware models, real runner/SDK wiring, redacted onResult/usage, typed skips/claim settlement and docs. Test provider-only owner, pinned vendor, source/policy change while queued, revoked final delivery and provider gateway limits.
+**Blocked by:** #4323 M1 (sequencing); re-verify its merged engine-aware helpers and migration head before implementation.
+
+Deliver the Judge module, full capability census, redaction, terminal settlement, skip vocabulary/UI/CLI and docs above. Preserve the no-forge-PAT judge assembly boundary (`judge.go` ~1107-1123).
+
+Focused acceptance (watched red/green for new behavior):
+- A claude_provider_v1-only worker cannot claim a provider judge, suppress demand or attract peer preference; a judge-capable worker can. Both reap statements cover old images with busy/custody negative controls; health names the missing capability and downgrade refuses before vault open.
+- Provider-only owner gets a frozen judge; claim has secrets.provider only, anthropic_secret_id stays NULL, no Anthropic run_credential_epochs row, and judgeChoice is not called. Explicit pinned-with-pointer vendor works despite selected/unusable Claude source; pinned-NULL follows provider. Codex judges preserve both source-unset vendor and source-set refusal controls.
+- Source/policy changes after creation cannot rebind a provider judge. Unmapped model at create skips; changed-to-unmapped while queued fails terminally at claim. Revocation at assembly/final locked recheck is terminal credential_unavailable, never parked.
+- Prefixless runtime-assembled key and its registered forms, echoed by a fake gateway, never reach judge review/usage frames, failure_reason or logs; registration precedes reportState/fetchTrace and onResult is redacted before parsing. Gateway 429/529 fails provider_gateway_limit with no account cooldown, vendor/pool fallback or fallback-review completion. Provider cost stays unknown.
+- Typed skip copy renders in JudgePanel/mocks and CLI. Run `task check:web` and touched Vitest tests alongside the API/agent checks below. Real-gateway/hosted acceptance remains outside milestones in #4473.
 
 ### M1b: Terminal provider jobs and safe output publication
+
+**Blocked by:** M1a (shared placement/claim migration sequencing).
 
 Creation/claim freeze, worker/preflight/SDK wiring, typed v1 errors and unservable bound-worker capability handling, structured redaction and exact uploaded-file-byte refusal. Jobs remain terminal and optional unsafe files are omitted as worker_unreadable. Test no vendor call, before/after final-claim revocation, old workers, normal clean outputs and v1 compatibility.
 
 ### M2: Opposite-engine plan and code provider checkers
 
+**Blocked by:** M1b (serial shared predicate changes); ships with M2b.
+
 Both child-creation families, source/freeze, custody exclusivity, actual SDK consumer and stage-specific failures; preserve settings and pin resolution, no hidden Codex implementation. Test both engine directions and both plan/code stages, plus final locked races and no synthetic approval.
 
 ### M2b: Actual resolved-model independence guard
 
+**Blocked by:** M2's source/claim wiring in the same PR; not independently dispatchable.
+
 Existing claim-time models, the exact comparison rule and checker_unavailable outcomes above, pure comparison fixtures plus actual claim/lead-stage tests. A vendor/vendor plan and code cross-check with both models unset is created and runs unchanged. No new gate-reason vocabulary or assumed default. The final plan must identify where actual lead model identity is available for provider-involved pairs; if it cannot establish it, refuse explicitly rather than label unknown as independent or silently freeze a new vendor model policy. M2 and M2b are one PR, and the checker capability is advertised only with this guard complete.
 
 ### M3: Explicit operator-listed isolated model channels
+
+**Blocked by:** M1b for job execution and M2+M2b for serial shared predicate changes.
 
 Research claim stripping/preflight/runner/executor/job SDK wiring, the isolated-provider capability in addition to the job-provider capability, both chart/CNI arms and env parser, transactional admission and recheck, ADR/new invariant/residual and docs. Test listed/unlisted/443/malformed hosts, legacy/ordinary-only workers, no broad network tool and unchanged vendor/Compose refusal. Live real-gateway/site-list behavior is in the linked hosted acceptance issue, not an in-run milestone proof.
 
@@ -124,7 +145,7 @@ Research claim stripping/preflight/runner/executor/job SDK wiring, the isolated-
 
 Chart: helm template with deploy/values/ci-render.yaml through the existing assert-chart-render.sh pattern, assert-openshift-render.sh, lint:shell, lint:yaml, check:api-v1-compat, docs:sync/check-docs:web and UUID changelog. Update ADR-4320 D9/ARCHITECTURE lane status, ADR-2149 checker custody, ADR-1906's new invariant/residual, and AI-synced specs/human.md. Sweep changed reasons/claim/output/forge contracts across E2E helpers, phases and forge fake; run test:e2e-lib and test:forge-fake and name affected phases left unrun. No new CI job or `.github/workflows/**` edits.
 
-Landing obligations outside milestones: **full agent suite: exact-head PR CI**, applicable API/repo/LiveDB/worker-UID checks. The linked maintainer acceptance issue covers real hosted gateway lanes, actual CNI reach/refusal, private-CA behavior and vendor controls, without a sweep/deadline. No offline fake is called live certification.
+Landing obligations outside milestones: **full agent suite: exact-head PR CI**, applicable API/repo/LiveDB/worker-UID checks. Maintainer acceptance is tracked in [#4473](https://github.com/vtmocanu/uzi/issues/4473), without a sweep/deadline. Before dispatch, correct its obsolete activation-off/relay prerequisite text and add the M1a checklist: real hosted provider-only judge, explicit vendor-pin control, missing judge-capability queue and fleet-roll behavior, genuine gateway-limit failure, unknown provider cost and private-CA coverage where applicable. Later slices add their own real gateway/CNI reach/refusal checks. These are owner obligations outside implementation milestones; no offline fake is live certification and partial delivery stays non-closing.
 
 ## Decision Log
 
@@ -133,7 +154,7 @@ Landing obligations outside milestones: **full agent suite: exact-head PR CI**, 
 - **D3. Jobs never park.** Provider refusal is terminal at assembly and final recheck. Unsafe optional output files are omitted with worker_unreadable, without upload or binary rewriting; a clean job result may still complete.
 - **D4. Research destinations are an explicit operator list.** modelHost plus providerHosts, exact names/443 in configured policy, with existing ADR-0285 enforcement limitations. No wildcard, general network tool, per-run policy or new proxy; the model channel has D5's accepted content residual.
 - **D5. Redirect risk extends to all four lanes (owner, 2026-11-20).** Judge traces, job inputs/files, plan/code snapshots and fetched pages may be forwarded through gateway redirects under both existing auth styles. Isolated model-channel reach remains its explicit policy. Add a new ADR-1906 model-destination invariant and conditional gateway content residual; do not rewrite invariant 1. The docs prohibition on gateway web proxy/search is advice, not enforced origin proof.
-- **D6. #4505 is the required merged base.** Its output/log redaction and all-upload exact-key scan are reused and extended at newly reachable result/file seams. Accepted redirects do not authorize accidental publication. #4496 stays parked; #4509/#4323 are independent Codex work.
+- **D6. #4505 is the required merged base.** Its output/log redaction and all-upload exact-key scan are reused and extended at newly reachable result/file seams. Accepted redirects do not authorize accidental publication. #4496 stays parked; #4323 M1 is an integration-order prerequisite for M1a, not a conceptual dependency of Claude judge authority.
 - **D7. Per-lane capability means actual consumers, not ordinary activation.** Alongside claude_provider_v1, judge/job/checker/isolated consumers advertise only their own claude_provider_judge_v1, claude_provider_job_v1, claude_provider_checker_v1 or claude_provider_isolated_v1 once complete. Isolated jobs also require the job capability. ClaimRun, assembly backstop, placement, health, unservable-job and reap predicates stay consistent; #4505-only workers never receive these claims. No version-floor or fleet-proof subsystem.
-- **D8. Independently shippable slices (lead Option A, 2026-11-20).** M1a judge and M1b jobs are independent PRs; M2 plan/code checker and M2b same-model guard ship together in one PR; M3 isolated channels depends on M1b and is another PR. No extra PRD is introduced. Freeze one permitted slice per gated run and keep partial delivery non-closing. The user must say go after final architecture/scope review; preparation is not dispatch.
+- **D8. Serial slice delivery (review fold, 2026-11-21).** #4323 M1 precedes M1a; M1a precedes M1b and #4574 M1. M2+M2b are one PR, followed by M3; each shared-function migration preserves its immediate predecessor. Freeze one permitted slice per gated run, keep partial delivery non-closing and track hosted acceptance in #4473. Dispatch requires applicable user go after final architecture/scope review.
 - **D9. Provider-involved same-model match uses existing unavailability.** Compare actual resolved IDs at claim only when a provider is involved, not a pre-child default or vendor/vendor pair. Use checker_unavailable with a server detail and the stage's existing outcome; unknown provider-pair identity is not independent-review proof. No new public reason/migration is justified solely for this guard.

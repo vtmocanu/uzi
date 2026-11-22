@@ -406,6 +406,24 @@ boot), and the config bytes, inode and mtime are unchanged through the admission
 the restart, so the test asserts the execution tuple changed rather than the inode. A missing Docker or image fails the test. The
 container and volume are named `cdr-3644-nsproof-*` and removed by exact name. `task test:agent:worker-uid` runs it after `run.sh`.
 
+### Refusal producer teardown proof (issue #4481)
+
+`e2e/worker-uid/refusal-producer-teardown-real.test.mts` is host-driven like the namespace teardown proof and uses the same
+`WORKER_UID_IMAGE`. It starts the shipped image through its real chain (the `uzi-entrypoint` ENTRYPOINT execs tini as PID 1, which
+runs the CMD `npm run start`, which runs `tsx src/main.ts`, which runs node), as uid 10001 with no capabilities, so the entrypoint
+takes its non-root branch (the root-started compose branch is not exercised). The one substitution is a read-only bind mount of a
+one-line `/app/src/main.ts` that imports `refusal-producer-teardown-probe.mts`. The probe, as the worker, builds a bare repository on a
+volume at the owed cap, admits generation G through the real `GitCache.admitRefusalProvenance`, and starts two delayed `git update-ref
+refs/uzi-incoming/<run>/<G>/<id>` producers, one in the worker's process group and one in a new session. The test SIGKILLs only the
+worker node process. A successor container on the same volume is started idle before the kill. The test asserts (a) ordering, before
+teardown is awaited: right after the kill the successor runs the real `refusalReleaseGate` while the producers' deadline is still in
+the future (before the kill a second process inside the worker container also runs the gate, with both producers re-confirmed alive
+immediately before the kill, and gets `ineligible`; the margin `deadlineMs - gateAt` is logged), and gets `ineligible` (admission from another process), while the same state under the dead worker's nonce is `eligible`;
+and (b) eventual cleanup: the worker container then stops (npm and tini exit), and after the deadline neither ref exists in the
+successor and the gate is unchanged. The worker runs the host checkout's `agent/src`, bind-mounted read-only into the proof tree, not
+the copy baked into the image. A missing Docker or image fails the test. Containers and volume are named `cdr-4481-refusal-*` and removed by
+exact name. `task test:agent:worker-uid` runs it after the namespace teardown proof.
+
 ### Node assert diagnostic calibration (issue #2471)
 
 After the two reports, `calibration.py` runs a measurement-only step of eight serial

@@ -9,8 +9,8 @@
 //      attention chips jump to their item in the attention card);
 //   4. the cross-user Fleet card (id="fleet", the target of the fleet.* items' link).
 //
-// TWO best-effort polls, each keeping its last-good value on a failed fetch (mirroring
-// CustodyBoardAlert): the health document via the shared useAdminHealth hook (10 s), and the
+// TWO best-effort polls, each keeping its last-good value on a failed fetch (like the
+// Overview's polls): the health document via the shared useAdminHealth hook (10 s), and the
 // fleet via api.adminListWorkers (10 s). A transient blip must never blank the page, and the
 // inventory's open groups live in AllChecks state, which a new document does not remount.
 //

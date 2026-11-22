@@ -12,8 +12,8 @@ import (
 
 // Request cases of fixtures/lead-config/contract.json the current server claim cannot produce,
 // each with the reason. A case is either listed here or carries a `server` block; never both.
-// Phase never matters to the server today (no planning default is resolved), so the plan-phase
-// cases are not listed for their phase.
+// The server ships plan_phase when planning defaults apply; the cases pin that pair as well as
+// the implementation defaults.
 const (
 	reasonEffortlessBuiltin = "config ships default_effort_source builtin without default_effort; the server always ships the builtin level, only the owner's `runtime` choice ships no level (and then the source is user_default)"
 	reasonEmptyConfig       = "config is empty; the server always ships default_effort_source on a lead-lane claim"
@@ -80,7 +80,8 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 			got := resolveLeadSettings(LeadSettingsInput{
 				Harness: harness, RunModel: text(s.RunModel), RunModelSource: text(s.RunModelSource),
 				RunEffort: text(s.RunEffort), RunEffortSource: text(s.RunEffortSource),
-				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort),
+				LaneModel: text(s.Lane), UserEffort: text(s.UserEffort), TemplateEffort: text(s.TemplateEffort),
+				PlanningModel: text(s.PlanningModel), PlanningEffort: text(s.PlanningEffort),
 			})
 
 			wantStr := func(key string) string {
@@ -100,6 +101,23 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 				t.Errorf("default_effort_source = %q, case config has %q", got.EffortSource, wantStr("default_effort_source"))
 			}
 
+			// PRD #3252: the claim's plan_phase is exactly the server's Plan, absent when no planning
+			// value applies; the worker resolves the plan-phase request from it.
+			wantPlan, _ := c.Config["plan_phase"].(map[string]any)
+			if (got.Plan != nil) != (wantPlan != nil) {
+				t.Fatalf("plan_phase present = %v, case config has %v", got.Plan != nil, wantPlan)
+			}
+			if got.Plan != nil {
+				planStr := func(key string) string {
+					v, _ := wantPlan[key].(string)
+					return v
+				}
+				if derefOr(got.Plan.Model, "") != planStr("model") || got.Plan.ModelSource != planStr("model_source") ||
+					derefOr(got.Plan.Effort, "") != planStr("effort") || got.Plan.EffortSource != planStr("effort_source") {
+					t.Errorf("plan_phase = %+v, case config has %v", *got.Plan, wantPlan)
+				}
+			}
+
 			model, source := "", string(got.ModelSource)
 			if got.Model.Valid {
 				model = got.Model.String
@@ -109,6 +127,13 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 				model, source = agenttmpl.ResolveWorkerDefaultModel(c.Harness, nil, s.TemplateClaude, s.TemplateCodex)
 			}
 			wantModel := derefOr(c.Expect.Model, "")
+			// The plan phase takes each planning key the server ships; an absent key keeps the
+			// implement result resolved above (what the worker does with plan_phase).
+			if c.Phase == "plan" && got.Plan != nil {
+				if got.Plan.Model != nil {
+					model, source = *got.Plan.Model, got.Plan.ModelSource
+				}
+			}
 			if c.Harness == "codex" && model == agenttmpl.DefaultCodexModel && c.ProviderDefaultModel != nil &&
 				*c.ProviderDefaultModel != agenttmpl.DefaultCodexModel {
 				t.Errorf("providerDefaultModel %q differs from agenttmpl.DefaultCodexModel %q", *c.ProviderDefaultModel, agenttmpl.DefaultCodexModel)

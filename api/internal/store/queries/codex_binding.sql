@@ -334,6 +334,41 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'codex_account_unavailable'
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
 
+-- name: ApplyRunCodexBinding :execrows
+-- Dedicated switch writer; caller holds worker/run, both aliases and accounts.
+UPDATE runs r SET codex_secret_id = @target_secret_id::uuid,
+ codex_auth_mode = @auth_mode::text, codex_secret_label = sqlc.narg('label')::text,
+ codex_material_revision = @material_revision::bigint,
+ codex_account_key = sqlc.narg('account_key')::text,
+ codex_account_revision = sqlc.narg('account_revision')::bigint,
+ updated_at = now()
+WHERE r.id = @id AND r.user_id = @user_id AND r.worker_id = @worker_id::uuid
+ AND r.harness = 'codex' AND r.claim_released_at IS NULL
+ AND r.status IN ('running','awaiting_approval','awaiting_input','awaiting_followup')
+ AND r.claim_generation = @claim_generation::bigint
+ AND r.credential_switch_requested_at IS NOT NULL
+ AND r.credential_switch_generation = @claim_generation::bigint
+ AND r.credential_switch_op_id = @op_id::uuid
+ AND r.codex_secret_id IS NOT DISTINCT FROM sqlc.narg('old_secret_id')::uuid
+ AND r.codex_auth_mode IS NOT DISTINCT FROM sqlc.narg('old_auth_mode')::text
+ AND r.codex_material_revision IS NOT DISTINCT FROM sqlc.narg('old_material_revision')::bigint
+ AND r.codex_account_key IS NOT DISTINCT FROM sqlc.narg('old_account_key')::text
+ AND r.codex_account_revision IS NOT DISTINCT FROM sqlc.narg('old_account_revision')::bigint
+ AND r.codex_claim_epoch = @old_claim_epoch::bigint
+ AND r.codex_switch_target_secret_id = @target_secret_id::uuid
+ AND r.codex_switch_target_generation = @claim_generation::bigint
+ AND r.codex_switch_target_op_id = @op_id::uuid
+ AND r.codex_switch_target_auth_mode = @auth_mode::text
+ AND r.codex_switch_target_material_revision = @material_revision::bigint
+ AND r.codex_switch_target_account_key IS NOT DISTINCT FROM sqlc.narg('account_key')::text
+ AND r.codex_switch_target_account_revision IS NOT DISTINCT FROM sqlc.narg('account_revision')::bigint
+ AND ((@auth_mode::text = 'api_key' AND sqlc.narg('account_key')::text IS NULL
+       AND sqlc.narg('account_revision')::bigint IS NULL)
+   OR (@auth_mode::text = 'subscription' AND sqlc.narg('account_key')::text IS NOT NULL
+       AND sqlc.narg('account_revision')::bigint IS NOT NULL))
+ AND EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.user_id = r.user_id
+     AND w.snapshot_register_nonce = @register_nonce::text);
+
 -- name: SetRunCodexClaimCapability :one
 -- Mint (or rotate) the per-claim Codex capability (PRD #1147 M2): store the new hash and
 -- bump the epoch so a prior capability is superseded. Guarded on worker_id — only the
@@ -1077,3 +1112,17 @@ LEFT JOIN codex_provider_account cpa
 WHERE r.id = ANY(@run_ids::uuid[])
   AND r.status = 'recovery_wait'
   AND r.recovery_wait_cause = 'codex_account_unavailable';
+
+
+-- name: LockCodexAccountForUpdateNowait :one
+-- Refresh admission serializes with switch apply before creating its intent.
+SELECT id FROM codex_provider_account
+WHERE id = @id AND user_id = @user_id
+FOR UPDATE NOWAIT;
+
+-- name: LockUnresolvedCodexSwitchIntents :many
+SELECT * FROM codex_refresh_intent
+WHERE user_id = @user_id AND provider_account_id = @provider_account_id
+  AND state = 'rotating'
+ORDER BY operation_id LIMIT 1
+FOR SHARE NOWAIT;

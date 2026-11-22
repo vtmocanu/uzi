@@ -61,7 +61,7 @@ it("checkpoint publish passes the confirmed tip to checkpointPack as confirmedBl
   };
   const flight = { cancel: abort, steering: { lifecycleSignal: () => abort.signal }, runId: "retry", runKind: "issue",
     barePath: "bare", branch: "branch", lastCheckpointRefTip: CONFIRMED, lastAttemptedCheckpointRefTip: undefined,
-    checkpointDefaultBranch: "main", reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(),
+    checkpointDefaultBranch: "main", providerKeyForms: [], reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(),
     batcher: { emit: () => undefined } };
   await seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, abort.signal);
   assert.equal(packOptions.length, 1);

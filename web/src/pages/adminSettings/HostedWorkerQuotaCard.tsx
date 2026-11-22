@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 import { SettingControl } from "./SettingControl";
@@ -24,7 +24,7 @@ export function HostedWorkerQuotaCard({ settings, sources = {}, defaults, sizeOp
   defaults?: Record<string, string>;
   /** The worker sizes the default-size selector offers (PRD #4213), lifted from Admin → Workers. */
   sizeOptions?: readonly NamedWorkerSize[];
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const savedValue = displayQuota(settings.hosted_worker_quota);
   const [value, setValue] = useState(savedValue);
@@ -41,8 +41,9 @@ export function HostedWorkerQuotaCard({ settings, sources = {}, defaults, sizeOp
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ hosted_worker_quota: value });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { hosted_worker_quota: value };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setValue(displayQuota(resp.settings.hosted_worker_quota));
       setNotice("Hosted worker quota saved.");
     } catch (err) {

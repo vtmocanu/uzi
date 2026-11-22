@@ -203,12 +203,18 @@ describe("Overview promotion (PRD #3877 M1)", () => {
     cleanup();
   }, 30000);
 
-  it("keeps the old Overview one click away at /overview/classic", async () => {
+  it("redirects the retired /overview/classic to /dashboard with query and hash intact", async () => {
     await mockApi.login("vlad@uzi.local", "x");
-    const { holder, container, unmount } = await mountRoute("/overview/classic");
-    expectRenderedCleanly("classic /overview/classic", holder, container);
-    expect(await screen.findByText("Agent templates")).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
+    const { unmount } = render(
+      <MemoryRouter initialEntries={["/overview/classic?mock=overview-next#x"]}>
+        <AuthProvider>
+          <App />
+          <RouteLocation />
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByTestId("route-location").textContent).toBe("/dashboard?mock=overview-next#x"));
+    expect(await screen.findByRole("region", { name: "Issue work" })).toBeTruthy();
     unmount();
     cleanup();
   }, 30000);

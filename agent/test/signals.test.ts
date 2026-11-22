@@ -14,6 +14,7 @@ describe("M3 exact park answers", () => {
   });
 });
 import { buildSignalMcpServer, isSignalToolName, REPORT_MD_MAX_LEN, scanSignals } from "../src/signals.js";
+import { makeTextRedactor, providerKeyForms } from "../src/redact.js";
 import { REPORT_MD_STORED_MAX_BYTES, SIGNAL_DONE_SUMMARY_DESCRIPTION } from "../src/forge-tool-help.js";
 
 // The plan/done signals are observed from the SDK message stream, so a scripted
@@ -1302,5 +1303,91 @@ describe("signal_done report_only texts scope the #3360 fallback to issue runs",
     const res = await callToolOverJsonRpc(buildSignalMcpServer({ reportOnly: true }), "signal_done", { summary: "s" });
     const content = ((res["result"] as { content?: { type: string; text?: string }[] } | undefined)?.content) ?? [];
     pinned(content.map((c) => c.text ?? "").join("\n"));
+  });
+});
+
+// A provider key straddling a parse-time clamp must be redacted BEFORE the clamp: the redactor only
+// matches whole key forms, so a clamp that cuts first leaves an unmatchable prefix.
+describe("scanSignals redacts the run's text before each clamp (redactText)", () => {
+  const KEY = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+  const redact = makeTextRedactor(providerKeyForms(KEY));
+  const noPrefix = (label: string, value: unknown): void => {
+    const text = JSON.stringify(value);
+    for (let n = 8; n <= KEY.length; n++) assert.ok(!text.includes(KEY.slice(0, n)), `${label}: key prefix of length ${n} leaked`);
+  };
+  const done = (input: unknown, redactText?: (s: string) => string) =>
+    scanSignals(toolUse("mcp__uzi__signal_done", input), redactText ? { redactText } : {});
+
+  it("signal_done summary straddling REPORT_MD_MAX_LEN", () => {
+    const summary = "x".repeat(REPORT_MD_MAX_LEN - 10) + KEY;
+    assert.ok(done({ summary }).summary!.includes(KEY.slice(0, 10)), "without a redactor the fixture straddles the cut");
+    noPrefix("summary", done({ summary }, redact).summary);
+  });
+
+  it("pr_summary what straddling 4000 bytes", () => {
+    const what = "y".repeat(3990) + KEY;
+    assert.ok(done({ pr_summary: { what } }).prSummary!.what!.includes(KEY.slice(0, 10)));
+    noPrefix("what", done({ pr_summary: { what } }, redact).prSummary);
+  });
+
+  it("ask_user question and option label straddling their caps", () => {
+    const input = { questions: [{ question: "q".repeat(1990) + KEY, header: "h".repeat(50) + KEY, options: [{ label: "l".repeat(190) + KEY, description: "d".repeat(190) + KEY }] }] };
+    const msg = toolUse("mcp__uzi__ask_user", input);
+    assert.ok(JSON.stringify(scanSignals(msg).questions).includes(KEY.slice(0, 8)));
+    noPrefix("questions", scanSignals(msg, { redactText: redact }).questions);
+  });
+
+  it("submit_plan milestone title straddling 200, accepted and rejected shapes", () => {
+    const title = "t".repeat(190) + KEY;
+    const ok = toolUse("mcp__uzi__submit_plan", { plan_md: "p", milestones: [{ id: "m1", title }] });
+    assert.ok(JSON.stringify(scanSignals(ok).milestones).includes(KEY.slice(0, 8)));
+    noPrefix("milestones", scanSignals(ok, { redactText: redact }).milestones);
+    const bad = toolUse("mcp__uzi__submit_plan", { plan_md: "p", milestones: [{ id: "m1", title }, { id: "", title: "x" }] });
+    noPrefix("rejectedMilestones", scanSignals(bad, { redactText: redact }).rejectedMilestones);
+  });
+
+  it("milestones_agents agent_label is redacted before its clamp; agent stays byte-exact", () => {
+    const progress = (label: string) =>
+      scanSignals(toolUse("mcp__uzi__report_progress", {
+        completed: [], in_progress: ["m1"],
+        milestones_agents: [{ id: "m1", agent: "coder-agent", agent_label: label }],
+      }), { redactText: redact }).progress;
+    for (const label of ["x " + KEY, "p".repeat(190) + KEY]) {
+      const p = progress(label);
+      noPrefix("agent_label", p);
+      assert.equal(p!.milestones_agents![0]!.agent, "coder-agent");
+    }
+    const bare = scanSignals(toolUse("mcp__uzi__report_progress", {
+      completed: [], in_progress: ["m1"],
+      milestones_agents: [{ id: "m1", agent: "coder-agent", agent_label: "p".repeat(190) + KEY }],
+    })).progress;
+    assert.ok(JSON.stringify(bare).includes(KEY.slice(0, 8)), "without a redactor the fixture straddles the cut");
+  });
+
+  it("ids are redacted before the 64-rune clamp on every parse path and still match the frozen id", () => {
+    const part = ["Hd6y", "Nc3u", "V9pB", "1z5e", "T8mQ", "w7Lk", "R2xD", "f4Gh", "Zq_-"].join("");
+    const bigKey = (part + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789").repeat(3).slice(0, 100);
+    assert.equal(bigKey.length, 100);
+    const redactBig = makeTextRedactor(providerKeyForms(bigKey));
+    const opts = { redactText: redactBig };
+    const frozen = scanSignals(toolUse("mcp__uzi__submit_plan", { plan_md: "p", milestones: [{ id: bigKey, title: "t" }] }), opts).milestones![0]!.id;
+    const bad = scanSignals(toolUse("mcp__uzi__submit_plan", { plan_md: "p", milestones: [{ id: bigKey, title: "t" }, { id: "", title: "x" }] }), opts);
+    const prog = scanSignals(toolUse("mcp__uzi__report_progress", { completed: [bigKey], in_progress: bigKey, milestones_agents: [{ id: bigKey, agent: "a" }] }), opts).progress!;
+    const dn = scanSignals(toolUse("mcp__uzi__signal_done", { milestones_completed: [bigKey] }), opts).milestonesCompleted;
+    const leaks = (v: unknown): boolean => JSON.stringify(v).includes(bigKey.slice(0, 8));
+    for (const [label, v] of [["frozen", frozen], ["rejected", bad.rejectedMilestones], ["progress", prog], ["done", dn]] as const) {
+      assert.ok(!leaks(v), `${label}: key prefix leaked`);
+    }
+    assert.equal(prog.completed[0], frozen);
+    assert.equal(prog.in_progress[0], frozen);
+    assert.equal(prog.milestones_agents![0]!.id, frozen);
+    assert.equal(dn![0], frozen);
+    const plain = scanSignals(toolUse("mcp__uzi__submit_plan", { plan_md: "p", milestones: [{ id: bigKey, title: "t" }] })).milestones![0]!.id;
+    assert.equal(plain.length, 64, "without a redactor the id is cut at 64");
+  });
+
+  it("the identity default leaves text unchanged", () => {
+    assert.equal(done({ summary: "plain" }).summary, "plain");
+    assert.equal(done({ summary: "plain" }, (s) => s).summary, "plain");
   });
 });

@@ -590,6 +590,21 @@ describe("publication intent: guards are re-derived from the live claim (M1)", (
     assert.equal(out.secret_remediation.known.length, 1, "known findings are kept as extra caution");
     assert.equal(supplied.secret_remediation.clean_tip, CAND2, "pure: the input is not mutated");
   });
+
+  it("round-trips a provider run's providerKeyScan flag and the resumed guard keeps it; a vendor intent is unchanged", () => {
+    const provider = intent();
+    provider.guard.frozen_held = { ...provider.guard.frozen_held, providerKeyScan: true };
+    const parsed = parsePublicationIntent(JSON.parse(JSON.stringify(provider)), "issue");
+    assert.equal(parsed.guard.frozen_held.providerKeyScan, true);
+    assert.deepEqual(parsed, provider);
+    assert.equal(stricterGuard(parsed.guard, live).frozen_held.providerKeyScan, true);
+    const vendor = parsePublicationIntent(JSON.parse(JSON.stringify(intent())), "issue");
+    assert.equal("providerKeyScan" in vendor.guard.frozen_held, false);
+    assert.equal("providerKeyScan" in stricterGuard(vendor.guard, live).frozen_held, false);
+    const bad = JSON.parse(JSON.stringify(provider)) as { guard: { frozen_held: Record<string, unknown> } };
+    bad.guard.frozen_held.providerKeyScan = false;
+    assert.throws(() => parsePublicationIntent(bad, "issue"), PublicationIntentMismatchError);
+  });
 });
 
 describe("publication intent: what the api cannot store (N3)", () => {

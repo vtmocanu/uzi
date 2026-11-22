@@ -1,5 +1,5 @@
 import { crossCheckDiagnostic } from "./cross-check-diagnostic.js";
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 import fs from "node:fs/promises";
 import { collectCodeInventory, normalizeCodeCoverage, type CodeInventory } from "./code-cross-check-coverage.js";
 import { decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
@@ -25,7 +25,7 @@ import { errMessage } from "./util.js";
 import { rmHomeTree } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { MessageBatcher } from "./batcher.js";
-import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "./redact.js";
 import { CheckActivityRecorder } from "./cross-check-activity.js";
 
 // The verdict route uses reason-class refusals, whereas ordinary state routes use disposition.
@@ -213,12 +213,12 @@ export class CrossCheckRunner {
         if (registration === undefined || op.kind !== "checker") return undefined;
         const token = this.opts.activeRuns?.setAccountCooldown(runId, generation, op, registration);
         return token === undefined ? undefined : () => this.opts.activeRuns?.clearAccountCooldown(runId, generation, token);
-      }, ["checker"], this.log) : undefined;
+      }, ["checker"], this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     operation?.own();
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
-      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.provider?.credential, claim.secrets.codex?.capability];
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), claim.secrets.codex?.capability];
       // PRD #4320: the cross-check lane cannot serve a provider until PRD #4322; the server refuses it
       // first, this is the worker's second layer. Reported as an unavailable checker, never run.
       if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);

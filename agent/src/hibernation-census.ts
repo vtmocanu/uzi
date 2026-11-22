@@ -523,21 +523,30 @@ function unknownBareNodes(tree: Tree, bare: Node, out: Gathered): void {
 const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage",
   "uzi-recovery-episode", "uzi-cross-check"];
 const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed|coverage|recovery-episode|cross-check)\//;
+// issue #4481: a run-attributed stage or refused head (refs/uzi-incoming/<run>/<generation>/<name>) is recovery state;
+// a flat refs/uzi-incoming/<uuid> stage is a transient fetch stage and stays unprotected.
+const PROTECTED_PACKED_NESTED_INCOMING = / refs\/uzi-incoming\/[^/\s]+\//;
 
 /** Why a bare cache is more than a cache: owed records, a ref in a recovery namespace (loose or packed) or a code
  *  snapshot. "unreadable" when the packed refs could not be read. */
 async function protectedBareReason(dataDir: string, tree: Tree, bare: Node): Promise<string | undefined> {
   if (tree.children(`${bare.rel}/uzi-owed`).length > 0) return "owed_records";
   if (tree.children(`${bare.rel}/uzi-code-snapshots`).length > 0) return "code_snapshots";
+  // Admissions are written by inventory-guarded code-publishing flights and kept (cleanup never deletes them), so only evidence records protect.
+  if (tree.children(`${bare.rel}/info/uzi-refusals`).some(n => /^(?:refusals-|final-|cleanup-|incomplete-|owedpath-|\.tmp-)/.test(lastSegment(n.rel)))) return "refusal_records";
   for (const dir of PROTECTED_REF_DIRS) {
     if (tree.descendants(`${bare.rel}/refs/${dir}`).some(n => n.type !== "dir")) return "recovery_refs";
   }
+  const incoming = `${bare.rel}/refs/uzi-incoming/`;
+  if (tree.descendants(`${bare.rel}/refs/uzi-incoming`).some(n => n.type !== "dir" && n.rel.startsWith(incoming) &&
+    n.rel.slice(incoming.length).includes("/"))) return "recovery_refs";
   const packed = tree.byRel.get(`${bare.rel}/packed-refs`);
   if (!packed) return undefined;
   if (packed.type !== "file" || packed.size > MAX_PACKED_REFS_BYTES) return "unreadable";
   try {
     const text = await fsp.readFile(absBytes(dataDir, packed.rel), "latin1");
-    return text.split("\n").some(line => PROTECTED_PACKED_REF.test(line)) ? "recovery_refs" : undefined;
+    return text.split("\n").some(line => PROTECTED_PACKED_REF.test(line) || PROTECTED_PACKED_NESTED_INCOMING.test(line))
+      ? "recovery_refs" : undefined;
   } catch { return "unreadable"; }
 }
 

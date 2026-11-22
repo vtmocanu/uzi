@@ -290,40 +290,34 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 
 // newRunSetTokenCmd builds `uzi run set-token` (PRD #1247 M4, D12).
 //
-// `uzi run set-token <run-id> <label>|--auto|--default|--inherit` re-points which Anthropic
-// token ONE run spends: the positional LABEL pins the run to that token; the three flags
-// force a mode. Exactly one of {label, --auto, --default, --inherit} is required and they
-// are mutually exclusive (mirroring `--token` on `run create`, D12). A label is resolved to
-// an anthropic_token id CLIENT-SIDE (ListSecrets + findSecretByLabel), so an unknown or
-// wrong-kind label is refused before any request; the keywords need no round-trip.
+// `uzi run set-token <run-id> <label>|--auto|--default|--inherit` selects a credential
+// for ONE run. Claude accepts the three mode flags or an Anthropic token label;
+// Codex requires an explicit subscription or API-key label. Exactly one label or
+// mode is required. The owner-scoped run selects the harness before ListSecrets
+// resolves a matching credential kind, so unknown, wrong-kind and ambiguous labels
+// are refused before any write.
 //
-// On a queued run the switch takes effect at the next claim; on a parked run it promotes
-// the run back to queued at once; on a RUNNING or gated run held by a capability worker it
-// REQUESTS the switch, which takes effect when the worker releases its claim (PRD #1247 M5).
-// The server may return a D6 WARNING (no headroom, auto will hold in pool_wait) on the 200
-// without refusing — it is printed to STDERR regardless of --format (mirroring
-// renderCreatedRun), so a scripted/--json consumer still sees the advisory while stdout
-// stays a bare RunDTO.
+// Claude supports queued/parked rebinding and live switch requests. Codex requests
+// pin a target for a safe-boundary resume attempt in the same claim and worktree;
+// requestCodexCredentialSwitch leaves the current binding intact until apply.
 func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	setToken := &cobra.Command{
 		Use:   "set-token <run-id> [<label>]",
-		Short: "Switch which Anthropic token a run spends",
-		Long: "Re-point which Anthropic token ONE run spends (PRD #1247). A positional token " +
-			"LABEL pins the run to that token; `--auto` auto-selects from your pool, `--default` " +
-			"uses your default token, and `--inherit` clears the override back to the worker's " +
-			"binding. Exactly one of {label, --auto, --default, --inherit} is required and they " +
-			"are mutually exclusive.\n\n" +
-			"On a QUEUED run it takes effect at the next claim; on a PARKED run (limit_wait, " +
-			"pool_wait, recovery_wait, paused) it promotes the run back to `queued` at once so the " +
-			"next claim spends the chosen token. A recovery_wait run on an owner hold (for example worker " +
-			"memory pressure, worker requeue exhausted or a retained recovery cause) is refused (409, exit 5) " +
-			"with the hold named and nothing written; use Resume or Cancel. On a RUNNING or gated run held by a capable worker " +
-			"the switch is REQUESTED and takes effect when the worker releases its claim; it is refused " +
-			"(409, exit 5) when no live worker holds the run or the holding worker predates the " +
-			"credential_switch capability. A foreign or unknown run — or an unknown token label — is " +
-			"refused (404 / usage); a codex run is 422.\n\n" +
-			"It may print a warning (the token has no headroom, or auto will hold in pool_wait) " +
-			"WITHOUT refusing — the switch still applies.",
+		Short: "Switch which model credential a run spends",
+		Long: "Re-point the credential ONE run spends. A positional LABEL pins an explicit " +
+			"credential, resolved using the owner-scoped run harness. Claude accepts Anthropic " +
+			"tokens, --auto, --default or --inherit. Codex accepts only an explicit Codex subscription " +
+			"(codex_auth) or OpenAI API key (openai_api_key) label; no auto/default/inherit. " +
+			"Exactly one label or mode is required. Ambiguous eligible labels are refused; rename " +
+			"them in the web UI before retrying.\n\n" +
+			"For Claude, QUEUED switches apply at next claim and eligible PARKED switches requeue. " +
+			"Live Codex switches request a safe-boundary resume attempt in the same claim and " +
+			"worktree, without promising provider resume. A request leaves the committed binding " +
+			"unchanged until apply. Codex queued and parked runs are out of scope (422); claimed " +
+			"runs are refused (409). The server validates live states, worker capability, policy " +
+			"holds and credential usability; a policy refusal is 409, with nothing written. " +
+			"Foreign or unknown runs are 404. Warnings print to stderr without refusing. " +
+			"The response shows pending versus committed state; a request is not an applied switch.",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -357,12 +351,8 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	return setToken
 }
 
-// setTokenOverride resolves `uzi run set-token`'s positional label + mode flags into the
-// wire override (PRD #1247 M4, D12): exactly one of {label, --auto, --default, --inherit},
-// mutually exclusive. A label is resolved CLIENT-SIDE to {pinned, secret_id} via
-// ListSecrets + findSecretByLabel (kind-filtered to anthropic_token); an unknown label is a
-// clean usage refusal naming `uzi token list`, and a wrong-kind label names its kind. The
-// three keywords ride as a bare mode with no server round-trip.
+// setTokenOverride resolves labels against the owner-scoped run harness, never
+// against a provider account inferred from a label. State eligibility remains server-owned.
 func setTokenOverride(cmd *cobra.Command, args []string, c uzicli.Client) (uzicli.SetRunCredentialOverride, error) {
 	auto, _ := cmd.Flags().GetBool("auto")
 	def, _ := cmd.Flags().GetBool("default")
@@ -388,6 +378,20 @@ func setTokenOverride(cmd *cobra.Command, args []string, c uzicli.Client) (uzicl
 			"a token label, --auto, --default and --inherit are mutually exclusive; pass exactly one")
 	}
 
+	run, err := c.GetRun(cmd.Context(), args[0])
+	if err != nil {
+		return uzicli.SetRunCredentialOverride{}, err
+	}
+	codex := run.Harness == "codex"
+	if run.Harness != "claude" && !codex {
+		return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
+			"set-token does not support harness %q", sanitizeTTY(run.Harness))
+	}
+	if codex && label == "" {
+		return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
+			"Codex requires an explicit codex_auth or openai_api_key label; no auto/default/inherit")
+	}
+
 	switch {
 	case auto:
 		return uzicli.SetRunCredentialOverride{Mode: "auto"}, nil
@@ -402,17 +406,49 @@ func setTokenOverride(cmd *cobra.Command, args []string, c uzicli.Client) (uzicl
 	if err != nil {
 		return uzicli.SetRunCredentialOverride{}, err
 	}
-	target, ok := findSecretByLabel(secrets, kindAnthropicToken, label)
-	if !ok {
-		// A NON-anthropic secret carrying this label: name its kind so the refusal reads true.
-		if other, found := findSecretByLabel(secrets, "", label); found {
+	noun := "Anthropic token"
+	allowed := "Anthropic tokens"
+	if codex {
+		noun = "Codex credential (codex_auth or openai_api_key)"
+		allowed = "Codex subscriptions (codex_auth) or OpenAI API keys (openai_api_key)"
+	}
+	var targetID string
+	matches := 0
+	var disabled bool
+	var otherKind string
+	for _, secret := range secrets {
+		if !strings.EqualFold(secret.Label, label) {
+			continue
+		}
+		eligible := secret.Kind == kindAnthropicToken
+		if codex {
+			eligible = secret.Kind == kindCodexAuth || secret.Kind == kindOpenAIAPIKey
+		}
+		if !eligible {
+			otherKind = secret.Kind
+			continue
+		}
+		matches++
+		targetID = secret.ID
+		disabled = secretDisabled(secret)
+	}
+	if matches > 1 {
+		return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
+			"ambiguous %s label %q; rename credentials in the web UI", noun, sanitizeTTY(label))
+	}
+	if matches == 0 {
+		if otherKind != "" {
 			return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
-				"set-token accepts only Anthropic tokens; %q is a %s credential", label, tokenKindAlias(other.Kind))
+				"set-token accepts only %s for this harness; %q is a %s credential", allowed, sanitizeTTY(label), sanitizeTTY(tokenKindAlias(otherKind)))
 		}
 		return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
-			"no Anthropic token labelled %q; `uzi token list` shows yours", label)
+			"no %s labelled %q; `uzi token list` shows yours", noun, sanitizeTTY(label))
 	}
-	return uzicli.SetRunCredentialOverride{Mode: "pinned", SecretID: target.ID}, nil
+	if disabled || targetID == "" {
+		return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
+			"credential %q is disabled or unavailable; choose an enabled credential", sanitizeTTY(label))
+	}
+	return uzicli.SetRunCredentialOverride{Mode: "pinned", SecretID: targetID}, nil
 }
 
 // newRunMrReworkCmd builds `uzi run mr-rework`.

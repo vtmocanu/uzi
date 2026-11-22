@@ -117,8 +117,8 @@ Both persist across Compose restarts. To refresh the nix store, first run `docke
 
 ## Resource stats and sizing
 
-Once a worker is running, the **Workers** page, the new Overview's Capacity rail,
-and the classic Overview's "Worker load" card show live CPU, memory, and disk gauges, self-reported by the worker from its
+Once a worker is running, the **Workers** page, and the Overview's Capacity rail
+show live CPU, memory, and disk gauges, self-reported by the worker from its
 own cgroup and filesystem on every heartbeat. A worker under real load (running
 the e2e suite) reported `cpu 1%` / `mem 0.1/4 GiB` / `disk 7.1/20 GiB` — a small,
 honest number, since the SDK subprocess and git were mostly idle between tool
@@ -212,7 +212,8 @@ and switches are unchanged. Five mechanisms:
 2. **In-run cache cap, two layers** (D4). A *soft* layer trims a running
    run's own caches (least-recently-used entries first) at a proven quiet
    point between turns — no live process, never judged from file mtimes —
-   whenever they exceed the run's share of the volume; a run that stays over
+   whenever they exceed the run's share of the volume (by default also
+   capped at an absolute 15 GiB per run, `UZI_RUN_CACHE_CAP_MAX_BYTES`); a run that stays over
    the cap parks preventively (uncounted, so this cannot by itself fail a
    run). A *hard* layer watches the data volume itself on every stats tick,
    independent of turn boundaries, and — only once the volume nears the

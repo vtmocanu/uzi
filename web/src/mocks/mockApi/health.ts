@@ -27,7 +27,7 @@ function withAgentSource(doc: HealthDoc): HealthDoc {
 }
 
 // Admin health (PRD #1484). GET /api/admin/health backs the Health tab and (M5) the
-// Overview card + danger banner. Admin-only (RequireAdminRO), so the mock gates on admin
+// Overview HealthChip + danger banner. Admin-only (RequireAdminRO), so the mock gates on admin
 // exactly as the real route does. The scenario picks which fixture to serve:
 //
 //   ?mock=health-degraded  → two checks need attention (warn)

@@ -237,7 +237,7 @@ describe("runner.ts call sites: direct A wrappers exclude phased import transpor
 
   // Methods whose body reaches admitSourceUse, beginBareMutation or beginDestructive.
   const NEEDS_A = ["reconcileOwedCandidates", "deleteRecoveryPin", "normalizeRetainedSourceObjects", "prepareRecoverySuccessor",
-    "createOrAttachRunnerClone", "runnerCloneForBranch"];
+    "createOrAttachRunnerClone", "runnerCloneForBranch", "refusalReleaseGate"];
   // Lexical inventory only: fetchAgentBranch receives a trusted callback for its A -> B
   // proof phases. It must not hold A across transport. The bootstrap runtime controls
   // exercise that callback with real authority hooks; lexical wrapping cannot prove it.

@@ -855,9 +855,10 @@ most of the places that check are not the end of the run:
   finalize does (see below), with the clone kept. Codex ordinary recovery can
   first use the credential-free fallback described below; refused or exhausted
   proof retains a nonterminal stop without claiming a verified capture.
-- Codex direct and retained credential switches retain/refuse before capture or
-  credential work. Codex per-run overrides remain unsupported (D9); only Claude
-  invokes the switch callback, including its existing retained-switch hold flow
+- Legacy direct and retained Codex capture-switch entries retain/refuse before
+  capture or credential work. The separate [live owner switch](codex-credentials.md#switching-a-live-run)
+  changes the committed credential within the same claim, without a release/reclaim
+  fallback. Claude keeps its existing retained-switch hold flow
   ([credential-switch holds](run-recovery.md#credential-switch-holds)).
 - On graceful shutdown, an unproven clone means nothing is published to the
   run's checkpoint; the pending requeue stands, and a later resume recovers
@@ -1012,6 +1013,42 @@ During version skew, the web client accepts an omitted `base_diverged` usage
 count as zero. Run and board payloads may omit `fail_origin` or carry null;
 without the typed origin, the client cannot infer a base-change rejection
 from the failure reason and retains the ordinary presentation.
+
+## When the planning to implementation switch cannot be verified
+
+A Claude run with a [planning model or effort](./worker-model.md#planning-model-and-effort)
+checks the runtime's applied model and effort before its first implementation
+turn after approval. When it cannot confirm the switch, the feed gets a
+status line from the worker, then the run parks (see [the hold](./run-pause.md#held-when-the-planning-to-implementation-switch-cannot-be-verified)):
+
+- `Paused: the runtime kept the planning model <m> instead of switching to
+  <m'>. Resume retries on a new claim; Cancel ends the run.` The same shape
+  names an effort mismatch. After a re-plan the line says it kept the
+  implementation setting instead of switching back to the planning one.
+- `Paused: the runtime's settings could not be verified before switching
+  models. Resume retries on a new claim; Cancel ends the run.` The runtime did
+  not answer in time or answered in an unreadable form.
+- `Paused: this worker cannot verify a switch to <target>. Choose a supported
+  model (opus, sonnet, haiku, fable) or a full model id, or clear the Claude
+  planning setting, then Resume; Cancel ends the run.` The target is not in the
+  characterized set the worker can check. The same line also covers an omitted
+  effort on an uncharacterized reported model. The runtime not offering a
+  `getSettings` method gives this same line, since the worker cannot verify a
+  switch without it.
+
+Model and effort values in these lines are the value uzi requested and the value
+the runtime reported, reduced to printable ASCII and clipped to 80 characters. If the worker then cannot get the park
+confirmed, it adds a follow-up line instead of leaving the first one standing:
+either `This worker no longer holds the run and has stopped working on it. This
+worker keeps its copy of the work.` (the server definitively no longer lists the
+worker as owner), `The server paused the run first (<reason>); this worker
+keeps the work.` (the run is already `paused` at this claim for another reason
+with the claim kept, so the worker ends without recording its own hold; the
+wall-clock limit's park releases the claim and gives the first line instead), or `The pause could not be confirmed; the run may not be paused. This
+worker keeps the work.` (undetermined, because the worker shut down while
+still retrying; check `uzi run get`). The worker keeps retrying until it gets
+one of these answers, a confirmed hold or owner Cancel, or shuts down; it has no
+time limit of its own.
 
 ## When Codex reports a provider safety-policy refusal
 

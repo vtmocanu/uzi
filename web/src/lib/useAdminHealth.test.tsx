@@ -4,7 +4,7 @@
 // session makes ZERO requests to /api/admin/health, with a positive control that an ADMIN
 // session does make it. Both consolidate on the ONE provider mounted in AppShell, so the
 // gate is proven where it actually lives. Asserted on the mocked api CALL LOG (vi.fn), the
-// same "no request" seam AppShell/CustodyBoardAlert tests use.
+// same "no request" seam AppShell tests use.
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";

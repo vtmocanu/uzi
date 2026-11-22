@@ -70,6 +70,8 @@ type AgentTemplate struct {
 	Customized  bool               `json:"customized"`
 	Origin      pgtype.Text        `json:"origin"`
 	CodexModel  pgtype.Text        `json:"codex_model"`
+	Effort      pgtype.Text        `json:"effort"`
+	CodexEffort pgtype.Text        `json:"codex_effort"`
 }
 
 type AgentTemplateAllocation struct {
@@ -1427,6 +1429,13 @@ type Run struct {
 	HealthOwnerHoldSince              pgtype.Timestamptz `json:"health_owner_hold_since"`
 	FollowupParkSeq                   int64              `json:"followup_park_seq"`
 	FollowupFinalizeGeneration        pgtype.Int8        `json:"followup_finalize_generation"`
+	CodexSwitchTargetSecretID         pgtype.UUID        `json:"codex_switch_target_secret_id"`
+	CodexSwitchTargetGeneration       pgtype.Int8        `json:"codex_switch_target_generation"`
+	CodexSwitchTargetOpID             pgtype.UUID        `json:"codex_switch_target_op_id"`
+	CodexSwitchTargetAuthMode         pgtype.Text        `json:"codex_switch_target_auth_mode"`
+	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
+	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
+	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
 }
 
 type RunCompletionAttempt struct {
@@ -1453,27 +1462,37 @@ type RunCompletionPermit struct {
 }
 
 type RunCredentialEpoch struct {
-	RunID           uuid.UUID          `json:"run_id"`
-	ClaimGeneration int64              `json:"claim_generation"`
-	SecretID        pgtype.UUID        `json:"secret_id"`
-	Label           pgtype.Text        `json:"label"`
-	SelectReason    pgtype.Text        `json:"select_reason"`
-	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+	RunID                 uuid.UUID          `json:"run_id"`
+	ClaimGeneration       int64              `json:"claim_generation"`
+	SecretID              pgtype.UUID        `json:"secret_id"`
+	Label                 pgtype.Text        `json:"label"`
+	SelectReason          pgtype.Text        `json:"select_reason"`
+	AppliedAt             pgtype.Timestamptz `json:"applied_at"`
+	CodexAuthMode         pgtype.Text        `json:"codex_auth_mode"`
+	CodexMaterialRevision pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountKey       pgtype.Text        `json:"codex_account_key"`
+	CodexAccountID        pgtype.Text        `json:"codex_account_id"`
+	CodexClaimEpoch       pgtype.Int8        `json:"codex_claim_epoch"`
 }
 
 type RunCredentialSwitchEpoch struct {
-	RunID               uuid.UUID          `json:"run_id"`
-	ClaimGeneration     int64              `json:"claim_generation"`
-	Ordinal             int32              `json:"ordinal"`
-	OpID                uuid.UUID          `json:"op_id"`
-	WorkerID            pgtype.UUID        `json:"worker_id"`
-	SecretID            pgtype.UUID        `json:"secret_id"`
-	SecretEnablementRev int64              `json:"secret_enablement_rev"`
-	Label               pgtype.Text        `json:"label"`
-	SelectReason        pgtype.Text        `json:"select_reason"`
-	MessageSeq          int32              `json:"message_seq"`
-	OldCumulative       []byte             `json:"old_cumulative"`
-	AppliedAt           pgtype.Timestamptz `json:"applied_at"`
+	RunID                 uuid.UUID          `json:"run_id"`
+	ClaimGeneration       int64              `json:"claim_generation"`
+	Ordinal               int32              `json:"ordinal"`
+	OpID                  uuid.UUID          `json:"op_id"`
+	WorkerID              pgtype.UUID        `json:"worker_id"`
+	SecretID              pgtype.UUID        `json:"secret_id"`
+	SecretEnablementRev   int64              `json:"secret_enablement_rev"`
+	Label                 pgtype.Text        `json:"label"`
+	SelectReason          pgtype.Text        `json:"select_reason"`
+	MessageSeq            int32              `json:"message_seq"`
+	OldCumulative         []byte             `json:"old_cumulative"`
+	AppliedAt             pgtype.Timestamptz `json:"applied_at"`
+	CodexAuthMode         pgtype.Text        `json:"codex_auth_mode"`
+	CodexMaterialRevision pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountKey       pgtype.Text        `json:"codex_account_key"`
+	CodexAccountID        pgtype.Text        `json:"codex_account_id"`
+	CodexClaimEpoch       pgtype.Int8        `json:"codex_claim_epoch"`
 }
 
 type RunDecisionMemo struct {
@@ -1736,6 +1755,7 @@ type RunSchedule struct {
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
 	CiArtifacts                []byte             `json:"ci_artifacts"`
+	FireEpoch                  int64              `json:"fire_epoch"`
 }
 
 type RunTerminalContribution struct {
@@ -1871,6 +1891,24 @@ type RunUserInput struct {
 	GateRevision            pgtype.Int8        `json:"gate_revision"`
 	IncludedAt              pgtype.Timestamptz `json:"included_at"`
 	InclusionReported       bool               `json:"inclusion_reported"`
+}
+
+type ScheduleOnceFire struct {
+	ScheduleID   uuid.UUID          `json:"schedule_id"`
+	FireEpoch    int64              `json:"fire_epoch"`
+	EffectiveCap pgtype.Int4        `json:"effective_cap"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type ScheduleOnceFireRun struct {
+	ScheduleID uuid.UUID          `json:"schedule_id"`
+	FireEpoch  int64              `json:"fire_epoch"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	IssueIid   int64              `json:"issue_iid"`
+	IssueTitle string             `json:"issue_title"`
+	WebUrl     string             `json:"web_url"`
+	RunUuid    uuid.UUID          `json:"run_uuid"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type SemanticCandidateHistory struct {
@@ -2029,6 +2067,8 @@ type User struct {
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
 	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
+	PlanningClaudeModel       pgtype.Text        `json:"planning_claude_model"`
+	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
 }
 
 type UserCrossCheckPin struct {

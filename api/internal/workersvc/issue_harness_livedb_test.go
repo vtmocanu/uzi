@@ -36,13 +36,13 @@ func TestIssueLabelCodexStampingLiveDB(t *testing.T) {
 			var runID uuid.UUID
 			switch origin {
 			case "scheduled":
-				run, err := svc.CreateScheduledRun(ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, nil, nil, selection.Explicit)
+				run, err := svc.CreateScheduledRun(ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, nil, nil, selection.Explicit, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
 				runID = run.ID
 			case "scheduled_auto":
-				run, err := svc.CreateScheduledAutopilotRun(ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, nil, selection.Explicit)
+				run, err := svc.CreateScheduledAutopilotRun(ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, nil, selection.Explicit, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -92,9 +92,9 @@ func TestScheduledStoredOverrideCodexGuardLiveDB(t *testing.T) {
 			override := &CredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &alias}
 			var err error
 			if auto {
-				_, err = svc.CreateScheduledAutopilotRun(env.ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, override, &codex)
+				_, err = svc.CreateScheduledAutopilotRun(env.ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, override, &codex, nil)
 			} else {
-				_, err = svc.CreateScheduledRun(env.ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, nil, override, &codex)
+				_, err = svc.CreateScheduledRun(env.ctx, userID, repoID, iid, "fresh", nil, nil, nil, false, nil, override, &codex, nil)
 			}
 			want := ErrCredentialOverrideHarnessUnsupported
 			if disabled {

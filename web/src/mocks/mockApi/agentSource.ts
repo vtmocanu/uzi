@@ -119,6 +119,7 @@ function agentSourceView(): AgentSourceView {
     const isCodex = CODEX_ROLE_MODELS.includes(model);
     role.claude_model = isCodex ? "" : model;
     role.codex_model = isCodex ? model : "";
+    role.effort = role.effort ?? "";
   }
   return clone;
 }

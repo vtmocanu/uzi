@@ -5,7 +5,6 @@ import { AdminRoute, GuestRoute, ProtectedRoute } from "./components/RouteGuards
 import { Landing } from "./pages/Landing";
 import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
-import { Dashboard } from "./pages/Dashboard";
 import { OverviewNext } from "./pages/OverviewNext";
 import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
@@ -68,8 +67,9 @@ export interface AppRoute {
   layout?: "runs";
 }
 
-// Keep the preview bookmark's demo scenario and fragment while moving it to the default Overview.
-function OverviewNextRedirect() {
+// The legacy Overview URLs (/overview/next, the preview bookmark, and /overview/classic, the
+// retired old page) both land on the default Overview, keeping a demo scenario and fragment.
+function OverviewRedirect() {
   const { search, hash } = useLocation();
   return <Navigate to={{ pathname: "/dashboard", search, hash }} replace />;
 }
@@ -108,9 +108,9 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin", element: <Navigate to="/admin/users" replace />, guard: "public" },
   // Authenticated app.
   { path: "/dashboard", element: <OverviewNext />, guard: "protected" },
-  // PRD #3877 M1: the old page remains one click away during the bounded soak.
-  { path: "/overview/classic", element: <Dashboard />, guard: "protected" },
-  { path: "/overview/next", element: <OverviewNextRedirect />, guard: "protected" },
+  // PRD #3877 M2: the old page is retired; its URL keeps working as a redirect.
+  { path: "/overview/classic", element: <OverviewRedirect />, guard: "protected" },
+  { path: "/overview/next", element: <OverviewRedirect />, guard: "protected" },
   { path: "/settings", element: <Settings />, guard: "protected" },
   // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
   { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },

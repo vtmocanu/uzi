@@ -96,3 +96,33 @@ func TestCodexPinContentAndRender(t *testing.T) {
 		t.Error("Codex pin leaked into Claude Markdown")
 	}
 }
+
+func TestEffortForHarness(t *testing.T) {
+	cases := []struct {
+		name                   string
+		harness, claude, codex string
+		want                   string
+	}{
+		{"claude family", "claude", "high", "low", "high"},
+		{"codex family", "codex", "high", "low", "low"},
+		{"claude ignores codex-only", "claude", "", "low", ""},
+		{"codex ignores claude-only", "codex", "high", "", ""},
+		{"all levels claude", "claude", "xhigh", "", "xhigh"},
+		{"all levels codex", "codex", "", "max", "max"},
+		{"runtime is not a pin", "claude", "runtime", "", ""},
+		{"wrong case", "claude", "High", "", ""},
+		{"padded", "codex", "", " high", ""},
+		{"trailing newline", "claude", "high\n", "", ""},
+		{"injection", "codex", "", "high; drop table", ""},
+		{"unknown level", "claude", "ultra", "", ""},
+		{"unknown harness", "gemini", "high", "high", ""},
+		{"empty harness", "", "high", "high", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffortForHarness(tc.harness, tc.claude, tc.codex); got != tc.want {
+				t.Fatalf("EffortForHarness(%q,%q,%q) = %q, want %q", tc.harness, tc.claude, tc.codex, got, tc.want)
+			}
+		})
+	}
+}

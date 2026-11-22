@@ -205,3 +205,42 @@ export function gitleaksStdinArgs(opts: { configPath: string; reportPath: string
     opts.reportPath,
   ];
 }
+
+/** The `ruleId` of a finding produced by the exact-key push scan (see GitCache.scanObjectsForLiterals).
+ *  A finding carries no matched bytes: only this id, a commit and a path that never contains a key form. */
+export const PROVIDER_KEY_RULE_ID = "uzi-provider-key";
+
+/** Incremental exact-literal matcher over a byte stream; see {@link literalMatcher}. */
+export interface LiteralMatcher {
+  /** Forget the carried tail: the next chunk starts a new object. */
+  reset(): void;
+  /** Feed the next chunk of the CURRENT object; true when any literal occurs in the bytes seen so far. */
+  push(chunk: Uint8Array): boolean;
+}
+
+/**
+ * Exact-substring matcher for the encoded forms of one secret (providerKeyForms). It is incremental:
+ * the last `maxFormLen - 1` bytes of each chunk are carried into the next, so a form split across a
+ * chunk boundary at ANY offset still matches, and `reset()` drops that tail between objects so bytes
+ * from the end of one object never join the start of the next. Pure and I/O-free; empty forms are
+ * ignored, and with no usable form `push` is always false.
+ */
+export function literalMatcher(forms: readonly string[]): LiteralMatcher {
+  const needles = [...new Set(forms)].filter((f) => f.length > 0).map((f) => Buffer.from(f, "utf8"));
+  const keep = needles.reduce((n, b) => Math.max(n, b.length), 0) - 1;
+  let tail: Buffer = Buffer.alloc(0);
+  return {
+    reset(): void {
+      tail = Buffer.alloc(0);
+    },
+    push(chunk: Uint8Array): boolean {
+      if (needles.length === 0) return false;
+      const fresh = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      const buf = tail.length > 0 ? Buffer.concat([tail, fresh]) : fresh;
+      for (const needle of needles) if (buf.includes(needle)) return true;
+      // Copy: the retained tail must not pin the (possibly large) source chunk.
+      tail = keep > 0 ? Buffer.from(buf.subarray(Math.max(0, buf.length - keep))) : Buffer.alloc(0);
+      return false;
+    },
+  };
+}

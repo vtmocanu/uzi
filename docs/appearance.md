@@ -49,16 +49,18 @@ font either; the files ship with the app.
 
 ## Sidebar icon animations
 
-**Sidebar icon animations** is off by default. Turn it on and each sidebar
-icon plays a small one-shot animation when you hover it, focus it with the
-keyboard, or click it. Nothing moves on its own, and the animation never
-plays when your OS asks for reduced motion. Like theme and typeface, the
-choice follows you across browsers and devices.
+**Sidebar icon animations** is on by default for new users and anyone who
+has not chosen a setting. Turn it off in Appearance if you prefer static
+icons; an existing explicit on or off choice stays saved. Each animated sidebar
+icon plays a small one-shot animation when you click it (or press Enter on
+it); hovering or focusing it alone plays nothing. Nothing moves on its own,
+and the animation never plays when your OS asks for reduced motion. Like
+theme and typeface, the choice follows you across browsers and devices.
 
 ## Use instance defaults
 
 **Use instance defaults** clears every personal choice above, so you go
 back to tracking whatever your admin has set instance-wide for mode, both
-theme slots, and typeface. Sidebar icon animations go back to off. See
+theme slots, and typeface. Sidebar icon animations go back to on. See
 [Admin settings](./admin-settings.md#default-appearance) for what an admin
 controls there.

@@ -97,12 +97,14 @@ export const KNOWN_TOOLS: string[] = [
 ];
 
 // renderSubagent mirrors the server renderer (fixed field order, inline
-// comma-separated tools, model/tools omitted when empty). Used for the live
-// preview; the server's /rendered output is the authoritative export.
+// comma-separated tools, model/tools/effort omitted when empty; the Claude effort
+// follows model, the Codex pins are never rendered). Used for the live preview;
+// the server's /rendered output is the authoritative export.
 export function renderSubagent(t: {
   name: string;
   description: string;
   model: string | null;
+  effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }): string {
@@ -111,6 +113,7 @@ export function renderSubagent(t: {
   s += `description: ${t.description}\n`;
   if (t.tools && t.tools.length > 0) s += `tools: ${t.tools.join(", ")}\n`;
   if (t.model) s += `model: ${t.model}\n`;
+  if (t.effort) s += `effort: ${t.effort}\n`;
   s += "---\n\n";
   s += t.prompt_body;
   return s;
@@ -226,18 +229,62 @@ export function isLeadTemplateName(name: string): boolean {
 }
 
 // templateModelDefaultLabel names what an unset pin resolves to: the lead uses
-// its harness's built-in default, any other template follows the lead's model.
+// its harness's built-in default, any other template follows the lead
+// ("Default · follows lead").
 export function templateModelDefaultLabel(name: string, harness: Harness = "claude"): string {
-  if (!isLeadTemplateName(name)) return "Default · lead's model";
+  if (!isLeadTemplateName(name)) return "Default · follows lead";
   return harness === "codex"
     ? `Default · built-in (${DEFAULT_CODEX_MODEL})`
     : "Default · SDK/account default (built-in)";
 }
 
-// templateModelsLabel is shared by the list and detail surfaces so both pins
-// and their harness-specific Default labels have one presentation.
-export function templateModelsLabel(t: Pick<AgentTemplate, "name" | "model" | "codex_model">): string {
-  return `Claude: ${t.model || templateModelDefaultLabel(t.name, "claude")} · Codex: ${t.codex_model || templateModelDefaultLabel(t.name, "codex")}`;
+// templateEffortDefaultLabel names what an unset effort pin resolves to: the
+// lead/orchestrator uses the built-in medium, any other template follows the
+// run's effort.
+export function templateEffortDefaultLabel(name: string): string {
+  return isLeadTemplateName(name) ? "Default · built-in (medium)" : "Default · follows the run's effort";
+}
+
+export interface TemplatePinValue {
+  value: string | null;
+  label: string;
+}
+
+export interface TemplatePinRow {
+  family: "Claude" | "Codex";
+  harness: Harness;
+  model: TemplatePinValue;
+  effort: TemplatePinValue;
+}
+
+// templatePinRows is the structured model/effort pin presentation: one row per
+// harness family with the stored value (or null) and the label to show. It
+// reads only the stored fields. collapsed is true only for a non-lead template
+// with all four pins empty, which callers render as one "both harnesses" row.
+export function templatePinRows(
+  t: Pick<AgentTemplate, "name" | "model" | "codex_model" | "effort" | "codex_effort">,
+): { collapsed: boolean; rows: TemplatePinRow[] } {
+  const pin = (v: string | null | undefined, fallback: string): TemplatePinValue => {
+    const value = v ? v : null;
+    return { value, label: value ?? fallback };
+  };
+  const effortDefault = templateEffortDefaultLabel(t.name);
+  const rows: TemplatePinRow[] = [
+    {
+      family: "Claude",
+      harness: "claude",
+      model: pin(t.model, templateModelDefaultLabel(t.name, "claude")),
+      effort: pin(t.effort, effortDefault),
+    },
+    {
+      family: "Codex",
+      harness: "codex",
+      model: pin(t.codex_model, templateModelDefaultLabel(t.name, "codex")),
+      effort: pin(t.codex_effort, effortDefault),
+    },
+  ];
+  const allEmpty = rows.every((r) => r.model.value === null && r.effort.value === null);
+  return { collapsed: !isLeadTemplateName(t.name) && allEmpty, rows };
 }
 
 // looseSecretWarning returns a warning string if the text looks like it might
@@ -252,18 +299,22 @@ export function looseSecretWarning(text: string): string {
   return "";
 }
 
-// TemplateContent is the five mutable columns the drift comparison reads —
+// TemplateContent is the seven mutable columns the drift comparison reads —
 // exactly the fields agenttmpl.Definition carries, minus the name, which is the
 // lookup key rather than content.
 export interface TemplateContent {
   description: string;
   model: string | null;
   codex_model: string | null;
+  // Per-harness reasoning-effort pins (PRD #3258). Optional for api/web rollout skew: a
+  // server that predates them omits the key, which reads as null.
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
 
-// driftedColumns names which of the five columns differ between the shipped
+// driftedColumns names which of the seven columns differ between the shipped
 // definition and a template's current values, in display order.
 //
 // IT IS THE ONLY CLIENT-SIDE COPY OF THESE RULES, and it lives here rather than
@@ -278,6 +329,8 @@ export function driftedColumns(shipped: TemplateContent, current: TemplateConten
   if (shipped.description !== current.description) out.push("description");
   if ((shipped.model ?? "") !== (current.model ?? "")) out.push("model");
   if ((shipped.codex_model ?? "") !== (current.codex_model ?? "")) out.push("codex model");
+  if ((shipped.effort ?? "") !== (current.effort ?? "")) out.push("effort");
+  if ((shipped.codex_effort ?? "") !== (current.codex_effort ?? "")) out.push("codex effort");
   const a = shipped.tools ?? [];
   const b = current.tools ?? [];
   if (a.length !== b.length || a.some((t, i) => t !== b[i])) out.push("tools");

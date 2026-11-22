@@ -131,6 +131,7 @@ func TestSemanticWorkerWritesUseWorkerLimiter(t *testing.T) {
 	// The in-place credential switch apply (issue #4201) returns a plaintext token and decrypts a
 	// credential per call, so it rides the same per-worker bucket.
 	want["/api/worker/runs/{id}/credential-switch/apply"] = false
+	want["/api/worker/runs/{id}/credential-switch/codex/preflight"] = false
 	budget := 0
 	for i, name := range limiterNames {
 		if name == limProposal {

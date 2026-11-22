@@ -25,7 +25,10 @@
  * that very enrollment_seq.
  */
 import { validFrozenHeldPolicy, type FrozenHeldPolicy } from "./frozen-held.js";
+import { redactStrings } from "./redact.js";
 import type { PrSummaryClaim, PrSummaryScopeNote, PrSummaryVerification } from "./signals.js";
+
+export { redactStrings };
 
 /** The intent document version. A reader of any other version refuses it (mismatch). */
 const PUBLICATION_INTENT_VERSION = 1;
@@ -188,10 +191,7 @@ function assertStorableStrings(value: unknown, where: string): void {
  */
 export function boundedPrSummaryJson(summary: unknown, redact: (text: string) => string, maxChars: number = MAX_SUMMARY_CHARS): string {
   if (typeof summary !== "object" || summary === null || Array.isArray(summary)) return "";
-  const scrub = (v: unknown): unknown => typeof v === "string" ? redact(v)
-    : Array.isArray(v) ? v.map(scrub)
-      : typeof v === "object" && v !== null ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrub(x)])) : v;
-  const work = scrub(summary) as Record<string, unknown>;
+  const work = redactStrings(summary, redact) as Record<string, unknown>;
   const fits = (): string | undefined => {
     const json = JSON.stringify(work);
     return json.length <= maxChars ? json : undefined;
@@ -285,7 +285,7 @@ function secretRemediation(value: unknown, where: string): PublicationSecretReme
   };
 }
 
-const FROZEN_HELD_KEYS = ["version", "blocked", "everKnown", "cleanTip", "flaggedCommits", "ciGlobs", "confirmedTip", "checkpointKey", "extraFloors"];
+const FROZEN_HELD_KEYS = ["version", "blocked", "everKnown", "cleanTip", "flaggedCommits", "ciGlobs", "confirmedTip", "checkpointKey", "extraFloors", "providerKeyScan"];
 
 function frozenHeld(value: unknown, where: string, owner: { kind: string; runId: string }): FrozenHeldPolicy {
   const o = object(value, where, FROZEN_HELD_KEYS, ["version", "blocked", "everKnown", "flaggedCommits", "ciGlobs", "extraFloors"]);
@@ -302,6 +302,7 @@ function frozenHeld(value: unknown, where: string, owner: { kind: string; runId:
     ...(o.confirmedTip !== undefined ? { confirmedTip: o.confirmedTip } : {}),
     ...(o.checkpointKey !== undefined ? { checkpointKey: o.checkpointKey } : {}),
     extraFloors: [...o.extraFloors],
+    ...(o.providerKeyScan === true ? { providerKeyScan: true as const } : {}),
   };
 }
 

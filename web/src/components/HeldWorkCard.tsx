@@ -1,7 +1,6 @@
-// The default Overview's Held work card (PRD #3880 M2): the owner's custody capacity and holds
-// as three always-present figures, with the same headline and tone as the classic page's custody
-// alert when custodyAlertView says there is something to say. It replaces CustodyBoardAlert on
-// the default page, so the alert's own request is gone: the holds arrive as a prop from
+// The Overview's Held work card (PRD #3880 M2): the owner's custody capacity and holds
+// as three always-present figures, with a headline and tone from custodyAlertView (lib/recovery.ts)
+// when it has something to say. It makes no request of its own: the holds arrive as a prop from
 // useOverviewData. A "Review held work" link appears only when a hold needs a decision.
 
 import { Link } from "react-router-dom";
@@ -54,7 +53,7 @@ export function HeldWorkCard({
   return (
     <Card>
       <section
-        // Same live regions as the Dashboard alert: blocked runs are an alert, the other visible
+        // Live regions: blocked runs are an alert, the other visible
         // states a status. With nothing to say there is no live region, only a labelled section.
         {...(view
           ? {

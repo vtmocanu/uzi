@@ -128,8 +128,32 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
       visited.add(c.id);
     }
     assert.deepEqual([...visited].sort(), LEAD_REQUEST_CASES.map((c) => c.id).sort());
-    assert.equal(LEAD_REQUEST_CASES.length, 36);
-    assert.equal(visited.size, 36, "all shared request cases exercised");
+    assert.equal(LEAD_REQUEST_CASES.length, 54);
+    assert.equal(visited.size, 54, "all shared request cases exercised");
+  });
+
+  it("a plan_phase model without model_source falls back to the implement source, not builtin", () => {
+    const config: ClaimConfig = {
+      default_model: "sonnet", default_model_source: "user_default", default_effort_source: "builtin",
+      plan_phase: { model: "opus" },
+    };
+    const r = resolveLeadRequest({ harness: "claude", phase: "plan", config });
+    assert.equal(r.model, "opus");
+    assert.equal(r.modelSource, "user_default");
+  });
+
+  it("a Codex config with plan_phase ignores it in the plan phase", () => {
+    const config: ClaimConfig = {
+      default_model: "gpt-6-astra", default_model_source: "user_default",
+      default_effort: "low", default_effort_source: "user_default",
+      plan_phase: { model: "opus", effort: "high", model_source: "user_planning_default", effort_source: "user_planning_default" },
+    };
+    const base = { harness: "codex" as const, config, providerDefaultModel: "gpt-6.1-sol" };
+    const plan = resolveLeadRequest({ ...base, phase: "plan" });
+    assert.deepEqual(plan, resolveLeadRequest({ ...base, phase: "implement" }));
+    assert.equal(plan.model, "gpt-6-astra");
+    assert.equal(plan.effort, "low");
+    assert.equal(plan.effortSource, "user_default");
   });
 
   it("a blank claim model falls back to the template (|| not ??), and nothing resolves to no model", () => {

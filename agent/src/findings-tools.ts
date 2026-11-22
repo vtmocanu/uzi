@@ -64,6 +64,8 @@ export interface FindingsToolsDeps {
    *  without it the finding would only reach the api, never the stream. */
   emit(msg: EmittedMessage): void;
   log: Logger;
+  /** The run's text redactor (provider key forms included); absent means identity. */
+  redactText?: (s: string) => string;
 }
 
 export interface FindingsToolHandlers {
@@ -82,17 +84,20 @@ export interface FindingsToolHandlers {
  *  (a thrown tool error could disrupt the turn). */
 export function makeFindingsToolHandlers(deps: FindingsToolsDeps): FindingsToolHandlers {
   const { client, runId, emit, log } = deps;
+  const redact = deps.redactText ?? ((s: string): string => s);
+  // Redact BEFORE clamping so a key straddling the cut cannot leave an unredacted prefix.
+  const field = (s: string, n: number): string => clampStr(redact(s), n);
   return {
     async reportIncidentalIssue(args) {
       try {
-        const title = clampStr(args.title ?? "", MAX_TITLE_LEN);
-        const description = clampStr(args.description ?? "", MAX_DESCRIPTION_LEN);
-        const location = clampStr(args.location ?? "", MAX_LOCATION_LEN);
+        const title = field(args.title ?? "", MAX_TITLE_LEN);
+        const description = field(args.description ?? "", MAX_DESCRIPTION_LEN);
+        const location = field(args.location ?? "", MAX_LOCATION_LEN);
         const labels = (args.labels ?? [])
           .slice(0, MAX_LABELS)
-          .map((l) => clampStr(String(l), MAX_LABEL_LEN))
+          .map((l) => field(String(l), MAX_LABEL_LEN))
           .filter((l) => l.length > 0);
-        const confidence = args.confidence ? clampStr(String(args.confidence), MAX_CONFIDENCE_LEN) : undefined;
+        const confidence = args.confidence ? field(String(args.confidence), MAX_CONFIDENCE_LEN) : undefined;
 
         const id = await client.reportFinding(runId, {
           title,

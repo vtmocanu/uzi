@@ -52,7 +52,20 @@ func frozenCheckpointCoordinates(run store.Run) (*CheckpointCoordinates, error) 
 // claimCheckpointRun owns a savepoint for each of three attempts. Lineage lock
 // contention or drift rolls back custody, enrollment and the claim together.
 // Exhaustion returns idle so another normal admission can try later.
+//
+// Issue #4602: an idle precheck runs first, on the caller's transaction and before any
+// savepoint. HasQueuedRunForUser tests exact top-level conjuncts of ClaimRun's target, so
+// false means ClaimRun would claim nothing at the precheck's statement snapshot; the poll is then idle without
+// planning or executing ClaimRun. Nothing is cached between polls, and a true result admits
+// nothing by itself: ClaimRun below remains the authoritative claim.
 func (s *Service) claimCheckpointRun(ctx context.Context, tx pgx.Tx, params store.ClaimRunParams) (store.Run, error) {
+	queued, err := store.New(tx).HasQueuedRunForUser(ctx, params.UserID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if !queued {
+		return store.Run{}, pgx.ErrNoRows
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		sp, err := tx.Begin(ctx)
 		if err != nil {
@@ -64,6 +77,9 @@ func (s *Service) claimCheckpointRun(ctx context.Context, tx pgx.Tx, params stor
 			return store.Run{}, err
 		}
 		run, err := q.ClaimRun(ctx, params)
+		if err == nil {
+			run, err = expireCodexSwitchOnFreshClaim(ctx, q, run)
+		}
 		if err == nil && run.Kind == "task" {
 			run.CheckpointCoordinates, err = q.EnrollCheckpointCoordinates(ctx, store.EnrollCheckpointCoordinatesParams{
 				RunID: run.ID, WorkerID: uuid.UUID(params.WorkerID.Bytes), Generation: run.ClaimGeneration,

@@ -397,6 +397,10 @@ services:
       # Empty = no override; otherwise a positive integer <= 2147483647.
       WORKER_GO_BUILD_PARALLELISM: ${WORKER_GO_BUILD_PARALLELISM:-}
       WORKER_GO_MAXPROCS: ${WORKER_GO_MAXPROCS:-}
+      # Optional per-run cache cap (issue #4576). Empty = the worker default (15 GiB
+      # ceiling, 0.5 fraction); the worker parses both leniently.
+      UZI_RUN_CACHE_CAP_MAX_BYTES: ${UZI_RUN_CACHE_CAP_MAX_BYTES:-}
+      UZI_RUN_CACHE_CAP_FRACTION: ${UZI_RUN_CACHE_CAP_FRACTION:-}
       # PRD #83 M2: the DinD sidecar socket the worker probes. Unset by DEFAULT (empty):
       # a plain `--profile agent` worker then does ONE fast probe of the default path and
       # NEVER blocks. When you run `--profile agent-docker`, SET this (to
@@ -478,7 +482,7 @@ services:
   #      (Decision 3) — not the socket mode — is the containment, so 0666 is acceptable.
   #   The loop re-applies 0666 so a `dind` restart (new socket inode) stays reachable.
   dind-init:
-    image: alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    image: alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
     profiles: ["agent-docker"]
     # Runs as root (default) — the chown/chmod of a root-owned volume needs it.
     # SECURITY (auditor LOW): `0711` on /run/dind is deliberate, not lax — others get

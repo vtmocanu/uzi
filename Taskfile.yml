@@ -1733,6 +1733,18 @@ tasks:
       # job enforces both without a workflow edit.
       - ./scripts/assert-worker-size-ceilings-render.sh
       - ./scripts/assert-ephemeral-lease-render.sh
+      # Also runs the per-run cache cap render check (issue #4576: workers.runCacheCapMaxBytes
+      # / runCacheCapFraction relayed verbatim as strings, typed values refused, compose
+      # passthrough), same no-workflow-edit wiring.
+      - ./scripts/assert-run-cache-cap-render.sh
+
+  render:run-cache-cap-check:
+    desc: assert the chart relays workers.runCacheCapMaxBytes/runCacheCapFraction verbatim as strings to the controller and refuses typed values
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-run-cache-cap-render.sh
 
   render:worker-size-ceilings-check:
     desc: assert the chart renders the api's worker size ceiling and quota env (exact floor, zero quota accepted, malformed ceilings refused) and the controller's cpu/memory ceilings
@@ -3104,6 +3116,9 @@ tasks:
       # issue #3644 (PRD #3831 8.1): host-driven proof that killing the namespace init stops a delayed config writer before the
       # successor's admission; it drives the Docker CLI against WORKER_UID_IMAGE (the image this lane tests).
       - cd agent && node --import tsx --test --test-timeout=300000 ../e2e/worker-uid/namespace-teardown-real.test.mts
+      # issue #4481 (m3): a SIGKILLed worker's delayed refusal producers cannot land before a successor's refusalReleaseGate says
+      # ineligible, and are gone after the container stops. The worker starts through the real entrypoint chain (tini, npm run start, tsx).
+      - cd agent && node --import tsx --test --test-timeout=300000 ../e2e/worker-uid/refusal-producer-teardown-real.test.mts
       - |
           if [ "${GITHUB_ACTIONS:-}" = true ]; then
             python3 -B e2e/worker-uid/calibration.py --image "${WORKER_UID_IMAGE:-wuid-2134-base:local}" --mode ci

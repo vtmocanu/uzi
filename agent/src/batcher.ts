@@ -432,7 +432,7 @@ export class MessageBatcher {
     this.generation = opts.generation ?? 0;
     this.transientTripMs = opts.transientTripMs ?? TRANSIENT_TRIP_MS;
     this.spillBufferBytes = opts.spillBufferBytes ?? 2 * 1024 * 1024;
-    this.usage = new UsageRecorder({ client, runId, claimGeneration: this.generation, log });
+    this.usage = new UsageRecorder({ client, runId, claimGeneration: this.generation, log, redactText: this.redactText });
   }
 
   /** The newest session-cumulative `modelUsage` reading as an old_cumulative map (see

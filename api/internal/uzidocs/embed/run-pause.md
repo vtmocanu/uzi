@@ -347,9 +347,13 @@ worker itself posts. Neither
 the old nor the new token is used again until you act.
 
 To continue, **Resume** it (`uzi run resume <id>`, or the run page's
-**Resume**). Resume re-resolves the token from the run's current choice, so the
-token you last set is the one the run spends; to pick a different one first,
-run `uzi run set-token <id> <label>`. Cancel works as always.
+**Resume**). On Claude, Resume re-resolves the token from the run's current
+choice; to pick a different one first, run `uzi run set-token <id> <label>`.
+Codex uses its database-committed binding when a new claim is admitted;
+set-token refuses the paused state (422), so it cannot select a replacement
+here. Neither credential executes while the switch outcome is unresolved.
+See [Codex switch and recovery limits](codex-credentials.md#switching-a-live-run).
+Cancel works as always.
 
 This is different from a held switch (`credential_switch_settling` then
 `credential_switch_unsettled`), which means the worker could **not prove its
@@ -359,6 +363,72 @@ lifts only on the worker's acknowledgement, a stale heartbeat, worker removal
 or re-registration, never on elapsed time. A worker without in-place switching
 keeps the release-and-reclaim path and does not produce this pause.
 Design: [ADR-4201](../adr/4201-in-place-credential-switch.md).
+
+## Held when the planning to implementation switch cannot be verified
+
+A Claude run that uses a [planning model or effort](./worker-model.md#planning-model-and-effort)
+switches to its own model and effort when you approve the plan. Before it
+sends the first implementation prompt, the worker checks what the runtime
+applied. If it cannot confirm the switch (the runtime kept the planning model,
+reported a different one, did not answer, or the configuration cannot be
+checked), the run parks `paused` with `hold_reason: phase_switch_unavailable`
+and does no implementation work. It never continues on the planning model.
+
+The run feed shows a line such as "Paused: the runtime kept the planning model
+X instead of switching to Y. Resume retries on a new claim; Cancel ends the
+run." The run page shows a **Planning switch unavailable: waiting for owner**
+panel with **Resume** and **Cancel**, the board shows an owner-hold badge, and
+the CLI prints a notice and a `HOLD` row (see [the CLI
+reference](./cli.md#waiting-for-a-state-uzi-run-wait)). `uzi run wait` stops on
+it by default. Nothing resumes this hold on a timer.
+
+- **Resume** (`uzi run resume <id>` or the run page) queues the run for a new
+  claim, whose phase follows the run's state. An approved run goes straight to
+  implementation and verifies the switch again. The hold can also be taken
+  during planning, before approval: then an unapproved run with a submitted plan
+  shows the plan gate again (a revise re-plans and verifies the switch again),
+  and one with no plan yet plans again. In every case it holds again if the cause
+  is still there. Change the cause first: set a supported worker model, or clear
+  the planning setting.
+- **Cancel** ends the run as usual. If you cancel while the worker has not yet
+  heard that the hold was recorded, the run still reports cancelled.
+- **The session and work are kept.** The approved plan, the session and the
+  retained work stay with the run for the resume; this is not a failure.
+- **A worker crash before the hold is recorded** is not this hold. It follows the
+  ordinary worker-lost route: the run is requeued within its budget, otherwise it
+  ends in `recovery_wait` or `failed`, as described in [Run
+  recovery](./run-recovery.md).
+
+If the worker cannot get the park confirmed, it keeps the quiesced run
+registered (so its heartbeats continue) and keeps retrying, reading ownership
+first, with no time limit of its own. It stops only on a definitive answer: the
+hold is recorded, the owner already resumed it, the plan was not approved (the
+hold is re-posted for the plan phase), the claim is gone, or an owner Cancel is
+confirmed. It also ends if the worker shuts down, or if the server parks the run
+first: ownership shows the run `paused` at this claim with another hold reason,
+with the claim kept. Then the flight ends without posting and the feed says "The
+server paused the run first (<reason>); this worker keeps the work." (No server
+path is known to produce this today.) The wall-clock limit's park releases the
+claim, so it ends as "This worker no longer holds the run…". The wall-clock
+sweep skips interactive runs and runs waiting for approval, so for those an
+unconfirmed hold is retried until shutdown, an owner Cancel or a claim change.
+
+If the worker shuts down or dies with the hold unapplied, its flight ends and it
+keeps its copy of the work.
+If the worker is still alive, its next heartbeat no longer lists the run, and
+the server treats it as missing from the snapshot. That handling applies only
+when the hold was not applied, so the run is still `running` or `awaiting_*`.
+It fires on the first heartbeat that omits the run once the run's last status
+change is older than the stale window plus one heartbeat interval. The run is
+requeued while it is under its requeue budget (`RUN_MAX_REQUEUES`). Over the cap
+it parks in `recovery_wait` with cause `worker_requeue_exhausted` when recovery
+evidence exists (a checkpoint tip, an available capture, a publication
+enrollment, or uncertain or unknown evidence), which is the usual case for a
+held run because it keeps its clone and custody. Only without evidence does it
+fail with "worker lost the execution; exceeded re-queue budget". If the hold was
+applied but never confirmed to the worker, the run is already `paused` on
+`phase_switch_unavailable` and stays held for you (Resume or Cancel). The
+stale-worker sweep applies only when the worker itself is gone.
 
 ## Not the same as a completion hold
 

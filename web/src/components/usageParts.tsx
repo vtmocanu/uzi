@@ -8,15 +8,21 @@ import type { RunOutcomes, SelfUsage } from "../lib/api";
 import { failOriginLabel } from "../lib/failOriginLabel";
 import type { aggregateDisclosure } from "../lib/costStatus";
 import { cx } from "./ui";
-import type { UsageWindow } from "./UsageCards";
+import { InfoTip } from "./InfoTip";
+import type { UsageWindow } from "../lib/usageByUser";
 
-// Presentation pieces shared by the classic Overview's UsageCard (UsageCards.tsx) and the
-// default Overview's OverviewUsageCard during the bounded #3877 soak.
+// Presentation pieces for the Overview's OverviewUsageCard.
 
-// Issue #4209: run counts and failure rates cover primary work; tokens and cost also include
-// helper runs. One literal for both Usage cards, rendered under the KPI grid.
+// Issues #4209 and #4577: the Runs count covers primary work; tokens and cost also include
+// helper runs. Shown in the info tip beside the Overview Usage card's title.
 export const USAGE_SCOPE_NOTE =
-  "Runs and failure rates count primary work: issues, tasks, prompts, jobs and self-improve. Cost and tokens also include helper runs (judge, cross-check, PR rework, CI fix).";
+  "Runs count primary work: issues, tasks, prompts, jobs and self-improve. Cost and tokens also include helper runs (judge, cross-check, PR rework, CI fix).";
+
+// Issue #4577: outcomes count every non-chat run kind, unlike the primary-only Runs count.
+// Run history does not list judge or cross_check runs, so their failures are explained here.
+// Shown in the info tip beside the failed-of-finished line.
+export const OUTCOME_SCOPE_NOTE =
+  "The Runs count covers primary work with recorded usage. Outcomes also include reworks, CI fixes, cross-checks and judge runs. Judge and cross-check failures show on their parent run.";
 
 // Issue #4209: run_count counts only primary work runs, so a helper-only user has
 // run_count 0 yet real spend. "Nothing recorded" is true only when tokens, cost, the
@@ -77,7 +83,7 @@ export function perPrText(count: number, cost: number, disclosure: ReturnType<ty
 // PRD #1293: outcomes use the selected window and failed / finished denominator.
 // Issue #1418: remove the needs_landing hatch because an aggregate cannot know
 // whether recoverable work was landed later. It is a descriptive note, not backlog.
-export function FailedRunsBlock({ outcomes, personal, framed = true }: { outcomes: RunOutcomes; personal: boolean; framed?: boolean }) {
+export function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes; personal: boolean }) {
   if (outcomes.finished === 0) return <p className="text-sm text-muted">No finished runs in this period.</p>;
   const segments = [
     { label: "completed", count: outcomes.completed, background: "rgb(var(--ok))" },
@@ -86,9 +92,12 @@ export function FailedRunsBlock({ outcomes, personal, framed = true }: { outcome
     { label: "failed", count: outcomes.failed, background: "rgb(var(--danger))" },
   ].filter((s) => s.count > 0);
   return (
-    <div className={cx(framed && "border-t border-edge pt-3", "space-y-2.5")}>
+    <div className="space-y-2.5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs">
-        <p className="text-muted"><span className="tabular-nums text-fg">{outcomes.failed.toLocaleString("en-US")}</span> failed of <span className="tabular-nums text-fg">{outcomes.finished.toLocaleString("en-US")}</span> finished runs</p>
+        <p className="flex items-center gap-1.5 text-muted">
+          <span><span className="tabular-nums text-fg">{outcomes.failed.toLocaleString("en-US")}</span> failed of <span className="tabular-nums text-fg">{outcomes.finished.toLocaleString("en-US")}</span> finished runs</span>
+          <InfoTip label="About run outcomes" tip={OUTCOME_SCOPE_NOTE} />
+        </p>
         {personal && <Link className="text-brand hover:underline" to="/runs/history?status=failed">Your failed runs →</Link>}
       </div>
       <div className="flex h-2 gap-0.5 overflow-hidden rounded" role="img" aria-label={"Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ")}>
@@ -108,61 +117,51 @@ export function FailedRunsBlock({ outcomes, personal, framed = true }: { outcome
   );
 }
 
-// "inline" is the classic Overview's one-line summary; "list" is the default page's top-3 rows
-// with a bar per cause and an "other causes" total.
-export function TopCauses({ outcomes, personal, variant = "inline" }: { outcomes: RunOutcomes; personal: boolean; variant?: "inline" | "list" }) {
+// The top-3 failure causes as rows with a bar per cause and an "other causes" total.
+export function TopCauses({ outcomes, personal }: { outcomes: RunOutcomes; personal: boolean }) {
   const causes = Object.entries(outcomes.fail_origins)
     .filter(([, count]) => count > 0)
     .sort(([a, ac], [b, bc]) => bc - ac || a.localeCompare(b));
   const hiddenCauses = Math.max(0, causes.length - 3);
-  if (variant === "list") {
-    if (outcomes.failed === 0 || causes.length === 0) {
-      return (
-        <div>
-          <h4 className="text-[13px] font-medium text-fg">Top causes</h4>
-          <p className="mt-2 text-xs text-muted">No failures in this period.</p>
-        </div>
-      );
-    }
-    const top = causes.slice(0, 3);
-    const max = top[0][1];
-    const otherTotal = causes.slice(3).reduce((sum, [, count]) => sum + count, 0);
-    const row = "grid grid-cols-[minmax(0,1fr)_84px_30px] items-center gap-x-2.5";
+  if (outcomes.failed === 0 || causes.length === 0) {
     return (
       <div>
         <h4 className="text-[13px] font-medium text-fg">Top causes</h4>
-        <ul className="mt-2.5 space-y-1.5 text-[13px]">
-          {top.map(([origin, count]) => {
-            const label = stripUnsafeChars(failOriginLabel(origin));
-            return (
-              <li key={origin} className={row}>
-                <span className="min-w-0 truncate text-fg" title={label}>{label}</span>
-                <span aria-hidden="true" className="h-[5px] overflow-hidden rounded-[3px] bg-raised">
-                  <span className="block h-full bg-danger/80" style={{ width: `${(count / max) * 100}%` }} />
-                </span>
-                <span className="text-right font-mono text-xs tabular-nums text-muted">{count.toLocaleString("en-US")}</span>
-              </li>
-            );
-          })}
-          {hiddenCauses > 0 && (
-            <li className={row}>
-              <span className="min-w-0 truncate text-muted">
-                {personal ? <Link className="text-brand hover:underline" to="/runs/history?status=failed">other causes</Link> : "other causes"}
-              </span>
-              <span aria-hidden="true" />
-              <span className="text-right font-mono text-xs tabular-nums text-muted">{otherTotal.toLocaleString("en-US")}</span>
-            </li>
-          )}
-        </ul>
+        <p className="mt-2 text-xs text-muted">No failures in this period.</p>
       </div>
     );
   }
-  if (outcomes.failed === 0 || causes.length === 0) return null;
+  const top = causes.slice(0, 3);
+  const max = top[0][1];
+  const otherTotal = causes.slice(3).reduce((sum, [, count]) => sum + count, 0);
+  const row = "grid grid-cols-[minmax(0,1fr)_84px_30px] items-center gap-x-2.5";
   return (
-    <p className="text-xs text-muted">
-      Top causes: {causes.slice(0, 3).map(([origin, count]) => `${stripUnsafeChars(failOriginLabel(origin))} ${count.toLocaleString("en-US")}`).join(" · ")}
-      {hiddenCauses > 0 && <>{" "}{personal ? <Link className="whitespace-nowrap text-brand hover:underline" to="/runs/history?status=failed">+{hiddenCauses} more</Link> : <span className="whitespace-nowrap">+{hiddenCauses} more</span>}</>}
-    </p>
+    <div>
+      <h4 className="text-[13px] font-medium text-fg">Top causes</h4>
+      <ul className="mt-2.5 space-y-1.5 text-[13px]">
+        {top.map(([origin, count]) => {
+          const label = stripUnsafeChars(failOriginLabel(origin));
+          return (
+            <li key={origin} className={row}>
+              <span className="min-w-0 truncate text-fg" title={label}>{label}</span>
+              <span aria-hidden="true" className="h-[5px] overflow-hidden rounded-[3px] bg-raised">
+                <span className="block h-full bg-danger/80" style={{ width: `${(count / max) * 100}%` }} />
+              </span>
+              <span className="text-right font-mono text-xs tabular-nums text-muted">{count.toLocaleString("en-US")}</span>
+            </li>
+          );
+        })}
+        {hiddenCauses > 0 && (
+          <li className={row}>
+            <span className="min-w-0 truncate text-muted">
+              {personal ? <Link className="text-brand hover:underline" to="/runs/history?status=failed">other causes</Link> : "other causes"}
+            </span>
+            <span aria-hidden="true" />
+            <span className="text-right font-mono text-xs tabular-nums text-muted">{otherTotal.toLocaleString("en-US")}</span>
+          </li>
+        )}
+      </ul>
+    </div>
   );
 }
 
@@ -239,32 +238,15 @@ export function WindowToggle({ value, onChange, className, steadyWidth }: { valu
   return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} steadyWidth={steadyWidth} />;
 }
 
-// Table cells for both per-user tables. "current" is the classic Overview's PerUserUsageTable
-// (unchanged markup); "preview" is the default Overview's By user table (PRD #3881), whose
-// first column names its row.
-type TableVariant = "current" | "preview";
-
-// `start` (preview only) left-aligns a column header or cell without making it a row header,
-// for the By user table's combined cost-share / Claude-Codex bar column.
-export function Th({ children, left, start, title, variant = "current" }: { children: ReactNode; left?: boolean; start?: boolean; title?: string; variant?: TableVariant }) {
-  if (variant === "preview") {
-    return (
-      <th
-        scope="col"
-        title={title}
-        className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left || start ? "text-left" : "text-right")}
-      >
-        {children}
-      </th>
-    );
-  }
+// Table cells for the Overview's By user table (PRD #3881), whose first column names its row.
+// `start` left-aligns a column header or cell without making it a row header, for the
+// table's combined cost-share / Claude-Codex bar column.
+export function Th({ children, left, start, title }: { children: ReactNode; left?: boolean; start?: boolean; title?: string }) {
   return (
     <th
+      scope="col"
       title={title}
-      className={
-        "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint " +
-        (left ? "text-left" : "text-right")
-      }
+      className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left || start ? "text-left" : "text-right")}
     >
       {children}
     </th>
@@ -276,34 +258,19 @@ export function Td({
   left,
   start,
   total,
-  cost,
   title,
-  variant = "current",
 }: {
   children?: ReactNode;
   left?: boolean;
   start?: boolean;
   total?: boolean;
-  cost?: boolean;
   title?: string;
-  variant?: TableVariant;
 }) {
-  if (variant === "preview") {
-    const cls = cx(
-      "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
-      left || start ? "text-left" : "text-right",
-      total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
-    );
-    if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;
-    return <td title={title} className={cls}>{children}</td>;
-  }
-  const cls = ["px-2.5 py-1.5"];
-  cls.push(left ? "text-left font-sans" : "text-right font-mono tabular-nums");
-  if (total) cls.push("font-semibold text-fg");
-  else cls.push(cost ? "text-brand" : left ? "text-fg" : "text-muted", "border-b border-edge/50");
-  return (
-    <td className={cls.join(" ")} title={title}>
-      {children}
-    </td>
+  const cls = cx(
+    "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
+    left || start ? "text-left" : "text-right",
+    total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
   );
+  if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;
+  return <td title={title} className={cls}>{children}</td>;
 }

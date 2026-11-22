@@ -16,7 +16,7 @@ import (
 
 func TestCrossCheckMilestonesScrubEscapedContent(t *testing.T) {
 	token := "glpat-" + "abcdefghijklmnopqrst"
-	raw := []byte(`[{"title":"` + "glpat-" + `\u0061bcdefghijklmnopqrst \u202e"}]`)
+	raw := []byte(`[{"id":"m1","title":"` + "glpat-" + `\u0061bcdefghijklmnopqrst \u202e"}]`)
 	candidate, err := workersvc.NormalizePlanCrossCheckCandidate(workersvc.PlanCrossCheckCandidate{Milestones: raw})
 	clean := candidate.Milestones
 	if err != nil {

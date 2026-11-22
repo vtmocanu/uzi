@@ -73,7 +73,9 @@ import {
   gitleaksArgs,
   gitleaksReportWellFormed,
   gitleaksStdinArgs,
+  literalMatcher,
   parseGitleaksReport,
+  PROVIDER_KEY_RULE_ID,
   scanIsTrustworthy,
   stripAnsiSgr,
   type SecretFinding,
@@ -206,7 +208,7 @@ const CODE_SHA = codePattern(/^[a-f0-9]{40}(?![\s\S])/);
 const CODE_UUID = codePattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
 const CODE_READER_KEY = codePattern(/^cross-check-[A-Za-z0-9_-]{1,128}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
 const CODE_MAX_READERS = 128;
-type LocalMetadataDirectory = "uzi-owed" | "uzi-code-snapshots";
+type LocalMetadataDirectory = "uzi-owed" | "uzi-code-snapshots" | "info/uzi-refusals";
 interface RecoveryPhysicalWarningScope {
   emitted: boolean;
 }
@@ -1094,6 +1096,9 @@ export interface GitCacheOptions {
   /** Test-only override of {@link MAX_OWED_CANDIDATES_PER_RUN} so the cap boundary is cheap to
    *  exercise. Production never passes it. */
   maxOwedCandidates?: number;
+  /** Test-only process identity for refusal admissions; defaults to {@link WORKER_PROCESS_NONCE}, so a
+   *  second cache with another value stands in for a different worker process. */
+  processNonce?: string;
   /** issue #2733 — test-only overrides of {@link CHECKPOINT_CHAIN_MAX_WRAPPERS} /
    *  {@link CHECKPOINT_CHAIN_MAX_DIFF_BYTES} so the bound-exhaustion refusals are cheap to exercise.
    *  Production never passes it. */
@@ -1238,7 +1243,9 @@ export type CheckpointScanUntrustedReason =
   | "deadline"
   | "too_many_merges"
   | "merge_diff_too_large"
-  | "scan_untrusted";
+  | "scan_untrusted"
+  /** The exact-key scan ({@link GitCache.scanObjectsForLiterals}) could not prove the range free of the run's provider key. */
+  | "provider_key_scan_untrusted";
 
 /** issue #1597 M2: the result of {@link GitCache.secretScanCheckpointRange}. */
 export interface CheckpointScanResult {
@@ -4257,7 +4264,9 @@ export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
       displacedSha?: string; divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" }
   | { kind: "not_updated"; reason: "ownership_unknown" | "preservation_failed" | "owed_limit" |
-      "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed" };
+      "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed";
+      /** issue #4481: the incoming head fetchAgentBranch refused at the owed cap (`owed_limit` only). */
+      refusedSha?: string };
 /** One validated read of a bare's owed metadata (see GitCache.readOwedMetadataUnderLock). */
 interface OwedMetadata {
   names: string[];
@@ -4315,10 +4324,119 @@ function preservationReason(cause: unknown): "owed_limit" | "preservation_failed
 /** Thrown under the bare lock by `pinOwedUnderLock` at {@link MAX_OWED_CANDIDATES_PER_RUN}; every
  *  pin-producing caller maps it to the `owed_limit` refusal rather than a generic failure. */
 class OwedCandidateLimitError extends Error {
-  constructor() {
+  /** `sealed`: a final seal covers this generation, so nothing was recorded. `alreadyLedgered`: the
+   *  refused head was in the refusal ledger before this refusal. Both are false when recording failed. */
+  constructor(readonly sha?: string, readonly sealed = false, readonly alreadyLedgered = false) {
     super("owed candidate limit reached");
     this.name = "OwedCandidateLimitError";
   }
+}
+
+/** issue #4481: a head refused at the owed cap is recorded under `<bare>/info/uzi-refusals/` (a directory
+ *  older workers never read) and kept alive under `refs/uzi-incoming/<run>/<generation>/`, so the failed
+ *  run can later release custody once every refused head is proven covered. */
+const REFUSAL_DIRECTORY = "info/uzi-refusals" as const;
+const REFUSAL_PATHS = ["P1", "P2", "P3", "P4", "P5", "P6", "P7"] as const;
+export type RefusalPath = (typeof REFUSAL_PATHS)[number];
+/** One random value per worker process: an admission written by another process is never trusted. */
+export const WORKER_PROCESS_NONCE = randomUUID();
+const REFUSAL_MAX_GENERATIONS = 1024;
+interface RefusalEntry { generation: number; sha: string; path: RefusalPath }
+interface RefusalLedger { runId: string; branch: string; barePath: string; entries: RefusalEntry[] }
+interface RefusalAdmission { runId: string; generation: number; branch: string; barePath: string; process: string }
+interface RefusalFinal { runId: string; generation: number; sourceSha: string; evidenceDigest: string; process: string }
+interface RefusalCleanup {
+  version: 1; runId: string; generation: number; branch: string; barePath: string; finalDigest: string;
+  stages: Array<{ ref: string; generation: number; tip: string }>;
+  /** Anchored in-progress-import stages (see {@link isRefusalImportRef}) the sealed cleanup removes first. They are
+   *  not part of `finalDigest`: the refused ref and ledger row that anchor each one carry the evidence. */
+  importStages: Array<{ ref: string; generation: number; tip: string }>;
+  ledgerEntries: Array<{ generation: number; sha: string }>;
+}
+interface RefusalStage { ref: string; generation: number; sha: string }
+export type RefusalReleaseGate =
+  | { kind: "none" }
+  | { kind: "eligible"; evidenceDigest: string }
+  | { kind: "ineligible"; reason: string };
+export type RefusalSealResult = "sealed" | "matches" | "mismatch" | "ineligible" | "none";
+const refusalKeys = (v: unknown, keys: string): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).sort().join(",") === keys;
+const refusalGeneration = (v: unknown, min: number): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= min;
+const refusalOid = (v: unknown): v is string => typeof v === "string" && OWED_OID.test(v);
+const refusalRun = (v: unknown): v is string => typeof v === "string" && OWED_RUN_ID.test(v);
+const refusalText = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 4096;
+const refusalProcess = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9-]{8,64}$/.test(v);
+const refusalDigest = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+/** Strict parsers: any deviation answers undefined, never throws, so a malformed record only makes the gate ineligible. */
+function parseRefusalLedger(v: unknown): RefusalLedger | undefined {
+  if (!refusalKeys(v, "barePath,branch,entries,runId,version") || v.version !== 1 || !refusalRun(v.runId) ||
+      !refusalText(v.branch) || !refusalText(v.barePath) || !Array.isArray(v.entries) ||
+      v.entries.length > MAX_OWED_CANDIDATES_PER_RUN) return undefined;
+  const seen = new Set<string>();
+  for (const e of v.entries as unknown[]) {
+    if (!refusalKeys(e, "generation,path,sha") || !refusalGeneration(e.generation, 0) || !refusalOid(e.sha) ||
+        !(REFUSAL_PATHS as readonly unknown[]).includes(e.path) || seen.has(`${e.generation}:${e.sha}`)) return undefined;
+    seen.add(`${e.generation}:${e.sha}`);
+  }
+  return { runId: v.runId, branch: v.branch, barePath: v.barePath, entries: v.entries as RefusalEntry[] };
+}
+function parseRefusalAdmission(v: unknown): RefusalAdmission | undefined {
+  if (!refusalKeys(v, "barePath,branch,generation,process,protocol,runId,version") || v.version !== 1 || v.protocol !== 1 ||
+      !refusalRun(v.runId) || !refusalGeneration(v.generation, 1) || !refusalText(v.branch) ||
+      !refusalText(v.barePath) || !refusalProcess(v.process)) return undefined;
+  return { runId: v.runId, generation: v.generation, branch: v.branch, barePath: v.barePath, process: v.process };
+}
+function parseRefusalFinal(v: unknown): RefusalFinal | undefined {
+  if (!refusalKeys(v, "evidenceDigest,generation,process,runId,sourceSha,version") || v.version !== 1 ||
+      !refusalRun(v.runId) || !refusalGeneration(v.generation, 1) || !refusalOid(v.sourceSha) ||
+      !refusalDigest(v.evidenceDigest) || !refusalProcess(v.process)) return undefined;
+  return { runId: v.runId, generation: v.generation, sourceSha: v.sourceSha, evidenceDigest: v.evidenceDigest, process: v.process };
+}
+function parseRefusalCleanup(v: unknown): RefusalCleanup | undefined {
+  if (!refusalKeys(v, "barePath,branch,finalDigest,generation,importStages,ledgerEntries,runId,stages,version") || v.version !== 1 ||
+      !refusalRun(v.runId) || !refusalGeneration(v.generation, 1) || !refusalText(v.branch) || !refusalText(v.barePath) ||
+      !refusalDigest(v.finalDigest) || !Array.isArray(v.stages) || !Array.isArray(v.importStages) || !Array.isArray(v.ledgerEntries) ||
+      v.stages.length > 256 || v.importStages.length > 256 || v.ledgerEntries.length > MAX_OWED_CANDIDATES_PER_RUN) return undefined;
+  for (const s of [...v.stages as unknown[], ...v.importStages as unknown[]]) {
+    if (!refusalKeys(s, "generation,ref,tip") || !refusalGeneration(s.generation, 0) || !refusalOid(s.tip) ||
+        !refusalText(s.ref)) return undefined;
+  }
+  for (const e of v.ledgerEntries as unknown[]) {
+    if (!refusalKeys(e, "generation,sha") || !refusalGeneration(e.generation, 0) || !refusalOid(e.sha)) return undefined;
+  }
+  return v as unknown as RefusalCleanup;
+}
+function refusalEvidenceDigest(entries: Array<{ generation: number; sha: string }>, stages: Array<{ ref: string; sha: string }>): string {
+  const lines = [...entries.map(e => `L ${e.generation} ${e.sha}`).sort(), ...stages.map(s => `S ${s.ref} ${s.sha}`).sort()];
+  return createHash("sha256").update(lines.join("\n")).digest("hex");
+}
+/** issue #4481: an in-progress import's private stage, `refs/uzi-incoming/<run>/<generation>/import-<process>-<uuid>`.
+ *  Only this exact leaf shape is ever treated as an import stage; any other leaf besides `refused-<sha>` is plain evidence. */
+const REFUSAL_IMPORT_LEAF = /^import-[A-Za-z0-9-]{8,64}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const refusalLeaf = (ref: string): string => ref.slice(ref.lastIndexOf("/") + 1);
+/** Bound on the process-local record of finished import producers (see GitCache.finishedImportStages). */
+const FINISHED_IMPORT_STAGE_LIMIT = 4096;
+/** The process nonce embedded in an import stage leaf `import-<nonce>-<uuid>`; the uuid is the last 36 characters. */
+const importLeafNonce = (ref: string): string => { const leaf = refusalLeaf(ref); return leaf.slice("import-".length, leaf.length - 37); };
+const isRefusalImportRef = (ref: string): boolean => REFUSAL_IMPORT_LEAF.test(refusalLeaf(ref));
+/** The generations named by `<prefix><run>-<generation>.json` files for exactly this run. */
+function refusalFileGenerations(names: string[], prefix: string, runId: string): number[] {
+  const pattern = new RegExp(`^${prefix}-${runId}-([1-9][0-9]*)\\.json$`);
+  const out: number[] = [];
+  for (const n of names) { const m = pattern.exec(n); if (m) out.push(Number(m[1])); }
+  return out;
+}
+const REFUSAL_TEMP_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Whether a leftover `.tmp-*` entry of `info/uzi-refusals` blocks `runId`. A refusal-directory writer names its
+ *  temp `.tmp-<runId>-<uuid>`; run ids may contain `-`, so the uuid is peeled off the END of the name. Only a temp
+ *  that is positively another run's (a valid run id plus a uuid) is ignored: this run's own temp, and any temp
+ *  without a recognisable run tag (including the untagged `.tmp-<uuid>` form), fails closed. */
+function refusalTempBlocks(name: string, runId: string): boolean {
+  if (!name.startsWith(".tmp-")) return false;
+  const uuidAt = name.length - 36;
+  if (uuidAt < 6 || name[uuidAt - 1] !== "-" || !REFUSAL_TEMP_UUID.test(name.slice(uuidAt))) return true;
+  const tag = name.slice(5, uuidAt - 1);
+  return tag === runId || !OWED_RUN_ID.test(tag);
 }
 
 export type InventoryReadCause =
@@ -5665,7 +5783,8 @@ export class GitCache {
     try {
       const out = await this.execScoped("git", withDir(bare, ["for-each-ref", "--count=1", "--format=%(refname)",
         `refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
-        `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-cross-check/${id}`]),
+        `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-incoming/${id}/`,
+        `refs/uzi-cross-check/${id}`]),
       { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
       return judgeRunRefListing({ code: 0, stdout: out.stdout, stderr: out.stderr });
     } catch (err) {
@@ -5719,7 +5838,7 @@ export class GitCache {
       const top = await dirAt(refsDir);
       if (top === "bad") return refuse;
       if (top === "dir") {
-        for (const family of ["uzi-owed", "uzi-recovery-episode", "uzi-recovery-pin", "uzi-coverage", "uzi-settle", "uzi-archive", "uzi-cross-check"]) {
+        for (const family of ["uzi-owed", "uzi-recovery-episode", "uzi-recovery-pin", "uzi-coverage", "uzi-settle", "uzi-archive", "uzi-incoming", "uzi-cross-check"]) {
           const famDir = path.join(refsDir, family);
           const fam = await dirAt(famDir);
           if (fam === "bad") return refuse;
@@ -5752,7 +5871,7 @@ export class GitCache {
       return refuse;
     }
     const prefixes = [`refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
-      `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`];
+      `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-incoming/${id}/`];
     const cross = `refs/uzi-cross-check/${id}`;
     for (const line of text.split("\n")) {
       if (prefixes.some(p => line.includes(p))) return refuse;
@@ -6079,6 +6198,20 @@ export class GitCache {
   private readonly managedBareAclObserveSeam: GitCacheOptions["managedBareAclObserve"];
   private readonly managedBareGetfaclBin: string;
   private readonly managedBareStatfsSeam: GitCacheOptions["managedBareStatfs"];
+  /** issue #4481: this cache's process identity for refusal admissions and seals. */
+  private readonly processNonce: string;
+  /** issue #4481: in-process fence, run id to the highest closed refusal generation. */
+  private readonly closedRefusalGenerations = new Map<string, number>();
+  /** issue #4481: runs whose refusal recording failed in this process; their gate and seal stay ineligible. */
+  private readonly refusalRecordingFailed = new Set<string>();
+  /** issue #4481: what the chokepoint reported per refused sha for one import's options object. */
+  private readonly refusalNotes = new WeakMap<object, Map<string, { sealed: boolean; alreadyLedgered: boolean }>>();
+  /** issue #4481: attributed import stages of fetchAgentBranch calls in flight in this process, from before their fetch
+   *  until the whole import returns. The refusal gate and cleanup plan treat any as an import in progress. */
+  private readonly liveImportStages = new Set<string>();
+  /** issue #4481: attributed import stages whose producing import returned (success or failure) in this process.
+   *  Bounded at {@link FINISHED_IMPORT_STAGE_LIMIT} by evicting the oldest; an evicted stage is simply unproven. */
+  private readonly finishedImportStages = new Set<string>();
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
   /** See {@link GitCacheOptions.wipCapture}; undefined in production. */
@@ -6117,6 +6250,7 @@ export class GitCache {
     this.restoreSyncSeam = opts.restoreDurability;
     this.checkpointPackBounds = opts.checkpointPackBounds ?? {};
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
+    this.processNonce = opts.processNonce ?? WORKER_PROCESS_NONCE;
     this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
     this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
     this.scratchProvisioner = opts.scratchProvisioner;
@@ -8924,6 +9058,8 @@ export class GitCache {
     };
     if (opts.checkpointImportMode === "milestone") await this.maskCheckpointCooperation(prepare);
     else await prepare();
+    // issue #4481: a closed refusal generation stages, pins and writes nothing.
+    if (this.refusalGenerationClosed(opts.context)) return { kind: "not_updated", reason: "ownership_unknown" };
     opts.checkpointStep?.("checkpoint_import_lock_wait");
     const authenticate = async (): Promise<boolean> => {
       this.checkCheckpointCooperation();
@@ -8942,25 +9078,87 @@ export class GitCache {
       }
       return true;
     };
-    const stage = `refs/uzi-incoming/${randomUUID()}`;
-    const acquireIncoming = async (): Promise<string> => {
+    // issue #4481: a positive generation attributes the stage to its run, so a refused head's stage survives
+    // as evidence; every other fetch keeps the flat name.
+    const stageGeneration = opts.context.generation;
+    const stage = stageGeneration !== null && Number.isSafeInteger(stageGeneration) && stageGeneration > 0
+      ? `refs/uzi-incoming/${opts.context.runId}/${stageGeneration}/import-${this.processNonce}-${randomUUID()}`
+      : `refs/uzi-incoming/${randomUUID()}`;
+    const attributedStage = stage.startsWith(`refs/uzi-incoming/${opts.context.runId}/`);
+    // issue #4481: set once this import's own CAS delete of its stage succeeded, so a stage this import deleted is
+    // not recorded as a finished producer. An import that never wrote its stage (closed while waiting, failed
+    // authentication or transport) is still recorded; that only spends a slot of the bounded record (fail closed).
+    let stageDeleted = false;
+    const deleteStage = async (oid: string): Promise<void> => {
+      await this.runGit(barePath, ["update-ref", "-d", stage, oid]);
+      stageDeleted = true;
+    };
+    /** The stage's oid by a raw exact-ref read, before any validation; undefined when it cannot be read. */
+    const rawStageOid = async (): Promise<string | undefined> => {
+      try {
+        const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", stage]);
+        const lines = out.split("\n").filter((line) => line.startsWith(stage + " "));
+        const oid = lines.length === 1 ? lines[0]!.slice(stage.length + 1) : undefined;
+        return oid !== undefined && OWED_OID.test(oid) ? oid : undefined;
+      } catch { return undefined; }
+    };
+    /** True when the ledger names `sha` but neither a refused ref nor an owed pin does: the stage is its sole anchor. */
+    const stageIsSoleAnchor = async (sha: string): Promise<boolean> => {
+      const runId = opts.context.runId;
+      const ledger = await this.readRefusalRecord(barePath, `refusals-${runId}.json`, parseRefusalLedger);
+      if (ledger.state === "invalid") return true;
+      if (ledger.state === "absent" || !ledger.value.entries.some((e) => e.sha === sha)) return false;
+      const refs = (await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+        `refs/uzi-incoming/${runId}/`, `refs/uzi-owed/${runId}/`])).split("\n").filter(Boolean);
+      return !refs.some((line) => {
+        const [ref, oid] = line.split(" ");
+        return oid === sha && (ref === `refs/uzi-owed/${runId}/${sha}` ||
+          (ref!.startsWith(`refs/uzi-incoming/${runId}/`) && refusalLeaf(ref!) === `refused-${sha}`));
+      });
+    };
+    /** One CAS attempt to drop this import's attributed stage after a throw between the fetch and promotion. A moved
+     *  stage fails the CAS and stays; an unreadable fetch result, a sole-anchor stage, a boundary abort and any cleanup
+     *  error leave the stage to the refusal evidence rules. Caller holds the bare lock. */
+    const dropFailedStage = async (expected: string | undefined, cause: unknown): Promise<void> => {
+      if (!attributedStage || expected === undefined || this.boundaryAbortError(cause)) return;
+      try {
+        if (await stageIsSoleAnchor(expected)) return;
+        await deleteStage(expected);
+      } catch { /* the original failure is the one reported */ }
+    };
+    const closedResult: TrackingUpdateResult = { kind: "not_updated", reason: "ownership_unknown" };
+    // undefined: the refusal generation closed while this import waited for the bare lock; nothing was written.
+    const acquireIncoming = async (): Promise<string | undefined> => {
       this.checkCheckpointCooperation();
+      if (this.refusalGenerationClosed(opts.context)) return undefined;
       opts.checkpointStep?.("checkpoint_import_transport");
+      if (attributedStage) this.liveImportStages.add(stage);
       // Ordinary transport failures (including boundary aborts) deliberately throw.
       await this.runGit(barePath, [
         "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
         "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
       ]);
-      opts.checkpointStep?.("checkpoint_import_poststage");
-      const incoming = await this.resolveCommitStrict(barePath, stage);
-      await this.requireOwedCommit(barePath, incoming);
-      if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
-        throw new Error("checkpoint candidate changed during acquisition");
+      const fetchedOid = attributedStage ? await rawStageOid() : undefined;
+      try {
+        opts.checkpointStep?.("checkpoint_import_poststage");
+        const incoming = await this.resolveCommitStrict(barePath, stage);
+        await this.requireOwedCommit(barePath, incoming);
+        if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
+          throw new Error("checkpoint candidate changed during acquisition");
+        }
+        this.checkCheckpointCooperation();
+        return incoming;
+      } catch (cause) {
+        await dropFailedStage(fetchedOid, cause);
+        throw cause;
       }
-      this.checkCheckpointCooperation();
-      return incoming;
     };
     const promoteIncoming = async (incoming: string, authenticated = true): Promise<TrackingUpdateResult> => {
+      if (this.refusalGenerationClosed(opts.context)) {
+        // Closed after the stage was fetched: drop only our own private stage, pin and promote nothing.
+        await deleteStage(incoming).catch(() => undefined);
+        return closedResult;
+      }
       // No observation survives an unlocked phase: preservation and CAS use current B custody.
       let observed = authenticated ? await this.observeTrackingUnderLock(barePath, branch) : undefined;
       if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
@@ -8978,14 +9176,24 @@ export class GitCache {
         // The producing fetch context proves only incoming, never the unknown shared head.
         result = await this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
           try {
-            await this.pinOwedUnderLock(opts.context, incoming);
+            await this.pinOwedUnderLock(opts.context, incoming, "P1");
             return { kind: "not_updated", reason: "ownership_unknown" };
           } catch (cause) {
             const abort = this.boundaryAbortError(cause);
             if (abort) throw abort;
+            this.noteRefusal(opts, cause);
             return { kind: "not_updated", reason: preservationReason(cause) };
           }
         });
+      }
+      // issue #4481: the incoming head's refusal is recorded before any soft-deadline return, so a refused stage
+      // that is kept is never left without its ledger row and refused ref. The chokepoint may have refused a
+      // different head (a displaced one), in which case no note exists for the incoming one.
+      let incomingNote: { sealed: boolean; alreadyLedgered: boolean } | undefined;
+      if (result.kind === "not_updated" && result.reason === "owed_limit") {
+        result = { ...result, refusedSha: incoming };
+        incomingNote = this.refusalNotes.get(opts)?.get(incoming);
+        if (!incomingNote) incomingNote = await this.maskCheckpointCooperation(() => this.recordRefusalUnderLock(opts.context, incoming, "P2"));
       }
       // Ownership has settled. A stop now retains the private stage rather than
       // moving a stall into optional anchor lookup or staging cleanup.
@@ -9000,12 +9208,22 @@ export class GitCache {
         // Delete it only after an independently verified durable anchor exists.
         try {
           if (result.kind === "updated" && await this.checkedTrackingSha(barePath, branch) === incoming) {
-            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            await deleteStage(incoming);
           } else if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
-            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            await deleteStage(incoming);
           } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
-            // At the cap the incoming head is deliberately unpreserved; the stopped clone is kept.
-            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            // issue #4481: at the cap the stage is the refused head's evidence and is kept. Only a duplicate
+            // of an already-ledgered head (the refusal ledger and its refused ref anchor it) is released.
+            // The incoming head was recorded above. A flat (unattributed) stage is no evidence of any run: it is
+            // deleted as before.
+            const note = incomingNote ?? { sealed: false, alreadyLedgered: false };
+            // An attributed duplicate is released only when its refused ref is verified at the incoming head;
+            // an absent, mismatched or unreadable ref (checkedRefSha throws) keeps the stage.
+            if (!attributedStage) await deleteStage(incoming);
+            else if (note.alreadyLedgered && !note.sealed &&
+              await this.checkedRefSha(barePath, `refs/uzi-incoming/${opts.context.runId}/${opts.context.generation}/refused-${incoming}`) === incoming) {
+              await deleteStage(incoming);
+            }
           }
         } catch (cause) {
           // An inconclusive owner with a successfully preserved incoming pin is
@@ -9029,8 +9247,11 @@ export class GitCache {
       // Canonical imports keep their single B section and need no source authority.
       return this.withLock(barePath, () => {
         const importBranch = async () => {
-          const authenticated = await authenticate();
-          return promoteIncoming(await acquireIncoming(), authenticated);
+          try {
+            const authenticated = await authenticate();
+            const incoming = await acquireIncoming();
+            return incoming === undefined ? closedResult : await promoteIncoming(incoming, authenticated);
+          } finally { this.finishImportStage(stage, attributedStage && !stageDeleted); }
         };
         return opts.checkpointImportMode === "milestone"
           ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -9048,14 +9269,23 @@ export class GitCache {
     // HOME on this refusal; no imported incoming pin is claimed on this path.
     if (!authenticated) return { kind: "not_updated", reason: "ownership_unknown" };
     const importBranch = async () => {
-      const incoming = await this.withLock(barePath, acquireIncoming);
-      return withSourceAuthority(() => this.withLock(barePath, async () => {
-        const authenticated = await authenticate();
-        if (await this.resolveCommitStrict(barePath, stage) !== incoming)
-          throw new Error("checkpoint private stage changed before promotion");
-        await this.requireOwedCommit(barePath, incoming);
-        return promoteIncoming(incoming, authenticated);
-      }));
+      try {
+        const incoming = await this.withLock(barePath, acquireIncoming);
+        if (incoming === undefined) return closedResult;
+        return await withSourceAuthority(() => this.withLock(barePath, async () => {
+          const authenticated = await authenticate();
+          try {
+            if (await this.resolveCommitStrict(barePath, stage) !== incoming)
+              throw new Error("checkpoint private stage changed before promotion");
+            await this.requireOwedCommit(barePath, incoming);
+          } catch (cause) {
+            // The expected oid is the acquired incoming: a stage that moved fails the CAS and is retained.
+            await dropFailedStage(incoming, cause);
+            throw cause;
+          }
+          return promoteIncoming(incoming, authenticated);
+        }));
+      } finally { this.finishImportStage(stage, attributedStage && !stageDeleted); }
     };
     return opts.checkpointImportMode === "milestone"
       ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -9120,7 +9350,7 @@ export class GitCache {
       if (!observed.sha) continue;
       if (observed.owner?.runId === opts.context.runId &&
           !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha))) {
-        await this.pinOwedUnderLock(await this.producingContext(barePath, ancestorBranch, observed.owner), observed.sha);
+        await this.pinOwedUnderLock(await this.producingContext(barePath, ancestorBranch, observed.owner), observed.sha, "P4");
       }
       conflicts.push({ candidate, sha: observed.sha, branch: ancestorBranch });
     }
@@ -9226,9 +9456,12 @@ export class GitCache {
     await this.validateOwedContext(barePath, branch, opts.context);
     this.validateConfirmedSha(opts.remotelyConfirmedSha);
     await this.requireOwedCommit(barePath, sha);
+    // issue #4481: a closed refusal generation moves, pins and records nothing.
+    if (this.refusalGenerationClosed(opts.context)) return { kind: "not_updated", reason: "ownership_unknown" };
     opts.checkpointStep?.("checkpoint_lock_wait");
     return this.withLock(barePath, async () => {
       opts.checkpointStep?.("checkpoint_bridge");
+      if (this.refusalGenerationClosed(opts.context)) return { kind: "not_updated", reason: "ownership_unknown" };
       if ((await this.readRecoveryCapture(barePath, branch))?.remediationRecovery)
         throw new Error("remediation tracking rebind requires proof");
       let observed = await this.observeTrackingUnderLock(barePath, branch);
@@ -9276,9 +9509,12 @@ export class GitCache {
     await this.validateOwedContext(barePath, branch, c);
     this.validateConfirmedSha(opts.remotelyConfirmedSha);
     await this.requireOwedCommit(barePath, candidateSha);
+    // issue #4481: a closed refusal generation moves, pins and records nothing.
+    if (this.refusalGenerationClosed(c)) return { kind: "not_updated", reason: "ownership_unknown" };
     opts.checkpointStep?.("checkpoint_lock_wait");
     return this.withLock(barePath, async () => {
       opts.checkpointStep?.("checkpoint_bridge");
+      if (this.refusalGenerationClosed(c)) return { kind: "not_updated", reason: "ownership_unknown" };
       const read = () => this.readRemediationUnderLock(barePath, branch, source, {}, "runtime-restrictions");
       const record = await read();
       if (!record) throw new Error("remediation transformation requires enrollment");
@@ -9318,7 +9554,7 @@ export class GitCache {
       const result = await this.maskCheckpointCooperation(async () => {
         // Preserve S independently even when a remote confirmation covers it. Promotion
         // receives no producingSource, so it cannot rewrite the remediation journal.
-        await this.pinOwedUnderLock(c, record.ownedTip);
+        await this.pinOwedUnderLock(c, record.ownedTip, "P5");
         const promoted = await this.promoteTrackingUnderLock(barePath, branch, candidateSha, observed,
           { ...opts, checkpointStep: undefined });
         if (promoted.kind === "not_updated") return promoted;
@@ -12934,7 +13170,9 @@ export class GitCache {
           projected = parseRemediationRecovery(closed);
           const tracking = await this.committedTrackingOwnershipUnderLock(barePath, branch, expected.runId, remediation.ownedTip);
           if (tracking.kind !== "owned") throw new Error("remediation marker tracking changed");
-          await this.pinOwedUnderLock(tracking.context, executionTip!);
+          // issue #4481: a closed refusal generation pins nothing and records nothing.
+          if (this.refusalGenerationClosed(tracking.context)) throw new Error("remediation marker refusal generation closed");
+          await this.pinOwedUnderLock(tracking.context, executionTip!, "P6");
           if (!await this.hasOwedAnchorUnderLock(barePath, expected.runId, executionTip!))
             throw new Error("remediation marker anchor unavailable");
         }
@@ -19768,7 +20006,9 @@ export class GitCache {
   async secretScanCheckpointRange(
     barePath: string,
     range: CheckpointRange,
-    opts: { deadlineMs?: number } = {},
+    /** `literals` is REQUIRED: the encoded forms of the run's bound provider key, `[]` for a vendor run
+     *  (no extra git work). A caller that has no claim passes `[]` only under a policy that fails closed. */
+    opts: { deadlineMs?: number; literals: readonly string[] },
   ): Promise<CheckpointScanResult> {
     const label = "checkpoint secret scan";
     const untrusted = (reason: CheckpointScanUntrustedReason, fields: Record<string, unknown> = {}): CheckpointScanResult => {
@@ -19786,6 +20026,20 @@ export class GitCache {
     const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
     const remaining = (): number => deadlineAt - Date.now();
     const revs = [range.tipSha, `^${range.excludeSha}`, ...floors.map((f) => `^${f}`)];
+
+    // 0. The exact-key scan, over the same revisions and BEFORE the size pre-check and the
+    // zero-textual-commit early return below: an empty commit's message, a filename, a binary
+    // blob or a merge result carries the key without a gitleaks-countable hunk. The scan excludes
+    // only the pack's own exclusions, not the scan floors: `packExcludeShas` for a zero range (the
+    // tip's parents, see zeroRangePackExcludes), else `excludeSha`, so the scanned objects stay a
+    // superset of what the pinned pack (checkpointPack) carries.
+    if (opts.literals.length > 0) {
+      const key = await this.scanObjectsForLiterals(
+        barePath, { tip: range.tipSha, excludes: range.packExcludeShas ?? [range.excludeSha] }, opts.literals, { deadlineMs: remaining() },
+      );
+      if (!key.trusted) return untrusted("provider_key_scan_untrusted", { why: key.reason });
+      if (key.findings.length > 0) return { trusted: true, findings: key.findings };
+    }
 
     // 1. Size pre-check (bounded buffers; any failure is untrusted).
     const size = await this.checkpointRangeSize(barePath, revs, remaining).catch((err: unknown) => ({
@@ -19849,6 +20103,165 @@ export class GitCache {
       return untrusted("scan_untrusted", { error: gitErrorMessage(err) });
     } finally {
       await this.removeBestEffort(scratch, "scan-scratch");
+    }
+  }
+
+  /**
+   * Exact-literal scan of every object a publication of `range.tip` would carry: the objects of
+   * `rev-list --objects tip --not excludes` (plus, with `excludeRemoteTracking`, everything reachable
+   * from `refs/remotes/origin/*`), read whole (commits, trees and blobs, so messages, filenames,
+   * binary files and merge results are all covered) and searched for any of `literals` (the encoded
+   * forms of the run's bound provider key; gitleaks cannot detect a prefixless key).
+   *
+   * Empty `literals` is clean and spawns NO git child. Otherwise: the listing (capped at
+   * CHECKPOINT_SCAN_MAX_OBJECTS), a `cat-file --batch-check` size total (capped at
+   * CHECKPOINT_SCAN_MAX_TOTAL_BYTES) and a streamed `cat-file --batch` read, all under one deadline.
+   * Any failure, cap or deadline is `trusted: false` (the caller must not publish); only a boundary
+   * abort propagates, as everywhere on the checkpoint path. A finding carries the commit that
+   * introduced the object (the commit itself for a commit hit; `log --find-object` for a blob or
+   * tree, else the tip) and a path with no key form in it; no matched byte is ever returned or logged.
+   * Takes NO bare lock (the publication guards call it while holding it).
+   */
+  async scanObjectsForLiterals(
+    barePath: string,
+    range: { tip: string; excludes: readonly string[]; excludeRemoteTracking?: boolean },
+    literals: readonly string[],
+    opts: { deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number } } = {},
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
+    const usable = literals.filter((l) => l.length > 0);
+    if (usable.length === 0) return { trusted: true, findings: [] };
+    const untrusted = (reason: string): { trusted: false; reason: string } => {
+      this.log.warn("provider key scan: untrusted, not publishing", { barePath, reason });
+      return { trusted: false, reason };
+    };
+    if (!SHA40_RE.test(range.tip) || range.excludes.some((x) => !SHA40_RE.test(x))) return untrusted("range_invalid");
+    const maxObjects = opts.caps?.maxObjects ?? CHECKPOINT_SCAN_MAX_OBJECTS;
+    const maxTotal = opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES;
+    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => deadlineAt - Date.now();
+    const hasKeyForm = (s: string): boolean => usable.some((l) => s.includes(l));
+    let producer: { stdout: Readable; exited: Promise<number>; cancel: () => void } | undefined;
+    try {
+      this.checkCheckpointCooperation();
+      const revs = [range.tip, "--not", ...range.excludes, ...(range.excludeRemoteTracking ? ["--remotes=origin"] : []), "--"];
+      const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--objects", ...revs]), {
+        env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (maxObjects + 1) * 4096,
+      });
+      const oids: string[] = [];
+      const paths = new Map<string, string>();
+      for (const line of listing.stdout.split("\n")) {
+        const m = /^([0-9a-f]{40})(?: (.*))?$/.exec(line);
+        if (!m) continue; // a path containing a newline leaves a non-oid tail: never an object id
+        oids.push(m[1]!);
+        if (m[2]) paths.set(m[1]!, m[2]);
+      }
+      if (oids.length > maxObjects) return untrusted("too_many_objects");
+      if (oids.length === 0) return { trusted: true, findings: [] };
+      const input = oids.join("\n") + "\n";
+
+      this.checkCheckpointCooperation();
+      const sizes = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "cat-file", "--batch-check"]), {
+        env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: oids.length * 128 + 4096, input,
+      });
+      const rows = sizes.stdout.split("\n");
+      if (rows.pop() !== "" || rows.length !== oids.length) return untrusted("size_check_failed");
+      let total = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const m = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(rows[i]!);
+        if (!m || m[1] !== oids[i]) return untrusted("size_check_failed");
+        total += Number(m[3]);
+        if (total > maxTotal) return untrusted("scan_too_large");
+      }
+
+      this.checkCheckpointCooperation();
+      const spawned = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"], input, {
+        timeoutMs: Math.max(1, remaining()), stdoutCategory: "artifactBytes", stderrMaxBytes: 4096, cancelOnAbandon: true,
+      });
+      producer = spawned;
+      const matcher = literalMatcher(usable);
+      const hits: Array<{ oid: string; type: string }> = [];
+      // Frame parser for `cat-file --batch`: "<oid> <type> <size>\n" + <size> bytes + "\n", per object.
+      let mode: "header" | "body" | "lf" = "header";
+      let header = Buffer.alloc(0);
+      let pending: { oid: string; type: string; left: number; hit: boolean } | undefined;
+      let sawObjects = 0;
+      let garbled = false;
+      scan: for await (const raw of spawned.stdout) {
+        this.checkCheckpointCooperation();
+        if (remaining() <= 0) { producer.cancel(); producer.stdout.destroy(); await producer.exited; return untrusted("deadline"); }
+        let chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+        while (chunk.length > 0) {
+          if (mode === "header") {
+            const nl = chunk.indexOf(0x0a);
+            if (nl < 0) {
+              header = Buffer.concat([header, chunk]);
+              if (header.length > 256) { garbled = true; break scan; }
+              break;
+            }
+            header = Buffer.concat([header, chunk.subarray(0, nl)]);
+            chunk = chunk.subarray(nl + 1);
+            const m = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(header.toString("latin1"));
+            header = Buffer.alloc(0);
+            if (!m || m[1] !== oids[sawObjects]) { garbled = true; break scan; }
+            pending = { oid: m[1]!, type: m[2]!, left: Number(m[3]), hit: false };
+            matcher.reset();
+            sawObjects++;
+            mode = pending.left > 0 ? "body" : "lf";
+          } else if (mode === "body") {
+            const body = chunk.subarray(0, Math.min(pending!.left, chunk.length));
+            if (!pending!.hit && matcher.push(body)) pending!.hit = true;
+            pending!.left -= body.length;
+            chunk = chunk.subarray(body.length);
+            if (pending!.left === 0) mode = "lf";
+          } else {
+            if (chunk[0] !== 0x0a) { garbled = true; break scan; }
+            chunk = chunk.subarray(1);
+            if (pending!.hit) hits.push({ oid: pending!.oid, type: pending!.type });
+            pending = undefined;
+            mode = "header";
+          }
+        }
+        if (hits.length >= 16) break;
+      }
+      if (hits.length >= 16) {
+        producer.cancel(); producer.stdout.destroy(); await producer.exited;
+      } else {
+        const code = await producer.exited;
+        if (garbled || code !== 0 || mode !== "header" || header.length > 0 || sawObjects !== oids.length) {
+          return untrusted("read_failed");
+        }
+      }
+      if (hits.length === 0) return { trusted: true, findings: [] };
+
+      const findings: SecretFinding[] = [];
+      for (const hit of hits) {
+        let commit = hit.type === "commit" ? hit.oid : range.tip;
+        // Attribution is best effort and bounded by the scan deadline: once it is spent the finding names the tip.
+        const attributionLeftMs = remaining();
+        if (hit.type !== "commit" && attributionLeftMs > 0) {
+          try {
+            const log = await this.execScoped("git", withDir(barePath, [
+              "--no-replace-objects", "log", "-m", "--reverse", "--format=%H", `--find-object=${hit.oid}`, ...revs,
+            ]), { env: gitEnv(), timeout: attributionLeftMs, maxBuffer: 1024 * 1024 });
+            const first = log.stdout.split("\n").find((l) => SHA40_RE.test(l.trim()));
+            if (first) commit = first.trim();
+          } catch (err) {
+            const abort = this.boundaryAbortError(err);
+            if (abort) throw abort;
+          }
+        }
+        const path = paths.get(hit.oid) ?? "";
+        findings.push({
+          file: hasKeyForm(path) ? "[path withheld]" : path, startLine: 0, commit, ruleId: PROVIDER_KEY_RULE_ID,
+        });
+      }
+      return { trusted: true, findings };
+    } catch (err) {
+      if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited.catch(() => -1); }
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
+      return untrusted(`scan_failed`);
     }
   }
 
@@ -29212,7 +29625,8 @@ try {
     const dir = this.owedDirectory(barePath, directoryName);
     try {
       await fs.mkdir(dir, { mode: 0o700 });
-      const parent = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      // A nested name (info/uzi-refusals) never creates its parent: a missing info/ fails closed here.
+      const parent = await fs.open(path.dirname(dir), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
       try { await parent.sync(); } finally { await parent.close(); }
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
@@ -29283,9 +29697,16 @@ try {
   }
 
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
-  private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<void> {
+  private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed",
+    runId?: string): Promise<void> {
+    if (directoryName === REFUSAL_DIRECTORY && (typeof runId !== "string" || !OWED_RUN_ID.test(runId))) {
+      throw new Error("refusal metadata writes need a valid run id");
+    }
     const dir = await this.ensureOwedDirectory(barePath, directoryName);
-    const temp = path.join(dir, `.tmp-${randomUUID()}`);
+    // issue #4481: a refusal-directory temp carries its run, so a stranded temp of one run never blocks another;
+    // the uzi-owed validator accepts only `.tmp-<uuid>`, so that directory keeps the untagged name.
+    const temp = path.join(dir, directoryName === REFUSAL_DIRECTORY
+      ? `.tmp-${runId}-${randomUUID()}` : `.tmp-${randomUUID()}`);
     const file = await fs.open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT |
       fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
     try {
@@ -29356,15 +29777,32 @@ try {
 
   /** Caller MUST hold the bare lock: the count-then-pin below is only atomic under it. Every
    *  pin-producing path (fetchAgentBranch, promoteTrackingUnderLock, clearConflictingAncestorTrackingRefs,
-   *  retainCurrentOwedCandidate) funnels through here. The check precedes every write, so a refusal
-   *  leaves the existing pins, metadata and refs untouched. */
-  private async pinOwedUnderLock(c: StoredOwedContext, sha: string): Promise<void> {
+   *  retainCurrentOwedCandidate) funnels through here. At the cap a NEW pin is refused with
+   *  OwedCandidateLimitError after the refusal evidence is recorded (recordRefusalUnderLock); no pin, candidate
+   *  record or context is written, and the existing pins and refs are left untouched. */
+  private async pinOwedUnderLock(c: StoredOwedContext, sha: string, refusalPath: RefusalPath): Promise<void> {
     await this.assertBareClear(c.barePath, "owed-pin");
     await this.requireOwedCommit(c.barePath, sha);
     const ref = `refs/uzi-owed/${c.runId}/${sha}`;
     const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${c.runId}/`]))
       .split("\n").filter(Boolean).map((line) => line.split(" ")[0]!);
-    if (!held.includes(ref) && held.length >= this.maxOwedCandidates) throw new OwedCandidateLimitError();
+    if (!held.includes(ref) && held.length >= this.maxOwedCandidates) {
+      // issue #4481: the refusal is recorded (or deliberately not, once sealed) before it is thrown; a
+      // recording failure never changes what is thrown and claims nothing.
+      const outcome = await this.recordRefusalUnderLock(c, sha, refusalPath);
+      throw new OwedCandidateLimitError(sha, outcome.sealed, outcome.alreadyLedgered);
+    }
+    // issue #4481: the pin that fills the cap is preceded by the durable owed-path marker, so a restarted
+    // process can tell that this generation once stood at the cap even when every other record is lost. A
+    // failed write refuses the pin as a generic preservation failure, never as the cap.
+    if (!held.includes(ref) && held.length + 1 >= this.maxOwedCandidates) {
+      try { await this.ensureOwedPathMarker(c); }
+      catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        throw new Error("owed path marker write failed", { cause });
+      }
+    }
     await this.persistOwedContext(c); // Durable discovery precedes the first pin.
     const context = this.contextName(c);
     const name = `candidate-${c.runId}-${sha}-${context.slice(8, -5)}.json`;
@@ -29374,6 +29812,554 @@ try {
     if (old === undefined) await this.writeOwedFile(c.barePath, name, record);
     await this.runGit(c.barePath, ["update-ref", ref, sha]);
     if (await this.checkedRefSha(c.barePath, ref) !== sha) throw new Error("owed pin readback mismatch");
+  }
+
+  // ---- issue #4481: refusal ledger, release gate, seal and cleanup -------------------------------------
+
+  private refusalGenerationClosed(c: { runId: string; generation: number | null }): boolean {
+    const closed = this.closedRefusalGenerations.get(c.runId);
+    return closed !== undefined && (c.generation ?? 0) <= closed;
+  }
+
+  /** In-process fence: after this, imports and tracking updates of `runId` at `generation` or below
+   *  refuse before any stage, pin or ref write. retainCurrentOwedCandidate is fenced by the seal of the generation
+   *  it would pin (a FINAL file), not by this fence. */
+  closeRefusalGeneration(runId: string, generation: number): void {
+    if (!refusalRun(runId) || !refusalGeneration(generation, 1)) throw new Error("invalid refusal generation");
+    this.closedRefusalGenerations.set(runId, Math.max(this.closedRefusalGenerations.get(runId) ?? 0, generation));
+  }
+
+  private noteRefusal(opts: object, cause: unknown): void {
+    if (!(cause instanceof OwedCandidateLimitError) || cause.sha === undefined) return;
+    let notes = this.refusalNotes.get(opts);
+    if (!notes) this.refusalNotes.set(opts, notes = new Map());
+    notes.set(cause.sha, { sealed: cause.sealed, alreadyLedgered: cause.alreadyLedgered });
+  }
+
+  /** Sorted names in `info/uzi-refusals`; an absent directory is empty, an unsafe or oversized one throws. */
+  private async refusalNames(barePath: string): Promise<string[]> {
+    const dir = this.owedDirectory(barePath, REFUSAL_DIRECTORY);
+    let names: string[];
+    try {
+      const st = await fs.lstat(dir);
+      if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
+        throw new Error("unsafe refusal metadata directory");
+      }
+      names = await fs.readdir(dir);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw cause;
+    }
+    // Admission records are read by exact name (generations 1..G), never enumerated, so their number
+    // must not bound the listing every ordinary gate depends on.
+    names = names.filter((n) => !n.startsWith("admission-"));
+    if (names.length > 4096) throw new Error("refusal metadata entry budget");
+    return names.sort();
+  }
+
+  /** Every ref under `refs/uzi-incoming/<run>/`; a ref of any other shape is unattributable and throws. The
+   *  listing is only trusted when git says nothing on stderr, the ref backend is the files backend, and every
+   *  loose ref file under the run's directory is a plain 40-hex ref that the listing shows with the same oid
+   *  (so a broken, symbolic, symlinked or unlisted loose ref that git declined to list cannot hide evidence).
+   *  Callers map a throw to fail-closed (gate: ineligible, cleanup plan: retain). */
+  private async refusalStages(barePath: string, runId: string): Promise<RefusalStage[]> {
+    const { stdout, stderr } = await this.execScoped("git", withDir(barePath, ["for-each-ref",
+      "--format=%(refname) %(objectname)", `refs/uzi-incoming/${runId}/`]), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+    if (String(stderr ?? "") !== "") throw new Error("refusal stage listing wrote to stderr");
+    const pattern = new RegExp(`^(refs/uzi-incoming/${runId}/(0|[1-9][0-9]*)/[A-Za-z0-9._-]+) ([0-9a-f]{40})$`);
+    const stages = stdout.split("\n").filter(Boolean).map((line) => {
+      const m = pattern.exec(line);
+      if (!m) throw new Error("unattributed refusal stage ref");
+      return { ref: m[1]!, generation: Number(m[2]), sha: m[3]! };
+    });
+    await this.assertRefusalLooseRefs(barePath, runId, new Map(stages.map((s) => [s.ref, s.sha])));
+    return stages;
+  }
+
+  /** The files-backend check and a bounded, no-follow walk of `<bare>/refs/uzi-incoming/<run>/`. */
+  private async assertRefusalLooseRefs(barePath: string, runId: string, listed: Map<string, string>): Promise<void> {
+    const config = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      // Only an explicit `files`, compared exactly, is the files backend; an empty, valueless or other value is not.
+      if ((nl < 0 ? item : item.slice(0, nl)).toLowerCase() === "extensions.refstorage" &&
+          (nl < 0 ? undefined : item.slice(nl + 1)) !== "files") throw new Error("refusal stages: non-files ref backend");
+    }
+    try {
+      await fs.lstat(path.join(barePath, "reftable"));
+      throw new Error("refusal stages: non-files ref backend");
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+    }
+    const isDirectory = async (p: string): Promise<boolean> => {
+      try {
+        const st = await fs.lstat(p);
+        if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("refusal stages: unsafe ref directory");
+        return true;
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw cause;
+      }
+    };
+    const rootRef = `refs/uzi-incoming/${runId}`;
+    for (const ancestor of ["refs", "refs/uzi-incoming", rootRef]) {
+      if (!await isDirectory(path.join(barePath, ancestor))) return;
+    }
+    let entries = 0;
+    const walk = async (rel: string, depth: number): Promise<void> => {
+      if (depth > 3) throw new Error("refusal stages: loose ref tree too deep");
+      for (const name of await fs.readdir(path.join(barePath, rel))) {
+        if (++entries > 4096) throw new Error("refusal stages: loose ref entry budget");
+        const child = `${rel}/${name}`;
+        const full = path.join(barePath, child);
+        const st = await fs.lstat(full);
+        if (st.isSymbolicLink()) throw new Error("refusal stages: symlinked loose ref");
+        if (st.isDirectory()) { await walk(child, depth + 1); continue; }
+        if (!st.isFile() || st.size !== 41) throw new Error("refusal stages: unreadable loose ref");
+        const handle = await fs.open(full, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+        let text: string;
+        try {
+          const opened = await handle.stat();
+          if (!opened.isFile() || opened.size !== 41) throw new Error("refusal stages: unreadable loose ref");
+          text = (await handle.readFile()).toString("latin1");
+        } finally { await handle.close(); }
+        if (!/^[0-9a-f]{40}\n$/.test(text)) throw new Error("refusal stages: malformed loose ref");
+        if (listed.get(child) !== text.slice(0, 40)) throw new Error("refusal stages: loose ref differs from the listing");
+      }
+    };
+    await walk(rootRef, 0);
+  }
+
+  /** Splits a run's stages (generation <= G) into import stages that are anchored and the evidence set. An import stage
+   *  is anchored by a `refused-<its tip>` ref at its own generation plus a ledger row for that (generation, tip): the
+   *  refused ref and row carry the evidence, so the stage is excluded. Owed pins never anchor. An unanchored import
+   *  stage, and any stage that is neither an import nor a refused ref, stays evidence (fail closed). */
+  private splitImportStages(stages: RefusalStage[], entries: Array<{ generation: number; sha: string }>):
+    { evidence: RefusalStage[]; anchored: RefusalStage[] } {
+    const refused = new Set(stages.filter((s) => refusalLeaf(s.ref) === `refused-${s.sha}`).map((s) => `${s.generation}:${s.sha}`));
+    const ledgered = new Set(entries.map((e) => `${e.generation}:${e.sha}`));
+    const evidence: RefusalStage[] = [], anchored: RefusalStage[] = [];
+    for (const s of stages) {
+      const key = `${s.generation}:${s.sha}`;
+      (isRefusalImportRef(s.ref) && refused.has(key) && ledgered.has(key) ? anchored : evidence).push(s);
+    }
+    return { evidence, anchored };
+  }
+
+  /** Ends the producer's liveness for an attributed stage and records it as finished, evicting the oldest record
+   *  beyond the bound. A flat (unattributed) stage is never recorded. */
+  private finishImportStage(stage: string, attributed: boolean): void {
+    this.liveImportStages.delete(stage);
+    if (!attributed) return;
+    this.finishedImportStages.delete(stage);
+    this.finishedImportStages.add(stage);
+    while (this.finishedImportStages.size > FINISHED_IMPORT_STAGE_LIMIT) {
+      const oldest = this.finishedImportStages.values().next().value;
+      if (oldest === undefined) break;
+      this.finishedImportStages.delete(oldest);
+    }
+  }
+
+  /** An import stage's producer is proven finished only when it was created by this process, its import returned,
+   *  and it is not live now. A foreign nonce, an evicted record or an injected stage is unproven (fail closed). */
+  private importProducerProven(ref: string): boolean {
+    // The !liveImportStages clause is defence in depth: the gate's hasLiveImport check runs first.
+    return isRefusalImportRef(ref) && importLeafNonce(ref) === this.processNonce &&
+      this.finishedImportStages.has(ref) && !this.liveImportStages.has(ref);
+  }
+
+  /** The branch whose tracking ref may anchor an import stage: it must be the caller's hint, equal the ledger's
+   *  branch, and be owned by this run at a positive generation <= G whose producing context parses. Caller holds the
+   *  bare lock. Any failure means no tracking anchor; only a boundary abort propagates. */
+  private async trackingAnchorSha(barePath: string, runId: string, G: number, ledgerBranch: string | undefined,
+    branch: string | undefined): Promise<string | undefined> {
+    try {
+      if (!refusalText(branch) || (ledgerBranch !== undefined && ledgerBranch !== branch)) return undefined;
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      const owner = observed?.owner;
+      if (!observed?.sha || !owner || owner.runId !== runId || !refusalGeneration(owner.generation, 1) || owner.generation > G) return undefined;
+      await this.producingContext(barePath, branch, owner);
+      return observed.sha;
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return undefined;
+    }
+  }
+
+  /** issue #4481: removes attributed import stages whose producer is proven finished, whose exact tip has an
+   *  independent anchor (owed pin, recovery pin at a generation <= G, or the branch-hinted tracking ref) and whose tip
+   *  is covered. Object existence, ledger rows and the head alone never anchor. Each removal is the authority-registered
+   *  CAS delete; a refused or failed delete keeps the stage (the gate then holds). Caller holds the bare lock. */
+  private async reconcileFinishedImportStagesUnderLock(barePath: string, runId: string, G: number, headSha: string,
+    stages: RefusalStage[], ledgerBranch: string | undefined, branch: string | undefined): Promise<RefusalStage[]> {
+    const candidates = stages.filter((s) => s.generation >= 1 && this.importProducerProven(s.ref));
+    if (!candidates.length) return stages;
+    const removed = new Set<string>();
+    let recoveryPins: Map<string, string> | undefined;
+    let trackingSha: string | undefined | null = null;
+    for (const s of candidates) {
+      const tip = s.sha;
+      let anchored = await this.checkedRefSha(barePath, `refs/uzi-owed/${runId}/${tip}`) === tip;
+      const pinned = anchored;
+      if (!anchored) {
+        if (!recoveryPins) {
+          recoveryPins = new Map();
+          const prefix = recoveryPinRef(runId, 1).slice(0, -1);
+          const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", prefix]);
+          for (const ref of out.split("\n").filter(Boolean)) {
+            const g = Number(ref.slice(ref.lastIndexOf("/") + 1));
+            if (!refusalGeneration(g, 1) || g > G || ref !== recoveryPinRef(runId, g)) continue;
+            // Same verification as the owed pin: exact ref, commit required, ambiguity refused. A failure
+            // means this pin does not anchor; only a boundary abort propagates.
+            try {
+              const oid = await this.checkedRefSha(barePath, ref);
+              if (oid !== undefined) recoveryPins.set(ref, oid);
+            } catch (cause) {
+              const abort = this.boundaryAbortError(cause);
+              if (abort) throw abort;
+            }
+          }
+        }
+        for (const [ref, oid] of recoveryPins) {
+          const g = Number(ref.slice(ref.lastIndexOf("/") + 1));
+          if (oid === tip && refusalGeneration(g, 1) && g <= G && ref === recoveryPinRef(runId, g)) { anchored = true; break; }
+        }
+      }
+      if (!anchored) {
+        if (trackingSha === null) trackingSha = await this.trackingAnchorSha(barePath, runId, G, ledgerBranch, branch);
+        anchored = trackingSha === tip;
+      }
+      if (!anchored) continue;
+      if (!pinned && await this.ancestry(barePath, tip, headSha) !== "ancestor") continue;
+      try {
+        await this.deleteRefusalStageRefs(barePath, [{ ref: s.ref, tip }], () => {});
+        this.finishedImportStages.delete(s.ref);
+        removed.add(s.ref);
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+      }
+    }
+    return stages.filter((s) => !removed.has(s.ref));
+  }
+
+  /** Whether an import of this run at a generation <= G is in flight in this process. */
+  private hasLiveImport(runId: string, G: number): boolean {
+    const prefix = `refs/uzi-incoming/${runId}/`;
+    for (const ref of this.liveImportStages) {
+      if (!ref.startsWith(prefix)) continue;
+      const generation = Number(ref.slice(prefix.length).split("/")[0]);
+      if (!Number.isSafeInteger(generation) || generation <= G) return true;
+    }
+    return false;
+  }
+
+  private async readRefusalRecord<T>(barePath: string, name: string, parse: (v: unknown) => T | undefined):
+    Promise<{ state: "absent" } | { state: "invalid" } | { state: "valid"; value: T }> {
+    const raw = await this.readOwedFile(barePath, name, REFUSAL_DIRECTORY);
+    if (raw === undefined) return { state: "absent" };
+    const value = parse(raw);
+    return value === undefined ? { state: "invalid" } : { state: "valid", value };
+  }
+
+  /** The chokepoint's recording step. Caller holds the bare lock. Never throws except a boundary abort. */
+  private async recordRefusalUnderLock(c: StoredOwedContext, sha: string, refusalPath: RefusalPath):
+    Promise<{ sealed: boolean; alreadyLedgered: boolean }> {
+    const outcome = { sealed: false, alreadyLedgered: false };
+    const generation = c.generation ?? 0;
+    let abort: Error | undefined;
+    const attempt = async (step: () => Promise<boolean>): Promise<boolean> => {
+      try { return await step(); }
+      catch (cause) { abort ??= this.boundaryAbortError(cause); return false; }
+    };
+    // The seal check is the only step that ends recording without a failure: a sealed generation takes no evidence.
+    if (!await attempt(async () => {
+      const sealedGenerations = refusalFileGenerations(await this.refusalNames(c.barePath), "final", c.runId);
+      if (sealedGenerations.some((g) => g >= generation)) outcome.sealed = true;
+      return true;
+    })) { this.refusalRecordingFailed.add(c.runId); await this.markRefusalIncomplete(c); if (abort) throw abort; return outcome; }
+    if (outcome.sealed) return outcome;
+    // The refused ref and the ledger entry are independent: either alone still makes the gate demand coverage,
+    // and a failure of either latches this run ineligible for the process lifetime.
+    const refWritten = await attempt(async () => {
+      const ref = `refs/uzi-incoming/${c.runId}/${generation}/refused-${sha}`;
+      await this.runGit(c.barePath, ["update-ref", ref, sha]);
+      return await this.checkedRefSha(c.barePath, ref) === sha;
+    });
+    const ledgerWritten = await attempt(async () => {
+      const name = `refusals-${c.runId}.json`;
+      const read = await this.readRefusalRecord(c.barePath, name, parseRefusalLedger);
+      if (read.state === "invalid") return false;
+      const ledger: RefusalLedger = read.state === "valid" ? read.value
+        : { runId: c.runId, branch: c.branch, barePath: c.barePath, entries: [] };
+      if (ledger.runId !== c.runId || ledger.branch !== c.branch || ledger.barePath !== c.barePath) return false;
+      // Keyed by (generation, sha): another generation's row of the same head never stands in for this one.
+      if (ledger.entries.some((e) => e.generation === generation && e.sha === sha)) { outcome.alreadyLedgered = true; return true; }
+      if (ledger.entries.length >= MAX_OWED_CANDIDATES_PER_RUN) return false;
+      await this.writeOwedFile(c.barePath, name, { version: 1, runId: ledger.runId, branch: ledger.branch,
+        barePath: ledger.barePath, entries: [...ledger.entries, { generation, sha, path: refusalPath }] }, REFUSAL_DIRECTORY, c.runId);
+      return true;
+    });
+    // The refusal branch also leaves the owed-path marker when the cap-filling pin did not (old-worker pins, direct pins).
+    const markerWritten = await attempt(async () => { await this.ensureOwedPathMarker(c); return true; });
+    if (!refWritten || !ledgerWritten || !markerWritten) { this.refusalRecordingFailed.add(c.runId); await this.markRefusalIncomplete(c); }
+    if (abort) throw abort;
+    return outcome;
+  }
+
+  /** Write-once `owedpath-<run>-<generation>.json`: this positive generation reached (or was about to fill) the owed
+   *  cap. An existing marker is left alone. A null or non-positive generation never writes one. Throws on failure. */
+  private async ensureOwedPathMarker(c: StoredOwedContext): Promise<void> {
+    const generation = c.generation;
+    if (generation === null || !refusalGeneration(generation, 1)) return;
+    const name = `owedpath-${c.runId}-${generation}.json`;
+    if (await this.readOwedFile(c.barePath, name, REFUSAL_DIRECTORY) !== undefined) return;
+    await this.writeOwedFile(c.barePath, name,
+      { version: 1, runId: c.runId, generation, branch: c.branch, barePath: c.barePath }, REFUSAL_DIRECTORY, c.runId);
+  }
+
+  /** Durable, irreversible companion of the in-process latch: it survives a restart, so a successor process
+   *  never trusts the run's refusal history. Cleanup never deletes it; only the bare's removal does. Best effort and independent of the other recording steps; never throws. */
+  private async markRefusalIncomplete(c: StoredOwedContext): Promise<void> {
+    try {
+      await this.writeOwedFile(c.barePath, `incomplete-${c.runId}.json`,
+        { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath }, REFUSAL_DIRECTORY, c.runId);
+    } catch { /* the in-process latch still holds */ }
+  }
+
+  /** Writes one admission record per run and generation, never over an existing one. */
+  async admitRefusalProvenance(context: PositiveOwedCandidateContext): Promise<"written" | "existing" | "failed"> {
+    try {
+      if (!context || !refusalRun(context.runId) || !refusalGeneration(context.generation, 1) ||
+          !refusalText(context.branch) || !refusalText(context.barePath)) return "failed";
+      const { runId, generation, branch, barePath } = context;
+      const name = `admission-${runId}-${generation}.json`;
+      return await this.withLock(barePath, async () => {
+        if (await this.readOwedFile(barePath, name, REFUSAL_DIRECTORY) !== undefined) return "existing" as const;
+        await this.writeOwedFile(barePath, name, { version: 1, runId, generation, branch, barePath, protocol: 1,
+          process: this.processNonce }, REFUSAL_DIRECTORY, runId);
+        return "written" as const;
+      });
+    } catch { return "failed"; }
+  }
+
+  /** Whether the run's refused heads, as of `generation`, are all provably covered by `headSha`. */
+  async refusalReleaseGate(barePath: string, runId: string, generation: number, headSha: string, branch?: string): Promise<RefusalReleaseGate> {
+    try {
+      if (typeof barePath !== "string" || !refusalRun(runId) || !refusalGeneration(generation, 1) || !refusalOid(headSha)) {
+        return { kind: "ineligible", reason: "invalid gate arguments" };
+      }
+      return await this.withLock(barePath, () => this.refusalGateUnderLock(barePath, runId, generation, headSha, branch));
+    } catch (cause) {
+      return { kind: "ineligible", reason: `gate unreadable: ${cause instanceof Error ? cause.message : "error"}` };
+    }
+  }
+
+  private async refusalGateUnderLock(barePath: string, runId: string, G: number, headSha: string, branchHint?: string): Promise<RefusalReleaseGate> {
+    const ineligible = (reason: string): RefusalReleaseGate => ({ kind: "ineligible", reason });
+    if (this.refusalRecordingFailed.has(runId)) return ineligible("refusal recording failed in this process");
+    const names = await this.refusalNames(barePath);
+    // Valid or not, an incomplete marker is final: the history cannot be proven complete, whatever else is found.
+    if (names.includes(`incomplete-${runId}.json`)) return ineligible("refusal history incomplete");
+    if (names.some((n) => refusalTempBlocks(n, runId))) return ineligible("temporary refusal metadata present");
+    const ledgerRead = await this.readRefusalRecord(barePath, `refusals-${runId}.json`, parseRefusalLedger);
+    if (ledgerRead.state === "invalid") return ineligible("refusal ledger malformed");
+    const ledger = ledgerRead.state === "valid" ? ledgerRead.value : undefined;
+    if (ledger && (ledger.runId !== runId || ledger.barePath !== barePath)) return ineligible("refusal ledger unbound");
+    const entries = ledger?.entries.filter((e) => e.generation <= G) ?? [];
+    const allStages = await this.refusalStages(barePath, runId);
+    let stages = allStages.filter((s) => s.generation <= G);
+    const pinned = new Set((await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${runId}/`]))
+      .split("\n").filter(Boolean).map((r) => r.slice(r.lastIndexOf("/") + 1)));
+    // An owed-path marker at or below G says the generation once stood at the cap, so an empty-looking run is
+    // proven only by an admission of this process, never by the absence of evidence.
+    const atCapBefore = refusalFileGenerations(names, "owedpath", runId).some((g) => g <= G);
+    const noEvidence = (): boolean => !entries.length && !stages.length && pinned.size < this.maxOwedCandidates && !atCapBefore;
+    if (noEvidence()) return { kind: "none" };
+    if (allStages.length !== stages.length) return ineligible("refusal stage of a later generation");
+    if (this.hasLiveImport(runId, G)) return ineligible("refusal import in progress");
+    // A proven-finished, independently anchored and covered import stage is leftover staging, not evidence.
+    stages = await this.reconcileFinishedImportStagesUnderLock(barePath, runId, G, headSha, stages, ledger?.branch, branchHint);
+    if (noEvidence()) return { kind: "none" };
+    if (stages.some((s) => isRefusalImportRef(s.ref) && !this.importProducerProven(s.ref))) {
+      return ineligible("refusal import stage producer unproven");
+    }
+    const evidenceStages = this.splitImportStages(stages, entries).evidence;
+    if (G > REFUSAL_MAX_GENERATIONS) return ineligible("too many generations to prove");
+    let branch = ledger?.branch;
+    for (let g = 1; g <= G; g++) {
+      const admission = await this.readRefusalRecord(barePath, `admission-${runId}-${g}.json`, parseRefusalAdmission);
+      if (admission.state !== "valid") return ineligible(`admission for generation ${g} ${admission.state}`);
+      const a = admission.value;
+      if (a.runId !== runId || a.generation !== g || a.barePath !== barePath) return ineligible(`admission for generation ${g} unbound`);
+      if (a.process !== this.processNonce) return ineligible(`admission for generation ${g} is from another process`);
+      branch ??= a.branch;
+      if (a.branch !== branch) return ineligible(`admission for generation ${g} names another branch`);
+    }
+    for (const e of entries) if (e.generation < 1) return ineligible("ledger entry has no admitted generation");
+    const ledgered = new Set(entries.map((e) => e.sha));
+    for (const s of evidenceStages) {
+      if (s.generation < 1) return ineligible("refusal stage has no admitted generation");
+      if (!ledgered.has(s.sha)) return ineligible("refusal stage is not in the ledger");
+    }
+    if (evidenceStages.some((s) => isRefusalImportRef(s.ref))) return ineligible("refusal import stage is unanchored");
+    const covered = async (sha: string): Promise<boolean> =>
+      pinned.has(sha) || await this.ancestry(barePath, sha, headSha) === "ancestor";
+    for (const sha of new Set([...ledgered, ...evidenceStages.map((s) => s.sha)])) {
+      if (!await covered(sha)) return ineligible(`refused head ${sha} is not covered`);
+    }
+    const observed = await this.observeTrackingUnderLock(barePath, branch!);
+    if (!observed) return ineligible("tracking ownership unreadable");
+    if (observed.sha && observed.owner?.runId === runId &&
+        (observed.owner.generation == null || observed.owner.generation <= G) && !await covered(observed.sha)) {
+      return ineligible("tracking head is not covered");
+    }
+    return { kind: "eligible", evidenceDigest: refusalEvidenceDigest(entries, evidenceStages) };
+  }
+
+  /** The release seal: one lock section runs the gate, then writes (once) or compares the final record. */
+  async sealRefusalRelease(barePath: string, runId: string, generation: number, sourceSha: string, branch?: string): Promise<RefusalSealResult> {
+    try {
+      if (typeof barePath !== "string" || !refusalRun(runId) || !refusalGeneration(generation, 1) || !refusalOid(sourceSha)) return "ineligible";
+      return await this.withLock(barePath, async () => {
+        const gate = await this.refusalGateUnderLock(barePath, runId, generation, sourceSha, branch);
+        if (gate.kind === "ineligible") return "ineligible" as const;
+        const name = `final-${runId}-${generation}.json`;
+        const existing = await this.readRefusalRecord(barePath, name, parseRefusalFinal);
+        if (existing.state === "absent") {
+          if (gate.kind === "none") return "none" as const;
+          await this.writeOwedFile(barePath, name, { version: 1, runId, generation, sourceSha,
+            evidenceDigest: gate.evidenceDigest, process: this.processNonce }, REFUSAL_DIRECTORY, runId);
+          return "sealed" as const;
+        }
+        if (existing.state === "invalid") return "mismatch" as const;
+        // An existing seal is always compared, even when the evidence it sealed has since vanished (gate none).
+        const f = existing.value;
+        const digest = gate.kind === "eligible" ? gate.evidenceDigest : refusalEvidenceDigest([], []);
+        return f.runId === runId && f.generation === generation && f.sourceSha === sourceSha &&
+          f.evidenceDigest === digest && f.process === this.processNonce ? "matches" as const : "mismatch" as const;
+      });
+    } catch { return "ineligible"; }
+  }
+
+  /** Read-only decision for cleanupRecoveryGeneration: ordinary cleanup, retain, or the sealed protocol. */
+  private async refusalCleanupPlan(barePath: string, context: PositiveOwedCandidateContext, coveringSha: string):
+    Promise<{ kind: "none"; markers: string[] } | { kind: "retain"; markers?: undefined } |
+      { kind: "run"; cleanup: RefusalCleanup; write: boolean; markers: string[] }> {
+    const retain = { kind: "retain" } as const;
+    const R = context.runId, G = context.generation;
+    let names: string[], ledgerRead, allStages: RefusalStage[];
+    try {
+      names = await this.refusalNames(barePath);
+      ledgerRead = await this.readRefusalRecord(barePath, `refusals-${R}.json`, parseRefusalLedger);
+      allStages = await this.refusalStages(barePath, R);
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return retain;
+    }
+    if (ledgerRead.state === "invalid") return retain;
+    const ledger = ledgerRead.state === "valid" ? ledgerRead.value : undefined;
+    if (ledger && (ledger.runId !== R || ledger.barePath !== barePath || ledger.branch !== context.branch)) return retain;
+    const entries = ledger?.entries.filter((e) => e.generation <= G) ?? [];
+    const stages = allStages.filter((s) => s.generation <= G);
+    const finals = refusalFileGenerations(names, "final", R).filter((g) => g <= G);
+    const cleanups = refusalFileGenerations(names, "cleanup", R).filter((g) => g <= G);
+    // Owed-path markers are not evidence a seal must cover: they are removed with the generation, last.
+    const markers = refusalFileGenerations(names, "owedpath", R).filter((g) => g <= G).sort((a, b) => a - b)
+      .map((g) => `owedpath-${R}-${g}.json`);
+    if (!entries.length && !stages.length && !finals.length && !cleanups.length) return { kind: "none", markers };
+    try {
+      if (names.some((n) => refusalTempBlocks(n, R)) || cleanups.some((g) => g !== G) || stages.length > 256) return retain;
+      // An import of this run still in flight in this process: its stage is not settled evidence yet.
+      if (this.hasLiveImport(R, G)) return retain;
+      const finalRead = finals.includes(G)
+        ? await this.readRefusalRecord(barePath, `final-${R}-${G}.json`, parseRefusalFinal) : undefined;
+      const final = finalRead?.state === "valid" ? finalRead.value : undefined;
+      if (finalRead && (!final || final.runId !== R || final.generation !== G || final.sourceSha !== coveringSha)) return retain;
+      if (cleanups.includes(G)) {
+        const read = await this.readRefusalRecord(barePath, `cleanup-${R}-${G}.json`, parseRefusalCleanup);
+        if (read.state !== "valid") return retain;
+        const cleanup = read.value;
+        if (cleanup.runId !== R || cleanup.generation !== G || cleanup.branch !== context.branch ||
+            cleanup.barePath !== barePath || (final && final.evidenceDigest !== cleanup.finalDigest)) return retain;
+        // The ledger is keyed by (generation, sha): a row of the same head at another generation is a different row,
+        // never touched by this intent (deletions are exact pairs and listed stages are <= G, tip-checked).
+        // The intent must still prove itself: its own lists hash to the sealed digest, and every listed stage
+        // is a ref of this run at a generation <= G whose tip the intent's ledger entries cover.
+        const stageRef = new RegExp(`^refs/uzi-incoming/${R}/(0|[1-9][0-9]*)/[A-Za-z0-9._-]+$`);
+        if (refusalEvidenceDigest(cleanup.ledgerEntries, cleanup.stages.map((x) => ({ ref: x.ref, sha: x.tip }))) !== cleanup.finalDigest) return retain;
+        for (const x of cleanup.stages) {
+          const m = stageRef.exec(x.ref);
+          if (!m || Number(m[1]) !== x.generation || x.generation > G || !cleanup.ledgerEntries.some((e) => e.sha === x.tip)) return retain;
+        }
+        // An import stage the intent lists must be an import-shaped ref of this run, at its own generation, whose
+        // (generation, tip) the intent's ledger entries name.
+        for (const x of cleanup.importStages) {
+          const m = stageRef.exec(x.ref);
+          if (!m || !isRefusalImportRef(x.ref) || Number(m[1]) !== x.generation || x.generation > G ||
+              !cleanup.ledgerEntries.some((e) => e.generation === x.generation && e.sha === x.tip)) return retain;
+        }
+        if (cleanup.ledgerEntries.some((e) => e.generation > G)) return retain;
+        // Current evidence must be an exact-pair subset of the lists; anything else is a rebound generation. An import
+        // stage is matched exactly against the intent's import list instead of by anchor: the refused ref that anchored
+        // it may already be deleted by a crashed pass.
+        const exact = (list: Array<{ ref: string; generation: number; tip: string }>, s: RefusalStage): boolean =>
+          list.some((x) => x.ref === s.ref && x.tip === s.sha && x.generation === s.generation);
+        if (!stages.every((s) => isRefusalImportRef(s.ref) ? exact(cleanup.importStages, s) : exact(cleanup.stages, s)) ||
+            !entries.every((e) => cleanup.ledgerEntries.some((x) => x.sha === e.sha && x.generation === e.generation))) return retain;
+        return { kind: "run", cleanup, write: false, markers };
+      }
+      if (!final) return retain;
+      // Anchored import stages are excluded from the evidence set; an unanchored one stays evidence and blocks cleanup.
+      const split = this.splitImportStages(stages, entries);
+      if (split.evidence.some((s) => isRefusalImportRef(s.ref))) return retain;
+      if (refusalEvidenceDigest(entries, split.evidence) !== final.evidenceDigest) return retain;
+      for (const sha of new Set([...entries.map((e) => e.sha), ...split.evidence.map((s) => s.sha)])) {
+        if (await this.ancestry(barePath, sha, coveringSha) !== "ancestor") return retain;
+      }
+      for (const s of split.evidence) if (!entries.some((e) => e.sha === s.sha && e.generation <= s.generation)) return retain;
+      const listed = (list: RefusalStage[]) =>
+        list.map((s) => ({ ref: s.ref, generation: s.generation, tip: s.sha })).sort((a, b) => a.ref.localeCompare(b.ref));
+      return { kind: "run", write: true, markers, cleanup: { version: 1, runId: R, generation: G, branch: context.branch, barePath,
+        finalDigest: final.evidenceDigest,
+        stages: listed(split.evidence), importStages: listed(split.anchored),
+        ledgerEntries: entries.map((e) => ({ generation: e.generation, sha: e.sha })) } as RefusalCleanup };
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return retain;
+    }
+  }
+
+  /** The sealed cleanup's refusal-side deletions, idempotent so a crashed pass resumes: listed stages by CAS,
+   *  then the ledger without exactly the listed entries. */
+  private async applyRefusalCleanup(barePath: string, cleanup: RefusalCleanup, open: () => void): Promise<void> {
+    await this.deleteRefusalStageRefs(barePath, cleanup.stages, open);
+    const name = `refusals-${cleanup.runId}.json`;
+    const read = await this.readRefusalRecord(barePath, name, parseRefusalLedger);
+    if (read.state === "absent") return;
+    if (read.state === "invalid") throw new Error("refusal ledger malformed during cleanup");
+    const kept = read.value.entries.filter((e) => !cleanup.ledgerEntries.some((x) => x.sha === e.sha && x.generation === e.generation));
+    if (kept.length === read.value.entries.length) return;
+    open();
+    if (kept.length === 0) await this.removeOwedFile(barePath, name, true, REFUSAL_DIRECTORY);
+    else await this.writeOwedFile(barePath, name, { version: 1, runId: read.value.runId, branch: read.value.branch,
+      barePath: read.value.barePath, entries: kept }, REFUSAL_DIRECTORY, read.value.runId);
+  }
+
+  /** CAS-deletes each listed stage ref at its listed tip through the authority; an already absent ref is skipped. */
+  private async deleteRefusalStageRefs(barePath: string, list: Array<{ ref: string; tip: string }>, open: () => void): Promise<void> {
+    for (const s of list) {
+      const current = await this.checkedRefSha(barePath, s.ref);
+      if (current === undefined) continue;
+      if (current !== s.tip) throw new Error("refusal stage changed during cleanup");
+      open();
+      // The authority registers the shared-bare deletion before the child runs and settles it after a read-back.
+      const settlement = await this.beginBare(barePath, "refusal-cleanup-delete-ref", [s.ref]);
+      await this.deleteRefSettled(barePath, s.ref, s.tip, settlement, "refusal stage deletion mismatch");
+    }
   }
 
   /** Checked enumeration distinguishes a genuinely absent exact ref from a failed read. */
@@ -29567,17 +30553,18 @@ try {
       try {
         if (displacedContext && observed.sha) {
           // Only this run's confirmation can discharge its own debt.
-          await this.pinOwedUnderLock(displacedContext, observed.sha);
+          await this.pinOwedUnderLock(displacedContext, observed.sha, "P3");
           if (observed.owner?.runId === c.runId) retainedShas.push(observed.sha);
         }
         await this.persistOwedContext(c);
         if (!incomingCovered) {
-          await this.pinOwedUnderLock(c, incoming);
+          await this.pinOwedUnderLock(c, incoming, "P2");
           retainedShas.push(incoming);
         }
       } catch (cause) {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;
+        this.noteRefusal(opts, cause);
         return { kind: "not_updated", reason: preservationReason(cause) };
       }
       try {
@@ -29598,6 +30585,7 @@ try {
       } catch (cause) {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;
+        this.noteRefusal(opts, cause);
         return { kind: "not_updated", reason: preservationReason(cause) };
       }
       let remediation: { journal: RecoveryJournalEntry; raw: string } | undefined;
@@ -30018,9 +31006,18 @@ try {
         return { kind: "not_updated", reason: "ownership_unknown" };
       }
       try {
+        const producing = await this.producingContext(barePath, opts.context.branch, observed.owner);
+        // issue #4481: P7 is fenced by the seal (FINAL) of the generation it would pin or of the caller's
+        // generation, not by the in-process fence, so it stays open before the freeze.
+        const sealed = refusalFileGenerations(await this.refusalNames(barePath), "final", opts.context.runId);
+        const pinned = producing.generation !== null && producing.generation > 0 ? producing.generation : opts.context.generation;
+        const callerGeneration = opts.context.generation ?? 0;
+        if (sealed.some((g) => g > 0 && ((pinned !== null && pinned > 0 && g >= pinned) || (callerGeneration > 0 && g >= callerGeneration)))) {
+          return { kind: "not_updated", reason: "ownership_unknown" };
+        }
         const retainedShas: string[] = [];
         if (!(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha))) {
-          await this.pinOwedUnderLock(await this.producingContext(barePath, opts.context.branch, observed.owner), observed.sha);
+          await this.pinOwedUnderLock(producing, observed.sha, "P7");
           retainedShas.push(observed.sha);
         }
         return { kind: "updated", trackingRef: runnerTrackingRef(opts.context.branch),
@@ -30109,6 +31106,9 @@ try {
           if (!OWED_OID.test(head) || (authority === "archive" && await this.ancestry(barePath, head, coveringSha) !== "ancestor")) return "retained";
         }
       }
+      // issue #4481: refusal evidence for this generation needs its seal; without it nothing is deleted.
+      const refusal = await this.refusalCleanupPlan(barePath, context, coveringSha);
+      if (refusal.kind === "retain") return "retained";
       const open = (): void => {
         assertResidueQuarantineOpen("git");
         if (!canDelete()) throw new Error("recovery cleanup source protection changed");
@@ -30129,6 +31129,16 @@ try {
         await this.deleteRefSettled(barePath, ref, sha, settlement, "recovery cleanup ref deletion mismatch");
       };
       if (authority === "completion-check") { open(); return "verified"; }
+      if (refusal.kind === "run") {
+        open();
+        boundary();
+        if (refusal.write) {
+          await this.writeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, refusal.cleanup, REFUSAL_DIRECTORY, context.runId);
+        }
+        // The anchored import stages go first: once the refused refs are deleted nothing would anchor them.
+        await this.deleteRefusalStageRefs(barePath, refusal.cleanup.importStages, open);
+        await this.applyRefusalCleanup(barePath, refusal.cleanup, open);
+      }
       for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
       for (const sha of new Set(exact.map(r => r.sha))) {
         const ref = `refs/uzi-owed/${context.runId}/${sha}`;
@@ -30157,6 +31167,20 @@ try {
         boundary();
         await this.removeOwedFile(barePath, name, true);
       }
+      if (refusal.kind === "run") {
+        open();
+        await this.removeOwedFile(barePath, `final-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
+        await this.removeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
+      }
+      // The owed-path markers of generations <= G go last: they are the weakest evidence, and every caller reaches
+      // here only for a released or completed generation (the completion-check preflight returned above).
+      for (const marker of refusal.markers ?? []) {
+        open();
+        boundary();
+        await this.removeOwedFile(barePath, marker, true, REFUSAL_DIRECTORY);
+      }
+      // issue #4481: admissions are kept (the seal's process-binding evidence); only the bare's removal
+      // deletes them.
       return "removed";
     });
   }

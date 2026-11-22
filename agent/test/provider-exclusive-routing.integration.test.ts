@@ -11,7 +11,8 @@ import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
 
 // PRD #4320 module 7 (activation-blocking): does the REAL bundled CLI, run with the provider-mode
 // env uzi builds, send every request (main agent, Task subagent, haiku auxiliary calls) ONLY to the
-// bound base URL, and does it refuse to follow a gateway redirect for either auth style?
+// bound base URL? Redirect handling is NOT activation-blocking: the pinned CLI follows a gateway 307,
+// an accepted risk (ADR-4320) whose observed behaviour the redirect tests below pin.
 //
 // The SDK `env` REPLACES the child environment (sdk-env.ts), so the CLI's environment is built from
 // {...buildSdkEnv(providerCredential, home), HTTPS_PROXY, HTTP_PROXY, NO_PROXY} (the SDK may add its own
@@ -185,6 +186,7 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
     withSubagent: boolean;
     boundedRetries: boolean;
     budgetMs?: number;
+    prompt?: string;
   }): Promise<{ env: Record<string, string | undefined>; stderr: string; failed: boolean }> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-routing-it-"));
     roots.push(root);
@@ -223,7 +225,7 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
         : {}),
     };
     try {
-      for await (const m of query({ prompt: "run the steps", options })) {
+      for await (const m of query({ prompt: opts.prompt ?? "run the steps", options })) {
         const mm = m as { type: string; is_error?: boolean };
         if (mm.type === "result" && mm.is_error) failed = true;
       }
@@ -271,7 +273,6 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
         // Everything the gateway saw is under the bound base URL, and every model is a mapped one.
         const paths = [...new Set(gw.calls.map((c) => c.path))];
         const allPaths = [...new Set(gw.seen.map((s) => s.url.split("?")[0]))];
-        console.log(`ROUTING paths seen by the gateway (${authStyle}): ${JSON.stringify(allPaths)}; messages calls: ${gw.calls.length}`);
         for (const p of allPaths) assert.ok(p!.startsWith(`${GATEWAY_PREFIX}/`), `a request left the base URL path: ${p}`);
         assert.ok(paths.includes(`${GATEWAY_PREFIX}/v1/messages`), "the lead reached /v1/messages under the base URL");
         const models = new Set(gw.calls.map((c) => c.model));
@@ -297,29 +298,31 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
   }
 
   // ── Redirects ───────────────────────────────────────────────────────────────────────────────
-  // OBSERVED at the pinned SDK 0.3.319 / CLI 2.1.319 (2026-11-18): the CLI FOLLOWS a gateway 307 for
-  // POST /v1/messages, to a same-origin sibling path (with the auth header) and to a second loopback
-  // origin (bearer: the Authorization header is dropped by the fetch cross-origin rule; x_api_key: the
-  // `x-api-key` header IS forwarded). The strict not-followed assertions below are therefore RED, so
-  // they carry `todo` (reported, non-blocking) and the capability stays unadvertised until this is
-  // decided; the characterization test beneath them is green and pins what was observed, so a CLI
-  // bump that changes it is noticed. Remove `todo` when redirects are refused.
+  // ACCEPTED RISK (ADR-4320, 2026-11-19, #4505): the pinned CLI (SDK 0.3.319 / CLI 2.1.319) FOLLOWS a
+  // gateway 307 for POST /v1/messages, re-sending the request body to the Location the gateway names:
+  // to a same-origin sibling path with the auth header, and to a second loopback origin (bearer: the
+  // Authorization header is dropped by the fetch cross-origin rule; x_api_key: `x-api-key` IS forwarded).
+  // The owner accepted this and claude_provider_v1 is advertised. These tests PIN that observed behaviour.
+  // The relay (#4496) is the future mitigation. An SDK/CLI bump that changes redirect handling turns
+  // these red and forces a re-look at the accepted risk.
+  const REDIRECT_SENTINEL = "uzi-redirect-sentinel-7f3a91";
+  const REDIRECT_SENTINEL_PROMPT = `run the steps ${REDIRECT_SENTINEL}`;
+
   async function redirectRun(authStyle: "bearer" | "x_api_key", target: "same-origin sibling path" | "second loopback server") {
     const rec = await startRecorder();
-    const other = new RecordingServer((_req, res) => { res.writeHead(500); res.end("must never be reached"); });
+    const other = new RecordingServer((_req, res) => { res.writeHead(500); res.end("redirect target"); });
     const otherAddr = await other.listen();
     let location = "";
     const gw = new Gateway(() => ({ status: 307, to: location }));
     const { port, origin } = await gw.listen();
     location = target === "same-origin sibling path" ? "/other-tenant/v1/messages" : `${otherAddr.origin}/v1/messages`;
     try {
-      const { failed } = await drive({
+      await drive({
         cred: credential(`${origin}${GATEWAY_PREFIX}`, authStyle), proxy: rec,
-        noProxy: `127.0.0.1:${port},127.0.0.1:${otherAddr.port}`, withSubagent: false, boundedRetries: true, budgetMs: 40_000,
+        noProxy: `127.0.0.1:${port},127.0.0.1:${otherAddr.port}`, withSubagent: false, boundedRetries: true, budgetMs: 40_000, prompt: REDIRECT_SENTINEL_PROMPT,
       });
       const line = (s: Seen): string => `${s.method} ${s.url}`;
       return {
-        failed,
         gatewayLines: gw.seen.map(line),
         gatewaySibling: gw.seen.filter((s) => s.url.startsWith("/other-tenant")),
         otherSeen: other.seen,
@@ -334,32 +337,26 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
 
   for (const authStyle of ["bearer", "x_api_key"] as const) {
     for (const target of ["same-origin sibling path", "second loopback server"] as const) {
-      it(`${authStyle}: a 307 to a ${target} is not followed with the key`, {
-        timeout: 120_000,
-        todo: "the pinned CLI follows a gateway 307 (see the characterization test); owner decision: ship blocked, relay later; capability not advertised",
-      }, async () => {
+      it(`ACCEPTED RISK ${authStyle}: a 307 to a ${target} is followed with the request body (key per auth style)`, { timeout: 120_000 }, async () => {
         const r = await redirectRun(authStyle, target);
         assert.ok(r.gatewayLines.some((l) => l.startsWith("POST /gw/anthropic/v1/messages")), "the gateway issued the redirect");
-        assert.deepStrictEqual(r.gatewaySibling.map((s) => `${s.method} ${s.url}`), [], "the same-origin sibling path received a request: the CLI FOLLOWED the redirect");
-        assert.deepStrictEqual(r.otherSeen.map((s) => `${s.method} ${s.url}`), [], "the second loopback server received a request: the CLI FOLLOWED the redirect");
-        assert.deepStrictEqual(r.recorderTargets, [], "a request left the gateway through the proxy");
-        assert.ok(r.failed, "with no usable answer the turn ends as an error");
+        const hop = target === "same-origin sibling path" ? r.gatewaySibling[0] : r.otherSeen[0];
+        assert.ok(hop, "the redirect is followed (observed)");
+        assert.equal(hop.method, "POST");
+        assert.ok(hop.body.includes(REDIRECT_SENTINEL), "the request body is re-sent to the redirect target");
+        assert.deepEqual(r.recorderTargets, [], "no request left through the proxy recorder");
+        const auth = hop.headers.authorization;
+        const xKey = hop.headers["x-api-key"];
+        if (authStyle === "bearer") assert.equal(xKey, undefined, "bearer: no x-api-key header is sent");
+        if (target === "same-origin sibling path") {
+          if (authStyle === "bearer") assert.equal(auth, `Bearer ${KEY}`, "the key travels to the same-origin sibling");
+          else assert.equal(xKey, KEY, "the key travels to the same-origin sibling");
+        } else if (authStyle === "bearer") {
+          assert.equal(auth, undefined, "bearer: the fetch cross-origin rule drops Authorization");
+        } else {
+          assert.equal(xKey, KEY, "x_api_key: the key is forwarded to the second origin");
+        }
       });
     }
-  }
-
-  for (const authStyle of ["bearer", "x_api_key"] as const) {
-    it(`CHARACTERIZATION ${authStyle}: what the pinned CLI does with a 307 (followed; which auth header travels)`, { timeout: 120_000 }, async () => {
-      const sibling = await redirectRun(authStyle, "same-origin sibling path");
-      const cross = await redirectRun(authStyle, "second loopback server");
-      const sib = sibling.gatewaySibling[0];
-      const hop = cross.otherSeen[0];
-      console.log(`REDIRECT ${authStyle}: sibling followed=${sib !== undefined} authTravelled=${sib ? (authStyle === "bearer" ? sib.headers.authorization !== undefined : sib.headers["x-api-key"] !== undefined) : "n/a"}; second origin followed=${hop !== undefined} authTravelled=${hop ? (authStyle === "bearer" ? hop.headers.authorization !== undefined : hop.headers["x-api-key"] !== undefined) : "n/a"}`);
-      assert.ok(sib, "the same-origin sibling redirect is followed (observed)");
-      assert.ok(hop, "the cross-origin redirect is followed (observed)");
-      assert.equal(authStyle === "bearer" ? sib.headers.authorization : sib.headers["x-api-key"], authStyle === "bearer" ? `Bearer ${KEY}` : KEY, "the key travels to the same-origin sibling");
-      if (authStyle === "bearer") assert.equal(hop.headers.authorization, undefined, "bearer: the fetch cross-origin rule drops Authorization");
-      else assert.equal(hop.headers["x-api-key"], KEY, "x_api_key: the key is forwarded to the second origin");
-    });
   }
 });

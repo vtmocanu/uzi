@@ -467,6 +467,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   const leadGrants: RunGrants = {
     semanticPlanning: request.semanticPlanning,
     ownerDecisionRequested: request.ownerDecisionRequested,
+    redactText: request.redactText,
     role: LEAD_ROLE,
     phase: request.phase,
     allowedTools: sortedSet([
@@ -495,9 +496,10 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   for (const [role, agent] of roleEntries) {
     perRoleModels.set(role, {
       model: resolveRoleModel(agent.model, requestModel, role, diagnostics),
-      // HarnessAgent carries no per-role effort in the neutral contract, so every
-      // role runs on the request-scoped effort (already validated under the lead).
-      modelReasoningEffort: requestEffort,
+      // A role's own effort pin wins; an unpinned (or out-of-contract, reported under the
+      // role as `unknown_effort`) pin runs on the request-scoped effort, already validated
+      // under the lead. Both undefined = the Runtime default, sent as no effort.
+      modelReasoningEffort: resolveEffort(agent.effort, role, diagnostics) ?? requestEffort,
     });
     perRoleGrants.set(role, {
       role,

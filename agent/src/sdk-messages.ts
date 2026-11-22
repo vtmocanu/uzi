@@ -54,6 +54,29 @@ export async function* promptStream(text: string): AsyncGenerator<unknown> {
   yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
 }
 
+/**
+ * PRD #3252 D8: the same one-shot user turn, but yielding nothing until `released` settles, and ending
+ * with no message when `signal` aborts first. The SDK pulls the prompt lazily, so the CLI has nothing to
+ * send to the provider until the gate opens.
+ */
+export async function* gatedPromptStream(text: string, released: Promise<void>, signal: AbortSignal): AsyncGenerator<unknown> {
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<"aborted">((resolve) => {
+    if (signal.aborted) resolve("aborted");
+    else {
+      onAbort = () => resolve("aborted");
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+  let outcome: "released" | "aborted";
+  try {
+    outcome = await Promise.race([released.then(() => "released" as const), aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+  if (outcome === "released" && !signal.aborted) yield* promptStream(text);
+}
+
 // The real SDK `Query` has a required getContextUsage() returning the wider
 // SDKControlGetContextUsageResponse; it satisfies the optional, narrower seam
 // type by covariance, so no cast is needed here.
@@ -288,10 +311,13 @@ export function decodeResult(msg: Record<string, unknown>): {
 export function providerErrorMessage(
   status: number | null | undefined,
   resultText: string | undefined,
+  redactText: (text: string) => string = (s) => s,
 ): string {
   const firstLine =
     resultText?.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
-  const text = firstLine.replace(/^api error:\s*/i, "").slice(0, 200).trim();
+  // Redact BEFORE the 200-char cut so a secret straddling the cut cannot leave a
+  // prefix that later whole-value redaction cannot match.
+  const text = redactText(firstLine.replace(/^api error:\s*/i, "")).slice(0, 200).trim();
   const statusStr = status != null ? String(status) : "";
   // Do not repeat the status if the human text already leads with it.
   const needStatus = statusStr !== "" && !text.startsWith(statusStr);

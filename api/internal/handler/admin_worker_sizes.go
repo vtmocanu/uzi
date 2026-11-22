@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -191,13 +193,19 @@ func (h *Handler) AdminListWorkerSizes(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	names := make([]string, 0, len(rows))
+	for _, row := range rows {
+		names = append(names, row.Name)
+	}
+	refusals, refusalTotals := h.sizeRefusals(ctx, names)
 	out := apitypes.AdminWorkerSizesDTO{
-		Sizes:      make([]apitypes.AdminWorkerSizeDTO, 0, len(rows)),
-		Ceilings:   ceilingsDTO(h.cfg.WorkerSizeCeilings),
-		Editable:   gate.Editable,
-		Advisories: []apitypes.WorkerSizeAdvisoryDTO{},
-		MaxSizes:   maxWorkerSizes,
-		Refusals:   h.sizeRefusals(ctx),
+		Sizes:         make([]apitypes.AdminWorkerSizeDTO, 0, len(rows)),
+		Ceilings:      ceilingsDTO(h.cfg.WorkerSizeCeilings),
+		Editable:      gate.Editable,
+		Advisories:    []apitypes.WorkerSizeAdvisoryDTO{},
+		MaxSizes:      maxWorkerSizes,
+		Refusals:      refusals,
+		RefusalTotals: refusalTotals,
 	}
 	if !gate.Editable {
 		reason, code := gate.Reason, gate.Code
@@ -211,28 +219,39 @@ func (h *Handler) AdminListWorkerSizes(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, out)
 }
 
-// maxSizeRefusals bounds the refusals array of the size list.
 const (
-	maxSizeRefusals    = 50
+	// maxRefusalsPerSize bounds the refusal entries returned for one size; the true count is
+	// in refusal_totals.
+	maxRefusalsPerSize = 3
+	// maxRefusalSizes bounds how many distinct sizes the refusals array covers (a response cap).
+	maxRefusalSizes    = maxWorkerSizes
 	maxRefusalTextByte = 256
 )
 
 // sizeRefusals lists the hosted workers whose latest FRESH stored roll signal is a stuck
-// size_refused or pvc_rejected report, keyed by hosted_size. Freshness is the same API-receipt
-// rule the health check and the worker classifier use (workersvc.DefaultControllerSignalTTL on
-// roll_observed_at). Always non-nil; a read failure yields an empty list, since the refusals
-// are advisory display beside the size table, not part of what an edit depends on.
-func (h *Handler) sizeRefusals(ctx context.Context) []apitypes.WorkerSizeRefusalDTO {
+// size_refused or pvc_rejected report, keyed by hosted_size, plus per-size totals. Freshness is
+// the same API-receipt rule the health check and the worker classifier use
+// (workersvc.DefaultControllerSignalTTL on roll_observed_at). Every matching report is counted
+// under its raw hosted_size before any truncation; sizes in listed (the table's names) are
+// retained first, then unlisted raw sizes by name, up to maxRefusalSizes; each retained size
+// keeps its first maxRefusalsPerSize entries (worker name, then id). An unlisted size whose
+// sanitized key equals a listed name or an already retained key is skipped so totals never
+// merge. Both results are always non-nil; a read failure yields an empty list and map, since
+// the refusals are advisory display beside the size table, not part of what an edit depends on.
+func (h *Handler) sizeRefusals(ctx context.Context, listed []string) ([]apitypes.WorkerSizeRefusalDTO, map[string]int) {
 	out := []apitypes.WorkerSizeRefusalDTO{}
+	totals := map[string]int{}
 	if h.q == nil {
-		return out
+		return out, totals
 	}
 	rows, err := h.q.ListAllWorkers(ctx)
 	if err != nil {
 		slog.Warn("worker size refusals", "error", err)
-		return out
+		return out, totals
 	}
 	now := h.clock()
+	clean := cleanRefusalText
+	byRaw := map[string][]apitypes.WorkerSizeRefusalDTO{}
 	for _, row := range rows {
 		if row.Worker.Kind != "hosted" || !row.Worker.HostedSize.Valid ||
 			!row.RollObservedAt.Valid || now.Sub(row.RollObservedAt.Time) > workersvc.DefaultControllerSignalTTL {
@@ -246,12 +265,71 @@ func (h *Handler) sizeRefusals(ctx context.Context) []apitypes.WorkerSizeRefusal
 		if kind != workersvc.BlockingKindSizeRefused && kind != workersvc.BlockingKindPVCRejected {
 			continue
 		}
-		clean := func(s string) string { return termsafe.SanitizeBounded(termsafe.CellText(s), maxRefusalTextByte) }
-		out = append(out, apitypes.WorkerSizeRefusalDTO{
-			Size: clean(row.Worker.HostedSize.String), WorkerID: row.Worker.ID.String(),
+		raw := row.Worker.HostedSize.String
+		byRaw[raw] = append(byRaw[raw], apitypes.WorkerSizeRefusalDTO{
+			Size: clean(raw), WorkerID: row.Worker.ID.String(),
 			WorkerName: clean(row.Worker.Name), Kind: kind, Reason: clean(sig.BlockingReason),
 			ReportedAt: row.RollObservedAt.Time,
 		})
+	}
+
+	return selectSizeRefusals(byRaw, listed, clean)
+}
+
+// cleanRefusalText sanitizes and bounds one controller- or admin-supplied refusal field.
+func cleanRefusalText(s string) string {
+	return termsafe.SanitizeBounded(termsafe.CellText(s), maxRefusalTextByte)
+}
+
+// selectSizeRefusals picks the response from the fresh refusals grouped by raw hosted_size:
+// listed sizes first (name order), then unlisted raw sizes by name, at most maxRefusalSizes
+// sizes, each with its first maxRefusalsPerSize entries and its full count in totals. An
+// unlisted raw size whose sanitized key equals any listed name or an already retained key is
+// skipped, so one raw value never adds to another size's total. Both results are non-nil.
+func selectSizeRefusals(byRaw map[string][]apitypes.WorkerSizeRefusalDTO, listed []string, clean func(string) string) ([]apitypes.WorkerSizeRefusalDTO, map[string]int) {
+	out := []apitypes.WorkerSizeRefusalDTO{}
+	totals := map[string]int{}
+	listedKeys := map[string]bool{}
+	for _, name := range listed {
+		listedKeys[clean(name)] = true
+	}
+	order := make([]string, 0, len(byRaw))
+	seenListed := map[string]bool{}
+	for _, name := range slices.Sorted(slices.Values(listed)) {
+		if _, ok := byRaw[name]; ok && !seenListed[name] {
+			seenListed[name] = true
+			order = append(order, name)
+		}
+	}
+	unlisted := make([]string, 0, len(byRaw))
+	for raw := range byRaw {
+		if !seenListed[raw] {
+			unlisted = append(unlisted, raw)
+		}
+	}
+	sort.Strings(unlisted)
+	retained := map[string]bool{}
+	for _, raw := range order {
+		if len(retained) >= maxRefusalSizes {
+			break
+		}
+		key := clean(raw)
+		if retained[key] {
+			continue
+		}
+		retained[key] = true
+		out, totals = appendRefusalSize(out, totals, key, byRaw[raw])
+	}
+	for _, raw := range unlisted {
+		if len(retained) >= maxRefusalSizes {
+			break
+		}
+		key := clean(raw)
+		if listedKeys[key] || retained[key] {
+			continue
+		}
+		retained[key] = true
+		out, totals = appendRefusalSize(out, totals, key, byRaw[raw])
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Size != out[j].Size {
@@ -262,10 +340,23 @@ func (h *Handler) sizeRefusals(ctx context.Context) []apitypes.WorkerSizeRefusal
 		}
 		return out[i].WorkerID < out[j].WorkerID
 	})
-	if len(out) > maxSizeRefusals {
-		out = out[:maxSizeRefusals]
+	return out, totals
+}
+
+// appendRefusalSize records one retained size: its total is every entry, its output the first
+// maxRefusalsPerSize in (worker name, worker id) order.
+func appendRefusalSize(out []apitypes.WorkerSizeRefusalDTO, totals map[string]int, key string, entries []apitypes.WorkerSizeRefusalDTO) ([]apitypes.WorkerSizeRefusalDTO, map[string]int) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].WorkerName != entries[j].WorkerName {
+			return entries[i].WorkerName < entries[j].WorkerName
+		}
+		return entries[i].WorkerID < entries[j].WorkerID
+	})
+	totals[key] += len(entries)
+	if len(entries) > maxRefusalsPerSize {
+		entries = entries[:maxRefusalsPerSize]
 	}
-	return out
+	return append(out, entries...), totals
 }
 
 // refuseReadOnly answers 409 for a gated mutation, carrying the stable code and the reason.
@@ -334,6 +425,16 @@ func (h *Handler) beginSizeTx(ctx context.Context) (pgx.Tx, error) {
 // AdminPutWorkerSize serves PUT /api/admin/worker-sizes/{name}: edit an existing size, or
 // create the size when no row has that name (201). A name that is not a well-formed size name
 // is a 400, since nothing could ever be stored under it.
+//
+// A request whose If-None-Match field (r.Header.Get, trimmed) is exactly "*" is create-only:
+// once the body is well-formed and complete (malformed or missing fields are still 400), an
+// existing name is answered 412 with reason size_exists; the values are not validated and
+// nothing is written.
+// No ETags are issued, so any other If-None-Match value cannot match a current representation
+// (RFC 9110) and the request stays unconditional, including list forms such as `*, W/x`. The
+// existence check and the write are serialized by the advisory lock plus the READ COMMITTED
+// fresh snapshot of the row read taken after it, so two concurrent create-only PUTs for one
+// absent name yield one 201 and one 412.
 func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -384,6 +485,15 @@ func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("worker size read", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("If-None-Match")) == "*" {
+		// Create-only and the name exists: refuse before any validation or write.
+		slog.Info("worker size create-only refused", "size", name, "by_user_id", user.ID)
+		httpx.JSON(w, http.StatusPreconditionFailed, map[string]string{
+			"error":  "worker size " + name + " already exists",
+			"reason": "size_exists",
+		})
 		return
 	}
 	prev := rowSpec(row)

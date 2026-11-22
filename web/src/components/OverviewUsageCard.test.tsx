@@ -4,10 +4,13 @@ import { act, cleanup, fireEvent, render, within } from "@testing-library/react"
 import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
 import { OverviewUsageCard } from "./OverviewUsageCard";
-import type { UsageWindow } from "./UsageCards";
+import type { UsageWindow } from "../lib/usageByUser";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
-import { USAGE_SCOPE_NOTE } from "./usageParts";
+import { OUTCOME_SCOPE_NOTE, USAGE_SCOPE_NOTE } from "./usageParts";
+
+// The text a trigger's aria-describedby points at: its tooltip.
+const description = (el: HTMLElement) => document.getElementById(el.getAttribute("aria-describedby") ?? "")?.textContent;
 
 const bundle = (input: number, cache: number, output: number, cost: number) => ({
   input_tokens: input, cache_read_tokens: cache, cache_creation_tokens: 0,
@@ -277,14 +280,37 @@ describe("OverviewUsageCard (#3881 M1)", () => {
       expect(mount({ self }).getByText("No token usage recorded yet.")).toBeTruthy();
     });
 
-    it("renders the scope note", () => {
+    it("explains the scope in the Usage title's info tip, not as a paragraph", () => {
       const view = mount({ self: fixture().self });
-      expect(view.getByText(USAGE_SCOPE_NOTE)).toBeTruthy();
+      const info = view.getByRole("button", { name: "About usage figures" });
+      expect(description(info)).toBe(USAGE_SCOPE_NOTE);
+      expect(view.getByText(USAGE_SCOPE_NOTE).tagName).toBe("SPAN");
+      // Beside the heading, never inside it: the heading's name stays "Usage".
+      expect(view.getByRole("heading", { name: "Usage" }).contains(info)).toBe(false);
     });
 
     it("divides the full cost, helper spend included, by the PR count", () => {
       const self = helperOnly(); self.lifetime_pr_count = 4;
       expect(mount({ self }).getByText("$308.64 per PR")).toBeTruthy();
+    });
+  });
+
+  describe("outcome scope caption (#4577)", () => {
+    it("renders in personal scope and after switching to All users", () => {
+      const { self, admin } = fixture();
+      const view = mount({ self, admin });
+      expect(description(view.getByRole("button", { name: "About run outcomes" }))).toBe(OUTCOME_SCOPE_NOTE);
+      fireEvent.click(view.getByRole("button", { name: "All users" }));
+      expect(view.getAllByText(OUTCOME_SCOPE_NOTE)).toHaveLength(1);
+      expect(description(view.getByRole("button", { name: "About run outcomes" }))).toBe(OUTCOME_SCOPE_NOTE);
+    });
+
+    it("is not rendered when there are no finished runs", () => {
+      const { self } = fixture();
+      self.outcomes = { lifetime: outcomes({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {} }), last_7_days: self.outcomes.last_7_days };
+      const view = mount({ self });
+      expect(view.getByText("No finished runs in this period.")).toBeTruthy();
+      expect(view.queryByText(OUTCOME_SCOPE_NOTE)).toBeNull();
     });
   });
 
@@ -619,10 +645,23 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     const view = factoryView({ self, admin });
     const row = cells(rowOf(view, /^owner\./));
     expect(row[3]).toBe("10");
-    expect(row[4]).toBe("10.0%of 100 finished");
     expect(row[6]).toMatch(/^\$1,235.+/);
-    expect(within(rowOf(view, /^owner\./)).getByTitle("10 of 100 finished runs")).toBeTruthy();
-    expect(cells(rowOf(view, "Factory"))[4]).toBe("10.0%of 200 finished");
+    // The denominator moved from a second line into the rate's tip: the rate is the trigger's
+    // whole name, the denominator its description, and the cell carries no native title.
+    const rateOf = (name: RegExp | string) => within(rowOf(view, name)).getByRole("button", { name: "10.0%" });
+    expect(description(rateOf(/^owner\./))).toBe("10 failed of 100 finished runs");
+    expect(description(rateOf("Factory"))).toBe("20 failed of 200 finished runs");
+    expect(rowOf(view, /^owner\./).children[4].getAttribute("title")).toBeNull();
+    expect(within(rowOf(view, /^owner\./)).queryByText(/^of 100 finished$/)).toBeNull();
+  });
+
+  it("leaves a rate with no finished runs as plain text, with nothing to explain", () => {
+    const { self, admin } = fixture();
+    admin.users[0].outcomes = outcomes({ finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {} });
+    const view = factoryView({ self, admin });
+    const rateCell = rowOf(view, /^owner\./).children[4] as HTMLElement;
+    expect(rateCell.textContent).toBe("—");
+    expect(within(rateCell).queryByRole("button")).toBeNull();
   });
 
   it("takes the Factory row's lifetime Runs from the factory count, not the row sum", () => {

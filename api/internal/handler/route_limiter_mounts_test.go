@@ -944,6 +944,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
+	{"POST", "/api/worker/runs/{id}/phase-switch-hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/repo-agent-source-hold", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
@@ -1009,6 +1010,7 @@ var wantRouteMounts = []routeMount{
 	// Issue #4201: the in-place credential switch apply rides proposalLimiter.PerWorkerMiddleware
 	// (per-WORKER), which this per-USER probe reads as noLimiter.
 	{"POST", "/api/worker/runs/{id}/credential-switch/apply", noLimiter},
+	{"POST", "/api/worker/runs/{id}/credential-switch/codex/preflight", noLimiter},
 	// Bounded local lifecycle report, no forge/provider I/O; both actual router
 	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
 	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},

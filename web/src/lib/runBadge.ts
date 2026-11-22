@@ -188,6 +188,9 @@ export const NON_COMPLETION_HOLDS = {
   // Issue #3250: the run's chosen model or effort cannot run on its harness. RunOverrideHoldPanel owns
   // Resume and Cancel; Resume retries only if the choice has become available on that harness.
   run_override_unavailable: { tone: "warning", label: "model choice unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
+  // Issue #3252: the runtime did not switch between the planning and implementation model or effort.
+  // PhaseSwitchHoldPanel owns Resume (retries on a new claim) and Cancel.
+  phase_switch_unavailable: { tone: "warning", label: "planning switch unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
 } as const;
 
 type NonCompletionHold = keyof typeof NON_COMPLETION_HOLDS;
@@ -929,6 +932,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detai
     case "run_override_unavailable":
       return { kind: "badge", label: PARK_LABELS.run_override_unavailable, tone: "warning", pulse: false,
         title: "The run's chosen model or effort cannot run on its harness. The run waits for its owner; open the run to Resume and retry, or Cancel." };
+    case "phase_switch_unavailable":
+      return { kind: "badge", label: PARK_LABELS.phase_switch_unavailable, tone: "warning", pulse: false,
+        title: "The runtime did not switch between the planning and implementation model or effort. The run waits for its owner; open the run to Resume and retry on a new claim, or Cancel." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -1208,7 +1214,7 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
 }
 
 // milestoneBadgeText renders the compact pill's label + tooltip from a MilestoneProgress,
-// so the board (Dashboard/RunsList) stays in lockstep (PRD #265 M2). A
+// so the board (Overview/RunsList) stays in lockstep (PRD #265 M2). A
 // reported run shows `M{done}/{total}`; an unreported one shows an en-dash numerator and
 // says so in the tooltip, never a `0/N` that reads as failure on a done run.
 //

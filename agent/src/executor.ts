@@ -1,5 +1,7 @@
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { execFile } from "node:child_process";
 import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
+import type { PhaseSettings, PhaseSwitchCause } from "./phase-switch-unverified.js";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
@@ -845,6 +847,8 @@ export interface RunContext {
    * runner's outer catch, byte-identical to the pre-fix behaviour.
    */
   attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up" | "applied">;
+  /** Codex-only settled-boundary coordinator; only confirmed continuations return. */
+  attemptCodexCredentialSwitch?(opts: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"continued_A" | "resumed_B" | "fresh_B">;
   /**
    * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
    * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
@@ -1059,6 +1063,11 @@ export interface ExecutorResult {
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
   walled?: { reason: string };
+  /** PRD #3252 D8 (m4): phase verification failed before prompt release or a later init contradicted
+   *  the admitted pair (a request may already have been admitted). The runner reads it in phasePublish to SKIP
+   *  finalization and enter the phase-switch worker hold (no push, no PR, no terminal report). Claude
+   *  lead lanes only; absent on every other result. */
+  phaseSwitchHeld?: { cause: PhaseSwitchCause; requested: PhaseSettings; observed: PhaseSettings; phase: "plan" | "implement" };
   /** Disposition for every iteration sink outcome. The runner must skip finalization for either. */
   iterationParked?: { outcome: IterationParkOutcome };
   /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
@@ -1094,12 +1103,39 @@ export class PlanRevisionReplacedError extends Error {
   }
 }
 
+/** A proven exact-thread rollout in the credential-free local session store. */
+export type UsableSavedRollout = { kind: "usable"; sessionId: string } | { kind: "failed"; reason?: string };
+
+/**
+ * Executor-owned A half of a credential switch. Runner must already hold model
+ * execution at a settled boundary and confirm the operation before reopenA.
+ * Runner owns external drains, server fences and atomic batcher/claim publication.
+ */
+export interface CodexSuspendedEpoch {
+  /** Complete captured A's installer/credential boundary before read-only preflight.
+   * remainingMs is computed by the caller using its SwitchBounds monotonic clock.
+   */
+  reconcileA(bounds: import("./codex-switch-coordinator.js").SwitchBounds, remainingMs: number): Promise<import("./codex/safety.js").ReconcileOutcome>;
+  persistRollout(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout>;
+  reopenA(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+  teardown(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<boolean>;
+  publishB(bundle: Readonly<import("./codex-switch-coordinator.js").CodexSwitchBundle>, bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+  restartAndResume(sessionId: string, bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<import("./codex-switch-coordinator.js").CodexRestartResult>;
+  startFreshLineage(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+  finishB(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+}
+
 /**
  * The unit M3 replaces with the Claude Agent SDK. Keeping it behind this
  * interface is what lets M2 exercise the full state machine (claim → worktree →
  * work → report) with no AI in the loop.
  */
 export interface Executor {
+  /** Compose external Codex summaries with this executor's authority and cleanup owner. */
+  bindCodexSummaryFactory?(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory;
+  /** Strict credential-free save of the current live leg; does not stop or switch it. */
+  saveUsableRollout?(): Promise<UsableSavedRollout>;
+  suspendCodexEpoch?(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch>;
   run(ctx: RunContext): Promise<ExecutorResult>;
   /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
   closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;

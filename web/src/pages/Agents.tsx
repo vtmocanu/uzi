@@ -4,10 +4,12 @@
 // admins additionally toggle which builtin/global templates are global defaults.
 // Anyone can author a private ("Mine") agent; admins can also publish globals.
 
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
+import type { EffectiveSettings } from "../lib/apiTypes";
+import { codexRuntimeDefaultLabel, modelSettingSourceLabel } from "../lib/modelSettings";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { agentCountModel, isShadowedTemplate, sharedTemplateNames } from "../lib/agentCounts";
@@ -19,7 +21,7 @@ import {
   SYNCED_BADGE_LABEL,
   SYNCED_BADGE_TONE,
   TEMPLATE_SCOPE_LABEL,
-  templateModelsLabel,
+  templatePinRows,
   templateScopeBadgeTone,
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
@@ -49,16 +51,25 @@ export function Agents() {
   // must not fire from stale state and drop one (reviewer M7 ride-along).
   const [busy, setBusy] = useState(false);
 
+  const userId = user?.id;
+  // The viewer the loaded allocations belong to. A viewer change re-runs the load
+  // (deps below) but the previous viewer's allocations stay on screen until it
+  // lands, so the personal line is gated on this matching the current viewer.
+  const [allocFor, setAllocFor] = useState<string | null>(null);
+
   const { data, loading, error: loadError } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [{ templates }, { templates: alloc }] = await Promise.all([
         api.listAgentTemplates(),
         api.getTemplateAllocations(),
       ]);
-      setAllocations(alloc);
+      if (isCurrent()) {
+        setAllocations(alloc);
+        setAllocFor(userId ?? null);
+      }
       return { templates };
     },
-    [],
+    [userId],
     { fallback: "Failed to load templates" },
   );
   const templates = useMemo(() => data?.templates ?? [], [data]);
@@ -76,9 +87,68 @@ export function Agents() {
     [allocations, templates, isAdmin, user?.id],
   );
 
+  // The personal line depends on which lead template is effective, so it is
+  // fetched separately from the list (its failure never breaks the page) and is
+  // keyed by allocVersion + viewer: a response is shown only for the allocations
+  // and user it was requested for. allocVersion bumps on every successful PUT.
+  const [allocVersion, setAllocVersion] = useState(0);
+  const viewerRef = useRef(userId);
+  useEffect(() => {
+    viewerRef.current = userId;
+  }, [userId]);
+  const [personal, setPersonal] = useState<{
+    forVersion: number;
+    forUserId: string;
+    data: EffectiveSettings;
+  } | null>(null);
+  useEffect(() => {
+    if (!userId) return;
+    const v = allocVersion;
+    const uid = userId;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await api.getEffectiveSettings();
+        if (cancelled) return;
+        if (!res || !Array.isArray(res.models) || !Array.isArray(res.efforts) || !Array.isArray(res.harnesses)) return;
+        setPersonal({ forVersion: v, forUserId: uid, data: res });
+      } catch {
+        // Omit the line; the list is unaffected.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [allocVersion, userId]);
+
+  const leadIds = useMemo(
+    () =>
+      templates
+        .filter((t) => isLeadTemplateName(t.name) && !isShadowedTemplate(t, sharedNames) && allocById.get(t.id)?.effective)
+        .map((t) => t.id),
+    [templates, allocById, sharedNames],
+  );
+  const personalData =
+    !loading &&
+    !loadError &&
+    personal &&
+    personal.forVersion === allocVersion &&
+    personal.forUserId === user?.id &&
+    allocFor === user?.id
+      ? personal.data
+      : null;
+  const rowLine = (id: string): ReactNode => {
+    if (!personalData || leadIds.length !== 1 || leadIds[0] !== id) return null;
+    const lines = personalHarnessLines(personalData, (f) => `For your ${f} runs: `);
+    return lines.length ? <div data-testid="personal-lead-line">{lines}</div> : null;
+  };
+  const noteLines =
+    personalData && leadIds.length !== 1 ? personalHarnessLines(personalData, (f) => `${f}: `) : [];
+
   // Replace-set writes: the PUT fully replaces the half it carries, so each
   // toggle recomputes the whole set from current state and changes just one entry.
   const setMyOverride = async (id: string, enabled: boolean) => {
+    const initiator = userId;
     setBusy(true);
     setError("");
     setNotice("");
@@ -87,7 +157,11 @@ export function Agents() {
         .filter((a) => a.id === id || a.my_override !== null)
         .map((a) => ({ template_id: a.id, enabled: a.id === id ? enabled : (a.my_override as boolean) }));
       const { templates: next } = await api.setTemplateAllocations({ my_overrides });
+      // The viewer changed while the PUT was in flight: its response belongs to
+      // the previous viewer and must not replace the new viewer's allocations.
+      if (viewerRef.current !== initiator) return;
       setAllocations(next);
+      setAllocVersion((v) => v + 1);
     } catch (err) {
       setError(errorMessage(err, "Failed to update allocation"));
     } finally {
@@ -96,6 +170,7 @@ export function Agents() {
   };
 
   const setGlobalDefault = async (id: string, on: boolean) => {
+    const initiator = userId;
     setBusy(true);
     setError("");
     setNotice("");
@@ -105,7 +180,11 @@ export function Agents() {
         .filter((a) => (a.id === id ? on : a.global_default))
         .map((a) => a.id);
       const { templates: next } = await api.setTemplateAllocations({ global_default_ids });
+      // The viewer changed while the PUT was in flight: its response belongs to
+      // the previous viewer and must not replace the new viewer's allocations.
+      if (viewerRef.current !== initiator) return;
       setAllocations(next);
+      setAllocVersion((v) => v + 1);
     } catch (err) {
       setError(errorMessage(err, "Failed to update global default"));
     } finally {
@@ -169,6 +248,13 @@ export function Agents() {
       {loading ? (
         <ListSkeleton rows={6} />
       ) : (
+        <>
+        {noteLines.length > 0 && (
+          <div data-testid="personal-lead-note" className="text-sm text-muted">
+            <div className="font-medium text-fg">For your lead runs:</div>
+            <div className="space-y-0.5 text-xs text-faint">{noteLines}</div>
+          </div>
+        )}
         <Card flush>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
@@ -177,7 +263,7 @@ export function Agents() {
                   <th className="px-4 py-3 font-medium">Name</th>
                   <th className="px-4 py-3 font-medium">Scope</th>
                   <th className="px-4 py-3 font-medium">Description</th>
-                  <th className="px-4 py-3 font-medium">Model</th>
+                  <th className="min-w-[14rem] px-4 py-3 font-medium">Model & effort</th>
                   <th className="px-4 py-3 font-medium">Tools</th>
                   <th className="px-4 py-3 text-center font-medium">In my runs</th>
                   {isAdmin && <th className="px-4 py-3 text-center font-medium">Global default</th>}
@@ -198,7 +284,8 @@ export function Agents() {
                       alloc={allocById.get(t.id)}
                       isAdmin={isAdmin}
                       shadowed={isShadowedTemplate(t, sharedNames)}
-                      busy={busy}
+                      busy={busy || allocFor !== user?.id}
+                      personalLine={rowLine(t.id)}
                       onToggleMine={setMyOverride}
                       onToggleGlobal={setGlobalDefault}
                     />
@@ -208,6 +295,7 @@ export function Agents() {
             </table>
           </div>
         </Card>
+        </>
       )}
     </div>
   );
@@ -218,15 +306,43 @@ function SummarySep() {
   return <span className="text-faint"> · </span>;
 }
 
+// personalHarnessLines renders the caller's own worker_model / worker_effort per
+// usable harness. It is personal data from /me/effective-settings and is never
+// mixed into the shared stored-pin cells.
+function personalHarnessLines(data: EffectiveSettings, prefix: (family: string) => string): ReactNode[] {
+  const out: ReactNode[] = [];
+  for (const h of ["claude", "codex"] as const) {
+    if (!data.harnesses.find((x) => x.harness === h)?.usable) continue;
+    const m = data.models.find((c) => c.harness === h && c.setting === "worker_model");
+    const e = data.efforts.find((c) => c.harness === h && c.setting === "worker_effort");
+    if (!m && !e) continue;
+    const family = h === "claude" ? "Claude" : "Codex";
+    const parts: string[] = [];
+    if (m) {
+      const unset = modelSettingSourceLabel("note", "sdk_default");
+      parts.push(`${m.resolved_model || unset} · ${modelSettingSourceLabel("model", m.source)}`);
+    }
+    if (e) {
+      const runtime = e.mode === "runtime_default" || !e.resolved_effort;
+      const label = !runtime ? e.resolved_effort : h === "codex" ? codexRuntimeDefaultLabel(e) : "Runtime default";
+      parts.push(`effort ${label} · ${modelSettingSourceLabel("effort", e.source)}`);
+    }
+    out.push(<div key={h}>{`${prefix(family)}${parts.join("; ")}`}</div>);
+  }
+  return out;
+}
+
 function AgentRow({
   template: t,
   alloc,
   isAdmin,
   shadowed,
   busy,
+  personalLine,
   onToggleMine,
   onToggleGlobal,
 }: {
+  personalLine: ReactNode;
   template: AgentTemplate;
   alloc: TemplateAllocation | undefined;
   isAdmin: boolean;
@@ -236,6 +352,7 @@ function AgentRow({
   onToggleGlobal: (id: string, on: boolean) => void;
 }) {
   const effective = alloc?.effective ?? false;
+  const pins = templatePinRows(t);
   const globalDefault = alloc?.global_default ?? false;
   // Per-row ids: these hints sit in a table, so a single shared id would point
   // every row's badge at the first row's description.
@@ -319,8 +436,26 @@ function AgentRow({
         <Badge tone={templateScopeBadgeTone(t.scope)}>{TEMPLATE_SCOPE_LABEL[t.scope]}</Badge>
       </td>
       <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
-      <td className="px-4 py-3 text-muted">{templateModelsLabel(t)}</td>
-      <td className="max-w-xs truncate px-4 py-3 font-mono text-xs text-muted">{summarizeTools(t)}</td>
+      <td className="min-w-[14rem] px-4 py-3 text-muted">
+        {pins.collapsed ? (
+          <div role="group" aria-label="Claude and Codex model and effort" className="space-y-0.5">
+            <div>{pins.rows[0].model.label}</div>
+            <div className="text-faint">{`effort: ${pins.rows[0].effort.label}`}</div>
+            <div className="text-xs text-faint">both harnesses</div>
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            {pins.rows.map((r) => (
+              <div key={r.harness} role="group" aria-label={`${r.family} model and effort`}>
+                <div>{`${r.family}: ${r.model.label}`}</div>
+                <div className="text-faint">{`effort: ${r.effort.label}`}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {personalLine && <div className="mt-1 space-y-0.5 text-xs text-faint">{personalLine}</div>}
+      </td>
+      <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-muted">{summarizeTools(t)}</td>
       <td className="px-4 py-3 text-center">
         <input
           type="checkbox"

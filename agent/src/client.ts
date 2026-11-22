@@ -4,7 +4,7 @@ import {
   type PolicyRecoveryVerifiedRequest, type PolicyRecoveryVerifiedReply,
 } from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
-import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
+import type { ClaimCodexSecrets, CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
 import { selectCodexBinding } from "./codex/select.js";
 import { createHash } from "node:crypto";
@@ -154,6 +154,8 @@ import {
   type RecoverySettleRequest,
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
+  type PhaseSwitchHoldOutcome,
+  PHASE_SWITCH_HOLD_REASON,
   type FollowupFinalizeResult,
   BASE_ATTESTATION_HOLD_REASON,
   REPO_AGENT_SOURCE_HOLD_REASON,
@@ -328,7 +330,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
   }
   const caps = list(c.required_capabilities), tools = list(c.required_tools);
   if (!caps || !tools) return invalid();
-  // The normalizer preserves extra milestone prose, bounded to depth 32 and total bytes.
+  // The server admits only {id,title} milestone objects for new submissions, but rows stored
+  // earlier may still carry extra prose; this check stays a tolerant text/depth/size bound (depth 32, total bytes).
   const prose = (v: unknown, depth: number): boolean => depth <= 32 &&
     (typeof v === "string" ? crossCheckText(v, 256 * 1024) :
       Array.isArray(v) ? v.every((x) => prose(x, depth + 1)) :
@@ -854,9 +857,13 @@ export class SanitizedPrDescriptionFields {
 // minted as a frozen SanitizedPrDescriptionFields instance and the size is rebuilt frozen. None is exported: minting from arbitrary input stays
 // inside this module, on HTTP response bodies only.
 
-/** Issue #4201: the credential_switch signal is `{generation, op_id?}`; v1 servers omit op_id. */
-function credentialSwitchSignal(cs: { generation: number; op_id?: unknown }): { generation: number; op_id?: string } {
-  return typeof cs.op_id === "string" && cs.op_id !== "" ? { generation: cs.generation, op_id: cs.op_id } : { generation: cs.generation };
+/** Optional switch coordinates are retained only when nonempty strings. */
+function credentialSwitchSignal(cs: { generation: number; op_id?: unknown; target_secret_id?: unknown }): { generation: number; op_id?: string; target_secret_id?: string } {
+  return {
+    generation: cs.generation,
+    ...(typeof cs.op_id === "string" && cs.op_id !== "" ? { op_id: cs.op_id } : {}),
+    ...(typeof cs.target_secret_id === "string" && cs.target_secret_id !== "" ? { target_secret_id: cs.target_secret_id } : {}),
+  };
 }
 
 function parseJSONRecord(text: string): Record<string, unknown> | undefined {
@@ -1428,6 +1435,9 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
 /** Issue #4201: the api serves the in-place credential switch apply route and op-fenced reports. */
 const CREDENTIAL_SWITCH_APPLY_FEATURE = "credential_switch_apply_v1";
+const CODEX_CREDENTIAL_SWITCH_APPLY_FEATURE = "codex_credential_switch_apply_v1";
+const CODEX_SWITCH_STOPPED_FEATURE = "codex_switch_stopped_v1";
+const CODEX_CREDENTIAL_SWITCH_CAPABILITY = "codex_credential_switch_v1";
 /** Issue #4201: the protocol capability a worker advertises to use the in-place apply route. */
 const CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY = "credential_switch_in_place_v1";
 
@@ -1441,9 +1451,35 @@ export interface CredentialSwitchApplyRequest {
   oldCumulative?: unknown;
 }
 
+export interface CodexSwitchPreflightRequest extends CredentialSwitchApplyRequest {
+  targetSecretId: string;
+}
+
+/** Server's current coordinates; ready is an observation, never apply authority. */
+export type CodexSwitchPreflightResult =
+  | { kind: "ready"; expectedEpoch: number; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "superseded" | "fenced"; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "not_applied" | "refused_committed"; reason: string; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "uncertain"; detail: string };
+
+function decodeSwitchCodex(raw: unknown): ClaimCodexSecrets | undefined {
+  if (!isRecord(raw) || typeof raw.access_token !== "string" || raw.access_token.trim() === "" ||
+      typeof raw.capability !== "string" || raw.capability.trim() === "") return undefined;
+  if (raw.auth_mode === "api_key" && hasExactKeys(raw, ["auth_mode", "access_token", "capability"]))
+    return { auth_mode: "api_key", access_token: raw.access_token, capability: raw.capability };
+  if (raw.auth_mode === "subscription" &&
+      hasExactKeys(raw, ["auth_mode", "access_token", "capability", "generation", "chatgpt_account_id", "chatgpt_plan_type"]) &&
+      validGeneration(raw.generation) && typeof raw.chatgpt_account_id === "string" &&
+      raw.chatgpt_account_id.trim() !== "" && raw.chatgpt_plan_type === null)
+    return { auth_mode: "subscription", access_token: raw.access_token, capability: raw.capability,
+      generation: raw.generation, chatgpt_account_id: raw.chatgpt_account_id, chatgpt_plan_type: null };
+  return undefined;
+}
+
 /** Raw classification of one apply call. Never carries a response body; `detail` is a fixed label. */
 export type CredentialSwitchApplyResult =
   | { kind: "applied"; token: string; ordinal: number; messageSeq: number; replay: boolean }
+  | { kind: "codex_applied"; codex: ClaimCodexSecrets; capabilityEpoch: number; ordinal: number; messageSeq: number; replay: boolean }
   | { kind: "superseded" }
   | { kind: "fenced" }
   | { kind: "not_applied"; reason: string }
@@ -1731,6 +1767,8 @@ export class WorkerClient {
   private hasCredentialSwitchCapability = false;
   /** Issue #4201: whether THIS registration advertised credential_switch_in_place_v1. */
   private hasInPlaceCredentialSwitchCapability = false;
+  private hasCodexCredentialSwitchCapability = false;
+  private hasCodexSwitchStoppedCapability = false;
   /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
@@ -2143,6 +2181,8 @@ export class WorkerClient {
     this.hibernationPruneAdvertised = originalCapabilities?.includes("hibernation_cache_prune_v1") ?? false;
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasInPlaceCredentialSwitchCapability = originalCapabilities?.includes(CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY) ?? false;
+    this.hasCodexSwitchStoppedCapability = originalCapabilities?.includes(CODEX_SWITCH_STOPPED_FEATURE) ?? false;
+    this.hasCodexCredentialSwitchCapability = originalCapabilities?.includes(CODEX_CREDENTIAL_SWITCH_CAPABILITY) ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
@@ -2192,16 +2232,95 @@ export class WorkerClient {
     return this.hasInPlaceCredentialSwitchCapability && this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE);
   }
 
+  /** Requires this registration's Codex capability and the server's Codex apply feature. */
+  supportsInPlaceCodexCredentialSwitch(): boolean {
+    return this.hasCodexCredentialSwitchCapability && this.hasFeature(CODEX_CREDENTIAL_SWITCH_APPLY_FEATURE);
+  }
+
+  /** Admission requires both apply and stopped settlement negotiation. */
+  supportsCodexSwitchStopped(): boolean {
+    return this.supportsInPlaceCodexCredentialSwitch() &&
+      this.hasCodexSwitchStoppedCapability && this.hasFeature(CODEX_SWITCH_STOPPED_FEATURE);
+  }
+
+  /** One bounded settlement attempt using the admitted tuple, even after feature withdrawal. */
+  async settleCodexSwitchStopped(runId: string, req: {
+    claimGeneration: number; registerNonce: string; expectedEpoch: number;
+  }, signal?: AbortSignal): Promise<{ kind: "confirmed" | "unconfirmed" | "fenced" }> {
+    const { claimGeneration, registerNonce, expectedEpoch } = req;
+    if (this.registerNonce !== registerNonce) return { kind: "fenced" };
+    if (!validGeneration(claimGeneration) || !Number.isSafeInteger(expectedEpoch) || expectedEpoch <= 0 ||
+        !registerNonce || signal?.aborted) return { kind: "unconfirmed" };
+    let res: Response;
+    let raw: Buffer;
+    try {
+      res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/state`, {
+        status: "codex_switch_stopped", claim_generation: claimGeneration,
+        register_nonce: registerNonce, expected_epoch: expectedEpoch,
+      }, this.httpTimeoutMs, signal);
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true, signal);
+    } catch {
+      return { kind: this.registerNonce !== registerNonce ? "fenced" : "unconfirmed" };
+    }
+    if (this.registerNonce !== registerNonce) return { kind: "fenced" };
+    if (signal?.aborted || res.status !== 200) return { kind: "unconfirmed" };
+    const out = parseJSONRecord(raw.toString("utf8"));
+    const run = out?.run;
+    return { kind: out?.applied === true && out.disposition === "codex_switch_stopped" &&
+      isRecord(run) && run.id === runId && run.claim_generation === claimGeneration &&
+      run.status === "paused" && run.hold_reason === null ? "confirmed" : "unconfirmed" };
+  }
+
+  /** One read-only attempt. No response body or auth is retained on failure. */
+  async preflightCodexCredentialSwitch(runId: string, req: CodexSwitchPreflightRequest, signal?: AbortSignal): Promise<CodexSwitchPreflightResult> {
+    if (!this.supportsInPlaceCodexCredentialSwitch())
+      throw new Error("Codex switch preflight requires codex_credential_switch_v1 and codex_credential_switch_apply_v1");
+    let res: Response;
+    let raw: Buffer;
+    try {
+      res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/credential-switch/codex/preflight`, {
+        claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
+        target_secret_id: req.targetSecretId,
+        ...(req.oldCumulative !== undefined ? { old_cumulative: req.oldCumulative } : {}),
+      }, this.httpTimeoutMs, signal);
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true, signal);
+    } catch { return { kind: "uncertain", detail: "preflight_unavailable" }; }
+    if (signal?.aborted) return { kind: "uncertain", detail: "preflight_unavailable" };
+    if (res.status !== 200) return { kind: "uncertain", detail: `http_${res.status}` };
+    const out = parseJSONRecord(raw.toString("utf8"));
+    const invalid = (): CodexSwitchPreflightResult => ({ kind: "uncertain", detail: "malformed_preflight" });
+    if (!out || !validGeneration(out.claim_generation) || typeof out.register_nonce !== "string" || typeof out.op_id !== "string")
+      return invalid();
+    const coords = { claimGeneration: out.claim_generation, registerNonce: out.register_nonce, opId: out.op_id };
+    const keys = ["outcome", "claim_generation", "register_nonce", "op_id"];
+    switch (out.outcome) {
+      case "ready":
+        return hasExactKeys(out, [...keys, "expected_epoch"]) &&
+          typeof out.expected_epoch === "number" && Number.isSafeInteger(out.expected_epoch) && out.expected_epoch > 0
+          ? { kind: "ready", expectedEpoch: out.expected_epoch, ...coords } : invalid();
+      case "superseded":
+      case "fenced":
+        return hasExactKeys(out, keys) ? { kind: out.outcome, ...coords } : invalid();
+      case "not_applied":
+      case "refused_committed":
+        return hasExactKeys(out, [...keys, "reason"]) && typeof out.reason === "string" &&
+          out.reason.length > 0 && out.reason.length <= APPLY_REASON_MAX
+          ? { kind: out.outcome, reason: out.reason, ...coords } : invalid();
+      default: return invalid();
+    }
+  }
+
   /**
    * POST /worker/runs/:id/credential-switch/apply (issue #4201). One attempt, never retried here.
    * Classification is strict: `route_absent` only for chi's default text/plain `404 page not found`;
    * the exact run-not-owned JSON 404 is `fenced`; everything unrecognised is `uncertain`, because the
    * server may have committed. Never echoes a response body or the token. Callers must check
-   * supportsInPlaceCredentialSwitch() first; calling without it is a programming error.
+   * supportsInPlaceCredentialSwitch() or supportsInPlaceCodexCredentialSwitch() first. The shared
+   * request has no harness discriminator; either independently negotiated lane authorizes it.
    */
-  async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> {
-    if (!this.supportsInPlaceCredentialSwitch())
-      throw new Error("applyCredentialSwitch requires the credential_switch_in_place_v1 capability and the credential_switch_apply_v1 feature; check supportsInPlaceCredentialSwitch() first");
+  async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest, signal?: AbortSignal): Promise<CredentialSwitchApplyResult> {
+    if (!this.supportsInPlaceCredentialSwitch() && !this.supportsInPlaceCodexCredentialSwitch())
+      throw new Error("applyCredentialSwitch requires supportsInPlaceCredentialSwitch() or supportsInPlaceCodexCredentialSwitch() negotiation");
     const body: Record<string, unknown> = {
       claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
     };
@@ -2210,13 +2329,13 @@ export class WorkerClient {
     const uncertain = (detail: string): CredentialSwitchApplyResult => ({ kind: "uncertain", detail });
     let res: Response;
     try {
-      res = await this.fetchRaw("POST", path, body);
+      res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
     } catch {
       return uncertain("transport_error");
     }
     let raw: Buffer;
     try {
-      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true);
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true, signal);
     } catch {
       return uncertain("response_unreadable");
     }
@@ -2236,6 +2355,15 @@ export class WorkerClient {
     switch (out.outcome) {
       case "applied": {
         const { ordinal, message_seq: messageSeq, replay } = out;
+        if (Object.hasOwn(out, "codex") || Object.hasOwn(out, "capability_epoch")) {
+          const codex = decodeSwitchCodex(out.codex);
+          if (!this.hasFeature("codex_credential_switch_apply_v1") ||
+              !hasExactKeys(out, ["outcome", "codex", "capability_epoch", "ordinal", "message_seq", "replay"]) ||
+              !codex || !isInt(out.capability_epoch) || out.capability_epoch <= 0 ||
+              !isInt(ordinal) || ordinal <= 0 || !isInt(messageSeq) || messageSeq <= 0 || typeof replay !== "boolean")
+            return uncertain("malformed_codex_applied");
+          return { kind: "codex_applied", codex, capabilityEpoch: out.capability_epoch, ordinal, messageSeq, replay };
+        }
         // Trim once here: rebindCredential writes the trimmed value into the env, so the secret set, the
         // log registry and every other sink must see that same value.
         const token = typeof out.token === "string" ? out.token.trim() : out.token;
@@ -3057,17 +3185,17 @@ export class WorkerClient {
       // Issue #4201: fenced on the current registration and on the switch operation; never
       // downgraded or retried unqualified, because an api without the feature cannot decode it.
       const nonce = this.registerNonce;
-      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) || !nonce ||
+      if ((!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) && !this.supportsInPlaceCodexCredentialSwitch()) || !nonce ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
           typeof body.op_id !== "string" || body.op_id === "")
-        throw new ReportPreconditionError("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
+        throw new ReportPreconditionError("credential switch uncertain report requires the Claude apply feature or Codex negotiation, a registration nonce, a positive claim_generation and an op_id");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     if (body.op_id !== undefined) {
       if (body.status !== "credential_switch_failed" && body.status !== "credential_switch_held")
         throw new Error("op_id is only valid on credential switch failed, held and uncertain reports");
       // An api without the feature strict-decodes the report: keep the pre-#4201 shape for it.
-      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE)) {
+      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) && !this.supportsInPlaceCodexCredentialSwitch()) {
         const { op_id: _opId, ...withoutOp } = body;
         body = withoutOp;
       } else if (body.status === "credential_switch_failed") {
@@ -3076,6 +3204,13 @@ export class WorkerClient {
         const nonce = this.registerNonce;
         if (!nonce) throw new ReportPreconditionError("credential switch failed report with an op_id requires a registration nonce");
         body = { ...body, register_nonce: nonce };
+        if (this.supportsInPlaceCodexCredentialSwitch()) {
+          if (typeof body.op_id !== "string" || body.op_id === "" ||
+              !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
+            throw new ReportPreconditionError("Codex switch failed report requires a positive claim_generation and an op_id");
+          // Codex operation clears must retain their fences through strict-decode refusal.
+          return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+        }
       }
     }
     if (body.source_publication !== undefined) {
@@ -4534,7 +4669,7 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number; op_id?: string }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number; op_id?: string; target_secret_id?: string }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
@@ -5151,6 +5286,49 @@ export class WorkerClient {
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
     return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  /** Issue #3252: ask the server to hold this flight's claim on the `phase_switch_unavailable` hold
+   *  (POST /worker/runs/:id/phase-switch-hold). The claim generation is mandatory. One attempt, never
+   *  throws: `held` only on a 200 naming paused + this hold (a repeat answers the same 200); `refused`
+   *  on a 409 (its body's status, hold reason and `reason`, e.g. plan_not_approved); everything else,
+   *  a 404 included, is `unknown`. */
+  async requestPhaseSwitchHold(
+    runId: string,
+    args: { head?: string; claimGeneration: number; phase: "plan" | "implement" },
+    signal?: AbortSignal,
+  ): Promise<PhaseSwitchHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/phase-switch-hold`;
+    const body = {
+      ...(args.head !== undefined && args.head !== "" ? { head: args.head } : {}),
+      claim_generation: args.claimGeneration,
+      phase: args.phase,
+    };
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+      if (res.status === 200) {
+        const fields = await readRunAck(res);
+        if (fields.status === "paused" && fields.holdReason === PHASE_SWITCH_HOLD_REASON) {
+          return { outcome: "held", status: fields.status };
+        }
+        return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
+      }
+      if (res.status === 409) {
+        const fields = await readRunAck(res);
+        return {
+          outcome: "refused",
+          status: fields.status ?? "",
+          holdReason: fields.holdReason ?? null,
+          ...(fields.reason !== undefined ? { reason: fields.reason } : {}),
+        };
+      }
+      return { outcome: "unknown", detail: `HTTP ${res.status}` };
+    } catch (err) {
+      return { outcome: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   async requestRepoAgentSourceHold(
@@ -6350,7 +6528,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   budgetExhausted?: boolean;
   reason?: string;
   recoveryRetryNotBefore?: string | null;
-  credentialSwitch?: { generation: number; op_id?: string };
+  credentialSwitch?: { generation: number; op_id?: string; target_secret_id?: string };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
@@ -6454,7 +6632,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       budgetExhausted?: boolean;
       reason?: string;
       recoveryRetryNotBefore?: string | null;
-      credentialSwitch?: { generation: number; op_id?: string };
+      credentialSwitch?: { generation: number; op_id?: string; target_secret_id?: string };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;

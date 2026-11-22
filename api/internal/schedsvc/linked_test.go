@@ -83,7 +83,7 @@ func TestLinkedFireWithoutSourcesFailsClosed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			h, _, _ := linkedHarness(false)
 			h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 1}}
-			_, err := h.sched.fireOne(context.Background(), sched(h))
+			_, err := h.sched.fireOne(context.Background(), sched(h), false)
 			if err == nil {
 				t.Fatal("a linked repo with no resolver fired")
 			}
@@ -118,7 +118,7 @@ func TestLinkedProposalDigestWithoutSourcesIsSkipped(t *testing.T) {
 func TestLinkedSelfImproveFilesTheTrackingIssueThroughTheResolver(t *testing.T) {
 	h, tr, src := linkedHarness(true)
 	tr.createdIID = 501
-	out, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule())
+	out, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestLinkedSelfImproveFilesTheTrackingIssueThroughTheResolver(t *testing.T) 
 func TestLinkedSelfImproveRefusesWhenTheTrackingLabelIsTheEligibilityName(t *testing.T) {
 	h, tr, src := linkedHarness(true)
 	h.st.repoRow.EligibilityTagName = pgtype.Text{String: SelfImproveTrackingLabel, Valid: true}
-	_, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule())
+	_, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule(), false)
 	if !errors.Is(err, issuesource.ErrMarkerConfersEligibility) {
 		t.Fatalf("err = %v, want ErrMarkerConfersEligibility", err)
 	}
@@ -162,7 +162,7 @@ func TestLinkedSelfImproveRefusesWhenTheTrackingLabelIsTheEligibilityName(t *tes
 
 func TestLinkedSelfImproveWithoutSourcesFailsClosedAndNeverTouchesTheForge(t *testing.T) {
 	h, _, _ := linkedHarness(false)
-	if _, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule()); err == nil {
+	if _, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule(), false); err == nil {
 		t.Fatal("a linked repo with no resolver fired")
 	}
 	if h.fb.f.createCount != 0 || h.fb.f.listCount != 0 || len(h.runs.selfImprove) != 0 {
@@ -231,7 +231,7 @@ func TestLinkedFireSweepWithNoStoredTagIsABadConfigNotAForgeLabel(t *testing.T) 
 	h.st.repoRow.EligibilityTagName = pgtype.Text{}
 	sched := h.sweepSchedule(pgtype.Int4{})
 	sched.Labels = nil
-	if _, err := h.sched.fireSweep(context.Background(), sched); !errors.Is(err, errBadConfig) {
+	if _, err := h.sched.fireSweep(context.Background(), sched, false); !errors.Is(err, errBadConfig) {
 		t.Fatalf("err = %v, want errBadConfig", err)
 	}
 }

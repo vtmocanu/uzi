@@ -46,6 +46,7 @@
 
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentSource, AgentTemplate } from "./protocol.js";
+import { isHarnessEffort, type HarnessEffort } from "./harness.js";
 import { NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -221,6 +222,9 @@ function toDefinition(
     if (servers.length > 0) def.mcpServers = servers;
   }
   if (t.model) def.model = t.model;
+  // Template effort pin: only one of the five exact levels is projected; anything
+  // else (wrong case, "runtime", junk) is ignored so the subagent follows the run.
+  if (isHarnessEffort(t.effort)) def.effort = t.effort;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill
   // dropped by cap/collision) PLUS every all-templates skill — those carry no
@@ -333,12 +337,12 @@ export function subagentsFromTemplates(
 /**
  * PRD #305: when a schedule opts into "apply model also to agents", overwrite every
  * subagent's model with the run's resolved model (the same value the lead runs on),
- * overriding each template's own `model:` pin. Applied to BOTH rosters by the
- * executor — the own roster (assembled.subagents, before the plan-turn copy) and the
- * freshly-built repo roster — which is why it is a post-build mutation here rather
- * than a branch in `toDefinition`: the own roster is built and plan-turn-copied before
- * the run model resolves, so `toDefinition` cannot see it (PRD Decision 2 asks for one
- * mechanism covering both rosters; this helper is that mechanism). Mutates in place;
+ * overriding each template's own `model:` pin. The executor applies it per phase
+ * (PRD #3252): to the plan-turn roster copy with the PLAN lead model, and to the
+ * implement roster (own or repo-sourced, as selected) with the IMPLEMENT lead model.
+ * It is a post-build mutation here rather than a branch in `toDefinition` because the
+ * rosters are built before the run models resolve, so `toDefinition` cannot see them
+ * (PRD Decision 2 asks for one mechanism covering both rosters). Mutates in place;
  * the lead is never in these maps (it is the main thread), so it is untouched.
  */
 export function applySubagentModelOverride(
@@ -348,6 +352,24 @@ export function applySubagentModelOverride(
   for (const def of Object.values(subagents)) {
     def.model = model;
   }
+}
+
+/**
+ * Template effort precedence for Claude subagents: a subagent's own pin wins, else
+ * it runs at the lead's resolved effort, else (lead on the Runtime default) no
+ * effort key at all. Returns NEW definitions and never mutates its input, so
+ * `assembled.subagents` stays untouched. Applied to the copies the SDK receives.
+ */
+export function fillSubagentEffort(
+  roster: Record<string, AgentDefinition>,
+  leadEffort: HarnessEffort | undefined,
+): Record<string, AgentDefinition> {
+  const out: Record<string, AgentDefinition> = {};
+  for (const [name, def] of Object.entries(roster)) {
+    const effort = def.effort ?? leadEffort;
+    out[name] = effort === undefined ? { ...def } : { ...def, effort };
+  }
+  return out;
 }
 
 /** What a planning turn runs with (#203): the write-stripped roster, plus the

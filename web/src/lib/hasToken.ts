@@ -1,4 +1,4 @@
-// The one "does this user have an Anthropic token?" gate, shared by Dashboard,
+// The one "does this user have an Anthropic token?" gate, shared by the Overview,
 // Board and IssueView (PRD #104 M6).
 //
 // It lives here rather than inlined at the three call sites for a reason the
@@ -81,7 +81,7 @@ export function hasAnyCodexCredential(secrets: SecretMeta[]): boolean {
 }
 
 // hasUsableCredential is "a usable credential for AT LEAST ONE harness" — the onboarding
-// checklist's DONE condition (PRD #1429 M4a, Dashboard): a Codex-only user has already
+// checklist's DONE condition (PRD #1429 M4a, Overview): a Codex-only user has already
 // completed the "connect a credential" step even with zero Anthropic tokens.
 export function hasUsableCredential(secrets: SecretMeta[], codexMode?: string | null): boolean {
   return hasAnthropicToken(secrets) || isCodexUsable(secrets, codexMode);

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 // settingsFieldError is a decode or validation failure that names the request field it
@@ -120,6 +122,34 @@ func decodeSummaryModelField(raw json.RawMessage) (pgtype.Text, *settingsFieldEr
 
 func decodeCodexSummaryModelField(raw json.RawMessage) (pgtype.Text, *settingsFieldError) {
 	return decodePrefixedModelField(raw, "codex_summary_model", validateCodexSummaryModel)
+}
+
+// decodePlanningClaudeModelField validates the Claude planning model (PRD #3252): the same
+// Claude-lane rules as the judge lane (shared model rules plus the Codex role id refusal), with
+// the 400 naming planning_claude_model. Blank after trim clears to NULL.
+func decodePlanningClaudeModelField(raw json.RawMessage) (pgtype.Text, *settingsFieldError) {
+	return decodePrefixedModelField(raw, "planning_claude_model", validateClaudeJudgeModel)
+}
+
+// decodePlanningEffortField validates the Claude planning effort (PRD #3252): only the five
+// agenttmpl.EffortLevels; the preference-only `runtime` token is rejected. Blank clears.
+func decodePlanningEffortField(raw json.RawMessage) (pgtype.Text, *settingsFieldError) {
+	const field = "planning_claude_effort"
+	v, ferr := decodeNullableText(raw, field)
+	if ferr != nil {
+		return pgtype.Text{}, ferr
+	}
+	if v == nil {
+		return pgtype.Text{}, nil
+	}
+	e, err := agenttmpl.ValidateEffort(*v)
+	if err != nil {
+		return pgtype.Text{}, &settingsFieldError{Field: field, Message: field + ": " + err.Error()}
+	}
+	if e == "" {
+		return pgtype.Text{}, nil
+	}
+	return pgtype.Text{String: e, Valid: true}, nil
 }
 
 // decodeDefaultHarnessField validates default_harness (PUT /api/me/settings only).

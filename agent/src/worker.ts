@@ -2,6 +2,7 @@ import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import { CLAUDE_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -14,6 +15,7 @@ import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
+import { CLAUDE_PHASE_MODELS_CAPABILITY } from "./lead-config-report.js";
 import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, PublicationResumeEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
@@ -998,6 +1000,8 @@ export class Worker {
           // keeps draining /inputs while a switch is pending, which only a worker that handles the
           // switch in place can take.
           "credential_switch_in_place_v1",
+          "codex_credential_switch_v1",
+          "codex_switch_stopped_v1",
           // #2944: generation-stamped checkpoint/input/memory requests and fresh-transcript
           // checkpoint restoration. Distinct from the API feature milestone_reconciliation_v1.
           "milestone_reconciliation_claim_v1",
@@ -1042,6 +1046,9 @@ export class Worker {
           "cross_check_v1",
           "cross_check_rounds_v1",
           "cross_check_pins_v1",
+          // Issue #3258: this image applies `agents[].effort` template pins on both harnesses
+          // (Claude AgentDefinition.effort, Codex per-role effort). Advertised unconditionally.
+          "template_effort_v1",
           // PRD #2460: this image runs a Codex lead's checked plan gate and a Claude plan
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.
@@ -1069,6 +1076,15 @@ export class Worker {
           // writes Closes #<iid>. Advertised UNCONDITIONALLY: the api offers a run on a linked
           // repo only to a worker advertising it.
           "issue_key_v1",
+          // PRD #3252: this image resolves a Claude claim's plan_phase (planning model/effort) for the
+          // plan turns and the implementation values for the implement turns. Advertised
+          // UNCONDITIONALLY; the api sends plan_phase only to a worker advertising it.
+          CLAUDE_PHASE_MODELS_CAPABILITY,
+          // PRD #4320 / #4505: activated 2026-11-19 with the gateway-redirect risk accepted
+          // (ADR-4320). Advertised UNCONDITIONALLY: the api offers a provider-bound run only to a
+          // worker advertising it, and client.ts requireProviderCapability still refuses a provider
+          // claim on a registration that did not advertise it.
+          CLAUDE_PROVIDER_CAPABILITY,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

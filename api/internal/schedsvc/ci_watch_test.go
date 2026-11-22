@@ -183,7 +183,7 @@ func (h *ciHarness) schedule() store.RunSchedule {
 
 func (h *ciHarness) fire(t *testing.T, sched store.RunSchedule) FireOutcome {
 	t.Helper()
-	out, err := h.sched.fireOne(context.Background(), sched)
+	out, err := h.sched.fireOne(context.Background(), sched, false)
 	if err != nil {
 		t.Fatalf("fireOne: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestCIWatchKeepsDefaultBranchEvents(t *testing.T) {
 func TestCIWatchCIConfigPathLookupFailureCreatesNoRun(t *testing.T) {
 	h := newCIHarness(t, ciRed("1", 100, 0))
 	h.cf.pathErr = errors.New("gitlab 503")
-	if _, err := h.sched.fireOne(context.Background(), h.schedule()); err == nil {
+	if _, err := h.sched.fireOne(context.Background(), h.schedule(), false); err == nil {
 		t.Fatal("a ci_config_path lookup failure must be returned as a transient fire error")
 	}
 	if len(h.runs.ciRepairs) != 0 {
@@ -599,7 +599,7 @@ func TestCIWatchForgeErrors(t *testing.T) {
 
 	h = newCIHarness(t, ciRed("1", 100, 0))
 	h.cf.listErr = errors.New("503")
-	if _, err := h.sched.fireOne(context.Background(), h.schedule()); err == nil {
+	if _, err := h.sched.fireOne(context.Background(), h.schedule(), false); err == nil {
 		t.Fatal("an ordinary forge error must be transient (returned)")
 	}
 }
@@ -668,7 +668,7 @@ func TestCIWatchSeamRefusals(t *testing.T) {
 	// A transient create error is returned for retry, not recorded.
 	h := newCIHarness(t, ciRed("1", 100, 0))
 	h.runs.ciCreateErr = errors.New("db down")
-	if _, err := h.sched.fireOne(context.Background(), h.schedule()); err == nil {
+	if _, err := h.sched.fireOne(context.Background(), h.schedule(), false); err == nil {
 		t.Fatal("a transient create error must be returned")
 	}
 }
@@ -715,12 +715,12 @@ func TestCIWatchMissingCatalogIsBadConfig(t *testing.T) {
 	h := newCIHarness(t, ciRed("1", 100, 0))
 	s := h.schedule()
 	s.CatalogSlug = pgtype.Text{String: "nope", Valid: true}
-	if _, err := h.sched.fireOne(context.Background(), s); !errors.Is(err, errBadConfig) {
+	if _, err := h.sched.fireOne(context.Background(), s, false); !errors.Is(err, errBadConfig) {
 		t.Fatalf("err = %v, want errBadConfig", err)
 	}
 	s = h.schedule()
 	s.CiWorkflows = []byte(`{"not":"an array"}`)
-	if _, err := h.sched.fireOne(context.Background(), s); !errors.Is(err, errBadConfig) {
+	if _, err := h.sched.fireOne(context.Background(), s, false); !errors.Is(err, errBadConfig) {
 		t.Fatalf("err = %v, want errBadConfig for malformed ci_workflows", err)
 	}
 }
@@ -856,7 +856,7 @@ func TestCIWatchHistoryListingFailureNeverWrites(t *testing.T) {
 	for _, err := range []error{errors.New("503"), forge.ErrCIReadBudget, forge.ErrForgeVersionUnsupported} {
 		h := newCIHarness(t, ciRed("a", 100, 0), ciGreenRun("a", 99, -1))
 		h.cf.listErr = err
-		_, gotErr := h.sched.fireOne(context.Background(), h.schedule())
+		_, gotErr := h.sched.fireOne(context.Background(), h.schedule(), false)
 		if err.Error() == "503" && gotErr == nil {
 			t.Fatal("ordinary listing failure must remain transient")
 		}

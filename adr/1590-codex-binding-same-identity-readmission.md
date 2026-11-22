@@ -1,4 +1,4 @@
-# ADR-1590: a held Codex run's write-once binding may advance its material revision after a verified same-identity re-login, and nothing else
+# ADR-1590: a held Codex run's write-once binding may advance its material revision after a verified same-identity re-login, with a separate fenced owner-switch exception
 
 **Status**: Accepted (implemented on the issue branch, pending merge; issue #1590)
 **Date**: 2026-09-24
@@ -143,7 +143,9 @@ LiveDB suite, and each reddened at least one test
 (`api/internal/workersvc/codex_account_readmit_livedb_test.go`,
 `TestReadmitRunCodexBindingFencesLiveDB` has one leg per fence).
 
-This is the only relaxation of the write-once freeze. `FreezeRunCodexBinding` and
+This same-identity readmission is distinct from the owner-authorized live-switch
+exception added on 2026-11-15 in [ADR-4201](4201-in-place-credential-switch.md#codex-live-owner-switch-2026-11-15).
+The freeze-at-creation rule of PRD #1147 is therefore narrowly amended: only the owner-authorized, fenced apply of that switch may change a Codex run's binding to another identity. Outside it, identity changes remain terminal. For this readmission, `FreezeRunCodexBinding` and
 `SetRunCodexFrozenIdentity` still refuse every change, and the relaxation cannot re-point a
 run to another alias, account, auth mode or credential revision.
 

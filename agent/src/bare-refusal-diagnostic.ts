@@ -8,6 +8,7 @@ export const BARE_DELETE_OPS = [
   "recovery-pin-archive-delete-ref",
   "recovery-cleanup-delete-ref",
   "owed-reconcile-delete-ref",
+  "refusal-cleanup-delete-ref",
 ] as const;
 
 export type BareDeleteOp = (typeof BARE_DELETE_OPS)[number];
@@ -27,11 +28,14 @@ const PIN = new RegExp(`^refs/uzi-recovery-pin/(${RUN_ID})/([0-9]+)$`);
 const COVERAGE = new RegExp(`^refs/uzi-coverage/(${RUN_ID})/([0-9]+)/[0-9a-f]{64}$`);
 const OWED = new RegExp(`^refs/uzi-owed/(${RUN_ID})/[0-9a-f]{40}$`);
 
+const INCOMING = new RegExp(`^refs/uzi-incoming/(${RUN_ID})/([0-9]+)/[A-Za-z0-9._-]+$`);
+
 const NAMESPACES: Record<BareDeleteOp, readonly RegExp[]> = {
   "recovery-pin-delete-ref": [PIN],
   "recovery-pin-archive-delete-ref": [PIN],
   "recovery-cleanup-delete-ref": [PIN, COVERAGE, OWED],
   "owed-reconcile-delete-ref": [OWED],
+  "refusal-cleanup-delete-ref": [INCOMING],
 };
 
 export function classifyBareFootprint(footprint: string): BareFootprintClass {

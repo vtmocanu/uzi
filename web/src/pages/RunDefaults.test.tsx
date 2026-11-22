@@ -1643,8 +1643,8 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
     expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
     expect(optionTexts(screen.getByLabelText("Claude summary model"))[0]).toBe("Default");
-    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · medium (built-in)");
-    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
     expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
   });
 
@@ -2848,5 +2848,232 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     expect(screen.getByText(/If the judge’s harness can’t run/).textContent).toBe(
       "If the judge’s harness can’t run, the judge is skipped, never charged to the other provider.",
     );
+  });
+});
+
+describe("Run defaults — Claude planning model and effort (PRD #3252)", () => {
+  const modelCell = (over: Partial<ModelSettingCell> = {}): ModelSettingCell => ({
+    harness: "claude", model: null, default_model: "sonnet", default_source: "user_default", resolved_model: "sonnet", source: "user_default", ...over,
+  });
+  const effortCell = (over: object = {}) => ({
+    harness: "claude", effort: null, default_effort: "high", default_source: "user_default", resolved_effort: "high", source: "user_default", mode: "explicit", ...over,
+  });
+  const settings = (over: object = {}): { settings: UserSettings } => ({
+    settings: {
+      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null,
+      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      planning_claude_model: null, planning_claude_effort: null,
+      planning_models: [modelCell()], planning_efforts: [effortCell()],
+      ...over,
+    } as UserSettings,
+  });
+  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  const saveBtn = () => screen.getByText("Save planning defaults") as HTMLButtonElement;
+
+  it("renders the Planning card with the verbatim intro and default labels from the cells", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
+    expect(screen.getByText("Planning")).toBeTruthy();
+    expect(screen.getByText("Use a different model and reasoning effort while a run plans. When the plan is approved the run continues on your worker model and effort above; if it plans again, it uses these. Planning stays on the run's harness. Handoff (task) runs also plan first. A model chosen by a schedule or when starting the run applies to both phases.")).toBeTruthy();
+    expect(model.options[0].text).toMatch(/^Same as the run · sonnet \(/);
+    expect(effort.options[0].text).toMatch(/^Same as the run · high \(/);
+    expect(Array.from(effort.options).map((o) => o.value)).not.toContain("runtime");
+    expect(saveBtn().disabled).toBe(true);
+  });
+
+  it("uses the runtime and SDK-default wording for those defaults", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings({
+      planning_models: [modelCell({ default_model: "", default_source: "builtin" })],
+      planning_efforts: [effortCell({ default_effort: "runtime", mode: "runtime_default" })],
+    }));
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
+    expect(model.options[0].text).toBe("Same as the run · the SDK decides");
+    expect(effort.options[0].text).toBe("Same as the run · runtime default (your choice)");
+  });
+
+  it("names the source of each default in the Same as the run label", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings({
+      planning_models: [modelCell({ default_model: "sonnet", default_source: "user_default" })],
+      planning_efforts: [effortCell({ default_effort: "medium", default_source: "builtin" })],
+    }));
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    expect(model.options[0].text).toBe("Same as the run · sonnet (your choice)");
+    expect((screen.getByLabelText("Claude planning effort") as HTMLSelectElement).options[0].text)
+      .toBe("Same as the run · medium (built-in)");
+    cleanup();
+    mockApi.getMySettings.mockResolvedValue(settings({
+      planning_models: [modelCell({ default_model: "opus", default_source: "template" })],
+    }));
+    renderPage();
+    expect(((await screen.findByLabelText("Claude planning model")) as HTMLSelectElement).options[0].text)
+      .toBe("Same as the run · opus (lead template)");
+    cleanup();
+    mockApi.getMySettings.mockResolvedValue(settings({
+      planning_efforts: [effortCell({ default_effort: "high", default_source: "template", resolved_effort: "high", source: "template" })],
+    }));
+    renderPage();
+    expect(((await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement).options[0].text)
+      .toBe("Same as the run · high (lead template)");
+  });
+
+  it("refreshes the Same as the run effort label after the Claude effort is saved", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockResolvedValue(settings({
+      default_effort: "low",
+      planning_efforts: [effortCell({ default_effort: "low", resolved_effort: "low" })],
+    }));
+    renderPage();
+    const planningEffort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    expect(planningEffort.options[0].text).toMatch(/^Same as the run · high \(/);
+    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "low" } });
+    fireEvent.click(screen.getByText("Save Claude effort"));
+    await waitFor(() => expect(planningEffort.options[0].text).toMatch(/^Same as the run · low \(/));
+  });
+
+  it("refreshes the Same as the run model label after the worker model is saved", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockResolvedValue(settings({
+      default_claude_model: "opus",
+      planning_models: [modelCell({ default_model: "opus" })],
+    }));
+    renderPage();
+    const planningModel = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    expect(planningModel.options[0].text).toMatch(/^Same as the run · sonnet \(/);
+    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "opus" } });
+    fireEvent.click(screen.getByText("Save defaults"));
+    await waitFor(() => expect(planningModel.options[0].text).toMatch(/^Same as the run · opus \(/));
+  });
+
+  it("sends only the dirty field in one PUT and adopts the response", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockResolvedValue(settings({
+      planning_claude_effort: "max",
+      planning_efforts: [effortCell({ effort: "max", resolved_effort: "max", source: "user_planning_default" })],
+    }));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "max" } });
+    expect(saveBtn().disabled).toBe(false);
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMySettings).toHaveBeenCalledWith({ planning_claude_effort: "max" });
+    await waitFor(() => expect(saveBtn().disabled).toBe(true));
+    expect((screen.getByLabelText("Claude planning effort") as HTMLSelectElement).value).toBe("max");
+  });
+
+  it("Same as the run sends null and is disabled while busy", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings({ planning_claude_effort: "max" }));
+    let release!: (v: { settings: UserSettings }) => void;
+    mockApi.putMySettings.mockReturnValue(new Promise((r) => { release = r; }));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "" } });
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ planning_claude_effort: null }));
+    expect(saveBtn().disabled).toBe(true);
+    release(settings());
+    await waitFor(() => expect(effort.value).toBe(""));
+  });
+
+  it("a model warning blocks the save", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    fireEvent.change(model, { target: { value: "custom" } });
+    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: "two words" } });
+    expect(screen.getByText("Model must be a single token with no spaces.")).toBeTruthy();
+    expect(saveBtn().disabled).toBe(true);
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+  });
+
+  it("warns about a Codex model id and blocks the save", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    const codexId = CODEX_ROLE_MODELS[0];
+    fireEvent.change(model, { target: { value: "custom" } });
+    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: codexId } });
+    expect(screen.getByText(
+      `Not a Claude model: ${codexId} is a Codex model, so Claude planning skips it. Choose Same as the run to clear it.`,
+    )).toBeTruthy();
+    expect(model.getAttribute("aria-describedby")).toContain("planning-model-warning");
+    expect(saveBtn().disabled).toBe(true);
+  });
+
+  it("blocks the save on an empty custom model and describes the select with the message", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    fireEvent.change(model, { target: { value: "custom" } });
+    // A dirty effort alone would enable Save, so the empty custom model is the only blocker.
+    fireEvent.change(screen.getByLabelText("Claude planning effort"), { target: { value: "low" } });
+    const msg = screen.getByText("Enter a custom model ID, or choose Same as the run.");
+    expect(msg.getAttribute("role")).toBe("alert");
+    expect(model.getAttribute("aria-describedby")).toContain(msg.id);
+    expect(saveBtn().disabled).toBe(true);
+    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: "opus" } });
+    expect(screen.queryByText("Enter a custom model ID, or choose Same as the run.")).toBeNull();
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("shows a 400 under the effort select when the server names the effort", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh, max"));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    const model = screen.getByLabelText("Claude planning model") as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "low" } });
+    fireEvent.click(saveBtn());
+    const msg = await screen.findByText(/planning_claude_effort: effort must be one of/);
+    expect(msg.id).toBe("planning-effort-error");
+    // After the effort select, and nothing described under the model select.
+    expect(effort.compareDocumentPosition(msg) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(model.getAttribute("aria-describedby")).toBeNull();
+    expect(document.getElementById("planning-model-error")).toBeNull();
+  });
+
+  it("shows a 400 under the model select when the server names the model, and clears it on edit", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_model: model must be at most 100 characters"));
+    renderPage();
+    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
+    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
+    fireEvent.change(model, { target: { value: "opus" } });
+    fireEvent.click(saveBtn());
+    const msg = await screen.findByText(/planning_claude_model: model must be at most/);
+    expect(model.getAttribute("aria-describedby")).toBe(msg.id);
+    expect(effort.compareDocumentPosition(msg) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+    expect(document.getElementById("planning-effort-error")).toBeNull();
+    fireEvent.change(model, { target: { value: "sonnet" } });
+    expect(screen.queryByText(/planning_claude_model: model must be at most/)).toBeNull();
+    expect(model.getAttribute("aria-describedby")).toBeNull();
+  });
+
+  it("clears an effort error when the effort is edited", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh, max"));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "low" } });
+    fireEvent.click(saveBtn());
+    await screen.findByText(/planning_claude_effort: effort must be one of/);
+    fireEvent.change(effort, { target: { value: "high" } });
+    expect(screen.queryByText(/planning_claude_effort: effort must be one of/)).toBeNull();
+  });
+
+  it("shows an unattributable 400 under both fields", async () => {
+    mockApi.getMySettings.mockResolvedValue(settings());
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "bad planning pair"));
+    renderPage();
+    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
+    fireEvent.change(effort, { target: { value: "low" } });
+    fireEvent.click(saveBtn());
+    expect(await screen.findAllByText("bad planning pair")).toHaveLength(2);
+    expect(screen.getByLabelText("Claude planning model").getAttribute("aria-describedby")).toBe("planning-model-error");
   });
 });

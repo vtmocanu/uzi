@@ -19,10 +19,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 var ErrCrossCheckRefused = errors.New("plan cross-check refused")
+var ErrCrossCheckCandidateInvalid = fmt.Errorf("%w: invalid candidate", ErrCrossCheckRefused)
 var ErrCrossCheckInterrupted = fmt.Errorf("%w: interrupted", ErrCrossCheckRefused)
 var ErrCrossCheckNoRow = fmt.Errorf("%w: no candidate", ErrCrossCheckRefused)
 var ErrCrossCheckRevisionsExhausted = fmt.Errorf("%w: revisions exhausted", ErrCrossCheckRefused)
@@ -100,6 +102,74 @@ func isCrossCheckLeadHarness(lead string) bool {
 	return ok
 }
 
+// legacyCheckedPlanMilestones returns the canonical milestone JSON a received candidate would
+// have been keyed on before non-issue leads dropped milestones, and false when the received
+// milestones do not normalize (blank, null, non-array, over 64, inadmissible). It works on slice
+// copies because NormalizePlanCrossCheckCandidate rewrites the capability and tool slices in place.
+func legacyCheckedPlanMilestones(c PlanCrossCheckCandidate) (json.RawMessage, bool) {
+	c.RequiredCapabilities = append([]string(nil), c.RequiredCapabilities...)
+	c.RequiredTools = append([]string(nil), c.RequiredTools...)
+	n, err := NormalizePlanCrossCheckCandidate(c)
+	if err != nil {
+		return nil, false
+	}
+	var entries []json.RawMessage
+	if json.Unmarshal(n.Milestones, &entries) != nil || len(entries) > 64 {
+		return nil, false
+	}
+	canonical, err := canonicalRawJSON(n.Milestones)
+	if err != nil {
+		return nil, false
+	}
+	return canonical, true
+}
+
+// legacyCrossCheckDigest is the digest of candidate under the legacy milestones, or nil when
+// there is no legacy identity or a semantic identity was bound. semantic_planning has no
+// production writer; a semantic row on a non-issue lead fails closed as before.
+func legacyCrossCheckDigest(candidate PlanCrossCheckCandidate, legacyMs json.RawMessage, legacyOK bool) []byte {
+	if !legacyOK || candidate.CandidateIdentityVersion != "" || candidate.SemanticCandidate != nil {
+		return nil
+	}
+	legacy := candidate
+	legacy.Milestones = legacyMs
+	d, err := legacy.Digest()
+	if err != nil {
+		return nil
+	}
+	return d
+}
+
+func priorMatches(prior store.CrossCheck, generation int64, digest, legacyDigest []byte) bool {
+	return prior.LeadClaimGeneration == generation &&
+		(bytes.Equal(prior.CandidateDigest, digest) || (legacyDigest != nil && bytes.Equal(prior.CandidateDigest, legacyDigest)))
+}
+
+// priorMismatchError: a non-issue lead whose received milestones did not normalize was refused
+// before any lookup at base, so a non-matching prior keeps its candidate-invalid disposition.
+func priorMismatchError(nonIssue, legacyOK bool) error {
+	if nonIssue && !legacyOK {
+		return ErrCrossCheckCandidateInvalid
+	}
+	return ErrCrossCheckInterrupted
+}
+
+// PlanCrossCheckLeadKind returns the run kind of a lead the worker owns, so the HTTP boundary can
+// decide whether milestones are checked. Not owned or foreign user is ErrCrossCheckRefused.
+func (s *Service) PlanCrossCheckLeadKind(ctx context.Context, worker store.Worker, leadID uuid.UUID) (string, error) {
+	run, err := s.runOwnedByWorker(ctx, leadID, worker)
+	if err != nil {
+		if errors.Is(err, ErrRunNotOwned) || errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrCrossCheckRefused
+		}
+		return "", fmt.Errorf("plan cross-check lead kind: %w", err)
+	}
+	if run.UserID != worker.UserID {
+		return "", ErrCrossCheckRefused
+	}
+	return run.Kind, nil
+}
+
 func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, candidate PlanCrossCheckCandidate, requestedRounds ...int32) (store.CrossCheck, error) {
 	round := int32(1)
 	if len(requestedRounds) > 1 {
@@ -125,6 +195,16 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	}
 	if err := validateCrossCheckContext(lead.IssueTitle, lead.IssueDescription); err != nil {
 		return store.CrossCheck{}, err
+	}
+	// A non-issue lead has no milestones to check: the candidate carries canonical [] before
+	// validation, digest and review. A prior row written before this rule keyed its digest on the
+	// received milestones, so keep that identity (legacyMs) for the retry lookups only.
+	nonIssue := lead.Kind != runkind.Issue
+	var legacyMs json.RawMessage
+	legacyOK := false
+	if nonIssue {
+		legacyMs, legacyOK = legacyCheckedPlanMilestones(candidate)
+		candidate.Milestones = json.RawMessage(`[]`)
 	}
 	var normalizeErr error
 	candidate, normalizeErr = NormalizePlanCrossCheckCandidate(candidate)
@@ -172,10 +252,11 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return store.CrossCheck{}, err
 	}
+	legacyDigest := legacyCrossCheckDigest(candidate, legacyMs, legacyOK)
 	prior, err := retryQ.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: leadID, Round: round})
 	if err == nil {
-		if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
-			return store.CrossCheck{}, ErrCrossCheckInterrupted
+		if !priorMatches(prior, generation, digest, legacyDigest) {
+			return store.CrossCheck{}, priorMismatchError(nonIssue, legacyOK)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return store.CrossCheck{}, err
@@ -192,6 +273,9 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.CrossCheck{}, err
+	}
+	if s.planCrossCheckAfterPreflightHook != nil {
+		s.planCrossCheckAfterPreflightHook()
 	}
 
 	timeout := s.p.PlanCrossCheckTimeout
@@ -239,10 +323,11 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, ErrCrossCheckInterrupted
 		}
 		candidate = rebound
+		legacyDigest := legacyCrossCheckDigest(candidate, legacyMs, legacyOK)
 		prior, e := txq.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: leadID, Round: round})
 		if e == nil {
-			if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
-				return store.Run{}, ErrCrossCheckInterrupted
+			if !priorMatches(prior, generation, digest, legacyDigest) {
+				return store.Run{}, priorMismatchError(nonIssue, legacyOK)
 			}
 			existing = prior
 			return store.Run{}, errRetry

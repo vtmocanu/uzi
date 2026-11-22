@@ -375,6 +375,7 @@ type scheduleBranch struct {
 	effort     *apitypes.EffectiveEffortCellDTO
 	credential *apitypes.CredentialDTO
 	subagents  *apitypes.EffectiveSubagentsDTO
+	plan       *apitypes.EffectivePlanPhaseDTO
 	refused    refusal
 	// tokenFixed is set for a self_improve claim whose judge binding is not auto: the binding, not a
 	// ranker, decides the token. It follows the bind mode, because an auto binding with an empty pool
@@ -411,7 +412,7 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 	}
 	b.model = &model
 
-	effort := effortSettingCell(string(hn), lead.UserEffort)
+	effort := leadEffortSettingCell(string(hn), lead)
 	if hn == workersvc.HarnessCodex {
 		effort.CatalogDefault = h.codexCatalogDefaultForModel(ctx, d.userID, lead.Model)
 	}
@@ -433,6 +434,7 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 	}
 	b.credential = credentialDTO(cred)
 	b.subagents = subagentsDTO(lead.Subagents)
+	b.plan = planPhaseDTO(lead.Plan)
 	return b, nil
 }
 
@@ -459,6 +461,7 @@ func scheduleAlternatives(branches []scheduleBranch) ([]apitypes.ScheduleAlterna
 			alt.Refusal, alt.RefusalDetail = b.refused.ptrs()
 		} else {
 			alt.WorkerModel, alt.WorkerEffort, alt.Credential, alt.Subagents = b.model, b.effort, b.credential, b.subagents
+			alt.PlanPhase = b.plan
 		}
 		alts = append(alts, alt)
 		refusals = append(refusals, b.refused)
@@ -501,6 +504,7 @@ func (h *Handler) buildScheduleSettingsPreview(ctx context.Context, d scheduleDr
 			return dto, nil
 		}
 		dto.WorkerModel, dto.WorkerEffort, dto.Credential, dto.Subagents = b.model, b.effort, b.credential, b.subagents
+		dto.PlanPhase = b.plan
 		// The judge binding fixes the token; an auto binding picks one at the claim instead.
 		if b.tokenFixed {
 			dto.Notes = append(dto.Notes, noteTokenFixed)

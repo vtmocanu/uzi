@@ -23,7 +23,7 @@ All **deployment** configuration is via environment variables, set in `.env` (co
 | `OAUTH_RATE_LIMIT_MAX` / `OAUTH_RATE_LIMIT_WINDOW` | `60` / `1m` | Budget of the OAuth token endpoint (`/api/oauth/token`, and `/api/oauth/revoke` when it ships). Applied per client IP on every request, so failed client authentication spends it, and again per client (the product's id) once the client has authenticated, so one product's retry storm cannot starve another's. The per-client budget is one bucket per product shared by all of that product's users, so raise it for a busy multi-user product. Over it, a 429 `temporarily_unavailable` with `Retry-After`. See [Registering an OAuth client](./oauth-clients.md). |
 | `TRUSTED_PROXIES` | *(empty)* | CIDRs whose direct connections are trusted to speak for a real client via `X-Forwarded-For`. Only requests whose `RemoteAddr` falls in one of these ranges get their `X-Forwarded-For` honored; everyone else's is ignored. **Empty (the default) never trusts `X-Forwarded-For`, and that is correct for compose** — see [auth-design.md](auth-design.md). Set it **only** if you front uzi with your own reverse proxy, and set it to *that proxy's address*, narrowly: a hand-typed CIDR also covers the `agent` container, which shares the network and runs untrusted code by design. |
 | `DATABASE_URL` | set by compose | pgx connection string, built from `POSTGRES_*` and the `db` service name. Not meant to be set directly when using compose. |
-| `DB_MAX_CONNS` | `20` | Maximum pgx pool connections per api replica. Precedence: a valid `DB_MAX_CONNS`; else a `pool_max_conns` in `DATABASE_URL` (URL query or keyword/value form, or a pg service file it references); else `20`. Independent of CPU count: it replaces pgx's `max(4, NumCPU)` default. Budget replicas × `DB_MAX_CONNS` against Postgres `max_connections` (100 by default, for example under the cnpg mode). Must be a positive 32-bit integer; zero, a negative number, trailing junk or overflow logs one boot warning naming the key and falls through to the `DATABASE_URL` value, then `20`. An invalid `pool_max_conns` inside `DATABASE_URL` still fails boot. The effective size and its source (`env`, `dsn` or `default`) are logged once at boot (`db pool sized`). |
+| `DB_MAX_CONNS` | `20` | Maximum pgx pool connections per api replica. Precedence: a valid `DB_MAX_CONNS`; else a `pool_max_conns` in `DATABASE_URL` (URL query or keyword/value form, or a pg service file it references); else `20`. Independent of CPU count: it replaces pgx's `max(4, NumCPU)` default. Budget api replicas × `DB_MAX_CONNS` against Postgres `max_connections` (100 by default, for example under the cnpg mode). See [Database connection memory and sizing](#database-connection-memory-and-sizing-issue-4591) for the per-connection memory side. Must be a positive 32-bit integer; zero, a negative number, trailing junk or overflow logs one boot warning naming the key and falls through to the `DATABASE_URL` value, then `20`. An invalid `pool_max_conns` inside `DATABASE_URL` still fails boot. The effective size and its source (`env`, `dsn` or `default`) are logged once at boot (`db pool sized`). |
 | `JWT_SECRET_FILE` | — (optional) | Path to a file that holds `JWT_SECRET`, for a mounted Docker or Kubernetes secret. Set this or `JWT_SECRET`, never both: the API refuses to start when both are set. The API removes one trailing newline from the file and applies the same checks as to `JWT_SECRET`. A missing or unreadable file stops the start. |
 | `UZI_SECRET_KEY_FILE` | — (optional) | Path to a file that holds `UZI_SECRET_KEY` (the base64 key). Same rules as `JWT_SECRET_FILE`: one of the two forms only, one trailing newline removed, the same boot checks as `UZI_SECRET_KEY`. |
 | `DATABASE_URL_FILE` | — (optional) | Path to a file that holds the complete `DATABASE_URL` connection string, not the password alone. Same rules as `JWT_SECRET_FILE`: one of the two forms only, one trailing newline removed. |
@@ -91,6 +91,8 @@ A new component, one per deployment, the only thing in uzi holding a kube-API cr
 | `UZI_WORKER_STORAGE_CLASS` | *(cluster default)* | StorageClass for a hosted worker's PVCs. |
 | `UZI_WORKER_MAX_CPU` / `UZI_WORKER_MAX_MEMORY` | chart: LimitRange `max` (default `4` / `32Gi`) | The controller's own copy of the restricted tier's ceilings. It refuses to render a worker whose size exceeds them (the worker shows provisioning or upgrade failed and [Admin health](admin-health.md) reports it) instead of letting admission reject it. `UZI_WORKER_DOCKER_MAX_CPU` / `_MEMORY` and `UZI_WORKER_ISOLATED_MAX_CPU` / `_MEMORY` do the same for the Docker and isolated tiers; the chart omits a tier's pair when that tier's LimitRange is off. Values are Kubernetes quantities. See [Editing sizes](hosted-workers.md#editing-sizes-admins). |
 | `UZI_WORKER_CROSS_CHECK_SLOTS` | `1` | Hosted cross-check capacity, relayed through `RenderConfig` as pod `WORKER_CROSS_CHECK_SLOTS`. Chart: `workers.crossCheckSlots` (default 1). Strict integer range 0–16; invalid values refuse controller startup. Zero disables the lane and is preserved as a quoted env value. Changes roll workers through the spec hash without increasing preset memory. See [worker setup](./worker-setup.md#cross-check-slots). |
+| `UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES` | unset | Per-deployment value of the worker's absolute per-run cache ceiling. Relayed verbatim (no trim, parse or boot error) as pod `UZI_RUN_CACHE_CAP_MAX_BYTES`, and only when nonempty. Chart: `workers.runCacheCapMaxBytes` (a string; empty by default). The worker's lenient parser handles the value (`off` disables the ceiling; an invalid value gives its 15 GiB default). See [Worker disk safety](#worker-disk-safety-prd-1809) and [Per-run cache cap](../deploy/README.md#per-run-cache-cap). |
+| `UZI_WORKER_RUN_CACHE_CAP_FRACTION` | unset | Per-deployment value of the worker's per-run cache cap fraction. Relayed verbatim (no parse) as pod `UZI_RUN_CACHE_CAP_FRACTION`, and only when nonempty. Chart: `workers.runCacheCapFraction` (a string; empty by default). An invalid value reaches the worker, which falls back to its default (0.5). Setting or changing either key rolls the hosted fleet once through the spec hash; empty values leave the pod spec unchanged. |
 | `UZI_WORKER_UID_SPLIT` | `false` | Opt in to the worker/runner/runner-cmd uid-split profile Codex needs ([PRD #1493](../prds/done/1493-codex-k8s-uid-split-profile.md)). On, the `worker` and `seed-nix` containers start as root with a fixed capability set so the image's existing entrypoint establishes the three-identity split and then drops to `worker`; off, the pod renders byte-identical to today's single-uid start. Trades a bounded root startup window (the same posture compose has shipped since PRD #51) for OS-level containment of the Codex credential, the forge PAT and the join token from model-authorized commands — and it moves the kube-native worker namespace's PodSecurity `enforce` tier from `restricted` to `baseline` while it is on (`audit`/`warn` stay `restricted`). See [ARCHITECTURE.md](../ARCHITECTURE.md#worker-controller-k8s-only). |
 | `UZI_CODEX_COMMAND_SANDBOX` | `off` | Whether a Codex command runs under Landlock filesystem confinement. `off` (the default) never applies Landlock: commands run unconfined, relying on the uid split alone for containment. `required` makes Landlock mandatory and fails a Codex command closed on a kernel without it; `best-effort` applies Landlock wherever the kernel has it and runs the command unconfined on a kernel without it. No mode relaxes the uid split. Has no effect unless `UZI_WORKER_UID_SPLIT` is also on. Chart value: `workers.codex.commandSandbox` (quote `"off"`: a bare `off` is YAML `false` and the chart rejects it). A worker image older than the `off` mode keeps its own `required` default until the fleet rolls onto a newer image. |
 | `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` | `4294967296` (4 GiB) | Per-run byte budget for a running Codex run's command cache (issue #3675). After a cached command finishes, the worker measures the run's current cache generation in the background (at most one measurement per generation every 30 s, one helper at a time worker-wide); a measurement at or above this budget, or one that cannot complete, rotates the run to a fresh cache generation, and the old one is removed once it is proven drained. A command is never refused for cache size. Plain decimal bytes; unset or empty uses the default, `0` disables live measurement and rotation, and anything else (a sign, a unit suffix, hex, a leading zero, or a value above 9007199254740991) refuses worker start and is a controller boot error. Best-effort with no hard size bound: measurement lags several admissions, overlapping commands keep writing the old generation until they finish, and a measurement can undercount because entries that vanish mid-walk are skipped. The default is a candidate, not a validated fleet default. Chart value: `workers.codex.commandCacheRunBytes` (default empty, forwarded only when non-empty; an unquoted integer including `0` works, a bool, negative or fractional value fails the render). Setting or changing it changes the worker pod spec and rolls the hosted fleet once; a default install's pod is unchanged. On compose, the agent service has no `env_file` and does not pass this variable through: add it to the agent service's `environment` with a compose override. A worker image older than this change ignores it. The per-run cache, and so rotation, exists only on uid-split workers (on k8s `UZI_WORKER_UID_SPLIT` on; compose workers are uid-split by default); an invalid value still refuses worker start regardless. |
@@ -256,11 +258,15 @@ so does every Test, right before it connects) and the claims of runs already bou
 run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
 run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
 
-**Activation is blocked.** Workers do not advertise the capability `claude_provider_v1` that provider
-runs need, because the pinned Claude CLI follows gateway redirects (see
-[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-and-activation-is-blocked)).
-Setting the allowlist lets users define, test and select providers, but a run bound to one stays
-queued ("no worker that supports model providers is online") until a later release removes the block.
+**Activated, with an accepted redirect risk.** Workers advertise the capability `claude_provider_v1`
+by default (no switch), so a run bound to a provider starts on a current worker. The pinned Claude
+CLI follows gateway redirects, so the allowlist is the only control on where provider traffic
+starts: allowlist only gateways you trust not to redirect (see
+[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay) and
+[Model providers](./providers.md)). Workers on an image that predates the capability never claim a
+provider run, which queues ("no worker that supports model providers is online"); update operator
+image overrides and Compose or separately run workers yourself, since only the chart's worker image
+pin is bumped by the release helper.
 
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
@@ -430,8 +436,8 @@ The body holds, for a manual start of an issue run with no model and no Anthropi
 |---|---|
 | `harnesses` | Claude then Codex, each taken as an explicit choice: `usable`, a `refusal` (and optional `refusal_detail`) when not, and the `credential` it would use. |
 | `start` | The three start choices (`default`, `claude`, `codex`): the predicted `harness` (`value`, `source`, `fixed_at`, `notes`) or a refusal, plus `anthropic_override_allowed`. |
-| `models` | Eight cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex. |
-| `efforts` | Four cells: worker effort and task-review effort, each for Claude then Codex. |
+| `models` | Up to nine cells: the two worker model cells (Claude then Codex), then the Claude-only `planning_model`, then the judge, run-summary and task-review cells (each Claude then Codex). The judge and summary cells are present only when instance settings are wired, hence "up to". |
+| `efforts` | Five cells: worker effort and task-review effort, each for Claude then Codex, then the Claude-only `planning_effort` appended last. |
 | `cross_check` | Eight cells: plan then code, Claude then Codex, as `models` and `efforts`. |
 | `judge_harness` | One cell, always present: the harness a [judge](./judge.md#judge-runs-on) run would use (`value`, `source`, `fixed_at`, `notes`). An explicit **Judge runs on** choice is `value` `claude` or `codex` with `source` `user_default`; unset is `value` null with `source` `same_as_run`, because the judge follows the harness of the run it reviews, known only once that run exists. `fixed_at` is `create` in both cases. |
 
@@ -450,13 +456,17 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
 | Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
 
+For a Claude lead-lane run, a preview may show the planning-phase and implementation-phase model and effort as a pair, because the lead plans on your [planning settings](./worker-model.md#planning-model-and-effort) and implements on its own. A model or effort chosen for the run or pinned by a schedule applies to both.
+
+On the start preview and the schedule preview (and on each of their `alternatives`), that pair is the optional `plan_phase` key: `model`, `effort`, `model_source` and `effort_source`, each omitted when absent. A `model` or `effort` is omitted when the plan phase ships none on that side, which then follows the implement side (the preview's own `worker_model` and `worker_effort`). A source is `user_planning_default` for a planning value, else the implement value's source. The whole key is omitted unless the harness is Claude and your planning model or effort applies, so every other preview body is unchanged. A start-time model or effort in the request, or a schedule's model pin, is frozen into both phases and stays out of the planning lane.
+
 Subagent pins and repository-defined agents are not part of the account view or the start-preview; the [schedule preview](./scheduling.md#settings-preview) predicts your own subagents' pins, and not repository-defined agents.
 
 ### When a value is fixed
 
 `fixed_at` says when the answer stops changing:
 
-- `create`: frozen when the run is created. The harness, and a Codex credential, are fixed here.
+- `create`: frozen when the run is created. The harness and initial Codex credential are selected here; the credential can later change through an explicit [live owner switch](codex-credentials.md#switching-a-live-run).
 - `claim`: read again each time a worker claims the run, including a queued, scheduled or resumed run. Models, efforts and an Anthropic token (`claim_selection`) are fixed here, so a settings change made before the claim still applies.
 - An honoured schedule model pin is also fixed at `create`: the schedule freezes it into the run when it fires, so the schedule-preview `worker_model` cell for that pin reads `fixed_at: create`.
 
@@ -466,7 +476,7 @@ Two creation-time policies can choose the harness only when the run is created, 
 
 The view is a prediction made now. Between the read and the claim, these can still move:
 
-- **Settings, credentials and templates, until the claim.** Anything fixed at `claim` (models, efforts, the Anthropic token) reads your stored choices, the credentials and the `lead` template again when a worker claims the run, so an edit made after the read applies. Only the `create`-fixed values (the harness and a Codex credential) are frozen at creation.
+- **Settings, credentials and templates, until the claim.** Anything fixed at `claim` (models, efforts, the Anthropic token) reads your stored choices, the credentials and the `lead` template again when a worker claims the run, so an edit made after the read applies. The harness and initial Codex credential are frozen at creation; settings edits do not change them. An explicit [live owner switch](codex-credentials.md#switching-a-live-run) is the narrow exception for the Codex credential.
 - **The Anthropic token.** A Claude run's token is `claim_selection`: it is selected when a worker claims the run, so the view names no token, only that the claim chooses it.
 - **The worker image during a roll.** The view is computed by the API; the claim is served by whichever worker takes the run. While a new worker image rolls out the fleet can mix versions, so a claim can be handled by a worker that behaves differently from what the API predicted.
 - **The SDK default.** A cell noted `sdk_default` sends no model, so the Claude SDK or your account decides at run time; the view cannot name that model.
@@ -1026,12 +1036,13 @@ See [worker-setup.md](worker-setup.md#worker-disk-safety-prd-1809) for how these
 | `UZI_DISK_ADMISSION` | `true` | Whether the admission stop is armed (PRD #1809 D5): while on, the run lane claims no new run while the data volume is at or over the soft threshold, for at most `UZI_DISK_ADMISSION_MAX_WAIT` after a reclaim pass has run. `0`/`false`/`no`/`off` disables it, so a full-ish volume never blocks a new claim on this worker. |
 | `UZI_DISK_ADMISSION_MAX_WAIT` | `15m` | How long the admission stop above may keep holding once a reclaim pass has run since the volume crossed the soft threshold. Past it, claims reopen (with a warning) until the next fresh crossing — the run lane cannot restrict a claim to this worker's own parked runs, so an unbounded stop could idle a worker that has nothing left to reclaim. |
 | `UZI_RUN_CACHE_CAP_ENABLED` | `true` | Whether the **soft layer** of the per-run cache cap is armed (PRD #1809 D4): a Claude run whose caches exceed its cap is trimmed (least-recently-used entries first) at a proven quiet point between turns, with no process of the run alive, and parked preventively (`disk_park_preventive: true`, uncounted) if it stays over the cap. `0`/`false`/`no`/`off` disables it. |
-| `UZI_RUN_CACHE_CAP_FRACTION` | `0.5` | The share of the data volume all currently-running runs' caches may use together. One run's cap is this fraction of the volume's total size, divided by `WORKER_MAX_CONCURRENT_RUNS`. A fraction in `(0, 1]`; anything else falls back to the default. |
+| `UZI_RUN_CACHE_CAP_FRACTION` | `0.5` | The share of the data volume all currently-running runs' caches may use together. One run's cap is this fraction of the volume's total size, divided by `WORKER_MAX_CONCURRENT_RUNS`, and also limited by `UZI_RUN_CACHE_CAP_MAX_BYTES` below. A fraction in `(0, 1]`; anything else falls back to the default. Hosted chart key: `workers.runCacheCapFraction` (see the [controller table](#controller)). Bundled `docker-compose.yml` passes it through, empty by default. |
+| `UZI_RUN_CACHE_CAP_MAX_BYTES` | `16106127360` (15 GiB) | An absolute per-run ceiling on the soft cap: one run's cap is `min(UZI_RUN_CACHE_CAP_FRACTION × volume ÷ WORKER_MAX_CONCURRENT_RUNS, this ceiling)`. A positive decimal byte count (leading zeros allowed) is taken as given; `off` (trimmed, case-insensitive) disables only the ceiling; unset, blank, zero, negative, fractional, non-finite, unsafe-integer or malformed values fall back to the default, and it never fails boot. A very small value is honoured, so a run whose caches exceed it is trimmed and, if it stays over, parked preventively (soft layer only). An unknown or zero volume size still means no cap. With two slots a 25 GiB volume caps at 6.25 GiB (trim target 3.75 GiB) and a 50 GiB volume at 12.5 GiB (7.5 GiB), both unchanged; a 100 GiB volume now caps at 15 GiB (9 GiB), not 25 GiB (15 GiB). On large volumes this trades more Go cache rebuilds, possible whole-module-cache drops on a trim and more uncounted preventive parks for long `-race` runs for a lower ceiling; it is a mitigation, not a within-turn bound (#4203). Hosted chart key: `workers.runCacheCapMaxBytes` (see the [controller table](#controller)). Bundled `docker-compose.yml` passes it through, empty by default. |
 | `UZI_RUN_CACHE_LOW_WATER` | `0.6` | Where a soft-layer trim stops, as a fraction of the run's cap: a trim evicts cache entries until the run's caches are at or under this share of its cap, rather than trimming to zero every time. A fraction strictly in `(0, 1)`; anything else falls back to the default. |
 | `UZI_DISK_HARD_STOP_ENABLED` | `true` | Whether the **hard layer** of the per-run cache cap is armed (PRD #1809 D4): a data volume at or over `UZI_DISK_PRESSURE_THRESHOLD` minus `UZI_DISK_HARD_MARGIN` selects a registered Claude run by measured cache bytes and parks it only with a server-confirmed running executor (a **counted** `data_volume_full` park), independent of turn boundaries; any other Claude run has its rebuildable caches dropped in place and keeps its gate. `0`/`false`/`no`/`off` disables it. |
 | `UZI_RUN_DISK_SAMPLE_INTERVAL` | `10m` | How often the worker's background per-run HOME measurement runs, feeding the heartbeat's `run_disk` report (PRD #1809 D8) that powers the `HOME` row on `uzi run get`, the `LARGEST RUN` column on `uzi worker list`/`uzi admin workers`, and the `fleet.rundisk` [admin health](admin-health.md#the-checks) check. The heartbeat only ever reads the latest finished sample, so a slow measurement never delays a heartbeat. `0` turns the sampler off (no `run_disk` reported). Matches the reclaim cadence by default because one sample may walk a large HOME tree. |
 
-Invalid values for the fraction knobs (`UZI_DISK_SOFT_MARGIN`, `UZI_DISK_HARD_MARGIN`, `UZI_RUN_CACHE_CAP_FRACTION`, `UZI_RUN_CACHE_LOW_WATER`) and the boolean toggles fall back to their defaults, the same lenient-parse behavior as the core table; none of those is a boot guard. The three duration knobs, `UZI_DISK_RECLAIM_INTERVAL`, `UZI_DISK_ADMISSION_MAX_WAIT`, and `UZI_RUN_DISK_SAMPLE_INTERVAL`, are stricter: each is parsed by the shared duration parser (a bare integer, or an integer followed (optionally after spaces) by `ms`/`s`/`m`/`h`/`d`, e.g. `10m` or `15000` — no fractions, no other unit), and a malformed value (e.g. `1.5m`) throws at startup and the worker **fails to boot** rather than falling back to its default. None of these eleven vars is wired into the `agent` service's `environment:` block in `docker-compose.yml`, matching `UZI_HOME_RECLAIM` above — they're documented in `.env.example` for a standalone `docker run` or a compose override, but setting one in `.env` on the bundled compose stack has no effect on its own.
+Invalid values for the fraction knobs (`UZI_DISK_SOFT_MARGIN`, `UZI_DISK_HARD_MARGIN`, `UZI_RUN_CACHE_CAP_FRACTION`, `UZI_RUN_CACHE_LOW_WATER`) and the boolean toggles fall back to their defaults, the same lenient-parse behavior as the core table; none of those is a boot guard. `UZI_RUN_CACHE_CAP_MAX_BYTES` is equally lenient: an invalid value falls back to its 15 GiB default, and `off` disables it. The three duration knobs, `UZI_DISK_RECLAIM_INTERVAL`, `UZI_DISK_ADMISSION_MAX_WAIT`, and `UZI_RUN_DISK_SAMPLE_INTERVAL`, are stricter: each is parsed by the shared duration parser (a bare integer, or an integer followed (optionally after spaces) by `ms`/`s`/`m`/`h`/`d`, e.g. `10m` or `15000` — no fractions, no other unit), and a malformed value (e.g. `1.5m`) throws at startup and the worker **fails to boot** rather than falling back to its default. `UZI_RUN_CACHE_CAP_MAX_BYTES` and `UZI_RUN_CACHE_CAP_FRACTION` are passed through by the bundled `docker-compose.yml` (`${X:-}`, empty by default, which means the worker default). The other ten vars in the table are not wired into the `agent` service's `environment:` block, matching `UZI_HOME_RECLAIM` above; they're documented in `.env.example` for a standalone `docker run` or a compose override, but setting one in `.env` on the bundled compose stack has no effect on its own. The VPS stack `deploy/compose/compose.yaml` forwards these same two variables; the other ten are not forwarded by that stack.
 
 **Proxied deployments and worker egress.** The worker's git operations (`gitEnv`) and the self-improvement check runner (`buildCheckEnv`, PRD #46 M9/M10) run under a scrubbed *replacement* environment — a deliberate security measure that keeps the join token and API URL out of worker-spawned git/test subprocesses. That replacement env does **not** carry `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`. On the default internal-forge / direct-egress deployment this is fine (the e2e is green), but a deployment that reaches the forge (git push over HTTPS) or the npm registry (`npm ci` for the self-improvement job's test evidence) **through a proxy** must allowlist those vars in the two env builders, or the push / `npm ci` will fail (the checks then degrade to an honest "skipped", never a false failure).
 
@@ -1223,9 +1234,96 @@ in `DATABASE_URL` is kept by pgx as an unrecognized DSN parameter and passed to
 PostgreSQL as a connection runtime parameter, so it applies only to connections made
 with that DSN.
 
+## Database connection memory and sizing (issue #4591)
+
+Each api pool connection is one PostgreSQL backend process. pgx caches every parameterised
+statement it sends as a server-side prepared statement, and the backend keeps each one's plan
+in memory until the connection closes. The api uses pgx's default per-connection cache of
+**512** statements, unchanged. [ADR-4591](../adr/4591-api-pool-backend-memory.md) measured
+lower caps and shorter connection lifetimes on a synthetic fixture; that measurement was
+inconclusive and changed no default.
+
+**Release notes for operators.** No default changed. The synthetic measurement in ADR-4591
+was inconclusive for a global default change, so the api keeps pgx's defaults. The overrides
+below remain available if you want to trade backend memory against re-prepares for your own
+workload.
+
+**Overrides**, as keys in the `DATABASE_URL` query (or the keyword/value or service-file
+form). pgx reads them and does not forward them to PostgreSQL:
+
+```text
+postgres://app:<password>@example.com:5432/uzi?statement_cache_capacity=256
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `statement_cache_capacity` | `512` (pgx's default, unchanged) | Per-connection prepared-statement cache. **Never set `0`**: with pgx's default exec mode it makes every query fail except an argument-less `Exec` ("cannot use QueryExecModeCacheStatement with disabled statement cache"); `0` is only valid together with a different `default_query_exec_mode`. |
+| `description_cache_capacity` | pgx's `512` | No effect under the default cached-statement exec mode (`default_query_exec_mode` unset): pgx uses it only under `cache_describe`. |
+| `pool_max_conn_lifetime` | `1h` | Unchanged pgx default. |
+| `pool_max_conn_lifetime_jitter` | `0` | Unchanged pgx default. In the synthetic harness, `ClaimRun` spent about 69-75 ms planning on the first execution on a fresh connection (after a reconnect), and about 348-358 ms summed over its six prepared executions (further custom and generic planning on later executions). A re-prepare on a warm connection restarts the same custom-then-generic planning sequence, but its planning time was not measured separately. Harness observations, not production figures. |
+| `pool_max_conn_idle_time` | `30m` | Unchanged pgx default. |
+
+**Lowering the statement cache.** Lowering `statement_cache_capacity` in `DATABASE_URL`
+trades backend memory for re-prepares once a connection runs more distinct statements than the
+cap between two uses of a hot statement (worker claim, message append). In the synthetic
+harness that showed as the `ClaimRun` per-execution mean rising from about 7 ms to about
+68 ms at a cap of 32 under stress. To check after a change, compare `ClaimRun` latency, or, with the database
+owner's agreement, compare `pg_stat_statements` plans to calls with `track_planning` on.
+
+**JIT may add memory.** In the synthetic measurement with PostgreSQL's default `jit = on`,
+the candidates that evict statements or recycle connections showed LLVM mapped and about 8.5-14 MiB more heap
+than in the `jit = off` runs, plus about 51 MiB of shared library text (counted once per
+instance). Whether statements whose plans cross `jit_above_cost` cause this is a hypothesis;
+it was not established, and a library mapping alone is not proof of a JIT compilation. If you
+want JIT off:
+
+- `ALTER ROLE <app-role> SET jit = off;` affects **new sessions only**, so existing pool
+  connections keep JIT until they are replaced. The change takes effect as sessions are
+  replaced, or after an API restart. pgxpool's background health check closes idle connections
+  that are past their lifetime, but a checked-out connection is not interrupted and is
+  destroyed only when it is released, so there is no fixed deadline.
+- Or add `jit=off` to the `DATABASE_URL` query: pgx passes unknown keys through as startup
+  parameters. The chart ships no PgBouncer; a transaction-mode PgBouncer rejects a startup
+  parameter it does not track, failing the connection, unless it is listed in
+  `ignore_startup_parameters`, which drops it silently (see
+  [ADR-1620](../adr/1620-custom-plan-cache-mode.md)).
+- Or `ALTER DATABASE ... SET jit = off`, or a server-wide setting; that is the database
+  owner's call.
+
+Identify which statements JIT first (`pg_stat_statements` `jit_functions > 0`, or `EXPLAIN`)
+before tuning any cost threshold; no `jit_above_cost` value is recommended here.
+
+**Sizing estimate.** Peak backend memory across the pools is roughly
+**api replicas × per-api DB_MAX_CONNS × per-backend memory**, where api replicas is the
+number of api pools connected to the same primary (CNPG standby instances are not part of the
+multiplier). This is an estimate, not a hard bound.
+
+Choose per-backend input from representative measurements of your own workload, including connection age, cold/reprepare and concurrent query peaks. The synthetic fixture below illustrates the arithmetic only; its 60/75 MiB values are not production sizing recommendations and do not supersede the reported incident measurements.
+
+Synthetic illustration (arithmetic only): the harness measured about 60 MiB per backend with
+JIT off and about 75 MiB with JIT on, at a 128-statement cache candidate (not the api's 512
+default). One replica × 20
+connections would then be about 1.2 GiB (JIT off) or 1.5 GiB (JIT on). Add:
+
+- what is counted once: `shared_buffers`, the shared LLVM library page cache, and the
+  PostgreSQL background processes;
+- headroom for non-api connections (one-off `/server setup` runs, admin `psql` sessions, migrations, CNPG's own connections);
+- concurrent query memory: up to `work_mem` per sort node and `work_mem × hash_mem_multiplier`
+  per hash node (`hash_mem_multiplier` defaults to 2.0 since PostgreSQL 15; see the
+  [PostgreSQL 17 resource settings](https://www.postgresql.org/docs/17/runtime-config-resource.html)).
+  These multiply by the number of such nodes in a plan and by the number of concurrent
+  queries, so leave headroom. Each parallel worker of a parallel query gets its own
+  allowance;
+- other PostgreSQL and container overhead.
+
+The estimate assumes every pool connection has been opened and used; pgxpool opens connections
+lazily and closes idle ones after 30 minutes. The chart's api Deployment uses `Recreate`, so
+a rollout adds no overlapping pool. Figures come from PostgreSQL 17.12 with a small synthetic
+fixture and 100 ms sampling; CNPG may run a different major version.
+
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.167.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,

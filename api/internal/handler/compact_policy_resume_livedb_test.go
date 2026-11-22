@@ -400,14 +400,14 @@ func TestPolicyRecoveryVerifiedRouteLiveDB(t *testing.T) {
 	}
 }
 
-// Set-token keeps its Codex refusal. On a run in an unresolved policy episode the same 422 only
+// Set-token keeps the active-only Codex refusal. On an unresolved policy episode the 422 also
 // gains the pointer to the continuation that applies; nothing is written.
 func TestSetTokenOnPolicyHeldCodexRunLiveDB(t *testing.T) {
 	fx := newCompactPolicyFx(t)
 	run := fx.seedRun()
 	fx.hold(run, 1, "same_conversation", false, strings.Repeat("a", 40))
 	hint := ". Resume this policy hold with POST /api/runs/" + run.String() + "/resume-now, an explicit mode and expected_episode_id."
-	const base = "a credential override is not supported on the codex harness"
+	base := workersvc.ErrCodexSwitchIneligible.Error()
 	overrides := `SELECT concat_ws('|',credential_override_mode,credential_override_secret_id::text) FROM runs WHERE id=$1`
 	before, overridesBefore := fx.state(run), fx.query(overrides, run)
 	for _, client := range []string{"cookie", "bearer"} {
@@ -430,7 +430,7 @@ func TestSetTokenOnPolicyHeldCodexRunLiveDB(t *testing.T) {
 	if fx.state(run) != before || fx.query(overrides, run) != overridesBefore {
 		t.Fatal("refused set-token changed the run row, an override column or the inputs")
 	}
-	// Once the episode is resolved the refusal is the unchanged Codex message with no pointer.
+	// Once the episode is resolved the active-only refusal carries no policy pointer.
 	episode := fx.query("SELECT policy_outcome_id::text FROM runs WHERE id=$1", run)
 	if resp := fx.resumeAs("bearer", run, resumeBody("preserve", episode, "")); resp.Code != http.StatusOK {
 		t.Fatalf("resume = %d %s", resp.Code, resp.Body.String())

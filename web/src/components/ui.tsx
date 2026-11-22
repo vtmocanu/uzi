@@ -551,7 +551,7 @@ export const RUN_STATUS_TONES: Record<
   completion_blocked: { tone: "warning" },
   /** The server holds that are not completion states (credential_disabled, credentials_reset,
    *  provider_unavailable, codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable,
-   *  the token-switch holds, iteration_budget_exhausted, run_override_unavailable): raw status
+   *  the token-switch holds, iteration_budget_exhausted, run_override_unavailable, phase_switch_unavailable): raw status
    *  "paused", overlaid by effectiveRunStatus from hold_reason. Tone and label come from
    *  NON_COMPLETION_HOLDS (runBadge.ts), the single source. Static warning, NOT the owner-pause
    *  info tone and not pulsing: none does work until the owner (or an Enable) clears it. */
@@ -825,30 +825,4 @@ export function PageHeader({
       </div>
     </div>
   );
-}
-
-// StatTile: dashboard number tile.
-export function StatTile({
-  label,
-  value,
-  hint,
-  to,
-}: {
-  label: string;
-  value: ReactNode;
-  hint?: string;
-  to?: string;
-}) {
-  const body = (
-    <div className="rounded-xl border border-edge bg-surface p-4 transition-colors hover:border-edge-strong">
-      <p className="text-xs font-medium uppercase tracking-wider text-faint">
-        {label}
-      </p>
-      <p className="mt-1.5 text-2xl font-semibold tabular-nums text-fg">
-        {value}
-      </p>
-      {hint && <p className="mt-0.5 text-xs text-faint">{hint}</p>}
-    </div>
-  );
-  return to ? <Link to={to}>{body}</Link> : body;
 }

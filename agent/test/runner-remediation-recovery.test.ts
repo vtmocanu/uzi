@@ -68,7 +68,7 @@ async function fixture() {
   };
   const freshFlight = (): Flight => ({ runId: RUN, branch: BRANCH, barePath: bare, worktreePath: clone.path,
     runnerClone: clone, runLog: nullLogger(), batcher: { emit: () => {} }, claimGenerations: new Map(),
-    reportedPublishOutcomes: new Set(),
+    providerKeyForms: [], reportedPublishOutcomes: new Set(),
     cancel: new AbortController(), steering: { lifecycleSignal: () => new AbortController().signal } });
   await fetch();
   const enroll = async () => {
@@ -104,7 +104,7 @@ test("fresh runner restores flagged and displaced roots, admits only confirmed c
   assert.equal(await runner.checkpointRemediationHold(flight, f.bare, clean, true), false);
   const policy = runner.frozenHeldPolicy(flight);
   assert.equal(policy.blocked, true);
-  assert.deepEqual(await prepareFrozenHeld({ git, barePath: f.bare, branch: BRANCH, sourceSha: clean,
+  assert.deepEqual(await prepareFrozenHeld({ literals: [], git, barePath: f.bare, branch: BRANCH, sourceSha: clean,
     policy, deadlineMs: 10_000 }), { reason: "secret_remediation_pending" });
   // A floor that would reintroduce excluded history must remain a requirement.
   flight.publishedRealTips = [displaced];

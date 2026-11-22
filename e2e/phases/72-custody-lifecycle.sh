@@ -68,7 +68,8 @@
 #                                                    api/internal/store/custody_episode_livedb_test.go
 #   per-run custody nudge SUPPRESSED for the
 #     episode reconciler (M6) ..................... api/internal/workersvc/health_custody_nudge_test.go
-#   board alert + Workers resolution surface (M6) . web/src/components/CustodyBoardAlert.test.tsx,
+#   Held work card + Workers resolution surface (M6) web/src/components/HeldWorkCard.test.tsx,
+#                                                    web/src/pages/OverviewNext.test.tsx ("Held work card"),
 #                                                    web/src/components/RecoveryHoldsSurface.test.tsx
 #   No scenario in the matrix is uncovered; this phase is the integrated proof M7 asks for.
 # =============================================================================
@@ -189,7 +190,7 @@ SEEDED="$(db_psql "SELECT count(*) FROM recovery_custody_holds
                      WHERE user_id = '$ADMIN_ID' AND original_worker_identity = '$SEED_IDENT' AND state = 'open'")"
 [ "$SEEDED" = "$LIMIT" ] || fail "seeding did not create exactly $LIMIT open seed holds (got '$SEEDED')"
 
-# The owner-wide aggregate (GET /api/recovery/holds, read by the board alert / Workers surface /
+# The owner-wide aggregate (GET /api/recovery/holds, read by the Overview Held work card / Workers surface /
 # `uzi run recovery`) must show admission pressure at or above the limit (baseline included),
 # agree with total custody, and echo the configured limit (default 8). One snapshot.
 AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"

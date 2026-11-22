@@ -404,8 +404,7 @@ function PoweredBy({
 }
 
 function isNavActive(pathname: string, href: string): boolean {
-  return (pathname === "/overview/classic" && href === "/dashboard")
-    || pathname === href || pathname.startsWith(href + "/");
+  return pathname === href || pathname.startsWith(href + "/");
 }
 
 // forgeIcon picks a board entry's glyph from its connection's forge type
@@ -508,8 +507,6 @@ export function NavItem({
         onNavigate?.();
         if (motionGlyph) motion.onClick();
       }}
-      onPointerEnter={motionGlyph ? motion.onPointerEnter : undefined}
-      onFocus={motionGlyph ? motion.onFocus : undefined}
       aria-current={active ? "page" : undefined}
       title={collapsed ? label : undefined}
       className={cx(
@@ -1324,7 +1321,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     // The ONE admin-health poll for the whole app (PRD #1484 M5). Mounted here, above both
-    // the sidebar (the Admin pip) and the main pane (the danger banner + Overview card + the
+    // the sidebar (the Admin pip) and the main pane (the danger banner + Overview HealthChip + the
     // Health page), so every consumer reads one provider and the isAdmin gate lives in one
     // place. A non-admin session never fetches the admin endpoint.
     <HealthStatusProvider>

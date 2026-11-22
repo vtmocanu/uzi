@@ -653,6 +653,11 @@ type ClaimAgent struct {
 	PromptBody  string   `json:"prompt_body"`
 	Tools       []string `json:"tools"`
 	Model       *string  `json:"model"`
+	// Effort is the template's reasoning-effort pin for the run's harness (issue #3258): one of
+	// agenttmpl.EffortLevels, projected by agenttmpl.EffortForHarness so the other family's value
+	// never rides. It is sent only to a worker advertising capability.TemplateEffortV1 and omitted
+	// otherwise (an older worker's wire is byte-identical); nil means follow the run's effort.
+	Effort *string `json:"effort,omitempty"`
 	// Skills is this template's allocated skill names (shared ∪ owner's overlay),
 	// restricted to names that survived in the per-run union (a name dropped over
 	// the cap is removed; a shadowed name stays because the name is still delivered,
@@ -722,6 +727,10 @@ type ClaimConfig struct {
 	// run_override, user_default or builtin). PRD #3244: present on every lead-lane claim, which makes
 	// it the worker's activation signal for the lead-config reporter; absent otherwise.
 	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
+	// PlanPhase is the plan-phase model and effort (PRD #3252): set only on a Claude lead-lane
+	// claim whose owner has a planning value that applies; omitted otherwise so the wire is
+	// byte-identical. A claim carrying it requires the worker capability claude_phase_models_v1.
+	PlanPhase *ClaimPhaseSettings `json:"plan_phase,omitempty"`
 	// CodexCatalogContext is the opaque catalog context (issue #3251): lowercase hex SHA-256 of
 	// the credential revision this claim releases (user, secret id, auth mode, material revision,
 	// subscription account key). The worker echoes it verbatim when it reports the Codex catalog's
@@ -851,8 +860,10 @@ type CompletionScopeAccepted struct {
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding
 // the jsonb tools allowlist (NULL/empty ⇒ inherit-all ⇒ nil) and attaching each
 // template's surviving skill names from perTemplateSkills (nil ⇒ empty list, so
-// the JSON carries `skills: []`, never null).
-func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[string][]string, harness string) []ClaimAgent {
+// the JSON carries `skills: []`, never null). templateEffort is whether the claiming worker
+// advertises capability.TemplateEffortV1; only then is each template's effort pin for the run's
+// harness projected (issue #3258).
+func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[string][]string, harness string, templateEffort bool) []ClaimAgent {
 	out := make([]ClaimAgent, 0, len(rows))
 	for _, t := range rows {
 		skills := perTemplateSkills[t.Name]
@@ -876,9 +887,27 @@ func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[strin
 		if m := agenttmpl.PinForHarness(harness, claudePin, codexPin); m != "" {
 			a.Model = &m
 		}
+		// The lead template's effort is not a per-agent pin: it travels only via default_effort.
+		if templateEffort && !agenttmpl.IsLeadName(t.Name) {
+			if e := templateEffortPin(t, harness); e != "" {
+				a.Effort = &e
+			}
+		}
 		out = append(out, a)
 	}
 	return out
+}
+
+// templateEffortPin is the template's valid effort pin for the harness, "" when none.
+func templateEffortPin(t store.AgentTemplate, harness string) string {
+	var claudeEffort, codexEffort string
+	if t.Effort.Valid {
+		claudeEffort = t.Effort.String
+	}
+	if t.CodexEffort.Valid {
+		codexEffort = t.CodexEffort.String
+	}
+	return agenttmpl.EffortForHarness(harness, claudeEffort, codexEffort)
 }
 
 // decodeTools turns the stored jsonb allowlist into a slice; a NULL/empty column

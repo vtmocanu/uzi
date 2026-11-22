@@ -186,7 +186,8 @@ The endpoints that call out to the forge on a user's behalf (`.../verify`, `.../
 
 An agent template (`agent_templates` table) is the definition of one role an
 agent can play: name, description, optional per-harness model pins (`model`
-for Claude, `codex_model` for Codex), an optional tools allowlist, and a prompt
+for Claude, `codex_model` for Codex), optional per-harness effort pins
+(`effort`, `codex_effort`), an optional tools allowlist, and a prompt
 body. It is not itself an agent; it is the recipe a later release renders into
 a running one.
 
@@ -202,6 +203,14 @@ a running one.
   and no agent-source sync replaced, so admin edits survive restarts and future
   releases add or upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
   a non-builtin row already occupies a builtin's name.
+- **Effort pins are projected per family, behind a capability.** The claim
+  carries a subagent's `effort` for the run's harness only, and only to a worker
+  advertising `template_effort_v1`; for an older worker the api omits the pins
+  and, when at least one subagent pin was withheld, writes one run-feed notice
+  per claim generation. The lead template's
+  effort is not projected as a pin: it is a tier of the lead's own effort
+  (run override, then the user's preference, then the lead template, then
+  medium). See [PRD #3258](prds/done/3258-per-harness-template-effort.md).
 - **The `lead` is the main thread, not a subagent.** The worker
   (`agent/src/agents.ts`) selects the first delivered own template matching
   `lead`/`orchestrator` case-insensitively and routes its body and delivered
@@ -526,11 +535,16 @@ The Test probe is dialed from the api, ignores proxy variables, never follows a 
 admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
 flag, loopback addresses).
 
-**Activation is blocked.** The pinned Claude CLI follows gateway redirects (a same-origin 307
-re-sends the key in both auth styles; a cross-origin one forwards `x-api-key` and the body), so
-workers do not advertise the capability `claude_provider_v1` and a provider-bound run stays queued
-("no worker that supports model providers is online"). A loopback relay is deferred to a separate
-issue. Design record, route split, inheritance rules and rollback hazards:
+**Activated without the relay (owner decision 2026-11-19).** Workers advertise `claude_provider_v1` by
+default, so a provider-bound run starts on a current worker; an older worker never claims one and
+the run queues ("no worker that supports model providers is online"). The pinned Claude CLI follows
+gateway redirects (the key can be re-sent to another path on the same host under both auth styles,
+and the request body to any `Location` host), so the operator allowlist is the only control on where
+provider traffic starts; the loopback relay (#4496) is parked. Worker-side, the bound key is redacted
+(raw and encoded forms) from model, run, chat and forge-bound output, and an exact-key scan blocks
+any forge upload (branch push, checkpoint packs, held publication) whose objects carry it. Ephemeral
+provisioning counts a provider-bound run as demand and reaps an online ephemeral worker without the
+capability. Design record, route split, inheritance rules and rollback hazards:
 [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md); user docs:
 [docs/providers.md](docs/providers.md).
 
@@ -681,7 +695,7 @@ issue, no branch and nobody's attention, and would silently pile up. Because
 the token rides the claim rather than the worker, re-pointing a worker is
 complete server-side — no restart, no re-minted join token. Since PRD #1247
 `claimSecretID` also consults, ahead of the worker's own bind mode, a
-per-run (or per-schedule) credential override the owner can set or change at
+per-run (or per-schedule) credential override that, for Claude, the owner can set or change at
 any time — queued, parked, at the plan gate, or mid-run. A mid-run switch
 reuses the same custody `runs.claim_generation` (below) as its fence. On a
 worker that negotiated `credential_switch_in_place_v1` (against an api serving
@@ -693,7 +707,7 @@ withdraws the switch stamp and appends the `credential_switch` feed message,
 and returns the token only after COMMIT. The worker, claim generation and
 working directory stay the same and the SDK restarts on the new token,
 resuming the same session where the provider allows (otherwise a fresh session
-in the same directory, with a notice). A worker without the capability still crosses an actual claim
+in the same directory, with a notice). A legacy Claude worker without the capability still crosses an actual claim
 boundary: it releases the claim (`claim_released_at` fence) and the next claim
 delivers the token. Where quiescence cannot be proven the run is held `paused`
 for the owner (`credential_switch_settling`, then `credential_switch_unsettled`)
@@ -702,6 +716,10 @@ pause (`credential_switch_uncertain`; the worker posts that feed line itself
 through its own message stream, not the server). See
 [adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md) and
 [adr/4201-in-place-credential-switch.md](adr/4201-in-place-credential-switch.md).
+Codex uses its separate owner-authorized fenced live-switch path: running or
+worker-held awaiting states only; claimed returns 409, queued and every park
+return 422. It changes the committed binding without a release/reclaim fallback;
+cross-account thread resume is attempted and remains unproven with real accounts.
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens, by default the soonest weekly
@@ -1348,8 +1366,8 @@ chain in the diagram above, with no intervening `running`.
   provider revision is gone) is final for that run, and a manual resume of either is refused
   with 409. Neither falls back to a vendor credential. A gateway 429 or overload parks an
   issue run as `limit_wait` instead (1, 5, 15 minutes, then the owner). See
-  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Dormant until
-  activation lands: no worker advertises `claude_provider_v1` yet, so a provider run stays queued.
+  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Active on workers that
+  advertise `claude_provider_v1`; an older worker leaves a provider run queued.
 
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,
@@ -1872,7 +1890,7 @@ chain in the diagram above, with no intervening `running`.
   release, committed → generation-bound capture, unverifiable → retain), and
   owners can list retained holds and discard one exact held source
   (`GET /api/recovery/holds` + aggregate; `uzi run recovery` /
-  `uzi run discard`; a Dashboard board alert and Workers resolution surface),
+  `uzi run discard`; an Overview held-work card and Workers resolution surface),
   with the per-run custody Slack nudge coalesced into one owner-level
   blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
   [PRD #1296](prds/done/1296-durable-run-recovery.md),
@@ -1934,6 +1952,10 @@ chain in the diagram above, with no intervening `running`.
   exact old-journal clearing, while lost proof retains remaining artifacts.
   See [ADR-1296](adr/1296-durable-run-recovery.md) and
   [ADR-2417](adr/2417-guarded-local-retention.md) for the dated amendments.
+  The retained predecessor FINAL pass (#2969) stays disabled; its command-uid
+  writer-exclusion enablement contract, incomplete and pending owner decisions or
+  missing mechanisms,
+  is [ADR-4001](adr/4001-command-uid-writer-exclusion.md).
   Older/successor holds and unstamped older completions gain no completed-publication authority;
   failed/cancelled/parked runs and other kinds keep their existing policy.
   A separate server-discard phase (#2506, maintainer decision 2026-10-14)
@@ -3165,7 +3187,7 @@ Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.
 
 ### Admin in-app health (PRD #1484)
 
-An admin-only, read-only Health tab, Overview card and `uzi admin health`
+An admin-only, read-only Health tab, Overview header health chip and `uzi admin health`
 show the full closed registry of checks over worker rolls/capacity, the queue,
 the controller's own liveness, background loops, the database, integrations,
 and housekeeping. The app-wide Danger banner (with a per-admin 1h snooze)

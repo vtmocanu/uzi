@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "../codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../codex-operation-scope.js";
 import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 import { ExecutorLifetime, type ExecutorSealResult, type ExecutorTerminalSeal } from "./executor-lifetime.js";
@@ -86,9 +86,9 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type UsableSavedRollout, type CodexSuspendedEpoch, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
-import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
@@ -126,6 +126,7 @@ import {
   type BoundaryProcessRequest,
   type CodexExecutionSafety,
   type HarnessAgent,
+  type HarnessEffort,
   type HarnessContextHook,
   type HarnessError,
   type CredentialFreeCaptureContext,
@@ -145,7 +146,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -194,7 +195,7 @@ import {
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
 import { resolveChildTurnDeadlineMs } from "./child-budget.js";
-import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
+import { codexSubagentWriteCapabilities, sanitizeName, type CodexRenderDiagnostic } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -395,9 +396,11 @@ const TRANSIENT_RETRY_MAX = 2;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
 const TRANSIENT_BACKOFF_SLICE_MS = 250;
 
-/** The trip reason an aborted run signal maps to: a PauseNowSignal is a pause, anything else a cancel. */
+const REASON_SWITCH = "codex credential switch";
+
+/** Steering switches and pauses are distinct from terminal cancellation. */
 function reasonForSignal(signal: AbortSignal | undefined): string {
-  return signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
+  return signal?.reason instanceof CredentialSwitchSignal ? REASON_SWITCH : signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
 }
 
 /** Issue #1764: one handling path's snapshot of the pause-now state, taken before its first await. */
@@ -455,7 +458,17 @@ class CodexVaultLockState {
  * captured; one that arrived during its awaits stays pending and trips the next turn at its start.
  */
 class CodexPauseNowState {
-  /** Bumped by every ctx.onPauseNow interrupt (steering fires it for `now` and `wall`). */
+  /** Switch generations are consumed only after a confirmed coordinator continuation. */
+  switchSeq = 0;
+  handledSwitchSeq = 0;
+  readonly handledSwitchSignals = new WeakSet<AbortSignal>();
+  switchToken?: { seq: number; signal?: AbortSignal; error: CredentialSwitchSignal };
+  continueSwitch?: (site: import("../executor.js").InPlaceSwitchSite) => Promise<ProviderEpoch>;
+  interruptSwitch(): void {
+    this.switchSeq++;
+    this.activeTurnTrip?.(REASON_SWITCH);
+  }
+  /** Bumped by every ctx.onPauseNow interrupt. */
   private seq = 0;
   /** The newest generation a handling path consumed without parking. */
   private handledSeq = 0;
@@ -622,11 +635,39 @@ function toHarnessAgent(t: AgentTemplate, repoSkills?: readonly string[]): Harne
     description: t.description,
     prompt: t.prompt_body,
     model: t.model ?? undefined,
+    // A string is passed through unvalidated on purpose: renderCodexRun's resolveEffort drops an
+    // out-of-contract value with an `unknown_effort` diagnostic the executor reports. A non-string
+    // (never sent by the api) is no pin, so it cannot reach the renderer's string sanitizer.
+    ...(typeof t.effort === "string" ? { effort: t.effort as HarnessEffort } : {}),
     tools: t.tools == null ? { kind: "inherit" } : { kind: "allow", names: t.tools },
     deniedTools: repoSkills ? [...REPO_AGENT_DENIED_TOOLS] : [],
     toolServers: [],
     skills: repoSkills ? [...repoSkills] : (t.skills ?? []),
   };
+}
+
+/** Roles already told about an out-of-contract effort pin, per run. buildPhaseBroker runs per
+ *  turn and is rebuilt per epoch, so the notice dedupes here, keyed by the run's context. */
+const unknownEffortNoticed = new WeakMap<RunContext, Set<string>>();
+
+/** Emit one `status` run message per subagent role whose template effort was dropped by the
+ *  renderer (an `unknown_effort` diagnostic on a non-lead role). The text carries the sanitized
+ *  role name only, never the raw effort value. Lead diagnostics are out of scope here: the lead's
+ *  effort arrives already closed-set from the claim guard. */
+function emitUnknownEffortNotices(ctx: RunContext, diagnostics: readonly CodexRenderDiagnostic[]): void {
+  for (const d of diagnostics) {
+    if (d.kind !== "unknown_effort" || d.role === "lead") continue;
+    let seen = unknownEffortNoticed.get(ctx);
+    if (!seen) {
+      seen = new Set<string>();
+      unknownEffortNoticed.set(ctx, seen);
+    }
+    if (seen.has(d.role)) continue;
+    seen.add(d.role);
+    ctx.emit({ kind: "status", agent: "worker", payload: {
+      text: `Subagent ${sanitizeName(d.role)} declares a reasoning effort outside low, medium, high, xhigh and max. uzi ignores it and the subagent follows the run's effort.`,
+    } });
+  }
 }
 
 // ─── A single-consumer child-frame queue (part C consumer side) ─────────────────
@@ -944,15 +985,12 @@ export function createRunLaneInstallerReconcile(
     registerToken: (token: string) => void;
     committed?: CodexCommittedGenerationCell;
     isVaultLocked?: () => boolean;
+    assertCurrent?: () => void;
   },
   timeoutNow?: () => number,
   abort = new AbortController(),
   verifyOwnedInstallerProof: () => boolean = () => true,
 ) {
-  const credentialReconcile = buildRunLaneReconcile(
-    credentials.runId, credentials.client, credentials.binding, credentials.registerToken,
-    credentials.committed, credentials.isVaultLocked, lifecycleSignal,
-  );
   const state: {
     abort: AbortController;
     cancellation: AbortSignal;
@@ -984,37 +1022,51 @@ export function createRunLaneInstallerReconcile(
       if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   };
-  const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
-    const now = request.checkpointStop?.now ?? Date.now;
-    const cause = request.gracefulShutdownCheckpoint;
-    const deadlineAt = Math.min(now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
-    const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
-    const cancellation = AbortSignal.any([signal, authoritySignal,
-      ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
-      ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
-    const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
-      category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
-      message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
-        : "codex dependency install did not settle before reconcile",
-    }] });
-    const remaining = () => Math.max(0, Math.min(deadlineAt - now(),
-      cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
-    if (cause && cancellation.aborted) return refused();
-    if (!await settle(deadlineAt, cancellation, remaining)) {
-      if (request.checkpointStop?.signal.aborted && !signal.aborted && remaining() > 0) {
-        // Cleanup ignores cooperative/lifecycle cancellation only; it grants no
-        // credential authority. The original hard deadline still bounds the join.
-        const cleanupSignal = AbortSignal.any([signal,
-          ...[cause?.stopSignal, cause ? MaintenanceBudget.signal() : undefined]
-            .filter((s): s is AbortSignal => s !== undefined)]);
-        if (!await settle(deadlineAt, cleanupSignal, remaining)) return refused();
-        return credentialReconcile({ ...request, deadlineMs: remaining() }, signal);
+  const forCredentials = (input: typeof credentials): ReconcileBeforeBoundary => {
+    const captured = Object.freeze({ ...input });
+    const capturedReconcile = buildRunLaneReconcile(
+      captured.runId, captured.client, captured.binding, captured.registerToken,
+      captured.committed, captured.isVaultLocked, lifecycleSignal, captured.assertCurrent,
+    );
+    const credentialReconcile: ReconcileBeforeBoundary = async (request, signal) => {
+      captured.assertCurrent?.();
+      const result = await capturedReconcile(request, signal);
+      captured.assertCurrent?.();
+      return result;
+    };
+    const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+      const now = request.checkpointStop?.now ?? Date.now;
+      const cause = request.gracefulShutdownCheckpoint;
+      const deadlineAt = Math.min(now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
+      const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
+      const cancellation = AbortSignal.any([signal, authoritySignal,
+        ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
+        ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
+      const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
+        category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
+        message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
+          : "codex dependency install did not settle before reconcile",
+      }] });
+      const remaining = () => Math.max(0, Math.min(deadlineAt - now(),
+        cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
+      if (cause && cancellation.aborted) return refused();
+      if (!await settle(deadlineAt, cancellation, remaining)) {
+        if (request.checkpointStop?.signal.aborted && !signal.aborted && remaining() > 0) {
+          // Cleanup ignores cooperative/lifecycle cancellation only; it grants no
+          // credential authority. The original hard deadline still bounds the join.
+          const cleanupSignal = AbortSignal.any([signal,
+            ...[cause?.stopSignal, cause ? MaintenanceBudget.signal() : undefined]
+              .filter((s): s is AbortSignal => s !== undefined)]);
+          if (!await settle(deadlineAt, cleanupSignal, remaining)) return refused();
+          return credentialReconcile({ ...request, deadlineMs: remaining() }, signal);
+        }
+        return refused();
       }
-      return refused();
-    }
-    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - now()) }, signal);
+      return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - now()) }, signal);
+    };
+    return reconcile;
   };
-  return Object.assign(state, { settle, reconcile });
+  return Object.assign(state, { settle, reconcile: forCredentials(credentials), forCredentials });
 }
 
 /**
@@ -1052,10 +1104,12 @@ export function buildRunLaneReconcile(
   committed: CodexCommittedGenerationCell = { value: binding.authMode === "subscription" ? binding.generation : undefined },
   isVaultLocked?: () => boolean,
   lifecycleSignal?: AbortSignal,
+  assertCurrent?: () => void,
 ): ReconcileBeforeBoundary {
   let operation: { capability: string; operation_id: string; observed_generation: number } | undefined;
   let operationUncertain = false;
   return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
+    assertCurrent?.();
     const now = request.checkpointStop?.now ?? Date.now;
     const cause = request.gracefulShutdownCheckpoint;
     const deadlineAt = Math.min(now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
@@ -1115,6 +1169,7 @@ export function buildRunLaneReconcile(
         // At most two HTTP attempts, immediate reconciliation in this same flight. A refusal
         // ends the loop; ambiguity/contended alone admits the second attempt.
         for (let attempt = 0; attempt < 2; attempt++) {
+          assertCurrent?.();
           if (authoritySignal?.aborted) return blocked();
           if (expired()) return blocked(uncertain ? "refresh_unknown" : undefined);
           try {
@@ -1122,6 +1177,9 @@ export function buildRunLaneReconcile(
               runId, { ...frozenOperation },
               { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId }, signal,
             );
+            // Retirement cannot settle the retained operation or publish its late result.
+            try { assertCurrent?.(); }
+            catch (error) { operationUncertain = true; throw error; }
             // Cancellation can arrive with the response; it still precedes any new authority.
             if (authoritySignal?.aborted) return blocked();
             if (expired()) {
@@ -1135,6 +1193,8 @@ export function buildRunLaneReconcile(
             operationUncertain = false;
             return { kind: "ready" };
           } catch (err) {
+            try { assertCurrent?.(); }
+            catch (error) { operationUncertain = true; throw error; }
             if (authoritySignal?.aborted) return blocked();
             if (codexDeferralReason(err) === "vault_locked") {
               return { kind: "blocked", errors: [{ category: "authorization",
@@ -1162,17 +1222,20 @@ export function buildRunLaneReconcile(
         return blocked("refresh_unknown");
       }
       // api_key: ZERO refresh; a fresh release re-authorizes only (no subscription fallback).
+      assertCurrent?.();
       const res = await client.releaseCodex(
         runId,
         { capability: binding.capability },
         { authMode: "api_key" },
         signal,
       );
+      assertCurrent?.();
       if (authoritySignal?.aborted) return blocked();
       if (expired()) return blocked();
       registerToken(res.access_token);
       return { kind: "ready" };
     } catch (err) {
+      assertCurrent?.();
       if (authoritySignal?.aborted) return blocked();
       // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
       // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
@@ -1493,7 +1556,7 @@ export function makeProductionCodexAdviceHarnessFactory(
     // Retain the owner's scope before credential release can yield. A delayed advice
     // launch must still observe root closure, rather than create a fresh unbound scope.
     const scope = binding.authMode === "subscription"
-      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0, {}, undefined, undefined, log) : undefined;
+      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0, {}, undefined, undefined, log, codexOperationAuthorityIdentity(binding.capability)) : undefined;
     const close = (): void => { signal?.removeEventListener("abort", close); scope?.close(); };
     signal?.addEventListener("abort", close, { once: true });
     if (signal?.aborted) close();
@@ -1539,6 +1602,8 @@ export interface CodexToolHandlerDeps {
   readonly log: Logger;
   /** The run's live-stream emit (the findings tool emits a `finding` card through it). */
   readonly emit: (msg: EmittedMessage) => void;
+  /** The run's text redactor (ctx.redactText); absent means identity. */
+  readonly redactText?: (s: string) => string;
   /** The run's GRANTED skills (ctx.skills). The Skill handler returns the sanitized
    *  body/description of the requested granted skill; the broker has ALREADY gated the
    *  call on `allowedSkills` before the handler is reached. */
@@ -1566,7 +1631,7 @@ export interface CodexToolHandlerDeps {
  *     mismatch a latent inconsistency — it is deliberately NOT registered.
  */
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
-  const { client, runId, log, emit, skills } = deps;
+  const { client, runId, log, emit, skills, redactText } = deps;
   const map = new Map<string, ToolHandler>();
   if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, async args => {
     const reply = await readCIEvidence(deps.ciEvidence!, args);
@@ -1581,14 +1646,14 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
 
   // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
   // allowedTools gate stops a subagent reaching this handler regardless).
-  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration });
+  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration, redactText });
   map.set(
     memoryToolNames()[0]!,
     (args) => memHandlers.saveMemory(args as Parameters<MemoryToolHandlers["saveMemory"]>[0]),
   );
 
   // findings (granted to the lead AND every subagent — stays in the subagent base).
-  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log });
+  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log, redactText });
   map.set(
     reportIncidentalIssueToolName(),
     (args) => findingsHandlers.reportIncidentalIssue(args as Parameters<FindingsToolHandlers["reportIncidentalIssue"]>[0]),
@@ -1597,7 +1662,7 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
   // forge (8 tools; the 6 reads + 2 writes share the ONE per-run budget in makeForgeToolHandlers).
   // An explicit [suffix, handler] table so a rename cannot silently misalign the map; the
   // qualified keys equal forgeToolNames() by construction (same FORGE_SERVER_NAME + suffixes).
-  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log });
+  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log, redactText });
   const forgeEntries: ReadonlyArray<readonly [suffix: string, handler: ToolHandler]> = [
     ["get_issue", (a) => forgeHandlers.getIssue(a as Parameters<ForgeToolHandlers["getIssue"]>[0])],
     ["list_issues", (a) => forgeHandlers.listIssues(a as Parameters<ForgeToolHandlers["listIssues"]>[0])],
@@ -1936,7 +2001,7 @@ export interface CodexExecutorDeps {
    *  `persist` is used before every provider-root reap and at terminal to capture the
    *  live session subset; `remove` is NO LONGER called by the executor (the runner's
    *  runHome lifecycle owns store removal — preserve on park, remove on terminal). */
-  readonly sessionStore?: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
+  readonly sessionStore?: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist"> & Partial<Pick<typeof CodexSessionStore, "inspectSession">>;
   /** The shared tool-provisioning step (PRD #18). Production uses the real
    *  {@link provisionRunTools}; a unit test injects a stub so no real devbox/nix install
    *  runs. The resolved `toolEnv` is folded into the credential-free command env
@@ -2002,7 +2067,7 @@ export interface CodexExecutorOptions {
   /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
   readonly summarySettleMs?: number;
   readonly codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
-  /** Original summary claim block, validated by SummaryRunner; undefined uses the standalone binding. */
+  /** Legacy construction input; credentials are always derived from the captured binding. */
   readonly summaryClaimCodex?: unknown;
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
@@ -2051,6 +2116,32 @@ export interface CodexExecutorOptions {
 }
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
+/** Credential identity is fixed across provider-root recreations, never rebound in place. */
+export function createCodexEpochAuthority(input: CodexBinding, metadata: { capabilityEpoch?: number; ordinal: number } = { ordinal: 0 }) {
+  const binding = Object.freeze({ ...input });
+  const claim: Readonly<ClaimCodexSecrets> = Object.freeze({
+    auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
+    ...(binding.authMode === "subscription" ? {
+      generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
+      chatgpt_plan_type: null,
+    } : {}),
+  } as ClaimCodexSecrets);
+  const committedGeneration: CodexCommittedGenerationCell = {
+    value: binding.authMode === "subscription" ? binding.generation : undefined,
+  };
+  let retired = false;
+  return Object.freeze({
+    binding, claim, committedGeneration, capabilityEpoch: metadata.capabilityEpoch, ordinal: metadata.ordinal,
+    isCurrent: (): boolean => !retired,
+    assertCurrent: (): void => {
+      if (retired) throw new TrustedExecutionRefusal("codex credential authority retired");
+    },
+    retire: (): void => { retired = true; },
+  });
+}
+
+type CodexEpochAuthority = ReturnType<typeof createCodexEpochAuthority>;
+
 /**
  * PRD #1171 m4: state shared by every provider epoch inside ONE executor claim leg. Closed over
  * once in `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
@@ -2060,9 +2151,9 @@ export interface CodexExecutorOptions {
  * an owned HOME are minted anew per epoch.
  */
 interface EpochSharedContext {
+  readonly authority: CodexEpochAuthority;
   readonly repoInstructions?: string;
   readonly provider: CodexProviderConfig;
-  readonly binding: CodexBinding;
   readonly worktreePath: string;
   readonly storeDir: string;
   readonly homeRoot: string;
@@ -2080,7 +2171,6 @@ interface EpochSharedContext {
    *  redactor never sees these) AND of the claim secrets (`ctx.redactText`), so neither can leave
    *  an unredacted prefix straddling the bound's cut. */
   readonly scrubProjected: (s: string) => string;
-  readonly committedGeneration: CodexCommittedGenerationCell;
   /** Issue #1789: the run-scoped vault-lock latch the run-lane refresh bridge reports into. */
   readonly vaultLock: CodexVaultLockState;
   readonly launchEffectRoot: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
@@ -2131,6 +2221,8 @@ interface ProviderEpoch {
   readonly buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker;
   /** Persist THIS epoch's credential-free session subset into the shared store (best-effort). */
   persistSession(): Promise<void>;
+  /** Strict copy errors propagate; an unlaunched epoch leaves the saved generation untouched. */
+  persistUsableSession(): Promise<void>;
   /** Full teardown of an ABANDONED epoch on recreation (quiesce + reap + disposeTools the
    *  registry, WITHOUT the token-eviction hook, then close the harness/fileop). */
   dispose(): Promise<void>;
@@ -2441,6 +2533,28 @@ export class CodexExecutor implements Executor {
   }
   private readonly epochSafeties = new Map<ExecutionRegistry, CodexExecutionSafetyImpl>();
   private readonly completedCaptures = new WeakMap<ExecutionRegistry, CompletedCredentialFreeCapture>();
+  private liveRolloutSave?: () => Promise<UsableSavedRollout>;
+
+  saveUsableRollout(): Promise<UsableSavedRollout> {
+    return this.liveRolloutSave?.() ?? Promise.resolve({ kind: "failed", reason: "inactive_leg" });
+  }
+
+  private switchAdmissionClosed = false;
+  private currentCodexAuthority?: CodexEpochAuthority;
+  private switchBuildAuthority?: CodexEpochAuthority;
+  private lastRootRequest?: RunTurnRequest;
+  private liveEpochSuspension?: (bounds: import("../codex-switch-coordinator.js").SwitchBounds) => Promise<CodexSuspendedEpoch>;
+
+  suspendCodexEpoch(bounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch> {
+    bounds.guard();
+    if (!this.liveEpochSuspension) return Promise.reject(new TrustedExecutionRefusal("inactive Codex switch boundary"));
+    return this.liveEpochSuspension(bounds);
+  }
+
+  private assertSwitchAdmission(construction?: CodexEpochAuthority): void {
+    if (this.switchAdmissionClosed && (!construction || construction !== this.switchBuildAuthority)) throw new TrustedExecutionRefusal("Codex switch admission closed");
+  }
+
   private beforeCaptureDrain?: () => Promise<void>;
   private captureMayHaveDrained?: () => boolean;
   private epochAdmission?: () => void;
@@ -2831,7 +2945,7 @@ export class CodexExecutor implements Executor {
   private readonly provisionRoot: string;
   private readonly opts: CodexExecutorOptions;
   private readonly deps: CodexExecutorDeps;
-  private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
+  private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist" | "inspectSession">;
   /** issue #1783 (R0): the supervisor pids of the provider roots this executor launched and has
    *  not yet cleanly reaped/disposed (see {@link recordedRootPids}). */
   private readonly providerRootPids = new Map<number, RecordedRoot>();
@@ -2858,14 +2972,39 @@ export class CodexExecutor implements Executor {
       inspect: (...args) => this.lifetime.admit(() => sessions.inspect(...args)),
       remove: (...args) => this.lifetime.admit(() => sessions.remove(...args)),
       persist: (...args) => this.lifetime.admit(() => sessions.persist(...args)),
+      inspectSession: (...args) => this.lifetime.admit(() => sessions.inspectSession?.(...args) ?? Promise.resolve("unknown" as const)),
     };
   }
 
-  /** Bind only the default intent/plan runner; other advice callers retain their policy. */
+  /** Runner Now calls share the same authority and cleanup ownership as internal summaries. */
+  bindCodexSummaryFactory(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory {
+    return this.ownSummaryFactory(build);
+  }
+
+  /** Bind internal and external summaries; other advice callers retain their policy. */
   private ownSummaryFactory(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory {
     const factory: CodexAdviceHarnessFactory = params => this.lifetime.admit(async () => {
       this.assertCaptureAdmission();
       const revision = this.captureRevision;
+      // Capture once at call admission: an A closure must never acquire B's authority.
+      // A public summary can precede run(); both entry points share the initial authority.
+      const authority = this.currentCodexAuthority ?? createCodexEpochAuthority(this.opts.binding);
+      this.currentCodexAuthority = authority;
+      const assertAuthority = () => {
+        if (!authority || this.currentCodexAuthority !== authority)
+          throw new TrustedExecutionRefusal("summary credential authority changed");
+        authority.assertCurrent();
+        if (params.binding.capability !== authority.binding.capability ||
+            params.binding.authMode !== authority.binding.authMode ||
+            params.binding.accessToken !== authority.binding.accessToken ||
+            (params.binding.authMode === "subscription" && authority.binding.authMode === "subscription" &&
+              (params.binding.generation !== authority.binding.generation ||
+               params.binding.chatgptAccountId !== authority.binding.chatgptAccountId ||
+               params.binding.chatgptPlanType !== authority.binding.chatgptPlanType)))
+          throw new TrustedExecutionRefusal("summary credential authority mismatch");
+        this.assertSwitchAdmission();
+      };
+      assertAuthority();
       const deadlineAt = summaryCallDeadlines.get(params);
       if (deadlineAt === undefined) throw new TrustedExecutionRefusal("summary call deadline missing");
       const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
@@ -2884,6 +3023,7 @@ export class CodexExecutor implements Executor {
       const guard = () => {
         try {
           this.assertCaptureAdmission(revision);
+          assertAuthority();
           if (this.summaryLifecycleClosed) throw new TrustedExecutionRefusal("summary admission closed");
           params.signal?.throwIfAborted();
           if (remaining() <= 0) throw new TrustedExecutionRefusal("summary deadline expired");
@@ -2923,6 +3063,7 @@ export class CodexExecutor implements Executor {
             await finish();
             throw new TrustedExecutionRefusal("summary root admission rejected");
           }
+          guard();
           return ownedHandle;
         },
       };
@@ -2949,11 +3090,16 @@ export class CodexExecutor implements Executor {
       try {
         guard();
         const harness = await build(params);
+        guard();
         ownedSummaryHarnesses.set(harness, () => registry.markLaunchCleanupUnconfirmed());
         const run = harness.run.bind(harness);
         harness.run = (request, policy) => this.lifetime.admit(async () => {
-          try { return await run(request, policy); }
-          finally { await finish(); }
+          try {
+            guard();
+            const result = await run(request, policy);
+            guard();
+            return result;
+          } finally { await finish(); }
         });
         return harness;
       } catch (error) {
@@ -3004,20 +3150,25 @@ export class CodexExecutor implements Executor {
     this.assertCaptureAdmission();
     if (this.runActive) throw new TrustedExecutionRefusal("codex run already active");
     this.runActive = true;
-    const operation = this.opts.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
-      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log) : undefined;
+    const authority = this.currentCodexAuthority ?? createCodexEpochAuthority(this.opts.binding);
+    this.currentCodexAuthority = authority;
+    this.lastRootRequest = undefined;
+    const operation = authority.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
+      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(authority.binding.capability)) : undefined;
     operation?.own();
     if (operation) ctx = { ...ctx,
       codexRootAdmissionActive: () => operation.controller.active(),
       prepareCodexRootDispatch: (signal, check, kind = "root") => operation.prepare(kind,
         AbortSignal.any([signal, ...[ctx.terminalLifecycleSignal].filter((s): s is AbortSignal => !!s)]), check),
     };
-    try { return await this.runLeg(ctx); }
+    try { return await this.runLeg(ctx, authority); }
     finally { operation?.close(); this.runActive = false; }
   }
 
-  private async runLeg(ctx: RunContext): Promise<ExecutorResult> {
+  private async runLeg(ctx: RunContext, authority: CodexEpochAuthority): Promise<ExecutorResult> {
+    let currentAuthority = authority;
     this.assertCaptureAdmission();
+    this.assertSwitchAdmission();
     this.executionStarted = true;
     const setupRevision = this.captureRevision;
     this.intentFlight = undefined;
@@ -3035,7 +3186,7 @@ export class CodexExecutor implements Executor {
     this.deferredFinal = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
-    const binding = this.opts.binding;
+    const { binding, committedGeneration } = authority;
     // The packaged-only loopback seam must override both halves of the app-server
     // provider selection. config.toml names the custom HTTP provider in launcher.ts,
     // while thread/start carries this object and would otherwise override it back to
@@ -3109,13 +3260,6 @@ export class CodexExecutor implements Executor {
       this.log.addSecret(token);
       releasedTokens.add(token);
     };
-    // (m1) The run's ONE shared committed observed-generation cell, SHARED across every epoch: the
-    // app-server refresh bridge (during a turn) and the boundary reconcile (at a sink) of EVERY
-    // epoch read/write it, so a generation advanced under epoch N carries into epoch N+1. Neither
-    // keeps a private copy. Subscription seeds it from the binding; api_key never refreshes.
-    const committedGeneration: CodexCommittedGenerationCell = {
-      value: binding.authMode === "subscription" ? binding.generation : undefined,
-    };
 
     // A SINGLE terminal try/finally spanning ALL provider epochs. `epoch` holds the CURRENT
     // provider epoch — undefined until the first startProviderEpoch succeeds, so a setup failure
@@ -3183,12 +3327,13 @@ export class CodexExecutor implements Executor {
     // onPauseNow is last-wins and fires on every `now`/`wall` pause). Each turn installs its own trip.
     const pauseNow = new CodexPauseNowState(ctx.signal);
     ctx.onPauseNow?.(() => pauseNow.interrupt());
+    ctx.onCredentialSwitch?.(() => pauseNow.interruptSwitch());
     // Issue #1764: the lifecycle signal for epoch startup. It forwards only a genuine (non-pause)
     // abort of ctx.signal; deferred safety retains the listener until terminal disposal,
     // otherwise the finally below removes it.
     const lifecycleAbort = new AbortController();
     const forwardLifecycleAbort = (): void => {
-      if (!(ctx.signal?.reason instanceof PauseNowSignal)) lifecycleAbort.abort(ctx.signal?.reason);
+      if (!(ctx.signal?.reason instanceof PauseNowSignal) && !(ctx.signal?.reason instanceof CredentialSwitchSignal)) lifecycleAbort.abort(ctx.signal?.reason);
     };
     if (ctx.signal?.aborted) forwardLifecycleAbort();
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
@@ -3200,27 +3345,26 @@ export class CodexExecutor implements Executor {
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(lifecycleSignal.reason); }
     };
     lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
-    const summaryResultAllowed = (): boolean => !lifecycleSignal.aborted
+    const summaryResultAllowed = (): boolean => currentAuthority.isCurrent() && !lifecycleSignal.aborted
       && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
     const summaryAllowed = (): boolean => this.lifetime.isOpen() && !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
-      && summaryResultAllowed();
-    const summaryBinding = {
-      auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
-      ...(binding.authMode === "subscription" ? {
-        generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
-        chatgpt_plan_type: null,
-      } : {}),
-    };
+      && !this.switchAdmissionClosed && summaryResultAllowed();
     const summariesOn = isRunSummaryKind(ctx.kind);
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
-    const summaryInputs = async () => ({
-      claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
-        codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
-      } },
-      token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
-      issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
-    });
+    const summaryInputs = async () => {
+      const admitted = currentAuthority;
+      admitted.assertCurrent();
+      const prdText = (await prdInputP)?.prdText;
+      admitted.assertCurrent();
+      return {
+        claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
+          codex: admitted.claim,
+        } },
+        token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
+        issueBody: ctx.issueDescription, prdText,
+      };
+    };
     // Invalidate the current plan-summary flight and latched result. Does not reopen
     // summaryLifecycleClosed; returns the new generation.
     const supersedePlanSummary = (): number => {
@@ -3233,16 +3377,20 @@ export class CodexExecutor implements Executor {
       const generation = supersedePlanSummary();
       // A later accepted candidate may start fresh after a refused capture/switch.
       this.summaryLifecycleClosed = false;
+      // The callback belongs to the credential authority current when it was created: after a switch
+      // replaces it, this retired callback must not start work (summaryInputs reads the live authority).
+      const admittedAuthority = currentAuthority;
+      const authorityCurrent = (): boolean => currentAuthority === admittedAuthority;
       let flight: CodexExecutor["planFlight"];
       return planMd => {
         if (flight) return flight.done;
-        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
+        if (!summariesOn || !authorityCurrent() || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
         flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false,
           abandoned: false, closed: false, generation };
         const owned = flight;
         this.planFlight = owned;
         this.planFlights.add(owned);
-        const allowed = (): boolean => summaryAllowed() && generation === planGeneration
+        const allowed = (): boolean => authorityCurrent() && summaryAllowed() && generation === planGeneration
           && this.planFlight === owned && !owned.closed && !owned.abandoned && !owned.ctrl.signal.aborted;
         owned.done = (async () => {
           try {
@@ -3286,7 +3434,8 @@ export class CodexExecutor implements Executor {
     const installState = createRunLaneInstallerReconcile(
       lifecycleSignal,
       {
-        runId: ctx.runId, client: this.opts.client, binding: this.opts.binding, registerToken,
+        runId: ctx.runId, client: this.opts.client, binding, registerToken,
+        assertCurrent: authority.assertCurrent,
         committed: committedGeneration, isVaultLocked: () => pauseNow.vaultLock.latched,
       },
       this.deps.timeoutNow,
@@ -3690,6 +3839,7 @@ export class CodexExecutor implements Executor {
         claimGeneration: ctx.claimGeneration,
         log: this.log,
         emit: (msg) => ctx.emit(msg),
+        redactText: ctx.redactText,
         skills: ctx.skills ?? [],
         ciEvidence: ctx.ciEvidence,
         codeCrossCheck: codeCrossCheckAccess(ctx),
@@ -3708,11 +3858,19 @@ export class CodexExecutor implements Executor {
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
-      const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
-        this.lifetime.assertOpen();
-        const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
-        await this.settleOwnedSummariesBeforeCredentials(request.deadlineMs);
-        return installState.reconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
+      const reconcileFor = (owned: CodexEpochAuthority): ReconcileBeforeBoundary => {
+        const credentials = installState.forCredentials({
+          runId: ctx.runId, client: this.opts.client, binding: owned.binding, registerToken,
+          committed: owned.committedGeneration, assertCurrent: owned.assertCurrent,
+          isVaultLocked: () => pauseNow.vaultLock.latched,
+        });
+        return async (request, signal) => {
+          owned.assertCurrent(); this.lifetime.assertOpen();
+          const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
+          await this.settleOwnedSummariesBeforeCredentials(request.deadlineMs);
+          owned.assertCurrent();
+          return credentials({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
+        };
       };
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
@@ -3748,10 +3906,10 @@ export class CodexExecutor implements Executor {
       // ONCE; startProviderEpoch mints only the per-epoch registry/safety/harness/effect roots +
       // its own fresh credential + owned HOME on top of it.
       const claimRedact = ctx.redactText ?? ((s: string): string => s);
-      const shared: EpochSharedContext = {
+      let shared: EpochSharedContext = {
         repoInstructions,
         provider,
-        binding,
+        authority,
         vaultLock: pauseNow.vaultLock,
         settleDepsInstall: settleInstall,
         worktreePath,
@@ -3782,11 +3940,10 @@ export class CodexExecutor implements Executor {
         // Issue #1583: BOTH secret sets are scrubbed before a projection is bounded — the claim
         // secrets (ctx.redactText, the batcher's set) and the runtime-released Codex tokens.
         scrubProjected: (s: string): string => claimRedact(makeTextRedactor([...releasedTokens])(s)),
-        committedGeneration,
         launchEffectRoot,
         spawnBoundaryRoot,
         boundaryProcessSpawner,
-        reconcile,
+        reconcile: reconcileFor(authority),
         onTerminalDispose,
         commandCache: runCache,
         // One accountant for this executor claim leg. Internal provider epochs share its cumulative;
@@ -3804,6 +3961,47 @@ export class CodexExecutor implements Executor {
       // cross-worker resume) or starts a fresh session. `lastSessionId` tracks the most recent
       // turn's session id so a recreated epoch resumes the RIGHT thread.
       let lastSessionId = ctx.sessionId ?? undefined;
+      const saveRollout = (): Promise<UsableSavedRollout> => {
+        const admitted = currentAuthority;
+        const captured = epoch;
+        const sessionId = captured?.harness.rootThreadId ?? lastSessionId;
+        const revision = this.captureRevision;
+        const guard = (): void => {
+          admitted.assertCurrent();
+          this.assertCaptureAdmission(revision);
+          if (this.liveRolloutSave !== saveRollout || epoch !== captured
+            || (captured?.harness.rootThreadId ?? lastSessionId) !== sessionId || lifecycleSignal.aborted
+            || ctx.claimFenced?.() || ctx.cancelRequested?.()) throw new Error("retired rollout save");
+        };
+        return this.withCaptureOwnership(async (): Promise<UsableSavedRollout> => {
+          try {
+            guard();
+            if (!captured || !sessionId) return { kind: "failed", reason: "missing_session" };
+            // Read the sink's current copy only after acquiring ownership. The ordinary
+            // sink can start independently of captureTail, including during our own copy.
+            if (!beforeReapPersist && !reapedSinceLastPersist) await captured.persistUsableSession();
+            guard();
+            const pending = beforeReapPersist;
+            const saved = reapedSinceLastPersist;
+            if (pending) await pending;
+            const guardCopy = (): void => {
+              guard();
+              // One join is bounded; a changed copy/flag fails closed rather than retrying
+              // indefinitely or inspecting a generation whose copy is still outstanding.
+              if (beforeReapPersist !== pending || reapedSinceLastPersist !== saved
+                || (saved && !pending)) throw new Error("rollout copy changed");
+            };
+            guardCopy();
+            const presence = await this.sessionStore.inspectSession(storeDir, sessionId);
+            guardCopy();
+            return presence === "present" ? { kind: "usable", sessionId }
+              : { kind: "failed", reason: "session_unavailable" };
+          } catch {
+            return { kind: "failed", reason: "save_unproven" };
+          }
+        });
+      };
+      this.liveRolloutSave = saveRollout;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
       let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; checkedAt: number; ownerWaiting?: boolean } | undefined;
@@ -3826,6 +4024,8 @@ export class CodexExecutor implements Executor {
       let completionAttempted = false;
       const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
       this.epochAdmission = () => {
+        currentAuthority.assertCurrent();
+        this.assertSwitchAdmission(currentAuthority);
         this.assertCaptureAdmission();
         // Capture continuation adds this fence. Ordinary epoch startup retains its
         // established approval/installer interruption routing.
@@ -3856,6 +4056,251 @@ export class CodexExecutor implements Executor {
         this.safety = epoch.safety;
         return epoch;
       });
+
+      const suspendEpoch = async (bounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch> => {
+        bounds.guard();
+        const ownedAuthority = currentAuthority;
+        const capturedReconcile = shared.reconcile;
+        ownedAuthority.assertCurrent();
+        this.assertCaptureAdmission();
+        if (this.switchAdmissionClosed || pauseNow.activeTurnTrip || !epoch)
+          throw new TrustedExecutionRefusal("Codex switch requires a settled live boundary");
+        const captured = epoch;
+        const revision = this.captureRevision;
+        let retired = false;
+        let reopened = false;
+        let saved: string | undefined;
+        let reaped = false;
+        let replacement: CodexEpochAuthority | undefined;
+        let prepared = false;
+        let preparationStarted = false;
+        let replacementRefresh: import("./appserver-auth.js").CodexAuthSuspensionLease | undefined;
+        let freshStarted = false;
+        let resumeRefused = false;
+        const current = (): void => {
+          bounds.guard();
+          ownedAuthority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+          if (this.liveEpochSuspension !== suspendEpoch || epoch !== captured ||
+              lifecycleSignal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.() ||
+              retired || reopened)
+            throw new TrustedExecutionRefusal("retired Codex switch boundary");
+        };
+        current();
+        const summaryWasClosed = this.summaryLifecycleClosed;
+        // This gate is independent of captureRevision and leaves A's root and scope intact.
+        this.switchAdmissionClosed = true;
+        // Ordinary checkpoint reap has already saved A and closed its transport. Only
+        // that closed epoch with every root reaped may bypass live auth health checks.
+        const alreadyReaped = reapedSinceLastPersist;
+        const assertReaped = (): void => {
+          if (!reapedSinceLastPersist || !["closed", "disposed"].includes(captured.registry.state()) ||
+              captured.registry.isPoisoned() || !captured.registry.allRegisteredRootsReaped() ||
+              captured.registry.pendingLaunchCount() !== 0 || captured.registry.inFlightCallbackCount() !== 0)
+            throw new TrustedExecutionRefusal("Codex reaped boundary cleanup unproven");
+        };
+        let refresh: import("./appserver-auth.js").CodexAuthSuspensionLease | undefined;
+        const assertAuthHealthy = (): void => {
+          try {
+            if (alreadyReaped) assertReaped();
+            else refresh!.assertHealthy();
+          } catch {
+            throw new TrustedExecutionRefusal("Codex live authentication is unavailable");
+          }
+        };
+        try {
+          if (alreadyReaped) assertReaped();
+          else refresh = captured.harness.suspendRefreshAdmission();
+        } catch {
+          throw new TrustedExecutionRefusal("Codex authentication suspension refused");
+        }
+        const intentFlights = [...this.retiredIntentFlights, ...(this.intentFlight ? [this.intentFlight] : [])];
+        const planFlights = [...this.planFlights];
+        this.summaryLifecycleClosed = true;
+        for (const flight of intentFlights) flight.ctrl.abort();
+        for (const flight of planFlights) { flight.closed = true; flight.ctrl.abort(); }
+        // Each admitted producer retains ownership until it settles. An error does
+        // not detach siblings; bounds are rechecked after their complete join.
+        const drained = await Promise.allSettled([
+          alreadyReaped ? captured.harness.settleReapedAuth() : refresh?.drain(), settleInstall(),
+          ...[...intentFlights, ...planFlights].map(flight => flight.done),
+        ]);
+        current();
+        assertAuthHealthy();
+        const failure = drained.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+        if ([...this.unverifiedEpochRegistries].some(registry => this.ownedSummaryRegistries.has(registry)))
+          throw new TrustedExecutionRefusal("summary cleanup unproven");
+        return Object.freeze<CodexSuspendedEpoch>({
+          reconcileA: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds, remainingMs: number): Promise<ReconcileOutcome> => {
+            nextBounds.guard(); current();
+            if (!Number.isFinite(remainingMs) || remainingMs <= 0)
+              throw new TrustedExecutionRefusal("Codex reconcile requires positive remaining duration");
+            // Summary producers have joined above. Use the existing installer's
+            // immutable A credential closure; SwitchBounds.deadline is not epoch time.
+            const result = await capturedReconcile(
+              { boundary: "checkpoint", deadlineMs: remainingMs }, nextBounds.signal);
+            nextBounds.guard(); current();
+            assertAuthHealthy();
+            return result;
+          },
+          persistRollout: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout> => {
+            nextBounds.guard(); current();
+            const result = await saveRollout();
+            nextBounds.guard(); current();
+            if (result.kind === "usable") saved = result.sessionId;
+            return result;
+          },
+          reopenA: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<void> => {
+            nextBounds.guard(); current();
+            refresh?.resume();
+            nextBounds.guard(); current();
+            assertAuthHealthy();
+            reopened = true;
+            this.summaryLifecycleClosed = summaryWasClosed;
+            this.switchAdmissionClosed = false;
+          },
+          teardown: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<boolean> => {
+            nextBounds.guard(); current();
+            if (!saved || (captured.harness.rootThreadId ?? lastSessionId) !== saved)
+              throw new TrustedExecutionRefusal("Codex teardown requires exact saved rollout");
+            retired = true;
+            ownedAuthority.retire();
+            // Preserve the strict copy through ordinary finally/reap handling.
+            reapedSinceLastPersist = true;
+            beforeReapPersist = Promise.resolve();
+            await captured.dispose();
+            nextBounds.guard(); bounds.guard();
+            this.lifetime.assertOpen();
+            if (lifecycleSignal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.() ||
+                epoch !== captured || this.captureRevision !== revision)
+              throw new TrustedExecutionRefusal("Codex teardown ownership changed");
+            reaped = !this.unverifiedEpochRegistries.has(captured.registry) &&
+              this.unverifiedEpochRegistries.size === 0;
+            return reaped;
+          },
+          publishB: async (bundle, nextBounds): Promise<void> => {
+            nextBounds.guard(); bounds.guard(); this.lifetime.assertOpen();
+            if (!retired || !reaped || replacement || reopened || epoch !== captured ||
+                this.liveEpochSuspension !== suspendEpoch || lifecycleSignal.aborted ||
+                ctx.claimFenced?.() || ctx.cancelRequested?.() || this.captureRevision !== revision)
+              throw new TrustedExecutionRefusal("Codex replacement publication refused");
+            if (!Number.isSafeInteger(bundle.capabilityEpoch) || bundle.capabilityEpoch <= 0 ||
+                bundle.ordinal !== ownedAuthority.ordinal + 1)
+              throw new TrustedExecutionRefusal("Codex replacement metadata invalid");
+            const next = createCodexEpochAuthority(bundle.binding, bundle);
+            registerToken(next.binding.accessToken); registerToken(next.binding.capability);
+            const nextShared = Object.freeze({ ...shared, authority: next, reconcile: reconcileFor(next) });
+            // Consumers remain gated throughout this synchronous, complete authority publication.
+            currentAuthority = next; shared = nextShared; this.currentCodexAuthority = next;
+            replacement = next;
+          },
+          restartAndResume: async (sessionId, nextBounds) => {
+            nextBounds.guard(); bounds.guard();
+            const next = replacement;
+            if (!next || !retired || !reaped || preparationStarted || sessionId !== saved)
+              throw new TrustedExecutionRefusal("Codex replacement preparation refused");
+            preparationStarted = true;
+            next.assertCurrent();
+            const base = this.lastRootRequest ?? this.buildRunRequest(ctx,
+              ctx.planApproved ? "implement" : "plan", "", sessionId, nextBounds.signal,
+              shared.selection.current, shared.repoInstructions);
+            this.switchBuildAuthority = next;
+            try {
+              const fresh = await this.startProviderEpoch(ctx, shared, sessionId, epochNamespace, ++epochIndex,
+                { persistAfterLaunchOnly: true });
+              // Transfer cleanup ownership before any post-construction guard can throw.
+              epoch = fresh; this.safety = fresh.safety;
+              // Login initializes B, but ordinary refresh stays gated until the
+              // complete authority bundle opens. Teardown refuses queued refreshes
+              // if preparation or publication fails before finishB.
+              replacementRefresh = fresh.harness.suspendRefreshAdmission();
+              nextBounds.guard(); bounds.guard(); next.assertCurrent();
+              const request = { ...base, signal: nextBounds.signal, resumeSessionId: sessionId,
+                rootDispatch: undefined, onRuntimeConfig: undefined };
+              try {
+                lastSessionId = await fresh.harness.prepareRootAndThread(request);
+                nextBounds.guard(); bounds.guard(); next.assertCurrent(); prepared = true;
+                reapedSinceLastPersist = false; beforeReapPersist = undefined;
+                return { kind: "resumed" } as const;
+              } catch (error) {
+                nextBounds.guard(); bounds.guard(); next.assertCurrent();
+                if (error instanceof CodexResumeError) { resumeRefused = true; return { kind: "confirmed_resume_refusal" } as const; }
+                throw error;
+              }
+            } finally { this.switchBuildAuthority = undefined; }
+          },
+          startFreshLineage: async (nextBounds): Promise<void> => {
+            nextBounds.guard(); bounds.guard();
+            const next = replacement;
+            if (!next || !resumeRefused || freshStarted || prepared || !epoch || epoch === captured)
+              throw new TrustedExecutionRefusal("Codex fresh lineage preparation refused");
+            freshStarted = true;
+            if (ctx.preserveConversation) throw new PolicyContinuationRejected("provider_resume_rejected");
+            next.assertCurrent();
+            const base = this.lastRootRequest ?? this.buildRunRequest(ctx, ctx.planApproved ? "implement" : "plan",
+              "", undefined, nextBounds.signal, shared.selection.current, shared.repoInstructions);
+            this.switchBuildAuthority = next;
+            try {
+              lastSessionId = await epoch.harness.prepareRootAndThread({ ...base, signal: nextBounds.signal,
+                resumeSessionId: undefined, rootDispatch: undefined, onRuntimeConfig: undefined }, { allowFresh: true });
+              nextBounds.guard(); bounds.guard(); next.assertCurrent();
+              ctx.emit({ kind: "status", agent: "worker", payload: {
+                event: "resume_lineage_break", text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
+              } });
+              prepared = true; reapedSinceLastPersist = false; beforeReapPersist = undefined;
+            } finally { this.switchBuildAuthority = undefined; }
+          },
+          finishB: async (nextBounds): Promise<void> => {
+            nextBounds.guard(); bounds.guard();
+            if (!replacement || !prepared || currentAuthority !== replacement || !epoch || epoch === captured || reopened)
+              throw new TrustedExecutionRefusal("Codex replacement admission refused");
+            replacement.assertCurrent(); this.lifetime.assertOpen();
+            if (lifecycleSignal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.())
+              throw new TrustedExecutionRefusal("Codex replacement ownership lost");
+            this.summaryLifecycleClosed = summaryWasClosed;
+            reopened = true; this.switchAdmissionClosed = false;
+            replacementRefresh?.resume();
+          },
+        });
+      };
+      this.liveEpochSuspension = suspendEpoch;
+      pauseNow.continueSwitch = async site => {
+        const token = pauseNow.switchToken ?? this.captureSwitch(ctx, pauseNow);
+        const guard = (): void => {
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted || ctx.claimFenced?.() ||
+              (ctx.signal?.aborted && reasonForSignal(ctx.signal) === REASON_CANCEL))
+            throw new Error(REASON_CANCEL);
+        };
+        guard();
+        if (!ctx.attemptCodexCredentialSwitch) throw token.error;
+        const outcome = await ctx.attemptCodexCredentialSwitch({ site, laneSettled: true });
+        guard();
+        if (outcome !== "continued_A" && outcome !== "resumed_B" && outcome !== "fresh_B") throw token.error;
+        pauseNow.handledSwitchSeq = Math.max(pauseNow.handledSwitchSeq, token.seq);
+        if (token.signal) pauseNow.handledSwitchSignals.add(token.signal);
+        if (pauseNow.switchToken === token) pauseNow.switchToken = undefined;
+        return epoch!;
+      };
+      // Each successful continuation retries only this held callback. Cancellation or any
+      // noncontinuation stops the loop; newer switch generations remain pending.
+      const retryHeldSwitch = async <T>(site: import("../executor.js").InPlaceSwitchSite, callback: () => Promise<T>): Promise<T> => {
+        for (;;) {
+          try {
+            const pending = this.pendingInterruption(ctx, pauseNow, wall);
+            if (pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
+            if (pending === REASON_SWITCH) throw new CredentialSwitchSignal();
+            const result = await callback();
+            if (ctx.cancelRequested?.() || ctx.claimFenced?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            return result;
+          }
+          catch (error) {
+            if (!(error instanceof CredentialSwitchSignal)) throw error;
+            this.captureSwitch(ctx, pauseNow, error);
+            await pauseNow.continueSwitch!(site);
+          }
+        }
+      };
 
       // Issue #1782: a refused in-turn wall park may already have reaped the provider root (the
       // runner's capture runs the Codex boundary before the owner's extension is known), which
@@ -3970,10 +4415,10 @@ export class CodexExecutor implements Executor {
         if (ctx.autoApprove) {
           // The runner emits its existing auto-approval notice and returns a sentinel.
           // Do not echo that sentinel as a human answer.
-          await ctx.askUser(questions);
+          await retryHeldSwitch("ask_user", () => ctx.askUser!(questions));
           return unansweredPrompt(questions);
         }
-        let verdict = await ctx.askUser(questions);
+        let verdict = await retryHeldSwitch("ask_user", () => ctx.askUser!(questions));
         questionBudget.asked++;
         // The worker callback owns explicit owner retries and the shared parked-time budget.
         if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
@@ -4197,7 +4642,7 @@ export class CodexExecutor implements Executor {
         // Issue #1789: from the first gate submission until approval the server row is
         // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission);
+        let verdict = await retryHeldSwitch("plan_gate", () => ctx.gatePlan!(planMd!, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission));
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -4250,7 +4695,7 @@ export class CodexExecutor implements Executor {
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
-          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles, planResult.semanticSubmission);
+          verdict = await retryHeldSwitch("plan_gate_revision", () => ctx.gatePlan!(planMd!, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles, planResult.semanticSubmission));
           silentRevision = undefined;
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
@@ -4757,7 +5202,7 @@ export class CodexExecutor implements Executor {
               shared.selection.current, shared.repoInstructions, at, shared.scrubProjected, beforeReapingSink, pauseNow,
               recreateEpochAfterReap, completion, onProgress, undefined, async () => {
                 await beforeReapingSink();
-                disposition = await ctx.requestParkRun!(at);
+                disposition = await retryHeldSwitch("ask_user", () => ctx.requestParkRun!(at));
                 return { done: false };
               });
             if (outcome.kind === "turn") return disposition!;
@@ -4889,6 +5334,7 @@ export class CodexExecutor implements Executor {
             }
             break;
           }
+          const completionEpoch = epoch;
           const { unmet, head, worktreeFingerprint } = await recordAttempt(
             result.milestonesCompleted ?? [], declaredNonClosing);
           if (unmet.length === 0) {
@@ -4960,8 +5406,8 @@ export class CodexExecutor implements Executor {
           }
           if (leadRequest || completionStallStreak >= STALL_LIMIT) {
             const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
-            const decision = await ctx.askCompletionQuestion?.(unmet, leadRequest
-              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+            const decision = await retryHeldSwitch("ask_user", async () => ctx.askCompletionQuestion?.(unmet, leadRequest
+              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" }));
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             // A timeout keeps the question open; do not report running to resolve it.
             if (await checkRequestBoundary(decision?.outcome === "continue")) {
@@ -4985,8 +5431,8 @@ export class CodexExecutor implements Executor {
             ctx.completionInterlock === true && isIssueRun && !ctx.interactive);
           completionAnswered = answer !== undefined;
           if (iteration >= maxIterations) pendingIterationExhaustion = true;
-          // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
-          epochNeedsRecreate = true;
+          // Recreate only the epoch reaped for this attempt; a held switch may have prepared B.
+          epochNeedsRecreate = epoch === completionEpoch;
           continue;
         }
         // Issue #3139: a worker-initiated no-progress stall. An eligible run (interlocked issue run,
@@ -5026,9 +5472,10 @@ export class CodexExecutor implements Executor {
             });
             // completionStallStreak and lastCompletionFingerprint stay untouched: this attempt is not
             // a lead completion attempt.
+            const completionEpoch = epoch;
             const { unmet } = await recordAttempt([]);
-            epochNeedsRecreate = true;
-            const decision = await ctx.askCompletionQuestion?.(unmet, { kind: "no_progress_stall" });
+            const decision = await retryHeldSwitch("ask_user", async () => ctx.askCompletionQuestion?.(unmet, { kind: "no_progress_stall" }));
+            epochNeedsRecreate = epoch === completionEpoch;
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             if (decision?.outcome === "continue") {
               completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones,
@@ -5095,6 +5542,8 @@ export class CodexExecutor implements Executor {
       this.provisionAbort?.abort();
       this.intentFlight?.ctrl.abort();
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(); }
+      this.liveRolloutSave = undefined;
+      this.liveEpochSuspension = undefined;
       await this.withCaptureOwnership(async () => {
         this.beforeCaptureDrain = undefined;
         this.captureMayHaveDrained = undefined;
@@ -5272,11 +5721,13 @@ export class CodexExecutor implements Executor {
       throw new TrustedExecutionRefusal("captured memory run identity mismatch");
     }
     const {
-      provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
-      commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
+      provider, authority, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
+      commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
       commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall, repoInstructions,
     } = shared;
+    const { binding, committedGeneration } = authority;
+    authority.assertCurrent();
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
     // owner/group/mode/directory-type immediately before each credentialed provider root. The
@@ -5329,7 +5780,7 @@ export class CodexExecutor implements Executor {
       // login (the token flows over `account/login/start`, NEVER the launcher env).
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
-      const initialToken = await this.releaseInitialCredential(ctx, registerToken, committedGeneration, lifecycleSignal, revision);
+      const initialToken = await this.releaseInitialCredential(ctx, binding, registerToken, committedGeneration, lifecycleSignal, revision, authority.assertCurrent);
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
 
@@ -5340,13 +5791,20 @@ export class CodexExecutor implements Executor {
         ? {
             mode: "subscription",
             initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
-            assertRefreshAdmission: () => this.assertCaptureAdmission(revision),
+            assertRefreshAdmission: () => { authority.assertCurrent(); this.assertCaptureAdmission(revision); },
             bridge: this.lifetimeBoundRefreshBridge(buildAppServerRefreshBridge(ctx.runId, {
               refreshCodex: async (...args) => {
+                // Ordinary refresh cannot borrow B's preparation authority while
+                // the complete replacement bundle remains closed to consumers.
+                this.assertSwitchAdmission();
                 await this.settleOwnedSummariesBeforeCredentials();
+                this.assertSwitchAdmission();
                 this.assertCaptureAdmission(revision);
+                authority.assertCurrent();
                 const result = await this.lifetime.admit(() => this.opts.client.refreshCodex(...args));
+                this.assertSwitchAdmission();
                 this.assertCaptureAdmission(revision);
+                authority.assertCurrent();
                 return result;
               },
             }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked())),
@@ -5445,6 +5903,7 @@ export class CodexExecutor implements Executor {
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current, repoInstructions),
         );
+        emitUnknownEffortNotices(ctx, runPlan.diagnostics);
         const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
           ...result, command: scrubProjected(result.command),
           tool_id: scrubProjected(result.tool_id), attempt_id: scrubProjected(result.attempt_id),
@@ -5603,6 +6062,16 @@ export class CodexExecutor implements Executor {
         // Issue #1782: an epoch recreated after a refused wall park persists nothing until its
         // provider has launched and adopted the session, so an unpopulated home never replaces the
         // generation persisted before the park.
+        persistUsableSession: async (): Promise<void> => {
+          await settleDepsInstall();
+          authority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+          // An unlaunched replacement may only inspect the prior saved generation.
+          if (!launched) return;
+          await this.sessionStore.persist(codexHome, storeDir);
+          authority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+        },
         persistSession: async (): Promise<void> => {
           await settleDepsInstall();
           if (opts.persistAfterLaunchOnly && !launched) return;
@@ -5793,6 +6262,7 @@ export class CodexExecutor implements Executor {
       if (tripReason === undefined) {
         tripReason = reason;
         tripToken = pauseNow.capture();
+        if (reason === REASON_SWITCH) this.captureSwitch(ctx, pauseNow);
         if (reason === REASON_IDLE) tripRetryClassification = harness.retryClassification;
         turnAbort.abort();
       }
@@ -5804,7 +6274,15 @@ export class CodexExecutor implements Executor {
     // pause) trips REASON_PAUSE, not REASON_CANCEL, so the run-lane can route a `wall` pause to the
     // capture-first wall park instead of cancelling the run at its time limit (D2). Every other abort
     // (a steering cancel, a shutdown) has the default reason and stays REASON_CANCEL, unchanged.
-    const onCancel = (): void => trip(reasonForSignal(ctx.signal));
+    const onCancel = (): void => {
+      const reason = reasonForSignal(ctx.signal);
+      // Steering aborts its shared signal before invoking the same request's
+      // re-armable callback. Let that synchronous callback assign the generation
+      // before capturing the first trip. Signal-only callers still trip in this
+      // microtask; a later notification during settlement remains a new request.
+      if (reason === REASON_SWITCH) queueMicrotask(() => trip(reason));
+      else trip(reason);
+    };
     // Issue #2099: the prelude's three checks live in pendingInterruption (shared with the transient
     // retry gate); evaluated first, they have no side effects.
     const pendingAtStart = this.pendingInterruption(ctx, pauseNow, wall);
@@ -5870,6 +6348,7 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const captureRevision = this.captureRevision;
+      const turnAuthority = this.currentCodexAuthority;
       let sourceGuard: (() => boolean | void) | undefined;
       const checkDispatch = (): void => {
         if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
@@ -5877,6 +6356,8 @@ export class CodexExecutor implements Executor {
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         if (accountAdmissionActive() && (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted))
           throw new CodexRequestFailure("parent_abort");
+        turnAuthority?.assertCurrent();
+        this.assertSwitchAdmission();
         this.assertCaptureAdmission(captureRevision);
         if (registry.state() !== "open") throw new CodexRequestFailure("parent_abort");
         assertResidueQuarantineOpen("provider_turn");
@@ -5928,6 +6409,7 @@ export class CodexExecutor implements Executor {
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
       request.rootDispatch = dispatch;
       if (onRuntimeConfig) request.onRuntimeConfig = onRuntimeConfig;
+      this.lastRootRequest = request;
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -6060,13 +6542,24 @@ export class CodexExecutor implements Executor {
    * PauseNowSignal) always trips, and a NEWER owner/wall pause arrives as a fresh generation, never
    * through this spent signal.
    */
+  private captureSwitch(ctx: RunContext, state: CodexPauseNowState, error?: CredentialSwitchSignal) {
+    return state.switchToken ??= {
+      seq: state.switchSeq,
+      signal: ctx.signal?.reason instanceof CredentialSwitchSignal ? ctx.signal : undefined,
+      error: ctx.signal?.reason instanceof CredentialSwitchSignal ? ctx.signal.reason : error ?? new CredentialSwitchSignal(),
+    };
+  }
+
   private pendingInterruption(ctx: RunContext, pauseNow: CodexPauseNowState, wall: RunWall): string | undefined {
-    if (ctx.signal?.aborted) {
+    if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted) return REASON_CANCEL;
+    if (ctx.signal?.aborted && !(ctx.signal.reason instanceof CredentialSwitchSignal &&
+        pauseNow.handledSwitchSignals.has(ctx.signal))) {
       const mode = ctx.pauseModeRequested?.();
       const stalePause = ctx.signal.reason instanceof PauseNowSignal &&
         (mode == null || (pauseNow.sharedAbortHandled && mode !== "wall"));
       if (!stalePause) return reasonForSignal(ctx.signal);
     }
+    if (pauseNow.switchSeq > pauseNow.handledSwitchSeq) return REASON_SWITCH;
     if (pauseNow.pending) return REASON_PAUSE;
     if (wall.remainingMs <= 0) return REASON_WALL;
     return undefined;
@@ -6106,6 +6599,7 @@ export class CodexExecutor implements Executor {
   }
 
   private tripError(reason: string, pauseToken: PauseNowToken, processedEvents: number, retryClassification?: Readonly<CodexErrorClassification>): Error {
+    if (reason === REASON_SWITCH) return new CredentialSwitchSignal();
     return new CodexTurnTripError(reason, pauseToken, processedEvents, retryClassification);
   }
 
@@ -6175,11 +6669,23 @@ export class CodexExecutor implements Executor {
       resumeId = fresh.resumeSessionId;
       buildPhaseBroker = fresh.buildPhaseBroker;
     };
+    const continueSwitch = async (error: unknown): Promise<void> => {
+      const token = this.captureSwitch(ctx, pauseNow, error instanceof CredentialSwitchSignal ? error : undefined);
+      if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted ||
+          (ctx.signal?.aborted && reasonForSignal(ctx.signal) === REASON_CANCEL)) throw new Error(REASON_CANCEL);
+      if (!pauseNow.continueSwitch) throw token.error;
+      const current = await pauseNow.continueSwitch(phase === "plan" ? "plan_turn" : "implement_turn");
+      harness = current.harness;
+      registry = current.registry;
+      resumeId = current.resumeSessionId;
+      buildPhaseBroker = current.buildPhaseBroker;
+    };
     turnLoop: for (;;) {
       try {
         // Use consumable lifecycle state, not the sticky pause mode, before releasing again.
         const pending = this.pendingInterruption(ctx, pauseNow, wall);
         if (ctx.cancelRequested?.() || pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
+        if (pending === REASON_SWITCH) { this.captureSwitch(ctx, pauseNow); throw new CredentialSwitchSignal(); }
         if (this.captureMayHaveDrained?.()) {
           if (pending !== undefined) throw new CodexTurnTripError(pending, pauseNow.capture());
           if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
@@ -6200,6 +6706,10 @@ export class CodexExecutor implements Executor {
         // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
+        if (caught instanceof CredentialSwitchSignal || (caught instanceof CodexTurnTripError && caught.message === REASON_SWITCH)) {
+          await continueSwitch(caught);
+          continue turnLoop;
+        }
         let err: unknown = caught instanceof PauseNowSignal
           ? new CodexTurnTripError(REASON_PAUSE, pauseNow.capture()) : caught;
         // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
@@ -6273,6 +6783,10 @@ export class CodexExecutor implements Executor {
         // At most one idle capture and one declined hold; each new interruption leaves
         // the idle arm and follows the existing pause/wall route with its own snapshot.
         routeTrip: for (;;) {
+          if (err instanceof CodexTurnTripError && err.message === REASON_SWITCH) {
+            await continueSwitch(err);
+            continue turnLoop;
+          }
           const msg = err instanceof Error ? err.message : "";
           // Issue #1764: the interrupt generation this path handles, captured before any await; a
           // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
@@ -6465,12 +6979,13 @@ export class CodexExecutor implements Executor {
    */
   private async releaseInitialCredential(
     ctx: RunContext,
+    binding: CodexBinding,
     registerToken: (token: string) => void,
     committed: CodexCommittedGenerationCell,
     signal: AbortSignal,
     revision: number,
+    assertCurrent: () => void,
   ): Promise<string> {
-    const binding = this.opts.binding;
     const expected = binding.authMode === "subscription"
       ? {
           authMode: "subscription" as const,
@@ -6481,6 +6996,7 @@ export class CodexExecutor implements Executor {
     const attempts = Math.max(1, Math.floor(this.deps.initialCredentialAttempts ?? 6));
     const baseDelay = Math.max(0, this.deps.initialCredentialBaseDelayMs ?? 2000);
     const checkAbort = (): void => {
+      assertCurrent();
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
       if (signal.aborted) throw new CodexRequestFailure("parent_abort");
@@ -6537,6 +7053,8 @@ export class CodexExecutor implements Executor {
     ctx: RunContext,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
+      // Preparation may construct B's broker before ordinary work is admitted.
+      this.assertSwitchAdmission();
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
       // project / doc-max-0 config, never a hook-trust bypass).
       const threadRes = await harness.requestOnTransport<{ thread?: { id?: string } }>(
@@ -6581,6 +7099,7 @@ export class CodexExecutor implements Executor {
           spec.signal?.throwIfAborted();
           if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
             throw new CodexRequestFailure("parent_abort");
+          this.assertSwitchAdmission();
           this.assertCaptureAdmission(revision);
           assertResidueQuarantineOpen("provider_turn");
         };
@@ -6742,6 +7261,7 @@ export class CodexExecutor implements Executor {
       childTurnBudgetMs: this.childTurnDeadlineMs(),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
+      redactText: ctx.redactText,
       parkRunSupported: ctx.parkRunSupported,
       // Phase-independent: the root vocabulary is registered once at thread/start and survives
       // the approval thread/resume; the broker gates the phase.

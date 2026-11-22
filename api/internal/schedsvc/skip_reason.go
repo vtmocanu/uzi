@@ -38,8 +38,10 @@ const (
 	// silently dropped and the matched == started + skipped invariant still balances.
 	SkipFetchFailed SkipReason = "fetch_failed"
 
-	// SkipConsumerGateBusy is recorded only after a sweep has already started work.
-	// That partial fire is consumed; before any start the busy error remains retryable.
+	// SkipConsumerGateBusy is recorded only after a sweep has already started work. A
+	// recurring sweep's partial fire is consumed; a scheduled one-time sweep is not advanced
+	// and resumes its remaining slots (issue #4512); before any start the busy error remains
+	// retryable.
 	SkipConsumerGateBusy SkipReason = "consumer_gate_busy"
 
 	// SkipVaultLocked ← the self_improve fire path (PRD #590 M1) when the enabling owner's

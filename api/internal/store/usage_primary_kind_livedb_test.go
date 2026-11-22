@@ -18,9 +18,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// Issue #4209: Overview usage run counts and run outcomes measure PRIMARY work runs
-// (issue, task, prompt, job, self_improve), defined once by fn_usage_primary_kind. Token,
-// cost and disclosure sums keep including helper runs. These tests seed every registered
+// Issue #4209: Overview usage run counts measure PRIMARY work runs (issue, task, prompt, job,
+// self_improve), defined once by fn_usage_primary_kind. Token, cost and disclosure sums keep
+// including helper runs. Run OUTCOMES moved to fn_outcome_kind in #4577 (see
+// outcome_kind_livedb_test.go). These tests seed every registered
 // kind and compute every expectation in Go from the literal primary set below, never from
 // the SQL function under test.
 
@@ -180,15 +181,16 @@ func TestUsagePrimaryKindFunctionLiveDB(t *testing.T) {
 	// The plans are those of the real sqlc statements, read from their generated constants.
 	landable := workersvc.AllHumanLandableFailOrigins()
 	for _, c := range []struct {
-		name string
-		args []any
+		name    string
+		args    []any
+		outcome bool // outcome queries use fn_outcome_kind (issue #4577), usage queries the primary list
 	}{
-		{"selfUsage", []any{e.userID}},
-		{"selfRunOutcomes", []any{e.userID, landable}},
-		{"adminUsageTotals", nil},
-		{"adminUsagePerUser", nil},
-		{"adminRunOutcomes", []any{landable}},
-		{"adminRunOutcomesPerUser", []any{landable}},
+		{"selfUsage", []any{e.userID}, false},
+		{"selfRunOutcomes", []any{e.userID, landable}, true},
+		{"adminUsageTotals", nil, false},
+		{"adminUsagePerUser", nil, false},
+		{"adminRunOutcomes", []any{landable}, true},
+		{"adminRunOutcomesPerUser", []any{landable}, true},
 	} {
 		name := c.name
 		rows, err := e.pool.Query(e.ctx, "EXPLAIN (VERBOSE) "+sqlcConst(t, c.name), c.args...)
@@ -207,10 +209,19 @@ func TestUsagePrimaryKindFunctionLiveDB(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(plan.String(), "fn_usage_primary_kind") {
-			t.Errorf("%s: fn_usage_primary_kind was not inlined:\n%s", name, plan.String())
+		for _, fn := range []string{"fn_usage_primary_kind", "fn_outcome_kind"} {
+			if strings.Contains(plan.String(), fn) {
+				t.Errorf("%s: %s was not inlined:\n%s", name, fn, plan.String())
+			}
 		}
-		if !strings.Contains(plan.String(), "kind = ANY ('{issue,task,prompt,job,self_improve}'") {
+		if c.outcome {
+			if strings.Contains(plan.String(), "kind = ANY ('{issue,") {
+				t.Errorf("%s: outcome query still carries the primary-kind qual:\n%s", name, plan.String())
+			}
+			if !strings.Contains(plan.String(), "<> 'chat'") {
+				t.Errorf("%s: expected the inlined non-chat qual:\n%s", name, plan.String())
+			}
+		} else if !strings.Contains(plan.String(), "kind = ANY ('{issue,task,prompt,job,self_improve}'") {
 			t.Errorf("%s: expected the inlined primary-kind qual:\n%s", name, plan.String())
 		}
 	}
@@ -474,223 +485,6 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 	if sum.last7 != want[0].last7+want[1].last7+want[2].last7 {
 		t.Errorf("last7 per-user sum %d", sum.last7)
 	}
-}
-
-func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
-	f, q, users, cleanup := newPrimaryKindFixture(t)
-	defer cleanup()
-	ctx := f.ctx
-
-	// Primary terminal runs for users 0 and 1; user 2 has only helper failures.
-	type exp struct{ fin, comp, canc, rej, div, fail, nl, l7fin, l7fail int64 }
-	// The fixture's own 30-day completed issue run is a primary terminal run of user 0.
-	want := map[int]*exp{0: {fin: 1, comp: 1}, 1: {}, 2: {}}
-	origins := map[int]map[string]int64{0: {}, 1: {}, 2: {}}
-	l7origins := map[int]map[string]int64{0: {}, 1: {}, 2: {}}
-	landable := map[string]bool{}
-	for _, o := range workersvc.AllHumanLandableFailOrigins() {
-		landable[o] = true
-	}
-	// The expected last (non-rejected, non-diverged) failure per user: all finished_at values
-	// equal the transaction's now(), so the newest failure is the one with the greatest id.
-	type lastFail struct {
-		id     uuid.UUID
-		origin string
-	}
-	lastFails := map[int]lastFail{}
-	primary := func(u int, kind, status, origin, age string, usage bool, patch bool) uuid.UUID {
-		var factor int64
-		if usage {
-			factor = 1
-		}
-		id := f.seed(pkRun{user: users[u], kind: kind, status: status, origin: origin, age: age, factor: factor, patch: patch})
-		recent := age == "1 day" || age == "2 days"
-		e := want[u]
-		e.fin++
-		if recent {
-			e.l7fin++
-		}
-		switch {
-		case status == "completed":
-			e.comp++
-		case status == "cancelled":
-			e.canc++
-		case origin == "plan_rejected":
-			e.rej++
-		case origin == "base_diverged":
-			e.div++
-		default:
-			e.fail++
-			o := origin
-			if o == "" {
-				o = "unknown"
-			}
-			origins[u][o]++
-			if lf, ok := lastFails[u]; !ok || id.String() > lf.id.String() {
-				lastFails[u] = lastFail{id: id, origin: o}
-			}
-			if recent {
-				l7origins[u][o]++
-				e.l7fail++
-			}
-			if patch && landable[origin] {
-				e.nl++
-			}
-		}
-		return id
-	}
-	for _, kind := range []string{"issue", "task", "prompt", "job", "self_improve"} {
-		primary(0, kind, "completed", "", "1 day", true, false)
-		primary(0, kind, "failed", "agent_failure", "1 day", kind == "issue", false)
-	}
-	primary(0, "issue", "cancelled", "", "10 days", false, false)
-	primary(0, "issue", "failed", "plan_rejected", "1 day", false, false)
-	primary(0, "issue", "failed", "base_diverged", "1 day", false, false)
-	primary(0, "issue", "failed", "workflow_scope_missing", "1 day", false, true)
-	primary(0, "issue", "failed", "", "10 days", false, false) // failure without usage still counts
-	user1Done := primary(1, "issue", "completed", "", "1 day", true, false)
-	primary(1, "issue", "failed", "workflow_scope_missing", "10 days", false, true)
-	// A primary completion strictly after user 1's last failure, so completed_since_last_failure is 1
-	// before any helper exists; later helper completions (finished even later) must not add to it.
-	f.exec(`UPDATE runs SET finished_at = now() + interval '30 minutes', status_since = now() + interval '30 minutes' WHERE id = $1`, user1Done)
-	wantSince := map[int]int64{0: 0, 1: 1}
-
-	// Snapshot the primary-only answer, then add LATER failed helpers for every helper kind
-	// (manual and automatic ci_fix alike, recoverable ones carrying a preserved patch) and a
-	// chat. None may move any outcome field.
-	selfBefore := make([]store.SelfRunOutcomesRow, 3)
-	for i, u := range users {
-		r, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: u, LandableOrigins: workersvc.AllHumanLandableFailOrigins()})
-		if err != nil {
-			t.Fatal(err)
-		}
-		selfBefore[i] = r
-	}
-	factoryBefore, err := q.AdminRunOutcomes(ctx, workersvc.AllHumanLandableFailOrigins())
-	if err != nil {
-		t.Fatal(err)
-	}
-	perBefore, err := q.AdminRunOutcomesPerUser(ctx, workersvc.AllHumanLandableFailOrigins())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, u := range []int{0, 1, 2} {
-		for _, kind := range []string{"judge", "cross_check", "mr_rework", "ci_fix", "ci_fix", "chat"} {
-			for i, st := range []string{"failed", "completed"} {
-				origin := ""
-				if st == "failed" {
-					origin = "workflow_scope_missing"
-				}
-				f.seed(pkRun{user: users[u], kind: kind, status: st, origin: origin, age: "1 day", patch: st == "failed", autoAppr: i == 0 && kind == "ci_fix"})
-			}
-		}
-	}
-	f.exec(`UPDATE runs SET created_at = now() + interval '1 hour', finished_at = now() + interval '1 hour', status_since = now() + interval '1 hour' WHERE kind <> ALL($1)`,
-		[]string{"issue", "task", "prompt", "job", "self_improve"})
-
-	landableList := workersvc.AllHumanLandableFailOrigins()
-	for i, u := range users {
-		r, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: u, LandableOrigins: landableList})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !sameOutcomeRow(r, selfBefore[i]) {
-			t.Errorf("SelfRunOutcomes user %d moved after helper failures:\nbefore %+v\nafter  %+v", i, selfBefore[i], r)
-		}
-		e := want[i]
-		got := [9]int64{r.LifetimeFinished, r.LifetimeCompleted, r.LifetimeCancelled, r.LifetimePlanRejected, r.LifetimeBaseDiverged, r.LifetimeFailed, r.LifetimeNeedsLanding, r.Last7Finished, r.Last7Failed}
-		exps := [9]int64{e.fin, e.comp, e.canc, e.rej, e.div, e.fail, e.nl, e.l7fin, e.l7fail}
-		if got != exps {
-			t.Errorf("SelfRunOutcomes user %d: got %v want %v", i, got, exps)
-		}
-		if r.LifetimeFinished != r.LifetimeCompleted+r.LifetimeCancelled+r.LifetimePlanRejected+r.LifetimeBaseDiverged+r.LifetimeFailed {
-			t.Errorf("user %d: finished != segments", i)
-		}
-		assertOrigins(t, fmt.Sprintf("user %d lifetime", i), r.LifetimeFailOrigins, origins[i], r.LifetimeFailed)
-		assertOrigins(t, fmt.Sprintf("user %d last7", i), r.Last7FailOrigins, l7origins[i], r.Last7Failed)
-	}
-	if want[2].fin != 0 {
-		t.Fatal("fixture bug: user 2 should have no primary outcomes")
-	}
-
-	fr, err := q.AdminRunOutcomes(ctx, landableList)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fr.LifetimeFinished != factoryBefore.LifetimeFinished || fr.LifetimeFailed != factoryBefore.LifetimeFailed ||
-		fr.LastFailedRunID != factoryBefore.LastFailedRunID || fr.LastFailedAt != factoryBefore.LastFailedAt ||
-		fr.CompletedSinceLastFailure != factoryBefore.CompletedSinceLastFailure ||
-		fr.LifetimeNeedsLanding != factoryBefore.LifetimeNeedsLanding || fr.Last7NeedsLanding != factoryBefore.Last7NeedsLanding {
-		t.Errorf("AdminRunOutcomes moved after helper failures: before %+v after %+v", factoryBefore, fr)
-	}
-	var sumFin, sumFail, sumNL, sumL7Fin, sumL7Fail int64
-	for _, e := range want {
-		sumFin += e.fin
-		sumFail += e.fail
-		sumNL += e.nl
-		sumL7Fin += e.l7fin
-		sumL7Fail += e.l7fail
-	}
-	if fr.LifetimeFinished != sumFin || fr.LifetimeFailed != sumFail || fr.LifetimeNeedsLanding != sumNL || fr.Last7Finished != sumL7Fin || fr.Last7Failed != sumL7Fail {
-		t.Errorf("AdminRunOutcomes = %d/%d/%d/%d/%d, want %d/%d/%d/%d/%d", fr.LifetimeFinished, fr.LifetimeFailed, fr.LifetimeNeedsLanding, fr.Last7Finished, fr.Last7Failed, sumFin, sumFail, sumNL, sumL7Fin, sumL7Fail)
-	}
-	if fr.LastFailedRunID == uuid.Nil {
-		t.Error("factory last failure lost")
-	}
-	assertOrigins(t, "factory lifetime", fr.LifetimeFailOrigins, mergeCounts(origins[0], origins[1], origins[2]), fr.LifetimeFailed)
-	assertOrigins(t, "factory last7", fr.Last7FailOrigins, mergeCounts(l7origins[0], l7origins[1], l7origins[2]), fr.Last7Failed)
-
-	per, err := q.AdminRunOutcomesPerUser(ctx, landableList)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(per) != 2 {
-		t.Fatalf("per-user outcome rows = %d, want 2 (helper-only user has no primary outcomes)", len(per))
-	}
-	for _, r := range per {
-		for i, u := range users {
-			if u != r.UserID {
-				continue
-			}
-			e := want[i]
-			got := [9]int64{r.Finished, r.Completed, r.Cancelled, r.PlanRejected, r.LifetimeBaseDiverged, r.Failed, r.NeedsLanding, r.Last7Finished, r.Last7Failed}
-			exps := [9]int64{e.fin, e.comp, e.canc, e.rej, e.div, e.fail, e.nl, e.l7fin, e.l7fail}
-			if got != exps {
-				t.Errorf("AdminRunOutcomesPerUser user %d: got %v want %v", i, got, exps)
-			}
-			// The last-failure fields come from the primary runs alone: a newer helper failure
-			// and later helper completions must leave them as they were before the helpers.
-			var b *store.AdminRunOutcomesPerUserRow
-			for k := range perBefore {
-				if perBefore[k].UserID == u {
-					b = &perBefore[k]
-				}
-			}
-			if b == nil {
-				t.Fatalf("per-user %d missing from the pre-helper snapshot", i)
-			}
-			if r.LastFailedAt != b.LastFailedAt || r.LastFailedRunID != b.LastFailedRunID || r.LastFailedOrigin != b.LastFailedOrigin || r.CompletedSinceLastFailure != b.CompletedSinceLastFailure {
-				t.Errorf("AdminRunOutcomesPerUser user %d last-failure fields moved after helpers:\nbefore %v %v %q %d\nafter  %v %v %q %d", i,
-					b.LastFailedAt, b.LastFailedRunID, b.LastFailedOrigin, b.CompletedSinceLastFailure, r.LastFailedAt, r.LastFailedRunID, r.LastFailedOrigin, r.CompletedSinceLastFailure)
-			}
-			if lf := lastFails[i]; r.LastFailedRunID != lf.id || r.LastFailedOrigin != lf.origin || !r.LastFailedAt.Valid {
-				t.Errorf("AdminRunOutcomesPerUser user %d last failure = %v/%q (valid %v), want %v/%q", i, r.LastFailedRunID, r.LastFailedOrigin, r.LastFailedAt.Valid, lf.id, lf.origin)
-			}
-			if r.CompletedSinceLastFailure != wantSince[i] {
-				t.Errorf("AdminRunOutcomesPerUser user %d completed_since_last_failure = %d, want %d", i, r.CompletedSinceLastFailure, wantSince[i])
-			}
-			assertOrigins(t, fmt.Sprintf("per-user %d lifetime", i), r.FailOrigins, origins[i], r.Failed)
-			assertOrigins(t, fmt.Sprintf("per-user %d last7", i), r.Last7FailOrigins, l7origins[i], r.Last7Failed)
-		}
-	}
-}
-
-func sameOutcomeRow(a, b store.SelfRunOutcomesRow) bool {
-	return a.LastFailedAt == b.LastFailedAt && a.LastFailedRunID == b.LastFailedRunID && a.LastFailedOrigin == b.LastFailedOrigin &&
-		a.CompletedSinceLastFailure == b.CompletedSinceLastFailure && a.LifetimeFinished == b.LifetimeFinished &&
-		a.LifetimeFailed == b.LifetimeFailed && a.LifetimeNeedsLanding == b.LifetimeNeedsLanding &&
-		a.Last7Finished == b.Last7Finished && a.Last7Failed == b.Last7Failed && a.Last7NeedsLanding == b.Last7NeedsLanding &&
-		string(a.LifetimeFailOrigins) == string(b.LifetimeFailOrigins) && string(a.Last7FailOrigins) == string(b.Last7FailOrigins)
 }
 
 func mergeCounts(ms ...map[string]int64) map[string]int64 {

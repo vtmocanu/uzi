@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { PhaseSwitchUnverifiedError } from "./phase-switch-unverified.js";
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "./park-run.js";
 import { chunkedTimeout } from "./chunked-timeout.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
@@ -59,6 +60,7 @@ import {
 } from "./js-deps.js";
 import {
   applySubagentModelOverride,
+  fillSubagentEffort,
   assembleAgents,
   planTurnSubagents,
   selectSubagents,
@@ -209,6 +211,9 @@ const REASON_CREDENTIAL_SWITCH = "run released for a credential switch";
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
 /** PRD #4320 D8: a credential switch on a provider-bound run is refused (the run fails; no OAuth token is injected). */
 const REASON_PROVIDER_SWITCH_REFUSED = "provider_credential_switch_refused: a provider-bound run cannot switch credentials";
+/** PRD #3252: a Claude planning model is set but nothing resolves the implementation model. */
+const REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL =
+  "unsupported phase configuration: a Claude planning model is set but no implementation model resolves; set an implementation (worker) model, or clear the Claude planning model";
 const REASON_NO_PLAN =
   "the agent ended the planning turn without submitting a plan";
 /** PRD #88 M4: the lead kept asking instead of planning. Distinct from
@@ -825,9 +830,11 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
  *  The first-truthy-session-id latch moved into the per-run reducer (harness-
  *  reducer.ts); the owner delivers ctx.onSessionId from its `firstSessionId`. */
 interface RunDrive {
-  /** PRD #3244: the lead's requested model/effort, the same value the SDK options were built from;
-   *  reported through ctx.leadConfig at each lead phase entry. */
-  leadRequest: LeadRequest;
+  /** PRD #3244 / #3252: the lead's requested model/effort per phase, the same values the SDK options
+   *  were built from; reported through ctx.leadConfig at each lead phase entry. Equal unless the
+   *  claim carries `plan_phase`. */
+  planRequest: LeadRequest;
+  implementRequest: LeadRequest;
   /** PRD #3244 M2: the phase entries whose first turn already carried the runtime-config callback
    *  ("phase:entry"); a later turn of the same entry (revise round, re-drive) does not get one. */
   observedEntries?: Set<string>;
@@ -885,6 +892,24 @@ interface RunDrive {
    *  whether it showed model evidence. Read by driveTurnWithEmptyRecovery's refusal arm. */
   lastTurnPostSwitch?: boolean;
   lastTurnModelEvidence?: boolean;
+  /** PRD #3252 D8: phases whose settings barrier returned a passing verdict this claim. Set only by that
+   *  verdict, so an in-place restart or an event-free retry before a verdict verifies again. */
+  phaseVerified?: Set<"plan" | "implement">;
+}
+
+/** PRD #3252 D8: on a provider run the CLI resolves an alias through the gateway map, so the runtime
+ *  applies the mapped id; that id is what the settings barrier must see. Undefined = no mapping. */
+const PROVIDER_ALIAS_ENV: Readonly<Record<string, string>> = {
+  opus: "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+};
+function providerMappedModel(ctx: RunContext, turnConfig: ClaudeTurnConfig): string | undefined {
+  const key = ctx.provider && turnConfig.model !== undefined && Object.hasOwn(PROVIDER_ALIAS_ENV, turnConfig.model)
+    ? PROVIDER_ALIAS_ENV[turnConfig.model] : undefined;
+  const mapped = key !== undefined ? turnConfig.env[key] : undefined;
+  return mapped !== undefined && mapped !== "" ? mapped : undefined;
 }
 
 /**
@@ -918,7 +943,10 @@ interface DriveState {
   repoInstructionsBlock: string | undefined;
   survivorNames: Set<string>;
   assembled: ReturnType<typeof assembleAgents>;
+  /** The IMPLEMENT lead model (state.implementRequest.model): applied to the implement roster. */
   leadModel: string | undefined;
+  /** The implement turns' model after provider mapping (PRD #3252); undefined leaves the key off. */
+  implementSpawnModel: string | undefined;
   planSubagentNames: string[];
   planSource: AgentSource;
   subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
@@ -1807,28 +1835,42 @@ export class SdkExecutor implements Executor {
     // ONLY when a model is resolved — `model: undefined` must stay omitted (never
     // an explicit key), so an unset model falls back to the SDK/account default.
     // Computed HERE (before the plan-turn copy at planTurnSubagents) so the PRD #305
-    // own-roster override below can run against the same value the lead uses.
+    // override of the plan-turn roster copy below runs against the plan lead model.
     //
-    // PRD #3244: one LeadRequest per run (equal for both phases in this unit). The model/effort
-    // sent below and the lead-config row reported at each phase entry come from this one value.
-    const leadRequest = resolveLeadRequest({
+    // PRD #3244 / #3252: one LeadRequest per lead phase. Without a claim `plan_phase` the two are
+    // equal. The model/effort sent below and the lead-config row reported at each phase entry come
+    // from these values: `planRequest` drives every plan-block turn, `implementRequest` every
+    // implement turn.
+    const templateModelInput = assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {};
+    const implementRequest = resolveLeadRequest({
       harness: "claude",
       phase: "implement",
       config: ctx.config,
-      ...(assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {}),
+      ...templateModelInput,
     });
-    const leadModel = leadRequest.model;
+    const planRequest = resolveLeadRequest({
+      harness: "claude",
+      phase: "plan",
+      config: ctx.config,
+      ...templateModelInput,
+    });
+    const leadModel = implementRequest.model;
+    const planLeadModel = planRequest.model;
+    // PRD #3252: a planning model with no implementation model to fall back to is an unsupported
+    // phase configuration. It is refused (before any turn) only where the planning model could
+    // reach the implement turn, and per PRD #3252 it fails visibly rather than being replaced, so it is
+    // refused on every non-provider start regardless of approval state. That check sits below, once `preApproved` is known. On a provider run the
+    // provider map's default (the sonnet alias) counts as the implementation model only if the map
+    // yields a name; resolveProviderModel below throws otherwise.
     // PRD #4320 module 7: a provider run resolves the lead through the bound map BEFORE any content is
     // sent. An unmapped alias or vendor model ID is a typed refusal (provider_model_unmapped) that
     // fails the run; an unset model is the sonnet alias. Never rewritten.
-    const spawnModel = ctx.provider ? resolveProviderModel(leadModel, ctx.provider.model_map) : leadModel;
-    // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
-    // copies them and before the own-source implement path reuses them, so both the plan
-    // turn and an own-source implement follow the lead model. The repo roster is built
-    // later and overridden where it is built. Off/no-model = pins win (byte-identical).
-    if (ctx.config?.override_subagent_model && leadModel) {
-      applySubagentModelOverride(assembled.subagents, leadModel);
-    }
+    const spawnModel = ctx.provider ? resolveProviderModel(planLeadModel, ctx.provider.model_map) : planLeadModel;
+    const implementSpawnModel = ctx.provider ? resolveProviderModel(leadModel, ctx.provider.model_map) : leadModel;
+    // PRD #305: the run's model is applied to every subagent of a roster. The plan-turn copy gets
+    // the PLAN lead model (applied to `planAgents` below, after it is copied) and the implement
+    // roster gets the IMPLEMENT lead model where it is selected (phaseRunLoop), so a planning
+    // model never reaches an implement subagent. Off/no-model = pins win (byte-identical).
     // The names come from the RESULT, never from `assembled.subagents`. They feed
     // the plan turn's Agent-guard allowSet AND the "Available subagents to
     // delegate to:" line of every plan prompt, so a name surviving here while its
@@ -1852,9 +1894,10 @@ export class SdkExecutor implements Executor {
     // keys feed the Agent guard's allow set and the delegation lines below.
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
-    const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
-    if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
-      applySubagentModelOverride(planAgents, leadModel);
+    // Fill a copy from this phase; explicit effort pins remain unchanged.
+    const planAgents = fillSubagentEffort(planShaped ? planShaped.agents : planTurn.subagents, planRequest.effort);
+    if (ctx.config?.override_subagent_model && planLeadModel) {
+      applySubagentModelOverride(planAgents, planLeadModel);
     }
     // PRD #4320 module 7: every subagent the plan turn can run resolves through the bound map (own and
     // repo-sourced rosters alike); an excluded template is never in this map and is not checked.
@@ -2016,6 +2059,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         claimGeneration: ctx.claimGeneration,
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
       // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
       // run-scoped, so the server needs only the client + runId — no RunContext
@@ -2029,6 +2073,7 @@ export class SdkExecutor implements Executor {
         client: this.client,
         runId: ctx.runId,
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
       // PRD #333 M2: the incidental-findings capture tool (mcp__findings__report_-
       // incidental_issue). A PLAIN working tool (POST → emit card → ack, turn
@@ -2043,6 +2088,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         emit: (m) => ctx.emit(m),
         log: this.log,
+        redactText: ctx.redactText,
       }).server;
     }
 
@@ -2063,9 +2109,10 @@ export class SdkExecutor implements Executor {
     //   `baseConfig` drives both planning turns (first plan in Phase 1, re-plan in the
     //   revise loop) while `implementConfig` spreads `baseConfig` and OVERRIDES this
     //   from `selectSubagents(...)`, which reads `assembled.subagents` directly and is
-    //   therefore untouched. `agents` is one of THREE keys `implementConfig` overrides,
-    //   all plan-turn-scoped by that same spread mechanism: `agents`, `systemPrompt`
-    //   and `preToolUse`. Worth knowing which, because `preToolUse` is where the
+    //   therefore untouched. `agents` is one of the plan-turn-scoped keys `implementConfig`
+    //   overrides after the spread: `agents`, `systemPrompt` and `preToolUse` (plus the
+    //   model/effort pair, which is set or deleted per phase, see below). Worth knowing
+    //   which, because `preToolUse` is where the
     //   recorded upgrade path goes — a plan-turn-only `PreToolUse` deny on the
     //   write-tool family, the one mechanism that would also reach the LEAD's own
     //   writes. DO NOT move that denial down to the adapter's top-level
@@ -2092,15 +2139,18 @@ export class SdkExecutor implements Executor {
     //   synchronous by the Agent guard hook. Native AskUserQuestion is denied because
     //   clarification goes through uzi's MCP ask_user (PRD #88).
     //
-    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
-    // override can use it; here it only drives the top-level lead model. PRD #617 effort
+    // `planLeadModel` / `leadModel` are computed above so the PRD #305 plan-roster override
+    // can use them; `spawnModel` drives the plan-block lead model. PRD #617 effort
     // and issue #916 attribution are set ONLY when present in the config (never an explicit
     // undefined); when a key is absent the adapter omits it and the SDK applies its own
     // fallback. The runtime adds no default of its own — the API is the policy source and
     // now populates effort with the owner's choice or the uzi default `medium` for an
-    // inheriting owner (issue #1157). Both reach the implement turn too, via the
-    // `baseConfig` spread.
-    const effort = leadRequest.effort;
+    // inheriting owner (issue #1157). Attribution reaches the implement turn via the
+    // `baseConfig` spread; model and effort do NOT: phaseRunLoop replaces them with the
+    // implement pair (or deletes the key).
+    // PRD #3252: baseConfig carries the PLAN pair (every plan-block turn reads it); implementConfig
+    // replaces model/effort with the implement pair in phaseRunLoop.
+    const effort = planRequest.effort;
     const baseConfig: ClaudeTurnConfig = {
       cwd: ctx.worktreePath,
       env: env as unknown as Record<string, string | undefined>,
@@ -2140,7 +2190,8 @@ export class SdkExecutor implements Executor {
     // it. This replaced the applied-once `wallScaled` latch, which swallowed a second bump.
     let maxServedWallMs = initialWallMs;
     const state: RunDrive = {
-      leadRequest,
+      planRequest,
+      implementRequest,
       currentChild: {},
       wallRemainingMs: initialWallMs,
       ...(ctx.codeCrossCheckGate && ctx.codeCrossCheckRepairActive && ctx.codeCrossCheckRepair && ctx.reportCrossCheckDispositions && ctx.claimGeneration ? {
@@ -2262,6 +2313,7 @@ export class SdkExecutor implements Executor {
       survivorNames,
       assembled,
       leadModel,
+      implementSpawnModel,
       planSubagentNames,
       planSource,
       subagentCanWrite,
@@ -2372,6 +2424,19 @@ export class SdkExecutor implements Executor {
         !preApproved &&
         ctx.resumePhase === "awaiting_approval" &&
         !!ctx.approvedPlan?.trim();
+
+      // PRD #3252: the unsupported-phase-configuration refusal (see leadModel above), regardless
+      // of approval state: a planning model with no implement model has no model key to switch
+      // back with, so every start or resume (pre-approved, resumed at the gate, or fresh) is
+      // refused rather than left to run or resume under the planning model. A provider run is
+      // skipped: resolveProviderModel always yields an explicit model or throws.
+      if (
+        ctx.config?.plan_phase?.model &&
+        state.implementRequest.model === undefined &&
+        !ctx.provider
+      ) {
+        throw new Error(REASON_PLAN_MODEL_WITHOUT_IMPLEMENT_MODEL);
+      }
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
       // planning label) reads the same values on both paths.
@@ -2987,6 +3052,7 @@ export class SdkExecutor implements Executor {
     const {
       depsInstall,
       leadModel,
+      implementSpawnModel,
       assembled,
       survivorNames,
       prepared,
@@ -3062,19 +3128,21 @@ export class SdkExecutor implements Executor {
       // full survivor set, since a repo roster has no template rows to allocate
       // against. survivorNames is the filter in both cases, so a skill dropped by
       // the cap or a collision is unreachable either way.
-      const selectedSubagents = selectSubagents(
-        selection.source,
-        assembled.subagents,
-        ctx.repoAgents ?? [],
-        selection.exclusions,
-        survivorNames,
-        prepared.repoSurvivorNames,
+      // Template effort (N2/N5): fill from the lead's resolved effort on a copy; the
+      // `assembled.subagents` entries selectSubagents may return by reference stay untouched.
+      const selectedSubagents = fillSubagentEffort(
+        selectSubagents(
+          selection.source,
+          assembled.subagents,
+          ctx.repoAgents ?? [],
+          selection.exclusions,
+          survivorNames,
+          prepared.repoSurvivorNames,
+        ),
+        state.implementRequest.effort,
       );
-      // PRD #305: repo-source defs are freshly built from repo files here and were NOT
-      // touched by the own-roster override above; apply it so the flag covers the repo
-      // roster (the primary case: an auto-approved scheduled run resolves to the repo
-      // roster). Own-source defs were copied by reference from the already-overridden
-      // assembled.subagents, so this repeat is idempotent for them.
+      // PRD #305: apply the implementation model override to either source's copied roster.
+      // The plan roster used its own copy; effort pins and this phase's effort are preserved.
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
@@ -3102,8 +3170,8 @@ export class SdkExecutor implements Executor {
       // `assembled.subagents` — because the repo-source path's defs come from the repo
       // roster and are absent from `assembled.subagents`, so reusing the plan map would
       // miss every repo name and mislabel a write-capable repo subagent read-only.
-      // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
-      // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
+      // `selectedSubagents` is pre-strip on both sources (effort-filled copies of the assembled
+      // or freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
       drive.enableImplementationSignals();
       const implementConfig: ClaudeTurnConfig = {
@@ -3121,6 +3189,12 @@ export class SdkExecutor implements Executor {
         preToolUse: preToolUse(selectedNames, true, implementUnavailable),
         mcpServers: baseConfig.mcpServers,
       };
+      // PRD #3252: baseConfig carries the PLAN pair; the implement turns take the implement pair.
+      // An unresolved value deletes the key (never `model: undefined`), so the SDK default applies.
+      if (implementSpawnModel) implementConfig.model = implementSpawnModel;
+      else delete implementConfig.model;
+      if (state.implementRequest.effort) implementConfig.effort = state.implementRequest.effort;
+      else delete implementConfig.effort;
       ctx.emit({
         kind: "status",
         agent: "worker",
@@ -3272,6 +3346,8 @@ export class SdkExecutor implements Executor {
       // the runner reads it in phasePublish to SKIP finalize (the wall seam already parked the run or
       // left it non-terminal, and the finally preserves clone + HOME).
       let walled: { reason: string } | undefined;
+      // PRD #3252 D8: latched when implement-phase verification fails, before or after prompt release.
+      let phaseSwitchHeld: NonNullable<ExecutorResult["phaseSwitchHeld"]> | undefined;
       const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
         if (!ctx.completionInterlock || !(completionAttempted || history.priorAttempt)) return false;
         if (await this.routeSummaryHold(ctx, reason, true, { allowDegradedCapture: true }))
@@ -3978,6 +4054,13 @@ export class SdkExecutor implements Executor {
           }
 
         } catch (err) {
+          // PRD #3252 D8: checked FIRST so no credential-switch, pause-now, wall or idle arm below can
+          // swallow it. A contradictory init may follow an admitted request; stop further work and hold.
+          if (err instanceof PhaseSwitchUnverifiedError) {
+            state.phaseVerified?.delete("implement");
+            phaseSwitchHeld = { cause: err.cause, requested: err.requested, observed: err.observed, phase: "implement" };
+            break;
+          }
           // PRD #1247 M5b (data-integrity fix): a held-state credential switch tripped this
           // implement turn (the SDK abort / re-armable interrupt → driveTurn throws
           // CredentialSwitchSignal). Handle it IN PLACE via ctx.attemptCredentialSwitch INSTEAD of
@@ -4706,7 +4789,9 @@ export class SdkExecutor implements Executor {
       // shape every existing deepStrictEqual on this result asserts and blur the
       // wire distinction between "declared nothing" and "field present but empty".
       if (isIssueRun && declaredPrdPath !== undefined) {
-        result.prdDonePath = declaredPrdPath.slice(0, PRD_DONE_PATH_MAX_LEN);
+        // Redact BEFORE the clamp: a provider key straddling the cut would otherwise leave a prefix
+        // that no later whole-key redaction can match.
+        result.prdDonePath = (ctx.redactText?.(declaredPrdPath) ?? declaredPrdPath).slice(0, PRD_DONE_PATH_MAX_LEN);
       }
       // PRD #265 M1: forward the declared finished-milestone ids on `issue` runs only,
       // for the same reasons the PRD path is gated and OMITTED-not-undefined above. The
@@ -4795,6 +4880,7 @@ export class SdkExecutor implements Executor {
       // pausedAt/completionHeld. NOT gated on isIssueRun (all six timed kinds park). OMITTED (not
       // undefined) on every normal completion so existing deepStrictEqual assertions hold.
       if (walled) result.walled = walled;
+      if (phaseSwitchHeld) result.phaseSwitchHeld = phaseSwitchHeld;
       if (iterationParked) result.iterationParked = iterationParked;
       // PRD #1247 M5b (data-integrity fix): forward the released-in-place disposition. Set only when a
       // held-state credential switch RELEASED the claim (ctx.attemptCredentialSwitch → "released")
@@ -5281,7 +5367,7 @@ export class SdkExecutor implements Executor {
     let markObserved: (() => void) | undefined;
     if (ctx.leadConfig?.enabled) {
       const reporter = ctx.leadConfig;
-      const entry: PhaseEntry = await reporter.enterPhase(phase, state.leadRequest);
+      const entry: PhaseEntry = await reporter.enterPhase(phase, phase === "plan" ? state.planRequest : state.implementRequest);
       // PRD #3244 M2: only the first turn of a phase entry asks the runtime for its config, so the
       // single settings probe runs at most once per entry. The callback never throws into the turn.
       const key = `${entry.phase}:${entry.entry}`;
@@ -5342,9 +5428,14 @@ export class SdkExecutor implements Executor {
         if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
       }
       if (beforeDispatch) prompt = beforeDispatch(prompt);
+      // PRD #3252 D8: with a claim `plan_phase`, the first implement turn and the first plan turn that
+      // resumes an existing session withhold the prompt until the runtime's applied settings match.
+      const verifyPhase = ctx.config?.plan_phase !== undefined && !state.phaseVerified?.has(phase) &&
+        (phase === "implement" || resumeId !== undefined);
       const request: RunTurnRequest = {
         semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
+        redactText: ctx.redactText,
         prompt,
         // The neutral fields below are carried as-is; the placeholders
         // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which
@@ -5358,6 +5449,15 @@ export class SdkExecutor implements Executor {
         agents: {},
         leadSkills: [],
         ...(onRuntimeConfig ? { onRuntimeConfig } : {}),
+        ...(verifyPhase
+          ? {
+              verifyApplied: {
+                ...(turnConfig.model !== undefined ? { model: providerMappedModel(ctx, turnConfig) ?? turnConfig.model } : {}),
+                ...(turnConfig.effort !== undefined ? { effort: turnConfig.effort } : {}),
+              },
+              onPhaseVerified: () => (state.phaseVerified ??= new Set()).add(phase),
+            }
+          : {}),
       };
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
@@ -5477,14 +5577,14 @@ export class SdkExecutor implements Executor {
         const spend = classifySpendLimitTerminal(terminal);
         if (spend) {
           throw new SpendLimitHoldError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText, ctx.redactText),
             spend.detail,
             resumableSessionId(),
           );
         }
         if (!limitFacts && isProviderTransient(terminal)) {
           throw new ProviderTransientError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText, ctx.redactText),
             terminal.apiErrorStatus,
             resumableSessionId(),
           );
@@ -5503,6 +5603,8 @@ export class SdkExecutor implements Executor {
       // A watchdog/cancel trip surfaces as its static reason, not the raw
       // AbortError the aborted iterator throws.
       if (state.tripReason) throw this.tripError(state);
+      // PRD #3252 D8: an unverified phase switch is final for this claim: no resume, no retry.
+      if (err instanceof PhaseSwitchUnverifiedError) throw err;
       // issue #1656: only with no trip pending — every uzi kill sets tripReason first — is a
       // SIGTERM/SIGKILL death of the CLI foreign, and resumable by the recovery wrapper.
       const death = err instanceof Error ? foreignCliTermination(err) : undefined;
@@ -5659,6 +5761,8 @@ export class SdkExecutor implements Executor {
         } catch (err) {
           // A real cancel/idle/wall trip WINS and keeps its existing outcome.
           if (state.tripReason) throw this.tripError(state);
+          // PRD #3252 D8: ahead of every retry arm below (event-free, signal death, resume refusal).
+          if (err instanceof PhaseSwitchUnverifiedError) throw err;
           // A usage-limit death routes to the usage-limit wait path, unchanged.
           if (err instanceof LimitReachedError) throw err;
           if (err instanceof EventFreeStreamError) {

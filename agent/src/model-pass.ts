@@ -33,6 +33,7 @@ import { uidSplitActive } from "./runner-uid.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
+import { makeTextRedactor, providerKeyForms, redactStrings, type TextRedactor } from "./redact.js";
 import type { Logger } from "./log.js";
 import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
@@ -102,7 +103,8 @@ export interface ReadOnlyModelPassOpts {
    *  usage-limit death); on a success frame it is a capture side-effect. When omitted
    *  (review/summary), the helper's default applies: throw a generic
    *  `${label} model call returned an error result` on an error frame, return the
-   *  accumulated text on success. */
+   *  accumulated text on success. It receives the raw SDK message OUTSIDE the provider redaction
+   *  seam, so it must not be used on a provider pass (the judge refuses providers today). */
   onResult?(msg: unknown, ctx: { isError: boolean; latest: RateLimitObservation | undefined }): void;
   /** PRD #1429 M3: when set, this pass runs the ISOLATED CODEX advice harness (built via
    *  the injected `buildHarness` factory — never constructed in this file, per
@@ -211,12 +213,13 @@ function linkExternalAbort(
 /** PRD #2603: the usage-evidence latch of one pass. `observe` keeps the latest snapshot until
  *  `flush`, which delivers it to `onUsage` at most once and closes the latch, so a late
  *  observation after the pass returned can never produce a second delivery. */
-function usageLatch(opts: ReadOnlyModelPassOpts): {
+function usageLatch(opts: ReadOnlyModelPassOpts, scope?: ProviderScope): {
   observe: ((snapshot: AdviceUsageSnapshot) => void) | undefined;
   flush(): void;
 } {
   const onUsage = opts.onUsage;
   if (!onUsage) return { observe: undefined, flush: () => {} };
+  const log = scope?.log ?? opts.log;
   let latest: AdviceUsageSnapshot | undefined;
   let closed = false;
   return {
@@ -228,12 +231,167 @@ function usageLatch(opts: ReadOnlyModelPassOpts): {
       closed = true;
       if (latest === undefined) return;
       try {
-        onUsage(latest);
+        onUsage(scope ? redactStrings(latest, scope.text) : latest);
       } catch (e) {
-        opts.log.warn(`${opts.label} usage callback failed`, { error: errMessage(e) });
+        log.warn(`${opts.label} usage callback failed`, { error: errMessage(e) });
       }
     },
   };
+}
+
+// Provider output redaction (issue #4505). A provider pass runs under a gateway key the worker
+// log may not have registered, and a gateway can echo that key into the model's text, the model
+// ids of the usage evidence, thrown errors and the pass's own log lines. Everything the pass hands
+// back is scrubbed of the key in every form providerKeyForms builds (raw, JSON-escaped, `\/`, HTML-safe
+// \u00XX, percent-encoded). Vendor passes never build a scope.
+
+interface ProviderScope {
+  readonly text: TextRedactor;
+  /** The pass's logger: redacts the message, member names and string fields of plain objects and arrays (up to depth 6)
+   *  before delegating. */
+  readonly log: Logger;
+  /** The value to throw in place of `err`: `err` itself when it carries no key form. */
+  thrown(err: unknown): unknown;
+}
+
+function providerScope(key: string, base: Logger, label: string): ProviderScope {
+  const text = makeTextRedactor(providerKeyForms(key));
+  return { text, log: redactingLogger(base, text), thrown: (err) => sanitizeThrown(err, text, label) };
+}
+
+const MAX_LOG_FIELD_DEPTH = 6;
+
+function redactLogValue(v: unknown, text: TextRedactor): unknown {
+  return redactStrings(v, text, (container, depth) => {
+    if (depth >= MAX_LOG_FIELD_DEPTH) return false;
+    const proto = Object.getPrototypeOf(container);
+    return Array.isArray(container) || proto === Object.prototype || proto === null;
+  });
+}
+
+/** A Logger over `base` that scrubs the message, member names and string fields of plain objects and arrays
+ *  (to a depth of MAX_LOG_FIELD_DEPTH); class instances and deeper values pass through. It never
+ *  touches `base`'s secret registry: addSecret/removeSecret only delegate what a caller explicitly asks. */
+export function redactingLogger(base: Logger, text: TextRedactor): Logger {
+  const emit = (level: "debug" | "info" | "warn" | "error") => (msg: string, fields?: Record<string, unknown>): void => {
+    if (fields === undefined) base[level](text(msg));
+    else base[level](text(msg), redactLogValue(fields, text) as Record<string, unknown>);
+  };
+  const out: Logger = {
+    debug: emit("debug"),
+    info: emit("info"),
+    warn: emit("warn"),
+    error: emit("error"),
+    addSecret: (secret) => base.addSecret(secret),
+    removeSecret: (secret) => base.removeSecret(secret),
+    child: (fields) => redactingLogger(base.child(redactLogValue(fields, text) as Record<string, unknown>), text),
+  };
+  if (base.redactDiagnostic) out.redactDiagnostic = (t) => text(base.redactDiagnostic!(t));
+  return out;
+}
+
+function sanitizeThrown(value: unknown, text: TextRedactor, label: string): unknown {
+  try {
+    return value instanceof Error ? sanitizeError(value, text) : sanitizeNonError(value, text);
+  } catch {
+    return new Error(`${label} model call failed`);
+  }
+}
+
+function safeRead(obj: object, key: string): unknown {
+  try {
+    return (obj as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function ownStringFields(obj: object): string[] {
+  return Object.keys(obj).filter((k) => typeof safeRead(obj, k) === "string");
+}
+
+/** Redacts `message`, `stack`, `name` and the enumerable string fields of `err`. Other fields,
+ *  including a nested `cause`, are not inspected. */
+function sanitizeError(err: Error, text: TextRedactor): Error {
+  const redacted = new Map<string, string>();
+  for (const k of new Set(["message", "stack", "name", ...ownStringFields(err)])) {
+    const v = safeRead(err, k);
+    if (typeof v !== "string") continue;
+    const r = text(v);
+    if (r !== v) redacted.set(k, r);
+  }
+  if (redacted.size === 0) return err;
+  try {
+    for (const [k, v] of redacted) (err as unknown as Record<string, unknown>)[k] = v;
+    if ([...redacted].every(([k, v]) => safeRead(err, k) === v)) return err;
+  } catch {
+    // frozen, or an accessor without a setter: fall through to the replacement
+  }
+  const copy = Object.create(Object.getPrototypeOf(err)) as Error;
+  const define = (k: string, value: unknown, enumerable: boolean): void => {
+    Object.defineProperty(copy, k, { value, enumerable, writable: true, configurable: true });
+  };
+  for (const k of Object.keys(err)) {
+    const v = safeRead(err, k);
+    define(k, typeof v === "string" ? text(v) : v, true);
+  }
+  const message = safeRead(err, "message");
+  define("message", text(typeof message === "string" ? message : String(message ?? "")), false);
+  const stack = safeRead(err, "stack");
+  if (typeof stack === "string") define("stack", text(stack), false);
+  if (redacted.has("name") || Object.hasOwn(err, "name")) {
+    const name = safeRead(err, "name");
+    define("name", typeof name === "string" ? text(name) : name, Object.keys(err).includes("name"));
+  }
+  return copy;
+}
+
+function sanitizeNonError(value: unknown, text: TextRedactor): unknown {
+  switch (typeof value) {
+    case "string":
+      return text(value);
+    case "number":
+      return text(String(value)) === String(value) ? value : NaN;
+    case "bigint":
+      return text(String(value)) === String(value) ? value : 0n;
+    case "symbol": {
+      const description = value.description;
+      return description !== undefined && text(description) !== description ? Symbol(text(description)) : value;
+    }
+    case "function": {
+      const name = safeRead(value, "name");
+      const shown = safeStringify(value);
+      const redactedName = typeof name === "string" ? text(name) : name;
+      if (shown === text(shown) && redactedName === name) return value;
+      const substitute = function () {};
+      Object.defineProperty(substitute, "name", { value: redactedName, configurable: true });
+      Object.defineProperty(substitute, "toString", { value: () => text(shown), configurable: true, writable: true });
+      return substitute;
+    }
+    case "object": {
+      if (value === null) return value;
+      const fields = ownStringFields(value);
+      const shown = safeStringify(value);
+      const message = safeRead(value, "message");
+      const bearing = [shown, ...fields.map((k) => safeRead(value, k) as string), typeof message === "string" ? message : ""].some((s) => text(s) !== s);
+      if (!bearing) return value;
+      const substitute: Record<string, unknown> = {};
+      for (const k of fields) substitute[k] = text(safeRead(value, k) as string);
+      if (typeof message === "string") substitute["message"] = text(message);
+      Object.defineProperty(substitute, "toString", { value: () => text(shown), enumerable: false });
+      return Object.freeze(substitute);
+    }
+    default:
+      return value;
+  }
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -257,6 +415,9 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     // branches). Reaching here with neither is a programming error.
     throw new Error(`${opts.label} model pass requires a token or a codex claim`);
   }
+  // Issue #4505: only a provider pass is scoped; a vendor pass uses opts.log and its text as-is.
+  const scope = opts.provider ? providerScope(opts.provider.credential, opts.log, opts.label) : undefined;
+  const log = scope?.log ?? opts.log;
   const homeDir = await fs.mkdtemp(path.join(opts.homeRoot, opts.homePrefix));
   // PRD #1809 D7: unregistered after the cleanup attempt in the finally below (or on the
   // chmod failure just after this).
@@ -283,7 +444,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   // timeoutMs and the caller falls back.
   const abort = new AbortController();
   const external = linkExternalAbort(opts.signal, abort, opts.label);
-  const usage = usageLatch(opts);
+  const usage = usageLatch(opts, scope);
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
@@ -321,13 +482,16 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     abort,
     queryFn: opts.queryFn,
     denyReason: opts.denyReason,
-    log: opts.log,
+    log,
     rawResultShim: opts.onResult,
   })
     .run(request, policy)
     .then((r) => r.text);
   try {
-    return await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
+    const text = await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
+    return scope ? scope.text(text) : text;
+  } catch (err) {
+    throw scope ? scope.thrown(err) : err;
   } finally {
     if (timer) clearTimeout(timer);
     external?.unlink();
@@ -347,7 +511,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     // fail a run. Sibling writers can remain live even after this query settles, so
     // deletion stays descriptor-pinned; refusal warns and retains the tree.
     await rmTeardownTree(homeDir, opts.teardownTestDeps).catch((e) =>
-      opts.log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
+      log.warn(`${opts.label} HOME cleanup failed`, { home_dir: homeDir, error: errMessage(e) }),
     );
     // PRD #1809 D7: the pass is over; a dir its cleanup could not remove is now the disk
     // reclaim's to collect.

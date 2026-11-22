@@ -1,8 +1,8 @@
-// Compact instance-health chip for the default Overview header (PRD #3878, #3877). Admin-only by
+// Compact instance-health chip for the Overview header (PRD #3878, #3877). Admin-only by
 // construction: it reads the ONE shared HealthStatusProvider, whose doc is null for a
 // non-admin (no fetch) and before the first load, and the chip then renders nothing.
-// It mirrors HealthOverviewCard's severity in one line and always opens a popover (#4281).
-// Attention rows use the card's shared row (#4166); passing checks appear by area. The
+// It shows the instance-health verdict in one line and always opens a popover (#4281).
+// Attention rows use the shared HealthCheckRow (#4166); passing checks appear by area. The
 // footer's Open health link reaches the full Health tab. Live verdict changes keep the
 // popover open and move focus only if the previously focused item disappeared.
 // Its wide panel placement and live-update focus tracking need a different effect order
@@ -157,7 +157,7 @@ export function HealthChip() {
   const text = passing
     ? `${doc.counts.ok} of ${applicable} checks passing`
     : healthVerdict(doc).title;
-  // Same severity the card colours by: danger, otherwise warn for any attention item.
+  // Severity colours the chip by: danger, otherwise warn for any attention item.
   const severity = passing ? "ok" : doc.status === "danger" ? "danger" : "warn";
   const checkedAt = Date.parse(doc.checked_at);
   const checked = Number.isFinite(checkedAt) ? `checked ${formatAgo(doc.checked_at, now)}` : null;
@@ -206,7 +206,7 @@ export function HealthChip() {
               <>
                 <ul data-health-attention-list className="space-y-1.5">
                   {attention.map((c) => (
-                    <HealthCheckRow key={c.id} check={c} twoColumnDetails />
+                    <HealthCheckRow key={c.id} check={c} />
                   ))}
                 </ul>
                 {passingChecks.length > 0 && (

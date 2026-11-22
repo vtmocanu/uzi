@@ -1,12 +1,11 @@
 // @vitest-environment jsdom
-// PRD #3877 M1: the default Overview at /dashboard, with the old page at /overview/classic.
+// PRD #3877: the Overview at /dashboard.
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { CommandMenuContext } from "../components/CommandMenuContext";
-import { Dashboard } from "./Dashboard";
 import { api, type AgentTemplate } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { healthySilentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
@@ -84,8 +83,8 @@ async function settle(ms = 0) {
   });
 }
 
-async function mount(page: "next" | "classic" = "next") {
-  const view = render(<MemoryRouter>{page === "next" ? <OverviewNext /> : <Dashboard />}</MemoryRouter>);
+async function mount() {
+  const view = render(<MemoryRouter><OverviewNext /></MemoryRouter>);
   await settle();
   return view;
 }
@@ -146,12 +145,12 @@ describe("OverviewNext for a non-admin", () => {
     expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
   });
 
-  it("links to the classic Overview, which links back to the new default", async () => {
+  it("offers no link back to the retired old Overview", async () => {
     await mount();
-    expect(screen.getByRole("link", { name: "Back to the old Overview" }).getAttribute("href")).toBe("/overview/classic");
-    cleanup();
-    await mount("classic");
-    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
+    expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
+    expect(screen.getAllByRole("link").some((l) => l.getAttribute("href") === "/overview/classic")).toBe(false);
+    // Paired positive: the page does render links, so the negative is not vacuous.
+    expect(screen.getAllByRole("link").length).toBeGreaterThan(0);
   });
 
   it("lists only the viewer's active runs, with the empty state when there are none", async () => {
@@ -176,6 +175,17 @@ describe("OverviewNext for a non-admin", () => {
     mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
+    await mount();
+    expect(screen.queryByText("Get the factory running")).toBeNull();
+  });
+
+  it("counts a registered-but-offline fleet as joined, so setup completes (PRD #1331)", async () => {
+    mockApi.listRepos.mockResolvedValue({ repos: [{ enabled: true } as never] });
+    mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ status: "offline", last_heartbeat_at: "2026-07-05T10:00:00Z" })],
+    });
     await mount();
     expect(screen.queryByText("Get the factory running")).toBeNull();
   });
@@ -274,13 +284,57 @@ describe("OverviewNext for an admin", () => {
   });
 });
 
+describe("account cooldown through the 10s poll", () => {
+  const retained = { agent: "coder", agent_label: "Coder", tool: "Bash", detail: "retained cooldown activity", at: "2026-10-28T12:00:00Z", seq: 1 };
+  const waiting = { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" } as never;
+  const row = () => within(screen.getByRole("list", { name: "Your runs" })).getByText("Live run row").closest("li")!;
+  const visibleWaits = () =>
+    [...row().querySelectorAll("*")].filter((el) => !el.childElementCount && !el.closest(".sr-only") && el.textContent?.includes("waiting for account cooldown"));
+
+  it("refreshes an extended cooldown, then drops the wait once a poll clears it", async () => {
+    vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+    const r = aRun({ health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-10-28T12:01:37Z", progress: waiting });
+    mockApi.listRuns.mockResolvedValue({ runs: [r] });
+    await mount();
+    expect(visibleWaits()).toHaveLength(1);
+    expect(row().textContent).not.toMatch(/waits on you|⚠|%/);
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...r, account_cooldown_class: "overload", account_cooldown_eligible_at: "2026-10-28T12:05:37Z" }] });
+    await settle(10_000);
+    expect(visibleWaits()[0].textContent).toBe("waiting for account cooldown \u00b7 overload \u00b7 earliest eligibility 2026-10-28T12:05:37Z");
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...r, account_cooldown_class: undefined, account_cooldown_eligible_at: undefined }] });
+    await settle(10_000);
+    expect(visibleWaits()).toHaveLength(0);
+    expect(row().textContent).not.toMatch(/waits on you|⚠|provider reported/);
+  });
+
+  it.each(["running", "awaiting_approval"] as const)(
+    "keeps a %s row quiet when polls drop or expire the cooldown metadata, until a healthy poll",
+    async (status) => {
+      vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+      const run = aRun({ status, health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-10-28T11:59:59Z", current_activity: retained });
+      mockApi.listRuns.mockResolvedValue({ runs: [run] });
+      await mount();
+      for (const metadata of [{}, { account_cooldown_class: undefined }, { account_cooldown_eligible_at: undefined }]) {
+        mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, ...metadata }] });
+        await settle(10_000);
+        expect(row().textContent).toContain("waiting");
+        expect(row().textContent).not.toMatch(/waiting for account cooldown|Coder/);
+        expect(row().querySelector(".animate-pulse")).toBeNull();
+      }
+      mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, health: "ok" }] });
+      await settle(10_000);
+      expect(within(row()).getByText("Coder")).toBeTruthy();
+    },
+  );
+});
+
 describe("Capacity rail", () => {
-  it("lists every owner worker on the rail, including one with no stats, and drops Worker load", async () => {
+  it("lists every owner worker on the rail, including offline and stat-less ones", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [
         aWorker({ id: "w1", name: "statless-worker", active_runs: 1, max_concurrent_runs: 2 }),
         aWorker({ id: "w2", name: "gone-worker", status: "offline" }),
-        // Stats-bearing (hasStats) so WorkerLoadCard would render if it were still mounted.
+        // A stats-bearing worker, listed on the rail like the others.
         aWorker({
           id: "w3",
           name: "loaded-worker",
@@ -291,44 +345,33 @@ describe("Capacity rail", () => {
       ],
     });
     await mount();
-    expect(screen.queryByText("Worker load")).toBeNull();
     const rail = screen.getByRole("heading", { name: /Capacity/ }).closest("section") as HTMLElement;
     expect(within(rail).getByText("1 of 2")).toBeTruthy();
     expect(within(rail).getByText("statless-worker")).toBeTruthy();
     expect(within(rail).getByText("gone-worker")).toBeTruthy();
+    expect(within(rail).getByText("loaded-worker")).toBeTruthy();
     expect(within(rail).getAllByText("No stats reported")).toHaveLength(2);
   });
 
-  it("keeps Worker load on the classic Overview", async () => {
-    mockApi.listWorkers.mockResolvedValue({
-      workers: [aWorker({ stats_cpu_pct: 10, stats_mem_bytes: 1024, stats_source: "cgroup" })],
-    });
-    await mount("classic");
-    expect(screen.getByText("Worker load")).toBeTruthy();
-  });
 });
 
-describe("carried-over sections take the same inputs as Dashboard", () => {
-  it("shows a non-admin the same hosted-workers platform line as Dashboard", async () => {
+describe("hosted-workers platform line", () => {
+  it("shows a non-admin the hosted-workers platform line", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "queued" })] });
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ id: "h1", kind: "hosted", status: "offline", upgrade_status: "capacity_blocked" })],
     });
-    await mount("classic");
-    const onDashboard = screen.getByRole("status", { name: "Your hosted workers" }).textContent;
-    expect(onDashboard).toContain("Your hosted workers cannot start right now.");
-    cleanup();
-    await mount("next");
-    expect(screen.getByRole("status", { name: "Your hosted workers" }).textContent).toBe(onDashboard);
+    await mount();
+    expect(screen.getByRole("status", { name: "Your hosted workers" }).textContent).toContain("Your hosted workers cannot start right now.");
   });
 
-  it("shows an admin no platform line on the preview, as on Dashboard", async () => {
+  it("shows an admin no platform line", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "queued" })] });
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ id: "h1", kind: "hosted", status: "offline", upgrade_status: "capacity_blocked" })],
     });
-    await mount("next");
+    await mount();
     expect(screen.queryByRole("status", { name: "Your hosted workers" })).toBeNull();
   });
 });
@@ -355,7 +398,7 @@ function decisionHold(runId: string, createdAt: string) {
 const heldCard = () => screen.getByRole("heading", { name: /Held work/, level: 2 }).closest("section") as HTMLElement;
 
 describe("Held work card", () => {
-  it("shows the Dashboard alert's headline and the own-runs-only recovery diagnostic, with no alert copy of its own", async () => {
+  it("shows the decision headline and the own-runs-only recovery diagnostic", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listRuns.mockResolvedValue({
       runs: [aRun({ id: "own-1", status: "recovery_wait" }), aRun({ id: "own-2", status: "recovery_wait" })],
@@ -369,19 +412,10 @@ describe("Held work card", () => {
       aggregate: heldAggregate({ open_holds: 1, admission_counted_holds: 1, decision_needed: 1 }),
       holds: [],
     });
-    await mount("classic");
-    const alert = screen.getByRole("status", { name: "Held work" });
-    const dashboardHeadline = within(alert).getByRole("heading").textContent;
-    expect(alert.textContent).toContain("2 runs waiting to recover");
-    cleanup();
-    mockApi.getRecoveryHolds.mockClear();
-
-    await mount("next");
+    await mount();
     const card = screen.getByRole("status", { name: "Held work" });
-    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe(dashboardHeadline);
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work needs your attention");
     expect(within(card).getByText("2 runs waiting to recover")).toBeTruthy();
-    // CustodyBoardAlert's own copy is not on the preview.
-    expect(screen.queryByText(/Review the holds that need a decision and choose how to preserve their work\./)).toBeNull();
     expect(screen.getAllByRole("status", { name: "Held work" })).toHaveLength(1);
     // One request per tick: the card takes holds from the hook, it does not fetch its own.
     expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
@@ -491,10 +525,6 @@ describe("Held work card", () => {
     expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
-  it("does not fetch holds on Dashboard beyond its own alert", async () => {
-    await mount("classic");
-    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
-  });
 });
 
 describe("Needs your decision", () => {
@@ -1100,7 +1130,7 @@ describe("Repos chip (issue #4334)", () => {
 
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
-  it("puts the Back link after the title and before the chips in reading order", async () => {
+  it("puts the title before the chips in reading order", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
@@ -1116,14 +1146,13 @@ describe("OverviewNext Search button", () => {
     const people = screen.getByRole("button", { name: /^People:/ });
     const repos = screen.getByRole("button", { name: /^Repos:/ });
     const search = screen.getByRole("button", { name: /^Search/ });
-    const back = screen.getByRole("link", { name: "Back to the old Overview" });
+    const title = screen.getByRole("heading", { name: "Welcome, Admin" });
     const before = (a: Element, b: Element) =>
       (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     expect(before(health, people)).toBe(true);
     expect(before(people, repos)).toBe(true);
     expect(before(repos, search)).toBe(true);
-    expect(before(screen.getByRole("heading", { name: "Welcome, Admin" }), back)).toBe(true);
-    expect(before(back, health)).toBe(true);
+    expect(before(title, health)).toBe(true);
   });
 
   it("calls the shell's open() on click, with the shortcut shown on the button", async () => {

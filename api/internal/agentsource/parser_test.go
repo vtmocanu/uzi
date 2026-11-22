@@ -2,6 +2,7 @@ package agentsource
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,6 +27,7 @@ type goldenEntry struct {
 	PromptBody  string       `json:"prompt_body"`
 	Tools       []string     `json:"tools"`
 	Model       string       `json:"model"`
+	Effort      string       `json:"effort"`
 	Skip        string       `json:"skip"`
 	Notes       []goldenNote `json:"notes"`
 }
@@ -73,7 +75,7 @@ func TestParityGolden(t *testing.T) {
 			if !ok {
 				t.Fatalf("no golden entry for fixture %q", name)
 			}
-			raw, err := os.ReadFile(filepath.Join(parityDir, name))
+			raw, err := os.ReadFile(filepath.Join(parityDir, name)) //nolint:gosec // G304: a fixture name listed from this package's own testdata dir.
 			if err != nil {
 				t.Fatalf("read fixture: %v", err)
 			}
@@ -101,6 +103,9 @@ func TestParityGolden(t *testing.T) {
 			}
 			if got.Role.PromptBody != want.PromptBody {
 				t.Errorf("prompt_body = %q, want %q", got.Role.PromptBody, want.PromptBody)
+			}
+			if got.Role.Effort != want.Effort {
+				t.Errorf("effort = %q, want %q", got.Role.Effort, want.Effort)
 			}
 			if got.Role.Model != want.Model {
 				t.Errorf("model = %q, want %q", got.Role.Model, want.Model)
@@ -150,7 +155,7 @@ func TestParseSetCapsAndDedupe(t *testing.T) {
 	// roleName generates a unique, valid, lexically-sortable kebab-case name for the i-th
 	// synthetic role file (a00, a01, … a99). Used to build rosters of a chosen size.
 	roleName := func(i int) string {
-		return "a" + string(rune('0'+i/10)) + string(rune('0'+i%10))
+		return fmt.Sprintf("a%02d", i)
 	}
 
 	t.Run("duplicate name, first file by name wins", func(t *testing.T) {

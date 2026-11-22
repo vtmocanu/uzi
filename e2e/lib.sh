@@ -480,7 +480,8 @@ _docker_wire_service_running() {
 }
 # #4165 sidecar startup diagnostics. _docker_wire_diag_limiter names the timeout command that bounds every
 # diagnostic Docker read (the storage_diagnostic_snapshot convention); empty when neither is installed, and
-# then no Docker read is issued at all (never an unbounded daemon query).
+# then no Docker read is issued at all (never an unbounded daemon query). resolve_fixture_source_hold's
+# receipt-timeout agent log tail (#4606) uses it too.
 _docker_wire_diag_limiter() { command -v timeout || command -v gtimeout || true; }
 _dw_diag_missing() {
   echo "MISSING-EVIDENCE: docker wiring diagnostics: $1" >&2
@@ -1049,6 +1050,22 @@ login() {
     -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}" >/dev/null
 }
 apiget()  { retry_read curl -fsS -b "$JAR" "$BASE$1"; }
+# apiget_before DEADLINE PATH: apiget bounded by an absolute $SECONDS deadline. Each
+# attempt (at most 3, like retry_read) gets curl --max-time of the time remaining, and
+# none starts once the deadline has passed, so a blocked read cannot outlive its caller.
+apiget_before() {
+  local deadline="$1" path="$2" n=1 rem rc
+  [[ "$deadline" =~ ^[0-9]+$ ]] || return 2
+  while :; do
+    rem=$((deadline - SECONDS))
+    [ "$rem" -gt 0 ] || return 28
+    curl -fsS --max-time "$rem" -b "$JAR" "$BASE$path" && return 0
+    rc=$?
+    [ "$n" -ge 3 ] && return "$rc"
+    n=$((n + 1))
+    sleep 0.5
+  done
+}
 apipost() { curl -fsS -b "$JAR" -X POST "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/json' \
@@ -1414,17 +1431,49 @@ remove_fixture_ephemeral_worker() {
 # FINAL; only capture-less holds use owner discard. Available archives are preserved.
 resolve_fixture_source_hold() {
   local run="$1" generation="$2" view hold id state before after reply
-  local timeout="${3:-120}" restored_at="${4:-}" start=$SECONDS snapshot
+  local timeout="${3:-120}" restored_at="${4:-}" start=$SECONDS snapshot attention
+  local rem rc last_snapshot=none diag_limiter diag_rc
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture receipt timeout: $timeout"
+  # One deadline for the whole call: the capture wait and the archive receipt share it,
+  # and every read (run, holds, archive listings, receipt SQL) is bounded by what
+  # remains (apiget_before / db_psql_rows SECS), never reset.
+  local deadline=$((start + timeout))
   [[ "$run" =~ ^[0-9a-fA-F-]{36}$ && "$generation" =~ ^[1-9][0-9]*$ ]] \
     || fail "invalid fixture hold identity: run=$run generation=$generation"
-  apiget "/api/runs/$run" | jq -e --arg run "$run" '.run.id==$run and (.run.status|IN("completed","failed","cancelled"))' >/dev/null \
+  view="$(apiget_before "$deadline" "/api/runs/$run")" \
+    || fail "fixture hold run read failed or exceeded the ${timeout}s deadline: run=$run"
+  printf '%s' "$view" | jq -e --arg run "$run" '.run.id==$run and (.run.status|IN("completed","failed","cancelled"))' >/dev/null \
     || fail "fixture hold run is not terminal: $run"
-  view="$(apiget /api/recovery/holds)"
+  view="$(apiget_before "$deadline" /api/recovery/holds)" \
+    || fail "fixture hold read failed or exceeded the ${timeout}s deadline: run=$run generation=$generation"
   hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
     '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
   [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
   id="$(printf '%s' "$hold" | jq -r '.[0].id')"
   [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid fixture hold id: $hold"
+  # A capture still being prepared/uploaded settles on its own; wait it out on the
+  # shared deadline, then branch on whatever it became (available, source_only, released).
+  while [ "$(printf '%s' "$hold" | jq -r '.[0].attention // ""')" = capturing ]; do
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then
+      fail "fixture hold still capturing after ${timeout}s: run=$run generation=$generation hold=$id"
+    fi
+    sleep 1
+    # The pause itself may spend the budget: report the capture, not a refused read.
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "fixture hold still capturing after ${timeout}s: run=$run generation=$generation hold=$id"
+    view="$(apiget_before "$deadline" /api/recovery/holds)" \
+      || fail "fixture hold read failed or exceeded the ${timeout}s deadline: run=$run generation=$generation hold=$id"
+    hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
+      '[.holds[] | select(.run_id==$run and .generation==$generation)]')"
+    [ "$(printf '%s' "$hold" | jq -r 'length')" = 1 ] || fail "fixture hold missing/ambiguous: run=$run generation=$generation $hold"
+    [ "$(printf '%s' "$hold" | jq -r '.[0].id')" = "$id" ] || fail "fixture hold identity changed: run=$run generation=$generation $hold"
+    # A transition first observed at or past the deadline is never acted on; a hold
+    # still capturing falls through to the loop's own timeout diagnostic.
+    attention="$(printf '%s' "$hold" | jq -r '.[0].attention // ""')"
+    if [ "$SECONDS" -ge "$deadline" ] && [ "$attention" != capturing ]; then
+      fail "fixture hold changed after the ${timeout}s deadline: run=$run generation=$generation hold=$id $hold"
+    fi
+  done
   state="$(printf '%s' "$hold" | jq -r '.[0].state')"
   case "$state" in
     released|discarded) pass "fixture hold already resolved: run=$run generation=$generation hold=$id"; return ;;
@@ -1432,48 +1481,74 @@ resolve_fixture_source_hold() {
     *) fail "unexpected fixture hold state: $hold" ;;
   esac
   if printf '%s' "$hold" | jq -e '.[0] | .has_available_capture==true and .capture_state=="available"' >/dev/null; then
-    before="$(apiget "/api/runs/$run/archives" | jq -ce '.archives|select(type=="array")|[.[]|select(.state=="available")|{id,checksum,byte_size}]')" \
+    before="$(apiget_before "$deadline" "/api/runs/$run/archives")" \
+      || fail "fixture archive listing failed or exceeded the ${timeout}s deadline: run=$run hold=$id"
+    before="$(printf '%s' "$before" | jq -ce '.archives|select(type=="array")|[.[]|select(.state=="available")|{id,checksum,byte_size}]')" \
       || fail "fixture archive listing malformed: run=$run hold=$id"
-    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture receipt timeout: $timeout"
     while :; do
-      snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'run_status',r.status,
-        'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'run_id',h.run_id,'generation',h.generation,
-          'state',h.state,'inventory_guarded',h.inventory_guarded,'created_at',h.created_at,'updated_at',h.updated_at,
-          'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
-          'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,'final_coverage_digest',h.final_coverage_digest,
-          'archive_matches',EXISTS(SELECT 1 FROM recovery_captures c WHERE c.id=h.final_capture_id
-            AND c.hold_id=h.id AND c.run_id=h.run_id AND c.user_id=h.user_id AND c.original_worker_id=h.original_worker_id
-            AND c.manifest_bound AND c.state='available' AND c.expires_at>clock_timestamp()
-            AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest),
-          'captures',COALESCE((SELECT json_agg(json_build_object('id',c.id,'state',c.state,'manifest_bound',c.manifest_bound,
-            'source_sha',c.source_sha,'coverage_digest',c.coverage_digest,'expires_at',c.expires_at))
-            FROM recovery_captures c WHERE c.hold_id=h.id),'[]'::json),
-          'worker',(SELECT json_build_object('id',w.id,'status',w.status,'last_heartbeat_at',w.last_heartbeat_at,
-            'updated_at',w.updated_at,'online_since',w.online_since)
-            FROM workers w WHERE w.id=h.original_worker_id))) FROM recovery_custody_holds h
-          WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=$generation),'[]'::json))::text
-        FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")"
-      printf '%s' "$snapshot" | jq -e --arg run "$run" --arg id "$id" --argjson gen "$generation" '
-        .run_id==$run and (.run_status|IN("completed","failed","cancelled")) and
-        (.holds|type=="array" and length==1) and (.holds[0] | .id==$id and .run_id==$run and .generation==$gen and .inventory_guarded==true)' >/dev/null \
-        || fail "fixture receipt changed identity or outcome: $snapshot"
-      if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
-        printf '%s' "$snapshot" | jq -e '.holds[0] | .final_disposition=="archive" and .release_evidence=="archive" and .archive_matches==true' >/dev/null \
-          || fail "fixture receipt lacks archive proof: $snapshot"
-        after="$(apiget "/api/runs/$run/archives")"
-        printf '%s' "$after" | jq -e --argjson before "$before" \
-          '[.archives[]|select(.state=="available")|{id,checksum,byte_size}] as $after | all($before[]; . as $archive | any($after[]; .==$archive))' >/dev/null \
-          || fail "fixture receipt changed an available archive: run=$run hold=$id"
-        pass "fixture archive custody receipt: run=$run generation=$generation hold=$id; archives preserved"
-        return
+      # The receipt SQL is bounded by what remains of the shared deadline (db_psql_rows
+      # SECS kills the compose exec); past the deadline no read starts at all.
+      rc=0; rem=$((deadline - SECONDS))
+      if [ "$rem" -gt 0 ]; then
+        snapshot="$(db_psql_rows "SELECT json_build_object('run_id',r.id,'run_status',r.status,
+          'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'run_id',h.run_id,'generation',h.generation,
+            'state',h.state,'inventory_guarded',h.inventory_guarded,'created_at',h.created_at,'updated_at',h.updated_at,
+            'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
+            'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,'final_coverage_digest',h.final_coverage_digest,
+            'archive_matches',EXISTS(SELECT 1 FROM recovery_captures c WHERE c.id=h.final_capture_id
+              AND c.hold_id=h.id AND c.run_id=h.run_id AND c.user_id=h.user_id AND c.original_worker_id=h.original_worker_id
+              AND c.manifest_bound AND c.state='available' AND c.expires_at>clock_timestamp()
+              AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest),
+            'captures',COALESCE((SELECT json_agg(json_build_object('id',c.id,'state',c.state,'manifest_bound',c.manifest_bound,
+              'source_sha',c.source_sha,'coverage_digest',c.coverage_digest,'expires_at',c.expires_at))
+              FROM recovery_captures c WHERE c.hold_id=h.id),'[]'::json),
+            'worker',(SELECT json_build_object('id',w.id,'status',w.status,'last_heartbeat_at',w.last_heartbeat_at,
+              'updated_at',w.updated_at,'online_since',w.online_since)
+              FROM workers w WHERE w.id=h.original_worker_id))) FROM recovery_custody_holds h
+            WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=$generation),'[]'::json))::text
+          FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')" "$rem")" || rc=$?
+      else
+        rc=28
       fi
-      printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null
-        and (.captures|type=="array" and any(.[]; .state=="available"))' >/dev/null \
-        || fail "fixture receipt has unexpected disposition or capture state: $snapshot"
-      if [ $((SECONDS - start)) -ge "$timeout" ]; then
-        printf 'fixture receipt timeout evidence: restore_at=%s snapshot=%s\n' "${restored_at:-unknown}" "$snapshot"
+      if [ "$rc" = 0 ]; then
+        snapshot="${snapshot//$'\n'/}"
+        last_snapshot="$snapshot"
+        printf '%s' "$snapshot" | jq -e --arg run "$run" --arg id "$id" --argjson gen "$generation" '
+          .run_id==$run and (.run_status|IN("completed","failed","cancelled")) and
+          (.holds|type=="array" and length==1) and (.holds[0] | .id==$id and .run_id==$run and .generation==$gen and .inventory_guarded==true)' >/dev/null \
+          || fail "fixture receipt changed identity or outcome: $snapshot"
+        if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
+          printf '%s' "$snapshot" | jq -e '.holds[0] | .final_disposition=="archive" and .release_evidence=="archive" and .archive_matches==true' >/dev/null \
+            || fail "fixture receipt lacks archive proof: $snapshot"
+          after="$(apiget_before "$deadline" "/api/runs/$run/archives")" \
+            || fail "fixture archive listing failed or exceeded the ${timeout}s deadline: run=$run hold=$id"
+          printf '%s' "$after" | jq -e --argjson before "$before" \
+            '[.archives[]|select(.state=="available")|{id,checksum,byte_size}] as $after | all($before[]; . as $archive | any($after[]; .==$archive))' >/dev/null \
+            || fail "fixture receipt changed an available archive: run=$run hold=$id"
+          pass "fixture archive custody receipt: run=$run generation=$generation hold=$id; archives preserved"
+          return
+        fi
+        printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null
+          and (.captures|type=="array" and any(.[]; .state=="available"))' >/dev/null \
+          || fail "fixture receipt has unexpected disposition or capture state: $snapshot"
+      elif [ "$SECONDS" -lt "$deadline" ]; then
+        fail "fixture receipt read failed (rc=$rc) before the ${timeout}s deadline: run=$run hold=$id"
+      fi
+      # One evidence block for a receipt that never released and for a read the deadline
+      # cut short; the last good snapshot is kept, never blanked.
+      if [ "$rc" != 0 ] || [ "$SECONDS" -ge "$deadline" ]; then
+        printf 'fixture receipt timeout evidence: restore_at=%s snapshot=%s read_rc=%s\n' "${restored_at:-unknown}" "$last_snapshot" "$rc"
         if [ -n "$restored_at" ]; then
-          "${COMPOSE[@]}" logs --no-color --since "$restored_at" --tail 80 agent || true
+          # Evidence only, after the deadline decided the failure: its own 5s allowance plus a
+          # 2s kill grace (never the expired receipt budget), never retried, never unbounded.
+          diag_limiter="$(_docker_wire_diag_limiter)"
+          if [ -n "$diag_limiter" ]; then
+            diag_rc=0
+            "$diag_limiter" -k 2 5 "${COMPOSE[@]}" logs --no-color --since "$restored_at" --tail 80 agent || diag_rc=$?
+            [ "$diag_rc" = 0 ] || echo "fixture receipt diagnostic: agent log tail unavailable or timed out (rc=$diag_rc)"
+          else
+            echo 'fixture receipt diagnostic: agent log tail skipped (no timeout command)'
+          fi
         fi
         fail "fixture archive custody receipt timeout after ${timeout}s; evidence preserved"
       fi
@@ -1482,17 +1557,23 @@ resolve_fixture_source_hold() {
   fi
   printf '%s' "$hold" | jq -e '.[0] | .attention=="source_only" and .has_available_capture==false and (.capture_state // "")==""' >/dev/null \
     || fail "fixture hold is not a capture-less owner decision: $hold"
-  before="$(apiget "/api/runs/$run/archives")"
+  before="$(apiget_before "$deadline" "/api/runs/$run/archives")" \
+    || fail "fixture archive listing failed or exceeded the ${timeout}s deadline: run=$run hold=$id"
   printf '%s' "$before" | jq -e --arg id "$id" '.archives|type=="array" and all(.[]; .hold_id!=$id)' >/dev/null \
     || fail "fixture hold has capture evidence: $id"
   before="$(printf '%s' "$before" | jq -c '[.archives[]|select(.state=="available")|{id,checksum,byte_size}]')"
+  # Immediately before the owner disposition: past the deadline nothing is discarded.
+  [ "$SECONDS" -lt "$deadline" ] \
+    || fail "fixture hold deadline of ${timeout}s passed before the owner disposition: run=$run generation=$generation hold=$id"
   reply="$(uzi_cli run discard "$run" --hold "$id" --yes --json)" || fail "fixture owner disposition failed: run=$run hold=$id"
   printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "fixture owner disposition not acknowledged: $reply"
-  view="$(apiget /api/recovery/holds)"
+  view="$(apiget_before "$deadline" /api/recovery/holds)" \
+    || fail "fixture owner disposition re-read failed or exceeded the ${timeout}s deadline (discard was acknowledged): run=$run hold=$id"
   printf '%s' "$view" | jq -e --arg run "$run" --arg id "$id" --argjson generation "$generation" \
     '[.holds[] | select(.id==$id and .run_id==$run and .generation==$generation)] | length==1 and .[0].state=="discarded"' >/dev/null \
     || fail "fixture owner disposition has no exact discarded row: run=$run hold=$id"
-  after="$(apiget "/api/runs/$run/archives")"
+  after="$(apiget_before "$deadline" "/api/runs/$run/archives")" \
+    || fail "fixture archive listing failed or exceeded the ${timeout}s deadline (discard was acknowledged): run=$run hold=$id"
   printf '%s' "$after" | jq -e --argjson before "$before" \
     '[.archives[]|select(.state=="available")|{id,checksum,byte_size}] as $after | all($before[]; . as $archive | any($after[]; .==$archive))' >/dev/null \
     || fail "fixture owner disposition changed an available archive: run=$run hold=$id"

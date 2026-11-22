@@ -18,7 +18,7 @@ import {
   SYNCED_BADGE_HINT,
   SYNCED_BADGE_LABEL,
   SYNCED_BADGE_TONE,
-  templateModelsLabel,
+  templatePinRows,
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import {
@@ -313,6 +313,7 @@ export function AgentDetail() {
 }
 
 function ReadOnlyView({ template }: { template: AgentTemplate }) {
+  const pins = templatePinRows(template);
   return (
     <Card className="space-y-4">
       <dl className="space-y-3 text-sm">
@@ -320,10 +321,26 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
           <dt className="text-faint">Description</dt>
           <dd className="text-fg">{template.description}</dd>
         </div>
-        <div>
-          <dt className="text-faint">Model</dt>
-          <dd className="text-fg">{templateModelsLabel(template)}</dd>
-        </div>
+        {pins.collapsed ? (
+          <div>
+            <dt className="text-faint">Model &amp; effort</dt>
+            <dd className="text-fg">
+              <div>{pins.rows[0].model.label}</div>
+              <div className="text-muted">{`effort: ${pins.rows[0].effort.label}`}</div>
+              <div className="text-xs text-faint">both harnesses</div>
+            </dd>
+          </div>
+        ) : (
+          pins.rows.map((r) => (
+            <div key={r.family}>
+              <dt className="text-faint">{r.family}</dt>
+              <dd className="text-fg">
+                <div>{r.model.label}</div>
+                <div className="text-muted">{`effort: ${r.effort.label}`}</div>
+              </dd>
+            </div>
+          ))
+        )}
         <div>
           <dt className="text-faint">Tools</dt>
           <dd className="text-fg">{summarizeTools(template)}</dd>

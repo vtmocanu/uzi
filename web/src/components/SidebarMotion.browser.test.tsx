@@ -12,7 +12,7 @@ import { SIDEBAR_MOTION_ICONS } from "./sidebarMotion";
 import { ClockIcon } from "./icons";
 import type { HealthDoc } from "../lib/api";
 
-// Issue #4510: the opt-in animated sidebar icons, against the real stylesheet in Chromium.
+// Issue #4510: animated sidebar icons, against the real stylesheet in Chromium.
 // jsdom cannot run CSS animations, rasterize SVG or emulate reduced motion, so the contract
 // (gating, one-shot restart, stationary geometry, rest pixels) is proven here.
 
@@ -127,60 +127,69 @@ afterEach(async () => {
 });
 
 describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
-  it("hover, keyboard focus and click each play, finish within 0.7s-1.8s, then repeat", { timeout: 120000 }, async () => {
+  it("hover and focus start nothing; a click on the same glyph plays, finishes within 0.7s-1.8s, then repeats", { timeout: 120000 }, async () => {
     for (const def of DEFS) {
-      const gestures: Array<[string, (m: ReturnType<typeof mount>) => Promise<void>]> = [
-        ["hover", async (m) => hover(m.link)],
-        ["focus", async () => userEvent.tab()],
-        ["click", async (m) => m.link.click()],
-      ];
-      for (const [name, gesture] of gestures) {
-        const m = mount(def.key, rail);
-        await gesture(m);
-        const first = cssAnims(m.svg);
-        expect(first.length, `${def.key} ${name}`).toBeGreaterThan(0);
-        if (name === "hover") {
-          // One-shot, bounded: finite, fill none, whole icon between 0.7s and 1.8s.
-          let total = 0;
-          for (const a of first) {
-            const t = a.effect!.getComputedTiming();
-            expect(Number.isFinite(Number(t.endTime)), `${def.key} infinite`).toBe(true);
-            expect(t.fill, `${def.key} fill`).toBe("none");
-            total = Math.max(total, Number(t.endTime));
-          }
-          expect(total, `${def.key} total`).toBeGreaterThanOrEqual(700);
-          expect(total, `${def.key} total`).toBeLessThanOrEqual(1800);
-        }
-        for (const a of allAnims(m.svg)) a.finish();
-        await awaitRest(m.svg);
-        expect(allAnims(m.svg), `${def.key} ${name} rest`).toHaveLength(0);
-        // The same gesture again runs again.
-        if (name === "focus") {
-          // After a scripted blur Tab continues from the link's sequential focus position and
-          // would not land on it again. Park focus on a sentinel that precedes the row, then Tab.
-          const sentinel = document.createElement("button");
-          document.body.prepend(sentinel);
-          try {
-            sentinel.focus();
-            await userEvent.tab();
-            expect(document.activeElement, `${def.key} focus repeat lands on the link`).toBe(m.link);
-          } finally {
-            sentinel.remove();
-          }
-        } else {
-          await gesture(m);
-        }
-        expect(cssAnims(m.svg).length, `${def.key} ${name} repeat`).toBeGreaterThan(0);
-        cleanup();
-        await userEvent.unhover(document.body);
+      const m = mount(def.key, rail);
+      await hover(m.link);
+      await frames();
+      expect(m.svg.classList.contains(PLAY), `${def.key} hover starts no animation (class)`).toBe(false);
+      expect(allAnims(m.svg), `${def.key} hover starts no animation`).toHaveLength(0);
+      await userEvent.tab();
+      expect(document.activeElement, `${def.key} focus lands on the link`).toBe(m.link);
+      await frames();
+      expect(m.svg.classList.contains(PLAY), `${def.key} focus starts no animation (class)`).toBe(false);
+      expect(allAnims(m.svg), `${def.key} focus starts no animation`).toHaveLength(0);
+
+      m.link.click();
+      const first = cssAnims(m.svg);
+      expect(first.length, `${def.key} click`).toBeGreaterThan(0);
+      // One-shot, bounded: finite, fill none, whole icon between 0.7s and 1.8s.
+      let total = 0;
+      for (const a of first) {
+        const t = a.effect!.getComputedTiming();
+        expect(Number.isFinite(Number(t.endTime)), `${def.key} infinite`).toBe(true);
+        expect(t.fill, `${def.key} fill`).toBe("none");
+        total = Math.max(total, Number(t.endTime));
       }
+      expect(total, `${def.key} total`).toBeGreaterThanOrEqual(700);
+      expect(total, `${def.key} total`).toBeLessThanOrEqual(1800);
+      for (const a of allAnims(m.svg)) a.finish();
+      await awaitRest(m.svg);
+      expect(allAnims(m.svg), `${def.key} click rest`).toHaveLength(0);
+      // A repeat click on the now-active destination runs again.
+      m.link.click();
+      expect(cssAnims(m.svg).length, `${def.key} click repeat`).toBeGreaterThan(0);
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  });
+
+  it("Enter on a focused row plays (real key press) and a second Enter restarts", { timeout: 120000 }, async () => {
+    for (const def of DEFS) {
+      const m = mount(def.key, rail);
+      await userEvent.tab();
+      expect(document.activeElement, `${def.key} focus lands on the link`).toBe(m.link);
+      expect(allAnims(m.svg), `${def.key} focus starts no animation`).toHaveLength(0);
+      await userEvent.keyboard("{Enter}");
+      const before = cssAnims(m.svg);
+      expect(before.length, `${def.key} Enter plays`).toBeGreaterThan(0);
+      seek(m.svg, 350);
+      await userEvent.keyboard("{Enter}");
+      const after = cssAnims(m.svg);
+      expect(after.length, `${def.key} Enter single set`).toBe(before.length);
+      for (const a of after) {
+        expect(before.includes(a), `${def.key} Enter replaced`).toBe(false);
+        expect(Number(a.currentTime), `${def.key} Enter restarted`).toBeLessThan(300);
+      }
+      cleanup();
+      await userEvent.unhover(document.body);
     }
   });
 
   it("restarts a mid-flight gesture: fresh animations near time zero, no queue", { timeout: 120000 }, async () => {
     for (const def of DEFS) {
       const m = mount(def.key, rail);
-      await hover(m.link);
+      m.link.click();
       const before = cssAnims(m.svg);
       expect(before.length, def.key).toBeGreaterThan(0);
       seek(m.svg, 350);
@@ -198,7 +207,7 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
 
   it("clears the play class when the last animation ends during a press (the :active transition does not count)", { timeout: 60000 }, async () => {
     const m = mount("overview", rail);
-    await hover(m.link);
+    m.link.click();
     expect(cssAnims(m.svg).length).toBeGreaterThan(0);
     // Test-only: stretch the :active transition (an inline duration outranks the stylesheet's
     // 60ms) so it is reliably still running after the CDP press round trip on a slow host.
@@ -226,7 +235,7 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
   it("lets a moving glyph overflow its box only while it plays", { timeout: 30000 }, async () => {
     const m = mount("chat", rail);
     expect(getComputedStyle(m.svg).overflow, "rest").toBe("hidden");
-    await hover(m.link);
+    m.link.click();
     expect(cssAnims(m.svg).length).toBeGreaterThan(0);
     expect(getComputedStyle(m.svg).overflow, "during play").toBe("visible");
     for (const a of allAnims(m.svg)) a.finish();
@@ -295,7 +304,7 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
   it("cancels at once when the setting turns off mid-flight and does not replay when it is back on", { timeout: 120000 }, async () => {
     for (const def of DEFS) {
       const m = mount(def.key, rail);
-      await hover(m.link);
+      m.link.click();
       expect(cssAnims(m.svg).length, def.key).toBeGreaterThan(0);
       setMotion("off");
       expect(allAnims(m.svg), `${def.key} off`).toHaveLength(0);
@@ -325,7 +334,7 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
       await frames();
       expect(allAnims(m.svg), "off then on").toHaveLength(0);
 
-      await hover(m.link);
+      m.link.click();
       expect(cssAnims(m.svg).length).toBeGreaterThan(0);
       for (const a of allAnims(m.svg)) a.finish();
       await awaitRest(m.svg);
@@ -342,16 +351,21 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
   });
 });
 
-describe("collapsed rail: wrapper and dots stay still", () => {
-  it("keeps the badge dot, the severity pip and the icon wrapper unmoved while the svg plays", async () => {
+describe.each(RAILS)("%s rail: wrapper and dots stay still", (rail) => {
+  it("keeps the badge dot, the severity pip and the icon wrapper unmoved while the svg plays on click", async () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ["runs", { badge: 4, badgeLabel: "in progress" }],
       ["admin", { healthPip: healthCounts }],
     ];
     for (const [key, extra] of cases) {
-      const m = mount(key, "collapsed", extra);
+      const m = mount(key, rail, extra);
       const wrapper = m.svg.parentElement as HTMLElement;
-      const dot = wrapper.querySelector('span[aria-hidden="true"]') as HTMLElement;
+      // Collapsed: the dot/pip sits inside the icon wrapper. Expanded: the count pill is the
+      // link's last child, after the label.
+      const dot = (
+        rail === "collapsed" ? wrapper.querySelector('span[aria-hidden="true"]') : m.link.lastElementChild
+      ) as HTMLElement;
+      if (rail === "expanded") expect(wrapper.contains(dot), `${key} pill is outside the wrapper`).toBe(false);
       expect(dot, `${key} dot`).not.toBeNull();
       const rectOf = (el: Element) => {
         const r = el.getBoundingClientRect();
@@ -361,8 +375,16 @@ describe("collapsed rail: wrapper and dots stay still", () => {
       const wrapperBefore = rectOf(wrapper);
       expect(getComputedStyle(wrapper).transform).toBe("none");
 
+      // Hover and focus play nothing, and move nothing.
       await hover(m.link);
-      expect(cssAnims(m.svg).length, key).toBeGreaterThan(0);
+      await userEvent.tab();
+      await frames();
+      expect(allAnims(m.svg), `${key} hover and focus start no animation`).toHaveLength(0);
+      expect(rectOf(dot), `${key} dot after hover and focus`).toEqual(dotBefore);
+      expect(rectOf(wrapper), `${key} wrapper after hover and focus`).toEqual(wrapperBefore);
+
+      m.link.click();
+      expect(cssAnims(m.svg).length, `${key} click plays`).toBeGreaterThan(0);
       for (const t of [100, 400, 700]) {
         seek(m.svg, t);
         expect(rectOf(dot), `${key} dot @${t}`).toEqual(dotBefore);
@@ -489,7 +511,7 @@ describe("stationary geometry while a part moves", () => {
       const minute = q(m.svg, ".nm-minute");
       const orig = q(m.svg, ".nm-orig");
       const hourBox = box(hour);
-      await hover(m.link);
+      m.link.click();
       expect(getComputedStyle(orig).opacity, "orig hidden at start").toBe("0");
       const minuteAnim = cssAnims(m.svg).find((a) => a.animationName === "nm-minute")!;
       expect(minuteAnim, "minute animation").toBeDefined();
@@ -519,7 +541,7 @@ describe("stationary geometry while a part moves", () => {
     const post = q(m.svg, ".nm-post");
     const beam = q(m.svg, ".nm-beam");
     const postBox = box(post);
-    await hover(m.link);
+    m.link.click();
     expect(post.getAnimations().some(transformKeyframes)).toBe(false);
     let moved = false;
     for (const t of [200, 500, 800, 1100]) {
@@ -538,7 +560,7 @@ describe("stationary geometry while a part moves", () => {
     const orig = q(m.svg, ".nm-orig");
     const led1 = q(m.svg, ".nm-led1");
     const led2 = q(m.svg, ".nm-led2");
-    await hover(m.link);
+    m.link.click();
     const shown = (el: Element) => (Number(getComputedStyle(el).opacity) > 0 ? 1 : 0);
     for (const t of [100, 400, 600, 830, 1000, 1245, 1500, 1650]) {
       seek(m.svg, t);
@@ -560,7 +582,7 @@ describe("stationary geometry while a part moves", () => {
     const body = Array.from(m.svg.children).filter((c) => c.tagName.toLowerCase() === "path") as SVGGraphicsElement[];
     expect(body).toHaveLength(5);
     const before = body.map(box);
-    await hover(m.link);
+    m.link.click();
     const legs = [q(m.svg, ".nm-legs-l"), q(m.svg, ".nm-legs-r")];
     for (const el of body) expect(el.getAnimations().some(transformKeyframes)).toBe(false);
     seek(m.svg, 130);

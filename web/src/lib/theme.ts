@@ -116,6 +116,7 @@ export const DEFAULT_APPEARANCE_MODE: AppearanceMode = "dark";
 export const DEFAULT_LIGHT_THEME: Theme = "hall";
 export const DEFAULT_DARK_THEME: Theme = "ember";
 export const DEFAULT_TYPEFACE: Typeface = "system";
+export const DEFAULT_SIDEBAR_MOTION = true;
 
 // AppearanceInput is the raw nullable per-field shape both resolveAppearance
 // arguments take: user overrides and instance defaults are each a bag of
@@ -212,9 +213,9 @@ export function applyAppearance(a: {
     mode === "system" ? (prefersDark() ? "dark" : "light") : mode;
   document.documentElement.dataset.theme = polarity === "dark" ? dark : light;
   document.documentElement.dataset.font = typeface;
-  // Sidebar icon animations are opt-in: only a strict true stamps "on". There is
-  // deliberately no web-side default; the server resolves the value.
-  const sidebarMotion = a.sidebarMotion === true;
+  // Preserve a resolved choice, including false; older or malformed payloads use
+  // the compiled default until the server supplies an authoritative value.
+  const sidebarMotion = typeof a.sidebarMotion === "boolean" ? a.sidebarMotion : DEFAULT_SIDEBAR_MOTION;
   document.documentElement.dataset.motion = sidebarMotion ? "on" : "off";
 
   try {

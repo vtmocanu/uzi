@@ -105,7 +105,9 @@ can be edited and reset but never removed.
 
 - **Adding.** The table holds up to 16 sizes. A name is lowercase letters, digits and
   hyphens, starts with a letter and is at most 16 characters. A new size is validated
-  against the same chart ceilings as an edit. Admin-added sizes appear in the
+  against the same chart ceilings as an edit. If the name was added after your table
+  loaded (for example by another admin), your add is refused as a name conflict rather than overwriting theirs, and the
+  form keeps the values you entered. Admin-added sizes appear in the
   provision form, in the `SIZE` column of `uzi worker list` and `uzi worker get`, and
   in the TUI. They can also be chosen as the
   [ephemeral default size and the default size for new workers](./admin-settings.md#hosted-worker-quota).
@@ -143,6 +145,9 @@ can be edited and reset but never removed.
 - **Refusals.** A size the controller refuses (above its own ceilings) or a PVC the
   cluster rejects at create shows on the worker as provisioning or upgrade
   failed, and in [Admin health](./admin-health.md) on the **Worker image roll** check (`fleet.roll`).
+  The Worker sizes card marks each refused size **Refused** in its row, names up
+  to three of its affected workers, and says how many more there are, linking to
+  Admin health. Only fresh controller reports count.
 
 `uzi worker list` and `uzi worker get` show a `SIZE` column; see
 [CLI reference](./cli.md#worker-size).
@@ -1108,7 +1113,7 @@ advice alike. Four things can hold a worker back:
 The [operator knobs](./configuration.md#controller) that control the first two
 are `UZI_WORKER_UID_SPLIT` and `UZI_CODEX_COMMAND_SANDBOX`.
 
-A related knob does not hold a worker back: the controller also forwards `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` (chart value `workers.codex.commandCacheRunBytes`) to the worker container, only when it is set. It is the per-run budget past which a running Codex run's command cache is rotated to a fresh generation (default 4 GiB, `0` disables; best-effort, no hard size bound). Setting or changing it changes the pod spec and rolls the fleet once. See [Configuration](./configuration.md#controller).
+A related knob does not hold a worker back: the controller also forwards `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` (chart value `workers.codex.commandCacheRunBytes`) to the worker container, only when it is set. It is the per-run budget past which a running Codex run's command cache is rotated to a fresh generation (default 4 GiB, `0` disables; best-effort, no hard size bound). Setting or changing it changes the pod spec and rolls the fleet once. The controller likewise forwards `UZI_RUN_CACHE_CAP_MAX_BYTES` / `UZI_RUN_CACHE_CAP_FRACTION` (chart values `workers.runCacheCapMaxBytes` / `workers.runCacheCapFraction`) only when set, and setting or changing either rolls the fleet once. See [Configuration](./configuration.md#controller).
 
 ## My Codex run says "no worker supporting custom Codex models is online"
 
@@ -1140,11 +1145,32 @@ existing fences; otherwise cancel with `uzi run cancel <id>`. Cancellation does
 not itself release custody (see
 [Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker)).
 
+## My run says "no worker supporting separate planning settings is online"
+
+A Claude run that uses a [planning model or planning effort](./worker-model.md#planning-model-and-effort)
+needs a worker advertising the `claude_phase_models_v1` capability, which ships
+with a newer worker image. A run on an older worker image never claims it and
+never plans and implements on one pair silently; it stays queued, and its health
+reason reads **no worker supporting separate planning settings is online**.
+
+- Ask your admin to upgrade or roll the hosted worker fleet to an image that
+  advertises `claude_phase_models_v1`. Ephemeral and hosted placement provisions
+  a current worker for such a run on its own once hosting can supply one.
+- Or clear the **Claude planning model** and **Claude planning effort** in
+  [Settings → Run defaults](./worker-model.md#planning-model-and-effort) if you
+  don't need them right now. A run that already queued uses the settings
+  resolved when a worker claims it, so the change reaches it at its next claim.
+
+A run that was just requeued because its worker lacked the capability may stay
+tied to that worker for a short affinity window before another can take it. A
+placement that over-approximates which runs need the capability can, in rare
+cases, leave a run pinned to a worker that cannot claim it; cancel and restart
+it if the health reason does not clear after you roll the fleet.
+
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
-on the **Workers** page, the new Overview's Capacity rail, and the classic
-Overview's "Worker load" card gain a Disk bar per volume (`/nix`, `/data`); see [Resource stats and
+on the **Workers** page and the Overview's Capacity rail gain a Disk bar per volume (`/nix`, `/data`); see [Resource stats and
 sizing](./worker-setup.md#resource-stats-and-sizing).
 
 Automatic recycle handles these cases:
@@ -1395,7 +1421,7 @@ gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.167.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,

@@ -990,6 +990,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     assert.ok(caps?.includes("job_files_v1"), "job_files_v1 (PRD #1909 M1 rollout gate) is on the register wire next to job_runner_v1");
     assert.ok(caps?.includes("cross_check_v1"), "cross_check_v1 is advertised even when Codex is unavailable on this worker");
     assert.ok(caps?.includes("cross_check_pins_v1"), "cross-check pins are advertised independently of Codex availability");
+    assert.ok(caps?.includes("template_effort_v1"), "template effort pins (issue #3258) are advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_codex_lead_v1"), "the Claude checker capability is advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_gated_v1"), "the gated plan cross-check capability (PRD #3708 M2) is advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_semantic_plan_v1") && caps?.includes("completion_semantic_publication_v1"), "the dormant semantic capabilities are advertised independently of Codex availability");
@@ -1029,6 +1030,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "recovery_run_open_holds_v1",
     "credential_switch_v1",
     "credential_switch_in_place_v1",
+    "codex_credential_switch_v1",
+    "codex_switch_stopped_v1",
     "milestone_reconciliation_claim_v1",
     "codex_refresh_recovery_v1",
     "codex_account_park_v1",
@@ -1043,6 +1046,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_v1",
     "cross_check_rounds_v1",
     "cross_check_pins_v1",
+    "template_effort_v1",
     "cross_check_codex_lead_v1",
     "cross_check_gated_v1",
     "cross_check_semantic_plan_v1",
@@ -1052,6 +1056,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "repo_agent_source_v1",
     "agent_source_request_v1",
     "issue_key_v1",
+    "claude_phase_models_v1",
+    "claude_provider_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // #4007 slice B is production-dark: its capability is never advertised in any permutation below.

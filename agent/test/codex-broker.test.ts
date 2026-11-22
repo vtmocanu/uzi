@@ -23,6 +23,8 @@ import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry
 import { buildCodexToolHandlers, makeDefaultSpawnCommand } from "../src/codex/codex-executor.js";
 import { SupervisedChildExitTimeoutError, type CodexRootHandle, type DisposeOutcome } from "../src/codex/launcher.js";
 import { PassThrough } from "node:stream";
+import { makeTextRedactor, providerKeyForms } from "../src/redact.js";
+import { REPORT_MD_MAX_LEN } from "../src/signals.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -582,6 +584,31 @@ describe("m1 non-closing broker", () => {
       const h = makeBroker({ grants: grants({ isRoot }) });
       assertDenied(await h.broker.handleToolCall(rt(), "signal_done", { non_closing: { reason: "child" } }, origin), "signal_root_only");
     }
+  });
+});
+
+describe("broker signal parse applies grants.redactText before the clamps", () => {
+  const KEY = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+  const redactText = makeTextRedactor(providerKeyForms(KEY));
+  const noPrefix = (value: unknown): void => {
+    const text = JSON.stringify(value);
+    for (let n = 8; n <= KEY.length; n++) assert.ok(!text.includes(KEY.slice(0, n)), `key prefix of length ${n} leaked`);
+  };
+
+  it("signal_done summary straddling the summary cap", async () => {
+    const summary = "x".repeat(REPORT_MD_MAX_LEN - 10) + KEY;
+    const bare = await makeBroker().broker.handleToolCall(rt(), "signal_done", { summary }, "root");
+    assert.ok(JSON.stringify(bare).includes(KEY.slice(0, 10)), "without grants.redactText the fixture straddles the cut");
+    const h = makeBroker({ grants: grants({ redactText }) });
+    noPrefix(await h.broker.handleToolCall(rt(), "signal_done", { summary }, "root"));
+  });
+
+  it("ask_user question straddling its cap", async () => {
+    const input = { questions: [{ question: "q".repeat(1990) + KEY, header: "h" }] };
+    const grantsWithAsk = (extra: Partial<RunGrants>) => grants({ allowedTools: new Set(["ask_user"]), ...extra });
+    const bare = await makeBroker({ grants: grantsWithAsk({}) }).broker.handleToolCall(rt(), "ask_user", input, "root");
+    assert.ok(JSON.stringify(bare).includes(KEY.slice(0, 8)), "without grants.redactText the fixture straddles the cut");
+    noPrefix(await makeBroker({ grants: grantsWithAsk({ redactText }) }).broker.handleToolCall(rt(), "ask_user", input, "root"));
   });
 });
 

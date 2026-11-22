@@ -514,7 +514,7 @@ html[data-pinned-block] {
 
 /* Sidebar icon motion (issue #4510): opt-in, one-shot SVG part animations for the sidebar's
    13 top-level destinations (sidebarMotion.tsx supplies the glyphs and toggles `nm-play` on a
-   row's svg from hover, keyboard focus and click). This section is deliberately UNLAYERED so
+   row's svg on click, including Enter on a focused row). This section is deliberately UNLAYERED so
    it is not outranked by Tailwind's layered utilities. Every rule sits inside the
    no-preference media query AND under the root `data-motion="on"` attribute (stamped from the
    user's Appearance setting), so with the setting off, or under prefers-reduced-motion,

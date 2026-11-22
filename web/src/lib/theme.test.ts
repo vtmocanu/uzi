@@ -258,7 +258,7 @@ describe("applyAppearance (PRD #1167 m5)", () => {
     expect(document.documentElement.dataset.motion).toBe("off");
     expect(JSON.parse(window.localStorage.getItem("uzi.appearance") ?? "{}").sidebarMotion).toBe(false);
 
-    // A non-boolean that slipped past the types (stale/tampered data) is off, not truthy-on.
+    // Non-boolean stale/tampered data falls back to the compiled on default.
     applyAppearance({
       mode: "light",
       light: "dawn",
@@ -266,7 +266,7 @@ describe("applyAppearance (PRD #1167 m5)", () => {
       typeface: "system",
       sidebarMotion: "true" as unknown as boolean,
     });
-    expect(document.documentElement.dataset.motion).toBe("off");
+    expect(document.documentElement.dataset.motion).toBe("on");
   });
 
   it("narrows bad fields to the compiled fallbacks before stamping/caching", () => {

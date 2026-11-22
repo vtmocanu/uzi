@@ -245,8 +245,8 @@ uzi settings set <setting> [--harness claude|codex] <value>
 uzi settings reset <setting> [--harness claude|codex]
 uzi agent-template list
 uzi agent-template show <name|id>
-uzi agent-template set <name|id> --harness claude|codex <model>
-uzi agent-template reset <name|id> --harness claude|codex
+uzi agent-template set <name|id> --harness claude|codex [<model>] [--effort <level>]
+uzi agent-template reset <name|id> --harness claude|codex [--effort]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -271,8 +271,8 @@ A few worth knowing:
   window (default `lifetime`).** The factory summary and per-user rows use
   the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
   self_improve) with recorded usage. Finished, failed and the failure rate
-  count terminal primary work runs, including runs without usage; failure rate
-  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  count every terminal run except chat (helper runs included), including runs
+  without usage; failure rate is failed runs divided by finished runs. Tokens and API-equivalent cost also
   include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
   excluded. Cost shows `$0.00` for metered zero and discloses runs without a
   cost estimate and unreported runs. Incomplete totals include recorded partial
@@ -291,8 +291,9 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, rejected plans and `base_diverged` required-base
-  rejections do not count as failures. Required-base rejections remain in the
+  as Overview: chat, rejected plans and `base_diverged` required-base
+  rejections do not count as failures; failed helper runs (judge,
+  cross_check, mr_rework, ci_fix) do. Required-base rejections remain in the
   finished-run denominator and have a separate numeric `base_diverged` count
   in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
   for the partition identity and the web bar's combined **rejected** segment.
@@ -2971,7 +2972,7 @@ applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 
 has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
 (`use --none` only clears the selection, so it succeeds even with the feature off).
 `--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
-"unknown (custom provider)". Runs through a provider are currently blocked and stay queued; see [Model providers](./providers.md).
+"unknown (custom provider)". Runs start on workers that advertise `claude_provider_v1`; an older worker leaves them queued ("no worker that supports model providers is online"). See [Model providers](./providers.md).
 
 ## Anthropic tokens
 
@@ -3508,7 +3509,8 @@ exit 2 without a request.
 `effort ... runtime` is the explicit **Runtime default** mode: uzi sends no
 effort and the runtime picks its own level (see [Runtime
 default](./worker-effort.md#runtime-default)). It is not a reset. A reset
-removes your choice so the default applies (built-in medium); `runtime` is a
+removes your choice so the default applies (for the lead, the lead template's
+effort when it has one, else built-in medium); `runtime` is a
 stored choice that `uzi settings get` shows as `runtime default`.
 
 Human output prints the changed row of the **Model settings** table from a fresh
@@ -3549,30 +3551,38 @@ or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
 `judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
 already-enabled judge and summary work uses, and cannot turn that work on.
 
-### Agent-template model pins
+### Agent-template model and effort pins
 
 ```sh
 uzi agent-template list
 uzi agent-template show my-reviewer
 uzi agent-template set my-reviewer --harness claude sonnet
 uzi agent-template set my-reviewer --harness codex <model-id>
+uzi agent-template set my-reviewer --harness codex --effort high
+uzi agent-template set my-reviewer --harness claude sonnet --effort medium
 uzi agent-template reset my-reviewer --harness claude
+uzi agent-template reset my-reviewer --harness claude --effort
 ```
 
-`uzi agent-template` reads and edits the Claude pin (`model`) and the Codex pin
-(`codex_model`) of **your own** agent templates over `GET /api/me/agent-templates`
+`uzi agent-template` reads and edits the Claude pins (`model`, `effort`) and the
+Codex pins (`codex_model`, `codex_effort`) of **your own** agent templates over `GET /api/me/agent-templates`
 and `PUT /api/me/agent-templates/{id}/model-pins`, both of which accept a `uzc_`
 or `uza_` Bearer token. A pin is stored per family; `--harness claude` or
 `--harness codex` is required for `set` and `reset`, and the other family is left
 unchanged. `set` passes the model id through and the server validates it like the
-web editor (see [Model pins](./agent-templates.md#model-pins)). `reset` clears
-that pin so the family inherits again. Only the two pins change; description,
+web editor (see [Model pins](./agent-templates.md#model-pins)). `set` needs a
+model, `--effort <level>` (`low`, `medium`, `high`, `xhigh` or `max`), or both;
+`runtime` is not a template effort. `reset` clears the model pin so the family
+inherits again; `reset --effort` clears only the effort pin and keeps the model
+pin (see [Reasoning effort pins](./agent-templates.md#reasoning-effort-pins)).
+Only the pins change; description,
 tools and prompt are untouched, and the template's `customized` flag stays as it
 was.
 
 `list` prints your builtin, global and own templates with `NAME`, `SCOPE`,
-`CLAUDE PIN`, `CODEX PIN`, `EDITABLE` and `ID`. `show`, `set` and `reset` print
-the template's stored pins, each as the value or `inherit`. The output states
+`CLAUDE PIN`, `CODEX PIN`, `CLAUDE EFFORT`, `CODEX EFFORT`, `EDITABLE` and `ID`.
+`show`, `set` and `reset` print the template's stored pins (`Claude pin`,
+`Codex pin`, `Claude effort`, `Codex effort`), each as the value or `inherit`. The output states
 stored pins only and never a resolved model, because the model a template
 actually uses depends on the run role it fills (see [Model
 pins](./agent-templates.md#model-pins)). `--json` prints the server's envelope;
@@ -3593,8 +3603,8 @@ lists the ids; pass the id of one.
 | Exit | Meaning |
 | --- | --- |
 | 0 | The template was read or the pin written. |
-| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
-| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
+| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), or the write answered 400 `unknown field effort` / `unknown field codex_effort` (a server that predates effort pins), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, an invalid `--effort`, `set` with neither a model nor `--effort`, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
 | 3 | Authentication failed, or the template is builtin or global. |
 | 4 | The template does not exist or belongs to another user, including a `404` on the write. |
 | 6 | Server error or rate limit, including a typed 500 for an unknown commit outcome or a failed readback. |
@@ -3613,7 +3623,8 @@ setting prints once. The rows, in order:
 | --- | --- | --- |
 | `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
 | `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
-| `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `worker effort` | `claude`, `codex` | As the existing effort rows. `SOURCE` reads `lead template` when you have no per-harness effort preference and the lead template's effort is used (see [the lead template's effort](./worker-effort.md#the-lead-templates-effort)). |
+| `planning model`, `planning effort` | `claude` | The optional [Claude planning settings](./worker-model.md#planning-model-and-effort), shown only for Claude. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
 | `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
 | `task review effort` | `claude`, `codex` | `not sent` for both. |
@@ -3639,8 +3650,7 @@ usable. The CLI shows the `GET` only; it does not call the start-preview.
 `--schedule` adds the schedule preview, below.
 
 `--json` carries every key of the settings read plus an `effective` key holding
-the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and
-`cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes the Claude `planning_model` cell and `efforts` the `planning_effort` cell) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
 `effective` is `null` when the server does not have the view or the read failed.
 In that case the human output falls back to the previous Model settings rows, a
 line goes to stderr (`Effective settings: not available on this server` for an
@@ -3665,6 +3675,7 @@ the same columns:
 | --- | --- | --- |
 | `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
 | `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
+| `plan phase model`, `plan phase effort` | `claude` | Printed between the worker effort and credential rows, and only on a Claude fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
 | `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
 
 When the harness is chosen at creation, the rows for both harnesses follow
@@ -3674,8 +3685,10 @@ run on this harness; the default applies`).
 
 `--json` adds a `schedule_preview` key holding the response body
 (`version`, `harness`, `refusal`, `refusal_detail`, `worker_model`,
-`worker_effort`, `credential`, `subagents`, `notes` and, when the harness is
-chosen at creation, `alternatives`). The key is absent without `--schedule`.
+`worker_effort`, `credential`, `subagents`, `notes`, the optional `plan_phase`
+(`model`, `effort`, `model_source`, `effort_source`, each omitted when absent;
+also on each alternative) and, when the harness is chosen at creation,
+`alternatives`). The key is absent without `--schedule`.
 
 Exit codes follow the schedule being something you asked for: a schedule that
 does not exist for your account (or a server that predates the route) is a 404
@@ -4300,8 +4313,7 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   again; `hold_reason: provider_binding_stale` means the provider's key or revision changed
   after the run was created, so it cannot continue. `run get` prints a `HOLD` row reading
   `provider URL not allowed` or `provider binding changed`; `run logs --follow` and `run wait`
-  name the next step (wait, or `uzi run cancel` and start a new run). No worker claims a provider
-  run yet (activation is blocked), so these holds cannot occur until it lands. `run resume` is refused with a 409 for both, and neither
+  name the next step (wait, or `uzi run cancel` and start a new run). `run resume` is refused with a 409 for both, and neither
   falls back to an Anthropic token. See [Model providers](./providers.md#what-a-run-keeps).
   A `paused` run can also be **waiting because your credentials were reset**
   (`hold_reason: credentials_reset`): a Claude or chat run created before an
@@ -4336,8 +4348,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   If the worker cannot prove whether that switch took effect, the run is
   `paused` with no hold reason and a `credential_switch_uncertain` message in
   the run feed (posted by the worker):
-  `uzi run resume <id>` re-resolves the token from the run's current choice
-  and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
+  On Claude, `uzi run resume <id>` re-resolves the token from the run's current
+  choice. Codex new claims use the database-committed binding; set-token refuses
+  paused Codex runs (422), and neither credential executes while unresolved. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced
@@ -4361,6 +4374,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
   if the choice has become available on that harness; otherwise cancel the run
   (`uzi run cancel <id>`) and start a new run with a different choice.
+  A `paused` run can also be **held because the switch from its planning
+  model and effort to its own could not be verified**
+  (`hold_reason: phase_switch_unavailable`): `run get` prints a `HOLD` row
+  reading `planning switch unavailable`, and `run wait` and `run logs --follow`
+  print a notice naming the hold. `uzi run resume <id>` retries on a new
+  claim, which verifies the switch again; `uzi run cancel <id>` ends the run.
+  See [Planning model and effort](./worker-model.md#planning-model-and-effort).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -4591,6 +4611,29 @@ uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
 
 Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
 
+### Codex live credential switch
+
+`uzi run set-token <run-id> <label>` selects an enabled owner-owned Codex
+subscription or OpenAI API-key label. Codex refuses `--auto`, `--default`
+and `--inherit`; it does not use Anthropic pool or binding selection.
+The web picker offers the same explicit choice. An ambiguous eligible label
+(two or more matching credentials, compared case-insensitively) is refused before anything is written; rename a
+credential in the web UI, since the CLI cannot rename, then retry. Running and worker-held
+awaiting_approval/input/followup runs switch at the next safe boundary.
+Claimed returns 409; queued and every park return 422, including worker-held
+limit_wait/recovery_wait. Policy episodes unresolved at request or apply
+refuse the switch; a busy refresh lease/intent asks you to retry.
+
+Success keeps worker, generation and worktree without an attempt, custody
+or reclaim transition. It attempts the saved session; confirmed provider
+refusal alone permits a fresh thread and lineage notice, subject to
+preservation holds. Unproven teardown keeps settling/unsettled custody.
+An uncertain apply pauses with `credential_switch_uncertain`, and neither
+credential executes until resolved. No release/reclaim fallback is added.
+Real cross-account provider acceptance is unproven; owner two-account
+acceptance remains pending and non-closing. See
+[Codex switch and recovery limits](codex-credentials.md#switching-a-live-run).
+
 ### Codex idle stalls
 
 `recovery_wait` / `codex_idle_stall` covers measured no-output and productive
@@ -4607,8 +4650,8 @@ It preserves lifetime recovery backoff, provider streak, session, affinity,
 worker recovery episode and requeue baseline, with ordinary claim-release and
 custody semantics. Timer promotion preserves the count and grants a fresh wall
 window too; the default can therefore buy three extra full wall windows.
-`set-token` can promote a timed park; a held park returns a named 409 requiring
-Resume first.
+Claude `set-token` can promote a timed park; a held park returns a named 409
+requiring Resume first. Codex `set-token` refuses these parks with 422.
 
 Default wait and log follow stop for a NULL-retry hold, continue through finite
 or unknown timing, and report finite-to-held changes within the same cause/status.
@@ -4713,8 +4756,8 @@ except a default wait also stops at `recovery_wait` with cause
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
 owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
 Anthropic API spend-limit or exhausted-credit hold, Resume, Switch token or Cancel), and at a `paused` run held on
-`base_attestation_missing`, `run_override_unavailable` or a credential-switch
-hold, for an owner decision:
+`base_attestation_missing`, `run_override_unavailable`, `phase_switch_unavailable`
+or a credential-switch hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

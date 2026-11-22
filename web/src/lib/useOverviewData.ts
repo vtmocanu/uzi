@@ -1,7 +1,6 @@
-// The Overview's data loading, shared by the classic and default pages (PRD #3878, #3877):
-// the first load, the 10 s runs/workers poll and the 30 s usage poll that
-// used to live in Dashboard.tsx, moved here unchanged so the two pages cannot drift in
-// what they fetch or how they poll.
+// The Overview's data loading (PRD #3878, #3877): the first load, the 10 s runs/workers poll
+// and the 30 s usage poll, plus the opt-in admin reads. The page chooses which opt-in reads it
+// wants; with none, the hook sends only the personal requests.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
@@ -18,25 +17,21 @@ import {
   type Worker,
 } from "./api";
 import { hasAnthropicToken } from "./hasToken";
+import type { UsageWindow } from "./usageByUser";
 import { usePollWhileVisible } from "./usePollWhileVisible";
-import type { UsageWindow } from "../components/UsageCards";
 
 export interface Overview {
   runs: RunSummaryItem[];
-  // The full fleet drives both the online/total count and the per-worker load lines
-  // (PRD #49); the mount load and the 10s poll both already fetch it.
+  // The full fleet (PRD #49), refreshed by the mount load and the 10s poll.
   workers: Worker[];
-  workersOnline: number;
-  workersTotal: number;
   reposEnabled: number;
-  templates: number;
   // The same core read's rows, for the Overview Agents chip (#4335); no extra request.
   agentTemplates: AgentTemplate[];
   hasToken: boolean;
   hasForge: boolean;
   // PRD #40: the caller's own usage (everyone) + the factory view (admins only).
   // Best-effort: a usage fetch failure leaves these null and simply hides the cards,
-  // never blocking the rest of the dashboard.
+  // never blocking the rest of the Overview.
   selfUsage: SelfUsage | null;
   adminUsage: AdminUsage | null;
 }
@@ -107,7 +102,7 @@ export function useOverviewData(opts?: {
     }
   }, []);
   // Admin runs are opt-in per page AND admin-only: a non-admin never calls the
-  // admin-gated endpoint, and Dashboard (no option) sends exactly its historic requests.
+  // admin-gated endpoint, and a caller passing no option sends only the personal requests.
   const adminRunsEnabled = opts?.includeAdminRuns === true && user?.is_admin === true;
 
   // First load fetches everything — volatile tiles plus the rarely-changing
@@ -136,10 +131,7 @@ export function useOverviewData(opts?: {
         setData({
           runs,
           workers,
-          workersOnline: workers.filter((w) => w.status === "online").length,
-          workersTotal: workers.length,
           reposEnabled: repos.filter((r) => r.enabled).length,
-          templates: templates.length,
           agentTemplates: templates,
           hasToken: hasAnthropicToken(secrets),
           hasForge: connections.length > 0,
@@ -236,7 +228,7 @@ export function useOverviewData(opts?: {
   // Held-work (custody) holds are opt-in per page and ride their own request and poll, never
   // the personal Promise.all or `poll`: a hung runs/workers request must not stop holds, and a
   // holds failure must not touch `data`. A failure keeps the last good value (null before any
-  // success). Without the opt-in no request is made, so Dashboard sends its historic requests.
+  // success). Without the opt-in no request is made.
   const holdsEnabled = opts?.includeRecoveryHolds === true;
   const [holds, setHolds] = useState<RecoveryCustodyHolds | null>(null);
   const [holdsRequestFailed, setHoldsRequestFailed] = useState(false);
@@ -370,8 +362,6 @@ export function useOverviewData(opts?: {
               ...prev,
               runs,
               workers,
-              workersOnline: workers.filter((w) => w.status === "online").length,
-              workersTotal: workers.length,
             }
           : prev,
       );

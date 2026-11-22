@@ -19,9 +19,11 @@ import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimProviderBinding, ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
+import { createLogger } from "../src/log.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
 import { secretRecordingLogger } from "./runner-harness.js";
+import { withAppliedSettings } from "./phase-settings-fake.js";
 
 // PRD #4320 module 6/7 (agent half): every converted spawn builder's env and model in provider mode,
 // the gateway-limit and switch refusals, and the second-layer lane refusals. The gateway key is
@@ -113,6 +115,25 @@ describe("SdkExecutor in provider mode (issue run lead and subagents)", () => {
     assertProviderEnv(turns[1]!.options.env, "implement turn");
     assert.equal(turns[0]!.options.model, "sonnet");
     assert.equal(turns[1]!.options.model, "sonnet");
+  });
+
+  it("PRD #3252: a planning pair resolves through the map per phase, the plan turn on the planning model and the implement turn on the implement model", async () => {
+    const fake = fakeTurns([[submitPlan("plan"), sessionResult()], [signalDone(), sessionResult()]]);
+    const { turns } = fake;
+    // The gateway map resolves the alias the CLI is given; the runtime reports the mapped ids.
+    const queryFn = withAppliedSettings(fake.queryFn, (o) => ({ model: o.model === "opus" ? "corp-opus" : o.model, effort: "medium" }));
+    const { ctx } = makeCtx({
+      config: {
+        default_model: "corp-sonnet", default_model_source: "user_default",
+        default_effort: "medium", default_effort_source: "user_default",
+        plan_phase: { model: "opus", model_source: "user_planning_default", effort: "medium", effort_source: "user_planning_default" },
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assertProviderEnv(turns[0]!.options.env, "plan turn");
+    assertProviderEnv(turns[1]!.options.env, "implement turn");
+    assert.equal(turns[0]!.options.model, "opus", "plan turn: the planning alias, mapped by the provider");
+    assert.equal(turns[1]!.options.model, "corp-sonnet", "implement turn: the implement model, not the planning one");
   });
 
   it("a vendor run is unchanged: OAuth token, no base URL, no explicit model", async () => {
@@ -414,6 +435,20 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     assert.match(failed.body.failure_reason ?? "", /provider_lane_unsupported/);
     assert.ok(added.includes(KEY), "the gateway key was registered with the logger");
     assert.ok(removed.includes(KEY), "and evicted again when the job ended");
+  });
+
+  it("job: a sibling holder of the same key keeps it scrubbed after the refusal (add/remove are symmetric)", async () => {
+    const { client } = recordingClient();
+    const logger = createLogger("error");
+    logger.addSecret(KEY); // a concurrent run on the shared logger holds the same key
+    await new JobRunner(client, logger, { queryFn: (() => (async function* () { /* none */ })()) as unknown as SdkQueryFn,
+      jobsRoot: path.join(homeDir, "jobs"), batchMs: 5, cancelPollMs: 10 }).execute({
+      run_id: "job-2", kind: "job", issue_iid: null, issue_title: "", issue_description: "", repo: undefined, secrets: secrets as never, last_seq: 0, agents: [],
+      claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {},
+    } as unknown as ClaimResponse);
+    assert.ok(!logger.redactDiagnostic!(`leak ${KEY} here`).includes(KEY), "the holder's registration survives the refusal");
+    logger.removeSecret(KEY);
+    assert.ok(logger.redactDiagnostic!(`leak ${KEY} here`).includes(KEY), "released once its own holder lets go");
   });
 
   it("isolated: the preflight refuses with provider_lane_unsupported", () => {

@@ -44,11 +44,14 @@ import type { EmittedMessage, RunContext } from "./executor.js";
 import type { AdviceUsageSnapshot, HarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
+import type { CodexSwitchBundle } from "./codex-switch-coordinator.js";
+import { ownedSummaryFactories } from "./codex/summary-ownership.js";
 import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { ReadOnlyModelPassOpts } from "./model-pass.js";
 import type { Milestone, MilestoneProgress } from "./protocol.js";
 import { fenceNonce } from "./prompt.js";
 import { errMessage } from "./util.js";
+import { CredentialSwitchSignal } from "./steering.js";
 
 /** At most one call per this window. */
 export const NOW_MIN_INTERVAL_MS = 5 * 60_000;
@@ -220,6 +223,33 @@ export interface NowSummaryDeps {
   log: Logger;
 }
 
+export type NowCodexDrainResult = { readonly kind: "drained" | "timeout" | "cancelled" | "stopped" };
+export interface NowCodexSwitchLease {
+  readonly drained: Promise<NowCodexDrainResult>;
+  reopenA(): boolean;
+  publishB(bundle: Readonly<CodexSwitchBundle>): boolean;
+  finishB(): boolean;
+}
+
+type NowCodexAuthority = Readonly<NonNullable<ReadOnlyModelPassOpts["codex"]> & {
+  ordinal: number;
+  capabilityEpoch?: number;
+  messageSeq?: number;
+}>;
+
+function validateNowBinding(binding: CodexSwitchBundle["binding"]): CodexSwitchBundle["binding"] {
+  const selected = selectCodexBinding({ codex: {
+    auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
+    generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId, chatgpt_plan_type: binding.chatgptPlanType,
+  } });
+  if (selected.kind !== "codex") throw new Error("Invalid Now Codex binding");
+  return selected.binding;
+}
+
+function snapshotCodex(codex: NonNullable<ReadOnlyModelPassOpts["codex"]>, ordinal: number): NowCodexAuthority {
+  return Object.freeze({ ...codex, binding: Object.freeze({ ...codex.binding }), ordinal });
+}
+
 interface InFlight {
   ctrl: AbortController;
   /** Resolves when the call's bookkeeping is done. Never rejects. */
@@ -234,6 +264,10 @@ interface InFlight {
 }
 
 export class NowSummaryController {
+  private readonly initialValidatedCodex: NowCodexAuthority | undefined;
+  private authority: NowCodexAuthority | undefined;
+  private switchGate = false;
+  private stopDrain: (() => void) | undefined;
   private started = false;
   private stopped = false;
   private holdDepth = 0;
@@ -258,6 +292,96 @@ export class NowSummaryController {
 
   constructor(private readonly deps: NowSummaryDeps) {
     this.redact = deps.redact ?? ((s) => s);
+    this.authority = deps.claim.codex ? snapshotCodex(deps.claim.codex, 0) : undefined;
+    try {
+      if (this.authority && !deps.claim.claude && this.authority.runId.length > 0 &&
+          Number.isSafeInteger(this.authority.claimGeneration) && (this.authority.claimGeneration ?? 0) > 0) {
+        this.initialValidatedCodex = snapshotCodex({ ...this.authority, binding: validateNowBinding(this.authority.binding) }, 0);
+        this.authority = this.initialValidatedCodex;
+      }
+    } catch {
+      // Legacy advisory calls remain unchanged; a switch needs validated authority.
+    }
+  }
+
+  /**
+   * Only executor-owned factory composition makes model-pass completion join raw work.
+   * Close admission synchronously, then bound one wait for that captured call.
+   * Failure leaves the gate closed permanently; only a verified drain can authorize
+   * A again or publish B. Publication performs no provider work.
+   */
+  suspendCodexSwitch({ signal, remainingMs }: { signal: AbortSignal; remainingMs: number }): NowCodexSwitchLease {
+    if (this.stopped || this.switchGate || !this.initialValidatedCodex || !this.authority ||
+        typeof this.authority.buildHarness !== "function" || !ownedSummaryFactories.has(this.authority.buildHarness)) throw new Error("Now Codex switch unavailable");
+    if (!Number.isFinite(remainingMs) || remainingMs < 0) throw new Error("Invalid Now drain duration");
+    this.switchGate = true;
+    if (this.timer !== undefined) {
+      this.deps.clearTimer(this.timer);
+      this.timer = undefined;
+    }
+    const old = this.authority;
+    const call = this.inflight;
+    let state: "waiting" | "drained" | "failed" | "published" | "finished" = "waiting";
+    let timer: unknown;
+    let complete!: (result: NowCodexDrainResult) => void;
+    const drained = new Promise<NowCodexDrainResult>((resolve) => { complete = resolve; });
+    const finish = (kind: NowCodexDrainResult["kind"]): void => {
+      if (state !== "waiting") return;
+      state = kind === "drained" ? "drained" : "failed";
+      signal.removeEventListener("abort", onAbort);
+      if (timer !== undefined) this.deps.clearTimer(timer);
+      this.stopDrain = undefined;
+      complete(Object.freeze({ kind }));
+    };
+    const onAbort = (): void => finish("cancelled");
+    this.stopDrain = () => finish("stopped");
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) finish("cancelled");
+    else if (remainingMs === 0) finish("timeout");
+    else {
+      timer = this.deps.setTimer(() => finish("timeout"), remainingMs);
+      // No abandonment marker participates in this proof.
+      void (call?.done ?? Promise.resolve()).then(() => finish(this.stopped ? "stopped" : signal.aborted ? "cancelled" : "drained"));
+    }
+    call?.ctrl.abort();
+    const usable = (): boolean => {
+      const lifecycle = this.deps.steering.lifecycleSignal();
+      return !this.stopped && !signal.aborted && (!lifecycle.aborted || lifecycle.reason instanceof CredentialSwitchSignal) &&
+        this.deps.steering.claimFence() === undefined;
+    };
+    const open = (): void => {
+      state = "finished";
+      this.switchGate = false;
+      this.guard(() => { this.syncEnabled(); this.schedule(); });
+    };
+    return Object.freeze({
+      drained,
+      reopenA: (): boolean => {
+        if (state !== "drained" || !usable() || this.authority !== old) return false;
+        open();
+        return true;
+      },
+      publishB: (bundle: Readonly<CodexSwitchBundle>): boolean => {
+        if (state !== "drained" || !usable() || this.authority !== old) return false;
+        if (!Number.isSafeInteger(bundle.ordinal) || bundle.ordinal !== old.ordinal + 1 ||
+            !Number.isSafeInteger(bundle.capabilityEpoch) || bundle.capabilityEpoch <= 0 ||
+            !Number.isSafeInteger(bundle.messageSeq) || bundle.messageSeq <= 0) return false;
+        try {
+          const binding = validateNowBinding(bundle.binding);
+          this.authority = Object.freeze({ ...old, binding: Object.freeze({ ...binding }),
+            ordinal: bundle.ordinal, capabilityEpoch: bundle.capabilityEpoch, messageSeq: bundle.messageSeq });
+          state = "published";
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      finishB: (): boolean => {
+        if (state !== "published" || !usable()) return false;
+        open();
+        return true;
+      },
+    });
   }
 
   /** Begin scheduling. Idempotent. The first call still needs an active milestone. */
@@ -333,6 +457,7 @@ export class NowSummaryController {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    this.stopDrain?.();
     if (this.timer !== undefined) {
       this.deps.clearTimer(this.timer);
       this.timer = undefined;
@@ -371,6 +496,7 @@ export class NowSummaryController {
       isRunSummaryKind(d.claim.kind) &&
       (d.claim.claude || d.claim.codex !== undefined) &&
       !this.stopped &&
+      !this.switchGate &&
       this.holdDepth === 0 &&
       !d.steering.lifecycleSignal().aborted &&
       d.steering.claimFence() === undefined &&
@@ -424,7 +550,8 @@ export class NowSummaryController {
     const frames = this.frames.slice();
     // Issue #4201: one snapshot of the credential per call, at the call's start. Read BEFORE the
     // lifecycle listener is registered: a dep that throws must not leak the listener.
-    const cred = this.deps.credential?.();
+    const authority = this.authority;
+    const cred = authority ? undefined : this.deps.credential?.();
     const ctrl = new AbortController();
     const lifecycle = this.deps.steering.lifecycleSignal();
     const onLifecycle = (): void => ctrl.abort();
@@ -433,13 +560,13 @@ export class NowSummaryController {
 
     let usage: AdviceUsageSnapshot | undefined;
     let text = "";
-    const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve(), milestoneId, usage: undefined, epoch: cred?.ordinal ?? 0 };
+    const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve(), milestoneId, usage: undefined, epoch: authority?.ordinal ?? cred?.ordinal ?? 0 };
     // Registered BEFORE the async body runs: a pass that throws synchronously settles inside the
     // first synchronous stretch of the body, and settle() must find the registration to clear.
     this.inflight = call;
     call.done = (async () => {
       try {
-        const codex = this.deps.claim.codex;
+        const codex = authority;
         text = await this.deps.runPass({
           ...this.deps.pass,
           ...(cred ? { token: cred.token } : {}),
@@ -456,6 +583,7 @@ export class NowSummaryController {
           denyReason: "the Now summary runner is read-only and runs no tools",
           log: this.deps.log,
           onUsage: (u) => {
+            if (authority !== this.authority || call.abandoned) return;
             usage = u;
             call.usage = u;
           },
@@ -466,7 +594,7 @@ export class NowSummaryController {
       } finally {
         lifecycle.removeEventListener("abort", onLifecycle);
       }
-      if (call.abandoned) return;
+      if (call.abandoned || authority !== this.authority) return;
       try {
         this.settle(call, milestoneId, text, usage);
       } catch (e) {

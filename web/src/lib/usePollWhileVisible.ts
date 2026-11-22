@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef } from "react";
 // usePollWhileVisible runs `cb` every `intervalMs` while the tab is visible: it
 // skips a tick when `document.hidden`, and fires an immediate catch-up the moment
 // the tab becomes visible again. Extracted from the board's PRD #12 poll effect so
-// the dashboard reuses the same proven liveness (Board.tsx / Dashboard.tsx).
+// the dashboard reuses the same proven liveness (Board.tsx / useOverviewData.ts).
 //
 // The latest `cb` is stashed in a ref (the useInterval pattern) so inline-arrow
 // callers are safe: the interval effect depends only on `intervalMs`, never on

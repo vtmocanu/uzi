@@ -74,6 +74,15 @@ describe("Codex runtime discovery uses effective grants", () => {
   });
 });
 
+describe("renderCodexRun carries the run's text redactor onto the lead grants", () => {
+  it("puts the request's redactText on leadGrants (the broker's signal parse reads it there)", () => {
+    const redactText = (s: string): string => s.replaceAll("SECRET", "X");
+    const run = renderCodexRun(runRequest({ redactText }));
+    assert.equal(run.leadGrants.redactText, redactText);
+    assert.equal(renderCodexRun(runRequest()).leadGrants.redactText, undefined);
+  });
+});
+
 /** A HarnessAgent with sane defaults, overridable per test. */
 function agent(overrides: Partial<HarnessAgent> = {}): HarnessAgent {
   return {
@@ -424,7 +433,44 @@ describe("renderCodexRun — per-role resolution and root-ness", () => {
     }
   });
 
-  it("an agent model overrides the request model; absent inherits it; effort is request-scoped", () => {
+  it("a role's effort pin wins over the request effort; an unpinned role inherits it (issue #3258)", () => {
+    const run = renderCodexRun(runRequest({
+      model: "gpt-6-astra",
+      effort: "medium",
+      agents: {
+        deep: agent({ effort: "high" }),
+        quick: agent({ effort: "low" }),
+        plain: agent(),
+      },
+    }));
+    assert.equal(run.perRoleModels.get("deep")?.modelReasoningEffort, "high");
+    assert.equal(run.perRoleModels.get("quick")?.modelReasoningEffort, "low");
+    assert.equal(run.perRoleModels.get("plain")?.modelReasoningEffort, "medium");
+    assert.equal(run.lead.modelReasoningEffort, "medium", "a role pin never changes the lead");
+    assert.deepEqual(run.diagnostics, []);
+  });
+
+  it("a pinned role under the Runtime default carries its pin; an unpinned one carries none", () => {
+    const run = renderCodexRun(runRequest({
+      model: "gpt-6-astra",
+      agents: { deep: agent({ effort: "xhigh" }), plain: agent() },
+    }));
+    assert.equal(run.lead.modelReasoningEffort, undefined);
+    assert.equal(run.perRoleModels.get("deep")?.modelReasoningEffort, "xhigh");
+    assert.equal(run.perRoleModels.get("plain")?.modelReasoningEffort, undefined);
+  });
+
+  it("an out-of-contract role pin is reported under the role and the role inherits the request effort", () => {
+    const run = renderCodexRun(runRequest({
+      model: "gpt-6-astra",
+      effort: "medium",
+      agents: { bad: agent({ effort: "ultra" as unknown as HarnessEffort }) },
+    }));
+    assert.equal(run.perRoleModels.get("bad")?.modelReasoningEffort, "medium");
+    assert.equal(hasDiagnostic(run.diagnostics, "unknown_effort", "bad", "ultra"), true);
+  });
+
+  it("an agent model overrides the request model; absent inherits it; effort is request-scoped when unpinned", () => {
     const run = renderCodexRun(
       runRequest({
         model: "gpt-6-astra",

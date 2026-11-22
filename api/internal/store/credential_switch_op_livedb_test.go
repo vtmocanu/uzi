@@ -358,15 +358,42 @@ func TestCredentialSwitchOpFenceAndHoldIdentityLiveDB(t *testing.T) {
 		t.Fatalf("prior epoch should be the generation-2 base: %+v err=%v", p, err)
 	}
 
-	// Codex epoch: idempotent, never overwrites.
-	for _, l := range []string{"codex-a", "codex-b"} {
-		if err := f.q.RecordCodexCredentialEpoch(ctx, store.RecordCodexCredentialEpochParams{RunID: run, ClaimGeneration: 9, Label: pgtype.Text{String: l, Valid: true}}); err != nil {
+	// Codex epoch: snapshot the persisted binding and actual mint, never overwrite.
+	codexSecret := uuid.New()
+	mustExec(ctx, t, f.pool, `INSERT INTO user_secrets(id,user_id,kind,label,ciphertext)
+ VALUES($1,$2,'openai_api_key','codex-a',$3)`, codexSecret, f.user, []byte{1})
+	mustExec(ctx, t, f.pool, `INSERT INTO codex_credential_state(user_secret_id,user_id,status,material_revision)
+ VALUES($1,$2,'static',4)`, codexSecret, f.user)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET harness='codex', claim_generation=9,
+ codex_secret_id=$2, codex_secret_label='codex-a', codex_auth_mode='api_key',
+ codex_material_revision=4, codex_claim_epoch=7 WHERE id=$1`, run, codexSecret)
+	for i, l := range []string{"codex-a", "codex-b"} {
+		if i == 1 {
+			mustExec(ctx, t, f.pool, `UPDATE runs SET codex_secret_label='codex-b',
+ codex_material_revision=5, codex_claim_epoch=8 WHERE id=$1`, run)
+		}
+		if err := f.q.RecordCodexCredentialEpoch(ctx, store.RecordCodexCredentialEpochParams{
+			RunID: run, ClaimGeneration: 9, SecretID: pgtype.UUID{Bytes: codexSecret, Valid: true},
+			Label: pgtype.Text{String: l, Valid: true}, SelectReason: pgtype.Text{String: "codex_binding", Valid: true},
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	var label string
-	if err := f.pool.QueryRow(ctx, "SELECT label FROM run_credential_epochs WHERE run_id=$1 AND claim_generation=9", run).Scan(&label); err != nil || label != "codex-a" {
-		t.Fatalf("codex epoch label = %q err=%v", label, err)
+	var count int
+	var secret uuid.UUID
+	var label, reason, mode string
+	var revision, epoch int64
+	var accountKey, accountID pgtype.Text
+	if err := f.pool.QueryRow(ctx, `SELECT secret_id,label,select_reason,codex_auth_mode,
+ codex_material_revision,codex_account_key,codex_account_id,codex_claim_epoch,
+ count(*) OVER () FROM run_credential_epochs WHERE run_id=$1 AND claim_generation=9`, run).
+		Scan(&secret, &label, &reason, &mode, &revision, &accountKey, &accountID, &epoch, &count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || secret != codexSecret || label != "codex-a" || reason != "codex_binding" ||
+		mode != "api_key" || revision != 4 || epoch != 7 || accountKey.Valid || accountID.Valid {
+		t.Fatalf("baseline changed: count=%d secret=%s label=%q reason=%q mode=%q revision=%d epoch=%d key=%+v account=%+v",
+			count, secret, label, reason, mode, revision, epoch, accountKey, accountID)
 	}
 
 	// Secret lock: only the owner's anthropic_token.

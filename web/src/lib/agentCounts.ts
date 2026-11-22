@@ -6,7 +6,7 @@
 // dropped even for an admin, and an allocation with no matching template is
 // dropped. The lead is counted like any other agent (no special case).
 //
-// This deliberately differs from the Dashboard's "Agent templates" tile (web/src/pages/Dashboard.tsx), which counted every
+// This deliberately differs from the retired old Overview's "Agent templates" tile, which counted every
 // template the caller could see (for an admin, other users' private ones too).
 // Here `total` is the population above and `inRuns` is the subset that actually
 // reaches a run (effective and not shadowed by a same-named builtin/global).

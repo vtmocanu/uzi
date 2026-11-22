@@ -133,6 +133,15 @@ const CodexRuntimeV2 = "codex_runtime_v2"
 // capable-worker custom-model claim test then fails.
 const CodexCustomModelV1 = "codex_custom_model_v1"
 
+// ClaudePhaseModelsV1 is the PROTOCOL capability a worker self-reports (PRD #3252) after its Claude
+// executor can plan on a separate planning model and effort and switch to the run's pair at plan
+// approval (claim plan_phase). Like CodexCustomModelV1 it is a worker/server protocol fact, never a
+// scheduler capability or a user-chosen repo requirement. A Claude lead-lane run whose owner has a
+// planning value set is claimable only by a worker advertising it (every claim mirror in
+// runtime.sql, fn_placement_admitting_workers and the health filters), so an older worker never
+// receives a plan_phase it would ignore and implement on the planning pair.
+const ClaudePhaseModelsV1 = "claude_phase_models_v1"
+
 // CodexCompletionInterlockV1 identifies workers implementing Codex completion attempts.
 const CodexCompletionInterlockV1 = "codex_completion_interlock_v1"
 
@@ -157,6 +166,12 @@ const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capa
 // pending switch only for a worker that registered this one; a v1-only worker keeps the
 // signal-and-no-drain contract.
 const CredentialSwitchInPlaceV1 = "credential_switch_in_place_v1" //nolint:gosec // G101: a capability VOCABULARY name, not a credential — a protocol token stored in workers.protocol_capabilities, never a secret.
+
+// CodexSwitchStoppedV1 negotiates claim-scoped stopped settlement on switch withdrawal.
+const CodexSwitchStoppedV1 = "codex_switch_stopped_v1"
+
+// CodexCredentialSwitchV1 negotiates pending-only Codex switch requests.
+const CodexCredentialSwitchV1 = "codex_credential_switch_v1" //nolint:gosec // G101: public protocol vocabulary, not a credential.
 
 // WallParkV1 is the PROTOCOL capability a worker self-reports (PRD #1497 M1, D13) to declare it
 // implements the wall-clock PARK protocol — it drops its turn on a system 'wall' pause input,
@@ -280,13 +295,11 @@ const CrossCheckGatedV1 = "cross_check_gated_v1"
 // protocol capability, never a repo capability, and a NON-BYPASSABLE ClaimRun, ClaimChatRun and
 // placement clause: an older worker would ignore the unknown `provider` key and start the run
 // with an empty Anthropic credential, so a provider-bound run is claimable only by a worker
-// that advertises it. The worker (agent/src/worker.ts) does NOT advertise it yet: the worker
-// side (claim decoder, env, scrubber registration, the capability check on a provider claim) has
-// landed, but the advertisement is blocked: the pinned Claude CLI follows gateway redirects (PRD
-// #4320 Decision Log, "M2 finding: the pinned Claude CLI follows gateway redirects"), and module 7
-// makes activation depend on that test. The decision on a redirect-refusing mechanism is pending
-// with the owner. Until a worker reports it, a provider-bound run stays queued behind the
-// capability reason.
+// that advertises it. The worker (agent/src/worker.ts) advertises it: activation landed on
+// 2026-11-19 (#4505), with the pinned Claude CLI's gateway-redirect following accepted as a known
+// limit (ADR-4320; PRD #4320 Decision Log, "M2 finding: the pinned Claude CLI follows gateway
+// redirects"). Until a worker reports it (an older image), a provider-bound run stays queued
+// behind the capability reason.
 const ClaudeProviderV1 = "claude_provider_v1"
 
 // CrossCheckSemanticPlanV1 identifies workers whose Claude/Codex checker understands the
@@ -388,7 +401,14 @@ const RecoveryRunOpenHoldsV1 = "recovery_run_open_holds_v1"
 // reports it; the route refuses unsupported, with no write, for a worker that does not.
 const RecoveryTerminalPreservationV1 = "recovery_terminal_preservation_v1"
 
+// TemplateEffortV1 (issue #3258) negotiates the per-subagent reasoning effort on claim agents
+// (ClaimAgent.effort). A worker that reports it applies a template's effort pin; the api never
+// sends the key to one that does not and records a run-feed notice instead. It is a worker/server
+// protocol fact, so it lives in the protocol vocabulary only.
+const TemplateEffortV1 = "template_effort_v1"
+
 var protocolVocabulary = map[string]struct{}{
+	TemplateEffortV1:                {},
 	RecoveryRunOpenHoldsV1:          {},
 	RecoveryTerminalPreservationV1:  {},
 	RecoveryBindinglessClosedV1:     {},
@@ -415,9 +435,12 @@ var protocolVocabulary = map[string]struct{}{
 	CodexRefreshRecoveryV1:          {},
 	CodexAccountParkV1:              {},
 	CodexCustomModelV1:              {},
+	ClaudePhaseModelsV1:             {},
 	CodexCompletionInterlockV1:      {},
 	CredentialSwitchV1:              {},
 	CredentialSwitchInPlaceV1:       {},
+	CodexCredentialSwitchV1:         {},
+	CodexSwitchStoppedV1:            {},
 	MilestoneReconciliationClaimV1:  {},
 	WallParkV1:                      {},
 	ParkRunV1:                       {},
@@ -452,7 +475,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, HibernationCachePruneV1, HibernationInventoryV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, RecoveryTerminalPreservationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, CredentialSwitchInPlaceV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, ClaudeProviderV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, IssueKeyV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1}
+var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, HibernationCachePruneV1, HibernationInventoryV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, RecoveryTerminalPreservationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, ClaudePhaseModelsV1, CodexCompletionInterlockV1, CredentialSwitchV1, CredentialSwitchInPlaceV1, CodexCredentialSwitchV1, CodexSwitchStoppedV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, ClaudeProviderV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, IssueKeyV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1, TemplateEffortV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

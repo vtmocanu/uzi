@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 import { SettingControl } from "./SettingControl";
@@ -25,7 +25,7 @@ export function EphemeralWorkersCard({
   defaults?: Record<string, string>;
   /** The worker sizes the default-size selector offers (PRD #4213), lifted from Admin → Workers. */
   sizeOptions?: readonly NamedWorkerSize[];
-  onSaved: (resp: SettingsResponse) => void;
+  onSaved: (resp: SettingsResponse, sent: UpdateSettingsPayload) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.ephemeral_workers_enabled === "true");
   const [busy, setBusy] = useState(false);
@@ -40,8 +40,9 @@ export function EphemeralWorkersCard({
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ ephemeral_workers_enabled: String(enabled) });
-      onSaved(resp);
+      const payload: UpdateSettingsPayload = { ephemeral_workers_enabled: String(enabled) };
+      const resp = await api.updateSettings(payload);
+      onSaved(resp, payload);
       setEnabled(resp.settings.ephemeral_workers_enabled === "true");
       setNotice("Ephemeral workers settings saved.");
     } catch (err) {

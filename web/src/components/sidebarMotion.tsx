@@ -1,4 +1,4 @@
-// Opt-in animated sidebar icons (issue #4510). Two halves live here:
+// Animated sidebar icons with a personal opt-out (issue #4510). Two halves live here:
 //
 //  - SIDEBAR_MOTION_ICONS: one SVG per NAV_SECTIONS key. Each copies the matching icons.tsx
 //    glyph's markup verbatim (same svg attributes and path data) and adds `data-nav-motion`
@@ -10,11 +10,13 @@
 //      which the pixel comparison catches), and the moving part is a separate copy with inline
 //      opacity="0". While playing, the keyframes hide that original (class nm-orig) and show
 //      the copies, so nothing is drawn twice. Other parts may move the original element itself.
-//  - useNavIconMotion: the gesture hook. It only toggles the `nm-play` class on the row's svg;
-//    every animation rule is gated in CSS by the root `data-motion="on"` attribute and by
-//    prefers-reduced-motion, and this hook re-checks both before playing.
+//  - useNavIconMotion: the click hook. The icon plays on click only (Enter on a focused link
+//    fires click, so keyboard activation plays; hover and focus alone play nothing). It only
+//    toggles the `nm-play` class on the row's svg; every animation rule is gated in CSS by the
+//    root `data-motion="on"` attribute and by prefers-reduced-motion, and this hook re-checks
+//    both before playing.
 
-import { useCallback, useRef, type FocusEvent, type ReactElement, type ReactNode, type RefObject } from "react";
+import { useCallback, useRef, type ReactElement, type ReactNode, type RefObject } from "react";
 
 const PLAY_CLASS = "nm-play";
 
@@ -284,26 +286,15 @@ function play(host: HTMLElement | null) {
 
 export type NavIconMotion = {
   ref: RefObject<HTMLElement | null>;
-  onPointerEnter: () => void;
-  onFocus: (e: FocusEvent<HTMLElement>) => void;
   onClick: () => void;
 };
 
-// Attach `ref` to the row element that contains the glyph; the three handlers go on the same
-// element. None of them calls preventDefault or delays navigation.
+// Attach `ref` to the row element that contains the glyph; `onClick` goes on the same element.
+// The icon plays on click only: Enter on a focused link fires click, so keyboard activation
+// plays too, while hover and focus alone play nothing. It never calls preventDefault or delays
+// navigation.
 export function useNavIconMotion(): NavIconMotion {
   const ref = useRef<HTMLElement | null>(null);
-  const onPointerEnter = useCallback(() => play(ref.current), []);
   const onClick = useCallback(() => play(ref.current), []);
-  const onFocus = useCallback((e: FocusEvent<HTMLElement>) => {
-    // Pointer-driven focus (a click) is covered by onClick; only keyboard focus plays here.
-    let visible = false;
-    try {
-      visible = e.currentTarget.matches(":focus-visible");
-    } catch {
-      // :focus-visible unsupported
-    }
-    if (visible) play(ref.current);
-  }, []);
-  return { ref, onPointerEnter, onFocus, onClick };
+  return { ref, onClick };
 }

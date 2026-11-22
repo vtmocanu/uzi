@@ -21,6 +21,14 @@ The child uses ordinary run slots, with expedite priority 2. The lead retains it
 
 `api/internal/workersvc/cross_check.go` normalizes and stores the candidate and computes its digest over plan, milestones, capabilities, tools, size class, base commit and planning diff. In the original #2149 round-1 scope, same-generation retries recovered the immutable attempt, including a decided attempt; a mismatched candidate or generation could not create a second round. The dated #2150 extension below replaces that round-1 restriction while preserving exact-identity retry checks.
 
+Amendment 2026-11-20 (#4555): milestones belong to issue runs only. When a non-issue lead (any `runs.kind` other than `issue`, read from the worker-owned run row) submits a new candidate, the server drops its milestone field and uses the canonical `[]` before validation, digest and checker review. Within the existing request bounds (valid JSON, the 256 KiB field cap), a stray valid, blank or schema-invalid value is not a reason to refuse. Issue leads keep #4554's reject-only validation and their digests are unchanged.
+
+- Stored attempts are never stripped or re-digested. A same-round retry also accepts the digest the received milestones would have had before this rule, at the same claim generation only, so a valid pre-change attempt is recovered rather than interrupted.
+- Malformed received milestones have no such legacy identity. If the stored attempt does not match, the retry keeps HTTP 400 `candidate_invalid` and the worker's invalid-candidate disposition, rather than `interrupted` or a generic checker failure.
+- The handler resolves the lead kind only when the milestones fail normalization; a lookup fault answers 409 `cross-check refused`.
+- The approved-plan write keeps exact binding, because workers report the server's canonical candidate. Non-issue implement prompts and code cross-checks therefore see `[]`.
+- During a mixed api roll, an older replica replaying a new `[]` attempt answers `interrupted`, or 400 `candidate_invalid` for milestones it rejects, so the run goes to a refusal or the human gate. The legacy retry identity is not computed when a semantic identity is bound.
+
 `SetRunAutopilotPlan` in `api/internal/store/queries/runtime.sql` binds the latest plan-stage APPROVE to an opposite-harness `cross_check` child, current lead claim generation, server digest and matching approval-bearing fields. It freezes those fields in the guarded write. `SetRunRunning`, completion and progress guards prevent bypass through adjacent state reports. These are server storage/lifecycle guarantees; they cannot prevent arbitrary execution by a worker that ignores a refusal. Capability claim gates exclude unaware workers, and the worker treats a refused handoff as fatal.
 
 ### Bounded fallback, terminal delivery exceptions

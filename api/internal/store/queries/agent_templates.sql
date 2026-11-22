@@ -44,8 +44,8 @@ SELECT * FROM agent_templates WHERE name = $1 AND scope <> 'user';
 -- Create a global (admin) or user (owner) template. scope='builtin' is never
 -- created here (is_builtin stays false, kept in lockstep by the builtin_scope_ck);
 -- builtins are seeded only by the startup reconciler (InsertBuiltinAgentTemplate).
-INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, scope, user_id, updated_by)
-VALUES (@name, @description, @model, @codex_model, @tools, @prompt_body, @scope, @user_id, @updated_by)
+INSERT INTO agent_templates (name, description, model, codex_model, effort, codex_effort, tools, prompt_body, scope, user_id, updated_by)
+VALUES (@name, @description, @model, @codex_model, @effort, @codex_effort, @tools, @prompt_body, @scope, @user_id, @updated_by)
 RETURNING *;
 
 -- name: UpdateAgentTemplate :one
@@ -63,6 +63,8 @@ UPDATE agent_templates
 SET description = @description,
     model = @model,
     codex_model = @codex_model,
+    effort = @effort,
+    codex_effort = @codex_effort,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
@@ -78,13 +80,15 @@ WHERE id = @id
 RETURNING *;
 
 -- name: UpdateAgentTemplateModelPins :one
--- CLI pin-only edit (PRD #3264 M3): writes ONLY the two model pins plus the audit
+-- CLI pin-only edit (PRD #3264 M3, #3258): writes ONLY the model and effort pins plus the audit
 -- columns. description, tools, prompt_body, customized and origin are deliberately not
 -- touched. The caller holds the row lock (GetAgentTemplateForUpdate) and passes the locked
 -- current value for a lane the request omitted, so an omitted lane is preserved.
 UPDATE agent_templates
 SET model = @model,
     codex_model = @codex_model,
+    effort = @effort,
+    codex_effort = @codex_effort,
     updated_by = @updated_by,
     updated_at = now()
 WHERE id = @id
@@ -105,6 +109,8 @@ UPDATE agent_templates
 SET description = @description,
     model = @model,
     codex_model = @codex_model,
+    effort = @effort,
+    codex_effort = @codex_effort,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
@@ -132,8 +138,8 @@ DELETE FROM agent_templates WHERE id = @id AND is_builtin = false;
 -- marks it as owned by the shipped default (PRD #602 M1), so RefreshPristineBuiltin
 -- can keep tracking it; without it a freshly-seeded builtin would have NULL origin
 -- and violate agent_templates_origin_ck.
-INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, is_builtin, scope, origin)
-VALUES (@name, @description, @model, @codex_model, @tools, @prompt_body, true, 'builtin', 'embedded')
+INSERT INTO agent_templates (name, description, model, codex_model, effort, codex_effort, tools, prompt_body, is_builtin, scope, origin)
+VALUES (@name, @description, @model, @codex_model, @effort, @codex_effort, @tools, @prompt_body, true, 'builtin', 'embedded')
 ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING;
 
 -- name: ApplySyncedOverrideBuiltin :one
@@ -147,6 +153,8 @@ UPDATE agent_templates
 SET description = @description,
     model = @model,
     codex_model = @codex_model,
+    effort = @effort,
+    codex_effort = @codex_effort,
     tools = @tools,
     prompt_body = @prompt_body,
     origin = 'synced',
@@ -162,8 +170,8 @@ RETURNING *;
 -- scope='global'). is_builtin stays false to satisfy builtin_scope_ck. The caller
 -- seeds a default allocation (SeedSharedTemplateAllocationByName) right after so the
 -- role actually reaches a claim — table presence alone does not run it.
-INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, is_builtin, scope, origin, updated_by)
-VALUES (@name, @description, @model, @codex_model, @tools, @prompt_body, false, 'global', 'synced', @updated_by)
+INSERT INTO agent_templates (name, description, model, codex_model, effort, codex_effort, tools, prompt_body, is_builtin, scope, origin, updated_by)
+VALUES (@name, @description, @model, @codex_model, @effort, @codex_effort, @tools, @prompt_body, false, 'global', 'synced', @updated_by)
 RETURNING *;
 
 -- name: UpdateSyncedGlobalTemplate :one
@@ -176,6 +184,8 @@ UPDATE agent_templates
 SET description = @description,
     model = @model,
     codex_model = @codex_model,
+    effort = @effort,
+    codex_effort = @codex_effort,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
@@ -209,9 +219,11 @@ UPDATE agent_templates
 SET description = @description,
     model = @model,
     codex_model = @codex_model,
+    effort = @effort,
+    codex_effort = @codex_effort,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_at = now()
 WHERE name = @name AND scope = 'builtin' AND customized = false AND origin = 'embedded'
-  AND (description, model, codex_model, tools, prompt_body)
-      IS DISTINCT FROM (@description, @model, @codex_model, @tools, @prompt_body);
+  AND (description, model, codex_model, effort, codex_effort, tools, prompt_body)
+      IS DISTINCT FROM (@description, @model, @codex_model, @effort, @codex_effort, @tools, @prompt_body);

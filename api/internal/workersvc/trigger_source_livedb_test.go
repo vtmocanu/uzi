@@ -132,13 +132,13 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	r, err := svc.CreateRun(ctx, userID, repoID, 201, "desc", &waitFalse, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 	assert(t, "CreateRun", "manual", r, err)
 
-	r, err = svc.CreateScheduledRun(ctx, userID, repoID, 202, "desc", &waitFalse, nil, nil, false, nil, nil, nil)
+	r, err = svc.CreateScheduledRun(ctx, userID, repoID, 202, "desc", &waitFalse, nil, nil, false, nil, nil, nil, nil)
 	assert(t, "CreateScheduledRun", "schedule", r, err)
 
 	r, err = svc.CreateAutopilotRun(ctx, userID, repoID, 203, "desc", nil)
 	assert(t, "CreateAutopilotRun", "autopilot", r, err)
 
-	r, err = svc.CreateScheduledAutopilotRun(ctx, userID, repoID, 204, "desc", &waitFalse, nil, nil, false, nil, nil)
+	r, err = svc.CreateScheduledAutopilotRun(ctx, userID, repoID, 204, "desc", &waitFalse, nil, nil, false, nil, nil, nil)
 	assert(t, "CreateScheduledAutopilotRun", "autopilot", r, err)
 
 	// ── Store-query-level: the fixed-SQL-literal and param queries. ──

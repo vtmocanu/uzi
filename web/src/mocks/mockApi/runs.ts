@@ -70,7 +70,7 @@ function listRunsFor(): Run[] {
 
 // ── Custody recovery mock (PRD #1349 M6) ──────────────────────────────────────
 // The `?mock=custody` scenario seeds a full spread of owner custody holds — every
-// server-derived attention across several workers — so the board alert and the Workers
+// server-derived attention across several workers — so the Held work card and the Workers
 // resolution surface can be seen and driven offline. Any other scenario reports zero open
 // holds, so the alert self-hides and the existing demos stay clean.
 //
@@ -737,8 +737,9 @@ export const runsApi = {
       run_count: 23,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + base_diverged + failed, and sum(fail_origins) === failed. finished is a
-      // different population from run_count (D2) — infra failures spend no tokens, so it sits
-      // a little above the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
+      // different population from run_count (D2): finished counts every non-chat run kind
+      // (including reworks and CI fixes) and infra failures spend no tokens, so it need not
+      // track the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
       // needs_landing (issue #1418) is the sub-cut of failed whose committed work is
       // human-landable (here the workflow-scope + push-secret failures); needs_landing <= failed.
       outcomes: {
@@ -1371,7 +1372,7 @@ export const runsApi = {
         : [];
     return delay({ publications }, 80);
   },
-  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
+  // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the Held work card and
   // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
   // alert self-hides and the other demos stay clean.
   getRecoveryHolds: async () => delay(custodyResponse(), 80),

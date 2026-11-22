@@ -1,2 +1,2 @@
-lock-sha256=b62a8b3b3887a55a24c4d02fe7c4ed23cc606f323af0cf2ea785e6d3b4c4ea02
-runtime-tag=rust-v0.167.0
+lock-sha256=13d93e632543d59b0bf1f1a5cae1c4627a6e397c3b37a8fe28dc3413ee24f929
+runtime-tag=rust-v0.169.0

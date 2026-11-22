@@ -1,5 +1,5 @@
-// RunProgressCell renders compact state flags after the milestone badge in Dashboard
-// "Recent runs" and Runs rows. Percentages live in the adjacent running StatusPill.
+// RunProgressCell renders compact state flags after the milestone badge in the Overview's
+// run rows (OverviewRunRow) and Runs rows. Percentages live in the adjacent running StatusPill.
 // It only renders what the server derived (RunDTO.progress) — never re-derives a percent
 // or a flag client-side (PRD D3) — and every string it draws is enum-derived copy or a
 // number, so no untrusted text reaches it.

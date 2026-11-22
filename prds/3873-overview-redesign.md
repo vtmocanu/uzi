@@ -22,7 +22,7 @@
 | #4082 (issue) | Issue work: cross-check state in the run chip ("cross-checking", "cross-check: revise / blocked / unavailable"); target mock `prds/mockups/3873-overview-issue-work-crosscheck.html` | #4078 (same page and fixtures) |
 | #4334 (issue) | Admin Repos chip after People: "N repos active of M" with a People-style popover; target mock committed by its PR (3873-overview-repos-chip.html) | #3877 M1 (landing order) |
 | #4335 (issue) | Agent count: a summary line on the Agents page and an Agents chip after Repos; target mock committed by its PR (3873-overview-agents-count.html) | #4334 (landing order) |
-| #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` (M1), then retire the old one before the next stable (M2) | Verdict recorded 2026-11-14 (promote, with a soak). M2: M1, #4334, #4335 |
+| #3877 (`prds/done/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` (M1), then retire the old one before the next stable (M2) | Done: M1 shipped in #4338; M2 retired the old page (`/overview/classic` redirects to `/dashboard`) |
 
 The preview-era children landed serially in this order: #3878, #3880, #3879, #3881, #4052, #4041, #4040, #4042, #4078, #4082, #3876; #3875 any time after #3880. Then land in this order: **#3877 M1 → #4334 → #4335 → #3877 M2**; the in-flight #4334 and #4335 branches rebase onto M1 (the page moves from `/overview/next` to `/dashboard`) before they merge.
 
@@ -196,7 +196,7 @@ Build from what exists; do not re-implement these. The original anchors were che
 - **D21** ci_fix and mr_rework runs sit in Other work: they maintain an existing PR, they are not issue lifecycle stages.
 - **D22** Shadow markers: `data-attention` on the decisions card, `data-live` on the issue-work card.
 - **D23** The per-user provider split counts runs by harness, the same population as Runs; a cost split would need per-model cost attribution and is out of scope.
-- **D24** The new Overview lives at `/overview/next`, linked both ways with the current Overview, until #3877. #3877 M1 moves it to `/dashboard` and the old page to `/overview/classic` (linked both ways) until M2 retires the old page.
+- **D24** The new Overview lives at `/overview/next`, linked both ways with the current Overview, until #3877. #3877 M1 moves it to `/dashboard` and the old page to `/overview/classic` (linked both ways) until M2 retires the old page. #3877 M2 retired the old page: `/overview/classic` now redirects to `/dashboard`.
 - **D25** The compact header removes the status sentence; the all-kind run totals move to the Runs card, and an empty decisions card becomes a polite calm notice only after successful runs and holds reads. A later failed holds or combined runs/workers refresh hides the notice until recovery; other cards keep their last-good rows (#4366, maintainer call 2026-11-15).
 - **D26** At xl widths the compact header's single chip group pins to the content column after the title scrolls away; below xl it scrolls away with the title. The group may wrap as labels grow, and focus clearance tracks its measured height. One group stays in the DOM, the banner stack stays after the header, and focused controls remain clear of the pinned bar (#4370, maintainer call 2026-11-15).
 - **D27** The Agents header chip shows configured templates by origin and scope, with admin-only agent-source sync status. Its count comes from the core template read, independent of allocations; the Agents page keeps its allocation summary (#4367, maintainer call 2026-11-15).

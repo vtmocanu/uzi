@@ -58,40 +58,57 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 		}
 		exec(`INSERT INTO runs (id,user_id,repo_id,issue_iid,issue_title,issue_description,status,kind,fail_origin,finished_at,status_since,target_run_id) VALUES ($1,$2,$3,$4,'t','d',$5,$6,$7,$8,$9,$10)`, id, user, rid, issue, status, kind, origin, finished, end, target)
 	}
-	// The higher UUID wins the end-time tie; its missing timestamp and origin
-	// exercise both historical fallbacks. No run_usage row is ever inserted.
+	// These two failures tie at `at` but are older than the last failure (at+3h, below), so
+	// they only count toward failed/finished totals. No run_usage row is ever inserted.
 	lower := uuid.MustParse("00000000-0000-4000-8000-000000002399")
 	winner := uuid.MustParse("ffffffff-ffff-4fff-8fff-ffffffff2399")
 	seed(lower, owner, "failed", "issue", "agent_failure", at, false, nil)
 	seed(winner, owner, "failed", "issue", nil, at, true, nil)
 	seed(uuid.New(), owner, "completed", "issue", nil, at.Add(time.Hour), true, nil)
 	seed(uuid.New(), owner, "completed", "issue", nil, at.Add(-time.Hour), false, nil)
-	seed(uuid.New(), owner, "completed", "issue", nil, at, false, nil) // strict greater-than
-	seed(uuid.New(), clean, "completed", "issue", nil, at.Add(2*time.Hour), false, nil)
+	// Completed at exactly the last failure's end time (at+3h): strict greater-than, so it
+	// does not count as completed since the last failure.
+	seed(uuid.New(), owner, "completed", "issue", nil, at.Add(3*time.Hour), false, nil)
+	seed(uuid.New(), clean, "completed", "issue", nil, at.Add(4*time.Hour), false, nil)
 	for _, tc := range []struct {
 		status, kind string
 		origin       any
 		target       any
+		end          time.Duration
 	}{
-		{"cancelled", "issue", nil, nil}, {"failed", "issue", "plan_rejected", nil},
-		{"failed", "issue", "base_diverged", nil},
-		{"failed", "chat", "agent_failure", nil}, {"failed", "judge", "agent_failure", lower},
-		{"completed", "chat", nil, nil}, {"completed", "judge", nil, lower},
+		// Controls end after the last failure (at+3h), so each would win if not excluded.
+		{"cancelled", "issue", nil, nil, 5 * time.Hour}, {"failed", "issue", "plan_rejected", nil, 5 * time.Hour},
+		{"failed", "issue", "base_diverged", nil, 5 * time.Hour},
+		// Chat is the only kind outside the outcome population (issue #4577): neither chat row
+		// may become the last failure or count as completed after it.
+		{"failed", "chat", "agent_failure", nil, 8 * time.Hour}, {"completed", "chat", nil, nil, 8 * time.Hour},
+		// A completed judge after the last failure counts.
+		{"completed", "judge", nil, lower, 6 * time.Hour},
 	} {
-		seed(uuid.New(), owner, tc.status, tc.kind, tc.origin, at.Add(3*time.Hour), false, tc.target)
+		seed(uuid.New(), owner, tc.status, tc.kind, tc.origin, at.Add(tc.end), false, tc.target)
 	}
-	// Plan cross-check children are excluded from the outcome totals, so a later
-	// failed or completed child must neither replace the failure nor count after it.
-	for _, status := range []string{"failed", "completed"} {
+	// Judge and cross_check children count as outcomes (issue #4577). The failed judge and
+	// failed cross_check child tie at the last failure's end time (at+3h); the higher UUID (the judge, whose
+	// missing finished_at and NULL origin exercise both fallbacks) wins the tie.
+	judgeWinner := uuid.MustParse("ffffffff-ffff-4fff-8fff-ffffffff2398")
+	seed(judgeWinner, owner, "failed", "judge", nil, at.Add(3*time.Hour), true, lower)
+	for _, c := range []struct {
+		id     uuid.UUID
+		status string
+		end    time.Duration
+	}{
+		{uuid.MustParse("00000000-0000-4000-8000-000000002398"), "failed", 3 * time.Hour},
+		{uuid.New(), "completed", 7 * time.Hour},
+	} {
 		exec(`INSERT INTO runs (id,user_id,repo_id,issue_title,issue_description,status,kind,fail_origin,finished_at,status_since,target_run_id,harness,report_only,budget_wall_seconds) VALUES ($1,$2,$3,'t','d',$4,'cross_check',CASE WHEN $4 = 'failed' THEN 'agent_failure' END,$5,$5,$6,'codex',true,600)`,
-			uuid.New(), owner, repo, status, at.Add(3*time.Hour), lower)
+			c.id, owner, repo, c.status, at.Add(c.end), lower)
 	}
 	self, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: owner})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !self.LastFailedAt.Valid || !self.LastFailedAt.Time.Equal(at) || self.LastFailedRunID != winner || self.LastFailedOrigin != "unknown" || self.CompletedSinceLastFailure != 1 {
-		t.Fatalf("self failure recency = %+v, want tied historical failure %s at %s, unknown, 1 completed", self, winner, at)
+	if !self.LastFailedAt.Valid || !self.LastFailedAt.Time.Equal(at.Add(3*time.Hour)) || self.LastFailedRunID != judgeWinner || self.LastFailedOrigin != "unknown" || self.CompletedSinceLastFailure != 2 {
+		t.Fatalf("self failure recency = %+v, want tied historical judge failure %s, unknown, 2 completed (judge + cross_check)", self, judgeWinner)
 	}
 	for _, user := range []uuid.UUID{clean, empty} {
 		row, err := q.SelfRunOutcomes(ctx, store.SelfRunOutcomesParams{UserID: user})
@@ -106,8 +123,8 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !factory.LastFailedAt.Valid || !factory.LastFailedAt.Time.Equal(at) || factory.LastFailedRunID != winner || factory.LastFailedUserID != owner || factory.LastFailedOrigin != "unknown" || factory.CompletedSinceLastFailure != 2 {
-		t.Fatalf("factory failure recency = %+v, want owner %s and 2 completed", factory, owner)
+	if !factory.LastFailedAt.Valid || !factory.LastFailedAt.Time.Equal(at.Add(3*time.Hour)) || factory.LastFailedRunID != judgeWinner || factory.LastFailedUserID != owner || factory.LastFailedOrigin != "unknown" || factory.CompletedSinceLastFailure != 3 {
+		t.Fatalf("factory failure recency = %+v, want owner %s and 3 completed (owner judge + cross_check, clean user's)", factory, owner)
 	}
 	users, err := q.AdminRunOutcomesPerUser(ctx, nil)
 	if err != nil {
@@ -121,7 +138,7 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 		}
 		if row.UserID == owner {
 			found = true
-			if row.LastFailedRunID != winner || row.LastFailedOrigin != "unknown" || row.CompletedSinceLastFailure != 1 || row.Failed != self.LifetimeFailed || row.Finished != self.LifetimeFinished {
+			if row.LastFailedRunID != judgeWinner || row.LastFailedOrigin != "unknown" || row.CompletedSinceLastFailure != 2 || row.Failed != self.LifetimeFailed || row.Finished != self.LifetimeFinished {
 				t.Fatalf("per-user recency/counts = %+v, want self recency/counts", row)
 			}
 		}

@@ -277,9 +277,11 @@ func TestCodexRefreshRecoveryNonVaultBranchesLiveDB(t *testing.T) {
 }
 
 // Promote after the fenced recovery transaction commits, before response selection.
+// Admission can commit first; only a committed vault-lock recovery arms the hook.
 // The callback fires once for this fixture; a failed commit never runs it.
 type recoveryAfterCommitBeginner struct {
 	*pgxpool.Pool
+	ready       func() bool
 	afterCommit func()
 	fired       bool
 }
@@ -305,7 +307,7 @@ func (tx *recoveryAfterCommitTx) Commit(ctx context.Context) error {
 	if err := tx.Tx.Commit(ctx); err != nil {
 		return err
 	}
-	if !tx.parent.fired {
+	if !tx.parent.fired && tx.parent.ready() {
 		tx.parent.fired = true
 		tx.parent.afterCommit()
 	}
@@ -345,7 +347,10 @@ func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
 					enrollCodexProtectedVault(t, e, v, f.userID, "first-response-password")
 					fake.onRefresh = func() { v.Lock(f.userID) }
 					before := e.mustAccount(t, f.userID, f.accountID)
-					f.svc.SetTxBeginner(&recoveryAfterCommitBeginner{Pool: e.pool, afterCommit: func() {
+					beginner := &recoveryAfterCommitBeginner{Pool: e.pool, ready: func() bool {
+						acct := e.mustAccount(t, f.userID, f.accountID)
+						return acct.RecoveryCause.Valid && acct.RecoveryCause.String == "vault_locked"
+					}, afterCommit: func() {
 						acct := e.mustAccount(t, f.userID, f.accountID)
 						if !acct.RecoveryCause.Valid || acct.RecoveryCause.String != "vault_locked" {
 							t.Fatal("missing fenced vault-lock recovery")
@@ -364,8 +369,12 @@ func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
 							target := map[string]uuid.UUID{"run": f.runID, "alias": f.aliasID, "account": f.accountID}[tc.target]
 							e.exec(tc.sql, target)
 						}
-					}})
+					}}
+					f.svc.SetTxBeginner(beginner)
 					res, err := f.svc.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, uuid.New(), 0)
+					if !beginner.fired {
+						t.Fatal("committed vault-lock recovery never reached the promotion hook")
+					}
 					if !errors.Is(err, tc.want) || errors.Is(err, ErrCodexVaultLocked) != (tc.want == ErrCodexVaultLocked) {
 						t.Fatalf("first response=(%+v,%v), want %v", res, err, tc.want)
 					}

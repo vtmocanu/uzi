@@ -1,10 +1,8 @@
 import type { AdminUsage, HarnessRuns, RunUsage } from "./api";
 import { aggregateDisclosure } from "./costStatus";
-import type { UsageWindow } from "../components/UsageCards";
 
-// The per-user rows and the factory total row of the admin usage breakdown, for one window.
-// Shared by the classic Overview's PerUserUsageTable and the default Overview's By user table, so the
-// two cannot disagree about sorting, the window's source fields or the PR-count rule.
+// The reporting period the Overview's Usage card toggles between.
+export type UsageWindow = "lifetime" | "last_7_days";
 
 // A RunUsage bundle split the way the run view splits it: fresh = fresh input +
 // cache creation, cached = cache reads, out = output; total = all three.
@@ -25,6 +23,9 @@ export function harnessShare(h: HarnessRuns | undefined): { claude: number; code
   return { claude, codex: 100 - claude };
 }
 
+// The per-user rows and the factory total row of the admin usage breakdown, for one window,
+// behind the Overview Usage card's By user table (sorting, the window's source fields and the
+// PR-count rule).
 export function perUserRows(admin: AdminUsage, window: UsageWindow) {
   const recent = window === "last_7_days";
   const available = admin.users.every((u) =>

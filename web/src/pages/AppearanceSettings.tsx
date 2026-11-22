@@ -13,6 +13,7 @@ import { Alert, Button, Card, cx, SectionTitle, Toggle } from "../components/ui"
 import { SettingsShell } from "../components/SettingsShell";
 import {
   applyAppearance,
+  DEFAULT_SIDEBAR_MOTION,
   isTheme,
   THEME_LABELS,
   LIGHT_THEMES,
@@ -215,8 +216,9 @@ export function AppearanceSettings() {
     against: typeof appearance;
   } | null>(null);
   const confirmed = confirmedMotion?.against === appearance ? confirmedMotion.value : null;
-  // Strict: an absent field (older server) reads as off, never as a stored value.
-  const resolvedMotion = confirmed ?? appearance.sidebar_motion === true;
+  const defaultMotion = appearance.defaults.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
+  // An absent field from an older server follows the default, not a stored choice.
+  const resolvedMotion = confirmed ?? appearance.sidebar_motion ?? defaultMotion;
   const motionChecked = pendingMotion ?? resolvedMotion;
 
   // The current resolved appearance as applyAppearance's argument shape; each
@@ -285,7 +287,7 @@ export function AppearanceSettings() {
         dark: appearance.defaults.dark_theme,
         typeface: appearance.defaults.typeface,
         // The server's compiled default, not a hardcoded off.
-        sidebarMotion: appearance.defaults.sidebar_motion === true,
+        sidebarMotion: defaultMotion,
       },
       {
         appearance_mode: null,
@@ -437,13 +439,13 @@ export function AppearanceSettings() {
           </div>
         </div>
 
-        {/* SIDEBAR ICON ANIMATIONS: opt-in, off by default; saved like the rest. */}
+        {/* SIDEBAR ICON ANIMATIONS: on by default, with a saved personal opt-out. */}
         <div className="flex items-center justify-between gap-4 rounded-lg border border-edge bg-raised/60 px-4 py-3">
           <div>
             <p className="text-sm font-medium text-fg">Sidebar icon animations</p>
             <p id="sidebar-motion-desc" className="mt-1 text-xs text-faint">
-              Plays a small one-shot animation on sidebar icons on hover, focus and
-              click. Respects your system&apos;s reduced-motion setting.
+              Default: {defaultMotion ? "on" : "off"}. Plays a small one-shot animation when you click a sidebar icon (or press
+              Enter on it). Respects your system&apos;s reduced-motion setting.
             </p>
           </div>
           <Toggle

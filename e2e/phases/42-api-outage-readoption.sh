@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  compose:agent(force-recreated: max_concurrent_runs 2, then UZI_E2E_DROP_ON_SENTINEL for case c); compose:api(restarted for case a, force-recreated with UZI_ACTIVE_SNAPSHOT_DISABLED for case d); a transient second worker registered then deleted; stub runs created
-# restores: agent + api force-recreated back to their defaults (cap 1, snapshot enabled, drop seam off); stub runs cancelled best-effort; the transient second worker deleted
+# restores: agent + api force-recreated back to their defaults (cap 1, snapshot enabled, drop seam off); stub runs cancelled best-effort; the phase's fixture custody holds (E, EA, G, GA, X, ED) are resolved explicitly before the phase ends; the transient second worker deleted
 # race-sensitive: yes
 # =============================================================================
 # PRD #1390 M4 — the api-SIDE outage recovery this branch has landed:
@@ -205,6 +205,8 @@ wait_runs_terminal_off_worker 60 "$E" "$G"
 say "CASE (a): stop the api under both runs > the stale window, start it → NO requeue inside the boot grace (M1)"
 make_hold_run;  EA="$HOLD_RUN"
 make_gate_run;  GA="$GATE_RUN"
+GEN_EA="$(run_field "$EA" claim_generation)"
+GEN_GA="$(run_field "$GA" claim_generation)"
 # The durable boot-grace discriminator is the GATE run's budget_paused_seconds: a broken grace
 # would stale-requeue it at boot (banking its park interval) and only THEN re-adopt it, so the
 # park time would GROW even though the requeue is later refunded. With the grace it is NEVER
@@ -410,6 +412,13 @@ settle_runs_terminal 45 "${E:-}" "${G:-}" "${EA:-}" "${GA:-}" "${X:-}" "${ED:-}"
 # obligations before later phases inherit them; no other run/generation is selected.
 wait_status "$X" cancelled
 wait_status "$ED" cancelled
+# The case HOLD and GATE runs also leave a generation-1 custody hold; the worker
+# settles those only slowly (a few contexts per pass), past the driver's phase-end
+# hold boundary, so resolve them here too.
+resolve_fixture_source_hold "$E" "$GEN_E" 240
+resolve_fixture_source_hold "$EA" "$GEN_EA" 240
+resolve_fixture_source_hold "$G" "$GEN_G"
+resolve_fixture_source_hold "$GA" "$GEN_GA"
 resolve_fixture_source_hold "$X" "$GEN_X0"
 resolve_fixture_source_hold "$X" "$GEN_X1" 120 "$RA_RESTORE_AT"
 resolve_fixture_source_hold "$ED" "$GEN_ED_ORIGINAL"

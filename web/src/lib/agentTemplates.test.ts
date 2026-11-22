@@ -4,12 +4,15 @@ import {
   frontmatterFieldWarning,
   isLeadTemplateName,
   modelFieldWarning,
+  renderSubagent,
   TEMPLATE_SCOPE_LABEL,
   templateScopeBadgeTone,
   templateModelDefaultLabel,
   templateModelFieldWarning,
-  templateModelsLabel,
+  templateEffortDefaultLabel,
+  templatePinRows,
 } from "./agentTemplates";
+import { DEFAULT_CODEX_MODEL } from "../components/ModelSelect";
 
 describe("templateModelFieldWarning", () => {
   it.each(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"])(
@@ -48,27 +51,6 @@ describe("templateModelFieldWarning", () => {
     expect(templateModelFieldWarning("é".repeat(51), "claude")).toMatch(/100 bytes/);
     expect(modelFieldWarning("é".repeat(51))).toBe("");
     expect(templateModelFieldWarning("x".repeat(100), "claude")).toBe("");
-  });
-});
-
-describe("templateModelsLabel", () => {
-  it("shows both stored pins in harness order", () => {
-    expect(templateModelsLabel({ name: "coder", model: "sonnet", codex_model: "gpt-6-sol" }))
-      .toBe("Claude: sonnet · Codex: gpt-6-sol");
-  });
-
-  it.each(["lead", "ORCHESTRATOR"])("shows the built-in defaults for %s", (name) => {
-    expect(templateModelsLabel({ name, model: null, codex_model: "" }))
-      .toBe("Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)");
-  });
-
-  it("shows inherited and explicitly pinned lanes independently", () => {
-    expect(templateModelsLabel({ name: "coder", model: "", codex_model: null }))
-      .toBe("Claude: Default · lead's model · Codex: Default · lead's model");
-    expect(templateModelsLabel({ name: "coder", model: "haiku", codex_model: null }))
-      .toBe("Claude: haiku · Codex: Default · lead's model");
-    expect(templateModelsLabel({ name: "coder", model: null, codex_model: "gpt-6-luna" }))
-      .toBe("Claude: Default · lead's model · Codex: gpt-6-luna");
   });
 });
 
@@ -136,10 +118,80 @@ describe("templateModelDefaultLabel", () => {
       expect(templateModelDefaultLabel(name, "claude")).toBe("Default · SDK/account default (built-in)");
       expect(templateModelDefaultLabel(name, "codex")).toBe("Default · built-in (gpt-6.1-sol)");
     }
-    expect(templateModelDefaultLabel("coder")).toBe("Default · lead's model");
+    expect(templateModelDefaultLabel("coder")).toBe("Default · follows lead");
     for (const harness of ["claude", "codex"] as const) {
-      expect(templateModelDefaultLabel("coder", harness)).toBe("Default · lead's model");
+      expect(templateModelDefaultLabel("coder", harness)).toBe("Default · follows lead");
     }
+  });
+});
+
+describe("templateEffortDefaultLabel", () => {
+  it("follows the run's effort for subagents and is built-in medium for lead/orchestrator", () => {
+    expect(templateEffortDefaultLabel("coder")).toBe("Default · follows the run's effort");
+    for (const name of ["lead", "ORCHESTRATOR"]) {
+      expect(templateEffortDefaultLabel(name)).toBe("Default · built-in (medium)");
+    }
+  });
+});
+
+describe("templatePinRows", () => {
+  const unset = { model: null, codex_model: null, effort: null, codex_effort: null };
+
+  it("returns stored pins for both families", () => {
+    const r = templatePinRows({
+      name: "coder",
+      model: "claude-custom-v1",
+      codex_model: "gpt-6-luna",
+      effort: "high",
+      codex_effort: "xhigh",
+    });
+    expect(r.collapsed).toBe(false);
+    expect(r.rows).toEqual([
+      {
+        family: "Claude",
+        harness: "claude",
+        model: { value: "claude-custom-v1", label: "claude-custom-v1" },
+        effort: { value: "high", label: "high" },
+      },
+      {
+        family: "Codex",
+        harness: "codex",
+        model: { value: "gpt-6-luna", label: "gpt-6-luna" },
+        effort: { value: "xhigh", label: "xhigh" },
+      },
+    ]);
+  });
+
+  it("collapses an all-empty subagent and treats empty string like null/undefined", () => {
+    for (const t of [
+      { name: "coder", ...unset },
+      { name: "coder", model: "", codex_model: "", effort: "", codex_effort: "" },
+      { name: "coder", model: null, codex_model: null },
+    ]) {
+      const r = templatePinRows(t);
+      expect(r.collapsed).toBe(true);
+      for (const row of r.rows) {
+        expect(row.model).toEqual({ value: null, label: "Default · follows lead" });
+        expect(row.effort).toEqual({ value: null, label: "Default · follows the run's effort" });
+      }
+    }
+  });
+
+  it.each(["lead", "orchestrator"])("never collapses an unset %s and uses per-harness lead fallbacks", (name) => {
+    const r = templatePinRows({ name, ...unset });
+    expect(r.collapsed).toBe(false);
+    expect(r.rows[0]?.model.label).toBe("Default · SDK/account default (built-in)");
+    expect(r.rows[1]?.model.label).toBe(`Default · built-in (${DEFAULT_CODEX_MODEL})`);
+    expect(r.rows[0]?.effort.label).toBe("Default · built-in (medium)");
+    expect(r.rows[1]?.effort.label).toBe("Default · built-in (medium)");
+  });
+
+  it("does not collapse a subagent with only an effort pin", () => {
+    const r = templatePinRows({ name: "coder", ...unset, codex_effort: "low" });
+    expect(r.collapsed).toBe(false);
+    expect(r.rows[0]?.effort.label).toBe("Default · follows the run's effort");
+    expect(r.rows[1]?.effort).toEqual({ value: "low", label: "low" });
+    expect(r.rows[1]?.model.label).toBe("Default · follows lead");
   });
 });
 
@@ -150,6 +202,22 @@ describe("isLeadTemplateName", () => {
     }
     for (const n of ["coder", "reviewer", "leader", "lead-x", ""]) {
       expect(isLeadTemplateName(n)).toBe(false);
+    }
+  });
+});
+
+// Issue #3258 (M3 review): the live preview mirrors the server Render, which emits the Claude
+// effort after model and never a Codex pin.
+describe("renderSubagent effort", () => {
+  const base = { name: "coder", description: "d", model: "sonnet", tools: ["Read"], prompt_body: "Body.\n" };
+  it("emits the Claude effort after model", () => {
+    expect(renderSubagent({ ...base, effort: "high" })).toBe(
+      "---\nname: coder\ndescription: d\ntools: Read\nmodel: sonnet\neffort: high\n---\n\nBody.\n",
+    );
+  });
+  it("omits the line when unpinned", () => {
+    for (const effort of [undefined, null, ""]) {
+      expect(renderSubagent({ ...base, effort })).not.toContain("effort");
     }
   });
 });

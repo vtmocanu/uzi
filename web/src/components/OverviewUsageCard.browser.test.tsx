@@ -4,13 +4,13 @@ import "../index.css";
 import { afterEach, expect, it } from "vitest";
 import { page } from "vitest/browser";
 import { useState } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewUsageCard } from "./OverviewUsageCard";
-import type { UsageWindow } from "./UsageCards";
+import type { UsageWindow } from "../lib/usageByUser";
 import type { AdminUsage, SelfUsage } from "../lib/api";
 import { mockApi } from "../mocks/mockApi";
-import { USAGE_SCOPE_NOTE } from "./usageParts";
+import { OUTCOME_SCOPE_NOTE, USAGE_SCOPE_NOTE } from "./usageParts";
 
 afterEach(cleanup);
 
@@ -80,23 +80,68 @@ it("fits the whole by-user table in the card at a 1280px viewport, with every ce
   }
 });
 
-// Issue #4209: the scope note must wrap inside its card, never clip or push past it.
-function expectNoteInsideCard(note: HTMLElement) {
-  let card: HTMLElement | null = note.parentElement;
-  while (card && parseFloat(getComputedStyle(card).borderTopWidth) === 0) card = card.parentElement;
-  expect(card).toBeTruthy();
-  const n = note.getBoundingClientRect();
-  const c = card!.getBoundingClientRect();
-  expect(n.height).toBeGreaterThan(0);
-  expect(note.scrollWidth).toBeLessThanOrEqual(note.clientWidth);
-  expect(n.right).toBeLessThanOrEqual(c.right);
-  expect(n.left).toBeGreaterThanOrEqual(c.left);
-  expect(getComputedStyle(note).whiteSpace).not.toBe("nowrap");
+// The two notes live in info tips: opened by keyboard focus, each must read as sentence text
+// (the Usage title is uppercase and tracked), wrap, and stay fully visible on screen.
+async function openTip(name: string) {
+  const trigger = screen.getByRole("button", { name });
+  trigger.focus();
+  const tip = document.getElementById(trigger.getAttribute("aria-describedby")!)!;
+  await expect.poll(() => getComputedStyle(tip).opacity).toBe("1");
+  return tip;
 }
 
-it.each([1280, 400])("keeps the scope note visible and inside its card at %ipx", async (width) => {
+// Inside the viewport, wrapping rather than overflowing, and on top at points just inside its rounded corners (Chromium hit-tests the radius): a clip by an
+// ancestor scroller or a cover by a sibling would put another element there.
+function expectFullyVisible(tip: HTMLElement) {
+  const t = tip.getBoundingClientRect();
+  expect(t.width).toBeGreaterThan(0);
+  expect(t.left).toBeGreaterThanOrEqual(0);
+  expect(t.top).toBeGreaterThanOrEqual(0);
+  expect(t.right).toBeLessThanOrEqual(document.documentElement.clientWidth);
+  expect(t.bottom).toBeLessThanOrEqual(window.innerHeight);
+  expect(tip.scrollWidth).toBeLessThanOrEqual(tip.clientWidth);
+  for (const [x, y] of [[t.left + 10, t.top + 10], [t.right - 10, t.top + 10], [t.left + 10, t.bottom - 10], [t.right - 10, t.bottom - 10]]) {
+    const hit = document.elementFromPoint(x, y);
+    expect(tip.contains(hit), `${x},${y} ${hit?.outerHTML.slice(0, 160)} tip=${JSON.stringify(t)}`).toBe(true);
+  }
+}
+
+function expectSentenceText(tip: HTMLElement) {
+  const style = getComputedStyle(tip);
+  expect(style.textTransform).toBe("none");
+  expect(style.letterSpacing).toBe("normal");
+}
+
+it.each([1280, 400])("opens the scope note on focus, in sentence case and inside its card at %ipx", async (width) => {
   await mount(width);
-  const note = screen.getByText(USAGE_SCOPE_NOTE);
-  expect(note.getBoundingClientRect().width).toBeGreaterThan(0);
-  expectNoteInsideCard(note);
+  const tip = await openTip("About usage figures");
+  expect(tip.textContent).toBe(USAGE_SCOPE_NOTE);
+  expectSentenceText(tip);
+  expectFullyVisible(tip);
+});
+
+// Issue #4577: the outcomes caption sits in the outcomes block and must also stay inside its card.
+it.each([1280, 400])("opens the outcome scope note on focus, in sentence case and inside its card at %ipx", async (width) => {
+  await mount(width);
+  const tip = await openTip("About run outcomes");
+  expect(tip.textContent).toBe(OUTCOME_SCOPE_NOTE);
+  expectSentenceText(tip);
+  expectFullyVisible(tip);
+});
+
+// The fail rate's denominator is in a tip on the rate. The table's horizontal scroller also clips
+// vertically, so the Factory footer's tip (last row) must escape it and stay fully visible, in its
+// bold row without inheriting the weight.
+it.each([1280, 375])("opens the Factory fail rate's tip inside the table's scroller at %ipx", async (width) => {
+  const scroll = await mount(width, width === 1280 ? 1280 - 240 - 48 - 15 : undefined);
+  const rows = screen.getAllByRole("row");
+  const factory = rows[rows.length - 1];
+  const rate = within(factory).getByRole("button", { name: /%$/ });
+  rate.focus();
+  const tip = document.getElementById(rate.getAttribute("aria-describedby")!)!;
+  await expect.poll(() => getComputedStyle(tip).opacity).toBe("1");
+  expect(tip.textContent).toMatch(/^[\d,]+ failed of [\d,]+ finished runs$/);
+  expect(getComputedStyle(tip).fontWeight).toBe("400");
+  expect(scroll.contains(tip)).toBe(true);
+  expectFullyVisible(tip);
 });
