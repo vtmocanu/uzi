@@ -81,3 +81,62 @@ func TestUserTaskReviewModelLiveDB(t *testing.T) {
 		t.Fatalf("after clear = %+v, %v; want both NULL", got, err)
 	}
 }
+
+// TestUserTaskReviewEffortLiveDB executes the queries migration 00505 adds columns for
+// (SetUserTaskReviewEffort, SetUserCodexTaskReviewEffort, and the effort and worker-effort columns
+// of GetUserTaskReviewSettings and GetUserSettings, PRD #1570) against real Postgres.
+func TestUserTaskReviewEffortLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	user := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash, default_effort, default_codex_effort) VALUES ($1, $2, 'x', 'high', 'runtime')`,
+		user, fmt.Sprintf("task-review-effort-%s@e2e", user))
+
+	got, err := q.GetUserTaskReviewSettings(ctx, user)
+	if err != nil || got.TaskReviewEffort.Valid || got.CodexTaskReviewEffort.Valid {
+		t.Fatalf("pristine = %+v, %v; want both review efforts NULL (inherit)", got, err)
+	}
+	if got.DefaultEffort.String != "high" || got.DefaultCodexEffort.String != "runtime" {
+		t.Fatalf("worker efforts = %+v / %+v, want high and runtime", got.DefaultEffort, got.DefaultCodexEffort)
+	}
+
+	ret, err := q.SetUserTaskReviewEffort(ctx, store.SetUserTaskReviewEffortParams{ID: user, TaskReviewEffort: pgtype.Text{String: "xhigh", Valid: true}})
+	if err != nil || ret.String != "xhigh" {
+		t.Fatalf("set claude = %+v, %v", ret, err)
+	}
+	codexRet, err := q.SetUserCodexTaskReviewEffort(ctx, store.SetUserCodexTaskReviewEffortParams{ID: user, CodexTaskReviewEffort: pgtype.Text{String: "runtime", Valid: true}})
+	if err != nil || codexRet.String != "runtime" {
+		t.Fatalf("set codex = %+v, %v", codexRet, err)
+	}
+	got, err = q.GetUserTaskReviewSettings(ctx, user)
+	if err != nil || got.TaskReviewEffort.String != "xhigh" || got.CodexTaskReviewEffort.String != "runtime" {
+		t.Fatalf("after set = %+v, %v", got, err)
+	}
+	wide, err := q.GetUserSettings(ctx, user)
+	if err != nil || wide.TaskReviewEffort.String != "xhigh" || wide.CodexTaskReviewEffort.String != "runtime" {
+		t.Fatalf("GetUserSettings = %+v, %v; want the same two columns", wide, err)
+	}
+	if ret, err = q.SetUserTaskReviewEffort(ctx, store.SetUserTaskReviewEffortParams{ID: user}); err != nil || ret.Valid {
+		t.Fatalf("clear claude = %+v, %v", ret, err)
+	}
+	if codexRet, err = q.SetUserCodexTaskReviewEffort(ctx, store.SetUserCodexTaskReviewEffortParams{ID: user}); err != nil || codexRet.Valid {
+		t.Fatalf("clear codex = %+v, %v", codexRet, err)
+	}
+	got, err = q.GetUserTaskReviewSettings(ctx, user)
+	if err != nil || got.TaskReviewEffort.Valid || got.CodexTaskReviewEffort.Valid {
+		t.Fatalf("after clear = %+v, %v; want both NULL", got, err)
+	}
+}

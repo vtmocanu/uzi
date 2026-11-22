@@ -64,6 +64,12 @@ type userSettingsDTO struct {
 	TaskReviewModel      *string                        `json:"task_review_model"`
 	CodexTaskReviewModel *string                        `json:"codex_task_review_model"`
 	TaskReviewModels     []apitypes.ModelSettingCellDTO `json:"task_review_models"`
+	// TaskReviewEffort and CodexTaskReviewEffort are the owner's per-harness review effort (PRD
+	// #1570): a level or `runtime`, null = inherit the worker effort. TaskReviewEfforts is the
+	// read-only resolved view (claude then codex); never accepted on a PUT.
+	TaskReviewEffort      *string                         `json:"task_review_effort"`
+	CodexTaskReviewEffort *string                         `json:"codex_task_review_effort"`
+	TaskReviewEfforts     []apitypes.EffortSettingCellDTO `json:"task_review_efforts"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
 	// release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -223,23 +229,29 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
 	taskReviewLane := textPtrValue(s.TaskReviewModel.Valid, s.TaskReviewModel.String)
 	codexTaskReviewLane := textPtrValue(s.CodexTaskReviewModel.Valid, s.CodexTaskReviewModel.String)
+	taskReviewEffort := textPtrValue(s.TaskReviewEffort.Valid, s.TaskReviewEffort.String)
+	codexTaskReviewEffort := textPtrValue(s.CodexTaskReviewEffort.Valid, s.CodexTaskReviewEffort.String)
 	planningModel := textPtrValue(s.PlanningClaudeModel.Valid, s.PlanningClaudeModel.String)
 	planningEffort := textPtrValue(s.PlanningClaudeEffort.Valid, s.PlanningClaudeEffort.String)
 	return userSettingsDTO{
-		VaultAutoReunlock:      settingsAutoReunlock(r),
-		CrossCheckPins:         pins,
-		DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
-		DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
-		DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
-		DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-		DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-		JudgeModel:             judgeLane,
-		CodexJudgeModel:        codexJudgeLane,
-		SummaryModel:           summaryLane,
-		CodexSummaryModel:      codexSummaryLane,
-		TaskReviewModel:        taskReviewLane,
-		CodexTaskReviewModel:   codexTaskReviewLane,
-		TaskReviewModels:       taskReviewModelCells(taskReviewLane, codexTaskReviewLane),
+		VaultAutoReunlock:     settingsAutoReunlock(r),
+		CrossCheckPins:        pins,
+		DefaultModel:          textPtrValue(legacyModel.Valid, legacyModel.String),
+		DefaultClaudeModel:    textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+		DefaultCodexModel:     textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+		DefaultEffort:         textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+		DefaultCodexEffort:    textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+		JudgeModel:            judgeLane,
+		CodexJudgeModel:       codexJudgeLane,
+		SummaryModel:          summaryLane,
+		CodexSummaryModel:     codexSummaryLane,
+		TaskReviewModel:       taskReviewLane,
+		CodexTaskReviewModel:  codexTaskReviewLane,
+		TaskReviewModels:      taskReviewModelCells(taskReviewLane, codexTaskReviewLane),
+		TaskReviewEffort:      taskReviewEffort,
+		CodexTaskReviewEffort: codexTaskReviewEffort,
+		TaskReviewEfforts: taskReviewEffortCells(taskReviewEffort, codexTaskReviewEffort,
+			textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String), textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
 		Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 		MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
 		NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
@@ -345,10 +357,14 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		// harness, same absent/null/value tri-state. task_review_models is read-only.
 		TaskReviewModel      json.RawMessage `json:"task_review_model"`
 		CodexTaskReviewModel json.RawMessage `json:"codex_task_review_model"`
-		Theme                json.RawMessage `json:"theme"`
-		MrReworkEnabled      json.RawMessage `json:"mr_rework_enabled"`
-		NowSummaryEnabled    json.RawMessage `json:"now_summary_enabled"`
-		SidebarTokenIds      json.RawMessage `json:"sidebar_token_ids"`
+		// task_review_effort / codex_task_review_effort: the review effort per harness, same
+		// tri-state. task_review_efforts is read-only.
+		TaskReviewEffort      json.RawMessage `json:"task_review_effort"`
+		CodexTaskReviewEffort json.RawMessage `json:"codex_task_review_effort"`
+		Theme                 json.RawMessage `json:"theme"`
+		MrReworkEnabled       json.RawMessage `json:"mr_rework_enabled"`
+		NowSummaryEnabled     json.RawMessage `json:"now_summary_enabled"`
+		SidebarTokenIds       json.RawMessage `json:"sidebar_token_ids"`
 		// The linked Codex accounts on the sidebar rail (PRD #1209 M1): same
 		// absent/present tri-state as sidebar_token_ids — absent leaves the stored set,
 		// present (a JSON array, or null) replaces it. Unlike sidebar_token_ids, a
@@ -513,6 +529,28 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		codexTaskReviewVal = v
+	}
+
+	var taskReviewEffortVal pgtype.Text
+	taskReviewEffortPresent := req.TaskReviewEffort != nil
+	if taskReviewEffortPresent {
+		v, ferr := decodeDefaultEffortField(req.TaskReviewEffort, "task_review_effort")
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		taskReviewEffortVal = v
+	}
+
+	var codexTaskReviewEffortVal pgtype.Text
+	codexTaskReviewEffortPresent := req.CodexTaskReviewEffort != nil
+	if codexTaskReviewEffortPresent {
+		v, ferr := decodeDefaultEffortField(req.CodexTaskReviewEffort, "codex_task_review_effort")
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		codexTaskReviewEffortVal = v
 	}
 
 	// The legacy theme field (DEPRECATED, PRD #1167) still writes users.theme via
@@ -882,6 +920,28 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			CodexTaskReviewModel: codexTaskReviewVal,
 		}); err != nil {
 			slog.Error("set user codex task review model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if taskReviewEffortPresent {
+		if _, err := h.q.SetUserTaskReviewEffort(r.Context(), store.SetUserTaskReviewEffortParams{
+			ID:               user.ID,
+			TaskReviewEffort: taskReviewEffortVal,
+		}); err != nil {
+			slog.Error("set user task review effort", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexTaskReviewEffortPresent {
+		if _, err := h.q.SetUserCodexTaskReviewEffort(r.Context(), store.SetUserCodexTaskReviewEffortParams{
+			ID:                    user.ID,
+			CodexTaskReviewEffort: codexTaskReviewEffortVal,
+		}); err != nil {
+			slog.Error("set user codex task review effort", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

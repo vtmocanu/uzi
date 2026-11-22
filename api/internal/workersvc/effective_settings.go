@@ -54,7 +54,6 @@ const (
 const (
 	maxPredictedPinnedSubagents = 32
 	predictLeadSourceBuiltin    = agenttmpl.WorkerDefaultSourceBuiltin
-	predictReviewEffortSource   = "builtin"
 	predictIssueKind            = "issue"
 )
 
@@ -287,7 +286,8 @@ type SubagentPrediction struct {
 }
 
 // LeadPrediction is the lead worker model and effort a run on Harness would use, with where each
-// value comes from. For a task review it is the owner's review model, else the reviewer's built-in.
+// value comes from. For a task review it is the owner's review model, else the reviewer's built-in,
+// and the review effort (the owner's, else their worker effort).
 type LeadPrediction struct {
 	Harness Harness
 	Review  bool
@@ -307,9 +307,17 @@ type LeadPrediction struct {
 	DefaultModelSource string
 	// DroppedRunModel is a frozen model the harness cannot run, ignored in favour of the lane.
 	DroppedRunModel *string
-	// Effort is the claim's default_effort (nil: nothing is sent); EffortSource its provenance.
+	// Effort is the claim's default_effort (nil: nothing is sent); EffortSource its provenance. For
+	// a review it is the task_review_effort the review claim ships (nil: Runtime default), with
+	// UserEffort the stored review preference.
 	Effort       *string
 	EffortSource string
+	// ReviewEffort, ReviewEffortInherited and ReviewWorkerEffort are set on a review only (PRD
+	// #1570): the final review resolution, whether it came from the owner's worker effort, and that
+	// worker effort's own resolution (what a reset of the review effort selects).
+	ReviewEffort          agenttmpl.EffortResolution
+	ReviewEffortInherited bool
+	ReviewWorkerEffort    agenttmpl.EffortResolution
 	// TemplateEffort is the lead template's valid effort for the harness (nil: none), what an unset
 	// preference resolves to.
 	TemplateEffort *string
@@ -331,8 +339,9 @@ type leadPredictStore interface {
 
 // PredictLead predicts the lead model and effort of a run on harness, and its subagents. A
 // task-review run never reaches the lead path, so the review branch is decided first: it runs the
-// owner's review model for the harness (ResolveTaskReview), else the built-in (Codex: the curated
-// review model, Claude: no model, the SDK decides), and sends no effort yet. Otherwise the
+// owner's review model and effort for the harness (ResolveTaskReview), else the built-in model
+// (Codex: the curated review model, Claude: no model, the SDK decides) and the inherited worker
+// effort. Otherwise the
 // claim's own rule (resolveLeadSettings, over the lanes and efforts ListUserCrossCheckPins reads
 // with the lead template's pins) decides, and an empty claim model falls to the worker default
 // (agenttmpl.ResolveWorkerDefaultModel). frozenModel is a schedule's frozen run model.
@@ -379,7 +388,9 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 		}
 		return LeadPrediction{
 			Harness: harness, Review: true, LaneModel: tr.StoredModel, Model: tr.Model, ModelSource: tr.ModelSource,
-			DefaultModel: tr.BuiltinModel, DefaultModelSource: predictLeadSourceBuiltin, EffortSource: predictReviewEffortSource,
+			DefaultModel: tr.BuiltinModel, DefaultModelSource: predictLeadSourceBuiltin,
+			UserEffort: tr.StoredEffort, Effort: tr.EffortLevelPtr(), EffortSource: tr.Effort.Source,
+			ReviewEffort: tr.Effort, ReviewEffortInherited: tr.EffortInherited, ReviewWorkerEffort: tr.WorkerEffort,
 		}, nil
 	}
 	q, ok := s.q.(leadPredictStore)

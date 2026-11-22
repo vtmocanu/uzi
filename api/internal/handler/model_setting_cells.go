@@ -91,6 +91,40 @@ func taskReviewModelCell(harness workersvc.Harness, user *string) apitypes.Model
 	}
 }
 
+// taskReviewEffortCells builds the task-review effort setting's cells (PRD #1570), always ordered
+// claude then codex, from the stored review preferences and the stored ordinary worker efforts.
+func taskReviewEffortCells(reviewClaude, reviewCodex, workerClaude, workerCodex *string) []apitypes.EffortSettingCellDTO {
+	return []apitypes.EffortSettingCellDTO{
+		taskReviewEffortCell(workersvc.HarnessClaude, reviewClaude, workerClaude),
+		taskReviewEffortCell(workersvc.HarnessCodex, reviewCodex, workerCodex),
+	}
+}
+
+func taskReviewEffortCell(harness workersvc.Harness, review, worker *string) apitypes.EffortSettingCellDTO {
+	r := workersvc.ResolveTaskReview(harness, workersvc.TaskReviewInput{Effort: review, WorkerEffort: worker})
+	return reviewEffortCellFrom(string(harness), r.StoredEffort, r.WorkerEffort, r.Effort)
+}
+
+// reviewEffortCellFrom is the one cell shape of the task-review effort, shared by the Settings
+// cells and the effective view. stored is the owner's review preference (nil = inherits); worker is
+// the worker effort's resolution, what a reset selects (DefaultEffort carries its level, or the
+// `runtime` token when it sends none); final is what the review resolves to.
+func reviewEffortCellFrom(harness string, stored *string, worker, final agenttmpl.EffortResolution) apitypes.EffortSettingCellDTO {
+	cell := apitypes.EffortSettingCellDTO{
+		Harness: harness, Effort: stored,
+		DefaultEffort: worker.Level, DefaultSource: worker.Source,
+		Source: final.Source, Mode: final.Mode,
+	}
+	if worker.Mode == agenttmpl.EffortModeRuntimeDefault {
+		cell.DefaultEffort = agenttmpl.EffortRuntime
+	}
+	if final.Mode == agenttmpl.EffortModeExplicit {
+		level := final.Level
+		cell.ResolvedEffort = &level
+	}
+	return cell
+}
+
 // effortSettingCells builds the ordinary effort setting's cells (PRD #3247), always
 // ordered claude then codex, from the stored preference tokens of one row read.
 // catalog (issue #3251) is attached to the codex cell only; the claude cell never

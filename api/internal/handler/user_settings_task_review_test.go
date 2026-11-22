@@ -75,3 +75,74 @@ func TestPutMySettingsRejectsBadTaskReviewModels(t *testing.T) {
 		}
 	}
 }
+
+type taskReviewEffortResp struct {
+	Settings struct {
+		TaskReviewEffort      *string                         `json:"task_review_effort"`
+		CodexTaskReviewEffort *string                         `json:"codex_task_review_effort"`
+		TaskReviewEfforts     []apitypes.EffortSettingCellDTO `json:"task_review_efforts"`
+	} `json:"settings"`
+}
+
+func TestPutMySettingsTaskReviewEffortsRoundTripAndClear(t *testing.T) {
+	db := &fakeSettingsDB{effort: txt("high"), codexEffort: txt("runtime")}
+	h := instanceHandler(db)
+	rec := putJudgeLanes(h, `{"task_review_effort":"  xhigh  ","codex_task_review_effort":"runtime"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if db.taskReviewEffort.String != "xhigh" || db.codexTaskReviewEffort.String != "runtime" {
+		t.Fatalf("stored = %+v / %+v, want trimmed xhigh and runtime", db.taskReviewEffort, db.codexTaskReviewEffort)
+	}
+	var got taskReviewEffortResp
+	if err := json.Unmarshal(getJudgeLanes(h).Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	cells := got.Settings.TaskReviewEfforts
+	if len(cells) != 2 || cells[0].Harness != "claude" || cells[1].Harness != "codex" {
+		t.Fatalf("cells = %+v", cells)
+	}
+	if c := cells[0]; c.Effort == nil || *c.Effort != "xhigh" || c.ResolvedEffort == nil || *c.ResolvedEffort != "xhigh" || c.Source != "user_default" ||
+		c.DefaultEffort != "high" || c.DefaultSource != "user_default" || c.Mode != "explicit" {
+		t.Fatalf("claude cell = %+v", c)
+	}
+	if c := cells[1]; c.Effort == nil || *c.Effort != "runtime" || c.ResolvedEffort != nil || c.Mode != "runtime_default" || c.DefaultEffort != "runtime" {
+		t.Fatalf("explicit runtime codex cell = %+v", c)
+	}
+
+	// An omitted field is unchanged.
+	if rec = putJudgeLanes(h, `{"summary_model":"haiku"}`); rec.Code != http.StatusOK || db.taskReviewEffort.String != "xhigh" || db.codexTaskReviewEffort.String != "runtime" {
+		t.Fatalf("unrelated write: status=%d stored=%+v / %+v", rec.Code, db.taskReviewEffort, db.codexTaskReviewEffort)
+	}
+	for _, clear := range []string{`null`, `"   "`, `""`} {
+		db.taskReviewEffort, db.codexTaskReviewEffort = txt("xhigh"), txt("runtime")
+		if rec = putJudgeLanes(h, `{"task_review_effort":`+clear+`,"codex_task_review_effort":`+clear+`}`); rec.Code != http.StatusOK || db.taskReviewEffort.Valid || db.codexTaskReviewEffort.Valid {
+			t.Fatalf("%s must clear: status=%d stored=%+v / %+v", clear, rec.Code, db.taskReviewEffort, db.codexTaskReviewEffort)
+		}
+	}
+	// Cleared, the cell inherits the worker effort.
+	got = taskReviewEffortResp{}
+	if err := json.Unmarshal(getJudgeLanes(h).Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if c := got.Settings.TaskReviewEfforts[0]; c.Effort != nil || c.ResolvedEffort == nil || *c.ResolvedEffort != "high" || c.Source != "user_default" {
+		t.Fatalf("inheriting claude cell = %+v", c)
+	}
+}
+
+func TestPutMySettingsRejectsBadTaskReviewEfforts(t *testing.T) {
+	for _, field := range []string{"task_review_effort", "codex_task_review_effort"} {
+		for _, bad := range []string{`"HIGH"`, `"hi gh"`, `"bogus"`, `"hi\u0000gh"`, `"hi\u0007gh"`, `7`} {
+			db := &fakeSettingsDB{taskReviewEffort: txt("low"), codexTaskReviewEffort: txt("low")}
+			rec := putJudgeLanes(instanceHandler(db), `{"summary_model":"haiku","`+field+`":`+bad+`}`)
+			// PutMySettings reports the shared effort message (as for default_effort); the
+			// model-settings route adds the field name (livedb parity test).
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("%s=%s: status=%d body=%s, want 400", field, bad, rec.Code, rec.Body.String())
+			}
+			if db.taskReviewEffort.String != "low" || db.codexTaskReviewEffort.String != "low" || db.summary.Valid {
+				t.Errorf("%s=%s: something was written: %+v / %+v summary=%+v", field, bad, db.taskReviewEffort, db.codexTaskReviewEffort, db.summary)
+			}
+		}
+	}
+}

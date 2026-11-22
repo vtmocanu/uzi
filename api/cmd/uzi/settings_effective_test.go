@@ -69,8 +69,10 @@ func effectiveFixture() *apitypes.EffectiveSettingsDTO {
 		Efforts: []apitypes.EffectiveEffortCellDTO{
 			effortCell("worker_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
 			effortCell("worker_effort", "codex", sptr("runtime"), nil, "user_default", "runtime_default"),
-			effortCell("task_review_effort", "claude", nil, nil, "builtin", "runtime_default", "not_sent"),
-			effortCell("task_review_effort", "codex", nil, nil, "builtin", "runtime_default", "not_sent"),
+			// An unset Claude review effort inherits the worker effort (medium, built-in); an explicit
+			// Codex `runtime` sends no level even though the worker effort is Runtime default too.
+			effortCell("task_review_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
+			effortCell("task_review_effort", "codex", sptr("runtime"), nil, "user_default", "runtime_default", "not_sent"),
 		},
 	}
 }
@@ -117,8 +119,8 @@ func TestSettingsGetEffectiveRows(t *testing.T) {
 		"summary codex Default gpt-6-luna gpt-6-luna built-in",
 		"task review model claude Default SDK/account default SDK/account default built-in · the SDK decides",
 		"task review model codex Pin · gpt-6.1-sol gpt-6-sol gpt-6.1-sol your choice",
-		"task review effort claude Default medium runtime default (value not reported) built-in · not sent",
-		"task review effort codex Default medium runtime default (catalog default unknown) built-in · not sent",
+		"task review effort claude Default medium medium built-in",
+		"task review effort codex runtime default medium runtime default (catalog default unknown) your choice · not sent",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing row %q in:\n%s", want, out)
@@ -150,6 +152,35 @@ func TestSettingsGetEffectiveRows(t *testing.T) {
 	} {
 		if !strings.Contains(out, want+"\n") {
 			t.Errorf("missing line %q in:\n%s", want, out)
+		}
+	}
+}
+
+// An unset Codex review model reads as the built-in review model (gpt-6-sol), next to the configured
+// pin the base fixture carries (PRD #1570).
+func TestSettingsGetEffectiveUnsetCodexReviewModel(t *testing.T) {
+	e := effectiveFixture()
+	for i, c := range e.Models {
+		if c.Setting == "task_review_model" && c.Harness == "codex" {
+			e.Models[i] = modelCell("task_review_model", "codex", nil, "gpt-6-sol", "builtin", "gpt-6-sol", "builtin")
+		}
+	}
+	fc := &uzicli.FakeClient{Settings: settingsWithLegacyCells(), Effective: e}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	var rows []string
+	for _, l := range strings.Split(out, "\n") {
+		rows = append(rows, fields(l))
+	}
+	joined := strings.Join(rows, "\n")
+	for _, want := range []string{
+		"task review model codex Default gpt-6-sol gpt-6-sol built-in",
+		"task review model claude Default SDK/account default SDK/account default built-in · the SDK decides",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing row %q in:\n%s", want, out)
 		}
 	}
 }

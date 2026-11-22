@@ -1240,6 +1240,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"codex_summary_model", "summary_models",
 		// PRD #1570: the per-harness task-review models (null ⇒ built-in) and their read-only cells.
 		"task_review_model", "codex_task_review_model", "task_review_models",
+		// PRD #1570 M2: the per-harness review efforts (null ⇒ inherit the worker effort) and their cells.
+		"task_review_effort", "codex_task_review_effort", "task_review_efforts",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3252: the Claude planning pair (null ⇒ "Same as the run") and its read-only cells.

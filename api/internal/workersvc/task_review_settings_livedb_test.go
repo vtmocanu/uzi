@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -60,6 +61,10 @@ func TestTaskReviewCodexClaimLiveDB(t *testing.T) {
 		env.exec(`UPDATE users SET task_review_model = NULLIF($2,''), codex_task_review_model = NULLIF($3,'') WHERE id = $1`, userID, claude, codex)
 	}
 
+	// The model assertions below run with a Runtime default worker effort, so no inherited effort level
+	// is withheld (that is asserted at the end).
+	env.exec(`UPDATE users SET default_codex_effort = 'runtime', default_effort = 'runtime' WHERE id = $1`, userID)
+
 	// Unset: the field is omitted for a capable worker (it runs its built-in); an incapable worker runs the same built-in,
 	// so there is nothing withheld and no notice.
 	set("", "")
@@ -96,5 +101,64 @@ func TestTaskReviewCodexClaimLiveDB(t *testing.T) {
 	}
 	if got.Model != "gpt-6.1-sol" || got.ModelSource != "user_default" || got.DefaultModel != "gpt-6-sol" {
 		t.Errorf("predicted codex review = %+v", got)
+	}
+
+	// The review effort (PRD #1570 M2): an unset review effort inherits the stored Codex worker
+	// effort, an explicit one overrides it, `runtime` sends none, a run_override effort on the review
+	// run changes nothing, and a corrupt value sends the Codex built-in.
+	setEffort := func(review, worker string) {
+		t.Helper()
+		env.exec(`UPDATE users SET codex_task_review_effort = NULLIF($2,''), default_codex_effort = NULLIF($3,''),
+			task_review_effort = 'max', default_effort = 'max' WHERE id = $1`, userID, review, worker)
+	}
+	gen := int64(10)
+	effort := func(caps []string) (string, int) {
+		t.Helper()
+		gen++
+		p := assemble(caps, gen)
+		return derefOr(p.TaskReviewEffort, "<omitted>"), notes(gen)
+	}
+	set("", "")
+	setEffort("", "low")
+	if got, n := effort(capable); got != "low" || n != 0 {
+		t.Errorf("unset review + worker low, capable: effort=%q notes=%d, want low/0 (the Claude columns are never read for Codex)", got, n)
+	}
+	if got, n := effort(base); got != "<omitted>" || n != 1 {
+		t.Errorf("unset review + worker low, incapable: effort=%q notes=%d, want withheld with one notice", got, n)
+	}
+	env.exec(`UPDATE runs SET effort = 'xhigh', effort_source = 'run_override' WHERE id = $1`, reviewID)
+	if got, _ := effort(capable); got != "low" {
+		t.Errorf("a run_override effort changed the review effort to %q, want the worker's low", got)
+	}
+	setEffort("high", "low")
+	if got, n := effort(capable); got != "high" || n != 0 {
+		t.Errorf("explicit high: effort=%q notes=%d", got, n)
+	}
+	setEffort("runtime", "low")
+	if got, n := effort(capable); got != "<omitted>" || n != 0 {
+		t.Errorf("explicit runtime with a worker level: effort=%q notes=%d, want omitted", got, n)
+	}
+	if got, n := effort(base); got != "<omitted>" || n != 0 {
+		t.Errorf("explicit runtime, incapable: effort=%q notes=%d, want no notice", got, n)
+	}
+	setEffort("", "runtime")
+	if got, _ := effort(capable); got != "<omitted>" {
+		t.Errorf("inherited Runtime default worker effort: %q, want omitted", got)
+	}
+	setEffort("HI gh", "low")
+	if got, _ := effort(capable); got != agenttmpl.UziDefaultCodexEffort {
+		t.Errorf("corrupt review effort = %q, want the built-in %q", got, agenttmpl.UziDefaultCodexEffort)
+	}
+	setEffort("", "")
+	if got, n := effort(base); got != "<omitted>" || n != 1 {
+		t.Errorf("inherited built-in, incapable: effort=%q notes=%d, want withheld with one notice", got, n)
+	}
+	setEffort("", "low")
+	pred, err := svc.PredictLead(env.ctx, userID, HarnessCodex, nil, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pred.Effort == nil || *pred.Effort != "low" || !pred.ReviewEffortInherited || pred.EffortSource != "user_default" {
+		t.Errorf("predicted codex review effort = %+v", pred)
 	}
 }

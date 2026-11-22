@@ -726,7 +726,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// the effective-settings view also uses). They ride the claim only to a worker advertising
 	// task_review_settings_v1; for one that lacks it, a configured value is withheld and the feed
 	// notice is recorded at the end of assembly. A non-review claim never carries them.
-	var taskReviewModel *string
+	var taskReviewModel, taskReviewEffort *string
 	var taskReviewWithheld []string
 	if isReviewRun {
 		tr, terr := s.resolveUserTaskReview(ctx, run.UserID, harness)
@@ -740,8 +740,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 				m := tr.Model
 				taskReviewModel = &m
 			}
-		} else if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault {
-			taskReviewWithheld = append(taskReviewWithheld, taskReviewModelSettingName)
+			// The resolved level (inherited from the worker effort when unset), nil for Runtime default.
+			taskReviewEffort = tr.EffortLevelPtr()
+		} else {
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewModelSettingName)
+			}
+			// An inherited built-in level counts: the old worker sends none, a change from the
+			// resolved view. No notice when the resolved effort is Runtime default.
+			if tr.EffortLevelPtr() != nil {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewEffortSettingName)
+			}
 		}
 	}
 
@@ -993,8 +1002,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.
-		SummaryModel:    summaryModel,
-		TaskReviewModel: taskReviewModel,
+		SummaryModel:     summaryModel,
+		TaskReviewModel:  taskReviewModel,
+		TaskReviewEffort: taskReviewEffort,
 		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
 		// already set, so a resume/re-claim skips INTENT generation rather than
 		// re-spending the owner's token. Derived straight off the run row.

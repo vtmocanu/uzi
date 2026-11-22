@@ -358,8 +358,12 @@ func TestPredictLeadReviewBranchIsDecidedFirst(t *testing.T) {
 		model   string
 	}{{HarnessClaude, ""}, {HarnessCodex, "gpt-6-sol"}} {
 		got := predictLead(t, f, c.harness, nil, false, true)
-		if !got.Review || got.Model != c.model || got.ModelSource != "builtin" || got.Effort != nil || got.EffortSource != "builtin" || got.Subagents != nil {
+		if !got.Review || got.Model != c.model || got.ModelSource != "builtin" || got.Subagents != nil {
 			t.Fatalf("%s review = %+v", c.harness, got)
+		}
+		// An unset review effort inherits the unset worker effort: the built-in medium, sent (PRD #1570 D4).
+		if got.Effort == nil || *got.Effort != "medium" || got.EffortSource != "builtin" || !got.ReviewEffortInherited {
+			t.Fatalf("%s review effort = %+v", c.harness, got)
 		}
 	}
 	if agenttmpl.CodexTaskReviewModel != "gpt-6-sol" || agenttmpl.ClaudeTaskReviewModel != "" {

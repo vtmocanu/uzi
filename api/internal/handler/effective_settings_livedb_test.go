@@ -478,9 +478,11 @@ func TestEffectiveSettingsTaskReviewCellsLiveDB(t *testing.T) {
 	if claude.ResolvedModel != "" || claude.Source != "builtin" || claude.Model != nil || strings.Join(claude.Notes, ",") != "sdk_default" {
 		t.Errorf("claude task review model = %+v (the Claude worker lane is ignored by the reviewer)", claude)
 	}
+	// Unset review effort with unset worker efforts inherits the built-in medium, which is sent.
 	for _, h := range []string{"claude", "codex"} {
 		e := effortCell(t, dto.Efforts, "task_review_effort", h)
-		if e.ResolvedEffort != nil || e.Mode != "runtime_default" || e.Source != "builtin" || strings.Join(e.Notes, ",") != "not_sent" || e.Effort != nil {
+		if e.ResolvedEffort == nil || *e.ResolvedEffort != "medium" || e.Mode != "explicit" || e.Source != "builtin" || len(e.Notes) != 0 || e.Effort != nil ||
+			e.DefaultEffort != "medium" || e.DefaultSource != "builtin" {
 			t.Errorf("%s task review effort = %+v", h, e)
 		}
 	}
@@ -509,6 +511,35 @@ func TestEffectiveSettingsTaskReviewCellsLiveDB(t *testing.T) {
 	dto, _ = f.get()
 	if c := modelCell(t, dto.Models, "task_review_model", "codex"); c.ResolvedModel != agenttmpl.CodexTaskReviewModel || c.Source != "builtin" {
 		t.Errorf("retired codex task review model = %+v", c)
+	}
+
+	// The review effort inherits the owner's stored worker effort; a run_override cannot reach it.
+	f.set("default_effort", "high")
+	f.set("default_codex_effort", "runtime")
+	dto, _ = f.get()
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "claude"); e.Effort != nil || e.ResolvedEffort == nil || *e.ResolvedEffort != "high" ||
+		e.Source != "user_default" || e.DefaultEffort != "high" || e.DefaultSource != "user_default" || len(e.Notes) != 0 {
+		t.Errorf("inherited claude task review effort = %+v", e)
+	}
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "codex"); e.Effort != nil || e.ResolvedEffort != nil || e.Mode != "runtime_default" ||
+		e.Source != "user_default" || e.DefaultEffort != "runtime" || strings.Join(e.Notes, ",") != "not_sent" {
+		t.Errorf("inherited Runtime default codex task review effort = %+v", e)
+	}
+	// An explicit value (a level, or runtime with a worker level set) overrides.
+	f.set("task_review_effort", "runtime")
+	f.set("codex_task_review_effort", "xhigh")
+	dto, _ = f.get()
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "claude"); e.Effort == nil || *e.Effort != "runtime" || e.ResolvedEffort != nil || e.Mode != "runtime_default" ||
+		e.DefaultEffort != "high" || strings.Join(e.Notes, ",") != "not_sent" {
+		t.Errorf("explicit runtime claude task review effort = %+v", e)
+	}
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "codex"); e.Effort == nil || *e.Effort != "xhigh" || e.ResolvedEffort == nil || *e.ResolvedEffort != "xhigh" ||
+		e.Source != "user_default" || e.DefaultEffort != "runtime" || len(e.Notes) != 0 {
+		t.Errorf("explicit xhigh codex task review effort = %+v", e)
+	}
+	// The worker effort cells are untouched by the review settings.
+	if e := effortCell(t, dto.Efforts, "worker_effort", "claude"); e.ResolvedEffort == nil || *e.ResolvedEffort != "high" {
+		t.Errorf("worker effort = %+v", e)
 	}
 }
 

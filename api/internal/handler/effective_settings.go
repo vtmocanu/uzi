@@ -278,13 +278,14 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 	claudeEffort := leadEffortSettingCell("claude", leads[workersvc.HarnessClaude])
 	codexEffort := leadEffortSettingCell("codex", leads[workersvc.HarnessCodex])
 	codexEffort.CatalogDefault = h.codexCatalogDefaultForModel(ctx, userID, leads[workersvc.HarnessCodex].Model)
-	reviewCodexEffort := reviewEffortCell("codex")
+	reviewClaudeEffort, reviewClaudeNotes := reviewEffortCell(reviews[workersvc.HarnessClaude])
+	reviewCodexEffort, reviewCodexNotes := reviewEffortCell(reviews[workersvc.HarnessCodex])
 	reviewCodexEffort.CatalogDefault = h.codexCatalogDefaultForModel(ctx, userID, reviews[workersvc.HarnessCodex].Model)
 	dto.Efforts = []apitypes.EffectiveEffortCellDTO{
 		{EffortSettingCellDTO: claudeEffort, Setting: "worker_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{}},
 		{EffortSettingCellDTO: codexEffort, Setting: "worker_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{}},
-		{EffortSettingCellDTO: reviewEffortCell("claude"), Setting: "task_review_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{noteNotSent}},
-		{EffortSettingCellDTO: reviewCodexEffort, Setting: "task_review_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{noteNotSent}},
+		{EffortSettingCellDTO: reviewClaudeEffort, Setting: "task_review_effort", FixedAt: workersvc.FixedAtClaim, Notes: reviewClaudeNotes},
+		{EffortSettingCellDTO: reviewCodexEffort, Setting: "task_review_effort", FixedAt: workersvc.FixedAtClaim, Notes: reviewCodexNotes},
 		planningEffortCell(leads[workersvc.HarnessClaude], planningEffort),
 	}
 	dto.CrossCheck = apitypes.EffectiveCrossCheckDTO{Models: checkModels, Efforts: checkEfforts}
@@ -414,11 +415,16 @@ func reviewModelCell(p workersvc.LeadPrediction) apitypes.EffectiveModelCellDTO 
 	}
 }
 
-// reviewEffortCell is the task-review effort: neither review pass sends one.
-func reviewEffortCell(harness string) apitypes.EffortSettingCellDTO {
-	return apitypes.EffortSettingCellDTO{
-		Harness: harness, DefaultSource: sourceBuiltin, Source: sourceBuiltin, Mode: agenttmpl.EffortModeRuntimeDefault,
+// reviewEffortCell is the task-review effort (PRD #1570): Effort is the stored review preference
+// (nil when it inherits), DefaultEffort and DefaultSource the worker effort a reset selects, and
+// the resolved pair the claim's task_review_effort. A Runtime default resolution sends no level.
+func reviewEffortCell(p workersvc.LeadPrediction) (apitypes.EffortSettingCellDTO, []string) {
+	cell := reviewEffortCellFrom(string(p.Harness), p.UserEffort, p.ReviewWorkerEffort, p.ReviewEffort)
+	notes := []string{}
+	if p.ReviewEffort.Mode == agenttmpl.EffortModeRuntimeDefault {
+		notes = append(notes, noteNotSent)
 	}
+	return cell, notes
 }
 
 // crossCheckEffectiveCells maps the cross-check pin cells onto the model and effort cell shapes,

@@ -66,6 +66,11 @@ type fakeSettingsDB struct {
 	// (PRD #1570), written by SetUserTaskReviewModel / SetUserCodexTaskReviewModel.
 	taskReview      pgtype.Text
 	codexTaskReview pgtype.Text
+	// taskReviewEffort and codexTaskReviewEffort are users.task_review_effort /
+	// codex_task_review_effort (PRD #1570), written by SetUserTaskReviewEffort /
+	// SetUserCodexTaskReviewEffort.
+	taskReviewEffort      pgtype.Text
+	codexTaskReviewEffort pgtype.Text
 	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
 	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
 	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
@@ -167,6 +172,14 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.judgeRunsOn = j // SetUserJudgeRunsOn: $1 = judge_runs_on (PRD #3257)
 		}
+	case strings.Contains(sql, "UPDATE users SET codex_task_review_effort") && len(args) >= 1:
+		if e, ok := args[0].(pgtype.Text); ok {
+			f.codexTaskReviewEffort = e // SetUserCodexTaskReviewEffort: $1 = codex_task_review_effort
+		}
+	case strings.Contains(sql, "UPDATE users SET task_review_effort") && len(args) >= 1:
+		if e, ok := args[0].(pgtype.Text); ok {
+			f.taskReviewEffort = e // SetUserTaskReviewEffort: $1 = task_review_effort
+		}
 	case strings.Contains(sql, "UPDATE users SET codex_task_review_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
 			f.codexTaskReview = s // SetUserCodexTaskReviewModel: $1 = codex_task_review_model
@@ -240,64 +253,68 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		}
 	}
 	return fakeSettingsRow{
-		model:           f.model,
-		effort:          f.effort,
-		codexEffort:     f.codexEffort,
-		judge:           f.judge,
-		codexJudge:      f.codexJudge,
-		judgeRunsOn:     f.judgeRunsOn,
-		summary:         f.summary,
-		codexSummary:    f.codexSummary,
-		theme:           f.theme,
-		mrRework:        f.mrRework,
-		nowSummary:      f.nowSummary,
-		weeklyPct:       f.weeklyPct,
-		weeklyPause:     f.weeklyPause,
-		sidebarIDs:      f.sidebarIDs,
-		sidebarCodexIDs: f.sidebarCodexIDs,
-		apprMode:        f.apprMode,
-		lightTheme:      f.lightTheme,
-		darkTheme:       f.darkTheme,
-		typeface:        f.typeface,
-		sidebarMotion:   f.sidebarMotion,
-		defaultHarness:  f.defaultHarness,
-		claudeModel:     f.claudeModel,
-		codexModel:      f.codexModel,
-		planningModel:   f.planningModel,
-		planningEffort:  f.planningEffort,
-		taskReview:      f.taskReview,
-		codexTaskReview: f.codexTaskReview,
+		model:                 f.model,
+		effort:                f.effort,
+		codexEffort:           f.codexEffort,
+		judge:                 f.judge,
+		codexJudge:            f.codexJudge,
+		judgeRunsOn:           f.judgeRunsOn,
+		summary:               f.summary,
+		codexSummary:          f.codexSummary,
+		theme:                 f.theme,
+		mrRework:              f.mrRework,
+		nowSummary:            f.nowSummary,
+		weeklyPct:             f.weeklyPct,
+		weeklyPause:           f.weeklyPause,
+		sidebarIDs:            f.sidebarIDs,
+		sidebarCodexIDs:       f.sidebarCodexIDs,
+		apprMode:              f.apprMode,
+		lightTheme:            f.lightTheme,
+		darkTheme:             f.darkTheme,
+		typeface:              f.typeface,
+		sidebarMotion:         f.sidebarMotion,
+		defaultHarness:        f.defaultHarness,
+		claudeModel:           f.claudeModel,
+		codexModel:            f.codexModel,
+		planningModel:         f.planningModel,
+		planningEffort:        f.planningEffort,
+		taskReview:            f.taskReview,
+		codexTaskReview:       f.codexTaskReview,
+		taskReviewEffort:      f.taskReviewEffort,
+		codexTaskReviewEffort: f.codexTaskReviewEffort,
 	}
 }
 
 type fakeSettingsRow struct {
-	model           pgtype.Text
-	effort          pgtype.Text
-	codexEffort     pgtype.Text
-	judge           pgtype.Text
-	codexJudge      pgtype.Text
-	judgeRunsOn     pgtype.Text
-	summary         pgtype.Text
-	codexSummary    pgtype.Text
-	theme           pgtype.Text
-	mrRework        pgtype.Bool
-	nowSummary      pgtype.Bool
-	weeklyPct       pgtype.Int2
-	weeklyPause     bool
-	sidebarIDs      []uuid.UUID
-	sidebarCodexIDs []uuid.UUID
-	apprMode        pgtype.Text
-	lightTheme      pgtype.Text
-	darkTheme       pgtype.Text
-	typeface        pgtype.Text
-	sidebarMotion   pgtype.Bool
-	defaultHarness  pgtype.Text
-	claudeModel     pgtype.Text
-	codexModel      pgtype.Text
-	planningModel   pgtype.Text
-	planningEffort  pgtype.Text
-	taskReview      pgtype.Text
-	codexTaskReview pgtype.Text
+	model                 pgtype.Text
+	effort                pgtype.Text
+	codexEffort           pgtype.Text
+	judge                 pgtype.Text
+	codexJudge            pgtype.Text
+	judgeRunsOn           pgtype.Text
+	summary               pgtype.Text
+	codexSummary          pgtype.Text
+	theme                 pgtype.Text
+	mrRework              pgtype.Bool
+	nowSummary            pgtype.Bool
+	weeklyPct             pgtype.Int2
+	weeklyPause           bool
+	sidebarIDs            []uuid.UUID
+	sidebarCodexIDs       []uuid.UUID
+	apprMode              pgtype.Text
+	lightTheme            pgtype.Text
+	darkTheme             pgtype.Text
+	typeface              pgtype.Text
+	sidebarMotion         pgtype.Bool
+	defaultHarness        pgtype.Text
+	claudeModel           pgtype.Text
+	codexModel            pgtype.Text
+	planningModel         pgtype.Text
+	planningEffort        pgtype.Text
+	taskReview            pgtype.Text
+	codexTaskReview       pgtype.Text
+	taskReviewEffort      pgtype.Text
+	codexTaskReviewEffort pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -334,7 +351,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 28: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion, the planning pair (PRD #3252) and the task-review models (PRD #1570)
+	case 30: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion, the planning pair (PRD #3252), the task-review models and the task-review efforts (PRD #1570)
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -430,6 +447,13 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[27].(*pgtype.Text); ok {
 			*p = r.codexTaskReview
+		}
+		// task_review_effort and codex_task_review_effort (PRD #1570) are columns 29 and 30.
+		if p, ok := dest[28].(*pgtype.Text); ok {
+			*p = r.taskReviewEffort
+		}
+		if p, ok := dest[29].(*pgtype.Text); ok {
+			*p = r.codexTaskReviewEffort
 		}
 	}
 	return nil

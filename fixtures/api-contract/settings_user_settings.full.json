@@ -35,6 +35,26 @@
       "source": "x"
     }
   ],
+  "task_review_effort": "x",
+  "codex_task_review_effort": "x",
+  "task_review_efforts": [
+    {
+      "harness": "x",
+      "effort": "x",
+      "default_effort": "x",
+      "default_source": "x",
+      "resolved_effort": "x",
+      "source": "x",
+      "mode": "x",
+      "catalog_default": {
+        "state": "x",
+        "effort": "x",
+        "model": "x",
+        "runtime_version": "x",
+        "observed_at": "2020-01-02T03:04:05Z"
+      }
+    }
+  ],
   "theme": "x",
   "mr_rework_enabled": true,
   "now_summary_enabled": true,

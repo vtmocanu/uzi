@@ -20,9 +20,11 @@ const taskReviewSettingsOmittedEvent = "task_review_settings_omitted"
 // value on both sides keeps the live row and the reloaded row identical.
 const taskReviewSettingsOmittedAgent = "worker"
 
-// The user-facing names of the withheld settings, joined into the note text. The task-review effort
-// slice adds its own name here.
-const taskReviewModelSettingName = "task review model"
+// The user-facing names of the withheld settings, joined into the note text.
+const (
+	taskReviewModelSettingName  = "task review model"
+	taskReviewEffortSettingName = "task review effort"
+)
 
 type taskReviewSettingsOmittedPayload struct {
 	Event string `json:"event"`
@@ -42,7 +44,7 @@ func taskReviewSettingsOmittedText(withheld []string) string {
 // generations only; it is not an idempotency key. One line per claim generation holds because the
 // only caller is assembleClaim, whose only caller runs once per ClaimRun commit, and ClaimRun
 // advances claim_generation. A new caller must keep that property. withheld names each setting the
-// claim dropped (taskReviewModelSettingName).
+// claim dropped (taskReviewModelSettingName, taskReviewEffortSettingName).
 func (s *Service) recordTaskReviewSettingsOmittedNote(ctx context.Context, run store.Run, startLastSeq int32, withheld []string) int32 {
 	raw, err := json.Marshal(taskReviewSettingsOmittedPayload{
 		Event: taskReviewSettingsOmittedEvent,

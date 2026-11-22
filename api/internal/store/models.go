@@ -2057,6 +2057,8 @@ type User struct {
 	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
 	TaskReviewModel           pgtype.Text        `json:"task_review_model"`
 	CodexTaskReviewModel      pgtype.Text        `json:"codex_task_review_model"`
+	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
+	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
 }
 
 type UserCrossCheckPin struct {
