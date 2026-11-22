@@ -183,10 +183,12 @@ func renderHeldPublications(env Env, gf *globalFlags, runID string, pubs []apity
 			p.Printf("gen %d: reason %s\n", h.Generation, r)
 		}
 	}
-	if onForge && !gf.quiet && adminDebug {
-		p.Printf("\nfetch a held ref with `git fetch origin <ref>`\n")
-	} else if onForge && !gf.quiet {
-		p.Printf("\nfetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire %s`\n", sanitizeTTY(runID))
+	if onForge && !gf.quiet {
+		if adminDebug {
+			p.Printf("\nfetch a held ref with `git fetch origin <ref>`\n")
+		} else {
+			p.Printf("\nfetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire %s`\n", sanitizeTTY(runID))
+		}
 	}
 	return nil
 }

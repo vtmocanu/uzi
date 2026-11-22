@@ -76,7 +76,8 @@ type adrdFixture struct {
 	admin, owner, other, demoted uuid.UUID
 	run, hold, capture           uuid.UUID
 	run2, hold2                  uuid.UUID
-	heldPub                      uuid.UUID // an acknowledged held publication on run, still under hold
+	heldPub                      uuid.UUID // a created held publication on run, whose hold stays open
+	ackRun, ackHold, ackPub      uuid.UUID // the owner's run whose hold was released and publication acknowledged
 	chat, judged, rec, fetch     uuid.UUID
 
 	adminRO, adminUzc, adminJWT string
@@ -110,6 +111,15 @@ func adrdNewFixture(t *testing.T) *adrdFixture {
 	f.run2, f.hold2 = custodySeedRunHold(t, pool, f.owner, conn, worker, 12, "failed", 1)
 	f.capture = custodySeedCapture(t, pool, f.owner, f.run, worker, f.hold, "adrd-key", "available", 1)
 	f.heldPub = adrdSeedHeldPublication(t, pool, f.owner, f.run, f.hold, worker)
+	f.ackRun, f.ackPub = heldSeedPublication(t, pool, f.owner, conn, 13, true)
+	var ackState string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT p.state, p.hold_id FROM run_held_publications p WHERE p.id = $1`, f.ackPub).Scan(&ackState, &f.ackHold); err != nil {
+		t.Fatalf("read acknowledged publication: %v", err)
+	}
+	if ackState != "acknowledged" {
+		t.Fatalf("seeded publication state = %q, want acknowledged (the expire snapshot check is vacuous otherwise)", ackState)
+	}
 	cliMustExec(t, pool, `INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', $2)`, f.run, adrdFollowUp)
 	f.fetch = uuid.New()
 	cliMustExec(t, pool,
@@ -145,7 +155,7 @@ func adrdNewFixture(t *testing.T) *adrdFixture {
 	return f
 }
 
-// adrdSeedHeldPublication walks one held publication of run to acknowledged through the real
+// adrdSeedHeldPublication walks one held publication of run to created through the real
 // queries. The custody hold is left open, so the holds assertions of the matrix are unchanged.
 func adrdSeedHeldPublication(t *testing.T, pool *pgxpool.Pool, owner, run, hold, worker uuid.UUID) uuid.UUID {
 	t.Helper()
@@ -168,10 +178,9 @@ func adrdSeedHeldPublication(t *testing.T, pool *pgxpool.Pool, owner, run, hold,
 	if _, err := q.RecordHeldCreateOutcome(ctx, store.RecordHeldCreateOutcomeParams{State: "created", ID: row.ID}); err != nil {
 		t.Fatalf("created: %v", err)
 	}
-	// AcknowledgeHeldPublication matches only after the hold was released against the row, which
-	// would close f.hold and change the holds assertions; write the acknowledged shape directly.
-	cliMustExec(t, pool, `UPDATE run_held_publications SET state = 'acknowledged', acknowledged_at = now(),
-		expires_at = now() + interval '7 days' WHERE id = $1`, row.ID)
+	// The row stays created: reaching acknowledged needs the hold released against it (the
+	// held_publication_guard trigger refuses any other route), which would close f.hold. The
+	// acknowledged row lives on its own run, f.ackRun.
 	return row.ID
 }
 
@@ -247,8 +256,9 @@ func adrdRoutes() []adrdRoute {
 					t.Errorf("owner_id = %q, want %s", dto.OwnerID, f.owner)
 				}
 				ids := adrdHoldIDs(dto)
-				if len(ids) != 2 || !ids[f.hold.String()] || !ids[f.hold2.String()] {
-					t.Errorf("holds = %v, want both of the owner's holds %s %s", ids, f.hold, f.hold2)
+				// The all-states list also carries the released hold of ackRun.
+				if len(ids) != 3 || !ids[f.hold.String()] || !ids[f.hold2.String()] || !ids[f.ackHold.String()] {
+					t.Errorf("holds = %v, want the owner's holds %s %s %s", ids, f.hold, f.hold2, f.ackHold)
 				}
 			},
 			auditRoute: "recovery.holds",
@@ -485,7 +495,7 @@ func TestAdminRunDebugAuditHasNoPayloadLiveDB(t *testing.T) {
 // adrdSnapshot reads every row the write attempts below could change.
 func adrdSnapshot(t *testing.T, f *adrdFixture) string {
 	t.Helper()
-	runs := []uuid.UUID{f.run, f.run2, f.judged, f.chat}
+	runs := []uuid.UUID{f.run, f.run2, f.ackRun, f.judged, f.chat}
 	var snap string
 	err := f.pool.QueryRow(context.Background(), `SELECT concat_ws('|',
 	  (SELECT count(*) FROM run_user_inputs WHERE run_id = ANY($1)),
@@ -519,6 +529,7 @@ func TestAdminRunDebugWritesStayRefusedLiveDB(t *testing.T) {
 		{"download archive", http.MethodGet, "/api/runs/" + run + "/archives/" + f.capture.String() + "/download", ""},
 		{"discard hold", http.MethodDelete, "/api/runs/" + run + "/recovery-holds/" + f.hold.String() + "?confirm=discard", ""},
 		{"expire held publications", http.MethodPost, "/api/runs/" + run + "/held-publications/expire", ""},
+		{"expire acknowledged held publications", http.MethodPost, "/api/runs/" + f.ackRun.String() + "/held-publications/expire", ""},
 		{"rework", http.MethodPost, "/api/runs/" + run + "/rework", `{}`},
 	}
 	before := adrdSnapshot(t, f)

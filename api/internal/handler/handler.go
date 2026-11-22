@@ -1176,7 +1176,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// work was published to, and an early expiry of the acknowledged ones. Same
 				// RequireUser group and strict GetRun owner-or-404 gate as the hold discard above, so
 				// `uzi run held` reaches both from a uzc_ Bearer and a worker token is refused. The
-				// expiry deletes nothing: it makes the rows due, and the held_publication sweeper
+				// list is owner-or-404 plus the audited admin_ro debug read of a foreign run
+				// (adminRunDebugForeignRun); the expiry stays strictly owner-only. The expiry
+				// deletes nothing: it makes the rows due, and the held_publication sweeper
 				// pass deletes the refs. Not gated by UZI_HELD_PUBLICATION (cleanup never is).
 				r.Get("/{id}/held-publications", h.ListRunHeldPublications)
 				r.Post("/{id}/held-publications/expire", h.ExpireRunHeldPublications)

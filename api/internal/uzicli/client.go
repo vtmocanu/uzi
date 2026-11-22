@@ -846,7 +846,9 @@ type Client interface {
 	DiscardRecoveryHold(ctx context.Context, runID, holdID string) error
 	// HeldPublications lists a run's held-work publications (issue #2545):
 	// GET /api/runs/{runID}/held-publications. RequireUser and owner-or-404, so a uzc_ CLI token
-	// reaches its OWN runs only. Publications is always a JSON array (never null).
+	// reaches its OWN runs only; an admin_ro (uza_) token may also read a foreign run's list when
+	// the server's admin run debug flag is on (the response is marked admin_debug_read).
+	// Publications is always a JSON array (never null).
 	HeldPublications(ctx context.Context, runID string) (apitypes.HeldPublicationsDTO, error)
 	// ExpireHeldPublications makes every ACKNOWLEDGED held publication of the run due now
 	// (issue #2545): POST /api/runs/{runID}/held-publications/expire. It deletes nothing itself
