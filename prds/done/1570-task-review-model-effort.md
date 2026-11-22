@@ -5,7 +5,7 @@
 **Status:** Done, 2026-11-22: M1 and M2 implemented on branch `agent/issue-1570` (one PR). Draft r4 was written against main `0095b4361` (r2 folded the independent architect review; r3 records the owner's decision D4; r4 folds the buddy's resolver review). Full suites remain exact-head PR CI (Landing obligations).
 **Priority:** Normal.  
 **Blocked by:** none.  
-**Delivery:** one PRD, one uzi run, one PR, two serial milestones. Use the in-run/CI boundary in AGENTS.md *Run economy*. Neither implementation nor validation touches `.github/workflows/**`. Draft migration numbers sit above main's head (`00503` at drafting; `00504`-`00507` are held by open PRs); run `task migration:renumber` on the landing rebase.
+**Delivery:** one PRD, one uzi run, one PR, two serial milestones. Use the in-run/CI boundary in AGENTS.md *Run economy*. Neither implementation nor validation touches `.github/workflows/**`. Landing allocated `00508_task_review_model.sql` and `00509_task_review_effort.sql`; run `task migration:renumber` if main advances before landing.
 
 **Scope gate:** one independently valuable outcome: an owner can choose which model and reasoning effort the optional handoff review pass uses on each harness, and see it in the effective-settings view. An unset review model keeps today's built-in; an unset review effort follows the owner's worker effort for that harness (owner decision D4). Model and effort are separate slices because each is useful alone.
 

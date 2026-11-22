@@ -3550,7 +3550,7 @@ effort lanes, the two judge-model lanes, the two summary-model lanes, the two
 task-review-model lanes, the two task-review-effort lanes, `judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
 are written in one transaction. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
-`judge-runs-on`, `judge-model`, `summary-model` and `task-review-model` and `task-review-effort` choose which harness, model or effort
+`judge-runs-on`, `judge-model`, `summary-model`, `task-review-model` and `task-review-effort` choose which harness, model or effort
 already-enabled judge, summary and task-review work uses, and cannot turn that work on.
 
 ### Agent-template model and effort pins

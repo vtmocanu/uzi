@@ -812,7 +812,7 @@ describe("ReviewRunner", () => {
       const diff = "diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n";
       const config = { default_model: "opus", default_effort: "high" } as never;
       {
-        const { client } = fakeClient();
+        const { client, calls } = fakeClient();
         const { git } = fakeGit(diff);
         let options: Record<string, unknown> | undefined;
         const queryFn = (async function* (args: { options?: Record<string, unknown> }) {
@@ -822,6 +822,8 @@ describe("ReviewRunner", () => {
         }) as unknown as SdkQueryFn;
         await new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn })
           .execute(reviewClaim({ config, ...(blank === undefined ? {} : { task_review_model: blank }) }));
+        assert.ok(options, "the Claude model pass captured its options");
+        assert.equal(calls.review?.review.status, "complete");
         assert.equal(options?.model, undefined);
         assert.equal(options?.effort, undefined);
       }

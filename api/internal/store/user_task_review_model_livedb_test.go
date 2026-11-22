@@ -12,7 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestUserTaskReviewModelLiveDB executes the queries migration 00504 adds columns for
+// TestUserTaskReviewModelLiveDB executes the queries migration 00508 adds columns for
 // (GetUserTaskReviewSettings, SetUserTaskReviewModel, SetUserCodexTaskReviewModel, PRD #1570)
 // against real Postgres: a pristine NULL, a set value on each lane independently, the same values
 // through the wide GetUserSettings read, and clearing back to NULL. A green `sqlc generate` is not
@@ -82,7 +82,7 @@ func TestUserTaskReviewModelLiveDB(t *testing.T) {
 	}
 }
 
-// TestUserTaskReviewEffortLiveDB executes the queries migration 00505 adds columns for
+// TestUserTaskReviewEffortLiveDB executes the queries migration 00509 adds columns for
 // (SetUserTaskReviewEffort, SetUserCodexTaskReviewEffort, and the effort and worker-effort columns
 // of GetUserTaskReviewSettings and GetUserSettings, PRD #1570) against real Postgres.
 func TestUserTaskReviewEffortLiveDB(t *testing.T) {

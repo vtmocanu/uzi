@@ -106,3 +106,59 @@ describe.each(lanes)("Run defaults: $name task-review effort (PRD #1570 M2)", ({
     expect(mockApi.putMySettings).toHaveBeenCalledTimes(3);
   });
 });
+
+describe.each([
+  { late: "Claude task-review effort", field: "task_review_effort", newer: "Codex", newerField: "default_codex_effort" },
+  { late: "Codex task-review effort", field: "codex_task_review_effort", newer: "Claude", newerField: "default_effort" },
+  { late: "Claude effort", field: "default_effort", newer: "Codex", newerField: "default_codex_effort" },
+  { late: "Codex effort", field: "default_codex_effort", newer: "Claude", newerField: "default_effort" },
+] as const)("overlapping saves: late $late response", ({ late, field, newer, newerField }) => {
+  it("keeps the other lane's newly saved inherited effort when responses arrive in reverse order", async () => {
+    const values = { default_effort: "high", default_codex_effort: "runtime", task_review_effort: null, codex_task_review_effort: null } as {
+      default_effort: string; default_codex_effort: string; task_review_effort: string | null; codex_task_review_effort: string | null;
+    };
+    const snapshot = (): UserSettings => {
+      const claudeWorker = workerCell("claude", values.default_effort === "runtime" ? null : values.default_effort);
+      const codexWorker = workerCell("codex", values.default_codex_effort === "runtime" ? null : values.default_codex_effort);
+      return {
+        ...settings(values.task_review_effort, values.codex_task_review_effort), ...values,
+        effort_settings: [claudeWorker, codexWorker],
+        planning_efforts: [claudeWorker, codexWorker].map(cell => ({
+          ...cell, effort: null, default_effort: cell.resolved_effort ?? "runtime", default_source: "user_default" as const,
+        })),
+        task_review_efforts: mockTaskReviewEffortCells(
+          { claude: values.task_review_effort, codex: values.codex_task_review_effort },
+          { claude: claudeWorker, codex: codexWorker },
+        ),
+      };
+    };
+    const pending: Array<{ response: UserSettings; resolve: (value: { settings: UserSettings }) => void }> = [];
+    mockApi.getMySettings.mockResolvedValue({ settings: snapshot() });
+    mockApi.putMySettings.mockImplementation((patch) => {
+      Object.assign(values, patch);
+      const response = snapshot();
+      return new Promise(resolve => pending.push({ response, resolve }));
+    });
+    renderPage();
+    const lateSelect = await screen.findByLabelText(late);
+    const lateButton = screen.getByRole("button", { name: `Save ${late}` }) as HTMLButtonElement;
+    fireEvent.change(lateSelect, { target: { value: "max" } });
+    fireEvent.click(lateButton);
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenNthCalledWith(1, { [field]: "max" }));
+    const newerSelect = screen.getByLabelText(`${newer} effort`);
+    const newerButton = screen.getByRole("button", { name: `Save ${newer} effort` }) as HTMLButtonElement;
+    fireEvent.change(newerSelect, { target: { value: "low" } });
+    fireEvent.click(newerButton);
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, { [newerField]: "low" }));
+    pending[1].resolve({ settings: pending[1].response });
+    await waitFor(() => expect(newerButton.disabled).toBe(true));
+    const inherited = screen.getByLabelText(`${newer} task-review effort`) as HTMLSelectElement;
+    expect(inherited.options[0].textContent).toBe("Default · follows worker effort (low)");
+    const planning = screen.getByLabelText(`${newer} planning effort`) as HTMLSelectElement;
+    expect(planning.options[0].textContent).toContain("Same as the run · low");
+    pending[0].resolve({ settings: pending[0].response });
+    await waitFor(() => expect(lateButton.disabled).toBe(true));
+    expect(inherited.options[0].textContent).toBe("Default · follows worker effort (low)");
+    expect(planning.options[0].textContent).toContain("Same as the run · low");
+  });
+});

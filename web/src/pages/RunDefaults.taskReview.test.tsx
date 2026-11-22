@@ -116,5 +116,6 @@ describe("Run defaults: task review model (PRD #1570 M1)", () => {
     expect(describedBy).toContain("task-review-model-help");
     expect(describedBy).toContain("task-review-model-warning");
     expect(document.getElementById("task-review-model-warning")?.textContent).toMatch(/Not a Claude model/);
+    expect(document.getElementById("task-review-model-warning")?.textContent).toContain("the server refuses this save");
   });
 });

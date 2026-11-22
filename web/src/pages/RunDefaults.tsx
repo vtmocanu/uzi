@@ -60,17 +60,17 @@ function judgeLaneNote(cell: ModelSettingCell | undefined, notUsed: string): str
     : notUsed;
 }
 
-// The two summary lanes save independently, so a response may carry a stale sibling cell
+// Harness lanes save independently, so a response may carry a stale sibling cell
 // when saves land out of order. Take only the saved lane's cell from the response and keep
 // the rest of the committed cells; a response without that cell (older server) leaves them be.
-function mergeSummaryCell(
-  current: ModelSettingCell[] | undefined,
-  fromResponse: ModelSettingCell[] | undefined,
+function mergeHarnessCell<T extends { harness: ModelSettingCell["harness"] }>(
+  current: T[] | undefined,
+  fromResponse: T[] | undefined,
   harness: ModelSettingCell["harness"],
-): ModelSettingCell[] | undefined {
+): T[] | undefined {
   const saved = fromResponse?.find((c) => c.harness === harness);
   if (!saved) return current;
-  if (!current) return fromResponse;
+  if (!current) return [saved];
   return current.some((c) => c.harness === harness)
     ? current.map((c) => (c.harness === harness ? saved : c))
     : [...current, saved];
@@ -645,7 +645,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         summary_model: settings.summary_model,
-        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "claude"),
+        summary_models: mergeHarnessCell(current.summary_models, settings.summary_models, "claude"),
       }));
       const model = settings.summary_model ?? "";
       setSummaryModel(model);
@@ -671,7 +671,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         codex_summary_model: settings.codex_summary_model,
-        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "codex"),
+        summary_models: mergeHarnessCell(current.summary_models, settings.summary_models, "codex"),
       }));
       const model = settings.codex_summary_model ?? "";
       setCodexSummaryModel(model);
@@ -697,7 +697,7 @@ export function RunDefaults() {
   const taskReviewModelWarning =
     modelFieldWarning(taskReviewModel) ||
     (CODEX_ROLE_MODELS.includes(claudeTaskReviewTrimmed)
-      ? `Not a Claude model: ${claudeTaskReviewTrimmed} is a Codex model, so Claude task reviews skip it. Clear the field to use the default.`
+      ? `Not a Claude model: ${claudeTaskReviewTrimmed} is a Codex model, so the server refuses this save. Clear the field to use the default.`
       : "");
   const taskReviewModelDirty = claudeTaskReviewTrimmed !== savedTaskReviewModel;
   const codexTaskReviewModelDirty = codexTaskReviewModel.trim() !== savedCodexTaskReviewModel;
@@ -714,7 +714,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         task_review_model: settings.task_review_model,
-        task_review_models: mergeSummaryCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "claude"),
+        task_review_models: mergeHarnessCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "claude"),
       }));
       const model = settings.task_review_model ?? "";
       setTaskReviewModel(model);
@@ -740,7 +740,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         codex_task_review_model: settings.codex_task_review_model,
-        task_review_models: mergeSummaryCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "codex"),
+        task_review_models: mergeHarnessCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "codex"),
       }));
       const model = settings.codex_task_review_model ?? "";
       setCodexTaskReviewModel(model);
@@ -777,9 +777,8 @@ export function RunDefaults() {
       const { settings } = await api.putMySettings(claude ? { task_review_effort: value } : { codex_task_review_effort: value });
       setCommittedSettings(current => current && ({
         ...current,
-        task_review_effort: settings.task_review_effort,
-        codex_task_review_effort: settings.codex_task_review_effort,
-        task_review_efforts: settings.task_review_efforts,
+        [claude ? "task_review_effort" : "codex_task_review_effort"]: claude ? settings.task_review_effort : settings.codex_task_review_effort,
+        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, harness),
       }));
       const saved = (claude ? settings.task_review_effort : settings.codex_task_review_effort) ?? "";
       (claude ? setTaskReviewEffort : setCodexTaskReviewEffort)(saved);
@@ -814,9 +813,9 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         default_effort: settings.default_effort,
-        effort_settings: settings.effort_settings,
-        planning_efforts: settings.planning_efforts,
-        task_review_efforts: settings.task_review_efforts,
+        effort_settings: mergeHarnessCell(current.effort_settings, settings.effort_settings, "claude"),
+        planning_efforts: mergeHarnessCell(current.planning_efforts, settings.planning_efforts, "claude"),
+        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, "claude"),
       }));
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
@@ -842,7 +841,12 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings, planning_efforts: settings.planning_efforts, task_review_efforts: settings.task_review_efforts }));
+      setCommittedSettings(current => current && ({
+        ...current, default_codex_effort: settings.default_codex_effort,
+        effort_settings: mergeHarnessCell(current.effort_settings, settings.effort_settings, "codex"),
+        planning_efforts: mergeHarnessCell(current.planning_efforts, settings.planning_efforts, "codex"),
+        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, "codex"),
+      }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
