@@ -19,7 +19,8 @@ import {
 } from "../src/codex/safety.js";
 import { createRunLaneInstallerReconcile } from "../src/codex/codex-executor.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
-import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
+import { createCodexProviderExecutionAuthority, selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
+import type { ClaimCodexProviderBinding } from "../src/protocol.js";
 import type { BoundaryProcessRequest, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
 import { type StartupCleanupAuthorization } from "../src/codex/launcher.js";
 import { GitLabClient } from "../src/forge.js";
@@ -232,6 +233,8 @@ export function virtualBoundaryClock() {
 export function codexRig(
   opts: {
     authMode?: "subscription" | "api_key";
+    /** Validated provider authority: deliberately carries no vendor capability. */
+    provider?: ClaimCodexProviderBinding;
     /** Genuine runner lifecycle, joined from RunContext by lifecycle-sensitive scenarios. */
     lifecycleSignal?: AbortSignal;
     credentialClient?: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
@@ -261,7 +264,9 @@ export function codexRig(
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const tr = trackedRoot();
   registerRoot(registry, tr.root);
-  const binding = bindingOf(authMode === "subscription" ? SUBSCRIPTION : API_KEY);
+  const binding = opts.provider
+    ? createCodexProviderExecutionAuthority(opts.provider)
+    : bindingOf(authMode === "subscription" ? SUBSCRIPTION : API_KEY);
 
   let refreshCalls = 0;
   let releaseCalls = 0;
