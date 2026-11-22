@@ -3198,6 +3198,75 @@ describe("CodexHarness: provider error classification folds into the terminal (P
     assert.equal(thrown.original.failOrigin, "rate_limited");
   });
 
+  it("M3: provider gateway terminals park without vendor evidence or resets", async () => {
+    const positives: unknown[] = ["rateLimitExceeded", "serverOverloaded"];
+    for (const tag of ["httpConnectionFailed", "responseTooManyFailedAttempts", "responseStreamConnectionFailed", "responseStreamDisconnected"]) {
+      for (const httpStatusCode of [429, 529]) positives.push({ [tag]: { httpStatusCode } });
+    }
+    for (const info of positives) {
+      for (const source of ["terminal", "notification"]) {
+        const { harness, transport } = makeHarness({ authMode: "provider" });
+        transport.push(threadStarted()).push({
+          kind: "rate_limits_updated", method: "account/rateLimits/updated",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {},
+        });
+        if (source === "notification") transport.push(codexError(info));
+        transport.push(turnCompletedWithError(source === "terminal" ? info : "other")).end();
+        const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+        assert.equal(terminal.limitEvidence, undefined);
+        const thrown = terminal.failure!.materialize({ resetsAtMs: 2000000000000, window: "five_hour" });
+        assert.ok(thrown.original instanceof LimitReachedError, JSON.stringify({ info, source }));
+        assert.equal(thrown.original.rateLimitType, "provider_gateway_limit");
+        assert.equal(thrown.original.resetsAtMs, undefined);
+        assert.equal(thrown.failure.category, "rate_limit");
+        assert.equal(thrown.failure.limit, undefined);
+      }
+    }
+  });
+
+  it("M3: provider gateway classification is closed and native failures retain their types", async () => {
+    const negatives: unknown[] = [
+      "usageLimitExceeded", "sessionBudgetExceeded", "unauthorized", "other",
+      "HTTP 429 rateLimitExceeded serverOverloaded", "flexUnavailable", "internalServerError",
+      { httpConnectionFailed: { httpStatusCode: 401 } },
+      { httpConnectionFailed: { httpStatusCode: 403 } },
+      { httpConnectionFailed: { httpStatusCode: 503 } },
+      { httpConnectionFailed: { httpStatusCode: "429" } },
+      { unknown: { httpStatusCode: 429 } }, { httpStatusCode: 529 },
+      { rateLimitExceeded: {} }, { activeTurnNotSteerable: { httpStatusCode: 429 } },
+    ];
+    for (const authMode of ["provider", "subscription", "api_key", undefined] as const) {
+      const cases = authMode === "provider" ? negatives : [...negatives, "rateLimitExceeded", "serverOverloaded", { httpConnectionFailed: { httpStatusCode: 429 } }];
+      for (const info of cases) {
+        const { harness, transport } = makeHarness({ authMode });
+        transport.push(threadStarted()).push(turnCompletedWithError(info)).end();
+        const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+        assert.equal(terminal.limitEvidence, undefined);
+        const thrown = terminal.failure!.materialize();
+        assert.ok(thrown.original instanceof CodexTurnFailedError, JSON.stringify({ authMode, info }));
+        assert.equal(thrown.failure.limit, undefined);
+      }
+    }
+  });
+
+  it("M3: provider gateway uses final classification precedence and ignores retrying errors", async () => {
+    for (const [notification, terminalInfo, willRetry, gateway] of [
+      ["rateLimitExceeded", "unauthorized", false, true],
+      ["unauthorized", "rateLimitExceeded", false, false],
+      ["rateLimitExceeded", "cyberPolicy", false, false],
+      ["unknownTag", "serverOverloaded", false, true],
+      ["rateLimitExceeded", "other", true, false],
+    ] as const) {
+      const { harness, transport } = makeHarness({ authMode: "provider" });
+      transport.push(threadStarted()).push(codexError(notification, { willRetry }))
+        .push(turnCompletedWithError(terminalInfo)).end();
+      const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+      const thrown = terminal.failure!.materialize();
+      assert.equal(thrown.original instanceof LimitReachedError, gateway);
+      assert.equal(terminal.limitEvidence, undefined);
+    }
+  });
+
   it("#2360: only final usageLimitExceeded consumes subscription window evidence", async () => {
     for (const tag of ["usageLimitExceeded", "rateLimitExceeded", "sessionBudgetExceeded"]) {
       const { harness, transport } = makeHarness({ authMode: "subscription" });

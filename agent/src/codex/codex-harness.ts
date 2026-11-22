@@ -63,6 +63,7 @@ import { CATALOG_PROBE_LIMIT, parseCatalogEntry, type CodexCatalogEntry } from "
 export type { CodexCatalogEntry } from "./catalog-probe.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
+import { isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT } from "../provider-binding.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { DRAFT_PLAN_ACK } from "../draft-plan.js";
 import { emptyCounts, sanitizeText } from "../sanitize.js";
@@ -2613,7 +2614,14 @@ export class CodexHarness implements RunHarness {
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
     const cost = pricing === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
     const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
-    const limitEvidence = usageLimit ? this.rateLimits.classify(this.authMode) : undefined;
+    // Only the selected closed classification can identify a provider gateway limit.
+    // Normalized HTTP status exists only on accepted structured transport variants.
+    const gatewayLimit = outcome === "failed" && this.authMode === "provider" && (
+      classification?.classification === "rateLimitExceeded" ||
+      classification?.classification === "serverOverloaded" ||
+      (classification?.category === "transport" && isGatewayLimitStatus(classification.httpStatus))
+    );
+    const limitEvidence = usageLimit && this.authMode !== "provider" ? this.rateLimits.classify(this.authMode) : undefined;
     const durationMs = Math.max(0, Math.floor(this.nowMs() - (this.dispatchStartedAt ?? this.nowMs())));
     return {
       outcome,
@@ -2631,6 +2639,10 @@ export class CodexHarness implements RunHarness {
         // there is no classification the message stays based on the CLOSED subtype alone and
         // the category defaults to "unknown", byte-identical to before #1534.
         materialize: (limit): HarnessThrownFailure => {
+          if (gatewayLimit) {
+            const original = new LimitReachedError({ rateLimitType: PROVIDER_GATEWAY_LIMIT });
+            return { failure: { category: "rate_limit", message: original.message }, original };
+          }
           if (usageLimit && limit !== undefined) {
             const original = new LimitReachedError({ resetsAtMs: limit.resetsAtMs, rateLimitType: limit.window });
             return { failure: { category: "rate_limit", message: original.message, limit }, original };
