@@ -170,6 +170,7 @@ export interface CodexProviderConfig {
  *  app-server auth keeps the credential out of this shape; the optional legacy
  *  transitional credential remains private and never becomes model-visible. */
 export interface CodexLaunchRootSpec {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   readonly kind: "provider";
   readonly providerBinding?: import("../protocol.js").ClaimCodexProviderBinding;
   readonly provider: CodexProviderConfig;

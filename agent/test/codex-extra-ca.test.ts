@@ -54,7 +54,7 @@ describe("trusted startup Codex extra CA", () => {
     for (const pem of ["", " \n", "-----BEGIN " + "PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----",
       "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----", cert + "junk",
       "junk" + cert, cert.replace("CERTIFICATE", "PUBLIC KEY"), (cert + "\n").repeat(65),
-      cert.replace(/\n/, "\n!"), cert + "\u0080"]) {
+      cert.replace(/\n/, "\n!"), cert.replace(/\n-----END/, "-----END"), cert + "\u0080"]) {
       fs.writeFileSync(file, pem);
       rejects(file);
     }

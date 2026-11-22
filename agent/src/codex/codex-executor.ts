@@ -1270,6 +1270,7 @@ export async function makeCodexAdviceHarness(
   operationScope?: CodexAdviceHarnessOptions["operationScope"],
   onRefreshDenied?: () => void,
   providerBinding?: import("../protocol.js").ClaimCodexProviderBinding,
+  codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa,
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1285,7 +1286,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny", onRefreshDenied));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, providerBinding, log, admissionReporter, operationScope });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, providerBinding, ...(providerBinding && codexExtraCa ? { codexExtraCa } : {}), log, admissionReporter, operationScope });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1413,7 +1414,7 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
       ownedDataRoot,
       // No credentialValue: the token flows over account/login/start, never the launcher env
       // (mirrors defaultLaunchProviderRoot).
-      ...(spec.providerBinding ? { providerBinding: spec.providerBinding } : { provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey } }),
+      ...(spec.providerBinding ? { providerBinding: spec.providerBinding, ...(spec.codexExtraCa ? { codexExtraCa: spec.codexExtraCa } : {}) } : { provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey } }),
       model: spec.providerSlot ?? spec.model,
       codexBin: CODEX_BIN,
       supervisorBin: SUPERVISOR_BIN,
@@ -1539,7 +1540,7 @@ export function makeProductionCodexAdviceHarnessFactory(
   client: WorkerClient,
   baseLog: Logger,
   homeRoot: string,
-  deps: { launchRoot?: LaunchAdviceRootSeam } = {},
+  deps: { launchRoot?: LaunchAdviceRootSeam; codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const { runId, binding, signal, refresh, onRefreshDenied } = params;
@@ -1559,7 +1560,7 @@ export function makeProductionCodexAdviceHarnessFactory(
       return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
         binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
         scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined,
-        onRefreshDenied, binding.authMode === "provider" ? binding.providerBinding : undefined);
+        onRefreshDenied, binding.authMode === "provider" ? binding.providerBinding : undefined, deps.codexExtraCa);
     } catch (error) { close(); throw error; }
   };
 }
@@ -2054,6 +2055,7 @@ export interface CodexExecutorDeps {
 }
 
 export interface CodexExecutorOptions {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   readonly capturedMemory?: CapturedMemoryContext;
   /** Advisory seams; the default runner uses the shared provisioning HOME and advice factory. */
   readonly summaryRunner?: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
@@ -6027,7 +6029,8 @@ export class CodexExecutor implements Executor {
             const slot = modelMap[providerSlot!]?.model === spec.model
               ? providerSlot!
               : Object.entries(modelMap).find(([, entry]) => entry?.model === spec.model)?.[0] ?? providerSlot!;
-            spec = { ...spec, providerBinding: binding.providerBinding, model: slot };
+            spec = { ...spec, providerBinding: binding.providerBinding, model: slot,
+              ...(this.opts.codexExtraCa ? { codexExtraCa: this.opts.codexExtraCa } : {}) };
           }
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
@@ -8716,7 +8719,7 @@ async function defaultLaunchProviderRoot(
   const handle = await launch({
     ownedDataRoot: spec.ownedDataRoot,
     // No credentialValue: the token flows over `account/login/start`, never the launcher env.
-    ...(spec.providerBinding ? { providerBinding: spec.providerBinding } : { provider: {
+    ...(spec.providerBinding ? { providerBinding: spec.providerBinding, ...(spec.codexExtraCa ? { codexExtraCa: spec.codexExtraCa } : {}) } : { provider: {
       name: spec.provider.name,
       baseUrl: spec.provider.baseUrl,
       envKey: spec.provider.envKey,

@@ -287,6 +287,7 @@ const SHUTDOWN_RESULT_DEADLINE_MS = 35_000;
  *  supplies lightweight stand-ins (a `nullLogger()`, a throwaway `WorkerClient`, a
  *  temp dir, a fabricated `DockerWiring`). */
 export interface BuildRunExecutorDeps {
+  codexExtraCa?: import("./codex/extra-ca.js").ValidatedExtraCa;
   codexAdviceHarnessFactory?: import("./codex/codex-executor.js").CodexAdviceHarnessFactory;
   log: Logger;
   client: WorkerClient;
@@ -406,6 +407,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
       runHome,
       {
         binding: selection.binding,
+        codexExtraCa: deps.codexExtraCa,
         summaryClaimCodex: codex,
         codexAdviceHarnessFactory: deps.codexAdviceHarnessFactory,
         client,
@@ -814,6 +816,7 @@ async function mainBody(): Promise<void> {
     client,
     sdkHomeRoot,
     executorKind: config.executor,
+    codexExtraCa: config.codexExtraCa,
     codexAdviceHarnessFactory,
     stubPlanGate: config.stubPlanGate,
     workerTokenFile: config.workerTokenFile,
@@ -846,7 +849,7 @@ async function mainBody(): Promise<void> {
   // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
   // reaches the codex branch. Only this judge/review advice lane keeps the old
   // always-real-CodexAdviceHarness shape.)
-  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
+  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot, { codexExtraCa: config.codexExtraCa });
 
   // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
   const diskLocks = new RunDiskLocks();

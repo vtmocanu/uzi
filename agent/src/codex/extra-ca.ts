@@ -3,6 +3,7 @@ import { X509Certificate } from "node:crypto";
 
 const MAX_BYTES = 1024 * 1024;
 const MAX_CERTIFICATES = 64;
+const captured = new WeakSet<object>();
 const validated = Symbol("validated startup CA");
 
 /** Immutable, byte-exact ASCII PEM captured from the trusted worker startup env. */
@@ -44,16 +45,24 @@ export function captureExtraCa(file: string | undefined): ValidatedExtraCa | und
       const base64 = match[1]!.replace(/[\r\n]/g, "");
       const der = Buffer.from(base64, "base64");
       if (der.toString("base64") !== base64) throw new Error();
-      const certificate = new X509Certificate(der);
+      const certificate = new X509Certificate(match[0]);
       if (!certificate.raw.equals(der)) throw new Error();
       end = match.index + match[0].length;
     }
     if (count === 0 || !/^[ \t\r\n]*$/.test(pem.slice(end))) throw new Error();
-    return Object.freeze({ [validated]: true as const, pem });
+    const bundle = Object.freeze({ [validated]: true as const, pem });
+    captured.add(bundle);
+    return bundle;
   } catch {
     const error = new Error("Invalid UZI_CODEX_CA_FILE configuration");
     // Never expose filesystem/OpenSSL diagnostics, source paths or certificate contents.
     error.stack = error.message;
     throw error;
   }
+}
+
+/** Refuse structural copies, including objects carrying a copied private symbol. */
+export function extraCaPem(value: ValidatedExtraCa): string {
+  if (!captured.has(value)) throw new Error("Untrusted Codex extra CA");
+  return value.pem;
 }

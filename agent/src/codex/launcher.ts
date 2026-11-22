@@ -1,3 +1,4 @@
+import { extraCaPem } from "./extra-ca.js";
 // PRD #1156 (M3a) — the isolated per-root Codex launch primitive.
 //
 // This is the reusable library the production worker adapter (and the m3a lifecycle
@@ -112,6 +113,7 @@ export interface CodexLaunchProvider {
 }
 
 export interface CodexLaunchSpec {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   /** A RUNNER-WRITABLE root, OUTSIDE the target repo, under which fresh per-launch
    * HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. Managed-auth
    * provider roots add only session-reader-group traverse on the root and CODEX_HOME, plus
@@ -745,6 +747,12 @@ function pathsOverlap(a: string, b: string): boolean {
 
 /** Validate the trusted construction contract for every caller, not only the JSON CLI. */
 function validateLaunchContract(spec: CodexLaunchSpec): void {
+  if (spec.codexExtraCa !== undefined) {
+    if (spec.kind !== "provider" || spec.authMode !== "provider" || !spec.providerBinding) {
+      throw new TrustedExecutionRefusal("extra CA requires a custom provider binding");
+    }
+    extraCaPem(spec.codexExtraCa);
+  }
   if (spec.kind !== "provider" && spec.kind !== "command") throw new TrustedExecutionRefusal("kind must be provider or command");
   if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep || resolve(spec.ownedDataRoot) !== spec.ownedDataRoot) {
     throw new TrustedExecutionRefusal("ownedDataRoot must be a canonical absolute non-root path");
@@ -812,6 +820,7 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
   if (spec.kind === "provider" && !spec.useAppServerAuth && spec.provider?.credentialValue !== undefined) {
     env[spec.provider.envKey] = spec.provider.credentialValue;
   }
+  if (spec.providerBinding && spec.codexExtraCa) env.CODEX_CA_CERTIFICATE = join(trees.codexHome, "provider-extra-ca.crt");
   return env;
 }
 
@@ -1029,7 +1038,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
         }
       : {}),
     ...(spec.seedSession ? { sessionSeedDir } : {}),
-    files: [{ path: configPath, content: configText, mode: 0o600 }],
+    files: [{ path: configPath, content: configText, mode: 0o600 },
+      ...(spec.codexExtraCa ? [{ path: join(trees.codexHome, "provider-extra-ca.crt"), content: extraCaPem(spec.codexExtraCa), mode: 0o600 }] : [])],
   });
 
   // 5. Replaced env allowlist (NOT merged).

@@ -99,6 +99,7 @@ export class CodexAdviceError extends Error {
  *  launcher-fixed values plus the private credential; it NEVER carries a run worktree, a
  *  broker/handler registry, agents or tools — the advice ceiling by construction. */
 export interface CodexAdviceLaunchSpec {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   readonly providerBinding?: ClaimCodexProviderBinding;
   readonly providerSlot?: keyof ClaimCodexProviderBinding["model_map"];
   readonly kind: "advice";
@@ -145,6 +146,7 @@ interface AdviceOperation {
   close(): void;
 }
 export interface CodexAdviceHarnessOptions {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   readonly providerBinding?: ClaimCodexProviderBinding;
   readonly operationScope?: () => AdviceOperation;
   readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
@@ -238,6 +240,7 @@ export class CodexAdviceHarness implements AdviceHarness {
   private readonly launchRoot: LaunchAdviceRootSeam;
   private readonly provider: CodexProviderConfig;
   private readonly providerBinding?: ClaimCodexProviderBinding;
+  private readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   private readonly appServerAuth?: CodexAppServerAuthSession;
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
@@ -254,6 +257,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     this.now = opts.now ?? (() => new Date());
     this.launchRoot = opts.launchRoot;
     this.providerBinding = opts.providerBinding;
+    this.codexExtraCa = opts.providerBinding ? opts.codexExtraCa : undefined;
     this.provider = opts.providerBinding ? { ...opts.provider,
       name: "uzi-provider-" + createHash("sha256").update(JSON.stringify([opts.providerBinding.provider_id, opts.providerBinding.revision])).digest("hex"),
       baseUrl: opts.providerBinding.base_url, model: opts.providerBinding.model_map.default.model,
@@ -340,6 +344,7 @@ export class CodexAdviceHarness implements AdviceHarness {
         label: request.label,
         provider: this.provider,
         providerBinding: this.providerBinding,
+        ...(this.codexExtraCa ? { codexExtraCa: this.codexExtraCa } : {}),
         providerSlot,
         model,
         // PRIVATE → the isolated launcher env ONLY; never a thread/turn param or frame.
