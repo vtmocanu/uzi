@@ -38,8 +38,8 @@ const (
 	NextClaimUnknown           = "unknown"
 	NextClaimNotAuto           = "not_auto"
 	NextClaimPinned            = "pinned"
-	nextClaimCredentialKindAnt = "anthropic_token"
-	nextClaimCredentialKindCdx = "codex_auth"
+	nextClaimCredentialKindAnt = store.KindAnthropicToken
+	nextClaimCredentialKindCdx = store.KindCodexAuth
 )
 
 // The closed set of future-run fix kinds.
@@ -468,7 +468,7 @@ func (n *NextClaimSnapshot) switchPending(run store.Run) bool {
 }
 
 func (n *NextClaimSnapshot) manualSwitch(run store.Run, worker store.Worker) bool {
-	facts := switchFacts{Settling: n.settling[run.ID], StaleCutoff: n.staleCutoff}
+	facts := switchFacts{Stage: switchStageFull, Settling: n.settling[run.ID], StaleCutoff: n.staleCutoff}
 	if run.Harness == harnessCodex {
 		return codexSwitchRefusal(run, worker, facts) == nil
 	}

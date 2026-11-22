@@ -513,9 +513,9 @@ func TestNextClaimReasonCodexAccountBound(t *testing.T) {
 		}
 	})
 	t.Run("pooled alternative in codex auto mode needs no future fix", func(t *testing.T) {
-		e, snap := cxEnv(t, 95, 30, nil, codexAccountModeAuto)
+		e, _ := cxEnv(t, 95, 30, nil, codexAccountModeAuto)
 		e.f.codexPool = []store.ListCodexPoolAliasesRow{{AliasID: cxAliasTwo}}
-		snap = e.snapshot(t)
+		snap := e.snapshot(t)
 		if res := e.svc.NextClaimReason(cxRun(), snap); len(res.FutureRuns) != 0 {
 			t.Errorf("future runs = %+v, want none", res.FutureRuns)
 		}
