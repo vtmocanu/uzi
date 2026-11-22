@@ -41,7 +41,7 @@ func TestMaxClaimSecretBytesFitsTheLimits(t *testing.T) {
 	if MaxClaimSecretBytes >= MaxScopeValueBytes {
 		t.Fatalf("MaxClaimSecretBytes %d is not below MaxScopeValueBytes %d", MaxClaimSecretBytes, MaxScopeValueBytes)
 	}
-	if MaxClaimSecretBytes != 207253 {
+	if MaxClaimSecretBytes != 116959 {
 		t.Fatalf("MaxClaimSecretBytes = %d", MaxClaimSecretBytes)
 	}
 }

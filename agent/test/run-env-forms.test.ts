@@ -342,8 +342,8 @@ describe("lines of a multi-line value are registered only when they hold a secre
     assertLineClasses(["AaBbAaBbAaBb", ENTROPY[0]!], ["AaBbAaBbAaBb"], [ENTROPY[0]!]);
   });
 
-  it("a 64 KiB line of scheme characters builds its forms in linear time", () => {
-    const long = hex("long-line", 64).repeat(1024);
+  it("a 256 KiB line of scheme characters builds its forms in linear time", () => {
+    const long = hex("long-line", 64).repeat(4096);
     const started = performance.now();
     const claim = runEnvClaimForms([secretVar("LONG_HEX", `${long}\n${ENTROPY[0]}\n`)], []);
     const ms = performance.now() - started;

@@ -63,6 +63,11 @@ const GENERATORS: Record<string, Gen> = {
   "spaces and html-significant characters": (n) => fill([" ", "<", ">", "&", "/", '"', "\\"], n),
   "high-variety alphanumerics": (n) => hashed("variety", n),
   "controls with a space": (n) => " " + fill(range(1, 31, [9, 10, 13]), n - 1),
+  // Lines that hold a secret-shaped token, so each registers as a line form, padded with controls that JSON-escape to
+  // six units per byte, and ending in breaks so all four value variants exist.
+  "control-padded token lines with trailing breaks": (n) =>
+    fill(["aB3xY7kQ" + range(1, 8).join("") + "\r\n"], n - 4, "\u0001") + "\r\n\r\n",
+  "control-padded token lines, LF": (n) => fill(["aB3xY7kQ\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u000b\n"], n),
 };
 
 describe("the form budget shared with the api", () => {
@@ -150,6 +155,66 @@ describe("the form budget shared with the api", () => {
       assert.equal(distinctForms(claim).size, 4 * 14 + 2 * lineCount + 6);
     });
 
+    // The logger indexes each registered secret and, when it differs, its JSON-escaped copy, and formChars counts that
+    // copy too. A control byte is 1 byte and 1 unit: its JSON-family forms are 6 units and re-escape to 7 (the
+    // backslash doubles), its raw copy is 6; percent and base64 forms hold no escapable character.
+    const escapedCopy = (f: string): string => JSON.stringify(f).slice(1, -1);
+
+    it("escaped copies of a single-line value's forms add at most 6 + 4 x 7 units per byte, only for raw and JSON-family forms", () => {
+      const n = 4096;
+      const inputs = [...Object.values(GENERATORS).map((gen) => gen(n)), everyFormDistinct("x".repeat(n - 5)), "\u0001".repeat(n)];
+      for (const value of inputs) {
+        if (/[\r\n]/.test(value)) continue;
+        const b = bytes(value);
+        const claim = runEnvClaimForms([secretVar("ONE", value)], undefined);
+        const provider = new Set(providerKeyForms(value));
+        let extra = 0;
+        let differing = 0;
+        for (const f of claim.redaction) {
+          const copy = escapedCopy(f);
+          if (copy === f) continue;
+          assert.ok(f === value || provider.has(f), "only the raw value and a provider form re-escape");
+          assert.ok(copy.length <= (f === value ? 6 : 7) * b, `a ${copy.length}-unit copy of a ${f.length}-unit form`);
+          extra += copy.length;
+          differing++;
+        }
+        assert.ok(differing <= 5, `${differing} forms re-escape`);
+        assert.ok(extra <= (6 + 4 * 7) * b, `${extra} units of copies for ${b} bytes`);
+      }
+    });
+
+    it("escaped copies of a multi-line value's line forms add at most 6 + 7 units per byte", () => {
+      for (const name of ["control-padded token lines with trailing breaks", "control-padded token lines, LF"]) {
+        const value = GENERATORS[name]!(4096);
+        const claim = runEnvClaimForms([secretVar("MULTI", value)], undefined);
+        let extra = 0;
+        for (const f of claim.lineForms.flatMap((l) => l.forms)) {
+          const copy = escapedCopy(f);
+          if (copy !== f) extra += copy.length;
+        }
+        assert.ok(extra > 0, `${name} registers line forms that re-escape`);
+        assert.ok(extra <= (6 + 7) * bytes(value), `${extra} units of line-form copies`);
+      }
+    });
+
+    it("counts a form's escaped copy once, and only when it differs", () => {
+      // 4096 x U+0001: raw 4096, JSON-family (all four forms the same string) 6 x 4096, percent 3 x 4096 (both cases the
+      // same string), base64 5461 + 5460 + 5461 (the URL-safe alignments equal the standard ones). The raw value's copy
+      // is that JSON string, already counted; the JSON string's copy is 7 x 4096 new units.
+      const n = 4096;
+      const claim = runEnvClaimForms([secretVar("CTRL", "\u0001".repeat(n))], undefined);
+      assert.equal(claim.formChars, n + 6 * n + 3 * n + (5461 + 5460 + 5461) + 7 * n);
+    });
+
+    it("counts no escaped copy for a value that JSON leaves unchanged", () => {
+      // 4096 hex digits: raw 4096, the four JSON forms and the two percent forms equal it, base64 3 alignments.
+      const n = 4096;
+      const value = "ab12".repeat(n / 4);
+      const claim = runEnvClaimForms([secretVar("PLAIN", value)], undefined);
+      assert.equal(claim.redaction.filter((f) => f.length === n).length, 1);
+      assert.equal(claim.formChars, claim.redaction.reduce((a, f) => a + f.length, 0));
+    });
+
     it("every diff-shaped form stays within 3 units per byte", () => {
       for (const n of [100, 4096]) {
         for (const gen of [GENERATORS["alternating text and break"]!, GENERATORS["CRLF lines with trailing breaks"]!, GENERATORS["LF lines"]!, GENERATORS["lone CR and LF"]!]) {
@@ -164,8 +229,8 @@ describe("the form budget shared with the api", () => {
   });
 
   it("a claim at the write-time budget of worst-case values is not over budget", () => {
-    // Four distinct values (a prefix keeps their forms apart) totalling exactly the cap, built from the
-    // generator that costs the most units per byte.
+    // Distinct values (a prefix keeps their forms apart) of the largest size and the remainder, totalling exactly the
+    // cap, built from the generator that costs the most units per byte.
     let costliest = "";
     let worst = 0;
     for (const [name, gen] of Object.entries(GENERATORS)) {
@@ -173,7 +238,7 @@ describe("the form budget shared with the api", () => {
       if (ratio > worst) [costliest, worst] = [name, ratio];
     }
     assert.ok(worst <= PER_BYTE, `${costliest} costs ${worst.toFixed(1)} units per byte (bound ${PER_BYTE})`);
-    const sizes = [MAX_VALUE_BYTES, MAX_VALUE_BYTES, MAX_VALUE_BYTES, MAX_CLAIM_SECRET_BYTES - 3 * MAX_VALUE_BYTES];
+    const sizes = [MAX_VALUE_BYTES, MAX_CLAIM_SECRET_BYTES - MAX_VALUE_BYTES];
     assert.equal(sizes.reduce((a, b) => a + b, 0), MAX_CLAIM_SECRET_BYTES);
     const gen = GENERATORS[costliest]!;
     const vars = sizes.map((n, i) => {

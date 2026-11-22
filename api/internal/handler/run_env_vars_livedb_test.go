@@ -903,7 +903,7 @@ func TestRunEnvRecreateAgainstPendingDeletionLimitsLiveDB(t *testing.T) {
 		f := newEnvFixture(t)
 		f.withReceipts()
 		for i := range 3 {
-			// Plain: the secret form budget (207253 bytes) would stop four secrets before the scope limit.
+			// Plain: the secret form budget (116959 bytes) would stop a second full-size secret before the scope limit.
 			f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", 65536), "secret": false}), http.StatusCreated)
 		}
 		f.put("BIG_3", jsonBody(map[string]any{"value": strings.Repeat("a", 65536-8)}), http.StatusCreated) // 262136 bytes
@@ -1152,15 +1152,14 @@ func TestRunEnvDeniedStoredNameCanBeDisabledAndDeletedLiveDB(t *testing.T) {
 // past runenv.MaxClaimSecretBytes is refused with env_forms_budget, so a store filled to
 // its limits never makes a claim whose forms pass the worker's cap.
 
-// budgetBase creates three 65536-byte secrets and one 1000-byte secret D (197608 secret
-// bytes), leaving room for D to be rewritten to a larger value.
+// budgetBase creates one 65536-byte secret and one 1000-byte secret SMALL (66536 secret
+// bytes), leaving room, below one value's maximum size, for SMALL to be rewritten to a
+// larger value.
 func (f *envFixture) budgetBase() int {
 	f.t.Helper()
 	used := 0
-	for i := range 3 {
-		f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", runenv.MaxValueBytes)}), http.StatusCreated)
-		used += runenv.MaxValueBytes
-	}
+	f.put("BIG_0", jsonBody(map[string]any{"value": strings.Repeat("a", runenv.MaxValueBytes)}), http.StatusCreated)
+	used += runenv.MaxValueBytes
 	f.put("SMALL", jsonBody(map[string]any{"value": strings.Repeat("s", 1000)}), http.StatusCreated)
 	return used + 1000
 }
@@ -1213,7 +1212,7 @@ func TestRunEnvFormBudgetCreatePlusOneByteLiveDB(t *testing.T) {
 
 func TestRunEnvFormBudgetHeldUpdateLiveDB(t *testing.T) {
 	// A held old version stays sealed, so the new one adds to the total: R = U + new.
-	atBudget := runenv.MaxClaimSecretBytes - (3*runenv.MaxValueBytes + 1000) // the new size of SMALL that lands on the cap
+	atBudget := runenv.MaxClaimSecretBytes - (runenv.MaxValueBytes + 1000) // the new size of SMALL that lands on the cap
 	f := newEnvFixture(t)
 	f.withReceipts()
 	f.budgetBase()
@@ -1230,7 +1229,7 @@ func TestRunEnvFormBudgetHeldUpdateLiveDB(t *testing.T) {
 func TestRunEnvFormBudgetUnheldUpdateLiveDB(t *testing.T) {
 	// An unheld old version is replaced, so R = U - old + new: SMALL may grow by the room
 	// plus its own 1000 bytes, which a held update could not.
-	newSize := runenv.MaxClaimSecretBytes - 3*runenv.MaxValueBytes
+	newSize := runenv.MaxClaimSecretBytes - runenv.MaxValueBytes
 	f := newEnvFixture(t)
 	f.budgetBase()
 	f.putSized("SMALL", newSize, http.StatusOK)

@@ -57,7 +57,7 @@ function isMultiLine(value: string): boolean {
 }
 
 /** Whether a token is long enough and has at least {@link MIN_DISTINCT_CHARS} distinct characters, and is
- *  either all digits (a backup code) or mixes upper- and lower-case letters or a letter with at least two digits. */
+ *  either all digits or mixes upper- and lower-case letters or a letter with at least two digits. */
 function isSecretToken(token: string): boolean {
   if (token.length < MIN_SECRET_LEN || new Set(token).size < MIN_DISTINCT_CHARS) return false;
   if (/^[0-9]+$/.test(token)) return true;
@@ -112,7 +112,8 @@ export interface ScanNeedle {
   readonly forms: readonly string[];
 }
 
-/** The most UTF-16 units of forms one claim may register, every distinct form counted once. */
+/** The most UTF-16 units of forms one claim may register, every distinct form and logger copy counted once
+ *  (see {@link RunEnvClaimForms.formChars}). */
 export const RUN_ENV_FORM_CHARS_MAX = 40_000_000;
 
 /** The reason text of a claim whose forms passed {@link RUN_ENV_FORM_CHARS_MAX}. */
@@ -127,7 +128,9 @@ export interface RunEnvClaimForms {
   readonly needles: ScanNeedle[];
   /** Per variable name, the registered line forms of its multi-line values. Empty when over budget. */
   readonly lineForms: ScanNeedle[];
-  /** The UTF-16 units of distinct forms counted. The count is checked after each value variant's whole-value
+  /** The UTF-16 units of distinct strings counted: every form, and for each form registered for redaction its
+   *  JSON-escaped copy when that differs (the copy the logger indexes beside the form). Needle-only forms add no
+   *  copy. The count is checked after each value variant's whole-value
    *  forms and after a multi-line value's line and diff forms, so building stops after the group whose forms pass
    *  {@link RUN_ENV_FORM_CHARS_MAX} and the count can exceed the cap by that group's forms. */
   readonly formChars: number;
@@ -159,13 +162,19 @@ export function runEnvClaimForms(
     sets.set(name, set);
     return set;
   };
+  const count = (s: string): void => {
+    if (counted.has(s)) return;
+    counted.add(s);
+    chars += s.length;
+  };
   const register = (forms: readonly string[], targets: readonly Set<string>[]): void => {
     for (const f of forms) {
       if (f.length < MIN_SECRET_LEN) continue;
       for (const t of targets) t.add(f);
-      if (!counted.has(f)) {
-        counted.add(f);
-        chars += f.length;
+      count(f);
+      if (targets.includes(redaction)) {
+        const escaped = JSON.stringify(f).slice(1, -1);
+        if (escaped !== f) count(escaped);
       }
     }
   };

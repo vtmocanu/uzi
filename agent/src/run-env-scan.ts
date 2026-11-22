@@ -312,7 +312,7 @@ function decodeAllQuoted(line: string): string {
  *  redacted decoded text, re-quoted so a rename stays unambiguous. A value can also span two sides of a rename
  *  (one side quoted), so the result is accepted only when its fully decoded form (every quoted segment
  *  unquoted) and its raw form hold nothing for the redactor; otherwise the redacted fully decoded line is
- *  returned instead, a single unquoted line. With no match the line is returned unchanged (the same string). */
+ *  returned instead, unquoted. With no match the line is returned unchanged (the same string). */
 export function redactPorcelainLine(line: string, redactText: (text: string) => string): string {
   const segmented = line.replace(QUOTED_SEGMENT, (whole, body: string) => {
     const decoded = cUnquote(body);

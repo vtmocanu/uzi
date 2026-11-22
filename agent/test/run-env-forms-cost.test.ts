@@ -19,11 +19,15 @@ const src = process.env.COST_SRC;
 const { runEnvClaimForms } = await import(src + "run-env-forms.ts");
 const { SecretSet } = await import(src + "redact.ts");
 const { createLogger } = await import(src + "log.ts");
-const [liveCount, liveBytes, oldCount, oldBytes] = JSON.parse(process.env.COST_SHAPE);
+const [liveCount, liveBytes, oldCount, oldBytes, controls] = JSON.parse(process.env.COST_SHAPE);
+// One-byte control characters that JSON escapes to six units: C0 without tab, LF and CR.
+const CONTROLS = Array.from({ length: 31 }, (_, i) => i + 1).filter((c) => c !== 9 && c !== 10 && c !== 13);
 const value = (seed, bytes) => {
   let text = "";
   for (let i = 0; text.length < bytes; i++) text += createHash("sha512").update(seed + "-" + i).digest("base64").replace(/=+$/, "");
   text = text.slice(0, bytes - 2);
+  // Control shape: each 64-character line keeps a 12-character token and its other characters become controls.
+  if (controls) text = Array.from(text, (c, i) => (i % 64 < 12 ? c : String.fromCharCode(CONTROLS[c.charCodeAt(0) % CONTROLS.length]))).join("");
   return text.match(/.{1,64}/g).join("\r\n") + "\r\n";
 };
 const id = "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44";
@@ -61,7 +65,10 @@ interface Report {
   buildMs: number; setAddMs: number; logAddMs: number; setMasked: boolean; logMasked: boolean; addedMasked: boolean;
 }
 
-function measure(shape: [number, number, number, number]): Report {
+/** [live variables, bytes each, retired versions, bytes each, whether the values are made of control characters]. */
+type Shape = [number, number, number, number, boolean];
+
+function measure(shape: Shape): Report {
   const res = spawnSync(process.execPath, ["--expose-gc", "--max-old-space-size=512", "--import", "tsx", "--input-type=module", "-e", CHILD], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/", COST_SRC: pathToFileURL(fileURLToPath(new URL("../src/", import.meta.url))).href, COST_SHAPE: JSON.stringify(shape) },
@@ -75,13 +82,10 @@ function measure(shape: [number, number, number, number]): Report {
   return report;
 }
 
-// Measured (2 runs): 256 KiB of live values register 6.7M to 25.3M units by shape (40M cap, RUN_ENV_FORM_CHARS_MAX); the
-// full bounds stop at 40.0M units and 32 MiB of heap; a 35.5M-unit claim (15840 forms) grows the heap 49 MiB
-// and one add takes under 1 ms on each index.
 describe("the cost of a claim's forms at the store bounds", () => {
   it("the full bounds trip the budget and stay within the heap and per-add limits", () => {
     // 50 live variables of 5242 bytes (262100 of 262144) and 300 retired versions of 8738 bytes (2621400 of 2621440).
-    const r = measure([50, 5242, 300, 8738]);
+    const r = measure([50, 5242, 300, 8738, false]);
     assert.equal(r.overBudget, true);
     assert.ok(r.growthMiB <= HEAP_GROWTH_MAX_MIB, `heap grew ${r.growthMiB.toFixed(1)} MiB`);
     assert.ok(r.buildMs <= BUILD_MAX_MS, `building the forms took ${r.buildMs.toFixed(0)} ms`);
@@ -92,7 +96,30 @@ describe("the cost of a claim's forms at the store bounds", () => {
   });
 
   it("a claim just under the budget builds complete forms and keeps both indexes within the limits", () => {
-    const r = measure([50, 5242, 60, 8738]);
+    const r = measure([50, 5242, 40, 8738, false]);
+    assert.equal(r.overBudget, false);
+    assert.ok(r.formChars > 20_000_000, `a realistic large claim: ${r.formChars} units`);
+    assert.ok(r.needles > 0);
+    assert.ok(r.growthMiB <= HEAP_GROWTH_MAX_MIB, `heap grew ${r.growthMiB.toFixed(1)} MiB`);
+    assert.ok(r.buildMs <= BUILD_MAX_MS, `building the forms took ${r.buildMs.toFixed(0)} ms`);
+    assert.ok(r.setAddMs <= ONE_ADD_MAX_MS, `SecretSet.add took ${r.setAddMs.toFixed(1)} ms`);
+    assert.ok(r.logAddMs <= ONE_ADD_MAX_MS, `addSecret took ${r.logAddMs.toFixed(1)} ms`);
+    assert.ok(r.setMasked && r.logMasked && r.addedMasked, "a planted line and the added form are masked");
+  });
+
+  it("control-character values at the full bounds trip the budget and stay within the limits", () => {
+    const r = measure([50, 5242, 300, 8738, true]);
+    assert.equal(r.overBudget, true);
+    assert.ok(r.growthMiB <= HEAP_GROWTH_MAX_MIB, `heap grew ${r.growthMiB.toFixed(1)} MiB`);
+    assert.ok(r.buildMs <= BUILD_MAX_MS, `building the forms took ${r.buildMs.toFixed(0)} ms`);
+    assert.ok(r.setAddMs <= ONE_ADD_MAX_MS, `SecretSet.add took ${r.setAddMs.toFixed(1)} ms`);
+    assert.ok(r.logAddMs <= ONE_ADD_MAX_MS, `addSecret took ${r.logAddMs.toFixed(1)} ms`);
+    assert.ok(r.setMasked && r.logMasked && r.addedMasked, "the raw values and the added form are masked");
+    assert.equal(r.needles, 0, "no partial needle set");
+  });
+
+  it("a control-character claim just under the budget builds complete forms and keeps both indexes within the limits", () => {
+    const r = measure([20, 5242, 8, 8738, true]);
     assert.equal(r.overBudget, false);
     assert.ok(r.formChars > 20_000_000, `a realistic large claim: ${r.formChars} units`);
     assert.ok(r.needles > 0);
