@@ -2171,11 +2171,13 @@ defense-in-depth *on top of* this, not instead of it):
    None of the worker's own env (join token, PAT) is inherited;
    `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are explicitly unset so they
    can't outrank the OAuth token. Repo variables are folded in at the lowest
-   precedence: a key already present, a protected git-config carrier or a
-   denied name (`fixtures/run-env/name-rules.json`) is dropped, so a variable
-   can never replace a worker credential or steer the harness. The agent can
-   read every value it is given; secret values are redacted from run output and
-   every publish is scanned for them, failing closed. The agent only edits
+   precedence. Existing keys, protected git-config carriers and names denied by
+   the pinned rules (`fixtures/run-env/name-rules.json`) are dropped. The rules
+   reserve worker credentials and harness controls; allowed application-setting
+   overlaps are recorded in ADR-4416. The agent can read every value it is
+   given. Output redaction and publication checks cover the registered secret
+   forms; an incomplete publication scan withholds the publish. Exact-match and
+   multiline limitations are recorded in ADR-4416. The agent only edits
    files and makes local commits; when it signals done, the worker performs the
    push and MR.
 

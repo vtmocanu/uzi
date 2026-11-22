@@ -6,7 +6,10 @@
 // build here is exactly what the agent's Bash tool and every child it spawns
 // will see. That is the load-bearing property behind the primary directive:
 //
-//   - The agent gets ONLY the Anthropic OAuth token + HOME + PATH.
+//   - The agent gets the worker-built replacement environment (the Anthropic
+//     OAuth token, HOME, PATH and the other worker-set keys) plus, on a
+//     lead-lane run, the permitted repo run variables at the lowest
+//     precedence (ADR-4416).
 //   - The worker's own secrets — the join token (UZI_WORKER_TOKEN) and the
 //     GitLab bot PAT — are NEVER in this object, so they cannot leak into the
 //     agent subprocess (the worker, not the agent, performs authenticated git).
