@@ -1112,10 +1112,11 @@ export function buildRunLaneReconcile(
     // Provider keys are claim-delivered authority, independent of vendor vault/meter admission.
     // Each fresh boundary registers the same frozen key; no credential exchange or retry occurs.
     if (binding.authMode === "provider") {
-      if (authoritySignal?.aborted || expired()) return blocked();
-      if (!cause && cleanCheckpointAdmission(request.checkpointStop, lifecycleSignal)) {
+      if (!cause && !boundarySignal.aborted && now() < deadlineAt &&
+          cleanCheckpointAdmission(request.checkpointStop, lifecycleSignal)) {
         throw new CheckpointSoftDeadlineError();
       }
+      if (authoritySignal?.aborted || expired()) return blocked();
       assertCurrent?.();
       registerToken(binding.providerBinding.credential);
       return { kind: "ready" };

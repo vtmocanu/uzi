@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { CheckpointSoftDeadlineError } from "../src/checkpoint-stop.js";
+import { PauseNowSignal } from "../src/steering.js";
 import type { ClaimCodexProviderBinding } from "../src/protocol.js";
 import { decodeProviderBinding } from "../src/provider-binding.js";
 import { createCodexProviderExecutionAuthority, selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
@@ -89,6 +91,31 @@ describe("Codex provider execution authority bridge contract", () => {
       undefined, undefined, () => { throw new Error("retired"); });
     await assert.rejects(fenced(request, signal), /retired/);
     assert.deepEqual(calls, []);
+  });
+
+  it("provider soft admission accepts two typed pause lifecycles without credential exchange", async () => {
+    const client = {
+      releaseCodex: async (): Promise<never> => assert.fail("provider must not release"),
+      refreshCodex: async (): Promise<never> => assert.fail("provider must not refresh"),
+    };
+    const authority = createCodexProviderExecutionAuthority(provider());
+    for (const obstacle of ["none", "captured hard cancel", "actual hard cancel", "boundary cancel", "deadline", "retired"] as const) {
+      const captured = new AbortController(), actual = new AbortController(), soft = new AbortController();
+      captured.abort(obstacle === "captured hard cancel" ? new Error("hard stop") : new PauseNowSignal());
+      actual.abort(obstacle === "actual hard cancel" ? new Error("hard stop") : new PauseNowSignal());
+      soft.abort();
+      const stop = { signal: soft.signal, lifecycleSignal: captured.signal,
+        cooperativeLifecycleReason: (value: unknown) => value instanceof PauseNowSignal };
+      const reconcile = buildRunLaneReconcile("run", client, authority,
+        () => assert.fail("stopped provider must not register a token"), undefined,
+        () => assert.fail("provider requires no vault"), actual.signal,
+        () => { if (obstacle === "retired") throw new Error("retired"); });
+      const result = reconcile({ ...request, deadlineMs: obstacle === "deadline" ? 0 : 1000,
+        checkpointStop: stop }, obstacle === "boundary cancel" ? AbortSignal.abort() : signal);
+      if (obstacle === "none") await assert.rejects(result, CheckpointSoftDeadlineError);
+      else if (obstacle === "retired") await assert.rejects(result, /retired/);
+      else assert.equal((await result).kind, "blocked", obstacle);
+    }
   });
 
   it("preserves vendor capability fencing, release and subscription refresh", async () => {
