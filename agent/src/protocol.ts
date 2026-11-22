@@ -3399,11 +3399,10 @@ export interface StateRequest {
    *  the server allowlists it against its own closed enum and drops anything else,
    *  so the authoritative copy of the vocabulary stays on the trusted side. */
   fail_origin?: string;
-  /** failed (PRD #377 M1): the agent's branch diff, preserved for a human to land when a
-   *  GitHub run's branch touches `.github/workflows/**` — a path the bot's repo-only PAT
-   *  cannot push, so the run fails early with `fail_origin: "workflow_scope_missing"`
-   *  instead of face-planting into the push rejection and discarding the work. Additive +
-   *  optional and carried ONLY on that `failed` report (worker→api); the worker already
+  /** failed (PRD #377 M1): the agent's branch diff, preserved for a human to land when the
+   *  run fails before its push (a workflow-scope, CI-config guard, history-rewrite or
+   *  base-align failure). Additive + optional and carried only on such a `failed` report
+   *  (worker→api); the worker already
    *  secret-scrubs it (redactText) and then size-caps it (capReviewDiff in scanGatedPatch), and the server
    *  clamps it again before storing. Absent on every other report. */
   preserved_patch?: string;

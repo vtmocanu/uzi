@@ -233,7 +233,7 @@ describe("the largest claim redacts in bounded time", () => {
 
   it("dense PEM armor text against many PEM-valued secrets that share the armor key redacts in under 5 s", () => {
     // Every PEM value begins with the same 8-unit key ("-----BEG"), so one table bucket holds every value's
-    // whole-value forms and the text is dense with armor lines that hit that bucket at nearly every position.
+    // whole-value forms; the text repeats armor lines, so that bucket is probed at the start of every BEGIN line.
     const count = limits.max_run_env_entries;
     const pems = Array.from({ length: count }, (_, i) => secretVar(`PEM_${i}`, pem(`dense-${i}`)));
     const forms = runEnvRedactionForms(pems, []);
