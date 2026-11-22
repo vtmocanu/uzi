@@ -415,7 +415,7 @@ function AgentRow({
         {pins.collapsed ? (
           <div role="group" aria-label="Claude and Codex model and effort" className="space-y-0.5">
             <div>{pins.rows[0].model.label}</div>
-            <div className="text-muted">{`effort: ${pins.rows[0].effort.label}`}</div>
+            <div className="text-faint">{`effort: ${pins.rows[0].effort.label}`}</div>
             <div className="text-xs text-faint">both harnesses</div>
           </div>
         ) : (
@@ -423,14 +423,14 @@ function AgentRow({
             {pins.rows.map((r) => (
               <div key={r.harness} role="group" aria-label={`${r.family} model and effort`}>
                 <div>{`${r.family}: ${r.model.label}`}</div>
-                <div className="text-muted">{`effort: ${r.effort.label}`}</div>
+                <div className="text-faint">{`effort: ${r.effort.label}`}</div>
               </div>
             ))}
           </div>
         )}
         {personalLine && <div className="mt-1 space-y-0.5 text-xs text-faint">{personalLine}</div>}
       </td>
-      <td className="max-w-xs truncate px-4 py-3 font-mono text-xs text-muted">{summarizeTools(t)}</td>
+      <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-muted">{summarizeTools(t)}</td>
       <td className="px-4 py-3 text-center">
         <input
           type="checkbox"
