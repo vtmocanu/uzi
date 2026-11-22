@@ -41,7 +41,7 @@ func frozenCodexWakeRun(t *testing.T, p *provFix) store.Run {
 }
 
 func codexWakeCaps() []string {
-	return []string{capability.RepoAgentSourceV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1}
+	return []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1, capability.RepoAgentSourceV1}
 }
 
 func setWakeCaps(f *hibFx, id uuid.UUID, caps []string) {
