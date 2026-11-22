@@ -37154,11 +37154,67 @@ describe("M2 provider executor composition", () => {
     // No claim about final-root provisioning/disposal: the hook stops before it.
   });
 
+  for (const mapped of [false, true]) {
+    it(`provider delegated child uses ${mapped ? "role slot" : "default fallback"} for RPCs, context and accounting`, async () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport
+            .push(toolCall(11, "uzi_bash", { command: "echo mapped-child" }, "th-child", "tn-child", "child-shell"))
+            .push(tokenUsageUpdated("th-child", "tn-child", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+            .push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      } });
+      const binding = createCodexProviderExecutionAuthority({
+        ...providerClaim(),
+        model_map: {
+          default: { model: "corp-default", context_window: 32768 },
+          ...(mapped ? { "gpt-6.1-sol": { model: "corp-child", context_window: 65536 } } : {}),
+        },
+      });
+      const { ctx, emitted } = makeCtx({ agents: [
+        { name: "lead", description: "lead", prompt_body: "lead body" },
+        { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-6.1-sol" },
+      ] });
+      rig.transport.push(threadStarted())
+        .push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "root-child"));
+      const running = makeExecutor(rig, binding).run(ctx);
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "mapped child settled");
+      rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+      await withTimeout(running, 3000, "mapped child run");
+      const model = mapped ? "corp-child" : "corp-default";
+      const start = rec(rig.transport.requests.filter(r => r.method === "thread/start")[1]!.params);
+      const turn = rec(rig.transport.requests.filter(r => r.method === "turn/start")[1]!.params);
+      assert.equal(start.model, model);
+      assert.equal(turn.model, model);
+      assert.equal(rec(start.config).model_context_window, mapped ? 65536 : 32768);
+      assert.deepEqual(start.environments, []);
+      assert.deepEqual(turn.environments, []);
+      assertNoNativeServers(start.config);
+      assert.ok(rig.spawnCommandCalls.some(s => JSON.stringify(s.argv).includes("echo mapped-child")));
+      const usage = lastResultModelUsage(emitted)!;
+      assert.deepEqual(Object.keys(usage), [model]);
+      assert.equal(rec(usage[model]).inputTokens, 200);
+      assert.equal(rec(usage[model]).outputTokens, 100);
+      assert.equal(rec(usage[model]).costUSD, undefined);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
+
   it("refuses unmapped explicit models before login or vendor release", async () => {
     const rig = makeRig();
     const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()));
+    let admissions = 0;
     const { ctx } = makeCtx({ config: { default_model: "gpt-6-astra", default_model_source: "run_override" } });
+    ctx.prepareCodexRootDispatch = async () => { admissions++; return () => {}; };
     await assert.rejects(executor.run(ctx), /provider_model_unmapped/);
+    assert.equal(admissions, 0);
+    assert.equal(rig.transport.threadStartCount, 0);
+    assert.equal(rig.transport.turnStartCount, 0);
     assert.equal(rig.providerLaunches(), 0);
     assert.equal(rig.client.releaseCalls.length, 0);
     assert.equal(rig.client.refreshCalls.length, 0);

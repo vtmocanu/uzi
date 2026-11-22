@@ -5923,7 +5923,7 @@ export class CodexExecutor implements Executor {
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
-            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs), ctx),
+            this.startChildTurn(harness!, provider, binding, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs), ctx),
           spawnCommand,
           fileop,
           worktreePath,
@@ -7063,6 +7063,7 @@ export class CodexExecutor implements Executor {
   private startChildTurn(
     harness: CodexHarness,
     provider: CodexProviderConfig,
+    binding: CodexExecutionAuthority,
     workspace: string,
     spec: StartChildTurnSpec,
     interruptDeadlineMs: number,
@@ -7071,19 +7072,29 @@ export class CodexExecutor implements Executor {
     return (async (): Promise<ChildThreadController> => {
       // Preparation may construct B's broker before ordinary work is admitted.
       this.assertSwitchAdmission();
+      // Resolve internal role selections against THIS epoch's immutable authority, never
+      // the owner's current provider source. Internal models without a slot use default.
+      const entry = binding.authMode === "provider"
+        ? binding.providerBinding.model_map[resolveCodexProviderModelSlot(spec.model, binding.providerBinding.model_map)]
+        : undefined;
+      const childModel = entry?.model ?? spec.model ?? provider.model;
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
       // project / doc-max-0 config, never a hook-trust bypass).
       const threadRes = await harness.requestOnTransport<{ thread?: { id?: string } }>(
         "thread/start",
         {
-          model: spec.model ?? provider.model,
+          model: childModel,
           modelProvider: provider.name,
           cwd: workspace,
           approvalPolicy: "never",
           ephemeral: true,
           environments: [],
           dynamicTools: buildCodexDynamicTools(spec.grants),
-          config: { project_doc_max_bytes: 0, projects: { [workspace]: { trust_level: "untrusted" } } },
+          config: {
+            project_doc_max_bytes: 0,
+            projects: { [workspace]: { trust_level: "untrusted" } },
+            ...(entry?.context_window !== undefined ? { model_context_window: entry.context_window } : {}),
+          },
           developerInstructions: spec.systemPrompt,
         },
         { signal: spec.signal },
@@ -7092,11 +7103,8 @@ export class CodexExecutor implements Executor {
       if (typeof childThreadId !== "string" || childThreadId.length === 0) {
         throw new Error("codex child thread/start returned no thread id");
       }
-      // PRD #1332 C4a: capture the CHILD thread->model mapping the moment the child thread id
-      // is known, with the SAME model selected for its thread/start (`spec.model ?? provider.
-      // model`). Without this the child's token-usage notes would be an unknown thread and its
-      // usage would be dropped rather than charged to its actual model.
-      harness.recordChildThreadModel(childThreadId, spec.model ?? provider.model);
+      // Charge child usage to the same mapped model sent to thread/start and turn/start.
+      harness.recordChildThreadModel(childThreadId, childModel);
       // Register the sink BEFORE turn/start so no child turn frame is missed by the demux.
       const sink = new ChildFrameQueue();
       harness.registerChildSink(childThreadId, sink);
@@ -7108,7 +7116,7 @@ export class CodexExecutor implements Executor {
           environments: [],
           input: [{ type: "text", text: spec.taskInput }],
         };
-        if (spec.model !== undefined) turnParams.model = spec.model;
+        if (binding.authMode === "provider" || spec.model !== undefined) turnParams.model = childModel;
         if (spec.effort !== undefined) turnParams.effort = spec.effort;
         const revision = this.captureRevision;
         const check = (): void => {
