@@ -43,19 +43,27 @@ func (s *Service) SyncActiveMRTargets(ctx context.Context, repoID uuid.UUID, for
 			"event", "active_mr_targets_overflow", "repo", repoID, "page", activeMRTargetPageSize)
 	}
 
-	// The cursor advances only over rows this pass actually attempted (a row counts once its
-	// MR read was issued or answered from this pass's cache), so a deadline that keeps
-	// expiring mid-page resumes after the last attempted row instead of retrying the same
-	// prefix forever. A pass that attempted nothing leaves the cursor where it was.
-	var lastAttempted uuid.UUID
-	attempted := false
+	// The cursor advances only over rows this pass got through, so a deadline that keeps
+	// expiring mid-page never starves the rows after it. An interrupted pass resumes after the
+	// last row whose MR read finished (so the row the deadline cut off is retried first next
+	// pass); when no read finished, it resumes after the last attempted row, so a row whose read
+	// always hangs is skipped after one retry. A pass that attempted nothing leaves the cursor
+	// where it was.
+	var lastAttempted, lastCompleted uuid.UUID
+	attempted, completed := false, false
+	interrupted := func() error {
+		switch {
+		case completed:
+			s.setActiveTargetCursor(repoID, lastCompleted)
+		case attempted:
+			s.setActiveTargetCursor(repoID, lastAttempted)
+		}
+		return ctx.Err()
+	}
 	summaries := make(map[int64]*forge.MergeRequestSummary, len(rows))
 	for _, row := range rows {
 		if ctx.Err() != nil {
-			if attempted {
-				s.setActiveTargetCursor(repoID, lastAttempted)
-			}
-			return ctx.Err()
+			return interrupted()
 		}
 		lastAttempted, attempted = row.ID, true
 		sum, seen := summaries[row.TargetMrIid]
@@ -68,8 +76,12 @@ func (s *Service) SyncActiveMRTargets(ctx context.Context, repoID uuid.UUID, for
 			} else {
 				sum = &got
 			}
+			if ctx.Err() != nil {
+				return interrupted() // the deadline cut this read off: retry this row first
+			}
 			summaries[row.TargetMrIid] = sum // nil caches a failed read for this pass
 		}
+		lastCompleted, completed = row.ID, true
 		if sum == nil {
 			continue
 		}
@@ -80,6 +92,9 @@ func (s *Service) SyncActiveMRTargets(ctx context.Context, repoID uuid.UUID, for
 		if err := s.terminalTargetCanceller.CancelRunForTerminalTarget(ctx, repoID, obs); err != nil {
 			slog.Warn("forgesvc: terminal-target cancel failed, will retry", "repo", repoID, "run", row.ID, "mr", row.TargetMrIid, "state", obs.State, "error", err)
 		}
+	}
+	if ctx.Err() != nil {
+		return interrupted()
 	}
 	// A completed pass continues after the page when more rows exist, else wraps around.
 	if overflow {

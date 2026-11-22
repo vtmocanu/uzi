@@ -385,3 +385,73 @@ func TestSyncActiveMRTargetsInterruptedPassesEventuallyInspectEveryRun(t *testin
 		})
 	}
 }
+
+// A real forge client fails the read the deadline interrupts. That row must be retried on the
+// next pass, not skipped: with the deadline cutting every pass's third read, rows 3, 6, 9...
+// would otherwise never be inspected. A row whose read always hangs is still passed over, so
+// it cannot block the rows after it.
+func TestSyncActiveMRTargetsInterruptedReadIsRetriedAndHangingRowSkipped(t *testing.T) {
+	const total = 10
+	newFixture := func() (*fakeStore, *summaryForge, []store.ListActiveMRTargetRunsRow) {
+		var runs []store.ListActiveMRTargetRunsRow
+		f := &summaryForge{byIID: map[int64]forge.MergeRequestSummary{}, errs: map[int64]error{}}
+		for i := 0; i < total; i++ {
+			id := uuid.UUID{}
+			id[0] = byte(i + 1)
+			iid := int64(100 + i)
+			runs = append(runs, activeRow(id, "ci_fix", iid, activeTestBranch))
+			f.byIID[iid] = goodSummary(iid, forge.MRStateMerged)
+		}
+		return &fakeStore{activeTargetRuns: runs}, f, runs
+	}
+	runPasses := func(t *testing.T, svc *Service, f *summaryForge, c *fakeTerminalCanceller, cut func(iid int64, read int) bool) map[uuid.UUID]bool {
+		t.Helper()
+		seen := map[uuid.UUID]bool{}
+		repo := uuid.New()
+		for pass := 0; pass < 4*total && len(seen) < total; pass++ {
+			ctx, cancel := context.WithCancel(context.Background())
+			reads := 0
+			f.hook = func(iid int64) {
+				reads++
+				if cut(iid, reads) {
+					cancel()
+					f.errs[iid] = context.Canceled // the interrupted read fails, as a real client's does
+				} else {
+					delete(f.errs, iid)
+				}
+			}
+			if err := svc.SyncActiveMRTargets(ctx, repo, testProjectID, f); err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("pass %d: %v", pass, err)
+			}
+			cancel()
+			for _, o := range c.obs {
+				seen[o.RunID] = true
+			}
+		}
+		return seen
+	}
+
+	t.Run("every third read cut off", func(t *testing.T) {
+		st, f, _ := newFixture()
+		c := &fakeTerminalCanceller{}
+		svc := newTestService(st)
+		svc.SetTerminalTargetCanceller(c)
+		seen := runPasses(t, svc, f, c, func(_ int64, read int) bool { return read == 3 })
+		if len(seen) != total {
+			t.Fatalf("inspected %d of %d runs; the row each deadline cut off was never retried", len(seen), total)
+		}
+	})
+	t.Run("a row whose read always hangs is skipped", func(t *testing.T) {
+		st, f, runs := newFixture()
+		c := &fakeTerminalCanceller{}
+		svc := newTestService(st)
+		svc.SetTerminalTargetCanceller(c)
+		const hung = int64(104)
+		seen := runPasses(t, svc, f, c, func(iid int64, _ int) bool { return iid == hung })
+		for _, r := range runs {
+			if r.TargetMrIid != hung && !seen[r.ID] {
+				t.Fatalf("run on MR %d starved behind the hanging MR %d", r.TargetMrIid, hung)
+			}
+		}
+	})
+}
