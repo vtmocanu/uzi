@@ -163,15 +163,17 @@ $$;
 -- +goose StatementEnd
 
 -- fn_run_env_publication_pending: whether a run still has recovery custody or a publication in
--- flight: an open custody hold, a capture not yet expired or discarded, a held-work publication
--- that is prepared, invoked or of unknown outcome, or a terminal preservation that is bound,
--- publishing or live. The run-env redact route stays open for a terminal run while this holds.
+-- flight: an open custody hold, a capture that is preparing or uploading, a held-work publication
+-- that is prepared, invoked or of unknown outcome, or a terminal preservation that is bound or
+-- publishing. A settled state (a capture that is available or needs action, a created held
+-- publication, a live terminal preservation) does not hold. The run-env redact route stays open
+-- for a terminal run while this holds.
 -- +goose StatementBegin
 CREATE FUNCTION fn_run_env_publication_pending(p_run_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
     SELECT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = p_run_id AND h.state = 'open')
-        OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = p_run_id AND c.state NOT IN ('expired', 'discarded'))
+        OR EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = p_run_id AND c.state IN ('preparing', 'uploading'))
         OR EXISTS (SELECT 1 FROM run_held_publications p WHERE p.run_id = p_run_id AND p.state IN ('prepared', 'invoked', 'create_unknown'))
-        OR EXISTS (SELECT 1 FROM run_terminal_preservations t WHERE t.run_id = p_run_id AND t.state IN ('bound', 'publishing', 'live'))
+        OR EXISTS (SELECT 1 FROM run_terminal_preservations t WHERE t.run_id = p_run_id AND t.state IN ('bound', 'publishing'))
 $$;
 -- +goose StatementEnd
 

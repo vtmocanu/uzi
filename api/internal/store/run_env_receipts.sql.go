@@ -442,10 +442,12 @@ WHERE r.id = $1 AND r.kind = 'cross_check'
 `
 
 // Whether the redact route still answers for the requested run, which is not the governing run.
-// A run that is not terminal is served. A terminal run is served while it has recovery custody or
-// a publication in flight (fn_run_env_publication_pending). A cross-check child that is not
-// terminal is also served while its cross_checks row is open: a pending plan verdict or a pending
-// code outcome, before its deadline.
+// A run that is not a cross-check child is served while it is not terminal. A cross-check child
+// is served only while it is not terminal and its cross_checks row is open (a pending plan
+// verdict or a pending code outcome, before its deadline). Either is also served while
+// fn_run_env_publication_pending holds (an open custody hold, a capture preparing or uploading,
+// a held publication prepared, invoked or of unknown outcome, a terminal preservation bound or
+// publishing).
 func (q *Queries) RunEnvRedactOpen(ctx context.Context, runID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, runEnvRedactOpen, runID)
 	var open bool

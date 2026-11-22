@@ -33,14 +33,16 @@ func (h *Handler) runEnvRedactor() runEnvRedactor {
 // WorkerRunEnvRedact answers GET /api/worker/runs/{id}/run-env-redact (PRD #4416 M2). Worker
 // bearer authentication; the run must be the worker's user's and one this worker holds or last
 // held, or whose open recovery custody hold this worker took, else 404 with code
-// run_env_run_not_found (a deleted run is 404 too). {protected:false} when the run has no governing run (not a lead-lane run, not a
-// cross-check child) or its governing run has no secret receipt, otherwise every secret version
-// the governing run was delivered (a cross-check child: its lead's); 409 run_env_redact_closed
-// when versions would be returned but the requested run is terminal with no recovery custody or
-// publication in flight, or is a cross-check child whose check is no longer open. 409 vault_locked when the owner's
-// vault is locked, 409 run_env_history_unavailable when a receipted version is missing or cannot
-// be opened. The body carries plaintext secrets: Cache-Control: no-store on every answer, and
-// nothing here logs it.
+// run_env_run_not_found (a deleted run is 404 too). {protected:false} when the run has no
+// governing run (not a lead-lane run, not a cross-check child) or its governing run has no
+// secret receipt, otherwise every secret version the governing run was delivered (a cross-check
+// child: its lead's); 409 run_env_redact_closed when versions would be returned but the
+// requested run is terminal with no open custody hold, no capture preparing or uploading, no
+// held publication in flight and no terminal preservation bound or publishing, or is a
+// cross-check child that is terminal or whose check is no longer open, with the same exceptions.
+// 409 vault_locked when the owner's vault is locked, 409 run_env_history_unavailable when a
+// receipted version is missing or cannot be opened. The body carries plaintext secrets:
+// Cache-Control: no-store on every answer, and nothing here logs it.
 func (h *Handler) WorkerRunEnvRedact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	wkr, ok := mw.WorkerFromContext(r.Context())

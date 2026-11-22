@@ -280,7 +280,8 @@ func TestRunEnvRedactNonLeadLaneRunIsUnprotectedLiveDB(t *testing.T) {
 }
 
 // A cross-check child is served while its check is open; once it is terminal, or its check has
-// passed its deadline, the route is closed unless the child itself holds recovery state.
+// passed its deadline or been decided, the route is closed unless the child itself has recovery
+// work in flight.
 func TestRunEnvRedactCrossCheckChildBoundedLiveDB(t *testing.T) {
 	setup := func(t *testing.T, stage string) crossCheckContentionFixture {
 		t.Helper()
@@ -310,21 +311,34 @@ func TestRunEnvRedactCrossCheckChildBoundedLiveDB(t *testing.T) {
 				t.Fatalf("err = %v, want ErrRunEnvRedactClosed", err)
 			}
 		})
-		t.Run(stage+"/terminal child with its own live capture is served", func(t *testing.T) {
+		t.Run(stage+"/terminal child with its own uploading capture is served", func(t *testing.T) {
 			f := setup(t, stage)
 			f.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, f.runID)
 			hold, capture := uuid.New(), uuid.New()
 			f.env.exec(`INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
 			    VALUES($1,$2,(SELECT repo_id FROM runs WHERE id=$3),$3,1,'open',$4,'redact-fixture')`, hold, f.userID, f.runID, f.workerID)
 			f.env.exec(`INSERT INTO recovery_captures(id,hold_id,run_id,user_id,original_worker_id,original_worker_identity,source_sha,idempotency_key,state)
-			    VALUES($1,$2,$3,$4,$5,'redact-fixture','sha','redact-capture','available')`, capture, hold, f.runID, f.userID, f.workerID)
-			t.Cleanup(func() {
-				f.env.exec(`UPDATE recovery_captures SET state='discarded' WHERE id=$1`, capture)
-				f.env.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
-					released_at=now(),updated_at=now() WHERE id=$1`, hold)
-			})
+			    VALUES($1,$2,$3,$4,$5,'redact-fixture','sha','redact-capture','uploading')`, capture, hold, f.runID, f.userID, f.workerID)
+			// The hold is only the capture's parent: settle it so the capture is the sole arm.
+			f.env.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
+				released_at=now(),updated_at=now() WHERE id=$1`, hold)
 			if res, err := redact(f); err != nil || !res.Protected {
 				t.Fatalf("%+v, %v; want protected", res, err)
+			}
+			f.env.exec(`UPDATE recovery_captures SET state='available' WHERE id=$1`, capture)
+			if _, err := redact(f); !errors.Is(err, ErrRunEnvRedactClosed) {
+				t.Fatalf("available capture: err = %v, want ErrRunEnvRedactClosed", err)
+			}
+		})
+		t.Run(stage+"/non-terminal child with a decided check is closed", func(t *testing.T) {
+			f := setup(t, stage)
+			if stage == "plan" {
+				f.env.exec(`UPDATE cross_checks SET verdict='approve', reason_class='approve', decided_at=now() WHERE checker_run_id=$1`, f.runID)
+			} else {
+				f.env.exec(`UPDATE cross_checks SET outcome='failed', reason_class='timed_out', decided_at=now() WHERE checker_run_id=$1`, f.runID)
+			}
+			if _, err := redact(f); !errors.Is(err, ErrRunEnvRedactClosed) {
+				t.Fatalf("err = %v, want ErrRunEnvRedactClosed", err)
 			}
 		})
 	}

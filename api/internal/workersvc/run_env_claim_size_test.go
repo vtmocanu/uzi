@@ -10,9 +10,9 @@ import (
 )
 
 // pinnedRunEnvWorstCaseBytes bounds the serialized run_env and run_env_redact at the worst case
-// the test below builds from the store's own limits. Every value, description and name byte is a
+// the test below builds from the store's own limits. Every value and description byte is a
 // control byte 0x01, which encoding/json writes as the six bytes \u0001, so wire bytes are six
-// times payload bytes:
+// times payload bytes. A name is MaxNameBytes plain ASCII 'N' bytes, one wire byte each:
 //
 //	run_env: MaxVarsPerScope (50) entries holding MaxScopeValueBytes (262144) value bytes in all,
 //	each value at most MaxValueBytes (65536): 1,572,864 wire bytes of value. Each entry also has

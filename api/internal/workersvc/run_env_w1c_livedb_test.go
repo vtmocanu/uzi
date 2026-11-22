@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -185,6 +186,97 @@ func TestRunEnvRedactRefusesWhenHistoryCannotBeOpenedLiveDB(t *testing.T) {
 		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvVaultLocked) {
 			t.Fatalf("err = %v, want ErrRunEnvVaultLocked", err)
 		}
+	})
+}
+
+// openHold inserts an open custody hold of the fixture's worker on the run, the parent a capture or
+// a held publication row needs; closeHold settles it the way the fixture cleanups do.
+func (fx *reFix) openHold(runID uuid.UUID) uuid.UUID {
+	hold := uuid.New()
+	fx.env.exec(`INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
+	    VALUES($1,$2,$3,$4,1,'open',$5,'redact-fixture')`, hold, fx.userID, fx.repoID, runID, fx.workerID)
+	return hold
+}
+
+func (fx *reFix) closeHold(hold uuid.UUID) {
+	fx.env.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
+		released_at=now(),updated_at=now() WHERE id=$1`, hold)
+}
+
+// Each arm of fn_run_env_publication_pending alone, with no open custody hold except where the arm
+// is the hold: a terminal run is served while the arm's in-flight state holds, and closed once the
+// arm reaches a settled state. Rows that need a hold parent get one, then the hold is closed.
+func TestRunEnvRedactPublicationPendingArmsAloneLiveDB(t *testing.T) {
+	setup := func(t *testing.T) (*reFix, uuid.UUID) {
+		fx, runID, _ := redactFix(t)
+		fx.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, runID)
+		return fx, runID
+	}
+	served := func(t *testing.T, fx *reFix, runID uuid.UUID, why string) {
+		t.Helper()
+		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); err != nil || !res.Protected {
+			t.Fatalf("%s: %+v, %v; want served", why, res, err)
+		}
+	}
+	closed := func(t *testing.T, fx *reFix, runID uuid.UUID, why string) {
+		t.Helper()
+		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvRedactClosed) {
+			t.Fatalf("%s: err = %v, want ErrRunEnvRedactClosed", why, err)
+		}
+	}
+	t.Run("open custody hold", func(t *testing.T) {
+		fx, runID := setup(t)
+		hold := fx.openHold(runID)
+		served(t, fx, runID, "open hold")
+		fx.closeHold(hold)
+		closed(t, fx, runID, "released hold")
+	})
+	t.Run("capture", func(t *testing.T) {
+		fx, runID := setup(t)
+		hold := fx.openHold(runID)
+		fx.env.exec(`INSERT INTO recovery_captures(id,hold_id,run_id,user_id,original_worker_id,original_worker_identity,source_sha,idempotency_key,state)
+		    VALUES($1,$2,$3,$4,$5,'redact-fixture','sha','redact-capture','uploading')`, uuid.New(), hold, runID, fx.userID, fx.workerID)
+		fx.closeHold(hold)
+		served(t, fx, runID, "capture uploading, hold closed")
+		fx.env.exec(`UPDATE recovery_captures SET state='available' WHERE hold_id=$1`, hold)
+		closed(t, fx, runID, "capture available")
+		fx.env.exec(`UPDATE recovery_captures SET state='needs_action' WHERE hold_id=$1`, hold)
+		closed(t, fx, runID, "capture needs_action")
+	})
+	t.Run("held publication", func(t *testing.T) {
+		fx, runID := setup(t)
+		hold := fx.openHold(runID)
+		// The insert guard admits only a prepared row; invoked and created follow through the
+		// transitions held_publication_guard allows.
+		fx.env.exec(`INSERT INTO run_held_publications(run_id,generation,hold_id,user_id,repo_id,worker_id,live_run_id,ref,tip,coverage_digest,state)
+		    VALUES($1,1,$2,$3,$4,$5,$1,$6,$7,$8,'prepared')`, runID, hold, fx.userID, fx.repoID, fx.workerID,
+			"refs/uzi-held/"+runID.String()+"/1", strings.Repeat("a", 40), strings.Repeat("b", 64))
+		fx.closeHold(hold)
+		served(t, fx, runID, "held publication prepared")
+		fx.env.exec(`UPDATE run_held_publications SET state='invoked', create_invoked_at=now() WHERE run_id=$1`, runID)
+		served(t, fx, runID, "held publication invoked")
+		fx.env.exec(`UPDATE run_held_publications SET state='create_unknown' WHERE run_id=$1`, runID)
+		served(t, fx, runID, "held publication create_unknown")
+		fx.env.exec(`UPDATE run_held_publications SET state='created' WHERE run_id=$1`, runID)
+		closed(t, fx, runID, "held publication created")
+	})
+	t.Run("terminal preservation", func(t *testing.T) {
+		fx, runID := setup(t)
+		tip := strings.Repeat("c", 40)
+		// A row is born bound; publishing, then live follow through the transitions
+		// run_terminal_preservation_guard allows, and live needs a published contribution at its tip.
+		fx.env.exec(`INSERT INTO run_terminal_preservations(run_id,user_id,repo_id,ref,lifetime_at_bind)
+		    VALUES($1,$2,$3,$4,'issue')`, runID, fx.userID, fx.repoID, "refs/uzi-terminal/"+runID.String())
+		served(t, fx, runID, "preservation bound")
+		fx.env.exec(`UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE run_id=$1`, runID)
+		served(t, fx, runID, "preservation publishing")
+		fx.env.exec(`INSERT INTO run_terminal_contributions(preservation_id,run_id,generation,worker_id,user_id,authority,tip,coverage_digest,manifest,disposition,state)
+		    VALUES((SELECT id FROM run_terminal_preservations WHERE run_id=$1),$1,1,$2,$3,'current_flight',$4,$5,'{}'::jsonb,'preserved','prepared')`,
+			runID, fx.workerID, fx.userID, tip, strings.Repeat("d", 64))
+		fx.env.exec(`UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE run_id=$1`, runID)
+		fx.env.exec(`UPDATE run_terminal_contributions SET state='published', published_at=now() WHERE run_id=$1`, runID)
+		fx.env.exec(`UPDATE run_terminal_preservations SET state='live', tip=$2 WHERE run_id=$1`, runID, tip)
+		closed(t, fx, runID, "preservation live")
 	})
 }
 

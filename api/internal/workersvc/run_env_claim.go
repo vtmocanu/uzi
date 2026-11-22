@@ -242,8 +242,9 @@ func (s *Service) openRunEnvRedact(owner uuid.UUID, row runEnvRedactRow) (string
 // ErrRunEnvVaultLocked, ErrRunEnvHistoryUnavailable and ErrRunEnvRedactClosed are the redact
 // maintenance route's typed refusals: the owner's vault is locked, a receipted version is missing
 // or cannot be opened, or the requested run is past the point the route answers for it (a
-// terminal run with no recovery custody or publication in flight, or a cross-check child whose
-// check is no longer open). None carries a value.
+// terminal run with no open custody hold, no capture preparing or uploading, no held publication
+// in flight and no terminal preservation bound or publishing, or a cross-check child that is
+// terminal or whose check is no longer open, with the same exceptions). None carries a value.
 var (
 	ErrRunEnvVaultLocked        = errors.New("run environment redact: vault locked")
 	ErrRunEnvHistoryUnavailable = errors.New("run environment redact: history unavailable")
@@ -258,8 +259,9 @@ var (
 // and one this worker holds or last held (runs.worker_id), or one whose open recovery custody
 // hold this worker took (the worker recovering a run another claim has since moved); anything
 // else is ErrRunNotOwned. When versions would be returned, the requested run must still be open
-// (RunEnvRedactOpen), else ErrRunEnvRedactClosed. The route is read-only, so there is no generation or repo check. The
-// result carries plaintext secrets: the caller must never log or cache it.
+// (RunEnvRedactOpen), else ErrRunEnvRedactClosed. The route is read-only, so there is no
+// generation or repo check. The result carries plaintext secrets: the caller must never log or
+// cache it.
 func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid.UUID) (RunEnvRedactResponse, error) {
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -293,6 +295,9 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 		return RunEnvRedactResponse{Protected: false}, nil
 	}
 	open, err := s.q.RunEnvRedactOpen(ctx, runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RunEnvRedactResponse{}, ErrRunNotOwned
+	}
 	if err != nil {
 		return RunEnvRedactResponse{}, fmt.Errorf("run env redact open: %w", err)
 	}

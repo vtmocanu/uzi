@@ -644,14 +644,19 @@ func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID
 
 // SetRepoEnvVarDisabled is POST /api/repos/{id}/env/{name}/disable and .../enable:
 // metadata-only on the live version (no new version, no history or vault capacity, no
-// unlock needed). Idempotent.
+// unlock needed). Idempotent. Disable applies the name shape only, so a stored name the rules
+// now deny can still be switched off; enable applies the full name rule.
 func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, disabled bool) {
 	userID, repoID, ok := h.runEnvOwner(w, r)
 	if !ok {
 		return
 	}
 	name := chi.URLParam(r, "name")
-	if err := runenv.ValidateNameShape(name); err != nil {
+	validate := runenv.ValidateName
+	if disabled {
+		validate = runenv.ValidateNameShape
+	}
+	if err := validate(name); err != nil {
 		writeRunEnvRule(w, err)
 		return
 	}
