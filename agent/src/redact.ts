@@ -195,6 +195,7 @@ export class LiteralIndex {
       const path: Array<{ parent: TrieNode; unit: number; edge: TrieEdge }> = [];
       let node = root;
       let pos = MIN_SECRET_LEN;
+      // The walk trusts edge lengths without comparing labels: `counts` held this literal, so its exact path exists.
       while (pos < literal.length) {
         const unit = literal.charCodeAt(pos);
         const edge = node.children?.get(unit);

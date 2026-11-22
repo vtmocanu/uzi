@@ -146,7 +146,7 @@ describe("LiteralIndex agrees with a naive reference", () => {
         for (let n = 0; n < 14; n++) text += rand() < 0.4 ? pick([...counts.keys(), ...keys]) : pick(pieces);
         check(index, new Set(counts.keys()), text, `seed ${seed} step ${step}`);
       }
-      for (const l of [...counts.keys()]) for (let n = counts.get(l)!; n > 0; n--) index.remove(l);
+      for (const [l, held] of counts) for (let n = held; n > 0; n--) index.remove(l);
       assert.equal(index.size, 0, `seed ${seed} drained`);
       assert.deepEqual(index.find(keys.join("")), []);
     }
