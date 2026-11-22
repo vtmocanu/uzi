@@ -2989,15 +2989,24 @@ export class CodexExecutor implements Executor {
         if (!authority || this.currentCodexAuthority !== authority)
           throw new TrustedExecutionRefusal("summary credential authority changed");
         authority.assertCurrent();
-        if (authority.binding.authMode === "provider" || params.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
-        if (params.binding.capability !== authority.binding.capability ||
-            params.binding.authMode !== authority.binding.authMode ||
-            params.binding.accessToken !== authority.binding.accessToken ||
-            (params.binding.authMode === "subscription" && authority.binding.authMode === "subscription" &&
-              (params.binding.generation !== authority.binding.generation ||
-               params.binding.chatgptAccountId !== authority.binding.chatgptAccountId ||
-               params.binding.chatgptPlanType !== authority.binding.chatgptPlanType)))
-          throw new TrustedExecutionRefusal("summary credential authority mismatch");
+        if (authority.binding.authMode === "provider" || params.binding.authMode === "provider") {
+          if (authority.binding.authMode !== "provider" || params.binding.authMode !== "provider" ||
+              !Object.isFrozen(params.binding) || !Object.isFrozen(params.binding.providerBinding) ||
+              !Object.isFrozen(params.binding.providerBinding.model_map) ||
+              !Object.values(params.binding.providerBinding.model_map).every(Object.isFrozen) ||
+              JSON.stringify(createCodexProviderExecutionAuthority(params.binding.providerBinding).providerBinding) !==
+                JSON.stringify(authority.binding.providerBinding))
+            throw new TrustedExecutionRefusal("summary credential authority mismatch");
+        } else {
+          if (params.binding.capability !== authority.binding.capability ||
+              params.binding.authMode !== authority.binding.authMode ||
+              params.binding.accessToken !== authority.binding.accessToken ||
+                (params.binding.authMode === "subscription" && authority.binding.authMode === "subscription" &&
+                (params.binding.generation !== authority.binding.generation ||
+                 params.binding.chatgptAccountId !== authority.binding.chatgptAccountId ||
+                 params.binding.chatgptPlanType !== authority.binding.chatgptPlanType)))
+            throw new TrustedExecutionRefusal("summary credential authority mismatch");
+        }
         this.assertSwitchAdmission();
       };
       assertAuthority();
@@ -3354,14 +3363,11 @@ export class CodexExecutor implements Executor {
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => {
       const admitted = currentAuthority;
-      if (admitted.binding.authMode === "provider") throw new TrustedExecutionRefusal("provider_lane_unsupported");
       admitted.assertCurrent();
       const prdText = (await prdInputP)?.prdText;
       admitted.assertCurrent();
       return {
-        claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
-          codex: admitted.claim,
-        } },
+        claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: admitted.binding.authMode === "provider" ? { provider: admitted.providerClaim } : { codex: admitted.claim } },
         token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
         issueBody: ctx.issueDescription, prdText,
       };

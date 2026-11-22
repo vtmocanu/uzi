@@ -253,7 +253,7 @@ import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSw
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
-import { selectCodexBinding } from "./codex/select.js";
+import { selectCodexBinding, selectCodexExecutionAuthority } from "./codex/select.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
@@ -16146,7 +16146,7 @@ export class RunRunner {
     // block throws there (fail-closed executor), so it counts as Codex-bound here too.
     let codexBound = false;
     try {
-      codexBound = selectCodexBinding({ codex: claim.secrets.codex }).kind === "codex";
+      codexBound = selectCodexExecutionAuthority(claim.secrets).kind === "codex";
     } catch {
       codexBound = true;
     }
@@ -17071,11 +17071,11 @@ export class RunRunner {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || claim.secrets.provider?.engine === "claude"),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex,
-                claim.secrets.codex && this.nowSummaryOpts.codexAdviceHarnessFactory
+                codexBound && this.nowSummaryOpts.codexAdviceHarnessFactory
                   ? executor.bindCodexSummaryFactory?.(this.nowSummaryOpts.codexAdviceHarnessFactory)
                     ?? this.nowSummaryOpts.codexAdviceHarnessFactory
                   : this.nowSummaryOpts.codexAdviceHarnessFactory,
-                claim.claim_generation),
+                claim.claim_generation, claim.secrets),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,

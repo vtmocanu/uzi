@@ -36615,12 +36615,107 @@ describe("Codex repeated actualRunner switching", () => {
 });
 
 describe("M2 provider executor composition", () => {
+  it("provider Now actual model pass preserves tokens without inventing vendor cost", async () => {
+    const { runReadOnlyModelPass } = await import("../src/model-pass.js");
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const transport = new FakeTransport(defaultResponder);
+    transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(agentMessage("Working on the provider milestone"))
+      .push(turnCompleted("completed")).end();
+    let disposed = 0;
+    const client = new Proxy({}, { get: (_target, name) => { throw new Error("unexpected vendor operation " + String(name)); } });
+    const factory = makeProductionCodexAdviceHarnessFactory(client as never, noopLog, "/unused", {
+      launchRoot: async () => ({ transport, cwd: "/isolated", dispose: async () => { disposed++; } }),
+    });
+    const snapshots: import("../src/harness.js").AdviceUsageSnapshot[] = [];
+    const text = await runReadOnlyModelPass({
+      provider: binding.providerBinding, codex: { runId: "provider-now", binding, buildHarness: factory },
+      homeRoot: path.resolve("../.uzi/scratch"), label: "now", model: "gpt-6-luna",
+      prompt: "Describe progress", systemPrompt: "Summarize", timeoutMs: 1000,
+      homePrefix: "uzi-now-test-", denyReason: "read only",
+      queryFn: (() => { assert.fail("provider Now must never use Claude"); }) as never,
+      log: noopLog, onUsage: u => { snapshots.push(u); },
+    });
+    assert.equal(text, "Working on the provider milestone");
+    assert.equal(disposed, 1);
+    assert.equal(snapshots.length, 1);
+    const observed = snapshots[0]!["corp-code"]!;
+    assert.equal(observed.inputTokens, 100);
+    assert.equal(observed.outputTokens, 20);
+    assert.equal(observed.costStatus, "unreported");
+    assert.equal(observed.costUSD, undefined);
+  });
+
   const providerClaim = () => ({
     provider_id: "fixture-code", revision: 1, engine: "codex" as const,
     protocol: "openai_responses" as const, auth_style: "bearer" as const,
     base_url: "https://gateway.example.test/v1",
     credential: ["fixture", "provider", "key"].join("-"),
     model_map: { default: { model: "corp-code", context_window: 32768 } },
+  });
+
+  it("refuses changed provider summary authority before factory construction", async () => {
+    const rig = makeRig();
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    let builds = 0;
+    const factory = executor.bindCodexSummaryFactory(async () => {
+      builds++;
+      return { run: async () => ({}) } as never;
+    });
+    const variants = [
+      { provider_id: "other" }, { revision: 2 }, { credential: "changed-fixture-key" },
+      { base_url: "https://other.example/v1" },
+      { model_map: { default: { model: "other-model" } } },
+    ];
+    for (const change of variants) {
+      const params = { runId: "run-1", binding: createCodexProviderExecutionAuthority({ ...providerClaim(), ...change }) };
+      summaryCallDeadlines.set(params, Date.now() + 10000);
+      await assert.rejects(factory(params), /authority mismatch/);
+    }
+    const params = { runId: "run-1", binding: bindingOf(API_KEY) };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    await assert.rejects(factory(params), /authority mismatch/);
+    assert.equal(builds, 0);
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("derives provider-only intent and plan claims from the frozen epoch", async () => {
+    const done = epochResponder("th-1", "tn-1", (t, th, tn) =>
+      t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
+    const approve: Awaited<ReturnType<NonNullable<RunContext["gatePlan"]>>> = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
+    const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: "Provider plan" }, th, tn, "plan"))
+        .push(turnCompleted("completed", th, tn)));
+    const rig = makeMultiEpochRig([plan, done]);
+    const inputs: IntentSummaryInput[] = [];
+    const summaryRunner = {
+      generateIntentSummary: async (input: IntentSummaryInput) => { inputs.push(input); return "Intent."; },
+      generatePlanSummary: async (input: PlanSummaryInput) => { inputs.push(input); return { summary: "Plan.", deltas: [] }; },
+    };
+    const delivered: unknown[] = [];
+    Object.assign(rig.client, {
+      postIntentSummary: async (_id: string, summary: string) => { delivered.push(summary); },
+      postPlanSummary: async (_id: string, body: unknown) => { delivered.push(body); },
+    });
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async (md, _milestones, awaiting) => { await awaiting?.(md); return approve; },
+    });
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    await makeExecutor(rig, binding, noopLog, undefined, provider, { summaryRunner }).run(ctx);
+    assert.equal(inputs.length, 2);
+    assert.equal(delivered[0], "Intent.");
+    assert.equal((delivered[1] as { summary: string }).summary, "Plan.");
+    for (const input of inputs) {
+      assert.equal(Object.hasOwn(input.claim!.secrets, "codex"), false);
+      assert.deepEqual(input.claim!.secrets.provider, binding.providerBinding);
+      assert.ok(Object.isFrozen(input.claim!.secrets.provider));
+    }
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
   });
 
   it("delivers frozen managed login on fresh roots with no vendor operations", async () => {
