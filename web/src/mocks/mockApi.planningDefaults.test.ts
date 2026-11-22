@@ -14,9 +14,10 @@ afterEach(() => vi.resetModules());
 
 type Case = {
   id: string;
+  harness?: "claude" | "codex";
   seed: Record<string, string | null>;
   body: Record<string, string | null>;
-  expect: { status: number; error_contains?: string; planning_claude_model?: string | null; planning_claude_effort?: string | null; default_effort?: string };
+  expect: { [key: string]: string | number | null | undefined; status: number; error_contains?: string; planning_claude_model?: string | null; planning_claude_effort?: string | null; default_effort?: string };
 };
 
 // PRD #3252 M2: the mock PUT is a second implementation of the server's planning
@@ -38,8 +39,10 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
       expect(status, c.id).toBe(c.expect.status);
       if (c.expect.error_contains) expect(message, c.id).toContain(c.expect.error_contains);
       const { settings } = await api.getMySettings();
-      expect(settings.planning_claude_model ?? null, `${c.id} model`).toBe(c.expect.planning_claude_model);
-      expect(settings.planning_claude_effort ?? null, `${c.id} effort`).toBe(c.expect.planning_claude_effort);
+      const harness = c.harness ?? "claude";
+      expect(settings[`planning_${harness}_model`] ?? null, `${c.id} model`).toBe(c.expect[`planning_${harness}_model`]);
+      expect(settings[`planning_${harness}_effort`] ?? null, `${c.id} effort`).toBe(c.expect[`planning_${harness}_effort`]);
+      if (c.expect.default_codex_effort !== undefined) expect(settings.default_codex_effort, c.id).toBe(c.expect.default_codex_effort);
       if (c.expect.default_effort !== undefined) expect(settings.default_effort, `${c.id} default_effort`).toBe(c.expect.default_effort);
       got.add(c.id);
     }
@@ -77,13 +80,13 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
       .toBe("planning_claude_model: model must be a single token with no spaces");
   });
 
-  it("serves one Claude planning cell each, resolving like the server", async () => {
+  it("serves both harness planning cells, resolving like the server", async () => {
     const api = await reload();
     let { settings } = await api.getMySettings();
-    expect(settings.planning_models).toEqual([
+    expect(settings.planning_models?.filter(c => c.harness === "claude")).toEqual([
       { harness: "claude", model: null, default_model: "", default_source: "builtin", resolved_model: "", source: "builtin" },
     ]);
-    expect(settings.planning_efforts).toEqual([
+    expect(settings.planning_efforts?.filter(c => c.harness === "claude")).toEqual([
       { harness: "claude", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
     ]);
     ({ settings } = await api.putMySettings({
@@ -93,5 +96,31 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
     expect(settings.planning_efforts![0]).toMatchObject({ effort: "high", default_effort: "runtime", default_source: "user_default", resolved_effort: "high", source: "user_planning_default", mode: "explicit" });
     ({ settings } = await api.putMySettings({ planning_claude_effort: null }));
     expect(settings.planning_efforts![0]).toMatchObject({ effort: null, default_effort: "runtime", resolved_effort: null, source: "user_default", mode: "runtime_default" });
+  });
+
+  // The server composes planningEffortCellFromOrdinary(..., leadEffortSettingCell(...)), so a
+  // delivered lead template's per-harness effort is the planning default while the matching
+  // preference is blank, and a stored planning level still wins.
+  it.each(["claude", "codex"] as const)("%s planning default follows the delivered lead template effort", async (harness) => {
+    const api = await reload();
+    const { templates } = await import("./mockApi/agents");
+    const lead = {
+      ...templates[0]!, id: "b-lead-planning-cell", name: "lead", scope: "builtin" as const, is_builtin: true,
+      model: null, codex_model: null, effort: harness === "claude" ? "high" : "low", codex_effort: harness === "codex" ? "high" : "low",
+    };
+    templates.push(lead);
+    await api.setTemplateAllocations({ my_overrides: [{ template_id: lead.id, enabled: true }] });
+    let { settings } = await api.getMySettings();
+    expect(settings.planning_efforts!.find(c => c.harness === harness)).toMatchObject({
+      effort: null, default_effort: "high", default_source: "template", resolved_effort: "high", source: "template", mode: "explicit",
+    });
+    ({ settings } = await api.putMySettings({ [`planning_${harness}_effort`]: "low" }));
+    expect(settings.planning_efforts!.find(c => c.harness === harness)).toMatchObject({
+      effort: "low", default_effort: "high", default_source: "template", resolved_effort: "low", source: "user_planning_default",
+    });
+    ({ settings } = await api.putMySettings({ [`planning_${harness}_effort`]: null, [harness === "claude" ? "default_effort" : "default_codex_effort"]: "max" }));
+    expect(settings.planning_efforts!.find(c => c.harness === harness)).toMatchObject({
+      default_effort: "max", default_source: "user_default", resolved_effort: "max", source: "user_default",
+    });
   });
 });

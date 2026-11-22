@@ -1461,28 +1461,34 @@ WITH checker_template_pins AS MATERIALIZED (
               r.harness = 'codex'
               AND r.kind NOT IN ('judge', 'chat')
               AND r.review_target_run_id IS NULL
-              AND COALESCE(
+              AND (COALESCE(
                   NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
                       (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($30::text[]) THEN r.model
                              ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                        = ANY($30::text[])),
                   false)
+                  OR (r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND r.egress_profile_id IS NULL
+                      AND NOT COALESCE(r.model = ANY($30::text[]), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY($30::text[])))))
           )
           OR 'codex_custom_model_v1' = ANY($28::text[])
       )
-      -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+      -- PRD #3252: the NON-BYPASSABLE planning-phase clause, mirrored at every claim site: a
       -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
-      -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+      -- its harness phase-models capability. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
       -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
       AND (
           NOT (
-                r.harness = 'claude'
+                r.harness IN ('claude', 'codex')
                 AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
                 AND r.review_target_run_id IS NULL
                 AND r.egress_profile_id IS NULL
-                AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END))
           )
-          OR 'claude_phase_models_v1' = ANY($28::text[])
+          OR CASE r.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY($28::text[])
       )
       -- PRD #1908 (D-A): the NON-BYPASSABLE job-runner claim clause, a standalone sibling of the
       -- Codex clauses above. A repo-less 'job' run may be claimed ONLY by a NON-docker worker whose
@@ -1746,28 +1752,34 @@ WITH checker_template_pins AS MATERIALIZED (
                         r.harness = 'codex'
                         AND r.kind NOT IN ('judge', 'chat')
                         AND r.review_target_run_id IS NULL
-                        AND COALESCE(
+                        AND (COALESCE(
                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($30::text[]) THEN r.model
                                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                                  = ANY($30::text[])),
                             false)
+                  OR (r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND r.egress_profile_id IS NULL
+                      AND NOT COALESCE(r.model = ANY($30::text[]), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY($30::text[])))))
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
                 )
-                -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                -- PRD #3252: the NON-BYPASSABLE planning-phase clause, mirrored at every claim site: a
                 -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
-                -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                -- its harness phase-models capability. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
                 -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
                 AND (
                     NOT (
-                          r.harness = 'claude'
+                          r.harness IN ('claude', 'codex')
                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
                           AND r.review_target_run_id IS NULL
                           AND r.egress_profile_id IS NULL
-                          AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                          AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END))
                     )
-                    OR 'claude_phase_models_v1' = ANY(p.protocol_capabilities)
+                    OR CASE r.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(p.protocol_capabilities)
                 )
                 -- PRD #1908 (D-A): MIRROR the job-runner claim clause for the peer, or fleet-spread could
                 -- DEFER a job to a docker or old-image peer that could never claim it. Reads the peer's
@@ -3134,28 +3146,34 @@ WHERE run.id = $1
           run.harness = 'codex'
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
-          AND COALESCE(
+          AND (COALESCE(
               NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id),
                   (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = run.user_id)) WHEN run.model = ANY($11::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
                    = ANY($11::text[])),
               false)
+                  OR (run.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND run.egress_profile_id IS NULL
+                      AND NOT COALESCE(run.model = ANY($11::text[]), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = run.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY($11::text[])))))
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   )
-  -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+  -- PRD #3252: the NON-BYPASSABLE planning-phase clause, mirrored at every claim site: a
   -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
-  -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+  -- its harness phase-models capability. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
   -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
   AND (
       NOT (
-            run.harness = 'claude'
+            run.harness IN ('claude', 'codex')
             AND run.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
             AND run.review_target_run_id IS NULL
             AND run.egress_profile_id IS NULL
-            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = run.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = run.user_id AND (CASE run.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END))
       )
-      OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+      OR CASE run.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)
   )
   -- PRD #1906 M5: MIRROR ClaimRun's isolated-lane clause (both ways, the protocol capability,
   -- and no Codex-indicating profile-bound run), reading the candidate's OWN columns.
@@ -3553,7 +3571,13 @@ WHERE w.user_id = $1
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+  AND (NOT $2::boolean OR 'codex_phase_models_v1' = ANY(w.protocol_capabilities))
 `
+
+type CountOnlineWorkersSatisfyingCustomCodexParams struct {
+	UserID              uuid.UUID `json:"user_id"`
+	PhaseModelsRequired bool      `json:"phase_models_required"`
+}
 
 // PRD #1551 M4 (D6): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
 // the harness, current runtime and custom-model PROTOCOL capabilities. This is the
@@ -3573,8 +3597,8 @@ WHERE w.user_id = $1
 // w.ephemeral for the same reasons. Only called for a custom-root queued run already past its
 // health threshold (or one the early docker-allowlist probe found online-but-ineligible),
 // so it is off the hot path.
-func (q *Queries) CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCustomCodex, userID)
+func (q *Queries) CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, arg CountOnlineWorkersSatisfyingCustomCodexParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCustomCodex, arg.UserID, arg.PhaseModelsRequired)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3619,20 +3643,26 @@ WHERE w.user_id = $1
   AND NOT w.ephemeral
   -- The lane half of ClaimRun's isolated-lane clause: a lane worker never claims an unbound run.
   AND NOT w.isolated_lane
-  AND 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+  AND CASE $2::text WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)
+  AND ($2::text <> 'codex' OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
 `
 
+type CountOnlineWorkersSatisfyingPhaseModelsParams struct {
+	UserID  uuid.UUID `json:"user_id"`
+	Harness string    `json:"harness"`
+}
+
 // PRD #3252: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
-// 'claude_phase_models_v1' PROTOCOL capability. The planning-phase analogue of
+// harness-specific phase-models PROTOCOL capability. The planning-phase analogue of
 // CountOnlineWorkersSatisfyingCustomCodex: it answers "does the fleet have ANY worker that can
-// execute a Claude planning phase?", not "can THIS run be claimed right now?". It drives the
+// execute this harness planning phase?", not "can THIS run be claimed right now?". It drives the
 // queued-reason resolver's phase-models rung (reasonNoPhaseModelsCapableWorker): a 0 here for a
 // phase_models_required queued run means every online worker predates the planning-phase protocol,
 // so ClaimRun's NON-BYPASSABLE clause can never be satisfied. Reads workers.protocol_capabilities
 // DIRECTLY, like its siblings. Only called for a phase_models_required queued run already past its
 // health threshold, so it is off the hot path.
-func (q *Queries) CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingPhaseModels, userID)
+func (q *Queries) CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, arg CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingPhaseModels, arg.UserID, arg.Harness)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -10568,6 +10598,27 @@ func (q *Queries) GetWorkerProjectionForOwner(ctx context.Context, arg GetWorker
 	return i, err
 }
 
+const hasQueuedRunForUser = `-- name: HasQueuedRunForUser :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE user_id = $1 AND status = 'queued'
+      AND kind <> 'chat' AND NOT cross_check_lane
+)::boolean AS has_queued
+`
+
+// Issue #4602: the cheap idle precheck claimCheckpointRun runs before ClaimRun. Each
+// predicate is an exact top-level conjunct of ClaimRun's target CTE (user_id, the
+// chat/cross_check_lane exclusion, status = 'queued'), so false here means ClaimRun would
+// select no target row and write nothing at the precheck's statement snapshot. True never
+// admits anything: ClaimRun stays the authoritative claim. Its predicates lead with
+// idx_runs_claimable's (user_id, status) columns.
+func (q *Queries) HasQueuedRunForUser(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasQueuedRunForUser, userID)
+	var has_queued bool
+	err := row.Scan(&has_queued)
+	return has_queued, err
+}
+
 const heartbeatWorker = `-- name: HeartbeatWorker :one
 UPDATE workers SET
     status                = 'online',
@@ -12752,20 +12803,26 @@ SELECT id, runs.user_id, status, auto_approve,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
-        AND COALESCE(
+        AND (COALESCE(
             NOT ((CASE WHEN runs.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id),
                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = runs.user_id)) WHEN runs.model = ANY($1::text[]) THEN runs.model
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY($1::text[])),
-            false))::boolean AS codex_custom_root,
-       -- PRD #3252: phase_models_required is the SQL-computed predicate every claim mirror carries (a Claude
-       -- lead-lane run whose owner has a planning value set needs 'claude_phase_models_v1'), so the health
+            false)
+                  OR (runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND runs.egress_profile_id IS NULL
+                      AND NOT COALESCE(runs.model = ANY($1::text[]), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = runs.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY($1::text[]))))))::boolean AS codex_custom_root,
+       -- PRD #3252: phase_models_required is the SQL-computed predicate every claim mirror carries (a
+       -- lead-lane run whose owner has a planning value set needs its harness phase capability), so the health
        -- queued-reason rung and the capable-worker filter agree with ClaimRun.
-       (runs.harness = 'claude'
+       (runs.harness IN ('claude', 'codex')
         AND runs.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
         AND runs.review_target_run_id IS NULL
         AND runs.egress_profile_id IS NULL
-        AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = runs.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL)))::boolean AS phase_models_required,
+        AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = runs.user_id AND (CASE runs.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END)))::boolean AS phase_models_required,
        (EXISTS (
            SELECT 1 FROM runs r
            WHERE r.id = runs.id
@@ -16071,28 +16128,34 @@ WHERE r.status = 'queued'
                          r.harness = 'codex'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
-                         AND COALESCE(
+                         AND (COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
                                  (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY($9::text[])),
                              false)
+                  OR (r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND r.egress_profile_id IS NULL
+                      AND NOT COALESCE(r.model = ANY($9::text[]), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY($9::text[])))))
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
                  )
-                 -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                 -- PRD #3252: the NON-BYPASSABLE planning-phase clause, mirrored at every claim site: a
                  -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
-                 -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                 -- its harness phase-models capability. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
                  -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
                  AND (
                      NOT (
-                           r.harness = 'claude'
+                           r.harness IN ('claude', 'codex')
                            AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
                            AND r.review_target_run_id IS NULL
                            AND r.egress_profile_id IS NULL
-                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END))
                      )
-                     OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+                     OR CASE r.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)
                  )
         AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
@@ -16179,28 +16242,34 @@ WHERE r.status = 'queued'
                          r.harness = 'codex'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
-                         AND COALESCE(
+                         AND (COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
                                  (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY($9::text[])),
                              false)
+                  OR (r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND r.egress_profile_id IS NULL
+                      AND NOT COALESCE(r.model = ANY($9::text[]), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY($9::text[])))))
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
                  )
-                 -- PRD #3252: the NON-BYPASSABLE Claude planning-phase clause, mirrored at every claim site: a Claude
+                 -- PRD #3252: the NON-BYPASSABLE planning-phase clause, mirrored at every claim site: a
                  -- lead-lane run whose owner has a planning value set is claimable only by a worker reporting
-                 -- 'claude_phase_models_v1'. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
+                 -- its harness phase-models capability. The kind list is pinned to leadcfg.LeadLane by a test; no trim here (the
                  -- PUT stores trimmed values or NULL), so this is a superset of the Go check.
                  AND (
                      NOT (
-                           r.harness = 'claude'
+                           r.harness IN ('claude', 'codex')
                            AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
                            AND r.review_target_run_id IS NULL
                            AND r.egress_profile_id IS NULL
-                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END))
                      )
-                     OR 'claude_phase_models_v1' = ANY(w.protocol_capabilities)
+                     OR CASE r.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)
                  )
         AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
@@ -16480,15 +16549,15 @@ WHERE r.status = 'queued'
   -- execution is activated, so a fresh ephemeral worker can claim it; fn_placement_admitting_workers'
   -- provider clause (migration 00486) lets an online capable idle worker suppress it below.
   AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[])
-      -- PRD #3252: a Claude lead-lane run whose owner has a planning value set is demand too: with no
-      -- worker reporting 'claude_phase_models_v1' online, only a freshly provisioned worker can claim it
+      -- PRD #3252: a lead-lane run whose owner has a planning value set is demand too: with no
+      -- worker reporting its harness phase capability online, only a freshly provisioned worker can claim it
       -- (required_capabilities stays '{}' for it). The same predicate text as every claim site.
       OR (
-            r.harness = 'claude'
+            r.harness IN ('claude', 'codex')
             AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
             AND r.review_target_run_id IS NULL
             AND r.egress_profile_id IS NULL
-            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL))
+            AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END))
       ))
 
   -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and

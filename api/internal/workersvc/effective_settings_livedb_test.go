@@ -122,7 +122,7 @@ func (fx *effFix) claim(run store.Run) *ClaimPayload {
 	fx.t.Helper()
 	fx.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, run.ID, fx.workerID)
 	w := store.Worker{ID: fx.workerID, UserID: fx.userID, ProtocolCapabilities: []string{
-		capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1, capability.ClaudePhaseModelsV1,
+		capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1, capability.ClaudePhaseModelsV1, capability.CodexPhaseModelsV1,
 	}}
 	payload, err := fx.svc.assembleClaim(fx.env.ctx, w, mustRun(fx.t, fx.env, run.ID))
 	if err != nil {
@@ -290,13 +290,38 @@ func TestEffectiveSettingsLeadClaimEquivalenceLiveDB(t *testing.T) {
 			want:  leadWant{harness: HarnessClaude, model: "", modelSource: "builtin", effort: "medium", effortSource: "builtin"},
 		},
 		{
-			name: "planning columns never reach a codex run",
+			name: "Claude planning columns never reach a Codex run",
 			setup: func(fx *effFix) {
 				fx.codexDefault()
 				fx.lane("planning_claude_model", "opus")
 				fx.lane("planning_claude_effort", "high")
 			},
 			want: leadWant{harness: HarnessCodex, model: agenttmpl.DefaultCodexModel, modelSource: "builtin", effort: "medium", effortSource: "builtin"},
+		},
+
+		{
+			name: "codex planning custom model and effort with Runtime default implementation",
+			setup: func(fx *effFix) {
+				fx.codexDefault()
+				fx.lane("default_codex_model", "gpt-6-sol")
+				fx.lane("default_codex_effort", "runtime")
+				fx.lane("planning_codex_model", "custom-plan")
+				fx.lane("planning_codex_effort", "high")
+			},
+			want: leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "user_default",
+				claimModel: "gpt-6-sol", claimSource: "user_default", effortSource: "user_default",
+				plan: &ClaimPhaseSettings{Model: strp("custom-plan"), Effort: strp("high"), ModelSource: "user_planning_default", EffortSource: "user_planning_default"}},
+		},
+		{
+			name: "codex planning effort inherits template model",
+			setup: func(fx *effFix) {
+				fx.codexDefault()
+				fx.template(effLeadName, "", "gpt-6-sol")
+				fx.lane("planning_codex_effort", "high")
+			},
+			want: leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "template",
+				effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Effort: strp("high"), EffortSource: "user_planning_default"}},
 		},
 		{
 			name:  "codex only, nothing configured",

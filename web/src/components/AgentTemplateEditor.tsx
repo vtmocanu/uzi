@@ -11,7 +11,7 @@ import { diffLines, diffWords, type Change } from "diff";
 import { LineDiff } from "./LineDiff";
 import type { AgentTemplateInput, BuiltinDefinition } from "../lib/api";
 import { Alert, Button, Field, Input, Select } from "./ui";
-import { ModelSelect } from "./ModelSelect";
+import { DEFAULT_CODEX_MODEL, ModelSelect } from "./ModelSelect";
 import { EffortSelect } from "./EffortSelect";
 import { CODEX_ROLE_MODELS } from "../lib/codexModels";
 import {
@@ -21,6 +21,7 @@ import {
   looseSecretWarning,
   templateModelFieldWarning,
   templateModelDefaultLabel,
+  templateEffortDefaultLabel,
   renderSubagent,
   splitToolInput,
   toolsSummary,
@@ -39,8 +40,6 @@ export interface EditorInitial {
   tools: string[] | null;
   prompt_body: string;
 }
-
-const EFFORT_DEFAULT_LABEL = "Default · follows the run's effort";
 
 // AgentTemplateEditorHandle exposes the form's LIVE values to whoever owns the
 // Reset button (issue #201 M4a F14). Reset discards unsaved edits, so its
@@ -110,6 +109,7 @@ export const AgentTemplateEditor = forwardRef<
   const [tools, setTools] = useState<string[]>(initial.tools ?? []);
   const [promptBody, setPromptBody] = useState(initial.prompt_body);
   const [toolDraft, setToolDraft] = useState("");
+  const isLead = isLeadTemplateName(name);
 
   const secretWarning = useMemo(
     () => looseSecretWarning(description) || looseSecretWarning(promptBody),
@@ -258,7 +258,8 @@ export const AgentTemplateEditor = forwardRef<
                 id="template-effort"
                 value={effort}
                 onChange={setEffort}
-                defaultLabel={EFFORT_DEFAULT_LABEL}
+                defaultLabel={templateEffortDefaultLabel(name)}
+                ariaDescribedBy={isLead ? "template-effort-help" : undefined}
               />
             </Field>
           </div>
@@ -281,23 +282,24 @@ export const AgentTemplateEditor = forwardRef<
                 id="template-codex-effort"
                 value={codexEffort}
                 onChange={setCodexEffort}
-                defaultLabel={EFFORT_DEFAULT_LABEL}
+                defaultLabel={templateEffortDefaultLabel(name)}
+                ariaDescribedBy={isLead ? "template-effort-help" : undefined}
               />
             </Field>
           </div>
         </div>
-        <p id="template-model-help" className="text-xs text-muted">
-          Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.
-        </p>
-        {isLeadTemplateName(name) && (
-          <p className="text-xs text-muted">
-            Each harness's Run defaults model takes precedence over its lead template pin.
-          </p>
-        )}
-        {isLeadTemplateName(name) && (
-          <p className="text-xs text-muted">
-            <span>Used when you have no default effort for this harness</span>. A default effort set in
-            Run defaults takes precedence over the lead template's effort.
+        {isLead ? (
+          <>
+            <p id="template-model-help" className="text-xs text-muted">
+              A model chosen at start or a schedule's model, then your Run defaults model for that harness, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses {DEFAULT_CODEX_MODEL}.
+            </p>
+            <p id="template-effort-help" className="text-xs text-muted">
+              An effort chosen at start, then your Run defaults effort for that harness (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.
+            </p>
+          </>
+        ) : (
+          <p id="template-model-help" className="text-xs text-muted">
+            Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.
           </p>
         )}
       </div>
@@ -468,9 +470,9 @@ function BuiltinDiff({
 
       {changed.includes("model") && (
         <DiffField label="Claude model">
-          <span className="text-ok">{shipped.model ?? templateModelDefaultLabel(shipped.name)}</span>
+          <span className="text-ok">{shipped.model || templateModelDefaultLabel(shipped.name, "claude")}</span>
           <span className="text-faint"> → </span>
-          <span className="text-danger">{current.model ?? templateModelDefaultLabel(shipped.name)}</span>
+          <span className="text-danger">{current.model || templateModelDefaultLabel(shipped.name, "claude")}</span>
         </DiffField>
       )}
 
@@ -484,17 +486,17 @@ function BuiltinDiff({
 
       {changed.includes("effort") && (
         <DiffField label="Claude effort">
-          <span className="text-ok">{shipped.effort || "Default"}</span>
+          <span className="text-ok">{shipped.effort || templateEffortDefaultLabel(shipped.name)}</span>
           <span className="text-faint"> → </span>
-          <span className="text-danger">{current.effort || "Default"}</span>
+          <span className="text-danger">{current.effort || templateEffortDefaultLabel(shipped.name)}</span>
         </DiffField>
       )}
 
       {changed.includes("codex effort") && (
         <DiffField label="Codex effort">
-          <span className="text-ok">{shipped.codex_effort || "Default"}</span>
+          <span className="text-ok">{shipped.codex_effort || templateEffortDefaultLabel(shipped.name)}</span>
           <span className="text-faint"> → </span>
-          <span className="text-danger">{current.codex_effort || "Default"}</span>
+          <span className="text-danger">{current.codex_effort || templateEffortDefaultLabel(shipped.name)}</span>
         </DiffField>
       )}
 

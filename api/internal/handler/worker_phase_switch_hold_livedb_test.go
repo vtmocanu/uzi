@@ -128,6 +128,28 @@ func TestWorkerPhaseSwitchHoldLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("Codex holds at approval and lost ACK does not bank twice", func(t *testing.T) {
+		id := seed(t, true)
+		exec("UPDATE runs SET harness = 'codex', status = 'awaiting_approval', status_since = now() - interval '30 seconds', session_id = 'plan-thread' WHERE id = $1", id)
+		held := dtoOf(post(t, id, req(generation, "implement"), http.StatusOK))
+		if held["status"] != "paused" || held["hold_reason"] != workersvc.HoldReasonPhaseSwitchUnavailable {
+			t.Fatalf("Codex held DTO = %v", held)
+		}
+		first, err := q.GetRunByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		post(t, id, req(generation, "implement"), http.StatusOK)
+		again, err := q.GetRunByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.BudgetPausedSeconds < 30 || first.BudgetPausedSeconds != again.BudgetPausedSeconds ||
+			!first.StatusSince.Time.Equal(again.StatusSince.Time) || again.SessionID.String != "plan-thread" || again.ClaimReleasedAt.Valid {
+			t.Fatal("Codex hold changed wait budget, session or claim on lost-ACK retry")
+		}
+	})
+
 	t.Run("an implement hold needs an approved plan", func(t *testing.T) {
 		approved := seed(t, true)
 		if run := dtoOf(post(t, approved, req(generation, "implement"), http.StatusOK)); run["status"] != "paused" {

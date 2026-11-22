@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  rewrites the agent gitconfig so the AGENT's clone/fetch URL redirects to an unresolvable .invalid host (a pre-phase copy is saved); forge-fake stays UP the WHOLE phase so the api's claim-time default-branch guardrail + the poller keep reaching it over HTTP; lowers the api forge-park cap to 2 via E2E_FORGE_UNREACHABLE_MAX_PARKS in the env-file (api force-recreated while forge-fake is healthy); Cases D/E arm a forge-fake MR-create fault (POST /_e2e/faults) and Case E shortens the api publication-park bound to 20s via E2E_PROVIDER_PARK_MAX_DURATION (api force-recreated again)
-# restores: gitconfig restored byte-for-byte from the pre-phase copy; the forge-fake MR-create fault cleared; the forge-park cap and publication-park bound defaults restored (both env lines removed, api recreated) — done in-phase on the happy path AND by an EXIT-trap fail-safe (phase 20 / 35 precedent) so the fail-soft driver never continues on a broken stack
+# restores: gitconfig restored byte-for-byte from the pre-phase copy; the forge-fake MR-create fault cleared; the forge-park cap and publication-park bound defaults restored (both env lines removed, api recreated) — done in-phase on the happy path AND by an EXIT-trap fail-safe (phase 20 / 35 precedent) so the fail-soft driver never continues on a broken stack; the generation-1 custody holds of the completed case D and E runs are resolved explicitly (cases B and C leave none open)
 # =============================================================================
 # M5 contract update — the pre-clone forge-unreachable park, end to end through the LIVE
 # claim/clone/park/promote loop (the store-level and worker-level halves are proven at
@@ -408,3 +408,10 @@ login
 wait_worker_online
 trap - EXIT
 pass "restored the gitconfig and the api default cap for any later phase"
+
+# Cases D and E completed at a later generation; each run's first claim (generation 1)
+# was the predecessor of the publication-park resume and left a capture-less source_only
+# hold open. Resolve them with the stack healthy and the admin logged in, so the driver's
+# end-of-phase hold boundary finds none.
+resolve_fixture_source_hold "$RUN_D" 1
+resolve_fixture_source_hold "$RUN_E" 1

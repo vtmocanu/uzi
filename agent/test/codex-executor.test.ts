@@ -91,6 +91,8 @@ import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
 import { CodexHarness, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
+import { CodexUsageAccountant } from "../src/codex/token-accounting.js";
+import { PhaseSwitchUnverifiedError } from "../src/phase-switch-unverified.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
@@ -138,7 +140,7 @@ import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, ClaimConfig, LeadConfigReportBody, MilestoneProgress } from "../src/protocol.js";
 import { LeadConfigReporter, leadConfigActive } from "../src/lead-config-report.js";
-import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
+import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit, type RunTurnRequest } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
@@ -267,7 +269,7 @@ describe("M1 dependency wait characterization Codex", () => {
         advertisedTools = rec(c.params).dynamicTools;
         return { thread: { id: "th-1" } };
       }
-      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       const n = c.turnStartCount;
       const tn = `tn-wait-${n}`;
@@ -464,8 +466,8 @@ class FakeTransport implements CodexTransport {
 
 // Default responder: root ids th-1 / tn-1, first child th-child / tn-child.
 function defaultResponder(c: ResponderCtx): unknown {
-  if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
-  if (c.method === "thread/resume") return { thread: { id: "resumed-1" } };
+  if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" }, model: rec(c.params).model };
+  if (c.method === "thread/resume") return { thread: { id: rec(c.params).threadId }, model: rec(c.params).model };
   if (c.method === "turn/start") return { turn: { id: c.turnStartCount === 1 ? "tn-1" : "tn-child" } };
   return {};
 }
@@ -473,6 +475,9 @@ function defaultResponder(c: ResponderCtx): unknown {
 // --- notification builders (the M0 app-server wire vocabulary) -----------------
 function threadStarted(threadId = "th-1"): CodexNotification {
   return { kind: "thread_started", method: "thread/started", threadId, params: { thread: { id: threadId } } };
+}
+function turnStarted(threadId = "th-1", turnId = "tn-1"): CodexNotification {
+  return { kind: "turn_started", method: "turn/started", threadId, turnId, params: { threadId, turn: { id: turnId } } };
 }
 function turnCompleted(status = "completed", threadId = "th-1", turnId = "tn-1"): CodexNotification {
   return { kind: "turn_completed", method: "turn/completed", threadId, turnId, status, params: { threadId, turn: { id: turnId, status } } };
@@ -1692,9 +1697,14 @@ function epochResponder(
   pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
 ): Responder {
   return (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") threadId = String(rec(c.params).threadId);
+      return { thread: { id: threadId }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       c.transport.push(threadStarted(threadId));
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId, turnId,
+        params: { threadId, turn: { id: turnId } } });
       pushFrames(c.transport, threadId, turnId);
       return { turn: { id: turnId } };
     }
@@ -1714,7 +1724,10 @@ function resumedEpochResponder(
   pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
 ): Responder {
   return (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") threadId = String(rec(c.params).threadId);
+      return { thread: { id: threadId }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       pushFrames(c.transport, threadId, turnId);
       return { turn: { id: turnId } };
@@ -2761,7 +2774,7 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
             assert.deepEqual(published, Array(published.length).fill(published[0]), "park retries preserve the WIP tip");
             if (scenario === "window" || scenario === "docker") {
               const resumed = makeRig({ responder: c => {
-                if (c.method === "thread/resume") return { thread: { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } };
+                if (c.method === "thread/resume") return { thread: { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }, model: rec(c.params).model };
                 if (c.method === "thread/start") {
                   assert.equal(scenario, "docker", "plain worker must reuse the parked thread");
                   return { thread: { id: "th-1" } };
@@ -4776,7 +4789,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   for (const outcome of ["parked", "refused"] as const) it(`M3 Codex interrupted last iteration wall ${outcome} preserves completed count`, async () => {
     const controller = new AbortController();
     const rig = makeRig({ responder: c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted());
         else {
@@ -4917,7 +4930,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   // default signal_done / turn_completed frames route to the active turn.
   function refusedRestartResponder(): Responder {
     return (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted());
         else c.transport.push(signalDone()).push(turnCompleted("completed"));
@@ -5055,7 +5068,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     // Turn 1 goes quiet (the `wall` pause aborts it); the re-drive (turn 2) flips the sticky cancel as
     // it starts, then completes with signal_done — the exact case the pre-redrive check cannot see.
     const responder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted());
         else {
@@ -5102,7 +5115,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     let cancelled = false;
     let gateCalls = 0;
     const responder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const turnId = `tn-plan-${c.turnStartCount}`;
         if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
@@ -5142,7 +5155,7 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     let cancelled = false;
     let gateCalls = 0;
     const responder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-revise" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-revise" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const turnId = `tn-revise-${c.turnStartCount}`;
         if (c.turnStartCount === 1) {
@@ -5327,7 +5340,7 @@ describe("CodexExecutor: credential bridge + isolation", () => {
   it("(12) a resume seeds adopt (credential-free) AND still releases a fresh token", async () => {
     const rig = makeRig();
     rig.transport.requestOverride = (c) => c.method === "thread/resume"
-      ? Promise.resolve({ thread: { id: "prior-session" } })
+      ? Promise.resolve({ thread: { id: "prior-session" }, model: rec(c.params).model })
       : undefined;
     rig.transport.push(threadStarted("prior-session")).push(signalDone("prior-session", "tn-1")).push(turnCompleted("completed", "prior-session")).end();
     const { ctx } = makeCtx({ sessionId: "prior-session" });
@@ -5350,8 +5363,8 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume rejection fallback");
-    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
-    assert.ok(rig.transport.requests.some((r) => r.method === "thread/start"));
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/resume").length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 1);
     assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
   });
 
@@ -5359,7 +5372,7 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     const rig = makeRig();
     const rpcError = new Error("codex app-server returned a JSON-RPC error (code -32602)");
     rig.transport.requestOverride = (c) => {
-      if (c.method === "thread/resume") return Promise.resolve({ thread: { id: "claimed-thread" } });
+      if (c.method === "thread/resume") return Promise.resolve({ thread: { id: "claimed-thread" }, model: rec(c.params).model });
       if (c.method === "turn/start") return Promise.reject(rpcError);
       return undefined;
     };
@@ -5751,7 +5764,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
       async () => {
         const IDLE_MS = 90;
         const rig = makeRig({ responder: c => {
-          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
           if (c.method === "turn/start") {
             if (c.turnStartCount === 1) c.transport.push(threadStarted());
             return { turn: { id: `tn-${c.turnStartCount}` } };
@@ -6937,6 +6950,63 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     assert.deepEqual(list?.params, { limit: 200, includeHidden: true });
   });
 
+  for (const supported of ["medium", "high"]) {
+    it(`planning high with implementation medium advises against the actual planning pair (catalog ${supported})`, async () => {
+      const planning = epochResponder("catalog-plan", "catalog-turn", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "catalog plan" }, th, tn, "catalog-submit"))
+          .push(turnCompleted("completed", th, tn));
+      });
+      const rig = makeRig({ responder: c => c.method === "model/list"
+        ? catalog("gpt-6-astra", [supported]) : planning(c) });
+      const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        config: { default_effort: "medium", plan_phase: { effort: "high" } },
+        gatePlan: async () => ({ kind: "cancel" }) as never,
+      });
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "planning catalog advice"),
+        /run cancelled/,
+      );
+      const notes = emitted.filter(m => m.payload.event === NOTE_EVENT);
+      assert.equal(notes.length, supported === "medium" ? 1 : 0);
+      if (notes.length) assert.ok(String(notes[0]!.payload.text).includes("reasoning effort high for gpt-6-astra"));
+      const turns = rig.transport.requests.filter(r => r.method === "turn/start");
+      assert.equal(turns.length, 1);
+      assert.equal(rec(turns[0]!.params).model, "gpt-6-astra");
+      assert.equal(rec(turns[0]!.params).effort, "high");
+    });
+  }
+
+  for (const revision of [false, true]) {
+    for (const implementEffort of ["medium", undefined]) {
+      it(`restored gate actual-first-turn catalog: ${revision ? "revision" : "implementation"}, implement ${implementEffort ?? "runtime"}`, async () => {
+        const saved = "catalog-restored";
+        const turn = epochResponder(saved, "catalog-first-turn", (t, th, tn) => {
+          if (revision) t.push(toolCall(1, "submit_plan", { plan_md: "revised catalog plan" }, th, tn, "catalog-submit"));
+          else t.push(signalDone(th, tn));
+          t.push(turnCompleted("completed", th, tn));
+        });
+        const rig = makeRig({ responder: c => c.method === "model/list"
+          ? catalog("gpt-6-astra", ["medium"]) : turn(c) });
+        const { ctx, emitted } = makeCtx({ sessionId: saved, approvedPlan: "saved catalog plan",
+          planApproved: false, resumePhase: "awaiting_approval",
+          config: { ...(implementEffort ? { default_effort: implementEffort as "medium" } : {}), plan_phase: { effort: "high" } },
+          takeResumedGateEvent: async () => revision ? { kind: "revise", feedback: "revise", inputId: 1 } : undefined,
+          gatePlan: async () => revision ? { kind: "cancel" } as never : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never,
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        if (revision) await assert.rejects(withTimeout(running, 3000, "catalog revision"), /run cancelled/);
+        else await withTimeout(running, 3000, "catalog implementation");
+        const notes = emitted.filter(m => m.payload.event === NOTE_EVENT);
+        assert.equal(notes.length, revision ? 1 : 0, "advisory follows the first dispatched effort");
+        if (revision) assert.match(String(notes[0]!.payload.text), /reasoning effort high/);
+        assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, revision || implementEffort ? 1 : 0);
+        const starts = rig.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(starts.length, 1);
+        assert.equal(rec(starts[0]!.params).effort, revision ? "high" : implementEffort);
+      });
+    }
+  }
+
   it("sanitizes the model id in the note", async () => {
     const hostile = "evil\u001b[31m\nmodel";
     const { notes } = await run({ effort: "max", providerModel: hostile, list: () => catalog(hostile, ["low"]) });
@@ -6991,6 +7061,48 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
   const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); };
   const withDefault = (model: string, levels: string[], def: string | undefined) =>
     ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), ...(def !== undefined ? { defaultReasoningEffort: def } : {}) }] });
+
+  it("approved planning pair probes and reports only the first phase while implementation keeps its own pair", async () => {
+    const entries = { data: [
+      ...withDefault("gpt-6-astra", ["high"], "high").data,
+      ...withDefault("gpt-6.1-sol", ["medium"], "medium").data,
+    ] };
+    const planning = epochResponder("catalog-shared", "catalog-plan", (t, th, tn) => {
+      t.push(toolCall(1, "submit_plan", { plan_md: "bounded catalog plan" }, th, tn, "catalog-submit"))
+        .push(turnCompleted("completed", th, tn));
+    });
+    const implementation = epochResponder("catalog-shared", "catalog-implement", (t, th, tn) => {
+      t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+    });
+    const rig = makeMultiEpochRig([planning, implementation].map(respond =>
+      (c: ResponderCtx) => c.method === "model/list" ? entries : respond(c)));
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const reporterClient = new ReportStub();
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      config: { default_model: "gpt-6.1-sol", default_effort: "max",
+        plan_phase: { model: "gpt-6-astra", effort: "high" } },
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok",
+        selection: { source: "own", exclusions: [] } } }) as never,
+      codexCatalogReport: new CodexCatalogReporter({
+        client: reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+      }),
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "approved catalog phases");
+    await settle();
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(rig.epochs.map(e => e.transport.requests.filter(r => r.method === "model/list").length), [1, 0]);
+    assert.deepEqual(rig.epochs.map(e => {
+      const request = e.transport.requests.find(r => r.method === "turn/start");
+      return [rec(request!.params).model, rec(request!.params).effort];
+    }), [["gpt-6-astra", "high"], ["gpt-6.1-sol", "max"]]);
+    assert.equal(emitted.filter(m => m.payload.event === NOTE_EVENT).length, 0,
+      "the implementation pair is not catalog-probed; its requested effort is sent unchanged");
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.model, "gpt-6-astra");
+    assert.equal(reporterClient.posts[0]!.default_effort, "high");
+  });
 
   it("Runtime default with a reporter: the first turn/start does not wait for model/list, then one report is posted", async () => {
     const reporterClient = new ReportStub();
@@ -7261,7 +7373,7 @@ describe("#2878 M2 worker emitted fixture", () => {
     it(`regression retained child recorded before incomplete root worker payload: ${childModel}`, async () => {
       const responder: Responder = c => {
         if (c.method === "thread/start") return { thread: { id: "th-child" } };
-        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
           c.transport.push(tokenUsageUpdated("th-child", "tn-child",
@@ -9862,14 +9974,16 @@ describe("CodexExecutor — in-process approved plan drives implement (#1586)", 
     const PLAN = "PLAN-ALPHA-111";
     const order: string[] = [];
     const implResponder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "resumed-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         order.push(`implement:${c.turnStartCount}`);
         const turnId = `tn-impl-${c.turnStartCount}`;
-        if (c.turnStartCount === 1) c.transport.push(threadStarted("resumed-1"));
+        c.transport.push({ kind: "turn_started", method: "turn/started", threadId: "th-plan", turnId,
+          params: { threadId: "th-plan", turn: { id: turnId } } });
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
         // Turn 1 completes WITHOUT done/checkpoint → iteration-boundary fallback, SAME epoch.
-        if (c.turnStartCount >= 2) c.transport.push(toolCall(50 + c.turnStartCount, "signal_done", {}, "resumed-1", turnId, `c-done-${c.turnStartCount}`));
-        c.transport.push(turnCompleted("completed", "resumed-1", turnId));
+        if (c.turnStartCount >= 2) c.transport.push(toolCall(50 + c.turnStartCount, "signal_done", {}, "th-plan", turnId, `c-done-${c.turnStartCount}`));
+        c.transport.push(turnCompleted("completed", "th-plan", turnId));
         return { turn: { id: turnId } };
       }
       return {};
@@ -9901,12 +10015,14 @@ describe("CodexExecutor — in-process approved plan drives implement (#1586)", 
     const P1 = "PLAN-ALPHA-111";
     const P2 = "PLAN-BRAVO-222";
     const implResponder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "resumed-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const turnId = `tn-impl-${c.turnStartCount}`;
-        if (c.turnStartCount === 1) c.transport.push(threadStarted("resumed-plan"));
-        if (c.turnStartCount >= 2) c.transport.push(toolCall(60 + c.turnStartCount, "signal_done", {}, "resumed-plan", turnId, `c-done-${c.turnStartCount}`));
-        c.transport.push(turnCompleted("completed", "resumed-plan", turnId));
+        c.transport.push({ kind: "turn_started", method: "turn/started", threadId: "th-plan", turnId,
+          params: { threadId: "th-plan", turn: { id: turnId } } });
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        if (c.turnStartCount >= 2) c.transport.push(toolCall(60 + c.turnStartCount, "signal_done", {}, "th-plan", turnId, `c-done-${c.turnStartCount}`));
+        c.transport.push(turnCompleted("completed", "th-plan", turnId));
         return { turn: { id: turnId } };
       }
       return {};
@@ -11988,10 +12104,14 @@ describe("CodexExecutor clarification turns (#1584)", () => {
   const ask = (id: number, th: string, tn: string) =>
     toolCall(id, "ask_user", { questions: [question] }, th, tn, `c-ask-${id}`);
   const scripted = (steps: Array<Array<"ask" | "plan" | "done" | "checkpoint">>, th = "th-1"): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       const stepsNow = steps[c.turnStartCount - 1] ?? [];
       stepsNow.forEach((step, i) => {
         const id = c.turnStartCount * 10 + i;
@@ -12504,7 +12624,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
   const PROSE = "I think we should refactor the widget; let me know what you think.";
   type Step = "ask" | "plan" | "done" | "prose";
   const scripted = (steps: Step[][], th = "th-plan", prose = PROSE): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
     if (c.method === "turn/start") {
       const tn = `tn-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
@@ -12686,7 +12806,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
       let root = 0;
       return (c) => {
         if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-plan" : "th-child" } };
-        if (c.method === "thread/resume") return { thread: { id: "th-plan" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         if ((c.params as { threadId?: string }).threadId === "th-child") {
           c.transport.push(agentMessage(CHILD, "th-child")).push(turnCompleted("completed", "th-child", "tn-child"));
@@ -12757,7 +12877,7 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
   // real turn's would.
   function timedTurns(opts: { turnMs: number; turns: number; quietFirst?: boolean }): Responder {
     return (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const n = c.turnStartCount;
         if (opts.quietFirst && n === 1) c.transport.push(threadStarted());
@@ -12892,7 +13012,7 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
 
   it("(plan) a refused park after the budget is spent re-arms from the 409's budget before the plan re-drive", async () => {
     const responder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const n = c.turnStartCount;
         const turnId = `tn-plan-${n}`;
@@ -13990,7 +14110,7 @@ describe("approved m1 Codex resume reconciliation", () => {
     it(`m1 Codex resume display combines local progress with ${ack} ACK`, async () => {
       const milestones = ["m1", "m2", "m3"].map((id) => ({ id, title: `Title ${id}` }));
       const rig = makeMultiEpochRig([(c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         const tn = `tn-${c.turnStartCount}`;
         if (c.turnStartCount === 1) {
@@ -14533,7 +14653,7 @@ describe("Codex completion interlock", () => {
           .push(turnCompleted("completed", th, tn));
       });
       const later: Responder = call => {
-        if (call.method === "thread/start" || call.method === "thread/resume") return { thread: { id: "th-scope" } };
+        if (call.method === "thread/start" || call.method === "thread/resume") return { thread: { id: "th-scope" }, model: rec(call.params).model };
         if (call.method !== "turn/start") return {};
         const tn = `tn-later-${call.turnStartCount}`;
         if (call.turnStartCount === 1) call.transport.push(threadStarted("th-scope"));
@@ -14599,7 +14719,7 @@ describe("Codex completion interlock", () => {
         .push(turnCompleted("completed", th, tn));
     });
     const resumed: Responder = call => {
-      if (call.method === "thread/start" || call.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (call.method === "thread/start" || call.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(call.params).model };
       if (call.method === "turn/start") {
         const tn = `tn-${call.turnStartCount + 1}`;
         if (call.turnStartCount === 1) call.transport.push(threadStarted("th-1"));
@@ -14911,10 +15031,14 @@ describe("Codex completion interlock", () => {
 describe("CodexExecutor milestone progress (issue #1674)", () => {
   type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
   const script = (th: string, turns: TurnScript[]): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
       return { turn: { id: tn } };
@@ -16268,10 +16392,12 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.deepEqual(resumedStore.sources.map((s) => s.launched), [true]);
   });
 
-  it("plan approval recreation stopped at reportIteration leaves the plan generation intact", async () => {
+  it("plan approval preparation stopped at reportIteration preserves the saved plan without implementation", async () => {
     const rig = makeMultiEpochRig([epochResponder("th-plan", "tn-plan", (t, th, tn) => {
       t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan"))
         .push(turnCompleted("completed", th, tn));
+    }), resumedEpochResponder("th-plan", "tn-implement", () => {
+      assert.fail("reportIteration must stop before an implementation turn");
     })]);
     const store = sessionGenerationSpy(rig);
     const { ctx } = makeCtx({
@@ -16280,9 +16406,12 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
       reportIteration: async () => { throw new Error("stop at running report"); },
     });
     await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "approval report stop"), /stop at running report/);
-    assert.equal(rig.providerLaunches(), 1);
-    assert.deepEqual(store.sources.map((s) => s.launched), [true]);
-    assert.equal(store.generation(), 1);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "preparation never executes implementation");
+    assert.deepEqual(rig.epochs[1]!.transport.requests.filter(r => r.method === "thread/resume").map(r => rec(r.params).threadId), ["th-plan"]);
+    assert.deepEqual(store.sources.map((s) => s.launched), [true, true]);
+    // Explicit preparation launched and adopted the plan session before reportIteration failed.
+    assert.equal(store.generation(), 2);
     assert.equal(store.files(), 1);
   });
 
@@ -16535,7 +16664,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
   // helpers build the quiet first turn and the resuming completers; each test's parkForWall performs
   // the real reap through exec.safety.withBoundary, as the runner's capture does.
   const quietEpoch = (threadId: string): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId }, model: rec(c.params).model };
     if (c.method === "turn/start") {
       c.transport.push(threadStarted(threadId));
       return { turn: { id: "tn-1" } };
@@ -16927,7 +17056,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
   // turn completes with signal_done. All turns reuse turn id tn-1 so the frames route to it.
   function quietThenDone(quiet: number): Responder {
     return (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         if (c.turnStartCount <= quiet) c.transport.push(threadStarted());
         else c.transport.push(signalDone()).push(turnCompleted("completed"));
@@ -16987,7 +17116,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
   it("(T9) after a declined `now`, a checkpoint mints a fresh epoch on an un-aborted lifecycle signal and the run completes", async () => {
     const rig = makeMultiEpochRig([
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           c.transport.push(threadStarted("th-1"));
           // Turn 1 goes quiet (the `now` drops it); the re-drive checkpoints cooperatively.
@@ -17028,7 +17157,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
     let cancelNow = (): void => undefined;
     const rig = makeMultiEpochRig([
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           c.transport.push(threadStarted("th-1"));
           if (c.turnStartCount > 1) c.transport.push(toolCall(1, "checkpoint", {}, "th-1", "tn-1", "c-ckpt")).push(turnCompleted("completed"));
@@ -17037,7 +17166,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
         return {};
       },
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           cancelNow(); // the owner cancels while the fresh epoch's turn runs
           c.transport.push(toolCall(3, "signal_done", {}, "th-1", "tn-2", "c-done")).push(turnCompleted("completed", "th-1", "tn-2"));
@@ -17401,7 +17530,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
     let onInterrupt = (): void => undefined;
     const rig = makeRig({
       responder: (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           c.transport.push(threadStarted()); // quiet: the wall timer trips the turn
           return { turn: { id: "tn-1" } };
@@ -17899,7 +18028,7 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
 
   it("C6: a lock seen while a plan gate is open (a revise turn) is not latched: the turn fails as today", async () => {
     const responder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const turnId = `tn-${c.turnStartCount}`;
         if (c.turnStartCount === 1) {
@@ -17929,7 +18058,7 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
   // `reviseFrames` first. The next epoch is the post-approval implement epoch.
   const gatedRig = (reviseFrames: (t: FakeTransport, th: string, tn: string) => void, implement: Responder): MultiRig => {
     const plan: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const turnId = `tn-${c.turnStartCount}`;
         c.transport.push(threadStarted("th-plan"));
@@ -18484,7 +18613,7 @@ for (const mode of ["off", "repair", "stale"] as const) {
 describe("CodexExecutor secret remediation gate (issue #1932)", () => {
   type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
   const script = (th: string, turns: TurnScript[]): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
@@ -19176,10 +19305,14 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
 describe("CodexExecutor owner follow-up (issue #1800)", () => {
   type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
   const script = (th: string, turns: TurnScript[], onTurnStart: (n: number) => void = () => {}): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       onTurnStart(c.turnStartCount);
       for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
@@ -19397,7 +19530,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     // never produced an item, so the follow-up must stay unreported for the next claim.
     const rig = makeMultiEpochRig([
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           const tn = `tn-th-1-${c.turnStartCount}`;
           c.transport.push(threadStarted("th-1"));
@@ -19443,7 +19576,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     // refused wall park reaps and recreates the provider epoch, and the same drive re-runs on it.
     const rig = makeMultiEpochRig([
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           c.transport.push(threadStarted("th-1"));
           return { turn: { id: "tn-1" } };
@@ -19483,7 +19616,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     // and the loop-top recreation mints epoch 1 before the owner slot fill.
     const rig = makeMultiEpochRig([
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           c.transport.push(threadStarted("th-1")).push(turnCompleted("completed", "th-1", "tn-1"));
           return { turn: { id: "tn-1" } };
@@ -19537,7 +19670,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     // model read the follow-up, so a failing turn keeps it unreported for the next claim's requeue.
     const rig = makeMultiEpochRig([
       (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           const tn = `tn-th-1-${c.turnStartCount}`;
           c.transport.push(threadStarted("th-1"));
@@ -20042,7 +20175,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
   const spawnResponder = (rootTh: string, resumed: boolean): Responder => {
     let children = 0;
     return (c) => {
-      if (c.method === "thread/resume") return { thread: { id: rootTh } };
+      if (c.method === "thread/resume") return { thread: { id: rootTh }, model: rec(c.params).model };
       if (c.method === "thread/start") {
         if (!resumed && c.threadStartCount === 1) return { thread: { id: rootTh } };
         children += 1;
@@ -20051,10 +20184,11 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) {
           if (!resumed) c.transport.push(threadStarted(rootTh));
+          c.transport.push(turnStarted(rootTh, "tn-root"));
           return { turn: { id: "tn-root" } };
         }
         const th = String(rec(c.params).threadId);
-        c.transport.push(turnCompleted("completed", th, `tn-${th}`));
+        c.transport.push(turnStarted(th, `tn-${th}`)).push(turnCompleted("completed", th, `tn-${th}`));
         return { turn: { id: `tn-${th}` } };
       }
       return {};
@@ -20075,7 +20209,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     return out;
   };
   const planResponder: Responder = (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
     if (c.method === "turn/start") {
       c.transport.push(threadStarted("th-plan"));
       c.transport.push(toolCall(1, "submit_plan", { plan_md: "PLAN-1", milestones: [{ id: "m1", title: "Alpha" }] }, "th-plan", "tn-plan", "c-plan"));
@@ -20488,7 +20622,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     const childResponder = (): Responder => {
       let children = 0;
       return (c) => {
-        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "thread/start") {
           if (c.threadStartCount === 1) return { thread: { id: "th-1" } };
           children += 1;
@@ -20533,7 +20667,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 
   it("repo source: completion-rework and clarification continuation prompts carry the passage and names", async () => {
     const script1 = (th: string, calls: (tn: string) => CodexNotification[][]): Responder => (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const tn = `tn-${c.turnStartCount}`;
         if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
@@ -20579,7 +20713,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 
   it("own source: a replacement prompt carries the names and no passage", async () => {
     const rig = makeMultiEpochRig([(c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const tn = `tn-${c.turnStartCount}`;
         if (c.turnStartCount === 1) c.transport.push(threadStarted("th-1"));
@@ -20941,7 +21075,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       mocked.mock.restore();
       t.mock.timers.reset();
       const resumed = makeRig({ responder: c => {
-        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           c.transport.push(signalDone("th-1", "tn-2")).push(turnCompleted("completed", "th-1", "tn-2"));
           return { turn: { id: "tn-2" } };
@@ -21084,9 +21218,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
   for (const productive of [false, true]) for (const retry of productive ? [false] : [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive} retry=${retry}`, async t => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
-      epochResponder("th-2", "tn-2", transport => {
-        if (productive) transport.push(agentMessage("partial model output", "th-2"));
-        else if (retry) transport.push(retryNote("rateLimitExceeded", true, "th-2", "tn-2"));
+      epochResponder("th-2", "tn-2", (transport, th, tn) => {
+        if (productive) transport.push(agentMessage("partial model output", th));
+        else if (retry) transport.push(retryNote("rateLimitExceeded", true, th, tn));
       }),
     ]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
@@ -21147,7 +21281,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
-        c.transport.push(threadStarted());
+        c.transport.push(threadStarted()).push(turnStarted());
         if (retry) c.transport.push(retryNote("rateLimitExceeded"));
         if (productive) c.transport.push(agentMessage("partial model output"));
         c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
@@ -21570,7 +21704,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const rig = silentRevisionRig();
     // Three further silent epochs, then a successful owner replacement.
     const silent: Responder = c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") return { turn: { id: "tn-1" } };
       return {};
     };
@@ -22191,7 +22325,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
    *  `beforeFailure(n)` runs on the n-th failing turn right before its terminal is delivered. */
   function failingThenDone(failures: number, info: unknown, beforeFailure?: (n: number) => void): Responder {
     return (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted());
         if (c.turnStartCount <= failures) {
@@ -22206,7 +22340,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
 
   for (const replace of [false, true]) it(`M2 human revision retries the answered provider turn; replacement=${replace}`, async () => {
     const rig = makeRig({ responder: (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const n = c.turnStartCount;
         const tn = "tn-1";
@@ -22296,6 +22430,21 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     rig.deps = { ...rig.deps, transientBackoffBaseMs: 1, ...extra };
   }
 
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`resumed implementation retries after ${info} without a stale stop fence`, async () => {
+    const rig = makeRig({ responder: failingThenDone(1, info) });
+    tinyBackoff(rig);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1" });
+    await assert.doesNotReject(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000,
+      "resumed transient retry").then(result => {
+      assert.equal(result.phaseSwitchHeld, undefined);
+    }), "a proved same-thread retry must not reuse the preceding terminal stop bit");
+    assert.equal(rig.transport.turnStartCount, 2);
+    assert.equal(rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), false);
+    assert.deepEqual(rig.transport.requests.filter(r => r.method === "turn/start").map(r => rec(r.params).threadId), ["th-1", "th-1"]);
+    assert.equal(retryNotices(emitted).length, 1);
+  });
+
   for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(a) ${info} once then success: the run completes in the SAME thread with one retry notice [${info}]`, async () => {
     const rig = makeRig({ responder: failingThenDone(1, info) });
     tinyBackoff(rig);
@@ -22320,7 +22469,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
     it(`(b0) a transport notification then a ${tag} terminal is NOT retried or recovery-parked`, async () => {
       const responder: Responder = (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount === 1) c.transport.push(threadStarted());
           c.transport
@@ -22529,10 +22678,13 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         const resumedPlan = `recovered ${mode} plan`;
         let implementationSawStoredPlan = !planning;
         const resumed = makeRig({ responder: c => {
-          if (c.method === "thread/resume") return { thread: { id: parkedId } };
+          if (c.method === "thread/resume") return { thread: { id: parkedId }, model: rec(c.params).model };
           if (c.method === "turn/start") {
             const turnId = `tn-resumed-${c.turnStartCount}`;
             c.transport.push(threadStarted(parkedId));
+            // Cold approval needs the provider's live-turn boundary before completion.
+            c.transport.push({ kind: "turn_started", method: "turn/started", threadId: parkedId, turnId,
+              params: { threadId: parkedId, turn: { id: turnId } } });
             if (planning && c.turnStartCount === 1) {
               c.transport.push(toolCall(1701, "submit_plan", { plan_md: resumedPlan }, parkedId, turnId, "resumed-plan"));
             } else {
@@ -22897,7 +23049,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     // retries disabled, and the cancel (which cannot abort the spent signal) is only sticky.
     const rig = makeRig({
       responder: (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount === 1) c.transport.push(threadStarted());
           else {
@@ -22941,7 +23093,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     // not re-check the sticky cancel, so only the post-backoff gate stops a third turn start.
     const rig = makeRig({
       responder: (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount === 1) c.transport.push(threadStarted());
           else c.transport.push(turnCompletedWithError("serverOverloaded"));
@@ -23276,7 +23428,7 @@ describe("Codex M1 review transport", () => {
     return (turns[0]!.params as { input: { text: string }[] }).input[0]!.text;
   }
   const done = (threadId: string) => resumedEpochResponder(threadId, "tn-m1-done", (t, th, tn) => {
-    t.push(toolCall(2393, "signal_done", {}, th, tn, "m1-done")).push(turnCompleted("completed", th, tn));
+    t.push(turnStarted(th, tn)).push(toolCall(2393, "signal_done", {}, th, tn, "m1-done")).push(turnCompleted("completed", th, tn));
   });
   it("plan to gated implementation and ordinary successor on a distinct recreated epoch", async () => {
     const threadId = "th-m1-gated";
@@ -23285,7 +23437,7 @@ describe("Codex M1 review transport", () => {
         t.push(toolCall(2390, "submit_plan", { plan_md: "M1-GATED-PLAN" }, th, tn, "m1-plan")).push(turnCompleted("completed", th, tn));
       }),
       resumedEpochResponder(threadId, "tn-m1-checkpoint", (t, th, tn) => {
-        t.push(toolCall(2391, "checkpoint", {}, th, tn, "m1-checkpoint")).push(turnCompleted("completed", th, tn));
+        t.push(turnStarted(th, tn)).push(toolCall(2391, "checkpoint", {}, th, tn, "m1-checkpoint")).push(turnCompleted("completed", th, tn));
       }),
       done(threadId),
     ]);
@@ -23564,8 +23716,9 @@ describe("Codex dependency provisioning M2", () => {
       return {};
     };
     const impl: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
+        c.transport.push(turnStarted());
         if (c.turnStartCount === 2) c.transport.push(signalDone());
         c.transport.push(turnCompleted());
         return { turn: { id: "tn-1" } };
@@ -24101,10 +24254,10 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
       (c) => {
         if (c.method === "thread/resume") {
           latch();
-          return { thread: { id: "resumed-1" } };
+          return { thread: { id: "th-1" }, model: rec(c.params).model };
         }
         if (c.method === "turn/start") {
-          c.transport.push(toolCall(2, "signal_done", {}, "resumed-1", "tn-2", "c-done")).push(turnCompleted("completed", "resumed-1", "tn-2"));
+          c.transport.push(toolCall(2, "signal_done", {}, "th-1", "tn-2", "c-done")).push(turnCompleted("completed", "th-1", "tn-2"));
           return { turn: { id: "tn-2" } };
         }
         return {};
@@ -24130,7 +24283,7 @@ describe("M1 expired wall physical Codex runner", () => {
       let calls = 0;
       await exerciseExpiredWallRunner(boundary, (_ctx, home) => {
         const rig = makeRig({ responder: c => {
-          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
           if (c.method !== "turn/start") return {};
           assert.equal(++calls, 1, "wall ACK cannot start another provider turn");
           c.transport.push(toolCall(401, "park_run", {}, "th-1", "tn-expired-wall", "park"));
@@ -24162,7 +24315,7 @@ describe("M4 dependency wait physical Codex runner", () => {
           advertisedTools = rec(c.params).dynamicTools;
           return { thread: { id: "th-1" } };
         }
-        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         calls++;
         assert.ok(calls <= 3, "parking cannot start another provider turn");
@@ -24211,7 +24364,7 @@ describe("M3 dependency wait paired Codex", () => {
         advertisedTools = rec(c.params).dynamicTools;
         return { thread: { id: "th-1" } };
       }
-      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       const n = c.turnStartCount;
       const tn = `tn-wait-${n}`;
@@ -24260,7 +24413,7 @@ describe("M3 dependency wait Codex", () => {
         });
         const responder: Responder = (c) => {
           if (c.method === "thread/start") { advertisedTools = rec(c.params).dynamicTools; return { thread: { id: "th-1" } }; }
-          if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
           if (c.method !== "turn/start") return {};
           const n = c.turnStartCount, tn = `tn-park-${n}`;
           if (n === 1) {
@@ -24295,7 +24448,7 @@ describe("M3 dependency wait Codex", () => {
     it(`handles park failure-question ${disposition} at max1`, async () => {
       const prompts: string[] = [];
       const rig = makeRig({ responder: (c) => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         prompts.push((c.params as { input: { text: string }[] }).input[0]!.text);
         const tn = `tn-failure-${c.turnStartCount}`;
@@ -24415,7 +24568,7 @@ describe("M3 Codex bounded park controls", () => {
         let entered!: () => void;
         let nextRetry = new Promise<void>(resolve => { entered = resolve; });
         const rig = makeRig({ responder: c => {
-          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
           if (c.method !== "turn/start") return {};
           const tn = `tn-${c.turnStartCount}`;
           c.transport.push(toolCall(400 + c.turnStartCount, c.turnStartCount > 1 ? "signal_done" : direct ? "ask_user" : "park_run",
@@ -24511,10 +24664,11 @@ describe("M3 Codex bounded park controls", () => {
         if (c.method === "thread/start") assert.fail("the implementation epoch must resume, not start");
         if (c.method === "thread/resume") {
           resumes.push({ tools: rec(c.params).dynamicTools, threadId: rec(c.params).threadId });
-          return { thread: { id: "th-1" } };
+          return { thread: { id: "th-1" }, model: rec(c.params).model };
         }
         if (c.method === "turn/start") {
           prompts.push(JSON.stringify(c.params));
+          c.transport.push(turnStarted("th-1", "tn-2"));
           c.transport.push(toolCall(603, "park_run", {}, "th-1", "tn-2", "impl-park"));
           c.transport.push(turnCompleted("completed", "th-1", "tn-2"));
           return { turn: { id: "tn-2" } };
@@ -24681,7 +24835,9 @@ describe("Codex overflow scheduling M1", () => {
     const plan = epochResponder("th-1", "tn-1", transport => {
       transport.push(toolCall(1, "submit_plan", { plan_md: "M1" }, "th-1", "tn-1", "plan")).push(turnCompleted());
     });
-    const rig = makeMultiEpochRig([plan]);
+    const rig = makeMultiEpochRig([plan, resumedEpochResponder("th-1", "tn-2", () => {
+      assert.fail("spent wall budget must park before implementation");
+    })]);
     rig.deps = { ...rig.deps, timeoutNow: clock.now, wallMs: REPRO_DELAY, installDeps: (_cwd, _env, opts) => {
       opts?.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
       return install;
@@ -24714,6 +24870,7 @@ describe("Codex overflow scheduling M1", () => {
       finish({ results: [], truncated: false });
       const result = await running;
       assert.ok(result.walled);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "preparation permits no implementation turn after the wall");
       assert.equal(parks, 1);
       assert.equal(clock.pending().some(r => r.delay === 98_999_354), false, "actual installer join cancels pending deadline chunks");
       clock.move(98_999_354); clock.deliver(); await drain();
@@ -25398,12 +25555,13 @@ describe("2833 Codex inline summaries", () => {
             t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))
               .push(turnCompleted("completed", th, tn)));
           const implementResponder: Responder = c => {
-            if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-impl" } };
+            if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
             if (c.method !== "turn/start") return {};
+            c.transport.push(turnStarted("th-plan", "tn-impl"));
             implementation.resolve();
             void finish.promise.then(() => c.transport
-              .push(toolCall(99, "signal_done", {}, "th-impl", "tn-impl", "done"))
-              .push(turnCompleted("completed", "th-impl", "tn-impl")));
+              .push(toolCall(99, "signal_done", {}, "th-plan", "tn-impl", "done"))
+              .push(turnCompleted("completed", "th-plan", "tn-impl")));
             return { turn: { id: "tn-impl" } };
           };
           const rig = makeMultiEpochRig([planResponder, implementResponder]);
@@ -25465,12 +25623,13 @@ describe("2833 Codex inline summaries", () => {
       t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))
         .push(turnCompleted("completed", th, tn)));
     const implementResponder: Responder = c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-impl" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
+      c.transport.push(turnStarted("th-plan", "tn-impl"));
       implementation.resolve();
       void finish.promise.then(() => c.transport
-        .push(toolCall(99, "signal_done", {}, "th-impl", "tn-impl", "done"))
-        .push(turnCompleted("completed", "th-impl", "tn-impl")));
+        .push(toolCall(99, "signal_done", {}, "th-plan", "tn-impl", "done"))
+        .push(turnCompleted("completed", "th-plan", "tn-impl")));
       return { turn: { id: "tn-impl" } };
     };
     const rig = makeMultiEpochRig([planResponder, implementResponder]);
@@ -25521,7 +25680,7 @@ describe("2833 Codex inline summaries", () => {
       };
       let plans = 0;
       const planResponder: Responder = c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         const tn = `tn-${++plans}`;
         c.transport.push(toolCall(98 + plans, "submit_plan", { plan_md: plans === 1 ? "# Old" : "# Replacement" }, "th-plan", tn, tn))
@@ -25652,12 +25811,13 @@ describe("2833 Codex inline summaries", () => {
       const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
         t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
       const implementResponder: Responder = c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-impl" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
+        c.transport.push(turnStarted("th-plan", "tn-impl"));
         implementation.resolve();
         void finish.promise.then(() => c.transport
-          .push(toolCall(99, "signal_done", {}, "th-impl", "tn-impl", "done"))
-          .push(turnCompleted("completed", "th-impl", "tn-impl")));
+          .push(toolCall(99, "signal_done", {}, "th-plan", "tn-impl", "done"))
+          .push(turnCompleted("completed", "th-plan", "tn-impl")));
         return { turn: { id: "tn-impl" } };
       };
       const rig = makeMultiEpochRig([planResponder, implementResponder]);
@@ -25700,7 +25860,7 @@ describe("2833 Codex inline summaries", () => {
     };
     let plans = 0;
     const planResponder: Responder = c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       const tn = `tn-${++plans}`;
       c.transport.push(toolCall(98 + plans, "submit_plan", { plan_md: plans === 1 ? "# Old" : "# Replacement" }, "th-plan", tn, tn))
@@ -26300,7 +26460,7 @@ describe("2833 Codex inline summaries", () => {
   for (const sink of ["wall", "request", "hold"] as const) for (const accepted of [false, true]) {
     it(`2833 ${sink} ${accepted ? "accepted" : "declined"} park closes before destructive callback`, async () => {
       const responder: Responder = c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         const tn = `tn-${c.turnStartCount}`;
         if (c.turnStartCount === 1) c.transport.push(threadStarted("th-1"));
@@ -27546,10 +27706,22 @@ describe("A capture lifecycle public run", () => {
     const exec = makeExecutor(fx.rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, fx.homeRoot);
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
     try {
-      assert.equal((await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")).branch, ctx.branch);
+      if (unclean) {
+        // Approval cannot replace an epoch whose helper cleanup is unproved: allowing a
+        // successful branch here would publish work across an unverified ownership boundary.
+        const refusal = await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")
+          .then(() => undefined, (error: unknown) => error);
+        // Check admission first: bypassing the proof must fail on admitted work,
+        // even if the run later throws a different cleanup error.
+        assert.equal(fx.rig.providerLaunches(), 1, "no replacement launch without cleanup proof");
+        assert.equal(fx.rig.epochs[1]!.transport.turnStartCount, 0, "no implementation turn admitted");
+        assert.match(String(refusal), /prior Codex epoch cleanup unproven/);
+      } else {
+        assert.equal((await withTimeout(exec.run(ctx), 5000, "clean old epoch run")).branch, ctx.branch);
+        assert.equal(fx.rig.providerLaunches(), 2);
+        await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
+      }
       assert.ok(oldDisposals > 0, "the real abandoned epoch attempted helper teardown");
-      assert.equal(fx.rig.providerLaunches(), 2);
-      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
       const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
       assert.equal(disposed.kind, unclean ? "incomplete" : "disposed");
       if (disposed.kind === "incomplete") assert.match(JSON.stringify(disposed.errors), /terminal cleanup hook failed/);
@@ -28205,7 +28377,7 @@ describe("M3 Codex interrupted recovery delivery", () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-m3", "tn-first", done),
       c => {
-        if (c.method === "thread/resume") return { thread: { id: "th-m3" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-m3" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         const tn = `tn-rework-${c.turnStartCount}`;
         if (c.turnStartCount === 1) c.transport.push(agentMessage("completion rework", "th-m3"))
@@ -28246,9 +28418,12 @@ describe("M3 Codex interrupted recovery delivery", () => {
         t.push(toolCall(3131, "submit_plan", { plan_md: "plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn));
       }),
       resumedEpochResponder("th-m3", "tn-check", (t, th, tn) => {
-        t.push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
+        t.push(turnStarted(th, tn)).push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
       }),
-      resumedEpochResponder("th-m3", "tn-done", done),
+      resumedEpochResponder("th-m3", "tn-done", (t, th, tn) => {
+        t.push(turnStarted(th, tn));
+        done(t, th, tn);
+      }),
     ]);
     rig.deps = { ...rig.deps, installDeps: async () => { installed = true; return { results: [], truncated: false }; } };
     const { ctx } = makeCtx({
@@ -28302,7 +28477,7 @@ describe("M3 Codex interrupted recovery delivery", () => {
   it("M3 replan before implementation leaves evidence for first ordinary owner", async () => {
     let gets = 0, gates = 0;
     const plan: Responder = c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-m3" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-m3" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       const n = c.turnStartCount, tn = `tn-plan-${n}`;
       if (n === 1) c.transport.push(threadStarted("th-m3"));
@@ -28356,7 +28531,7 @@ describe("3282 Codex historical completion wall routing", () => {
     for (const accepted of (route === "extension" || route === "iteration" ? [true] : [true, false])) it(`3282 ${route} history without a flight attempt; hold ${accepted}`, async () => {
       let dispatches = 0, parks = 0, takes = 0, holds = 0;
       const rig = makeRig({ responder: c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method !== "turn/start") return {};
         dispatches++;
         assert.ok(dispatches <= 1, "no model redrive after a historical wall");
@@ -28412,7 +28587,7 @@ describe("3282 Codex historical completion wall routing", () => {
   it("3282 history survives zero and missing ACKs before a pending wall", async () => {
     let reports = 0, dispatches = 0, holds = 0;
     const rig = makeRig({ responder: c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       dispatches++; c.transport.push(turnCompleted());
       return { turn: { id: "tn-1" } };
@@ -28568,7 +28743,7 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
     let deferredRootDone: CodexNotification | undefined;
     const responder: Responder = (c) => {
       if (c.method === "thread/start" && spawnPending) { spawnPending = false; return { thread: { id: "th-child" } }; }
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       if ((c.params as { threadId?: string }).threadId === "th-child") {
         // A delegated child turn (not a lead provider call): its frames are subagent-origin.
@@ -28875,7 +29050,7 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
     const fixture = dependencyWaitCallbacks({ eligible: true });
     let turns = 0;
     const responder: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method !== "turn/start") return {};
       const n = ++turns;
       const tn = `tn-wait-${n}`;
@@ -29154,10 +29329,14 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
   type Script = (th: string, tn: string) => CodexNotification[];
   const done: Script = (th, tn) => [signalDone(th, tn)];
   const script = (th: string, turns: Script[]): Responder => c => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       const next = turns[c.turnStartCount - 1];
       assert.ok(next, "no unexpected extra model turn");
       for (const frame of next(th, tn)) c.transport.push(frame);
@@ -29309,13 +29488,16 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
         rig.transport.requestOverride = c => c.method === "thread/resume"
           ? rejected
             ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
-            : Promise.resolve({ thread: { id: "claimed-3472" } })
+            : Promise.resolve({ thread: { id: "claimed-3472" }, model: rec(c.params).model })
           : undefined;
         await observe(async requests => {
           const { ctx } = makeCtx({ worktreePath: root, repoClaudemdEnabled: true, sessionId: "claimed-3472" });
           await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "3472 claimed resume");
           assert.deepEqual(routes(rig.transport).map(r => r.method), rejected ? ["thread/resume", "thread/start"] : ["thread/resume"]);
-          assert.equal(requests.length, rejected ? 2 : 1);
+          // No-turn resume preparation is not a startTurn attempt; only the fresh fallback
+          // (or the accepted resume) reaches model dispatch. Both routes retain the snapshot.
+          assert.equal(requests.length, 1);
+          assert.equal(rig.transport.turnStartCount, 1);
           const snapshot = block(requests[0]!.systemPrompt!);
           assert.ok(snapshot.includes(payload));
           for (const r of requests) assert.equal(block(r.systemPrompt!), snapshot);
@@ -29638,7 +29820,7 @@ describe("M2 lazy root operation admission", () => {
 
   it("automatic revision receives a separate fresh admit without replaying feedback", async () => {
     const plan: Responder = c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "m2-plan" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "m2-plan" }, model: rec(c.params).model };
       if (c.method === "turn/start") {
         const tn = `m2-turn-${c.turnStartCount}`;
         c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "M2 plan" }, "m2-plan", tn, tn))
@@ -30334,7 +30516,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
     }> };
     const cases = contract.request_cases.filter((c) => c.harness === "codex");
-    assert.equal(cases.length, 22, "all Codex request cases loaded");
+    assert.equal(cases.length, 30, "all Codex request cases loaded");
     const visited: string[] = [];
     const phases = new Set<string>();
     for (const c of cases) {
@@ -30355,7 +30537,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       const planPhase = c.phase === "plan";
       const rig = makeMultiEpochRig(planPhase ? [
         reporting(planEpoch, fields),
-        reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+        epochResponder("th-plan", "tn-impl", doneFrames),
       ] : [reporting(resumedEpochResponder("th-1", "tn-1", doneFrames), fields)]);
       const { ctx } = makeCtx({
         agents: leadRequestCaseAgents(c), config: c.config, leadConfig: reporter,
@@ -30392,7 +30574,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 22);
+    assert.equal(visited.length, 30);
     assert.deepEqual([...phases].sort(), ["implement", "plan"]);
   });
 
@@ -30614,10 +30796,13 @@ describe("CodexExecutor: a preserve-only conversation never starts a fresh provi
 
   it("a successfully resumed preserving root runs normally on the claimed thread", async () => {
     const rig = makeRig();
-    rig.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.resolve({ thread: { id: "claimed-thread" } }) : undefined;
+    rig.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.resolve({ thread: { id: "claimed-thread" }, model: rec(c.params).model }) : undefined;
     rig.transport.push(threadStarted("claimed-thread")).push(signalDone("claimed-thread", "tn-1")).push(turnCompleted("completed", "claimed-thread")).end();
     const { ctx } = makeCtx({ sessionId: "claimed-thread", preserveConversation: true });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve resumed");
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve resumed");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(rig.transport.turnStartCount, 1);
+    assert.equal(rec(rig.transport.requests.find(r => r.method === "turn/start")!.params).threadId, "claimed-thread");
     assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/resume"]);
   });
 
@@ -30653,8 +30838,10 @@ describe("CodexExecutor: a preserve-only conversation never starts a fresh provi
     rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
     const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never);
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, sessionId: "th-1", preserveConversation: true });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "preserve plan to implement"),
-      rejectsWith("provider_resume_rejected"));
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "preserve plan to implement");
+    assert.equal(result.phaseSwitchHeld?.phase, "implement", "approval resume refusal holds the selected same-thread switch");
+    assert.equal(result.phaseSwitchHeld?.cause, "malformed");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
     assert.equal(rig.providerLaunches(), 2, "approval recreated the epoch for implementation");
     assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"]);
   });
@@ -30893,7 +31080,7 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       const rig = makeRig({ responder: c => {
         if (c.method === "thread/start" || c.method === "thread/resume" || c.method === "turn/start") events.push(`provider:${c.method}`);
         if (c.method === "thread/start") return { thread: { id: "th-new" } };
-        if (c.method === "thread/resume") return { thread: { id: String(rec(c.params).threadId) } };
+        if (c.method === "thread/resume") return { thread: { id: String(rec(c.params).threadId) }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           const th = String(rec(c.params).threadId);
           const tn = `tn-${c.turnStartCount}`;
@@ -32182,7 +32369,7 @@ describe("CodexExecutor credential switch continuation", () => {
     let interrupt!: () => void;
     let handlers = 0, second = false;
     const rig = makeRig({ responder: c => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
       if (c.method === "turn/interrupt" && !second) { second = true; interrupt(); }
       if (c.method === "turn/start") {
         if (c.turnStartCount > 1) {
@@ -32212,7 +32399,7 @@ describe("CodexExecutor credential switch continuation", () => {
       const candidates: unknown[] = [];
       const fixture = dependencyWaitCallbacks({ eligible: true });
       const a: Responder = c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (branch === "lead") c.transport.push(toolCall(1, "signal_done",
             { owner_decision_requested: { reason: "Need decision" } }, "th-1", "tn-1", "done"));
@@ -32279,7 +32466,7 @@ describe("CodexExecutor credential switch continuation", () => {
       const original = new CredentialSwitchSignal();
       let calls = 0;
       const rig = makeRig({ responder: c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount > 1) c.transport.push(signalDone()).push(turnCompleted("completed"));
           return { turn: { id: "tn-1" } };
@@ -32316,7 +32503,7 @@ describe("CodexExecutor credential switch continuation", () => {
       let release!: () => void;
       const held = new Promise<void>(resolve => { release = resolve; });
       const rig = makeRig({ responder: c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount > (mode === "rearm" ? 2 : 1))
             c.transport.push(signalDone()).push(turnCompleted("completed"));
@@ -32362,7 +32549,7 @@ describe("CodexExecutor credential switch continuation", () => {
       let switches = 0;
       const candidates: unknown[] = [];
       const rig = makeRig({ responder: c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount === 1) c.transport.push(toolCall(1,
             site === "question" ? "ask_user" : "submit_plan",
@@ -32401,7 +32588,7 @@ describe("CodexExecutor credential switch continuation", () => {
       let interrupt!: () => void;
       const controller = new AbortController();
       const quiet: Responder = c => {
-        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" }, model: rec(c.params).model };
         if (c.method === "turn/start") {
           if (c.turnStartCount > 1) c.transport.push(toolCall(2, "submit_plan", { plan_md: "continued plan" },
             "th-1", "tn-1", "plan")).push(turnCompleted("completed"));
@@ -33390,7 +33577,7 @@ describe("M2 actualRunner credential replacement", () => {
               c.transport.push(turnCompleted("completed", "M3-B-child", "M3-B-child-turn"));
               return { turn: { id: "M3-B-child-turn" } };
             }
-            if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: bThreadId } };
+            if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: bThreadId }, model: rec(c.params).model };
             if (c.method === "turn/interrupt")
               c.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
             if (c.method === "turn/start") {
@@ -36336,10 +36523,14 @@ describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { sk
   };
   // A multi-turn scripted provider: turn N pushes turns[N-1]'s frames, then completes.
   const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
       return { turn: { id: tn } };
@@ -36547,10 +36738,14 @@ describe("issue #4313 real CodexExecutor + RunRunner over the done gate and resu
     }
   };
   const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") th = String(rec(c.params).threadId);
+      return { thread: { id: th }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       const tn = `tn-${th}-${c.turnStartCount}`;
       if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      c.transport.push(turnStarted(th, tn));
       for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
       c.transport.push(turnCompleted("completed", th, tn));
       return { turn: { id: tn } };
@@ -36931,7 +37126,7 @@ describe("Codex repeated actualRunner switching", () => {
     const rig = makeMultiEpochRig(["A", "B", "C"].map((label, index): Responder => c => {
       const turn = `repeat-${label}-turn`;
       if (c.method === "thread/start" || c.method === "thread/resume")
-        return { thread: { id: savedId } };
+        return { thread: { id: savedId }, model: rec(c.params).model };
       if (c.method === "turn/interrupt") {
         if (index === 1) {
           // A steering interrupt may arrive before the outer assertion releases B.
@@ -37348,4 +37543,762 @@ describe("Codex repeated actualRunner switching", () => {
     }
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
+});
+
+describe("B2 cold approval model handoff", () => {
+  afterEach(() => { mock.restoreAll(); });
+  const saved = "b2-saved-plan";
+  const observeUsage = () => {
+    const order: string[] = [];
+    const cuts: [string, string][] = [];
+    const record = CodexUsageAccountant.prototype.record;
+    mock.method(CodexUsageAccountant.prototype, "record", function (
+      this: CodexUsageAccountant, ...args: Parameters<typeof record>
+    ) {
+      if (args[0] === saved) order.push(`${args[2] ? "replay" : "live"}:${args[1].total.inputTokens}`);
+      return record.apply(this, args);
+    });
+    const cut = CodexUsageAccountant.prototype.beginModelSegment;
+    mock.method(CodexUsageAccountant.prototype, "beginModelSegment", function (
+      this: CodexUsageAccountant, ...args: Parameters<typeof cut>
+    ) {
+      if (args[0] === saved) { cuts.push(args); order.push("cut"); }
+      return cut.apply(this, args);
+    });
+    return { order, cuts };
+  };
+  const assertImplementationResume = (transport: FakeTransport) => {
+    const resumes = transport.requests.filter(r => r.method === "thread/resume");
+    assert.equal(resumes.length, 1);
+    assert.equal(rec(resumes[0]!.params).threadId, saved);
+    assert.equal(rec(resumes[0]!.params).model, "gpt-6.1-sol");
+    assert.equal(transport.requests.some(r => r.method === "thread/start"), false);
+  };
+  const assertImplementationTurn = (transport: FakeTransport) => {
+    const turns = transport.requests.filter(r => r.method === "turn/start");
+    assert.equal(turns.length, 1, "only the implementation pair reaches turn/start");
+    const params = rec(turns[0]!.params);
+    assert.equal(params.threadId, saved);
+    assert.equal(params.model, "gpt-6.1-sol");
+    assert.equal(params.effort, "medium");
+  };
+  const config: ClaimConfig = {
+    default_model: "gpt-6.1-sol", default_model_source: "user_default",
+    default_effort: "medium", default_effort_source: "user_default",
+    plan_phase: { model: "gpt-6-astra", model_source: "user_planning_default",
+      effort: "high", effort_source: "user_planning_default" },
+  };
+  const plan = (): Responder => epochResponder(saved, "b2-plan", (t, th, tn) => {
+    t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+      .push(toolCall(1, "submit_plan", { plan_md: "bounded implementation" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn));
+  });
+  // Even a broken guard receives a bounded completion; failures must be assertions, not timeouts.
+  const implementation = (observed: unknown = "gpt-6.1-sol", replay = 100, total = 160): Responder => c => {
+    if (c.method === "thread/resume") {
+      c.transport.push(tokenUsageUpdated(saved, "b2-plan", { inputTokens: replay, totalTokens: replay }));
+      return { thread: { id: rec(c.params).threadId }, ...(observed === null ? {} : { model: observed }) };
+    }
+    if (c.method === "turn/start") {
+      const tn = "b2-implement";
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId: saved, turnId: tn,
+        params: { threadId: saved, turn: { id: tn } } })
+        .push(tokenUsageUpdated(saved, tn, { inputTokens: total, totalTokens: total },
+          { inputTokens: 60, totalTokens: 60 }))
+        .push(signalDone(saved, tn)).push(turnCompleted("completed", saved, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const approval = async () => ({ kind: "approve", selection: { status: "ok",
+    selection: { source: "own", exclusions: [] } } }) as never;
+
+  const observeClaimAccountants = () => {
+    const owners: CodexUsageAccountant[] = [];
+    const register = CodexUsageAccountant.prototype.registerThread;
+    mock.method(CodexUsageAccountant.prototype, "registerThread", function (
+      this: CodexUsageAccountant, ...args: Parameters<typeof register>
+    ) {
+      if (args[0] === saved && !owners.includes(this)) owners.push(this);
+      return register.apply(this, args);
+    });
+    return owners;
+  };
+
+  const stoppedApprovalClaim = async () => {
+    const rig = makeMultiEpochRig([plan(), implementation()]);
+    const stop = new Error("cold fixture stopped at running report");
+    const { ctx } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, reportIteration: async () => { throw stop; } });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx),
+      5000, "old approval claim"), error => error === stop);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    // Persisted claim inputs only; no executor or claim-local accounting escapes.
+    return { sessionId: saved, approvedPlan: "bounded implementation" };
+  };
+
+  for (const restoredGate of [false, true]) {
+    it(`cold persisted ${restoredGate ? "unapproved gate" : "approved resume"} owns fresh accounting`, async () => {
+      const owners = observeClaimAccountants();
+      const accounting = observeUsage();
+      const persisted = await stoppedApprovalClaim();
+      assert.equal(owners.length, 1);
+      const oldUsage = owners[0]!.aggregateByModel();
+      let gates = 0, reports = 0;
+      const respond = implementation("gpt-6.1-sol", 200, 225);
+      const rig = makeRig({ responder: c => {
+        if (c.method === "turn/start") {
+          assert.equal(gates, restoredGate ? 1 : 0, "restored gate must precede provider work");
+          assert.equal(rec(c.params).model, "gpt-6.1-sol", "old planning work must not be resent");
+        }
+        return respond(c);
+      } });
+      const sources: string[] = [];
+      const { ctx, emitted } = makeCtx({ config, ...persisted, planApproved: !restoredGate,
+        resumePhase: restoredGate ? "awaiting_approval" : "implementing",
+        gatePlan: async md => {
+          gates++;
+          assert.equal(md, persisted.approvedPlan);
+          assert.equal(rig.transport.turnStartCount, 0, "saved plan work must not be resent");
+          return approval();
+        },
+        reportPlanAgentSource: async source => { sources.push(source); },
+        reportIteration: async () => { reports++; } });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "cold persisted claim");
+      assert.equal(result.phaseSwitchHeld, undefined);
+      assert.equal(gates, restoredGate ? 1 : 0);
+      assert.equal(reports, 1);
+      assert.deepEqual(sources, [], "persisted plan requires no new planning source");
+      assertImplementationResume(rig.transport);
+      assertImplementationTurn(rig.transport);
+      assert.equal(owners.length, 2, "production creates a new accountant for each claim");
+      assert.notStrictEqual(owners[0], owners[1]);
+      assert.deepEqual(owners[0]!.aggregateByModel(), oldUsage);
+      assert.deepEqual(accounting.cuts, [], "old approval grants no inherited cut");
+      assert.deepEqual(accounting.order, ["live:100", "replay:200", "live:225"]);
+      const usage = lastResultModelUsage(emitted)!;
+      assert.equal(usage["gpt-6-astra"], undefined);
+      assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 25);
+    });
+  }
+
+  it("restored gate credential replacement cold-resumes implementation after approval", async () => {
+    const rig = makeMultiEpochRig([implementation("gpt-6-astra"), implementation()]);
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let gates = 0, switches = 0;
+    const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+      approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+      gatePlan: async () => { if (++gates === 1) throw new CredentialSwitchSignal(); return approval(); },
+      attemptCodexCredentialSwitch: async () => {
+        switches++;
+        const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+        const lease = await exec.suspendCodexEpoch(bounds);
+        assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+        assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+        assert.equal(await lease.teardown(bounds), true);
+        await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+        assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+        await lease.finishB(bounds);
+        return "resumed_B";
+      },
+    });
+    const result = await withTimeout(exec.run(ctx), 5000, "restored gate credential replacement");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(switches, 1);
+    assert.equal(gates, 2);
+    assert.equal(rig.providerLaunches(), 2, "approval replaces the prepared planning root");
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 0);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assertImplementationTurn(rig.epochs[1]!.transport);
+  });
+
+  for (const restored of [true, false]) {
+    for (const turnFallback of [false, true]) {
+      it(`${restored ? "restored gate" : "ordinary resume"} rejected implementation resume ${restored ? "holds" : "falls back"} at ${turnFallback ? "turn preparation" : "preflight"}`, async () => {
+        let skipPreflight = !restored && turnFallback;
+        let reports = 0;
+        const bounded = implementation();
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/resume") throw new CodexTransportError({
+            category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+          });
+          if (c.method === "thread/start") return { thread: { id: saved }, model: "gpt-6.1-sol" };
+          return bounded(c);
+        } });
+        const { ctx, emitted } = makeCtx({ config, sessionId: saved, planApproved: !restored,
+          approvedPlan: "persisted candidate", resumePhase: restored ? "awaiting_approval" : "implementing",
+          gatePlan: async () => { skipPreflight = turnFallback; return approval(); },
+          reportIteration: async () => { reports++; skipPreflight = false; },
+          pauseModeRequested: () => skipPreflight ? "milestone" : null });
+        const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "implementation resume refusal");
+        if (restored) {
+          assert.equal(result.phaseSwitchHeld?.phase, "implement");
+          assert.equal(reports, turnFallback ? 1 : 0, "the rejection reached the intended verification seam");
+          assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), false);
+          assert.equal(rig.transport.turnStartCount, 0);
+        } else {
+          assert.equal(result.phaseSwitchHeld, undefined);
+          assert.equal(result.branch, ctx.branch);
+          assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), true);
+          assert.equal(rig.transport.turnStartCount, 1);
+        }
+        assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), !restored);
+      });
+    }
+  }
+
+  for (const control of ["cancel", "reject"] as const) {
+    it(`restored gate consumes pending ${control} before presentation or provider work`, async () => {
+      const rig = makeRig();
+      let reads = 0;
+      const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+        approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+        takeResumedGateEvent: async () => {
+          reads++;
+          assert.equal(rig.transport.requests.length, 0);
+          return control === "cancel" ? { kind: "cancel" } :
+            { kind: "reject", reason: "saved candidate rejected", sourceGateRevision: 7 };
+        },
+        gatePlan: async () => { throw new Error("must not present the gate"); } });
+      await assert.rejects(makeExecutor(rig, bindingOf(API_KEY)).run(ctx),
+        control === "cancel" ? /cancel/ : /saved candidate rejected/);
+      assert.equal(reads, 1);
+      assert.equal(rig.transport.requests.length, 0);
+      assert.equal(rig.sessionOps.persist, 0, "unlaunched HOME cannot overwrite persisted session");
+    });
+  }
+
+  for (const control of ["cancel", "reject"] as const) {
+    it(`restored gate ${control} verdict never launches or persists a provider`, async () => {
+      const rig = makeRig();
+      let gates = 0;
+      const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+        approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+        gatePlan: async md => {
+          gates++;
+          assert.equal(md, "persisted candidate");
+          assert.equal(rig.transport.requests.length, 0);
+          return control === "cancel" ? { kind: "cancel" } :
+            { kind: "reject", reason: "restored gate rejected", sourceGateRevision: 7 };
+        } });
+      await assert.rejects(makeExecutor(rig, bindingOf(API_KEY)).run(ctx),
+        control === "cancel" ? /cancel/ : /restored gate rejected/);
+      assert.equal(gates, 1);
+      assert.equal(rig.transport.requests.length, 0);
+      assert.equal(rig.sessionOps.persist, 0);
+    });
+  }
+
+  it("restored candidate replays milestones without fabricating semantic submission", async () => {
+    const rig = makeRig({ responder: implementation() });
+    const milestones = [{ id: "m1", title: "persisted candidate milestone" }];
+    const stop = new Error("stop after restored approval preflight");
+    let reads = 0, gates = 0;
+    const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+      approvedPlan: "persisted candidate", resumePhase: "awaiting_approval", frozenMilestones: milestones,
+      takeResumedGateEvent: async () => { reads++; return undefined; },
+      gatePlan: async (md, candidate, onPersisted, settles, semantic) => {
+        gates++;
+        assert.equal(reads, 1, "pending controls drained first; queued approve belongs to gate");
+        assert.equal(md, "persisted candidate");
+        assert.deepEqual(candidate, milestones);
+        assert.equal(settles, undefined);
+        assert.equal(semantic, undefined, "persisted replay has no new semantic proposal");
+        assert.equal(typeof onPersisted, "function");
+        assert.equal(rig.transport.requests.length, 0, "approval precedes provider launch");
+        assert.equal(rig.sessionOps.persist, 0);
+        return approval();
+      }, reportIteration: async () => { throw stop; } });
+    await assert.rejects(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), error => error === stop);
+    assert.equal(gates, 1);
+    assertImplementationResume(rig.transport);
+    assert.equal(rig.transport.turnStartCount, 0);
+  });
+
+  for (const hasSession of [true, false]) {
+    it(`pending restored revision ${hasSession ? "resumes" : "reconstructs"} context and cuts only its own approval`, async () => {
+      const accounting = observeUsage();
+      const prompts: string[] = [];
+      const revision = epochResponder(saved, "revised-turn", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "revised candidate" }, th, tn, "revised"))
+          .push(turnCompleted("completed", th, tn));
+      });
+      const rig = makeMultiEpochRig([c => {
+        if (c.method === "turn/start") prompts.push(JSON.stringify(c.params));
+        return revision(c);
+      }, implementation()]);
+      const sources: string[] = [];
+      let gates = 0;
+      const { ctx } = makeCtx({ config, sessionId: hasSession ? saved : undefined,
+        planApproved: false, approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+        takeResumedGateEvent: async () => ({ kind: "revise", feedback: "tighten scope", inputId: 42 }),
+        reportPlanAgentSource: async source => { sources.push(source); },
+        gatePlan: async (md, _milestones, _onPersisted, settles) => {
+          gates++;
+          assert.equal(md, "revised candidate", "old candidate is never re-presented");
+          assert.equal(settles, 42, "revision settles at persistence of its replacement");
+          return approval();
+        } });
+      await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "restored revision");
+      assert.equal(gates, 1);
+      assert.equal(prompts.length, 1);
+      assert.match(prompts[0]!, /tighten scope/);
+      if (!hasSession) assert.match(prompts[0]!, /persisted candidate/);
+      assert.deepEqual(sources, ["own"]);
+      assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+      const revisionRoutes = rig.epochs[0]!.transport.requests.filter(r => r.method === "thread/start" || r.method === "thread/resume");
+      assert.equal(revisionRoutes.length, 1, "the revision uses exactly one thread route");
+      assert.equal(revisionRoutes[0]!.method, hasSession ? "thread/resume" : "thread/start");
+      if (hasSession) assert.equal(rec(revisionRoutes[0]!.params).threadId, saved);
+      assertImplementationResume(rig.epochs[1]!.transport);
+    });
+  }
+
+  it("an unapproved persisted plan without a session is freshly planned", async () => {
+    const rig = makeMultiEpochRig([plan(), implementation()]);
+    let gates = 0;
+    const { ctx } = makeCtx({ config, planApproved: false, approvedPlan: "old candidate",
+      resumePhase: "awaiting_approval", takeResumedGateEvent: async () => undefined,
+      gatePlan: async md => {
+        gates++;
+        assert.equal(md, "bounded implementation", "lost context must not restore the saved gate");
+        return approval();
+      } });
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "lost-session fresh plan");
+    assert.equal(gates, 1);
+    assert.equal(rig.epochs[0]!.transport.requests.some(r => r.method === "thread/start"), true);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
+
+  it("cold cleared-plan claim replans under A then owns exactly one B cut", async () => {
+    const owners = observeClaimAccountants();
+    const accounting = observeUsage();
+    const persisted = await stoppedApprovalClaim();
+    const oldUsage = owners[0]!.aggregateByModel();
+    const freshPlan: Responder = c => {
+      if (c.method === "thread/resume") {
+        c.transport.push(tokenUsageUpdated(saved, "old-claim", { inputTokens: 200, totalTokens: 200 }));
+        return { thread: { id: saved }, model: "gpt-6-astra" };
+      }
+      if (c.method === "turn/start") {
+        const tn = "cold-new-plan";
+        c.transport.push(turnStarted(saved, tn))
+          .push(tokenUsageUpdated(saved, tn, { inputTokens: 225, totalTokens: 225 },
+            { inputTokens: 25, totalTokens: 25 }))
+          .push(toolCall(1, "submit_plan", { plan_md: "new claim plan" }, saved, tn, "cold-plan"))
+          .push(turnCompleted("completed", saved, tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([freshPlan, implementation("gpt-6.1-sol", 235, 265)]);
+    let gates = 0, reports = 0;
+    const sources: string[] = [];
+    const { ctx, emitted } = makeCtx({ config, sessionId: persisted.sessionId,
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async md => { gates++; assert.equal(md, "new claim plan"); return approval(); },
+      reportPlanAgentSource: async source => { sources.push(source); },
+      reportIteration: async () => { reports++; } });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "cold genuine replan");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(gates, 1);
+    assert.equal(reports, 1);
+    assert.deepEqual(sources, ["own"]);
+    const a = rig.epochs[0]!.transport;
+    assert.equal(a.requests.some(r => r.method === "thread/start"), false);
+    const aTurn = a.requests.find(r => r.method === "turn/start")!;
+    assert.equal(rec(aTurn.params).threadId, saved);
+    assert.equal(rec(aTurn.params).model, "gpt-6-astra");
+    assert.equal(rec(aTurn.params).effort, "high");
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assertImplementationTurn(rig.epochs[1]!.transport);
+    assert.equal(owners.length, 2, "new A and B share only the new claim accountant");
+    assert.notStrictEqual(owners[0], owners[1]);
+    assert.deepEqual(owners[0]!.aggregateByModel(), oldUsage);
+    assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+    assert.deepEqual(accounting.order, ["live:100", "replay:200", "live:225", "replay:235", "cut", "live:265"]);
+    const usage = lastResultModelUsage(emitted)!;
+    assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 35, "old history is excluded");
+    assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 30);
+  });
+
+  for (const mode of ["match", "mismatch", "missing", "unsafe"] as const) {
+    it(`approval ${mode}: verifies before iteration and attributes same-thread usage`, async () => {
+      const observed = mode === "match" ? "gpt-6.1-sol" : mode === "mismatch" ? "gpt-6-astra"
+        : mode === "unsafe" ? "unsafe model value" : null;
+      // Missing is explicit: do not let the faithful default responder supply model evidence.
+      const impl = implementation(observed);
+      const rig = makeMultiEpochRig([plan(), impl]);
+      let reports = 0;
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, reportIteration: async () => { reports++; } });
+      const exec = makeExecutor(rig, bindingOf(API_KEY));
+      const result = await withTimeout(exec.run(ctx), 5000, `B2 ${mode}`);
+      const first = rig.epochs[0]!.transport.requests.find(r => r.method === "turn/start")!;
+      assert.equal(rec(first.params).model, "gpt-6-astra");
+      assert.equal(rec(first.params).effort, "high");
+      const resumes = rig.epochs[1]!.transport.requests.filter(r => r.method === "thread/resume");
+      assert.equal(resumes.length, 1);
+      assert.equal(rec(resumes[0]!.params).threadId, saved);
+      assert.equal(rec(resumes[0]!.params).model, "gpt-6.1-sol");
+      assert.equal(rig.epochs[1]!.transport.requests.some(r => r.method === "thread/start"), false);
+      if (mode === "match") {
+        assert.equal(result.phaseSwitchHeld, undefined);
+        assert.equal(reports, 1);
+        const turns = rig.epochs[1]!.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(turns.length, 1);
+        assert.equal(rec(turns[0]!.params).model, "gpt-6.1-sol");
+        assert.equal(rec(turns[0]!.params).effort, "medium");
+        const usage = lastResultModelUsage(emitted)!;
+        assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100);
+        assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60);
+      } else {
+        assert.equal(result.phaseSwitchHeld?.phase, "implement");
+        assert.equal(result.phaseSwitchHeld?.cause, mode === "mismatch" ? "model_mismatch" : "malformed");
+        assert.equal(reports, 0);
+        assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+        assert.ok(exec.safety, "published candidate remains the safety owner");
+        assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined, "no implementation cut");
+      }
+    });
+  }
+
+  for (const observed of ["gpt-6-astra", null]) {
+    it(`reclaimed implementation replacement before its first turn holds ${observed ?? "missing"} after credential commit`, async () => {
+      const rig = makeMultiEpochRig([implementation(), implementation(observed)]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let interrupt!: () => void;
+      let committed = false;
+      const { ctx, emitted } = makeCtx({ config, sessionId: saved,
+        onCredentialSwitch: cb => { interrupt = cb; },
+        reportIteration: async () => { interrupt(); },
+        attemptCodexCredentialSwitch: async () => {
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          await lease.finishB(bounds);
+          committed = true;
+          return "resumed_B";
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, "B2 reclaimed replacement");
+      assert.equal(committed, true, "model verification follows the coordinator's committed outcome");
+      assert.equal(result.phaseSwitchHeld?.phase, "implement");
+      assert.equal(result.phaseSwitchHeld?.cause, observed === null ? "malformed" : "model_mismatch");
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 0);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assert.ok(exec.safety, "published replacement retains safety ownership");
+      assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined, "no implementation cut or turn");
+    });
+  }
+
+  for (const observed of ["gpt-6.1-sol", "gpt-6-astra", null]) {
+    it(`consumed approval cut then checkpoint recreation verifies ${observed ?? "missing"} without another split`, async () => {
+      const accounting = observeUsage();
+      const checkpoint: Responder = c => {
+        if (c.method !== "turn/start") return implementation()(c);
+        const tn = "b2-checkpoint";
+        c.transport.push({ kind: "turn_started", method: "turn/started", threadId: saved, turnId: tn,
+          params: { threadId: saved, turn: { id: tn } } })
+          .push(tokenUsageUpdated(saved, tn, { inputTokens: 160, totalTokens: 160 },
+            { inputTokens: 60, totalTokens: 60 }))
+          .push(toolCall(2, "checkpoint", {}, saved, tn, "b2-checkpoint-call"))
+          .push(turnCompleted("completed", saved, tn));
+        return { turn: { id: tn } };
+      };
+      const rig = makeMultiEpochRig([plan(), checkpoint, implementation(observed, 160, 220)]);
+      let checkpoints = 0;
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, checkpoint: async () => { checkpoints++; } });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "B2 consumed cut recreation");
+      assert.equal(checkpoints, 1);
+      assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]], "checkpoint recreation never repeats the consumed approval cut");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      assert.equal(rig.epochs[2]!.transport.turnStartCount, observed === "gpt-6.1-sol" ? 1 : 0);
+      assert.equal(result.phaseSwitchHeld?.phase, observed === "gpt-6.1-sol" ? undefined : "implement");
+      assert.equal(rig.epochs[2]!.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+      assert.equal(rig.epochs[2]!.transport.requests.some(r => r.method === "thread/start"), false);
+      const usage = lastResultModelUsage(emitted)!;
+      assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100);
+      assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, observed === "gpt-6.1-sol" ? 120 : 60, "ordinary epochs retain the consumed baseline without a second cut");
+    });
+  }
+
+  for (const mode of ["mismatch", "missing", "unsafe"] as const) {
+    it(`pending resumed_B ${mode} holds only after coordinator commit`, async () => {
+      const observed = mode === "mismatch" ? "gpt-6-astra" : mode === "missing" ? null : "unsafe model value";
+      const accounting = observeUsage();
+      const rig = makeMultiEpochRig([plan(), implementation(), implementation(observed)]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let interrupt!: () => void;
+      let reports = 0, switches = 0;
+      let finished = false;
+      let oldSafety: CodexExecutor["safety"], bSafety: CodexExecutor["safety"];
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+        reportIteration: async () => { if (++reports === 1) interrupt(); },
+        attemptCodexCredentialSwitch: async () => {
+          switches++;
+          assert.equal((exec as unknown as { lastRootRequest?: RunTurnRequest }).lastRootRequest?.phase, "plan");
+          oldSafety = exec.safety;
+          assert.deepEqual(accounting.cuts, [], "approval preparation has not cut");
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          bSafety = exec.safety;
+          assert.deepEqual(accounting.cuts, [], "B preparation has not cut");
+          await lease.finishB(bounds);
+          finished = true;
+          return "resumed_B";
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, `B2 pending B ${mode}`);
+      assert.equal(finished, true, "the coordinator finishes before post-return model verification holds");
+      assert.equal(reports, 1);
+      assert.equal(switches, 1);
+      assert.equal(rig.providerLaunches(), 3);
+      assertImplementationResume(rig.epochs[1]!.transport);
+      assertImplementationResume(rig.epochs[2]!.transport);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
+      assert.equal(result.phaseSwitchHeld?.phase, "implement");
+      assert.equal(result.phaseSwitchHeld?.cause, mode === "mismatch" ? "model_mismatch" : "malformed");
+      assert.ok(bSafety);
+      assert.notStrictEqual(bSafety, oldSafety);
+      assert.strictEqual(exec.safety, bSafety, "published B remains cleanup owner");
+      assert.deepEqual(accounting.cuts, []);
+      assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+      assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+    });
+  }
+
+  it("pending resume refusal rejects explicit fresh lineage and B admission", async () => {
+    const accounting = observeUsage();
+    const rejected: Responder = c => {
+      if (c.method === "thread/resume") throw new CodexTransportError({
+        category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+      });
+      return implementation()(c);
+    };
+    const rig = makeMultiEpochRig([plan(), implementation(), rejected]);
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let interrupt!: () => void;
+    let reports = 0, switches = 0;
+    let freshError: unknown;
+    let admissionRefused = false;
+    let oldSafety: CodexExecutor["safety"], bSafety: CodexExecutor["safety"];
+    const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+      reportIteration: async () => { if (++reports === 1) interrupt(); },
+      attemptCodexCredentialSwitch: async () => {
+        switches++;
+        assert.equal(ctx.preserveConversation, undefined, "pending intent alone must refuse fresh lineage");
+        assert.equal((exec as unknown as { lastRootRequest?: RunTurnRequest }).lastRootRequest?.phase, "plan");
+        oldSafety = exec.safety;
+        const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+        const lease = await exec.suspendCodexEpoch(bounds);
+        assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+        assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+        assert.equal(await lease.teardown(bounds), true);
+        await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+        assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "confirmed_resume_refusal" });
+        bSafety = exec.safety;
+        try { await lease.startFreshLineage(bounds); }
+        catch (error) { freshError = error; }
+        assert.ok(freshError instanceof PhaseSwitchUnverifiedError);
+        assert.equal(freshError.cause, "malformed");
+        await assert.rejects(lease.finishB(bounds), /admission refused/);
+        admissionRefused = true;
+        throw freshError;
+      },
+    });
+    const result = await withTimeout(exec.run(ctx), 5000, "B2 pending resume refusal");
+    assert.equal(admissionRefused, true);
+    assert.equal(reports, 1);
+    assert.equal(switches, 1);
+    assert.equal(rig.providerLaunches(), 3);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assertImplementationResume(rig.epochs[2]!.transport);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
+    assert.equal(result.phaseSwitchHeld?.phase, "implement");
+    assert.equal(result.phaseSwitchHeld?.cause, "malformed");
+    assert.ok(bSafety);
+    assert.notStrictEqual(bSafety, oldSafety);
+    assert.strictEqual(exec.safety, bSafety, "failed B preparation remains cleanup owner");
+    assert.deepEqual(accounting.cuts, []);
+    assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+    assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+  });
+
+  it("pending continued_A rechecks immutable approval binding against changed claim effort", async () => {
+    const accounting = observeUsage();
+    const localConfig: ClaimConfig = { ...config, plan_phase: { ...config.plan_phase! } };
+    const rig = makeMultiEpochRig([plan(), implementation()]);
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let interrupt!: () => void;
+    let reports = 0, switches = 0;
+    let approvalSafety: CodexExecutor["safety"];
+    const { ctx, emitted } = makeCtx({ config: localConfig, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+      reportIteration: async () => { if (++reports === 1) interrupt(); },
+      attemptCodexCredentialSwitch: async () => {
+        switches++;
+        const stale = (exec as unknown as { lastRootRequest?: RunTurnRequest }).lastRootRequest;
+        assert.equal(stale?.phase, "plan");
+        assert.equal(stale?.model, "gpt-6-astra");
+        approvalSafety = exec.safety;
+        assert.deepEqual(accounting.cuts, []);
+        localConfig.default_effort = "high";
+        return "continued_A";
+      },
+    });
+    const result = await withTimeout(exec.run(ctx), 5000, "B2 continued A binding recheck");
+    assert.equal(result.phaseSwitchHeld?.phase, "implement");
+    assert.equal(result.phaseSwitchHeld?.cause, "model_mismatch", "existing binding mismatch cause");
+    assert.equal(reports, 1);
+    assert.equal(switches, 1);
+    assert.equal(rig.providerLaunches(), 2);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    assert.ok(approvalSafety);
+    assert.strictEqual(exec.safety, approvalSafety);
+    assert.deepEqual(accounting.cuts, []);
+    assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+    assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+  });
+
+  for (const mode of ["match", "mismatch", "missing", "unsafe"] as const) {
+    it(`pending declined pause recreation ${mode} retains approval intent before first turn`, async () => {
+      const observed = mode === "match" ? "gpt-6.1-sol" : mode === "mismatch" ? "gpt-6-astra"
+        : mode === "missing" ? null : "unsafe model value";
+      const accounting = observeUsage();
+      let replacementSafety: CodexExecutor["safety"];
+      const finalImplementation = implementation(observed, 130, 190);
+      const replacement: Responder = c => {
+        replacementSafety = exec.safety;
+        return finalImplementation(c);
+      };
+      const rig = makeMultiEpochRig([plan(), implementation(), replacement]);
+      const exec = makeExecutor(rig, bindingOf(API_KEY));
+      let reports = 0, parks = 0;
+      let approvalSafety: CodexExecutor["safety"];
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval,
+        reportIteration: async () => {
+          if (++reports === 1) {
+            approvalSafety = exec.safety;
+            assert.deepEqual(accounting.cuts, [], "approval preparation has not cut");
+            return { pauseRequested: true };
+          }
+        },
+        parkForPause: async () => {
+          parks++;
+          await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+          assert.deepEqual(accounting.cuts, [], "reaped approval candidate has no cut");
+          return false;
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, `B2 pending pause recreation ${mode}`);
+      assert.equal(parks, 1);
+      assert.equal(reports, 1);
+      assert.equal(rig.providerLaunches(), 3);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assertImplementationResume(rig.epochs[1]!.transport);
+      assertImplementationResume(rig.epochs[2]!.transport);
+      assert.ok(replacementSafety);
+      assert.notStrictEqual(replacementSafety, approvalSafety);
+      assert.strictEqual(exec.safety, replacementSafety, "replacement retains cleanup ownership");
+      assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+      if (mode === "match") {
+        assert.equal(result.phaseSwitchHeld, undefined);
+        assert.equal(rig.epochs[2]!.transport.turnStartCount, 1);
+        assertImplementationTurn(rig.epochs[2]!.transport);
+        assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+        assert.deepEqual(accounting.order, ["live:100", "replay:130", "cut", "live:190"]);
+        const usage = lastResultModelUsage(emitted)!;
+        assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 130);
+        assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60);
+      } else {
+        assert.equal(result.phaseSwitchHeld?.phase, "implement");
+        assert.equal(result.phaseSwitchHeld?.cause, mode === "mismatch" ? "model_mismatch" : "malformed");
+        assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
+        assert.deepEqual(accounting.cuts, []);
+        assert.equal(lastResultModelUsage(emitted)?.["gpt-6.1-sol"], undefined);
+      }
+    });
+  }
+
+  for (const replacement of [false, true]) {
+    it(`pending intent supersedes stale planning request on ${replacement ? "resumed_B" : "continued_A"}`, async () => {
+      const accounting = observeUsage();
+      const rig = makeMultiEpochRig([plan(), implementation(), implementation("gpt-6.1-sol", 130, 190)]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let interrupt!: () => void;
+      let switches = 0;
+      let reports = 0;
+      const { ctx, emitted } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+        gatePlan: approval, onCredentialSwitch: cb => { interrupt = cb; },
+        reportIteration: async () => { if (++reports === 1) interrupt(); },
+        attemptCodexCredentialSwitch: async () => {
+          switches++;
+          // The last dispatched request is deliberately still the planning request.
+          const state = exec as unknown as { lastRootRequest?: RunTurnRequest };
+          assert.equal(state.lastRootRequest?.phase, "plan");
+          assert.equal(state.lastRootRequest?.model, "gpt-6-astra");
+          assert.deepEqual(accounting.cuts, [], "prepared approval has no cut");
+          assert.deepEqual(accounting.order, ["live:100"], "preparation has not consumed replay");
+          if (!replacement) return "continued_A";
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+          // Pin the replacement wire pair before the coordinator returns: a stale
+          // planning request must fail here even if the later epoch guard also refuses it.
+          assertImplementationResume(rig.epochs[2]!.transport);
+          assert.deepEqual(accounting.cuts, [], "replacement preparation has no cut");
+          assert.deepEqual(accounting.order, ["live:100"], "discarded approval replay has not been consumed");
+          await lease.finishB(bounds);
+          return "resumed_B";
+        },
+      });
+      const result = await withTimeout(exec.run(ctx), 5000, "B2 pre-dispatch switch");
+      assert.equal(result.phaseSwitchHeld, undefined);
+      assert.equal(switches, 1);
+      assert.equal(reports, 1);
+      assert.equal(rig.providerLaunches(), replacement ? 3 : 2);
+      assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), false);
+      assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+      assert.deepEqual(accounting.order, replacement
+        ? ["live:100", "replay:130", "cut", "live:190"]
+        : ["live:100", "replay:100", "cut", "live:160"]);
+      const active = rig.epochs[replacement ? 2 : 1]!.transport;
+      if (replacement) assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assertImplementationResume(active);
+      if (replacement) assertImplementationResume(rig.epochs[1]!.transport);
+      assert.equal(active.turnStartCount, 1);
+      assertImplementationTurn(active);
+      assert.equal(active.requests.some(r => r.method === "thread/start"), false);
+      const usage = lastResultModelUsage(emitted)!;
+      assert.equal(rec(usage["gpt-6-astra"]).inputTokens, replacement ? 130 : 100);
+      assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "one implementation segment after replacement");
+    });
+  }
 });

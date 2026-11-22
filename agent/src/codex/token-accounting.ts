@@ -26,8 +26,9 @@
 //   - MODEL SEGMENTS (#4580): `beginModelSegment` splits a thread's cumulative at the running max
 //     into model segments. For non-negative safe-integer buckets (what Codex emits) each raw column's segment
 //     deltas sum exactly to `maxTotal - baseline`; non-integer values are subject to float rounding;
-//     reconciliation and pricing run per segment against that segment's own model. No production
-//     caller cuts a segment yet (#3253 adds it), so the behavior is exercised by tests only.
+//     reconciliation and pricing run per segment against that segment's own model. CodexHarness
+//     cuts the root segment at the verified planning-to-implementation boundary, after replay.
+//     Child threads retain their own registrations and are not cut by that root transition.
 //   - UNKNOWN / unregistered threads are dropped, NEVER attributed to the root model.
 //   - Reasoning tokens are a subset of output and are carried, never added to output twice.
 //
@@ -267,7 +268,9 @@ function uncachedOf(c: Cumulative): number {
 
 /**
  * Codex usage accountant for one executor claim leg. A thread's usage may be split into model
- * segments with {@link CodexUsageAccountant.beginModelSegment}; no production caller does so yet.
+ * segments with {@link CodexUsageAccountant.beginModelSegment}; CodexHarness calls it at the
+ * verified root planning-to-implementation boundary after recording replay. Child registrations
+ * remain independent.
  * ONE instance is owned by that invocation's
  * EpochSharedContext and shared across every provider-epoch {@link CodexHarness}. It survives plan
  * approval and checkpoint recreation, but a later worker claim deliberately creates a new instance
@@ -322,7 +325,7 @@ export class CodexUsageAccountant {
    * recorded any historical replay first. Caller contract: EVERY usage note of the previous
    * segment's work (historical replay AND live notes of earlier turns) must already have been
    * recorded. A note delivered after the cut that advances the running max is attributed to the NEW
-   * segment, so the caller (#3253) must drain or fence earlier-turn notes before cutting. Unknown thread, or the current segment already on
+   * segment, so CodexHarness must drain or fence earlier-turn notes before cutting. Unknown thread, or the current segment already on
    * `model`: no-op. Before the thread has an accepted cumulative (including a resumed thread
    * awaiting proved replay, and a quarantined thread) the current segment has no responses, so it
    * is rebound in place; on an already-incomplete thread the replaced model is remembered so it

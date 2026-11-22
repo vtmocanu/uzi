@@ -24,7 +24,7 @@ names them, then asks the harder question: is the cheaper run as good?
 
 ## How a run's cost is counted
 
-A run's lead makes one SDK `query()` call per turn — the planning turn, then
+A Claude run's lead makes one SDK `query()` call per turn — the planning turn, then
 each implement/review iteration, each resumed on the previous turn's session
 id. Before Claude Agent SDK 0.3.277, the SDK reported cost **per `query()`
 call, not cumulatively over the resumed session**, so every one of those
@@ -46,6 +46,23 @@ see [ADR-1079](../adr/1079-run-usage-per-leg-fold.md) for the per-leg design
 and the measured under-count it replaced, and
 [ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
 session-cumulative fold and what it does not backfill.
+
+### Codex planning and implementation costs
+
+With [separate planning settings](./worker-model.md#planning-model-and-effort),
+Codex attributes root usage to the planning model until implementation starts,
+then to the implementation model. Historical usage replayed at the switch
+stays with planning; child agents retain their own model attribution. Cost
+is priced per response on that response's model. A custom model without a
+price, or incomplete usage evidence, leaves the affected cost `unreported`
+while retaining proven tokens.
+
+The switch does not promise crash recovery of spend. A process crash loses
+in-memory accounting and unflushed frames. The next claim starts accounting
+for its current phase and treats proved history as a baseline; it does not
+reconstruct the missing spend. Delivered frames retain the existing
+idempotent, additive per-leg fold. This is not an fsync or storage-crash
+recovery guarantee. See [ADR-2555](../adr/2555-run-usage-attribution.md).
 
 ## Rejected runs and failure accounting
 

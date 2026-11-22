@@ -137,7 +137,8 @@ changes; malformed reasoning or total-token dips are now refused (see Admission)
   caller contract: before cutting, it must have recorded every usage note belonging to
   the earlier segment, historical replay and live notes of earlier turns. A note
   delivered after the cut that advances the running max is attributed to the new
-  segment and its model. #3253 owns enforcing this ordering. The first registration of
+  segment and its model. The #3253 CodexHarness root-boundary caller enforces
+  this ordering as described below. The first registration of
   a thread still wins and claim-shared deduplication is kept. Segment differences are
   clamped at zero as a defensive floor, identical to the plain difference for
   non-negative buckets under the monotone gate.
@@ -158,11 +159,22 @@ changes; malformed reasoning or total-token dips are now refused (see Admission)
   incomplete, every segment model `unreported`, tokens retained (PRD D6). Single-segment
   output is unchanged. Incompleteness also sets the claim-wide `usageIncomplete`,
   which an uncut thread with the same data does not; this asymmetry is accepted.
-- **Not shipped.** No production caller cuts a segment yet; #3253 supplies that
-  integration. Until then segment behavior (`beginModelSegment`, D5, D6) is reachable
-  only from tests, and production attribution is the single-model behavior described
-  above. The seven-column gate is not gated on segments: it applies now through every
-  `record()` call.
+- **Production caller (#3253).** `CodexHarness.recordUsageNote` records buffered
+  replay into the planning segment before calling `beginModelSegment` once at the
+  first matching root `turn_started`. Thread preparation and completion without
+  a matching start do not cut. Old-harness disposal and cleanup proof precede fresh
+  provider preparation/publication; its closed fence rejects late old notes.
+  Pending transition intent is claim-shared across replacements, while verification
+  binds to the new harness. Child threads retain their own registrations and are
+  not cut by the root transition. Per-response `usage_record` attribution uses the
+  adopted response's segment model. The seven-column admission gate remains in
+  `record()`; the integration does not replace it.
+- **Crash boundary.** A process crash loses the in-memory accountant, unflushed
+  frames and pending cut. The next claim creates a new accountant for its current
+  phase and baselines proved history, without reconstructing missing spend.
+  Delivered frames retain the existing idempotent, additive per-leg server fold.
+  This is not an fsync or storage-crash recovery guarantee. The cold switch and
+  verification contract are recorded in [ADR-3252](./3252-phase-model-switch.md).
 
 Rationale and rejected alternatives are in the PRD Decision Log
 ([PRD #4580](../prds/done/4580-codex-usage-model-segments.md)).

@@ -1323,7 +1323,7 @@ fixture and 100 ms sampling; CNPG may run a different major version.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.167.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,

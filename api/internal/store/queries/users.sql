@@ -229,6 +229,21 @@ SET planning_claude_model = CASE WHEN @set_model::bool THEN @planning_claude_mod
 WHERE id = @id
 RETURNING planning_claude_model, planning_claude_effort;
 
+-- name: GetUserPlanningCodex :one
+-- The owner's Codex planning model and effort (PRD #3253), each NULL = "Same as the run".
+-- Narrow read keyed on the user, mirroring GetUserHarnessModelDefaults.
+SELECT planning_codex_model, planning_codex_effort FROM users WHERE id = $1;
+
+-- name: SetUserPlanningCodex :one
+-- PATCHes the owner's Codex planning model and effort in ONE atomic statement (PRD #3253), the
+-- SetUserHarnessModels shape: each field is written only when its @set_* flag is true, otherwise the
+-- CASE keeps the row's own value; a true flag with a NULL value CLEARS that field. Own-user only.
+UPDATE users
+SET planning_codex_model = CASE WHEN @set_model::bool THEN @planning_codex_model ELSE planning_codex_model END,
+    planning_codex_effort = CASE WHEN @set_effort::bool THEN @planning_codex_effort ELSE planning_codex_effort END
+WHERE id = @id
+RETURNING planning_codex_model, planning_codex_effort;
+
 -- name: GetUserDefaultEffort :one
 -- The current user's per-user default reasoning effort (PRD #617); NULL = inherit,
 -- resolved to the uzi default `medium` at claim assembly (issue #1157). Read at issue-
@@ -381,7 +396,7 @@ SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE;
 -- task_review_model and codex_task_review_model (PRD #1570) ride it too: the owner's per-harness
 -- handoff-review model, NULL = the built-in; task_review_effort and codex_task_review_effort are the
 -- matching efforts, NULL = inherit the worker effort.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion, planning_claude_model, planning_claude_effort, task_review_model, codex_task_review_model, task_review_effort, codex_task_review_effort FROM users WHERE id = $1;
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion, planning_claude_model, planning_claude_effort, planning_codex_model, planning_codex_effort, task_review_model, codex_task_review_model, task_review_effort, codex_task_review_effort FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

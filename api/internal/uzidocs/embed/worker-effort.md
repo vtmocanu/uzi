@@ -8,7 +8,7 @@ audience: user
 
 Choose reasoning effort independently for your Claude and Codex runs in
 **Settings → Run defaults → Reasoning effort**. Both product defaults are
-**medium**. Leave a control on **Default · medium (built-in)** to use that product default,
+**medium**. Leave a control on **Default · lead template's effort, else medium (built-in)** to use that default,
 choose `low`, `medium`, `high`, `xhigh` or `max` for that harness, or choose
 **Runtime default** to send no level.
 
@@ -80,9 +80,9 @@ The lead's effort for a harness resolves in this order:
    *lead template*.
 4. The built-in **medium**.
 
-On Claude, a configured [planning effort](#planning-effort) overrides steps 2 through 4 for the plan phase.
+On either harness, a configured [planning effort](#planning-effort) overrides steps 2 through 4 for the plan phase.
 
-The template tier applies only when your preference is unset or blank, so
+The template tier is lead-only: with an unset preference, everything outside the lead lane (judge, chat, jobs, isolated and review runs) uses medium. It applies only when your preference is unset or blank, so
 choosing **Runtime default** keeps sending no level even when the lead template
 pins one. It reaches the worker as the claimed default effort. `uzi settings get` and
 `GET /api/me/effective-settings` show it with the source `template`. The
@@ -90,10 +90,15 @@ Codex catalog advisory below still applies to the lead only.
 
 ## Planning effort
 
-A Claude run can plan at a different effort than it implements. In **Settings →
-Run defaults → Planning**, **Claude planning effort** takes `low`, `medium`,
-`high`, `xhigh` or `max`; its empty option, **Same as the run**, plans at the
-run's own effort. There is no Runtime default choice for planning effort, and
+Claude and Codex runs can plan at a different effort than they implement.
+In **Settings → Run defaults → Planning**, each harness's planning effort
+takes `low`, `medium`, `high`, `xhigh` or `max`; its empty option,
+**Same as the run**, plans at the run's own effort. The shared
+**Save planning defaults** button saves changed fields for both harnesses.
+The empty option names the lead template tier when that supplies the run's
+effort, for example **Same as the run · high (lead template)**, matching what
+a run actually plans at.
+There is no Runtime default choice for planning effort, and
 the setting is written through `PUT /api/me/settings` (cookie-only) or that
 card; no CLI command sets it. Phases, scope and the planning model are in
 [Worker model](./worker-model.md#planning-model-and-effort).
@@ -101,10 +106,13 @@ card; no CLI command sets it. Phases, scope and the planning model are in
 - **Any combination is allowed.** A planning effort can be set while your
   implementation effort is **Runtime default**. When the run switches to
   implementation, uzi sends no effort and the runtime reverts to its own
-  default for the model; this was observed on the pinned Claude runtime, and
-  the worker verifies the applied effort before it sends the first
-  implementation prompt, holding the run if it differs.
-- **Which defaults apply.** After approval the runtime default is the one
+  default for the model. This combination is accepted in either save order.
+  Claude verifies the applied effort before the first implementation prompt,
+  holding if it differs. Codex uses a cold resume of the same conversation;
+  pinned 0.167.0 reports effort present as `null`. uzi sends no level and
+  invents no numeric effective effort. A warm switch retaining the planning
+  override is outside this allowance.
+- **Claude defaults.** After approval the runtime default is the one
   characterized for the implementation model: `medium` for `opus`, `sonnet`
   and `haiku`, and `high` for `fable`. An unlisted model has no independently
   established default, so that switch holds. The model is the one the runtime
@@ -116,7 +124,7 @@ card; no CLI command sets it. Phases, scope and the planning model are in
 ## Set an override
 
 1. Open **Settings → Run defaults → Reasoning effort**.
-2. Pick the **Claude effort** or **Codex effort** level, **Runtime default**, or **Default · medium (built-in)**.
+2. Pick the **Claude effort** or **Codex effort** level, **Runtime default**, or **Default · lead template's effort, else medium (built-in)**.
 3. Click **Save Claude effort** or **Save Codex effort**.
 
 The controls offer five levels; Codex's `ultra` catalog level is deliberately
@@ -139,6 +147,11 @@ oversized or timed-out catalog, or no matching entry, produces no warning. The
 catalog is per-account and can refresh, so the warning is advisory and can be
 wrong either way.
 
+With a separate planning pair, this one probe checks the first actual phase
+(the planning pair on a gated run). Approval does not trigger another catalog
+probe or warning for the implementation pair. Both phases still send their
+requested effort unchanged.
+
 The [judge](./judge.md) uses the preference for its own harness. The
 handoff task review has its own per-harness effort, which follows your worker
 effort until you set one (see [Task review
@@ -148,16 +161,16 @@ model remains `gpt-6-sol`.
 
 From the CLI, `uzi settings set effort --harness claude|codex
 <low|medium|high|xhigh|max|runtime>` writes the same preference and `uzi
-settings reset effort --harness claude|codex` returns it to **Default · medium
-(built-in)**; `runtime` is **Runtime default**, which is not a reset (see
+settings reset effort --harness claude|codex` returns it to **Default · lead template's
+effort, else medium (built-in)**; `runtime` is **Runtime default**, which is not a reset (see
 [Changing model and effort settings](./cli.md#changing-model-and-effort-settings)).
 `uzi settings get` reports the result (see
 [Effort reporting](#effort-reporting)).
 
 ## Runtime default
 
-Each harness also offers **Runtime default** beside **Default · medium
-(built-in)** and the five levels. The option is labelled **Runtime default · value
+Each harness also offers **Runtime default** beside **Default · lead template's
+effort, else medium (built-in)** and the five levels. The option is labelled **Runtime default · value
 not reported** for Claude. For Codex the label carries the catalog default last
 reported for your credential, or says it is unknown (see [What the Codex catalog
 default means](#what-the-codex-catalog-default-means)).
@@ -169,8 +182,9 @@ returns the stored token).
 With Runtime default, uzi sends no effort: the Claude CLI gets no `--effort`
 and Codex thread and turn requests carry no effort, so the runtime picks its
 own level. This applies to ordinary issue and lead runs and their subagents,
-the judge, chat, job and isolated runs. It differs from **Default · medium (built-in)**: an unset
-preference still means an explicit medium. A stored value uzi does not
+the judge, chat, job and isolated runs. It differs from **Default · lead template's effort, else medium (built-in)**: for
+runs outside the lead lane (judge, chat, jobs, isolated and review runs) an unset preference still means an explicit medium, and
+for the lead it means the lead template's effort when it has one, else medium. A stored value uzi does not
 recognise falls back to medium and is never forwarded, and workers drop any
 claimed default effort outside the five levels when decoding the claim,
 without logging the value.
@@ -231,6 +245,11 @@ use, if it is at most 30 days old. The Codex **Runtime default** option reads:
 | `... · may differ on workers still on another version` | Varies: workers on different Codex runtime versions reported different levels for the current credential. The label shows the highest runtime version's level (ties: the latest report). |
 | `catalog default unknown until a Codex run reports it` | Unknown: no report within 30 days for the current credential, no usable Codex credential, an unlinked subscription, or Codex account mode `auto` with at least one pooled login (the login is chosen only when a run is created, so none can be predicted). With `auto` and an empty pool uzi uses the default credential, so the label can be known. |
 
+A planning-model catalog report is stored under that planning model. Settings
+filter reports by the implementation model as well as the credential, so a
+different planning model cannot supply its label. A gated run that probes only
+the planning model can leave the implementation model’s label unknown or older.
+
 Saving a different Codex model refreshes the label. Because the value is a
 report from an earlier run, it can lag a Codex runtime upgrade, or a catalog
 refresh on your account (the default can change with no version or credential
@@ -273,7 +292,7 @@ used](./worker-model.md#see-which-model-a-run-used).
 
 - **Requested** is what uzi sent: your Claude or Codex effort override
   (*your Claude effort*, *your Codex effort*), or *built-in* when you left it on
-  **Default · medium (built-in)**. With [Runtime default](#runtime-default) uzi sends no level, so the
+  **Default · lead template's effort, else medium (built-in)** and the lead template pins none. With [Runtime default](#runtime-default) uzi sends no level, so the
   request reads *runtime default*, for example `lead: opus · runtime default`.
   The display shows that mode in place of a source; the stored record keeps the
   source (`user_default`), which `uzi run lead-config --json` returns.
