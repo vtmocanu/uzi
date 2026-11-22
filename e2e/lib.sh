@@ -480,7 +480,8 @@ _docker_wire_service_running() {
 }
 # #4165 sidecar startup diagnostics. _docker_wire_diag_limiter names the timeout command that bounds every
 # diagnostic Docker read (the storage_diagnostic_snapshot convention); empty when neither is installed, and
-# then no Docker read is issued at all (never an unbounded daemon query).
+# then no Docker read is issued at all (never an unbounded daemon query). resolve_fixture_source_hold's
+# receipt-timeout agent log tail (#4606) uses it too.
 _docker_wire_diag_limiter() { command -v timeout || command -v gtimeout || true; }
 _dw_diag_missing() {
   echo "MISSING-EVIDENCE: docker wiring diagnostics: $1" >&2
@@ -1431,7 +1432,7 @@ remove_fixture_ephemeral_worker() {
 resolve_fixture_source_hold() {
   local run="$1" generation="$2" view hold id state before after reply
   local timeout="${3:-120}" restored_at="${4:-}" start=$SECONDS snapshot attention
-  local rem rc last_snapshot=none
+  local rem rc last_snapshot=none diag_limiter diag_rc
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture receipt timeout: $timeout"
   # One deadline for the whole call: the capture wait and the archive receipt share it,
   # and every read (run, holds, archive listings, receipt SQL) is bounded by what
@@ -1538,7 +1539,16 @@ resolve_fixture_source_hold() {
       if [ "$rc" != 0 ] || [ "$SECONDS" -ge "$deadline" ]; then
         printf 'fixture receipt timeout evidence: restore_at=%s snapshot=%s read_rc=%s\n' "${restored_at:-unknown}" "$last_snapshot" "$rc"
         if [ -n "$restored_at" ]; then
-          "${COMPOSE[@]}" logs --no-color --since "$restored_at" --tail 80 agent || true
+          # Evidence only, after the deadline decided the failure: its own 5s allowance plus a
+          # 2s kill grace (never the expired receipt budget), never retried, never unbounded.
+          diag_limiter="$(_docker_wire_diag_limiter)"
+          if [ -n "$diag_limiter" ]; then
+            diag_rc=0
+            "$diag_limiter" -k 2 5 "${COMPOSE[@]}" logs --no-color --since "$restored_at" --tail 80 agent || diag_rc=$?
+            [ "$diag_rc" = 0 ] || echo "fixture receipt diagnostic: agent log tail unavailable or timed out (rc=$diag_rc)"
+          else
+            echo 'fixture receipt diagnostic: agent log tail skipped (no timeout command)'
+          fi
         fi
         fail "fixture archive custody receipt timeout after ${timeout}s; evidence preserved"
       fi
