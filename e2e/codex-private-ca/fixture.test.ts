@@ -132,13 +132,15 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
           });
         }
         return { root: path.join(parent, n), configClean: !config.includes(input.source) && !config.includes(input.key),
-          exists, uid: stat?.uid, mode: stat && (stat.mode & 511),
+          authRoot: home, exists, uid: stat?.uid, mode: stat && (stat.mode & 511),
           regular: stat?.isFile(), exact: exists && fs.readFileSync(ca).equals(Buffer.from(input.pem)),
           outsideSessions: !ca.startsWith(sessions + "/"), sessionsClean: clean(sessions) };
       });
       process.stdout.write(JSON.stringify({ uid: process.getuid(), results }));
     `;
     let ownedRoots: string[] = [];
+    let resumeSessionId: string | undefined;
+    let executionPhase = 1, phaseReceipts = 0;
     const probeRoots = (roots?: string[]) => {
       const probe = runnerCommand(process.execPath, ["-e", `
         const fs = require("node:fs"), path = require("node:path");
@@ -239,18 +241,19 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
           res.writeHead(400).end();
           return;
         }
-        if (row === "trusted" && receipts.length === 0) observeOwned();
+        if (row === "trusted" && phaseReceipts === 0) observeOwned();
         receipts.push(receipt);
+        phaseReceipts++;
         const id = `cdr-ca-${receipts.length}`;
         const done = parsed.tools?.find((tool: { type?: string; name?: string }) =>
           tool.type === "function" && tool.name === "signal_done");
-        if (receipts.length === 1 && !done) {
+        if (phaseReceipts === 1 && !done) {
           unexpected.push("signal_done function missing from request.tools");
           res.writeHead(400).end();
           return;
         }
-        const item = receipts.length === 1
-          ? { type: "function_call", call_id: "ca-done", name: done.name, arguments: "{}" }
+        const item = phaseReceipts === 1
+          ? { type: "function_call", call_id: `ca-done-${executionPhase}`, name: done.name, arguments: "{}" }
           : { type: "message", role: "assistant", content: [{ type: "output_text", text: "private CA complete" }] };
         const frames = [
           { type: "response.created", response: { id } },
@@ -277,6 +280,41 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
     if (row === "stalled") await new Promise<void>(resolve => stalled.listen(0, "127.0.0.1", resolve));
     observe("listeners-ready");
     let executor: any;
+    let disposedCurrent = false;
+    const disposeOwned = async () => {
+        assert.ok(executor?.safety, "native safety cleanup required");
+        if (executor?.safety) {
+          try {
+            // Retain live-probe paths; other rows enumerate only their own epochs.
+            const roots = probeRoots(ownedRoots.length ? ownedRoots : undefined);
+            assert.ok(roots.length > 0, "positive owned-root existence before cleanup");
+            for (const observed of roots) {
+              assert.equal(observed.directory, true, "owned epoch exists before cleanup");
+              assert.equal(observed.error, undefined);
+            }
+            ownedRoots = roots.map(observed => observed.root);
+            console.log("owned-roots-present", row, ownedRoots.length);
+            console.log("await-boundary", row, "withCredentialFreeCapture");
+            const captured = await executor.withCredentialFreeCapture(10000, async () => undefined, "cancel");
+            console.log("capture", JSON.stringify(captured));
+            assert.equal(captured.kind, "observed_empty");
+          } finally {
+            console.log("await-boundary", trusted, "safety.dispose");
+            const disposed = await executor.safety.dispose({ boundary: "shutdown", deadlineMs: 10000 });
+            console.log("disposal", JSON.stringify(disposed));
+            assert.equal(executor.safety.acceptsTerminalDisposal(disposed), true);
+            assert.ok(ownedRoots.length > 0, "previously observed owned roots required");
+            const removed = probeRoots(ownedRoots);
+            assert.equal(removed.length, ownedRoots.length);
+            for (const observed of removed) {
+              assert.equal(observed.error, "ENOENT", "previously observed owned epoch removed");
+            }
+            console.log("owned-roots-absent", row, removed.length,
+              row === "no-extra" ? "no-staged-ca-control" : "staged-ca-gone-with-root");
+          }
+        }
+      disposedCurrent = true;
+    };
     try {
       const cfg = loadConfig({ UZI_API_URL: `http://127.0.0.1:${(api.address() as any).port}`,
         UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"), UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk",
@@ -285,19 +323,21 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
       await fs.mkdir(workspace, { mode: 0o2770 });
       await fs.chown(workspace, 10001, 10002);
       await fs.chmod(workspace, 0o2770);
-      const built = buildRunExecutor(id, undefined, {
+      const factoryDeps = {
         log, client: new WorkerClient(cfg.apiUrl, cfg.workerToken, "cdr-private-ca", log),
         sdkHomeRoot: "/data/agent-home", executorKind: cfg.executor, stubPlanGate: cfg.stubPlanGate,
         dockerWiring: cfg.dockerWiring, codexExtraCa: cfg.codexExtraCa,
         codexCommandSandbox: cfg.codexCommandSandbox, codexSandboxDegraded: cfg.codexHarness.degraded,
-      }, { provider: { provider_id: "cdr-private-ca", revision: 1, engine: "codex",
+      };
+      const address = { provider: { provider_id: "cdr-private-ca", revision: 1, engine: "codex",
         protocol: "openai_responses", base_url: `https://127.0.0.1:${((row === "stalled" ? stalled : server).address() as any).port}/v1`,
-        auth_style: "bearer", credential, model_map: { default: { model: "corp-code", context_window: 32768 } } } });
-      executor = built.executor;
+        auth_style: "bearer", credential, model_map: { default: { model: "corp-code", context_window: 32768 } } } };
+      const freshExecutor = () => buildRunExecutor(id, undefined, factoryDeps, address).executor;
+      executor = freshExecutor();
       assert.equal(executor.constructor.name, "CodexExecutor", "actual Codex executor selected");
       console.log("factory-config", { trusted, sandbox: cfg.codexCommandSandbox });
       const emitted: unknown[] = [];
-      const run = executor.run({ runId: id, kind: "task", issueIid: 42, issueTitle: "Private CA proof",
+      const context = { runId: id, kind: "task", issueIid: 42, issueTitle: "Private CA proof",
         issueDescription: "Complete approved proof", worktreePath: workspace, branch: "agent/issue-42",
         planApproved: true, approvedPlan: "Signal completion", agents: [],
         config: { run_timeout_seconds: 20, idle_timeout_seconds: 10 }, emit: (m: any) => {
@@ -309,7 +349,8 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
               : text.startsWith("provisioning ") ? "provisioning"
               : "other-status" : "other-event";
           observe(`emit-${phase}`);
-        } });
+        } };
+      const run = executor.run(context);
       observe("await-executor.run");
       console.log("await-boundary", id, "executor.run");
       const started = performance.now();
@@ -349,7 +390,11 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
                 let entry: any;
                 try { entry = JSON.parse(line); } catch { assert.fail("copied transcript contains invalid JSONL"); }
                 if (entry.type === "session_meta" && typeof entry.payload?.id === "string" &&
-                    /^[0-9a-f-]{36}$/i.test(entry.payload.id)) runtimeMetadata = true;
+                    /^[0-9a-f-]{36}$/i.test(entry.payload.id)) {
+                  runtimeMetadata = true;
+                  if (resumeSessionId) assert.equal(entry.payload.id, resumeSessionId, "one runtime session identity");
+                  resumeSessionId = entry.payload.id;
+                }
               }
             }
           }
@@ -360,6 +405,35 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         console.log("persisted-session-subset-observed", "trusted", "nonempty-runtime-jsonl", "exclusions-pass");
         assert.ok(receipts.length >= 2, "tool call then assistant completion reached our listener");
         assert.ok(JSON.stringify(emitted).includes("private CA complete"));
+        assert.ok(resumeSessionId, "real persisted runtime session ID required for resume");
+        const firstRoots = [...ownedRoots];
+        await disposeOwned();
+        executionPhase = 2;
+        phaseReceipts = 0;
+        ownedRoots = [];
+        ownedObserved = false;
+        ownedObservationError = undefined;
+        executor = freshExecutor();
+        disposedCurrent = false;
+        assert.equal(executor.constructor.name, "CodexExecutor");
+        const firstReceiptCount = receipts.length;
+        emitted.length = 0;
+        await executor.run({ ...context, sessionId: resumeSessionId });
+        if (ownedObservationError) throw ownedObservationError;
+        assert.equal(ownedObserved, true, "second live owned root observed");
+        assert.equal(ownedRoots.length, 1);
+        assert.ok(ownedRoots.every(root => !firstRoots.includes(root)), "fresh owned root and codex auth home distinct");
+        for (const observed of probeRoots(firstRoots)) assert.equal(observed.error, "ENOENT", "old root remains absent after resume");
+        assert.ok(phaseReceipts >= 2, "second execution completes callback continuation");
+        const resumedRequest = JSON.parse((receipts[firstReceiptCount] as { body: string }).body);
+        assert.ok(JSON.stringify(resumedRequest.input).includes("private CA complete"),
+          "actual resumed request carries first execution assistant history");
+        assert.ok(JSON.stringify(emitted).includes("private CA complete"), "resumed execution completes");
+        const resumedGeneration = (await fs.readFile(store + "/current", "utf8")).trim();
+        assert.match(resumedGeneration, /^[a-zA-Z0-9_-]+$/);
+        await inspectSubset(store + "/generations/" + resumedGeneration);
+        console.log("fresh-executor-resume-observed", "trusted", "same-runtime-session", "prior-history", "distinct-root-auth-home", "old-root-absent");
+
       } else {
         await assert.rejects(run, (error: unknown) => {
           console.log("actual-rejection", error);
@@ -385,37 +459,7 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
     } finally {
       observe("entered-finally");
       try {
-        assert.ok(executor?.safety, "native safety cleanup required");
-        if (executor?.safety) {
-          try {
-            // Retain live-probe paths; other rows enumerate only their own epochs.
-            const roots = probeRoots(ownedRoots.length ? ownedRoots : undefined);
-            assert.ok(roots.length > 0, "positive owned-root existence before cleanup");
-            for (const observed of roots) {
-              assert.equal(observed.directory, true, "owned epoch exists before cleanup");
-              assert.equal(observed.error, undefined);
-            }
-            ownedRoots = roots.map(observed => observed.root);
-            console.log("owned-roots-present", row, ownedRoots.length);
-            console.log("await-boundary", row, "withCredentialFreeCapture");
-            const captured = await executor.withCredentialFreeCapture(10000, async () => undefined, "cancel");
-            console.log("capture", JSON.stringify(captured));
-            assert.equal(captured.kind, "observed_empty");
-          } finally {
-            console.log("await-boundary", trusted, "safety.dispose");
-            const disposed = await executor.safety.dispose({ boundary: "shutdown", deadlineMs: 10000 });
-            console.log("disposal", JSON.stringify(disposed));
-            assert.equal(executor.safety.acceptsTerminalDisposal(disposed), true);
-            assert.ok(ownedRoots.length > 0, "previously observed owned roots required");
-            const removed = probeRoots(ownedRoots);
-            assert.equal(removed.length, ownedRoots.length);
-            for (const observed of removed) {
-              assert.equal(observed.error, "ENOENT", "previously observed owned epoch removed");
-            }
-            console.log("owned-roots-absent", row, removed.length,
-              row === "no-extra" ? "no-staged-ca-control" : "staged-ca-gone-with-root");
-          }
-        }
+        if (!disposedCurrent) await disposeOwned();
       } finally {
         for (const socket of sockets) socket.destroy();
         observe("await-stalled-close");
