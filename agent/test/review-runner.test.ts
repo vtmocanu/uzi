@@ -683,9 +683,10 @@ describe("ReviewRunner", () => {
     assert.equal(reqModel, "gpt-6-sol", "the built-in review model is gpt-6-sol");
   });
 
-  // #3254: neither task-review pass sends a reasoning effort, and the Claude pass sends no model
-  // (the SDK default). The effective-settings preview relies on both facts.
-  it("the Codex review pass sends a model and no effort", async () => {
+  // #3254 / PRD #1570 M2: a task-review pass sends a reasoning effort only when the claim carries
+  // task_review_effort (never config.default_effort), and the Claude pass sends no model by default
+  // (the SDK default). The effective-settings preview relies on these facts.
+  it("the Codex review pass sends a model and no effort without task_review_effort", async () => {
     const { client } = fakeClient();
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
     let seen: { model?: string; effort?: string } | undefined;
@@ -703,7 +704,7 @@ describe("ReviewRunner", () => {
     assert.equal(seen?.effort, undefined, "the Codex review pass must not send an effort");
   });
 
-  it("the Claude review pass sends no model and no effort", async () => {
+  it("the Claude review pass sends no model and no effort without task_review_effort, even with config.default_effort", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
     let options: Record<string, unknown> | undefined;
@@ -757,6 +758,52 @@ describe("ReviewRunner", () => {
     assert.equal(seen?.model, "gpt-6.1-sol");
     assert.equal(seen?.effort, undefined);
   });
+
+  // PRD #1570 M2 regression: the server-resolved review effort rides claim.task_review_effort.
+  for (const [label, value, expected] of [
+    ["high", "high", "high"],
+    ["max", "max", "max"],
+    ["an unknown value", "ultra", undefined],
+    ["an empty string", "", undefined],
+  ] as const) {
+    it(`Claude review claim with task_review_effort ${label}: effort ${String(expected)} (PRD #1570 M2)`, async () => {
+      const { client, calls } = fakeClient();
+      const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+      let options: Record<string, unknown> | undefined;
+      const queryFn = (async function* (args: { options?: Record<string, unknown> }) {
+        options = args.options;
+        yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: goodModelJson }] } };
+        yield { type: "result", subtype: "success", is_error: false };
+      }) as unknown as SdkQueryFn;
+      const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+      await runner.execute(reviewClaim({ task_review_effort: value as never, config: { default_model: "haiku", default_effort: "low" } as never }));
+      assert.equal(calls.review?.review.status, "complete");
+      assert.equal(options?.effort, expected);
+    });
+
+    it(`Codex review claim with task_review_model and task_review_effort ${label}: effort ${String(expected)} (PRD #1570 M2)`, async () => {
+      const { client } = fakeClient();
+      const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+      let seen: { model?: string; effort?: string } | undefined;
+      const fakeHarness = {
+        kind: "codex" as const,
+        run: async (req: { model?: string; effort?: string }) => {
+          seen = req;
+          return { text: JSON.stringify({ summary: "codex review", findings: [] }), end: { kind: "terminal", terminal: { outcome: "success" } } };
+        },
+      };
+      const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+      const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+      await runner.execute(reviewClaim({
+        task_review_model: "gpt-6.1-sol",
+        task_review_effort: value as never,
+        config: { default_effort: "low" } as never,
+        secrets: { forge_pat: "pat", codex: { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" } } as never,
+      }));
+      assert.equal(seen?.model, "gpt-6.1-sol");
+      assert.equal(seen?.effort, expected);
+    });
+  }
 
   // Compatibility (passes on base by design): legacy config defaults alone change nothing, and a
   // blank task_review_model counts as absent.

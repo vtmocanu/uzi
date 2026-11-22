@@ -1049,9 +1049,9 @@ export class Worker {
           // Issue #3258: this image applies `agents[].effort` template pins on both harnesses
           // (Claude AgentDefinition.effort, Codex per-role effort). Advertised unconditionally.
           "template_effort_v1",
-          // PRD #1570: this image applies the owner-configured task-review model
-          // (claim.task_review_model) on both harnesses. The api sends it only to a worker
-          // advertising this. Advertised unconditionally.
+          // PRD #1570: this image applies the owner-configured task-review model and effort
+          // (claim.task_review_model, claim.task_review_effort) on both harnesses. The api
+          // sends them only to a worker advertising this. Advertised unconditionally.
           "task_review_settings_v1",
           // PRD #2460: this image runs a Codex lead's checked plan gate and a Claude plan
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is

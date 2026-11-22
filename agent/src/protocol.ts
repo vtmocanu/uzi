@@ -2012,6 +2012,11 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  a valid review model, and only for a worker advertising `task_review_settings_v1`.
    *  Absent means the harness built-in review model applies. */
   task_review_model?: string;
+  /** The resolved task-review effort level for this harness (PRD #1570 M2). Present only on
+   *  a task-review claim to a worker advertising `task_review_settings_v1`, and only when the
+   *  review should send an effort; the server has already folded in inheritance from the
+   *  worker effort. Absent means send no effort (Runtime default). */
+  task_review_effort?: EffortLevel;
   /** The model the inline run-summary generator runs on (PRD #362), resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  ordinary run claim assembly. Rides eligible run claims (unlike judge_model, which
