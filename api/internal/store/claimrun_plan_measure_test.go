@@ -25,7 +25,10 @@ package store_test
 //	                            F, a cheap profile-fixture feasibility check (one cold call per
 //	                            profile and scenario, no timing claim), and S, the plan-choice
 //	                            scale diagnostic (claimrun_plan_scale_test.go).
-//	                            Stages always run in the order P0,F,S,T1,T2,T3,T4,T5,R.
+//	                            E is the end-to-end stage (claimrun_plan_service_test.go): the real
+//	                            workersvc Service.Claim, run unchanged on a base revision and a fix
+//	                            revision (UZI_CLAIMRUN_PLAN_E_LABEL names the run).
+//	                            Stages always run in the order P0,F,S,T1,T2,T3,T4,T5,R,E.
 //	UZI_CLAIMRUN_PLAN_WINNER    C1|C2|C1C2, required for T4, T5 and R.
 //	UZI_CLAIMRUN_PLAN_RUNNERUP  C1|C2|C1C2, required for R, and different from the winner.
 //	UZI_CLAIMRUN_PLAN_N         timed calls per cell. Default 100, minimum 50. P0 always uses 20.
@@ -154,14 +157,14 @@ type cpConfig struct {
 	out          string
 }
 
-var cpStageOrder = []string{"P0", "F", "S", "T1", "T2", "T3", "T4", "T5", "R"}
+var cpStageOrder = []string{"P0", "F", "S", "T1", "T2", "T3", "T4", "T5", "R", "E"}
 
 func cpLoadConfig(t *testing.T) cpConfig {
 	t.Helper()
 	var cfg cpConfig
 	raw := strings.TrimSpace(os.Getenv("UZI_CLAIMRUN_PLAN_STAGES"))
 	if raw == "" {
-		t.Fatal("UZI_CLAIMRUN_PLAN_STAGES is required (a comma list of P0,F,S,T1,T2,T3,T4,T5,R)")
+		t.Fatal("UZI_CLAIMRUN_PLAN_STAGES is required (a comma list of P0,F,S,T1,T2,T3,T4,T5,R,E)")
 	}
 	want := map[string]bool{}
 	for _, s := range strings.Split(raw, ",") {
@@ -1721,6 +1724,13 @@ func TestClaimRunPlanMeasurement(t *testing.T) {
 			}
 			out.emit("stage_done", map[string]any{"stage": "S", "scales": cfg.scales, "wall_seconds": time.Since(began).Seconds()})
 			fmt.Printf("STAGEDONE|S|wall_seconds=%.1f\n", time.Since(began).Seconds())
+			continue
+		}
+		if stage == "E" {
+			fmt.Printf("STAGE|E|cells=%d\n", len(cpECells()))
+			env.runServiceStage(ctx)
+			out.emit("stage_done", map[string]any{"stage": "E", "cells": len(cpECells()), "wall_seconds": time.Since(began).Seconds()})
+			fmt.Printf("STAGEDONE|E|wall_seconds=%.1f\n", time.Since(began).Seconds())
 			continue
 		}
 		cells := env.stageCells(stage)
