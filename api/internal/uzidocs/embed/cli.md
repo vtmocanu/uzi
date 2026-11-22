@@ -1779,13 +1779,15 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   `--branch` are required; `--mr` must be positive. Each read is audited.
   - **Matching.** `ci_fix` runs match by exact branch; `mr_rework` runs match only by `--mr`, never by
     branch alone. Equivalent connections across owners count as the same repo: the match is by forge
-    type, the canonical base URL (`:443` and `api.github.com` folded) and the project id.
+    type, the canonical base URL (`:443` folded; `api.github.com` folded to `github.com` for GitHub) and
+    the project id. A writer's REPO column is its own repo id, which may differ from `--repo` because
+    equivalent connections of other owners match.
   - **Completeness.** `complete=false` means more than 500 matched and the answer is unknown: the CLI
     prints `incomplete: more than 500 matching writers; absence is unknown` on stderr and exits 1,
     unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
     no matching writer at that database snapshot only: a writer may start after the read.
   - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
-    `{writers, complete}` document as received.
+    the decoded `{writers, complete}` document.
   - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
     the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
     `VISIBILITY=owner_only`.

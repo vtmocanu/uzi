@@ -239,6 +239,7 @@ only) is active.
 - **Audit:** each read writes one server audit line, so `watch-pr.sh` polling writes one per poll.
 - **Race:** a writer may start after the read. `merge.sh` repeats the read right before
   `gh pr merge`, and `--match-head-commit` refuses the merge if anything was pushed since.
-  A merged or closed MR's active `mr_rework` is cancelled by the server's MR watcher, and a
-  late `ci_fix` push lands on the merged branch, not `main`. Late work can be stranded, but
-  it cannot change what was merged.
+  A merged or closed MR's active `mr_rework` is cancelled by the server's MR watcher on its
+  next poll, not instantly, and a late `ci_fix` push targets only the PR branch (deleted by
+  default after merge), never `main`. Late work can be stranded, but it cannot change what
+  was merged. Each successful (200) read writes one audit line; refused reads do not.

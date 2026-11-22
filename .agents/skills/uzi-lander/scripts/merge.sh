@@ -230,7 +230,7 @@ fi
 # Helper guard: repeat after the expensive preflights. A snapshot is not a lease.
 # Keep --no-rework-check restricted to repos not on uzi; no active-run bypass.
 helper_guard() {
-  local rl repo_id branch active
+  local rl repo_id branch active n
   [ "$REWORK_CHECK" -eq 1 ] || return 0
   command -v uzi >/dev/null 2>&1 || { echo "uzi CLI absent; cannot rule out active helpers (pass --no-rework-check for a repo not on uzi)"; return 4; }
   rl=$(uzi repo list --json 2>/dev/null) && printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1 \
@@ -243,7 +243,10 @@ helper_guard() {
       || { echo "$WRITERS_ERR; cannot rule out active helpers"; return 4; }
     active=$WRITERS
     print_writers_visibility
-    if [ "$(printf '%s' "$active" | jq length)" -gt 0 ]; then
+    n=$(printf '%s' "$active" | jq -se 'if length == 1 and (.[0] | type) == "array" then .[0] | length else error("bad") end' 2>/dev/null) \
+      && case "$n" in ''|*[!0-9]*) false;; esac \
+      || { echo "could not parse helper writers; cannot rule out active helpers"; return 4; }
+    if [ "$n" -gt 0 ]; then
       printf '%s' "$active" | jq -r '.[] | "ACTIVE_HELPER=\(.id) kind=\(.kind) status=\(.status)"'
       echo "wait (mr_rework: scripts/wait-mrrework.sh), or cancel the exact run and confirm terminal state; inspect branch delta, preserved_patch, recovery and held publications before retrying"
       return 14

@@ -35,7 +35,7 @@ func newAdminRunWritersCmd(env Env, gf *globalFlags) *cobra.Command {
 			"complete=true proves absence only at that database snapshot: a writer may start after the " +
 			"read. When the server reports complete=false (more than 500 matches) the command prints a " +
 			"note on stderr and exits non-zero, because absence is then unknown. --json prints the " +
-			"{writers, complete} document as received.",
+			"decoded {writers, complete} document.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("mr") && mrIID <= 0 {

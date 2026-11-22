@@ -90,8 +90,9 @@ branch_writers_read() {
     body=$(uzi admin run-writers "${args[@]}" --json 2>/dev/null) || rc=$?
     case "$rc" in
       0)
-        WRITERS=$(printf '%s' "$body" | jq -ce --arg br "$br" --argjson mr "$mr" '
-          if type != "object" or .complete != true or (.writers | type) != "array"
+        WRITERS=$(printf '%s' "$body" | jq -sce --arg br "$br" --argjson mr "$mr" '
+          (if length == 1 then .[0] else error("documents") end)
+          | if type != "object" or .complete != true or (.writers | type) != "array"
           then error("shape") else .writers end
           | if all(.[]; type == "object"
               and (.run_id | type == "string" and test("^[A-Za-z0-9_-]+$"))
@@ -124,8 +125,12 @@ print_writers_visibility() {
 # successful branch_writers_read), in the same one-line shape ci_fix_snapshot prints.
 # shellcheck disable=SC2034 # Sourced results, read by takeover.sh and watch-pr.sh.
 writers_summarize() {
+  local doc_ok
+  # One JSON array only: two concatenated documents print two lines and must not reach a numeric test.
+  doc_ok=$(printf '%s' "$WRITERS" | jq -se 'length == 1 and (.[0] | type) == "array"' 2>/dev/null) && [ "$doc_ok" = true ] || return 1
   CI_FIX_ACTIVE=$(printf '%s' "$WRITERS" | jq -r '[.[] | select(.kind == "ci_fix")] | sort_by(.id)
     | if length == 0 then "none" else map(.id + " " + .status) | join("; ") end') || return 1
   CI_FIX_ACTIVE_COUNT=$(printf '%s' "$WRITERS" | jq -r '[.[] | select(.kind == "ci_fix")] | length') || return 1
   WRITERS_MRW_COUNT=$(printf '%s' "$WRITERS" | jq -r '[.[] | select(.kind == "mr_rework")] | length') || return 1
+  case "$CI_FIX_ACTIVE_COUNT$WRITERS_MRW_COUNT" in ''|*[!0-9]*) return 1;; esac
 }

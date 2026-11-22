@@ -104,6 +104,12 @@ for body in 'junk' '{"writers":[],"complete":false}' '{"writers":[],"complete":"
   '{"writers":[{"run_id":"a","kind":"mr_rework","status":"running","mr_iid":8}],"complete":true}'; do
   WRITERS_OUT=$body; if branch_writers_read repo x 7; then fail "accepted $body"; fi
 done
+# Two concatenated documents (even individually valid) and an empty body are refused.
+WRITERS_OUT='{"writers":[],"complete":true}{"writers":[],"complete":true}'
+if branch_writers_read repo x 7; then fail 'two concatenated documents accepted'; fi
+WRITERS_OUT=''
+if branch_writers_read repo x 7; then fail 'empty body accepted'; fi
+WRITERS='[][]'; if writers_summarize; then fail 'summarize accepted two documents'; fi
 # Without an MR number an mr_rework entry cannot match.
 WRITERS_OUT='{"writers":[{"run_id":"a","kind":"mr_rework","status":"running","mr_iid":7}],"complete":true}'
 if branch_writers_read repo x; then fail 'mr_rework accepted without an MR'; fi

@@ -48,6 +48,15 @@ func TestAdminRunWritersHumanOutput(t *testing.T) {
 			t.Errorf("table missing %q:\n%s", want, out)
 		}
 	}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "run-1") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 7 || f[4] != writersRepoID || f[len(f)-1] != "7" {
+			t.Errorf("row %q: want repo id %q in the REPO column and MR 7 last", line, writersRepoID)
+		}
+	}
 	if fc.AdminRunWritersCalls[0].MRIID != 7 {
 		t.Errorf("calls = %+v", fc.AdminRunWritersCalls)
 	}

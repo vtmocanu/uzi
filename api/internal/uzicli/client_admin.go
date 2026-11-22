@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -157,15 +158,18 @@ func (c *HTTPClient) AdminRunWriters(ctx context.Context, repoID, branch string,
 	}
 	// "complete" must be a JSON boolean (a string, number or null is refused) and "writers" an
 	// array (null or absent is refused).
-	var complete bool
-	if raw, ok := keys["complete"]; !ok || json.Unmarshal(raw, &complete) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return apitypes.RunWritersDTO{}, malformed
-	}
-	if raw, ok := keys["writers"]; !ok || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
-		return apitypes.RunWritersDTO{}, malformed
+	// A key that matches these names only case-insensitively is refused: encoding/json would
+	// otherwise match it as well, so the DTO fields are decoded from the validated raw values.
+	for k := range keys {
+		if k != "writers" && k != "complete" && (strings.EqualFold(k, "writers") || strings.EqualFold(k, "complete")) {
+			return apitypes.RunWritersDTO{}, malformed
+		}
 	}
 	var out apitypes.RunWritersDTO
-	if err := json.Unmarshal(body, &out); err != nil {
+	if raw, ok := keys["complete"]; !ok || json.Unmarshal(raw, &out.Complete) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	if raw, ok := keys["writers"]; !ok || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) || json.Unmarshal(raw, &out.Writers) != nil {
 		return apitypes.RunWritersDTO{}, malformed
 	}
 	if out.Writers == nil {

@@ -1024,6 +1024,9 @@ UZI_RUNS_JSON='[]'; export UZI_RUNS_JSON
 UZI_WRITERS_RC=3 ci_watch wr-fb-empty 0
 grep -qxF 'VISIBILITY=owner_only' "$WORK/ci-wr-fb-empty.out" || fail 'owner_only visibility missing on empty fallback'
 UZI_WRITERS_RC=3 UZI_RUN_LIST_FAIL=1 ci_watch wr-fb-fail 9
+# Authorized read succeeded (complete, empty) but the owner run list failed: unknown path, never ready.
+UZI_WRITERS_OUT='{"writers":[],"complete":true}' UZI_RUN_LIST_FAIL=1 ci_watch wr-ok-listfail 9
+grep -qxF 'CI_FIX_RECENT=unknown' "$WORK/ci-wr-ok-listfail.out" || fail 'run-list failure after an authorized read did not leave CI_FIX_RECENT unknown'
 unset UZI_ADMIN_RW UZI_WRITERS_OUT UZI_WRITERS_RC
 unset UZI_REPO_JSON UZI_RUNS_JSON CHECKS_JSON
 

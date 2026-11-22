@@ -182,8 +182,7 @@ mrw_check() {
   branch_writers_read "$repo_id" "$BRANCH" "$PR" \
     || { log "$WRITERS_ERR; cannot rule out active helpers"; return 4; }
   active=$WRITERS
-  log "VISIBILITY=$WRITERS_VISIBILITY"
-  [ "$WRITERS_VISIBILITY" != owner_only ] || log 'note: owner-only visibility; foreign or older writers are not excluded'
+  print_writers_visibility | while IFS= read -r l; do log "$l"; done
   n=$(printf '%s' "$active" | jq -r '[.[] | select(.kind=="mr_rework") | .id] | join(" ")')
   if [ -n "$n" ]; then log "an mr_rework run is ACTIVE on #$PR ($n) — defer (scripts/wait-mrrework.sh)"; return 4; fi
   # ci_fix shares the worker-owned branch; match pipeline_ref rather than the PR number.

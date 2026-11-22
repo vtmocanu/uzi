@@ -55,6 +55,9 @@ func TestAdminRunWritersStrictDecode(t *testing.T) {
 		"writers missing":  `{"complete":true}`,
 		"writers object":   `{"writers":{},"complete":true}`,
 		"bad element":      `{"writers":[{"run_id":5}],"complete":true}`,
+		// Case-variant duplicates must not shadow or override the exact keys.
+		"writers case dup":  `{"writers":[{"run_id":"r1","kind":"ci_fix","status":"running","owner_id":"u1","repo_id":"x","pipeline_ref":"b","created_at":"2026-01-02T03:04:05Z"}],"complete":true,"WRITERS":[]}`,
+		"complete case dup": `{"writers":[],"complete":false,"Complete":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			var uri string

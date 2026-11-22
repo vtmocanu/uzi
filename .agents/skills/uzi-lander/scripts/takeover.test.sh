@@ -462,6 +462,9 @@ UZI_WRITERS_RC=3 snap head_clean wr-fb-empty
 has_line wr-fb-empty 'VISIBILITY=owner_only'; has_line wr-fb-empty 'CI_FIX_ACTIVE=none'
 UZI_WRITERS_RC=3 UZI_RUN_LIST_FAIL=1 snap head_clean wr-fb-fail
 has wr-fb-fail 'NEXT=unknown'; has_line wr-fb-fail 'CI_FIX_ACTIVE=unknown'
+# Authorized read succeeded (complete, empty) but the owner run list failed: CI_FIX_RECENT is unknowable, fail closed.
+UZI_WRITERS_OUT='{"writers":[],"complete":true}' UZI_RUN_LIST_FAIL=1 snap head_clean wr-ok-listfail
+has wr-ok-listfail 'NEXT=unknown'; has_line wr-ok-listfail 'CI_FIX_RECENT=unknown'
 unset UZI_ADMIN_RW UZI_WRITERS_OUT UZI_WRITERS_RC
 unset UZI_REPO_JSON UZI_RUNS_JSON
 

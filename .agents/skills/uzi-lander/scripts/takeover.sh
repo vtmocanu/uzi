@@ -411,8 +411,7 @@ if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
   if branch_writers_read "$repo_id" "$(printf '%s' "$pj" | jq -r '.headRefName // empty')" "$PR" \
      && writers_summarize; then
     mrw=$WRITERS_MRW_COUNT; ci_active=$CI_FIX_ACTIVE; ci_count=$CI_FIX_ACTIVE_COUNT
-    echo "VISIBILITY=$WRITERS_VISIBILITY"
-    [ "$WRITERS_VISIBILITY" != owner_only ] || echo 'note: owner-only visibility; foreign or older writers are not excluded'
+    print_writers_visibility
     # CI_FIX_RECENT stays owner-scoped: reuse the fallback's run list, else read it separately.
     runs=$WRITERS_RUNS
     [ -n "$runs" ] || runs=$(uzi run list --json 2>/dev/null || echo 'x')
