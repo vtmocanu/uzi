@@ -103,6 +103,10 @@ func (tx *scopedClaimTx) QueryRow(_ context.Context, sql string, args ...any) pg
 			return scopedClaimRow{err: pgx.ErrNoRows}
 		}
 		return scopedClaimRow{value: r}
+	case "HasQueuedRunForUser":
+		// Issue #4602 idle precheck: the fixture always offers a claimable candidate, so the
+		// owner has a queued run and ClaimRun stays the authoritative claim.
+		return scopedClaimRow{value: true}
 	case "ClaimRun":
 		tx.claims++
 		return scopedClaimRow{value: tx.candidate}

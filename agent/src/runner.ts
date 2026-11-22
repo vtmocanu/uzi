@@ -16098,6 +16098,13 @@ export class RunRunner {
         });
       }
     }
+    // Codex can only re-present the persisted gate with its preflighted conversation.
+    // Without it the executor replans, so buffered approval must not inherit the old gate.
+    // SDK retains its existing session-less gate recovery behaviour.
+    if (claim.secrets.codex && !sessionId && claim.plan_approved !== true && claim.plan_md?.trim()) {
+      this.gatedRuns.add(runId);
+      this.gateResumes.delete(runId);
+    }
     return sessionId;
   }
 

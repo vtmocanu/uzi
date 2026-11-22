@@ -44,7 +44,7 @@ type EffectiveEffortCellDTO struct {
 
 // EffectivePlanPhaseDTO is the lead model and effort of every turn before plan approval (PRD
 // #3252), exactly the claim's plan_phase: the same tokens and the same omission. It appears on a
-// preview only for a Claude run whose owner's Claude planning model or effort applies, and is
+// preview only for a run whose owner's harness-specific planning model or effort applies, and is
 // omitted otherwise, so every other preview body is unchanged. model and effort are the values the
 // claim ships (omitted when the plan side ships none, which then follows the implement side);
 // model_source and effort_source are the claim's provenance tokens: user_planning_default for a
@@ -107,8 +107,8 @@ type EffectiveCrossCheckDTO struct {
 }
 
 // EffectiveSettingsDTO is the body of GET /api/me/effective-settings: both harnesses, the three
-// start choices, the 9 model cells, the 5 effort cells, the 8 cross-check cells and the judge harness.
-// The extra model and effort cell are the Claude planning cells (PRD #3252, settings planning_model and
+// start choices, the 10 model cells, the 6 effort cells, the 8 cross-check cells and the judge harness.
+// The extra model and effort cells are the Claude and Codex planning cells (PRD #3252, settings planning_model and
 // planning_effort): Default is the implement resolution, and a stored planning value resolves with
 // source user_planning_default.
 type EffectiveSettingsDTO struct {
@@ -155,7 +155,7 @@ type StartPreviewAlternativeDTO struct {
 	Refusal       *string               `json:"refusal"`
 	RefusalDetail *string               `json:"refusal_detail"`
 	WorkerEffort  *EffortSettingCellDTO `json:"worker_effort,omitempty"`
-	// PlanPhase is the Claude plan-phase pair (PRD #3252) of a Claude alternative; see StartPreviewDTO.
+	// PlanPhase is the harness-specific plan-phase pair (PRD #3252) of a Claude alternative; see StartPreviewDTO.
 	PlanPhase *EffectivePlanPhaseDTO `json:"plan_phase,omitempty"`
 }
 
@@ -169,7 +169,7 @@ type StartPreviewAlternativeDTO struct {
 // refusal (create refuses that model before any credential check, so the preview does too). WorkerModel and WorkerEffort are present only when
 // the request carried that choice and the harness is decided (source run_override); with an undecided
 // harness only effort is answered, per alternative (a model request always decides the harness).
-// PlanPhase (PRD #3252) is present only when the harness is decided as Claude and the owner's planning
+// PlanPhase (PRD #3252) is present only when the harness is decided and the owner's planning
 // model or effort applies; a start-time model or effort the request carries is frozen into both
 // phases, so that setting stays out of the planning lane. It is omitted on every other response.
 type StartPreviewDTO struct {
@@ -302,7 +302,7 @@ type ScheduleAlternativeDTO struct {
 	Subagents     *EffectiveSubagentsDTO  `json:"subagents"`
 	Refusal       *string                 `json:"refusal"`
 	RefusalDetail *string                 `json:"refusal_detail"`
-	// PlanPhase is the Claude plan-phase pair (PRD #3252); omitted unless the planning lane applies.
+	// PlanPhase is the harness-specific plan-phase pair (PRD #3252); omitted unless the planning lane applies.
 	PlanPhase *EffectivePlanPhaseDTO `json:"plan_phase,omitempty"`
 }
 
@@ -324,7 +324,7 @@ type ScheduleSettingsPreviewDTO struct {
 	Notes         []string                 `json:"notes"`
 	Alternatives  []ScheduleAlternativeDTO `json:"alternatives,omitempty"`
 	// PlanPhase (PRD #3252) is the plan-phase pair of a fire on Claude: present only when the
-	// owner's Claude planning model or effort applies (a schedule's model pin is frozen into both
+	// owner's harness-specific planning model or effort applies (a schedule's model pin is frozen into both
 	// phases, so the planning model then yields to it), omitted otherwise. With the harness chosen
 	// at creation it is carried per alternative instead.
 	PlanPhase *EffectivePlanPhaseDTO `json:"plan_phase,omitempty"`

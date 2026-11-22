@@ -27,8 +27,8 @@ type LeadSettingsInput struct {
 	// caller via leadTemplateEffort. It applies only when UserEffort is NULL or blank, below the
 	// owner's choice and above the built-in default. Zero means no lead template effort.
 	TemplateEffort pgtype.Text
-	// PlanningModel and PlanningEffort are the owner's Claude planning columns (PRD #3252), read
-	// only for a Claude lead-lane claim; blank (after trim) is unset.
+	// PlanningModel and PlanningEffort are the owner's planning columns for Harness (PRDs #3252/#3253),
+	// read only for a lead-lane claim; blank (after trim) is unset.
 	PlanningModel  pgtype.Text
 	PlanningEffort pgtype.Text
 }
@@ -145,6 +145,14 @@ func leadEffortWithTemplate(harness Harness, runEffort, runEffortSource, userEff
 		return &level, leadcfg.EffortSourceTemplate, false
 	}
 	return leadEffortFor(harness, runEffort, runEffortSource, userEffort)
+}
+
+// LeadEffortWithTemplate is the exported, pure form of leadEffortWithTemplate for callers with no
+// run override (the /me/settings planning cell): it returns the effort and its source string. The
+// unhonorable result is only possible with a run override, so dropping it here is safe.
+func LeadEffortWithTemplate(harness Harness, userEffort, templateEffort pgtype.Text) (*string, string) {
+	effort, source, _ := leadEffortWithTemplate(harness, pgtype.Text{}, pgtype.Text{}, userEffort, templateEffort)
+	return effort, string(source)
 }
 
 // leadTemplateEffort is the effort pin of the lead template among the delivered templates for the

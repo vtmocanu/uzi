@@ -467,10 +467,13 @@ pending, with no saved revised plan answering it.
 Use [the existing CLI verdict commands](./cli.md#commands).
 The expired wait keeps its live poller, worker snapshot entry and busy slot,
 so it can defer a worker image roll. Existing drain/shutdown policy still
-applies. Reclaim loses the in-memory allowance, expiry and predecessor chain:
-Claude keeps existing pending-input replay; Codex shows a fresh plan and asks
-you to re-send feedback. A new flight may get a fresh allowance; there is no
-lifetime retry bound or exactly-once/ordering guarantee. Custody safeguards remain.
+applies. Reclaim loses the in-memory allowance, expiry and predecessor chain.
+On a subsequent admitted claim, Claude and Codex replay a still-pending revise
+against the persisted plan. Without a saved conversation, Codex rebuilds the
+planning context; the input becomes APPLIED only after the revised plan persists.
+Applied feedback is not replayed again. A new flight may get a fresh allowance;
+there is no lifetime retry bound or exactly-once provider execution/ordering
+guarantee. Custody and worker-admission safeguards remain.
 
 ## Inspecting an interrupted attempt
 

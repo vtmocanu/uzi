@@ -556,11 +556,11 @@ for (const resumed of [false, true]) test(`Codex executor prepares current evide
           if (method === "thread/start") {
             assert.ok((p.dynamicTools as { name: string }[]).some(tool => tool.name === "uzi_ci_evidence_read"),
               "executor registers the dynamic evidence reader");
-            return { thread: { id: sessionId } } as T;
+            return { thread: { id: sessionId }, model: p.model } as T;
           }
           if (method === "thread/resume") {
             assert.equal(p.threadId, sessionId, "resume keeps the stored thread");
-            return { thread: { id: sessionId } } as T;
+            return { thread: { id: sessionId }, model: p.model } as T;
           }
           if (method === "turn/start") {
             turns++;
@@ -571,6 +571,8 @@ for (const resumed of [false, true]) test(`Codex executor prepares current evide
             assert.ok(prompt.includes(ID), "executor forwards prepared metadata to provider");
             assert.ok(prompt.includes(f.options.claim.ci_repair.input_files[0]!.sha256));
             assert.ok(!prompt.includes(f.home));
+            push({ kind: "turn_started", method: "turn/started", threadId: sessionId, turnId: "turn",
+              params: { threadId: sessionId, turn: { id: "turn" } } });
             call(1, "uzi_ci_evidence_read", { manifest_id: ID, offset: 2, limit: 1 });
             return { turn: { id: "turn" } } as T;
           }
@@ -630,6 +632,7 @@ for (const resumed of [false, true]) test(`Codex executor prepares current evide
     },
   };
   const result = await executor.run(ctx);
+  assert.equal(result.phaseSwitchHeld, undefined, "the implementation thread passes model verification");
   assert.equal(result.branch, "repair");
   assert.equal(preparations, 1);
   assert.deepEqual(generations, [7], "the current claim generation downloads its own evidence");

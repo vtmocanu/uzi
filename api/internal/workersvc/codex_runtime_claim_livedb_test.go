@@ -81,7 +81,7 @@ func TestCodexRuntimeMixedFleetHealthCountsLiveDB(t *testing.T) {
 	e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CompletionInterlockV1})
 	assertCounts := func(want int64) {
 		t.Helper()
-		custom, err := e.q.CountOnlineWorkersSatisfyingCustomCodex(e.ctx, e.userID)
+		custom, err := e.q.CountOnlineWorkersSatisfyingCustomCodex(e.ctx, store.CountOnlineWorkersSatisfyingCustomCodexParams{UserID: e.userID})
 		if err != nil || custom != want {
 			t.Errorf("custom-capable current runtime count=%d want=%d err=%v", custom, want, err)
 		}

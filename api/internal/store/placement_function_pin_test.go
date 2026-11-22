@@ -116,10 +116,11 @@ func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 		"codex_completion_interlock_v1", "codex_custom_model_v1", "cross_check_v1",
 		"cross_check_codex_lead_v1", "cross_check_semantic_plan_v1", "cross_check_owner_steering_v1",
 		"completion_semantic_publication_v1", "cross_check_code_v1", "cross_check_lane_v1",
-		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "claude_phase_models_v1", "run_env_v1",
+		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "run_env_v1",
 	} {
 		want["'"+c+"' = ANY(w.protocol_capabilities)"] = 1
 	}
+	want["WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)"] = 1
 	keys := make([]string, 0, len(want))
 	for k := range want {
 		keys = append(keys, k)

@@ -112,9 +112,11 @@ type userSettingsDTO struct {
 	EffortSettings []apitypes.EffortSettingCellDTO `json:"effort_settings"`
 	// PlanningClaudeModel and PlanningClaudeEffort are the owner's Claude planning pair (PRD
 	// #3252): null = "Same as the run". PlanningModels and PlanningEfforts are the read-only
-	// resolved views (Claude entry only); they are never accepted on a PUT.
+	// resolved views (Claude then Codex); they are never accepted on a PUT.
 	PlanningClaudeModel  *string                         `json:"planning_claude_model"`
 	PlanningClaudeEffort *string                         `json:"planning_claude_effort"`
+	PlanningCodexModel   *string                         `json:"planning_codex_model"`
+	PlanningCodexEffort  *string                         `json:"planning_codex_effort"`
 	PlanningModels       []apitypes.ModelSettingCellDTO  `json:"planning_models"`
 	PlanningEfforts      []apitypes.EffortSettingCellDTO `json:"planning_efforts"`
 	// WeeklyReservePct and WeeklyReservePauseRunning are the weekly usage reserve (PRD
@@ -156,7 +158,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		slog.Error("get user settings", "error", err)
 		return userSettingsDTO{}, err
 	}
-	pins, leadCodexPin, leadClaudePin, err := h.crossCheckPinSettings(r.Context(), userID)
+	pins, leadCodexPin, leadClaudePin, leadClaudeEffort, leadCodexEffort, err := h.crossCheckPinSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get cross-check pins", "error", err)
 		return userSettingsDTO{}, err
@@ -217,6 +219,8 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
 	planningModel := textPtrValue(s.PlanningClaudeModel.Valid, s.PlanningClaudeModel.String)
 	planningEffort := textPtrValue(s.PlanningClaudeEffort.Valid, s.PlanningClaudeEffort.String)
+	planningCodexModel := textPtrValue(s.PlanningCodexModel.Valid, s.PlanningCodexModel.String)
+	planningCodexEffort := textPtrValue(s.PlanningCodexEffort.Valid, s.PlanningCodexEffort.String)
 	return userSettingsDTO{
 		VaultAutoReunlock:      settingsAutoReunlock(r),
 		CrossCheckPins:         pins,
@@ -249,17 +253,39 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 			textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
 			textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
 			catalogDefault),
+		PlanningCodexModel:   planningCodexModel,
+		PlanningCodexEffort:  planningCodexEffort,
 		PlanningClaudeModel:  planningModel,
 		PlanningClaudeEffort: planningEffort,
 		PlanningModels: planningModelCells(planningModel,
 			textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
-			textPtrValue(leadClaudePin.Valid, leadClaudePin.String)),
-		PlanningEfforts:           planningEffortCells(planningEffort, textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String)),
+			textPtrValue(leadClaudePin.Valid, leadClaudePin.String), planningCodexModel,
+			textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+			textPtrValue(leadCodexPin.Valid, leadCodexPin.String)),
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			planningEffortCellFor(workersvc.HarnessClaude, planningEffort, s.DefaultEffort, leadClaudeEffort),
+			planningEffortCellFor(workersvc.HarnessCodex, planningCodexEffort, s.DefaultCodexEffort, leadCodexEffort),
+		},
 		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		CodexAccountMode:          codexMode,
 		HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
 	}, nil
+}
+
+// planningEffortCellFor composes the same per-harness lead and planning resolutions as
+// claim assembly and the effective view, including the selected lead template's effort tier.
+func planningEffortCellFor(harness workersvc.Harness, planning *string, userEffort, rawTemplateEffort pgtype.Text) apitypes.EffortSettingCellDTO {
+	var template pgtype.Text
+	if rawTemplateEffort.Valid && agenttmpl.IsEffortLevel(rawTemplateEffort.String) {
+		template = rawTemplateEffort
+	}
+	effort, source := workersvc.LeadEffortWithTemplate(harness, userEffort, template)
+	lead := workersvc.LeadPrediction{
+		Harness: harness, UserEffort: textPtrValue(userEffort.Valid, userEffort.String),
+		TemplateEffort: textPtrValue(template.Valid, template.String), Effort: effort, EffortSource: source,
+	}
+	return planningEffortCellFromOrdinary(planning, leadEffortSettingCell(string(harness), lead))
 }
 
 // GetMySettings returns the current user's own settings. Session-authenticated
@@ -364,6 +390,8 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		// value ⇒ set. planning_models / planning_efforts are read-only and rejected as unknown.
 		PlanningClaudeModel  json.RawMessage `json:"planning_claude_model"`
 		PlanningClaudeEffort json.RawMessage `json:"planning_claude_effort"`
+		PlanningCodexEffort  json.RawMessage `json:"planning_codex_effort"`
+		PlanningCodexModel   json.RawMessage `json:"planning_codex_model"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -568,6 +596,28 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		planningEffortVal = v
+	}
+
+	var planningCodexModelVal pgtype.Text
+	planningCodexModelPresent := req.PlanningCodexModel != nil
+	if planningCodexModelPresent {
+		v, ferr := decodePlanningCodexModelField(req.PlanningCodexModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningCodexModelVal = v
+	}
+
+	var planningCodexEffortVal pgtype.Text
+	planningCodexEffortPresent := req.PlanningCodexEffort != nil
+	if planningCodexEffortPresent {
+		v, ferr := decodePlanningCodexEffortField(req.PlanningCodexEffort)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningCodexEffortVal = v
 	}
 
 	var mrVal pgtype.Bool
@@ -790,6 +840,20 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			PlanningClaudeEffort: planningEffortVal,
 		}); err != nil {
 			slog.Error("set user planning claude", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if planningCodexModelPresent || planningCodexEffortPresent {
+		if _, err := h.q.SetUserPlanningCodex(r.Context(), store.SetUserPlanningCodexParams{
+			ID:                  user.ID,
+			SetModel:            planningCodexModelPresent,
+			PlanningCodexModel:  planningCodexModelVal,
+			SetEffort:           planningCodexEffortPresent,
+			PlanningCodexEffort: planningCodexEffortVal,
+		}); err != nil {
+			slog.Error("set user planning codex", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

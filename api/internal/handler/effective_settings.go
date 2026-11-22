@@ -231,7 +231,7 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get user settings: %w", err)
 	}
-	pins, _, _, err := h.crossCheckPinSettings(ctx, userID)
+	pins, _, _, _, _, err := h.crossCheckPinSettings(ctx, userID)
 	if err != nil {
 		return apitypes.EffectiveSettingsDTO{}, fmt.Errorf("get cross-check pins: %w", err)
 	}
@@ -252,10 +252,11 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 
 	// Worker, judge, summary and task review, each Claude then Codex.
 	dto.Models = append(dto.Models, workerModelCell(leads[workersvc.HarnessClaude]), workerModelCell(leads[workersvc.HarnessCodex]))
-	// PRD #3252: the Claude planning model, beside the worker cells it defaults to.
+	// PRD #3252: the planning models, beside the worker cells it defaults to.
 	planningModel := textPtrValue(s.PlanningClaudeModel.Valid, s.PlanningClaudeModel.String)
 	planningEffort := textPtrValue(s.PlanningClaudeEffort.Valid, s.PlanningClaudeEffort.String)
-	dto.Models = append(dto.Models, planningModelCell(leads[workersvc.HarnessClaude], planningModel))
+	dto.Models = append(dto.Models, planningModelCell(leads[workersvc.HarnessClaude], planningModel),
+		planningModelCell(leads[workersvc.HarnessCodex], textPtrValue(s.PlanningCodexModel.Valid, s.PlanningCodexModel.String)))
 	if h.settings != nil {
 		instance, notes := h.effectiveInstanceModels(ctx)
 		judgeLane := textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String)
@@ -287,6 +288,7 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 		{EffortSettingCellDTO: reviewEffortCell("claude"), Setting: "task_review_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{noteNotSent}},
 		{EffortSettingCellDTO: reviewCodexEffort, Setting: "task_review_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{noteNotSent}},
 		planningEffortCell(leads[workersvc.HarnessClaude], planningEffort),
+		planningEffortCell(leads[workersvc.HarnessCodex], textPtrValue(s.PlanningCodexEffort.Valid, s.PlanningCodexEffort.String)),
 	}
 	dto.CrossCheck = apitypes.EffectiveCrossCheckDTO{Models: checkModels, Efforts: checkEfforts}
 	return dto, nil
@@ -366,14 +368,14 @@ func planPhaseDTO(p *workersvc.ClaimPhaseSettings) *apitypes.EffectivePlanPhaseD
 	return &apitypes.EffectivePlanPhaseDTO{Model: p.Model, Effort: p.Effort, ModelSource: p.ModelSource, EffortSource: p.EffortSource}
 }
 
-// planningModelCell is the Claude planning model cell (PRD #3252): the stored planning value, the
+// planningModelCell is the planning models cell (PRD #3252): the stored planning value, the
 // implement resolution as its Default (what the worker model cell resolves to), and, when the claim's
 // plan pair came from the planning lane, that value with source user_planning_default. The pair is
 // read off the claim's own resolution (LeadPrediction.Plan), so a stored value the claim ignores (a
 // Codex role id) leaves the cell on the default. Read when a worker claims the run.
 func planningModelCell(lead workersvc.LeadPrediction, stored *string) apitypes.EffectiveModelCellDTO {
 	cell := apitypes.ModelSettingCellDTO{
-		Harness: string(workersvc.HarnessClaude), Model: stored,
+		Harness: string(lead.Harness), Model: stored,
 		DefaultModel: lead.Model, DefaultSource: lead.ModelSource,
 		ResolvedModel: lead.Model, Source: lead.ModelSource,
 	}
@@ -385,11 +387,11 @@ func planningModelCell(lead workersvc.LeadPrediction, stored *string) apitypes.E
 	}
 }
 
-// planningEffortCell is the Claude planning effort cell (PRD #3252), the shared planning effort
-// cell of /me/settings (planningEffortCells) as an effective cell.
+// planningEffortCell builds the effective planning effort from the resolved lead, including
+// its template tier, matching the per-harness /me/settings planning cell.
 func planningEffortCell(lead workersvc.LeadPrediction, stored *string) apitypes.EffectiveEffortCellDTO {
 	return apitypes.EffectiveEffortCellDTO{
-		EffortSettingCellDTO: planningEffortCellFromOrdinary(stored, leadEffortSettingCell("claude", lead)),
+		EffortSettingCellDTO: planningEffortCellFromOrdinary(stored, leadEffortSettingCell(string(lead.Harness), lead)),
 		Setting:              "planning_effort", FixedAt: workersvc.FixedAtClaim, Notes: []string{},
 	}
 }
@@ -706,13 +708,10 @@ type runOverrideResult struct {
 }
 
 // runOverrideCells predicts a start-time model and effort on harness hn through the claim's own
-// resolver, and on Claude the plan pair (PRD #3252) even when the request carried neither. An
+// resolver, and the plan pair (PRD #3252) even when the request carried neither. An
 // incompatible model is a refusal, never a different model.
 func (h *Handler) runOverrideCells(ctx context.Context, userID uuid.UUID, hn workersvc.Harness, model, effort *string) (runOverrideResult, error) {
 	var out runOverrideResult
-	if model == nil && effort == nil && hn != workersvc.HarnessClaude {
-		return out, nil
-	}
 	lead, err := h.wsvc.PredictRunOverrideLead(ctx, userID, hn, model, effort)
 	if err != nil {
 		return out, fmt.Errorf("predict run override lead %s: %w", hn, err)

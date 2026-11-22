@@ -166,7 +166,10 @@ it("syncs the small tree and is idempotent", () => {
   const dir = smallTree((files) => { files[LOCK] = bumped(realLock); });
   try {
     const written = syncCodexPins(dir).sort();
-    assert.deepEqual(written, ["agent/src/codex/codex-runtime-probe.ts", "docs/pin.md", "e2e/codex-m4/large-resume.test.ts", "e2e/codex-m4/token-resume.test.ts"]);
+    assert.deepEqual(written, [
+      "agent/src/codex/codex-runtime-probe.ts", "docs/pin.md", "e2e/codex-m4/large-resume.test.ts",
+      "e2e/codex-m4/phase-model-live-codex.probe.ts", "e2e/codex-m4/phase-model-switch.test.ts", "e2e/codex-m4/token-resume.test.ts",
+    ]);
     assert.equal(readFileSync(join(dir, "docs/pin.md"), "utf8"), `binary at ${INSTALL_ROOT}${NEXT.version}/bin/codex\n`);
     assert.deepEqual(syncCodexPins(dir), []);
   } finally {

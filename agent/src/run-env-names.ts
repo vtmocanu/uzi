@@ -7,7 +7,7 @@
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
   claude_agent_sdk: "0.3.319",
-  codex: "0.167.0",
+  codex: "0.169.0",
 } as const;
 
 /** The worker invariants a denylist entry protects (fixtures/run-env/name-rules.json "invariants"). */

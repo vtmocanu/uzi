@@ -14,7 +14,7 @@ import (
 
 type roundsPinsHealthStore struct{ *roundsHealthStore }
 
-func (f *roundsPinsHealthStore) CountOnlineWorkersSatisfyingCustomCodex(context.Context, uuid.UUID) (int64, error) {
+func (f *roundsPinsHealthStore) CountOnlineWorkersSatisfyingCustomCodex(context.Context, store.CountOnlineWorkersSatisfyingCustomCodexParams) (int64, error) {
 	return 1, nil
 }
 

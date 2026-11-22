@@ -72,9 +72,9 @@ describe("AgentNew real editor model pins", () => {
     expect((claude as HTMLSelectElement).value).toBe("inherit");
     expect((codex as HTMLSelectElement).value).toBe("inherit");
     expect(within(codex).getAllByRole("option").map((option) => option.textContent)).toEqual([
-      "Default · lead's model", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
+      "Default · follows lead", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
     ]);
-    expect(within(claude).getByRole("option", { name: "Default · lead's model" })).toBeTruthy();
+    expect(within(claude).getByRole("option", { name: "Default · follows lead" })).toBeTruthy();
     const help = screen.getByText("Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.");
     expect(claude.getAttribute("aria-describedby")).toBe(help.id);
     expect(codex.getAttribute("aria-describedby")).toBe(help.id);
@@ -121,9 +121,14 @@ describe("AgentNew real editor model pins", () => {
     expect(within(claude).getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Default · follows the run's effort", "low", "medium (uzi default)", "high", "xhigh", "max",
     ]);
-    expect(screen.queryByText("Used when you have no default effort for this harness")).toBeNull();
+    const leadEffortHelp = /^An effort chosen at start, then your Run defaults effort/;
+    expect(screen.queryByText(leadEffortHelp)).toBeNull();
+    expect(screen.getByText(/^Leave a harness on Default so this subagent/)).toBeTruthy();
     fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "lead" } });
-    expect(screen.getByText("Used when you have no default effort for this harness")).toBeTruthy();
+    expect(screen.getByText(leadEffortHelp)).toBeTruthy();
+    expect(screen.getByText(/^A model chosen at start or a schedule's model/)).toBeTruthy();
+    expect(screen.queryByText(/^Leave a harness on Default so this subagent/)).toBeNull();
+    expect(claude.options[0]?.text).toBe("Default · built-in (medium)");
     fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "my-agent" } });
 
     fillRequiredFields();

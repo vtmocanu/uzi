@@ -1077,7 +1077,12 @@ func (f *fakeStore) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (sto
 func (f *fakeStore) GetUserPlanningClaude(context.Context, uuid.UUID) (store.GetUserPlanningClaudeRow, error) {
 	return store.GetUserPlanningClaudeRow{PlanningClaudeModel: f.planningModel, PlanningClaudeEffort: f.planningEffort}, f.planningErr
 }
-func (f *fakeStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, uuid.UUID) (int64, error) {
+
+func (f *fakeStore) GetUserPlanningCodex(context.Context, uuid.UUID) (store.GetUserPlanningCodexRow, error) {
+	return store.GetUserPlanningCodexRow{}, nil
+}
+
+func (f *fakeStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, store.CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error) {
 	return 1, nil
 }
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
