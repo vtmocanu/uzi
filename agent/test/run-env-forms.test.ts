@@ -4,7 +4,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { createLogger } from "../src/log.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
-import { runEnvRedactionForms, runEnvScanNeedles, secretForms } from "../src/run-env-forms.js";
+import { runEnvRedactionForms, runEnvScanNeedles } from "../src/run-env-forms.js";
 import { textHitVariables } from "../src/run-env-scan.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { fakeGitlab, git, installHarness, runnerWith } from "./runner-harness.js";
@@ -63,7 +63,7 @@ describe("whole-value encodings are redacted and found", () => {
       const embedded = Buffer.from(`${"x".repeat(n)}${value}trailing`);
       assert.ok(/[+/]/.test(embedded.toString("base64")) && /[-_]/.test(embedded.toString("base64url")), "the fixture exercises both alphabets");
       const text = `t=${embedded.toString("base64url")};`;
-      assert.ok(secretForms(value).some((f) => text.includes(f)), `alignment ${n}`);
+      assert.ok(runEnvRedactionForms([secretVar("SVC_PASSWORD", value)], []).some((f) => text.includes(f)), `alignment ${n}`);
       assert.ok(redact(text).includes("***REDACTED***"), `redacted at alignment ${n}`);
     }
   });

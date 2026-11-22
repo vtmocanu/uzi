@@ -5,7 +5,7 @@ import path from "node:path";
 import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
 import { buildCommandEnv, withCommandGitTrust } from "../src/codex/codex-executor.js";
 import { foldRunEnv, runEnvDropText } from "../src/run-env-inject.js";
-import { runEnvRedactionForms, secretForms } from "../src/run-env-forms.js";
+import { runEnvRedactionForms } from "../src/run-env-forms.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { RUN_ENV_DENIED_NAMES, RUN_ENV_DENIED_PREFIXES } from "../src/run-env-names.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
@@ -196,8 +196,8 @@ describe("registered forms of secret variables", () => {
   const SECRET = "s3cr3t-pa55word-xyz";
 
   it("hard-coded base64 alignments of a known value", () => {
-    const forms = secretForms("abcdefgh");
-    assert.deepEqual(forms.slice(0, 1), ["abcdefgh"]);
+    const forms = runEnvRedactionForms([v("X", "abcdefgh", true)], []);
+    assert.ok(forms.includes("abcdefgh"));
     for (const f of ["YWJjZGVmZ2", "FiY2RlZmdo", "hYmNkZWZna"]) assert.ok(forms.includes(f), f);
   });
 

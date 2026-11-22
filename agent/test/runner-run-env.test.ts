@@ -122,12 +122,16 @@ describe("the run variable marker", () => {
     fs.writeFileSync(blocker, "x");
     Object.defineProperty(git, "runEnvSeenRoot", { value: path.join(blocker, "run-env-seen"), configurable: true, writable: true });
     let built = 0;
+    let outcome: unknown;
     try {
-      await runnerWith(() => { built++; return { executor: { run: async () => { throw new Error("must not run"); } } }; }, gitlab).execute(claim).catch(() => undefined);
+      outcome = await runnerWith(() => { built++; return { executor: { run: async () => { throw new Error("must not run"); } } }; }, gitlab).execute(claim).then(() => "resolved", (e: unknown) => e);
     } finally {
       Object.defineProperty(git, "runEnvSeenRoot", { value: original, configurable: true, writable: true });
     }
     assert.equal(built, 0, "no executor was built");
+    assert.ok(outcome instanceof Error, "execute rejects with the marker write error");
+    assert.equal((outcome as NodeJS.ErrnoException).code, "ENOTDIR");
+    assert.deepEqual(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status), [], "no state is reported for the run");
   });
 });
 

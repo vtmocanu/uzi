@@ -9,9 +9,13 @@
 //   hit      at least one needle occurs; findings carry the variable NAME (never a value) under `uzi-run-env`
 //   withhold the range could not be proven clean (deadline, git error, unresolved ref, over the byte cap,
 //            the needles could not be resolved): the caller must not publish, and keeps its custody
-// There is no fourth outcome and no fail-open path. This module takes no lock and holds no state.
+// There is no fourth outcome. The one place a publish proceeds without needles is resolveScanNeedles: a
+// run whose own claim carried no secret variables, an api answer of `{protected:false}`, or a missing route
+// with a local marker proving this worker never handed the run variables. This module takes no lock and
+// holds no state.
 
 import type { GitCache } from "./git.js";
+import { literalsPresent } from "./redact.js";
 import type { RunEnvRedactResponse } from "./protocol.js";
 import { runEnvScanNeedles, type ScanNeedle } from "./run-env-forms.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
@@ -144,7 +148,11 @@ export async function resolveScanNeedles(opts: {
   return { kind: "needles", needles: runEnvScanNeedles(undefined, body.versions) };
 }
 
-/** The names of the variables whose forms occur in `text` (a raw patch). Used before the patch is redacted. */
+/** The names of the variables whose forms occur in `text` (a raw patch), in needle order. Used before the
+ *  patch is redacted. One pass over the text for every form of every needle. */
 export function textHitVariables(text: string, needles: readonly ScanNeedle[]): string[] {
-  return needles.filter((n) => n.forms.some((f) => f.length > 0 && text.includes(f))).map((n) => n.name);
+  const formsPresent = literalsPresent(needles.flatMap((n) => n.forms));
+  const present = formsPresent(text);
+  if (present.size === 0) return [];
+  return needles.filter((n) => n.forms.some((f) => present.has(f))).map((n) => n.name);
 }

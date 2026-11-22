@@ -75,21 +75,30 @@ function usable(forms: readonly string[]): string[] {
   return [...new Set(forms.filter((f) => f.length >= MIN_SECRET_LEN))];
 }
 
-/** The whole-value forms of one secret, deduplicated, with forms shorter than {@link MIN_SECRET_LEN} dropped. */
-export function secretForms(value: string): string[] {
-  return usable(wholeValueForms(value));
+/** The value as a file may hold it: as given, with its trailing line breaks stripped (a command
+ *  substitution drops them, and a token often carries one it was never meant to), and, for a multi-line
+ *  value, with every line break normalized to LF (a checkout normalizes CRLF), with and without the trailing
+ *  line breaks. */
+function valueVariants(value: string): string[] {
+  const lf = value.replace(/\r\n?/g, "\n");
+  return [...new Set([value, value.replace(/[\r\n]+$/, ""), lf, lf.replace(/\n+$/, "")])].filter((v) => v.length > 0);
 }
 
-/** Every form of one secret value to register for redaction: the whole-value forms, plus each line of a
- *  multi-line value (raw and JSON-escaped). Forms shorter than {@link MIN_SECRET_LEN} are dropped. */
+function variantForms(value: string): string[] {
+  return valueVariants(value).flatMap(wholeValueForms);
+}
+
+/** Every form of one secret value to register for redaction: the whole-value forms of each variant of the
+ *  value, plus each line of a multi-line value (raw and JSON-escaped). Forms shorter than
+ *  {@link MIN_SECRET_LEN} are dropped. */
 function redactionFormsOf(value: string): string[] {
-  return usable([...wholeValueForms(value), ...(isMultiLine(value) ? lineForms(value) : [])]);
+  return usable([...variantForms(value), ...(isMultiLine(value) ? lineForms(value) : [])]);
 }
 
-/** Every form of one secret value to search for: the whole-value forms, plus the diff-shaped forms of a
- *  multi-line value. Never a single line of a multi-line value. */
+/** Every form of one secret value to search for: the whole-value forms of each variant of the value, plus
+ *  the diff-shaped forms of a multi-line value. Never a single line of a multi-line value. */
 function scanFormsOf(value: string): string[] {
-  return usable([...wholeValueForms(value), ...(isMultiLine(value) ? diffShapedForms(value) : [])]);
+  return usable([...variantForms(value), ...(isMultiLine(value) ? diffShapedForms(value) : [])]);
 }
 
 /** One variable's scan needle: its NAME (the only text a finding may show) and every registered form of

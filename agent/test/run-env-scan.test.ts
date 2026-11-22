@@ -8,7 +8,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RECOVERY_BUNDLE_REF } from "../src/git.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
-import { runEnvScanNeedles, type ScanNeedle } from "../src/run-env-forms.js";
+import { runEnvRedactionForms, runEnvScanNeedles, type ScanNeedle } from "../src/run-env-forms.js";
 import {
   hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type RunEnvScanVerdict,
 } from "../src/run-env-scan.js";
@@ -144,6 +144,41 @@ describe("scanRunEnvRange over a real range", () => {
   });
 });
 
+describe("scanRunEnvRange when the committed bytes differ from the value in its line endings", () => {
+  const BODY = ["Zx3-line-one-dummy-0001", "Qm8-line-two-dummy-0002", "Ty5-line-three-dummy-0003"];
+  const ARMOR_BEGIN = ["-----BEGIN ", "DUMMY KEY", "-----"].join("");
+  const ARMOR_END = ["-----END ", "DUMMY KEY", "-----"].join("");
+  const MULTI = [ARMOR_BEGIN, ...BODY, ARMOR_END];
+
+  async function verdictFor(value: string, committed: string): Promise<RunEnvScanVerdict> {
+    const tip = commitFile(work, "k.pem", committed);
+    syncFeature();
+    return scan(tip, [base], runEnvScanNeedles([secretVar("SIGNING_KEY", value)], []));
+  }
+  const hitNames = (v: RunEnvScanVerdict): string[] => (v.kind === "hit" ? hitVariableNames(v.findings) : [`NOT a hit: ${v.kind}`]);
+
+  it("a multi-line value stored with a trailing line break is held when committed without it", async () => {
+    assert.deepEqual(hitNames(await verdictFor(`${MULTI.join("\n")}\n`, MULTI.join("\n"))), ["SIGNING_KEY"]);
+  });
+
+  it("a CRLF value is held when committed with LF line endings", async () => {
+    assert.deepEqual(hitNames(await verdictFor(MULTI.join("\r\n"), `${MULTI.join("\n")}\n`)), ["SIGNING_KEY"]);
+  });
+
+  it("a single-line token stored with a trailing line break is held when committed bare", async () => {
+    assert.deepEqual(hitNames(await verdictFor(`${SECRET}\n`, `token=${SECRET}`)), ["SIGNING_KEY"]);
+  });
+
+  it("a CRLF value with a trailing CRLF is held when committed LF and bare", async () => {
+    assert.deepEqual(hitNames(await verdictFor(`${MULTI.join("\r\n")}\r\n`, MULTI.join("\n"))), ["SIGNING_KEY"]);
+  });
+
+  it("the redaction forms cover the same variants", () => {
+    const forms = runEnvRedactionForms([secretVar("SIGNING_KEY", `${SECRET}\n`)], []);
+    assert.ok(forms.includes(SECRET));
+  });
+});
+
 describe("fail closed: anything that cannot be proven clean is a withhold, never a clean", () => {
   const withheld = (v: RunEnvScanVerdict): string => (v.kind === "withhold" ? v.reason : `NOT withheld: ${v.kind}`);
 
@@ -244,6 +279,20 @@ describe("text and rendering", () => {
     assert.deepEqual(textHitVariables(patch, NEEDLES), ["DB_PASSWORD"]);
     assert.deepEqual(textHitVariables("+nothing\n", NEEDLES), []);
     assert.deepEqual(textHitVariables(`+${Buffer.from(`u:${SECRET}`).toString("base64")}\n`, NEEDLES), ["DB_PASSWORD"]);
+  });
+
+  it("textHitVariables agrees with a per-form includes over needles that share prefixes and forms", () => {
+    const needles: ScanNeedle[] = [
+      { name: "SHORT", forms: ["abcdefgh-ijkl", "unused-form-1"] },
+      { name: "LONG", forms: ["abcdefgh-ijkl-mnop", "unused-form-2"] },
+      { name: "SAME", forms: ["abcdefgh-ijkl"] },
+      { name: "NONE", forms: ["never-present-form"] },
+    ];
+    const oracle = (text: string): string[] => needles.filter((n) => n.forms.some((f) => text.includes(f))).map((n) => n.name);
+    for (const text of ["x abcdefgh-ijkl-mnop y", "x abcdefgh-ijkl y", "abcdefgh-ij", "never-present-form", "", "unused-form-2 abcdefgh-ijkl"]) {
+      assert.deepEqual(textHitVariables(text, needles), oracle(text), JSON.stringify(text));
+    }
+    assert.deepEqual(textHitVariables("x abcdefgh-ijkl-mnop y", needles), ["SHORT", "LONG", "SAME"]);
   });
 
   it("a finding renders a validated variable name and never anything else from the finding", () => {

@@ -85,7 +85,7 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
   const list = usableSecrets(secrets);
   if (list.length === 0) return (s) => s;
   const visible = list.map((secret) => secret.replace(INVISIBLE, "")).filter((v) => v.length >= MIN_SECRET_LEN);
-  if (list.length > INDEXED_MIN_SECRETS) {
+  if (list.length > PER_SECRET_MAX) {
     // Many secrets (a run's secret variables, with a form per line of every multi-line value): one pass over
     // the text, not one pass per secret.
     const find = literalSpanFinder(list);
@@ -105,7 +105,7 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
 }
 
 /** The most secrets redacted one pass each; a longer list is matched in a single indexed pass. */
-const INDEXED_MIN_SECRETS = 64;
+export const PER_SECRET_MAX = 64;
 
 /** Finds the [start, end) spans of registered literals in a text. */
 export type SpanFinder = (text: string) => Array<[number, number]>;
@@ -113,10 +113,34 @@ export type SpanFinder = (text: string) => Array<[number, number]>;
 /**
  * A single-pass finder for many literals. Every literal is at least MIN_SECRET_LEN long, so the first
  * MIN_SECRET_LEN UTF-16 units of a literal key a table: at each text position the table is consulted once
- * and only the literals sharing that key are compared. Matches are leftmost, longest first, and do not
- * overlap. The cost is linear in the text for any number of literals.
+ * and only the literals sharing that key are compared. The longest literal starting at each position is
+ * reported, so spans are sorted by start and may overlap; replaceSpans merges them. The cost per position
+ * is proportional to the number of literals sharing that 8-unit key, so literals with one shared prefix
+ * share one bucket and are compared one after another.
  */
 export function literalSpanFinder(literals: readonly string[]): SpanFinder {
+  const scan = literalScanner(literals, true);
+  return (text) => {
+    const spans: Array<[number, number]> = [];
+    scan(text, (literal, at) => spans.push([at, at + literal.length]));
+    return spans;
+  };
+}
+
+/** One pass over a text that returns every one of `literals` occurring in it (not only the longest at a
+ *  position), so a literal that is a prefix of another is still reported. Same cost as literalSpanFinder. */
+export function literalsPresent(literals: readonly string[]): (text: string) => Set<string> {
+  const scan = literalScanner(literals, false);
+  return (text) => {
+    const found = new Set<string>();
+    scan(text, (literal) => found.add(literal));
+    return found;
+  };
+}
+
+function literalScanner(
+  literals: readonly string[], longestOnly: boolean,
+): (text: string, hit: (literal: string, at: number) => void) => void {
   const key = MIN_SECRET_LEN;
   const byKey = new Map<string, string[]>();
   const firstUnit = new Uint8Array(0x10000);
@@ -128,8 +152,7 @@ export function literalSpanFinder(literals: readonly string[]): SpanFinder {
     firstUnit[literal.charCodeAt(0)] = 1;
   }
   for (const bucket of byKey.values()) bucket.sort((a, b) => b.length - a.length);
-  return (text) => {
-    const spans: Array<[number, number]> = [];
+  return (text, hit) => {
     const last = text.length - key;
     for (let i = 0; i <= last; i++) {
       if (firstUnit[text.charCodeAt(i)] === 0) continue;
@@ -137,13 +160,11 @@ export function literalSpanFinder(literals: readonly string[]): SpanFinder {
       if (bucket === undefined) continue;
       for (const literal of bucket) {
         if (text.startsWith(literal, i)) {
-          spans.push([i, i + literal.length]);
-          i += literal.length - 1;
-          break;
+          hit(literal, i);
+          if (longestOnly) break;
         }
       }
     }
-    return spans;
   };
 }
 

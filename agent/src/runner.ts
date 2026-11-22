@@ -350,12 +350,13 @@ const RECEIPT_REPAIR_NEEDED_MESSAGE = "recovery source does not belong to this k
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
 
-/** `body` with its `failure_reason` scrubbed of the run's secrets and re-capped to MAX_FAILURE_REASON_LEN (the
- *  redaction marker can lengthen a short secret). The same object when the reason is absent or carries none. */
+/** `body` with its `failure_reason` scrubbed of the run's secrets, then capped to MAX_FAILURE_REASON_LEN. The
+ *  scrub sees the whole reason, so a secret that straddles the cap is masked before the cut. The same object
+ *  when the reason is absent, carries no secret and is within the cap. */
 function redactFailureReason<T extends { failure_reason?: string }>(redactText: (text: string) => string, body: T): T {
   if (typeof body.failure_reason !== "string") return body;
-  const safe = redactText(body.failure_reason);
-  return safe === body.failure_reason ? body : { ...body, failure_reason: safe.slice(0, MAX_FAILURE_REASON_LEN) };
+  const safe = redactText(body.failure_reason).slice(0, MAX_FAILURE_REASON_LEN);
+  return safe === body.failure_reason ? body : { ...body, failure_reason: safe };
 }
 /** Bound remembered unsafe markers per flight; unknown identity or overflow stays blocked. */
 const WIP_UNSAFE_MARKER_LIMIT = 64;
@@ -8723,7 +8724,8 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
-    // Every terminal report is journaled and sent from here, so the reason is scrubbed once, before it is stored.
+    // Every terminal report is journaled and sent from here: the reason is scrubbed, then capped, before it is
+    // stored, so a caller passes the uncapped reason.
     body = redactFailureReason(flight.redactText, body);
     const deps = this.terminalDeps();
     const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
@@ -8932,7 +8934,7 @@ export class RunRunner {
         TERMINAL_JOURNAL_PHASE,
         {
           status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+          failure_reason: reason,
         },
         (b, sig) => flight.reportState(b, sig),
         async () => {
@@ -9184,10 +9186,11 @@ export class RunRunner {
       err instanceof ResidueQuarantinedError
         ? archiveFailureReasonSuffix(await this.archiveQuarantinedSource(claim, flight))
         : "";
+    const safeReason = flight.redactText(reason);
     const reportedReason =
       archiveSuffix === ""
-        ? reason.slice(0, MAX_FAILURE_REASON_LEN)
-        : reason.slice(0, MAX_FAILURE_REASON_LEN - archiveSuffix.length) + archiveSuffix;
+        ? safeReason.slice(0, MAX_FAILURE_REASON_LEN)
+        : safeReason.slice(0, MAX_FAILURE_REASON_LEN - archiveSuffix.length) + archiveSuffix;
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -11514,7 +11517,7 @@ export class RunRunner {
     // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting to
     // agent_failure. NEVER attach preserved_patch (the diff carries the detected secret).
     const reportPushSecretBlocked = async (reason: string): Promise<void> => {
-      const capped = reason.slice(0, MAX_FAILURE_REASON_LEN);
+      const capped = flight.redactText(reason).slice(0, MAX_FAILURE_REASON_LEN);
       try {
         await journalTerminalReport({
           status: "failed",
@@ -12000,7 +12003,7 @@ export class RunRunner {
       if (!holdEligible) {
         try {
           await closeBatcher();
-          await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+          await journalTerminalReport({ status: "failed", failure_reason: failureReason });
         } finally {
           // Guarded inventory settlement owns its existing verified-cleanup policy. Legacy
           // refresh refusals retain the local source unless the original pinned H was archived.
@@ -12050,7 +12053,7 @@ export class RunRunner {
           return;
         }
         await closeBatcher();
-        await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        await journalTerminalReport({ status: "failed", failure_reason: failureReason });
       };
       await finalizeHold(holdReason, { publishCheckpoint: false, allowDegradedCapture: true, signal }, finish);
     };
@@ -12071,7 +12074,7 @@ export class RunRunner {
         });
         return undefined;
       }
-      const patch = redactText(capReviewDiff(rawPatch));
+      const patch = capReviewDiff(redactText(rawPatch));
       const scan = await this.git.scanPatchForSecrets(patch);
       if (scan.trusted && scan.findings.length === 0) return patch;
       runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
@@ -12100,7 +12103,7 @@ export class RunRunner {
     const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
       if (ciConfigGuardReported) return;
       ciConfigGuardReported = true;
-      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref, { untruncated: true }), "ci_config_guard");
+      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
       const reason = composeCIConfigGuardReason(paths, patch !== undefined);
       batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
       runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
@@ -12234,7 +12237,7 @@ export class RunRunner {
       await this.git.scratchPublicationPreflight(workflowBarePath, result.branch);
       workflowReported = true;
       const patch = await scanGatedPatch(
-        originalWorkflowTip ? await this.git.workflowScopeDiff(workflowBarePath, originalWorkflowTip, { untruncated: true }) : null,
+        originalWorkflowTip ? await this.git.workflowScopeDiff(workflowBarePath, originalWorkflowTip) : null,
         "workflow_scope_missing",
       );
       batcher.emit({ kind: "status", agent: "worker", payload: {
@@ -12244,7 +12247,7 @@ export class RunRunner {
       } });
       await closeBatcher();
       await journalTerminalReport({ status: "failed", fail_origin: "workflow_scope_missing",
-        failure_reason: composeWorkflowScopeReason(paths, patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
+        failure_reason: composeWorkflowScopeReason(paths.map((p) => redactText(p)), patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
         preserved_patch: patch });
     };
     const freshWorkflowFiles = async (
@@ -12727,7 +12730,7 @@ export class RunRunner {
       if (scanRangeTrusted) {
         // Reuse the same diff helper failBaseAlignConflict uses, behind the same exact-text gate.
         patch = await scanGatedPatch(
-          await this.git.workflowScopeDiff(finalizeBarePath, trackingRef, { untruncated: true }),
+          await this.git.workflowScopeDiff(finalizeBarePath, trackingRef),
           "history_rewritten",
         );
       }
@@ -12863,7 +12866,7 @@ export class RunRunner {
             // reason, byte-identical.
             const failBaseAlignConflict = async (stage: "align" | "import" = "align") => {
               const patch = await scanGatedPatch(
-                await this.git.workflowScopeDiff(alignBarePath, originalAgentTip, { untruncated: true }),
+                await this.git.workflowScopeDiff(alignBarePath, originalAgentTip),
                 "finalize_base_align_conflict",
               );
               const what = stage === "import"
@@ -12891,7 +12894,7 @@ export class RunRunner {
               // diff a human needs to land.
               await journalTerminalReport({
                 status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined, stage),
+                failure_reason: composeBaseAlignConflictReason(redactText(alignDefaultBranch), patch !== undefined, stage),
                 fail_origin: "finalize_base_align_conflict",
                 preserved_patch: patch,
               });

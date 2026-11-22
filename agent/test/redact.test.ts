@@ -98,6 +98,41 @@ describe("redaction across invisible separators", () => {
   });
 });
 
+describe("makeTextRedactor over more than 64 secrets", () => {
+  const fillers = Array.from({ length: 70 }, (_, i) => `filler-secret-${String(i).padStart(3, "0")}-dummy`);
+  const first = "aaaaaaaa-1";
+  const second = "-1bbbbbbbbbbbbbbbb";
+  const zwsp = "​";
+
+  it("redacts two distinct secrets that overlap in plain text, in full", () => {
+    const scrub = makeTextRedactor([...fillers, first, second]);
+    assert.equal(scrub("x aaaaaaaa-1bbbbbbbbbbbbbbbb y"), `x ${REDACTED} y`);
+  });
+
+  it("redacts overlapping secrets split by an invisible character exactly as the per-secret path does", () => {
+    const text = `x aaaaaaaa-${zwsp}1bbbbbbbbbbbbbbbb y`;
+    const many = makeTextRedactor([...fillers, first, second]);
+    const few = makeTextRedactor([first, second]);
+    assert.equal(many(text), few(text));
+    assert.ok(!many(text).includes("bbbbbbbb"), many(text));
+  });
+
+  it("matches a secret that starts inside another match", () => {
+    const scrub = makeTextRedactor([...fillers, "abcdefgh-ijkl", "ijkl-mnopqrstu"]);
+    assert.equal(scrub("<abcdefgh-ijkl-mnopqrstu>"), `<${REDACTED}>`);
+  });
+
+  it("redacts a large text with a bounded cost", () => {
+    const scrub = makeTextRedactor([...fillers, first]);
+    const text = `${"lorem ipsum dolor ".repeat(200000)}${first}`;
+    const started = Date.now();
+    const out = scrub(text);
+    const ms = Date.now() - started;
+    assert.ok(out.endsWith(REDACTED));
+    assert.ok(ms < 5000, `took ${ms}ms`);
+  });
+});
+
 describe("redaction across invisible separators: the shared fixture", () => {
   type Case = { name: string; rejoins_on_tty: boolean; input: string; redacted: string };
   const fixture = JSON.parse(

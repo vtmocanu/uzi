@@ -16,6 +16,8 @@ export interface SeenOps {
   /** Creates `file` exclusively, writes `data`, fsyncs the file and closes it. */
   writeSynced(file: string, data: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
+  /** Removes `file`; a missing file is not an error. */
+  remove(file: string): Promise<void>;
   syncDir(dir: string): Promise<void>;
 }
 
@@ -31,6 +33,7 @@ export const realSeenOps: SeenOps = {
     }
   },
   rename: (from, to) => fsp.rename(from, to),
+  remove: (file) => fsp.rm(file, { force: true }),
   async syncDir(dir) {
     const fh = await fsp.open(dir, "r");
     try { await fh.sync(); } finally { await fh.close(); }
@@ -52,11 +55,11 @@ export async function markRunEnvSeen(root: string, runId: string, ops: SeenOps =
   const tmp = `${final}.tmp-${process.pid}-${Date.now().toString(36)}`;
   await ops.mkdirp(root);
   await ops.syncDir(path.dirname(root));
-  await ops.writeSynced(tmp, "1\n");
   try {
+    await ops.writeSynced(tmp, "1\n");
     await ops.rename(tmp, final);
   } catch (e) {
-    await fsp.rm(tmp, { force: true }).catch(() => undefined);
+    await ops.remove(tmp).catch(() => undefined);
     throw e;
   }
   await ops.syncDir(root);

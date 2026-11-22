@@ -42,9 +42,8 @@ const claimFor = (iid: number) => gitlabClaim(iid, {
   secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: [var1] },
 });
 
-/** What the git layer returns: the whole diff, or the capped one unless the caller asks for it untruncated. */
-const diffOf = (full: string) => (async (_bare: string, _ref: string, opts?: { untruncated?: boolean }) =>
-  opts?.untruncated === true ? full : capReviewDiff(full)) as typeof git.workflowScopeDiff;
+/** What the git layer returns: the whole, uncapped diff. */
+const diffOf = (full: string) => (async () => full) as typeof git.workflowScopeDiff;
 const header = `diff --git a/${WORKFLOW} b/${WORKFLOW}\n`;
 const filler = "+".concat("y".repeat(79), "\n").repeat(8000);
 
@@ -65,6 +64,18 @@ describe("the preserved patch check sees the whole diff", () => {
     const failed = await failedReport(46201, full);
     assert.equal(failed.fail_origin, "workflow_scope_missing");
     assert.equal(failed.preserved_patch, undefined);
+  });
+
+  it("masks a registered secret that straddles the byte cap before the cap cuts it", async () => {
+    const cap = 512 * 1024;
+    const pat = "fixture-forge-pat-000000";
+    const lead = cap - 10 - header.length - 3;
+    const full = `${header}+${"y".repeat(lead)}\n+${pat}\n${filler}`;
+    assert.equal(Buffer.byteLength(full.slice(0, header.length + 1 + lead + 2 + 10)), cap, "the cap falls 10 characters into the value");
+    const failed = await failedReport(46203, full);
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.ok(failed.preserved_patch !== undefined, "the clean patch is kept");
+    assert.ok(!failed.preserved_patch.includes("fixture-fo"), "no fragment of the value survives");
   });
 
   it("keeps a clean patch, capped", async () => {

@@ -87,6 +87,7 @@ describe("the durable marker", () => {
       mkdirp: async (d) => { trace.push("mkdirp"); await realSeenOps.mkdirp(d); },
       writeSynced: async (f, data) => { trace.push(`write+fsync:${path.basename(f).includes(".tmp-") ? "tmp" : "final"}`); await realSeenOps.writeSynced(f, data); },
       rename: async (a, b) => { trace.push(`rename:${path.basename(b)}`); assert.ok(fs.existsSync(a)); assert.equal(fs.existsSync(b), false); await realSeenOps.rename(a, b); },
+      remove: realSeenOps.remove,
       syncDir: async (d) => { trace.push(`syncDir:${path.basename(d)}`); await realSeenOps.syncDir(d); },
     };
     await markRunEnvSeen(root, RUN, ops);
@@ -100,6 +101,16 @@ describe("the durable marker", () => {
       assert.equal(await runEnvSeen(root, RUN), false, failing);
       assert.deepEqual(fs.existsSync(root) ? fs.readdirSync(root) : [], [], failing);
     }
+  });
+
+  it("a write that fails after the temporary file exists removes it", async () => {
+    const ops: SeenOps = {
+      ...realSeenOps,
+      writeSynced: async (f) => { fs.writeFileSync(f, "partial"); throw new Error("fsync failed"); },
+    };
+    await assert.rejects(markRunEnvSeen(root, RUN, ops), /fsync failed/);
+    assert.deepEqual(fs.readdirSync(root), [], "no temporary file is left");
+    assert.equal(await runEnvSeen(root, RUN), false);
   });
 
   it("a read error other than a missing file is unknown, and so is an unsafe run id", async () => {

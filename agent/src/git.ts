@@ -25026,24 +25026,21 @@ try {
    * disable it explicitly. `changedFiles` sidesteps it via `--name-only`. `--no-color` keeps
    * the text plain.
    *
-   * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker, sliced on a byte
-   * boundary (a cut through a multi-byte rune yields at most one U+FFFD). It is secret-scrubbed
-   * by the CALLER (redactText) before it leaves the worker — this method does not scrub. Returns
-   * `null` on ANY failure (try/catch), so the caller can still report the failed outcome without
-   * a patch rather than turning a diff-computation error into a second failure.
+   * The result is NOT capped: the caller secret-scrubs it (redactText) and then caps it
+   * ({@link capReviewDiff}) before it leaves the worker, so a secret straddling the cap is masked first.
+   * This method does not scrub. Returns `null` on ANY failure (try/catch), so the caller can still
+   * report the failed outcome without a patch rather than turning a diff-computation error into a
+   * second failure.
    */
-  async workflowScopeDiff(
-    barePath: string, trackingRef: string, opts?: { readonly untruncated?: boolean },
-  ): Promise<string | null> {
+  async workflowScopeDiff(barePath: string, trackingRef: string): Promise<string | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const out = await this.runGit(barePath, [
+      return await this.runGit(barePath, [
         "diff",
         "--no-color",
         "--no-ext-diff",
         `${baseRef}...${trackingRef}`,
       ]);
-      return opts?.untruncated === true ? out : capReviewDiff(out);
     } catch {
       return null;
     }

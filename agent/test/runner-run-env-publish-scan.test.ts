@@ -359,6 +359,26 @@ describe("run variable scan: preserved_patch", () => {
     assert.match(clean?.preserved_patch ?? "", /workflows\/x\.yml/, "a patch without the value is still attached");
   });
 
+  it("sends the terminal failure reason with a registered secret masked (the guard composes the reason from a path name)", async () => {
+    const pat = "fixture-forge-pat-000000";
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { config: GUARD, secrets: withVars() as never });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commit(ctx.worktreePath, `.forgejo/workflows/${pat}.yml`, "name: ci\n");
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed.length > 0, "the guard refused the run");
+    for (const s of failed) {
+      assert.match(s.body.failure_reason ?? "", /CI-config guard/);
+      assert.ok(!(s.body.failure_reason ?? "").includes(pat), "the outbound reason carries no registered secret");
+      assert.ok((s.body.failure_reason ?? "").includes("***REDACTED***"), "the secret is masked in place");
+    }
+  });
+
   it("withholds a patch carrying the base64 form", async () => {
     assert.equal((await refused(withVars(), `name: ci\n# ${BASE64}\n`))?.preserved_patch, undefined);
   });

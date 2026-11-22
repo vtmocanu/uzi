@@ -6,12 +6,9 @@
 // from the final serialized line, so an accidental `log.info("...", { url })`
 // that embedded a token cannot leak it.
 
-import { literalSpanFinder, replaceSpans, type SpanFinder } from "./redact.js";
+import { literalSpanFinder, PER_SECRET_MAX, replaceSpans, type SpanFinder } from "./redact.js";
 
-/** The most registered strings scrubbed one pass each. */
-const INDEXED_REGISTRY_MIN = 64;
-
-export type LogLevel ="debug" | "info" | "warn" | "error";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
   debug: 10,
@@ -79,7 +76,7 @@ class SecretRegistry {
   scrub(line: string): string {
     // A run's secret variables register a form per line of every multi-line value: past this many strings one
     // indexed pass replaces the pass per string.
-    if (this.counts.size > INDEXED_REGISTRY_MIN) {
+    if (this.counts.size > PER_SECRET_MAX) {
       this.indexed ??= literalSpanFinder([...this.counts.keys()].flatMap((s) => {
         const escaped = JSON.stringify(s).slice(1, -1);
         return escaped === s ? [s] : [s, escaped];
