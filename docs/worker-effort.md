@@ -139,9 +139,12 @@ oversized or timed-out catalog, or no matching entry, produces no warning. The
 catalog is per-account and can refresh, so the warning is advisory and can be
 wrong either way.
 
-The [judge](./judge.md) uses the preference for its own harness. Task-review
-and internal PR-description passes retain their existing SDK/catalog effort
-behavior; their built-in Codex model remains `gpt-6-sol`.
+The [judge](./judge.md) uses the preference for its own harness. The
+handoff task review has its own per-harness effort, which follows your worker
+effort until you set one (see [Task review
+effort](./worker-model.md#task-review-effort)). Internal PR-description passes
+retain their existing SDK/catalog effort behavior; the built-in Codex review
+model remains `gpt-6-sol`.
 
 From the CLI, `uzi settings set effort --harness claude|codex
 <low|medium|high|xhigh|max|runtime>` writes the same preference and `uzi

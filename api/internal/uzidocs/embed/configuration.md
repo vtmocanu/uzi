@@ -453,7 +453,7 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Judge harness | Your **Judge runs on** choice (`claude` or `codex`); else the harness of the run being reviewed. | `user_default`, `same_as_run` |
 | Task-review model | Your lane for the harness (a stored value that is no longer valid is ignored); else the built-in (Codex `gpt-6-sol`; the Claude review sends no model, so the SDK decides). See [Task review model](./worker-model.md#task-review-model). | `user_default`, `builtin` |
 | Worker effort | Your effort preference for the harness, then the product default. | see [Reasoning effort](./worker-effort.md) |
-| Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
+| Task-review effort | Your task-review effort for the harness (`runtime` sends no level, note `not_sent`); else your worker effort for that harness; else the built-in `medium`. A corrupt stored value gives the built-in `medium`. See [Task review effort](./worker-model.md#task-review-effort). | see [Reasoning effort](./worker-effort.md), `builtin` |
 | Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
 
 For a Claude lead-lane run, a preview may show the planning-phase and implementation-phase model and effort as a pair, because the lead plans on your [planning settings](./worker-model.md#planning-model-and-effort) and implements on its own. A model or effort chosen for the run or pinned by a schedule applies to both.

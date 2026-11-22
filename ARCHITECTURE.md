@@ -205,7 +205,7 @@ a running one.
   a non-builtin row already occupies a builtin's name.
 - **Task-review settings ride review claims behind a capability (PRD #1570).** A
   task-review claim carries the owner's configured, re-validated `task_review_model`
-  only to a worker advertising `task_review_settings_v1`; absent, the worker runs its
+  and `task_review_effort` (resolved per harness; the worker effort when unset) only to a worker advertising `task_review_settings_v1`; absent, the worker runs its
   built-in. For an older worker the api withholds it and writes one
   `task_review_settings_omitted` run-feed notice per claim generation; the review still
   runs, on the built-in.

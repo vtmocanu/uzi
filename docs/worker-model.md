@@ -347,7 +347,38 @@ value clears the setting.
 - The server does not call the provider when you save. A configured model the
   provider cannot run produces the existing failed review.
 
-This release adds the model only. Neither review pass sends a reasoning effort.
+The review's reasoning effort is set separately; see [Task review
+effort](#task-review-effort).
+
+## Task review effort
+
+Each harness's review also has its own reasoning effort, next to the model under
+**Settings → Run defaults → Task review**. It accepts `low`, `medium`, `high`,
+`xhigh` or `max`, or **Runtime default** (`runtime`), which sends no level and
+lets the runtime decide.
+
+Left unset, the review follows your [worker effort](./worker-effort.md) for the
+same harness (Claude `effort`, Codex Codex effort), including a Runtime
+default. If the worker effort is unset too, the built-in `medium` is sent.
+**Behaviour change:** before this release no review effort was sent, so an owner
+who sets nothing now has reviews send their worker effort (the built-in
+`medium` when that is unset too).
+
+From the CLI, use `uzi settings set task-review-effort
+<low|medium|high|xhigh|max|runtime> --harness claude|codex` and `uzi settings
+reset task-review-effort --harness claude|codex`; reset follows your worker
+effort again, it does not pick a level. The API keys are `task_review_effort`
+(Claude) and `codex_task_review_effort` (Codex) on `PUT /api/me/model-settings`
+and `PUT /api/me/settings`.
+
+- A run's one-run effort override does not affect the review.
+- A stored value that is corrupt falls back to the built-in `medium`.
+- A worker older than this release does not read the setting. The api withholds
+  it, the run feed records a `task_review_settings_omitted` notice that names
+  "task review effort" (including an inherited `medium`), and the review runs
+  with no effort as before.
+- The effective view resolves the review effort per harness; its note is
+  `not_sent` only for Runtime default.
 
 ## Per-schedule model
 
