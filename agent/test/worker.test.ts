@@ -1047,6 +1047,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_rounds_v1",
     "cross_check_pins_v1",
     "template_effort_v1",
+    "task_review_settings_v1",
     "cross_check_codex_lead_v1",
     "cross_check_gated_v1",
     "cross_check_semantic_plan_v1",

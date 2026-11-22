@@ -720,6 +720,104 @@ describe("ReviewRunner", () => {
     assert.equal(options.effort, undefined, "the Claude review pass must send no effort");
   });
 
+  // PRD #1570 regression: an owner-configured review model rides claim.task_review_model.
+  it("a Claude review claim carrying task_review_model passes it to the query (PRD #1570)", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let options: Record<string, unknown> | undefined;
+    const queryFn = (async function* (args: { options?: Record<string, unknown> }) {
+      options = args.options;
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: goodModelJson }] } };
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+    await runner.execute(reviewClaim({ task_review_model: "claude-opus-4-1", config: { default_model: "haiku", default_effort: "high" } as never }));
+    assert.equal(calls.review?.review.status, "complete");
+    assert.equal(options?.model, "claude-opus-4-1");
+    assert.equal(options?.effort, undefined, "no effort is sent");
+  });
+
+  it("a Codex review claim carrying task_review_model passes it to the advice request (PRD #1570)", async () => {
+    const { client } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let seen: { model?: string; effort?: string } | undefined;
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async (req: { model?: string; effort?: string }) => {
+        seen = req;
+        return { text: JSON.stringify({ summary: "codex review", findings: [] }), end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    await runner.execute(reviewClaim({
+      task_review_model: "gpt-6.1-sol",
+      secrets: { forge_pat: "pat", codex: { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" } } as never,
+    }));
+    assert.equal(seen?.model, "gpt-6.1-sol");
+    assert.equal(seen?.effort, undefined);
+  });
+
+  // Compatibility (passes on base by design): legacy config defaults alone change nothing, and a
+  // blank task_review_model counts as absent.
+  for (const blank of [undefined, "", "  "]) {
+    it(`legacy config defaults only (task_review_model ${JSON.stringify(blank)}): no Claude model, gpt-6-sol on Codex, no effort`, async () => {
+      const diff = "diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n";
+      const config = { default_model: "opus", default_effort: "high" } as never;
+      {
+        const { client } = fakeClient();
+        const { git } = fakeGit(diff);
+        let options: Record<string, unknown> | undefined;
+        const queryFn = (async function* (args: { options?: Record<string, unknown> }) {
+          options = args.options;
+          yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: goodModelJson }] } };
+          yield { type: "result", subtype: "success", is_error: false };
+        }) as unknown as SdkQueryFn;
+        await new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn })
+          .execute(reviewClaim({ config, ...(blank === undefined ? {} : { task_review_model: blank }) }));
+        assert.equal(options?.model, undefined);
+        assert.equal(options?.effort, undefined);
+      }
+      {
+        const { client } = fakeClient();
+        const { git } = fakeGit(diff);
+        let seen: { model?: string; effort?: string } | undefined;
+        const fakeHarness = { kind: "codex" as const, run: async (req: { model?: string; effort?: string }) => {
+          seen = req;
+          return { text: JSON.stringify({ summary: "r", findings: [] }), end: { kind: "terminal", terminal: { outcome: "success" } } };
+        } };
+        const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+        await new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory })
+          .execute(reviewClaim({ config, ...(blank === undefined ? {} : { task_review_model: blank }),
+            secrets: { forge_pat: "pat", codex: { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" } } as never }));
+        assert.equal(seen?.model, "gpt-6-sol");
+        assert.equal(seen?.effort, undefined);
+      }
+    });
+  }
+
+  it("a provider-bound Claude review whose task_review_model the map does not resolve posts a failed review (PRD #1570)", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let queried = false;
+    const queryFn = (async function* () {
+      queried = true;
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: goodModelJson }] } };
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const key = ["Hd6y", "Nc/3", "uV+9", "&pB1", "<z5>", "eT8m"].join("");
+    const provider = {
+      provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+      auth_style: "bearer", credential: key, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+    };
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+    await runner.execute(reviewClaim({ task_review_model: "claude-opus-4-1", secrets: { forge_pat: "pat", anthropic_oauth_token: "", provider } as never }));
+    assert.equal(queried, false, "the unresolved model must fail before the query runs");
+    assert.equal(calls.review?.review.status, "failed");
+    assert.match(calls.review!.review.summary, /provider_model_unmapped/);
+    assert.equal(calls.states.at(-1)?.body.status, "completed");
+  });
+
   // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch
   // the injected Codex advice-harness factory, even when one is wired.
   it("a Claude review claim never touches the injected Codex advice-harness factory", async () => {

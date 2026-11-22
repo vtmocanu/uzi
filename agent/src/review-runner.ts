@@ -398,7 +398,7 @@ export class ReviewRunner {
   ): Promise<TaskReviewRequest> {
     try {
       const prompt = buildReviewPrompt(diff);
-      const text = await this.runModel(token, prompt, onUsage, provider);
+      const text = await this.runModel(token, prompt, onUsage, provider, configuredReviewModel(claim));
       return parseTaskReview(text);
     } catch (err) {
       this.log.warn("review model call failed; posting failed review", {
@@ -427,11 +427,11 @@ export class ReviewRunner {
       const text = await runReadOnlyModelPass({
         systemPrompt: REVIEW_SYSTEM_PROMPT,
         prompt,
-        // PRD #1551 (M2, D5): Codex task review runs on the built-in review model, NOT the
-        // claim's default_model (which assembly does not even read for a review run). It is
-        // selected here in the advice request's `model`, flows to AdviceRequest.model, and is
-        // a curated contract model the advice renderer accepts.
-        model: CODEX_TASK_REVIEW_MODEL,
+        // PRD #1551 (M2, D5) / PRD #1570: Codex task review runs on the owner-configured
+        // review model (`claim.task_review_model`) when the claim carries one, else the
+        // built-in review model; never the claim's default_model. Selected here in the
+        // advice request's `model`, which flows to AdviceRequest.model.
+        model: configuredReviewModel(claim) ?? CODEX_TASK_REVIEW_MODEL,
         homeRoot: this.homeRoot,
         homePrefix: "uzi-review-",
         label: "review",
@@ -453,9 +453,13 @@ export class ReviewRunner {
     }
   }
 
-  private async runModel(token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void, provider?: ClaimProviderBinding): Promise<string> {
+  private async runModel(
+    token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void,
+    provider?: ClaimProviderBinding, model?: string,
+  ): Promise<string> {
     return runReadOnlyModelPass({
       token,
+      ...(model ? { model } : {}),
       ...(provider ? { provider } : {}),
       systemPrompt: REVIEW_SYSTEM_PROMPT,
       prompt,
@@ -470,6 +474,13 @@ export class ReviewRunner {
     });
   }
 
+}
+
+/** PRD #1570: the owner-configured review model on the claim, or undefined when absent or
+ *  blank (the harness built-in applies). Never reads default_model / default_effort. */
+function configuredReviewModel(claim: ClaimResponse): string | undefined {
+  const m = (claim.task_review_model ?? "").trim();
+  return m === "" ? undefined : m;
 }
 
 /** Build the reviewer's user prompt: the git diff, fenced as UNTRUSTED DATA under a
