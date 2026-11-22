@@ -3,6 +3,7 @@ package forgesvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -334,5 +335,53 @@ func TestSyncActiveMRTargetsReadErrorDoesNotStarvePass(t *testing.T) {
 	}
 	if len(c.obs) != 1 || c.obs[0].RunID != good.ID {
 		t.Fatalf("cancel calls = %+v, want exactly the healthy run %s", c.obs, good.ID)
+	}
+}
+
+// A tick deadline that keeps expiring part-way through a page must not starve the rows after
+// the expiry point (cross-check finding): the cursor resumes after the last attempted row, so
+// repeated interrupted passes still inspect every target, on a single short page as well as
+// across an overflowing one.
+func TestSyncActiveMRTargetsInterruptedPassesEventuallyInspectEveryRun(t *testing.T) {
+	for _, total := range []int{10, 40} {
+		t.Run(fmt.Sprintf("%d_runs", total), func(t *testing.T) {
+			var runs []store.ListActiveMRTargetRunsRow
+			f := &summaryForge{byIID: map[int64]forge.MergeRequestSummary{}}
+			for i := 0; i < total; i++ {
+				id := uuid.UUID{}
+				id[0] = byte(i + 1)
+				iid := int64(100 + i)
+				runs = append(runs, activeRow(id, "ci_fix", iid, activeTestBranch))
+				f.byIID[iid] = goodSummary(iid, forge.MRStateMerged)
+			}
+			st := &fakeStore{activeTargetRuns: runs}
+			c := &fakeTerminalCanceller{}
+			svc := newTestService(st)
+			svc.SetTerminalTargetCanceller(c)
+			repo := uuid.New()
+
+			const readsPerPass = 3
+			seen := map[uuid.UUID]bool{}
+			for pass := 0; pass < 2*total && len(seen) < total; pass++ {
+				ctx, cancel := context.WithCancel(context.Background())
+				reads := 0
+				f.hook = func(int64) {
+					reads++
+					if reads == readsPerPass {
+						cancel() // the deadline expires during this pass's third read
+					}
+				}
+				if err := svc.SyncActiveMRTargets(ctx, repo, testProjectID, f); err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatalf("pass %d: %v", pass, err)
+				}
+				cancel()
+				for _, o := range c.obs {
+					seen[o.RunID] = true
+				}
+			}
+			if len(seen) != total {
+				t.Fatalf("interrupted passes inspected %d of %d runs; the suffix after the expiry point starved", len(seen), total)
+			}
+		})
 	}
 }

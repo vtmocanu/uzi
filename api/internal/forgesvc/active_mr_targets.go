@@ -36,23 +36,28 @@ func (s *Service) SyncActiveMRTargets(ctx context.Context, repoID uuid.UUID, for
 	if err != nil {
 		return err
 	}
-	if len(rows) > activeMRTargetPageSize {
+	overflow := len(rows) > activeMRTargetPageSize
+	if overflow {
 		rows = rows[:activeMRTargetPageSize]
-		s.setActiveTargetCursor(repoID, rows[len(rows)-1].ID)
 		slog.Info("forgesvc: active MR-target runs exceed one pass; continuing next pass",
 			"event", "active_mr_targets_overflow", "repo", repoID, "page", activeMRTargetPageSize)
-	} else {
-		s.setActiveTargetCursor(repoID, uuid.Nil)
 	}
 
+	// The cursor advances only over rows this pass actually attempted (a row counts once its
+	// MR read was issued or answered from this pass's cache), so a deadline that keeps
+	// expiring mid-page resumes after the last attempted row instead of retrying the same
+	// prefix forever. A pass that attempted nothing leaves the cursor where it was.
+	var lastAttempted uuid.UUID
+	attempted := false
 	summaries := make(map[int64]*forge.MergeRequestSummary, len(rows))
 	for _, row := range rows {
-		// The cursor already moved past this page, so a deadline hit mid-page leaves the rest of
-		// it for the next wrap-around. Accepted: the next page is always reached, and a skipped
-		// run is re-enumerated within one full rotation.
 		if ctx.Err() != nil {
+			if attempted {
+				s.setActiveTargetCursor(repoID, lastAttempted)
+			}
 			return ctx.Err()
 		}
+		lastAttempted, attempted = row.ID, true
 		sum, seen := summaries[row.TargetMrIid]
 		if !seen {
 			got, rerr := f.GetMergeRequestSummary(ctx, forgeProjectID, row.TargetMrIid)
@@ -75,6 +80,12 @@ func (s *Service) SyncActiveMRTargets(ctx context.Context, repoID uuid.UUID, for
 		if err := s.terminalTargetCanceller.CancelRunForTerminalTarget(ctx, repoID, obs); err != nil {
 			slog.Warn("forgesvc: terminal-target cancel failed, will retry", "repo", repoID, "run", row.ID, "mr", row.TargetMrIid, "state", obs.State, "error", err)
 		}
+	}
+	// A completed pass continues after the page when more rows exist, else wraps around.
+	if overflow {
+		s.setActiveTargetCursor(repoID, rows[len(rows)-1].ID)
+	} else {
+		s.setActiveTargetCursor(repoID, uuid.Nil)
 	}
 	return nil
 }

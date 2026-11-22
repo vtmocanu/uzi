@@ -556,11 +556,12 @@ func (c *sqlCapture) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.Tra
 
 func (c *sqlCapture) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
-// The enumeration must be served by an index on runs, never a sequential scan. The plan is first
-// taken with the planner's own choice over a seeded table; a tiny table can legitimately
-// seq-scan, in which case the test re-plans inside a rolled-back transaction with
-// enable_seqscan=off and asserts an index scan is POSSIBLE for the statement. The log says which
-// of the two proved it.
+// The enumeration must have a repo_id-scoped index path on runs. The planner's own choice is
+// accepted when it already uses one. A few-page test table can legitimately seq-scan, and a
+// production-sized fixture is impractical here (row triggers make bulk-loading runs take
+// minutes), so the test then re-plans with enable_seqscan=off and requires the repo_id Index
+// Cond. This proves the shipped statement can be served repo-scoped by an index. It does not
+// prove the production planner's choice on a large table, which stays a review/EXPLAIN check.
 func TestListActiveMRTargetRunsPlanUsesIndexLiveDB(t *testing.T) {
 	e := newTerminalTargetEnv(t)
 	for i := 0; i < 60; i++ {
