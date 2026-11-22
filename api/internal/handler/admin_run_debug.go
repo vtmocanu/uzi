@@ -112,13 +112,14 @@ func auditHoldsRunDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID
 }
 
 // auditRunsListDebugRead records an all-states admin run listing. ownerFilter nil
-// means all owners; since is omitted from the record when nil.
-func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, ownerFilter *uuid.UUID, since *time.Time, statuses []string, returned int) {
+// means all owners; since is omitted from the record when nil, statuses when empty.
+// The route is always adminRunDebugRouteRuns.
+func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, ownerFilter *uuid.UUID, since *time.Time, statuses []string, returned int) {
 	owner := "all"
 	if ownerFilter != nil {
 		owner = ownerFilter.String()
 	}
-	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, route), "owner_filter", owner)
+	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, adminRunDebugRouteRuns), "owner_filter", owner)
 	if since != nil {
 		attrs = append(attrs, "since", since.UTC().Format(time.RFC3339Nano))
 	}

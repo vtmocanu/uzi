@@ -285,7 +285,7 @@ func (h *Handler) adminRunDebugListRuns(w http.ResponseWriter, r *http.Request) 
 		s.ReportMd = nil
 		summaries = append(summaries, s)
 	}
-	auditRunsListDebugRead(r, actor, tokenID, adminRunDebugRouteRuns, ownerFilter, since, statuses, len(summaries))
+	auditRunsListDebugRead(r, actor, tokenID, ownerFilter, since, statuses, len(summaries))
 	httpx.JSON(w, http.StatusOK, apitypes.AdminRunsDebugDTO{Runs: summaries, Truncated: truncated, StatusFilter: statuses})
 }
 
