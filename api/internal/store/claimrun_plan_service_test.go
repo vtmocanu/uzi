@@ -204,7 +204,7 @@ func (e *cpEnv) runECell(ctx context.Context, box *secretbox.Box, runLabel strin
 				fail("warm read %s: %v", tbl, err)
 			}
 		}
-		var preHolds32 int32 // count(*)::int4: pgx refuses an out-of-range value, so no narrowing conversion
+		var preHolds32 int32 // count(*)::int4: Postgres errors on an out-of-range count, so no narrowing conversion
 		var cooldowns, liveSameUser int64
 		if err := obs.queryRow(cctx, `SELECT (SELECT count(*)::int4 FROM recovery_custody_holds WHERE state = 'open'),
 		        (SELECT count(*) FROM forge_origin_cooldowns),

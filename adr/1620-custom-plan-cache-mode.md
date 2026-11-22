@@ -296,7 +296,7 @@ profile.
 | (a) idle-empty | 2.19 / 414-433 | 2.38 / 121-124 | 0.92 / 17.8-18.1 | 1.01 / 18-21 |
 | (c) claimable | 8.44 / 474-501 | 8.77 / 200-205 | 8.67 / 492-511 | 9.09 / 212-217 |
 
-1. The isolated statement's p50 was about 0.95 ms for (a) and 7.0-7.2 ms for (c) across candidates.
+1. The isolated statement's p50 was about 0.95 ms for (a) and 6.9-7.3 ms for (c) across candidates and reps.
 2. Round trips per call, base vs C2: 7 vs 4 for (a), 8 vs 9 for (c).
 
 **T2** (base, forced modes). Segment p50 / cold + warm-ups, ms.
@@ -316,7 +316,7 @@ profile.
 
 **Mechanism** (stage S, a plan-choice-only diagnostic at 1k, 10k, 50k, 150k, 220k and 300k
 runs; 40% of the history belongs to the measured user; the template keeps pmSeed's one queued
-run, and the harness removes it in the measured clone for the idle scenario).
+run, and the harness removes it in both measured idle clones per scale).
 
 1. The generic cost grew 276, 539, 1,394, 3,525, 4,968, 6,785. That reaches the production figure of about 5,000 at about 220k runs.
 2. At every size, `auto` used 5 custom plans and switched to the generic plan on call 6. The custom-plan estimate was about the generic estimate + 11.5 at 1k runs and + 27 from 10k up.
@@ -338,7 +338,7 @@ causal effect was not established.
 | Scenario | base | C2 | Note |
 |---|---|---|---|
 | (b) queued run this worker cannot claim | 2.27 ms | 2.40 ms | `ClaimRun` still runs: the stated residual |
-| (d) backlog of 300 queued runs | 28.55 ms | 29.44 ms (+0.9 ms, +3%) | isolated statement unchanged, about 27.1 ms |
+| (d) backlog of 300 queued runs | 28.55 ms | 29.43 ms (+0.9 ms, +3%) | isolated statement unchanged, about 27.1 ms |
 | (e) row locked by another session | 6.74 ms | 6.94 ms | |
 
 All outcomes were correct: (d) claimed and (e) idle.
@@ -367,7 +367,7 @@ estimate, similar in relative terms.
 
 **Method notes and deviations.**
 
-1. Stage F (a fixture feasibility check: 13 clones) and stage S (the scale diagnostic: 6 templates, each with 2 measured clones and 2 EXPLAIN clones) ran in addition to the pre-registered 119-cell table. Together with the table they exceed the plan's 120-cell cap. That expansion was not reported to the owner beforehand; the owner was told about S's results when choosing the fix, and F produced no timing claim.
+1. Stage F (a fixture feasibility check: 13 cell clones, plus 4 profile-capture clones) and stage S (the scale diagnostic: 6 templates, each with 2 measured clones and 2 EXPLAIN clones, plus 1 capture clone per invocation) ran in addition to the pre-registered 119-cell table. Together with the table they exceed the plan's 120-cell cap. That expansion was not reported to the owner beforehand; the owner was told about S's results when choosing the fix, and F produced no timing claim.
 2. By default the harness also runs an isolated-statement pass in each M1 cell. That roughly doubles the `ClaimRun` executions above the plan's stated bound of 11,861, and it shares the cell's clone.
 3. The harness re-runs ANALYZE on `runs`, `workers` and `cross_checks` in each clone after the scenario change (`UZI_CLAIMRUN_PLAN_CLONE_ANALYZE`, on by default).
 4. Profile p1 replays lane `''`, while the real service sends `'run'`. The SQL treats them identically.
