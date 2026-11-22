@@ -26,6 +26,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		{"runtime", "ListActiveRunsAll", 1, ""},
 		{"runtime", "ListRunsAdminDebug", 1, ""},
 		{"runtime", "ListAllWorkers", 1, ""},
+		{"runtime", "HasQueuedRunForUser", 1, "idle precheck repeats ClaimRun target conjuncts (incl. NOT cross_check_lane) and admits nothing; ClaimRun stays authoritative (#4602)"},
 		{"runtime", "ClaimRun", 5, "selection and harness gates retain legacy children; load sites are separately pinned"},
 		{"runtime", "RunHasPendingOutcomeLease", 1, "pending outcome fence applies to children"},
 		{"runtime", "CancelRunServerSideWithPendingOutcome", 2, "cancellation fences retain children"},

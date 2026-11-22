@@ -3,7 +3,7 @@
 **Status**: Accepted: no default change; measurement inconclusive (issue #4591). `OpenPool` keeps pgx's defaults.
 **Date**: 2026-11-21
 **Deciders**: lead (plan), coder (measurement), reviewer, dba, fact-checker; owner (review decision to keep the current defaults).
-**Related**: [ADR-1620](1620-custom-plan-cache-mode.md) keeps `plan_cache_mode = auto` on the same pool and supplies the latency method reused here; this ADR does not change it.
+**Related**: [ADR-1620](1620-custom-plan-cache-mode.md) keeps `plan_cache_mode = auto` on the same pool and supplies the latency method reused here; this ADR does not change it. Issue #4602 later measured `ClaimRun`'s idle planning/execution split, found that `auto` switches to the generic plan after 5 custom plans, and added an idle precheck query at the claim seam; recorded in [ADR-1620](1620-custom-plan-cache-mode.md#measurement-update-4602-2026-11-22).
 **PRD**: none. The spec lived in the issue body; this ADR records the measurement and why it did not change a default.
 
 ## Decision (summary)

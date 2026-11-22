@@ -1162,6 +1162,19 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
 SELECT status, repo_id, kind, issue_iid, branch, pipeline_ref, pipeline_id
 FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 
+-- name: HasQueuedRunForUser :one
+-- Issue #4602: the cheap idle precheck claimCheckpointRun runs before ClaimRun. Each
+-- predicate is an exact top-level conjunct of ClaimRun's target CTE (user_id, the
+-- chat/cross_check_lane exclusion, status = 'queued'), so false here means ClaimRun would
+-- select no target row and write nothing at the precheck's statement snapshot. True never
+-- admits anything: ClaimRun stays the authoritative claim. Its predicates lead with
+-- idx_runs_claimable's (user_id, status) columns.
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE user_id = @user_id AND status = 'queued'
+      AND kind <> 'chat' AND NOT cross_check_lane
+)::boolean AS has_queued;
+
 -- name: ClaimRun :one
 -- The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
 -- for the worker's user, EXCLUDING chat runs (which the chat lane claims via
