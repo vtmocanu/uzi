@@ -162,7 +162,7 @@ func TestCodexPlanningCrashDeliveredFramesLiveDB(t *testing.T) {
 	assertStored := func(legs int) {
 		t.Helper()
 		run := mustRun(t, env, id)
-		if run.Harness != "codex" || !run.SessionID.Valid || run.SessionID.String != session || run.LastSeq != int32(legs*2) {
+		if run.Harness != "codex" || !run.SessionID.Valid || run.SessionID.String != session || int64(run.LastSeq) != int64(legs)*2 {
 			t.Fatal("persisted run lost Codex session or delivered-prefix high water")
 		}
 		rows, err := env.pool.Query(env.ctx, `SELECT run_id,session_id,model,lineage_epoch,lineage_index,
@@ -210,9 +210,10 @@ func TestCodexPlanningCrashDeliveredFramesLiveDB(t *testing.T) {
 			t.Fatal("delivered Codex subscription cost/status changed")
 		}
 		wantTotal := [4]int64{70, 20, 10, 40}
-		if legs == 2 {
+		switch legs {
+		case 2:
 			wantTotal = [4]int64{78, 21, 11, 45}
-		} else if legs == 3 {
+		case 3:
 			wantTotal = [4]int64{82, 23, 12, 48}
 		}
 		if [4]int64{total.InputTokens, total.CacheReadTokens, total.CacheCreationTokens, total.OutputTokens} != wantTotal {
@@ -317,9 +318,9 @@ func TestCodexPlanningCrashCommittedHoldOwnerActionsLiveDB(t *testing.T) {
 	first := mustRun(t, env, id)
 	// Bound the interval from the persisted transition timestamp, not a sleep or
 	// a timing tolerance: PostgreSQL rounds the elapsed seconds when casting to int.
-	waitSeconds := int32(first.StatusSince.Time.Sub(before.StatusSince.Time).Round(time.Second) / time.Second)
+	waitSeconds := int64(first.StatusSince.Time.Sub(before.StatusSince.Time).Round(time.Second) / time.Second)
 	if first.Harness != "codex" || first.Status != "paused" || first.SessionID.String != session ||
-		waitSeconds < 120 || first.BudgetPausedSeconds != before.BudgetPausedSeconds+waitSeconds {
+		waitSeconds < 120 || int64(first.BudgetPausedSeconds) != int64(before.BudgetPausedSeconds)+waitSeconds {
 		t.Fatal("hold did not persist Codex session and bank the exact approval wait")
 	}
 	svc = newService()
