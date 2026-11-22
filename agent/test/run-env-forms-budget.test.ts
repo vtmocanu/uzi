@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { RUN_ENV_FORM_CHARS_MAX, runEnvClaimForms } from "../src/run-env-forms.js";
+import { providerKeyForms } from "../src/redact.js";
 import type { ClaimRunEnvVar } from "../src/protocol.js";
 
 // PRD 4416: the api refuses a variable write that would push a repo's secret value bytes past
@@ -77,7 +78,7 @@ describe("the form budget shared with the api", () => {
 
   for (const [name, gen] of Object.entries(GENERATORS)) {
     for (const n of [8, 100, 4096, MAX_VALUE_BYTES]) {
-      it(`${name}: a ${n}-byte value's forms stay within ${"form_chars_per_secret_byte"} per byte`, () => {
+      it(`${name}: a ${n}-byte value's forms stay within the fixture's per-byte bound`, () => {
         const value = gen(n);
         assert.equal(bytes(value), n, "the generator produces the requested size");
         const claim = runEnvClaimForms([secretVar("ADVERSARIAL", value)], undefined);
@@ -86,6 +87,81 @@ describe("the form budget shared with the api", () => {
       });
     }
   }
+
+  // Drift guard for the derivation behind the per-byte bound (see form_budget.go): sampling values cannot
+  // notice a form type the worker gains later, so these pin the form COUNTS and per-family lengths the
+  // derivation multiplies. A new form raises a count or a length bound here and fails before the bound is wrong.
+  describe("the form counts the per-byte derivation assumes", () => {
+    const distinctForms = (c: ReturnType<typeof runEnvClaimForms>): Set<string> =>
+      new Set([...c.redaction, ...c.needles.flatMap((n) => n.forms)]);
+    // Every provider form differs from the others: "/" splits json from json-with-\/, "<" splits json from the
+    // HTML-safe forms, hex digits a-f split their two cases, a control character splits raw from json, a space adds
+    // the "+" form.
+    // The \u00ff and \u00fb pairs put the base64 characters "+" and "/" into every alignment, which ASCII text
+    // never does, so each URL-safe form differs from its standard one.
+    const WIDE = "\u00ff\u00fb".repeat(8);
+    const everyFormDistinct = (tail: string): string => `a/< \u0001${WIDE}${tail}`;
+
+    it("providerKeyForms yields at most 8 forms: raw, 4 JSON-family, 3 percent-family", () => {
+      assert.equal(providerKeyForms(everyFormDistinct("bcdefgh")).length, 8);
+      for (const [name, gen] of Object.entries(GENERATORS)) {
+        assert.ok(providerKeyForms(gen(4096)).length <= 8, name);
+      }
+    });
+
+    it("providerKeyForms forms stay within the per-family byte bounds", () => {
+      const n = 4096;
+      const inputs = [...Object.values(GENERATORS).map((gen) => gen(n)), everyFormDistinct("x".repeat(n - 5))];
+      for (const value of inputs) {
+        const b = bytes(value);
+        const lens = providerKeyForms(value).map((f) => f.length);
+        assert.ok(Math.max(...lens) <= 6 * b, "a form passes 6 units per byte");
+        assert.ok(lens.filter((l) => l > 3 * b).length <= 4, "more than 4 forms pass 3 units per byte (JSON family)");
+        assert.ok(lens.filter((l) => l > b).length <= 7, "more than 7 forms pass 1 unit per byte (JSON and percent families)");
+        assert.ok(lens.reduce((a, c) => a + c, 0) <= (1 + 4 * 6 + 3 * 3) * b, "the provider forms total more than 34 units per byte");
+      }
+    });
+
+    it("a single-line value has at most 14 distinct whole-value forms: 8 provider and 6 base64", () => {
+      let widest = 0;
+      for (let i = 0; i < 200; i++) {
+        const value = everyFormDistinct(hashed(`drift-${i}`, 100 + i));
+        const claim = runEnvClaimForms([secretVar("ONE", value)], undefined);
+        assert.equal(claim.lineForms.length, 0);
+        assert.equal(distinctForms(claim).size, claim.redaction.length, "a single-line value has no needle-only form");
+        assert.ok(claim.redaction.length <= 14, `${claim.redaction.length} distinct forms for sample ${i}`);
+        widest = Math.max(widest, claim.redaction.length);
+      }
+      assert.equal(widest, 14, "the construction reaches the analytic maximum, so the guard is live");
+    });
+
+    it("a multi-line value has at most 4 variants, 2 line forms per line and 6 diff-shaped forms", () => {
+      const lineCount = 3;
+      const lines = Array.from({ length: lineCount }, (_, i) => `${WIDE}${hashed(`line-${i}`, 40)} <"${hashed(`tail-${i}`, 20)}`);
+      const value = `${lines.join("\r\n")}\r\n`;
+      const claim = runEnvClaimForms([secretVar("MULTI", value)], undefined);
+      const lineFormCount = claim.lineForms.flatMap((n) => n.forms).length;
+      assert.equal(lineFormCount, 2 * lineCount, "raw and JSON-escaped form per line");
+      const redaction = new Set(claim.redaction);
+      const diffOnly = [...distinctForms(claim)].filter((f) => !redaction.has(f));
+      assert.equal(diffOnly.length, 6, "LF and CRLF joins for each of +, -, and space");
+      const wholeValue = redaction.size - lineFormCount;
+      assert.equal(wholeValue, 4 * 14, "4 value variants of 14 whole-value forms each");
+      assert.equal(distinctForms(claim).size, 4 * 14 + 2 * lineCount + 6);
+    });
+
+    it("every diff-shaped form stays within 3 units per byte", () => {
+      for (const n of [100, 4096]) {
+        for (const gen of [GENERATORS["alternating text and break"]!, GENERATORS["CRLF lines with trailing breaks"]!, GENERATORS["LF lines"]!, GENERATORS["lone CR and LF"]!]) {
+          const claim = runEnvClaimForms([secretVar("DIFF", gen(n))], undefined);
+          const redaction = new Set(claim.redaction);
+          const diffOnly = [...distinctForms(claim)].filter((f) => !redaction.has(f));
+          assert.ok(diffOnly.length <= 6);
+          for (const f of diffOnly) assert.ok(f.length <= 3 * n, `a ${f.length}-unit diff form for ${n} bytes`);
+        }
+      }
+    });
+  });
 
   it("a claim at the write-time budget of worst-case values is not over budget", () => {
     // Four distinct values (a prefix keeps their forms apart) totalling exactly the cap, built from the
@@ -96,7 +172,7 @@ describe("the form budget shared with the api", () => {
       const ratio = runEnvClaimForms([secretVar("PROBE", gen(4096))], undefined).formChars / 4096;
       if (ratio > worst) [costliest, worst] = [name, ratio];
     }
-    console.log(`costliest generator: ${costliest} at ${worst.toFixed(1)} units per byte (bound ${PER_BYTE})`);
+    assert.ok(worst <= PER_BYTE, `${costliest} costs ${worst.toFixed(1)} units per byte (bound ${PER_BYTE})`);
     const sizes = [MAX_VALUE_BYTES, MAX_VALUE_BYTES, MAX_VALUE_BYTES, MAX_CLAIM_SECRET_BYTES - 3 * MAX_VALUE_BYTES];
     assert.equal(sizes.reduce((a, b) => a + b, 0), MAX_CLAIM_SECRET_BYTES);
     const gen = GENERATORS[costliest]!;

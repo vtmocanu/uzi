@@ -1243,6 +1243,43 @@ func TestRunEnvFormBudgetUnheldUpdateLiveDB(t *testing.T) {
 	h.mustBudgetRefusal(h.putSized("SMALL", newSize, http.StatusConflict))
 }
 
+// A disabled secret and a pending-deletion secret are still sealed rows a claim can carry
+// (a run holding a receipt for the deleted one still masks it), so both count toward the
+// budget: with the store at the cap and a 65536-byte secret in one of those states, a new
+// 8-byte secret is refused. Excluding either state would let it in.
+func TestRunEnvFormBudgetCountsDisabledSecretLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	used := f.budgetBase()
+	f.putSized("FILLER", runenv.MaxClaimSecretBytes-used, http.StatusCreated)
+	f.mustBudgetRefusal(f.putSized("BEFORE_DISABLE", 8, http.StatusConflict))
+	f.must(f.do(http.MethodPost, "/BIG_0/disable", ""), http.StatusOK)
+	if f.rowCount("name='BIG_0' AND disabled_at IS NOT NULL AND retired_at IS NULL") != 1 {
+		t.Fatal("BIG_0 is not disabled")
+	}
+	f.mustBudgetRefusal(f.putSized("AFTER_DISABLE", 8, http.StatusConflict))
+	// A rotation that grows is refused the same way.
+	f.mustBudgetRefusal(f.putSized("SMALL", 1001, http.StatusConflict))
+	// Deleting the disabled secret (no receipt, so the row is dropped) frees its bytes.
+	f.must(f.do(http.MethodDelete, "/BIG_0", ""), http.StatusOK)
+	f.putSized("AFTER_DELETE", 8, http.StatusCreated)
+}
+
+func TestRunEnvFormBudgetCountsPendingDeletionSecretLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.withReceipts()
+	used := f.budgetBase()
+	f.putSized("FILLER", runenv.MaxClaimSecretBytes-used, http.StatusCreated)
+	f.mustBudgetRefusal(f.putSized("BEFORE_DELETE", 8, http.StatusConflict))
+	// A receipted secret's delete answers 202 and the row stays, pending deletion.
+	f.must(f.do(http.MethodDelete, "/BIG_0", ""), http.StatusAccepted)
+	if f.rowCount("name='BIG_0' AND pending_delete_at IS NOT NULL") != 1 {
+		t.Fatal("BIG_0 is not pending deletion")
+	}
+	f.mustBudgetRefusal(f.putSized("AFTER_DELETE", 8, http.StatusConflict))
+	// Re-creating the deleted name adds a new secret on top of the pending one: refused.
+	f.mustBudgetRefusal(f.putSized("BIG_0", 8, http.StatusConflict))
+}
+
 func TestRunEnvFormBudgetSecretFlagLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	used := f.budgetBase()

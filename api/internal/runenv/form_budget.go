@@ -31,8 +31,11 @@ package runenv
 // interior is at most 4N/3), so the bound needs no per-value constant. The worker's check
 // is "count > FormCharsMax", so a claim of at most MaxClaimSecretBytes secret bytes counts
 // at most FormCharsPerSecretByte*MaxClaimSecretBytes <= FormCharsMax and never fails it.
-// fixtures/run-env/form-budget.json carries the same numbers, and the agent test
-// run-env-forms-budget.test.ts proves the bound against the worker's own form builder.
+// fixtures/run-env/form-budget.json carries the same numbers. The agent test
+// run-env-forms-budget.test.ts samples adversarial values against the worker's own form
+// builder and pins the form counts and per-family lengths this derivation assumes (8
+// provider forms, 6 base64, 4 variants, 2 line forms per line, 6 diff-shaped forms), so a
+// form the worker gains fails that test; it does not prove the bound for every value.
 const (
 	FormCharsMax           = 40_000_000
 	FormCharsPerSecretByte = 193
