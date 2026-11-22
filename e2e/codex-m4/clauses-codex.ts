@@ -10,6 +10,7 @@
 //      the receipts gate (`check:codex-m4-receipts`, the LEAD merge gate) exits non-zero until the
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
+import { PROVIDER_ROOT_TITLES } from "./titles-provider.js";
 import type { ClauseRow } from "./clause.js";
 import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
@@ -45,6 +46,30 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-bound-provider-root-direct", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "CodexExecutor/default adapter/launchCodexRoot/config/auth/transport with pinned app-server HTTP",
+    positiveControl: "authenticated real Responses traffic and callback continuation reach the selected listener",
+    negativeOracle: "missing/wrong bearer, discovery and oversized fixture input never advance Responses; no vendor credential calls",
+    intendedOutcome: "immutable binding reaches launcher config and apiKey login; one root is removed after disposal; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ROOT_TITLES.direct],
+  },
+  {
+    id: "codex-p-bound-provider-root-same-origin-redirect", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "CodexExecutor/default adapter/launchCodexRoot/config/auth/transport with pinned app-server HTTP",
+    positiveControl: "HTTP 307/308 accepted same-origin receiver completes the callback continuation",
+    negativeOracle: "origin and receiver logs match exact POST method, raw body and bearer; no discovery or extra receiver traffic",
+    intendedOutcome: "pinned runtime forwards bearer and body on accepted same-origin redirects; characterization is not confinement; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ROOT_TITLES.same307, PROVIDER_ROOT_TITLES.same308],
+  },
+  {
+    id: "codex-p-bound-provider-root-cross-port-redirect", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "CodexExecutor/default adapter/launchCodexRoot/config/auth/transport with pinned app-server HTTP",
+    positiveControl: "authenticated origin receives POST and redirects the real pinned runtime across ports",
+    negativeOracle: "receiver sees identical POST body without bearer, rejects 401 and produces no Responses frames; exactly one origin and receiver request",
+    intendedOutcome: "pinned runtime strips cross-port bearer but forwards body; executor rejects and disposes its root; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ROOT_TITLES.cross307, PROVIDER_ROOT_TITLES.cross308],
+  },
   {
     id: "codex-p-phase-model-switch", adapter: "codex", layer: "P", family: "Persisted context and usage replay",
     seam: "pinned app-server with production config/auth/transport and two process roles",
