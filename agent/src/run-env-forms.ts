@@ -42,33 +42,42 @@ function wholeValueForms(value: string): string[] {
 
 const LINE_BREAK = /\r\n|\r|\n/;
 const PEM_ARMOR = /^-----(BEGIN|END) [^-]+-----$/;
-/** Lines whose text is shared by every value of their kind: a legacy PEM header and the constant members of a
- *  Google service-account JSON file. */
-const PUBLIC_LINES: readonly RegExp[] = [
-  /^\s*Proc-Type: \d+,[A-Z-]+\s*$/,
-  /^\s*"(type|auth_uri|token_uri|auth_provider_x509_cert_url|universe_domain)"\s*:\s*"[^"]*"\s*,?\s*$/,
-];
-/** A line with no letter or digit: separators and rules such as a run of `=`. */
-const NO_ALPHANUMERIC = /^[^\p{L}\p{N}]*$/u;
-
-function distinctNonSpace(line: string): number {
-  const seen = new Set<string>();
-  for (const ch of line) if (!/\s/u.test(ch)) seen.add(ch);
-  return seen.size;
-}
+/** A leading `key:` or `key=` (optionally after a YAML `- `, with the key optionally quoted). An `=` that
+ *  only pads the end of the line (base64 padding) and a `:` that starts `//` (a URL scheme) are not a key. */
+const LEADING_KEY = /^\s*(?:-\s+)?["']?[A-Za-z0-9_.-]+["']?\s*(?::|=(?!=*\s*$))(?!\/\/)\s*/;
+/** A URL's `scheme://` and host[:port]; an optional `userinfo@` between them is captured. */
+const URL_SCHEME_HOST = /[A-Za-z][A-Za-z0-9+.-]*:\/\/((?:[^\s/@]*@)?)[A-Za-z0-9.-]+(?::\d+)?/g;
+/** A maximal run of token characters; `/` and every other character separate tokens. */
+const TOKEN = /[A-Za-z0-9+=_-]+/g;
+const MIN_DISTINCT_CHARS = 5;
 
 function isMultiLine(value: string): boolean {
   return value.includes("\r") || value.includes("\n");
 }
 
-/** The lines of a multi-line value that may be registered alone: at least {@link MIN_SECRET_LEN} long, holding a
- *  letter or digit and at least two distinct non-space characters (so not whitespace, a punctuation rule or one
- *  repeated character), and neither PEM armor nor a public line. */
+/** Whether a token is long enough, varied enough, and mixes upper- and lower-case letters or a letter with
+ *  at least two digits. */
+function isSecretToken(token: string): boolean {
+  if (token.length < MIN_SECRET_LEN || new Set(token).size < MIN_DISTINCT_CHARS) return false;
+  const upper = /[A-Z]/.test(token);
+  const lower = /[a-z]/.test(token);
+  const digits = (token.match(/[0-9]/g) ?? []).length;
+  return (upper && lower) || ((upper || lower) && digits >= 2);
+}
+
+/** The part of a line that may hold a secret: the line without its leading key, and without each URL's
+ *  scheme and host (a URL's userinfo, path, query and fragment stay). */
+function valuePart(line: string): string {
+  return line.replace(LEADING_KEY, "").replace(URL_SCHEME_HOST, " $1");
+}
+
+/** The lines of a multi-line value that may be registered alone: at least {@link MIN_SECRET_LEN} long, not PEM
+ *  armor, and holding a token that {@link isSecretToken} accepts in its value part. */
 function lineForms(value: string): string[] {
   const out: string[] = [];
   for (const line of value.split(LINE_BREAK)) {
-    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line) || PUBLIC_LINES.some((re) => re.test(line))) continue;
-    if (NO_ALPHANUMERIC.test(line) || distinctNonSpace(line) < 2) continue;
+    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line)) continue;
+    if (!(valuePart(line).match(TOKEN) ?? []).some(isSecretToken)) continue;
     out.push(line, JSON.stringify(line).slice(1, -1));
   }
   return out;

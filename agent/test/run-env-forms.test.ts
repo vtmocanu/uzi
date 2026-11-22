@@ -87,14 +87,14 @@ describe("which lines of a multi-line value are registered alone", () => {
   const redactOf = (value: string) => makeTextRedactor(runEnvClaimForms([secretVar("BACKUP_CODES", value)], []).redaction);
   const FILLER = ["Qm9kdXMtZml4dHVyZS1hLQ", "c2Vjb25kLWZpeHR1cmUtYg"] as [string, string];
 
-  for (const code of ["11223344", "90090090"]) {
+  for (const code of ["a1b2c3d4", "x9y8z7w6"]) {
     it(`the line ${code} is masked on its own`, () => {
       const redact = redactOf([FILLER[0], code, FILLER[1]].join("\n"));
       assert.ok(!redact(`log: ${code} end`).includes(code));
     });
   }
 
-  for (const [label, line] of [["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a whitespace run", "        "]] as const) {
+  for (const [label, line] of [["a digits-only line", "11223344"], ["a one-digit mixed token", "abcdefg1"], ["a punctuation rule", "========"], ["one repeated character", "AAAAAAAA"], ["a whitespace run", "        "]] as const) {
     it(`${label} is not registered alone`, () => {
       const redact = redactOf([FILLER[0], line, FILLER[1]].join("\n"));
       assert.equal(redact(`text ${line} end`), `text ${line} end`);
@@ -290,41 +290,90 @@ describe("the largest claim redacts in bounded time", () => {
   });
 });
 
-// A multi-line value's public lines (constant JSON members, a legacy PEM header, blank padding) are never
-// registered alone, and a high-entropy line of the same value still is. Armor is joined at runtime.
-describe("public lines of a multi-line value stay readable in redacted output", () => {
-  const ENTROPY = bodyLines("one");
-  const PUBLIC = {
-    jsonType: '  "type": "service_account",',
-    authUri: '"auth_uri": "https://accounts.example.test/o/oauth2/auth",',
-    procType: "Proc-Type: 4,ENCRYPTED",
-    padding: " ".repeat(8),
-    flat: "aaaaaaaaaaaaaaaa",
-  };
-  const value = [
-    "{", PUBLIC.jsonType, PUBLIC.authUri, PUBLIC.procType, PUBLIC.padding, PUBLIC.flat,
-    `"client_email": "${ENTROPY[0]}",`, ENTROPY[1]!, ENTROPY[2]!, "}",
-  ].join("\n");
-  const claim = runEnvClaimForms([secretVar("SVC_JSON", value)], []);
+// A line of a multi-line value is registered alone only when its value part (after a leading key, and without a
+// URL's scheme and host) holds a token that is long, varied and mixes letter case or letters with digits. Armor
+// is joined at runtime; every secret-looking value is derived from a hash or joined from parts.
+const hex = (seed: string, n = 40): string => crypto.createHash("sha256").update(seed).digest("hex").slice(0, n);
+const b64 = (seed: string, n = 40): string => crypto.createHash("sha256").update(seed).digest("base64").replace(/[+/=]/g, "Q").slice(0, n);
+
+/** Builds a claim from `lines`, then checks each public line is left alone and each secret line is masked, in
+ *  redacted text and in the per-name line forms. */
+function assertLineClasses(lines: string[], publicLines: string[], secretLines: string[]): void {
+  const claim = runEnvClaimForms([secretVar("SVC_FILE", lines.join("\n"))], []);
   const redact = makeTextRedactor(claim.redaction);
-
-  for (const [label, line] of Object.entries(PUBLIC)) {
-    it(`${label} is not masked`, () => {
-      const text = `before\n${line}\nafter`;
-      assert.equal(redact(text), text);
-    });
+  const forms = claim.lineForms.find((n) => n.name === "SVC_FILE")?.forms ?? [];
+  for (const line of publicLines) {
+    const text = `before\n${line}\nafter`;
+    assert.equal(redact(text), text, `public: ${line}`);
+    assert.ok(!forms.includes(line), `not a line form: ${line}`);
   }
+  for (const line of secretLines) {
+    const text = `before\n${line}\nafter`;
+    assert.notEqual(redact(text), text, `secret: ${line}`);
+    assert.ok(forms.includes(line), `a line form: ${line}`);
+  }
+}
 
-  it("a high-entropy line of the same value is masked, raw and JSON-escaped", () => {
-    for (const line of [ENTROPY[1]!, ENTROPY[2]!, JSON.stringify(ENTROPY[1]).slice(1, -1)]) {
-      assert.ok(!redact(`x ${line} y`).includes(line.slice(0, 30)), "masked");
-    }
+describe("lines of a multi-line value are registered only when they hold a secret-like token", () => {
+  const ENTROPY = bodyLines("one");
+
+  it("blank padding, a flat run, a legacy PEM header and punctuation rules are not registered; entropy lines are", () => {
+    const value = ["{", " ".repeat(8), "aaaaaaaaaaaaaaaa", "Proc-Type: 4,ENCRYPTED", "========", `"client_email": "${ENTROPY[0]}",`, ENTROPY[1]!, ENTROPY[2]!, "}"];
+    assertLineClasses(value, [value[1]!, value[2]!, value[3]!, value[4]!], [value[5]!, ENTROPY[1]!, ENTROPY[2]!]);
+    const claim = runEnvClaimForms([secretVar("SVC_FILE", value.join("\n"))], []);
+    const forms = claim.lineForms[0]!.forms;
+    assert.ok(forms.includes(JSON.stringify(ENTROPY[1]).slice(1, -1)), "the JSON-escaped form is kept");
+    assert.ok(!makeTextRedactor(claim.redaction)(`x ${JSON.stringify(ENTROPY[1]).slice(1, -1)} y`).includes(ENTROPY[1]!.slice(0, 30)));
   });
 
-  it("the per-name line forms hold the entropy lines and no public line", () => {
-    const forms = claim.lineForms.find((n) => n.name === "SVC_JSON")!.forms;
-    assert.ok(forms.includes(ENTROPY[1]!));
-    for (const line of Object.values(PUBLIC)) assert.ok(!forms.includes(line), line);
+  it("a kubeconfig keeps its structure readable and masks its data lines", () => {
+    const secrets = [`    certificate-authority-data: ${b64("ca", 60)}`, `    client-key-data: ${b64("key", 60)}`, `    token: ${b64("tok", 32)}`];
+    assertLineClasses(
+      ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443", ...secrets],
+      ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443"],
+      secrets,
+    );
+  });
+
+  it("an AWS credentials file keeps its section and region readable and masks its keys", () => {
+    const secrets = [`aws_access_key_id = ${["AK", "IA", "7Q2M", "X9D4", "K1LZ", "8P3R"].join("")}`, `aws_secret_access_key = ${b64("aws-secret")}`, `aws_session_token = ${b64("aws-session", 64)}`];
+    assertLineClasses(["[default]", "region = us-east-1", ...secrets], ["[default]", "region = us-east-1"], secrets);
+  });
+
+  it("a docker config keeps its braces and registry readable and masks the auth, even letters-only", () => {
+    const lettersOnly = Buffer.from("user:pass").toString("base64");
+    assert.ok(/^[A-Za-z]+$/.test(lettersOnly) && /[a-z]/.test(lettersOnly) && /[A-Z]/.test(lettersOnly), "fixture is letters only, mixed case");
+    const secrets = [`"auth": "${Buffer.from(`user:${b64("docker-pass", 24)}`).toString("base64")}"`, `"auth": "${lettersOnly}"`];
+    assertLineClasses(["{", '"auths": {', '"registry.example.com": {', ...secrets, "}", "}", "}"],
+      ["{", '"auths": {', '"registry.example.com": {'], secrets);
+  });
+
+  it("a Google service account keeps its constant members readable and masks its key id and key body", () => {
+    const body = bodyLines("gsa");
+    const secrets = [`"private_key_id": "${hex("gsa-id")}",`, ...body];
+    assertLineClasses(
+      ["{", '"type": "service_account",', '"auth_uri": "https://accounts.google.com/o/oauth2/auth",', '"token_uri": "https://oauth2.googleapis.com/token",',
+        '"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",', '"universe_domain": "googleapis.com"', ...secrets, "}"],
+      ['"type": "service_account",', '"auth_uri": "https://accounts.google.com/o/oauth2/auth",', '"token_uri": "https://oauth2.googleapis.com/token",',
+        '"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",', '"universe_domain": "googleapis.com"'],
+      secrets,
+    );
+  });
+
+  it("a secret in a value that looks like a public member is still masked", () => {
+    const tok = b64("odd", 32);
+    const secrets = [`"token_uri": "${tok}",`, `"type": "${tok}",`, `"token_uri": "https://oauth2.googleapis.com/${tok}"`, `url = https://oauth2:${tok}@git.example.com`];
+    assertLineClasses(["{", ...secrets, "}"], [], secrets);
+  });
+
+  it("a padded last base64 line without + or / is masked", () => {
+    const last = `${b64("pad", 41)}==`;
+    assert.ok(!/[+/]/.test(last) && last.endsWith("=="));
+    assertLineClasses([BEGIN, ...bodyLines("pad"), last, END], [BEGIN, END], [last]);
+  });
+
+  it("PEM armor lines are never registered", () => {
+    assertLineClasses([BEGIN, ENTROPY[0]!, END], [BEGIN, END], [ENTROPY[0]!]);
   });
 
   it("a claim with no multi-line value has no line forms", () => {

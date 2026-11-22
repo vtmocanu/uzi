@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,7 @@ import type { Logger } from "../src/log.js";
 import { capReviewDiff } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
 import { patchScanVerdict } from "../src/run-env-scan.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import type { GitHubClient } from "../src/forge.js";
 import type { ClaimRunEnvVar } from "../src/protocol.js";
 import { api, client, fakeGitHub, fx, git, gitlabClaim, installHarness } from "./runner-harness.js";
@@ -134,6 +136,25 @@ function realDiff(files: Array<{ name: string; body?: string; rename?: string }>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+
+// A patch whose added lines are only the structural lines of a multi-line secret file is not withheld; one that
+// adds a line holding a secret-like token is. The key line is derived from a hash.
+describe("the preserved patch and the structural lines of a secret file", () => {
+  const keyLine = `    client-key-data: ${crypto.createHash("sha256").update("patch-key").digest("base64").replace(/[+/=]/g, "Q")}`;
+  const lines = ["apiVersion: v1", "kind: Config", "current-context: example", "clusters:", "- name: example", "    server: https://kubernetes.example.com:6443", keyLine];
+  const claim = runEnvClaimForms([{ ...var1, name: "KUBECONFIG_FILE", value: lines.join("\n") }], []);
+  const added = (...body: string[]): string => hunkPatch(`@@ -0,0 +1,${body.length} @@`, ...body.map((l) => `+${l}`));
+
+  it("is not withheld when it adds only the structural lines", () => {
+    const verdict = patchScanVerdict(added(...lines.slice(0, 6)), claim.needles, claim.lineForms);
+    assert.deepEqual(verdict, { withhold: false });
+  });
+
+  it("is withheld as line_form when it adds the key line", () => {
+    const verdict = patchScanVerdict(added(lines[0]!, keyLine), claim.needles, claim.lineForms);
+    assert.deepEqual(verdict, { withhold: true, reason: "line_form", variables: ["KUBECONFIG_FILE"] });
+  });
+});
 
 describe("the preserved patch decodes quoted header paths", () => {
   const cases: Array<[string, string]> = [

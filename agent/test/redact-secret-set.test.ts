@@ -65,7 +65,8 @@ describe("SecretSet", () => {
 
 describe("SecretSet over a run's secret variable forms", () => {
   const ENTROPY = Array.from({ length: 80 }, (_, i) => createHash("sha256").update(`entropy-${i}`).digest("base64"));
-  const value = ["{", '  "type": "service_account",', "Proc-Type: 4,ENCRYPTED", " ".repeat(8), ...ENTROPY, "}"].join("\n");
+  const PUBLIC_LINES = ["apiVersion: v1", "kind: Config", "current-context: example", "    server: https://kubernetes.example.com:6443", "clusters:", "- name: example", " ".repeat(8)];
+  const value = [...PUBLIC_LINES, ...ENTROPY, "}"].join("\n");
   const claim = runEnvClaimForms([
     { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "SVC_JSON", value, secret: true, description: "" },
   ], []);
@@ -76,7 +77,7 @@ describe("SecretSet over a run's secret variable forms", () => {
 
   it("leaves public lines and padding unmasked and masks an entropy line, in text and payloads", () => {
     const set = new SecretSet(claim.redaction);
-    for (const line of ['  "type": "service_account",', "Proc-Type: 4,ENCRYPTED", " ".repeat(8)]) {
+    for (const line of PUBLIC_LINES) {
       assert.equal(set.text(`a\n${line}\nb`), `a\n${line}\nb`);
       assert.deepEqual(set.payload({ k: line }), { k: line });
     }
