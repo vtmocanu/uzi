@@ -308,6 +308,36 @@
     "max": 1,
     "remaining": 1
   },
+  "weekly_limit": {
+    "credential_label": "x",
+    "credential_key": "x",
+    "harness": "x",
+    "pct": 1.5,
+    "effective_limit": 1.5,
+    "resets_at": "2020-01-02T03:04:05Z",
+    "tier": "x",
+    "reason": "x",
+    "alternative_label": "x",
+    "future_runs": [
+      {
+        "kind": "x",
+        "target_id": "x",
+        "target_label": "x",
+        "command": "x",
+        "command_unavailable": "x"
+      }
+    ],
+    "fix": [
+      {
+        "kind": "x",
+        "target_id": "x",
+        "target_label": "x",
+        "command": "x",
+        "command_unavailable": "x"
+      }
+    ],
+    "wait": "x"
+  },
   "id": "x",
   "repo_id": "x",
   "repo_path": "x",

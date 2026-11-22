@@ -54,6 +54,11 @@
           "x"
         ]
       },
+      "weekly_limit": {
+        "tier": "x",
+        "credential_key": "x",
+        "credential_label": "x"
+      },
       "id": "x",
       "repo_id": "x",
       "forge_type": "x",

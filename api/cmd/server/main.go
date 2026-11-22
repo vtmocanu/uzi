@@ -58,6 +58,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
 	"github.com/vtmocanu/uzi/api/internal/usagepoller"
 	"github.com/vtmocanu/uzi/api/internal/vault"
+	"github.com/vtmocanu/uzi/api/internal/weeklylimit"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -701,6 +702,8 @@ func run() error {
 	// failure is logged redacted and never affects the run. Unconfigured users are
 	// dropped silently, so this is a strict no-op until linking is set up.
 	const notificationUserCap = notifysvc.DefaultUserCap
+	// PRD #4123: one read-only weekly-limit block source for the run DTO and Slack park lines.
+	weeklyLimits := weeklylimit.NewLoader(wsvc)
 	slackNotifier := slacksvc.NewNotifier(
 		q,
 		slackPoster,
@@ -714,6 +717,9 @@ func run() error {
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
 		slacksvc.WithRunWallCeiling(cfg.RunWallCeiling),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
+		// PRD #4123: the seven_day / weekly-reserve park lines append the next-claim switch
+		// reason and the fix command, computed by the same weeklylimit function the run DTO uses.
+		slacksvc.WithWeeklyLimit(weeklyLimits.ForRunID),
 	)
 	// Notifications write seam (PRD #46 M2): the one place that creates notification
 	// rows. It persists the row first, then delivers best-effort through slackNotifier
@@ -1080,6 +1086,7 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	h.SetWeeklyLimit(weeklyLimits)
 	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
 	// the reconnect rule run in transactions on the pool. An empty allowlist
 	// (ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.

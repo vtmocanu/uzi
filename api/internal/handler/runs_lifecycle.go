@@ -578,6 +578,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
 	dto.HarnessDecision = harnessDecisionForViewer(run, user)
+	dto.WeeklyLimit = h.weeklyLimitForViewer(r.Context(), user, []store.Run{run})[run.ID]
 	h.overlayCreatedIssues(r.Context(), run, &dto)
 	dto.CapabilityProvenance = workersvc.CapabilityProvenanceForRun(run)
 	if user.ID == run.UserID {

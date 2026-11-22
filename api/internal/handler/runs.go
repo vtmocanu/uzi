@@ -149,6 +149,12 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item)
 	}
 	h.overlayListDecorations(r, out)
+	// Owner-only: the rows are this user's own (ListRunsForUser), and overlayWeeklyLimit re-checks it.
+	runRows := make([]store.Run, 0, len(rows))
+	for _, row := range rows {
+		runRows = append(runRows, row.Run)
+	}
+	h.overlayWeeklyLimit(r, user, runRows, out)
 	writeRunList(w, r, out)
 }
 
