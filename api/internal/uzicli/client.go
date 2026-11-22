@@ -292,12 +292,14 @@ type Client interface {
 	// (GET /api/admin/runs?view=summary, issue #2661), polled by the admin TUI board.
 	AdminListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error)
 	// AdminListRunsDebug is the admin run debug listing (issue #4198): GET
-	// /api/admin/runs?state=all[&user=<uuid>][&since=<RFC3339>], summary rows of every
-	// status, newest first, with Truncated set when the server's row cap cut the list. The
+	// /api/admin/runs?state=all[&user=<uuid>][&since=<RFC3339>][&status=a,b], summary rows
+	// (of every status, or only the requested statuses), newest first, with Truncated set
+	// when the server's row cap cut the list. A server that ignored the status filter is
+	// refused (CheckAdminRunsDebugStatusFilter). The
 	// server needs UZI_ADMIN_RUN_DEBUG plus an admin_ro (uza_) token, else 403 -> ExitAuth.
 	// An older server ignores the query and answers with its active-runs listing, which
 	// is refused here with a clear error rather than shown as if it were everything.
-	AdminListRunsDebug(ctx context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error)
+	AdminListRunsDebug(ctx context.Context, userID, since string, statuses []string) (apitypes.AdminRunsDebugDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
 	// AdminHealth reads the admin health document (PRD #1484 M3): GET
 	// /api/admin/health, in the admin READ group (RequireUser + RequireAdminRO), so a

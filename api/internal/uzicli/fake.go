@@ -846,10 +846,11 @@ type RecoveryHoldsScopedCall struct {
 	RunID  string
 }
 
-// AdminListRunsDebugCall is one AdminListRunsDebug filter pair.
+// AdminListRunsDebugCall is one AdminListRunsDebug filter set.
 type AdminListRunsDebugCall struct {
-	UserID string
-	Since  string
+	UserID   string
+	Since    string
+	Statuses []string
 }
 
 // FindingIssueDraft records the evidence id and returns its canned draft, or a not-found exit
