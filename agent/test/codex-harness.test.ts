@@ -6858,3 +6858,86 @@ describe("CodexHarness: preparation deadline", () => {
     } finally { await harness.close(); }
   });
 });
+
+describe("CodexHarness: initial provider response deadline", () => {
+  it("does not bound later long turns on the same root", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { harness, transport } = makeHarness({ authMode: "provider" });
+    const controller = new AbortController();
+    try {
+      transport.push(turnCompleted());
+      await collect(harness.startTurn(makeRequest()).events);
+      let settled = false;
+      const pending = collect(harness.startTurn(makeRequest({ signal: controller.signal })).events)
+        .finally(() => { settled = true; });
+      try {
+        await tick();
+        t.mock.timers.tick(60_000);
+        await tick();
+        assert.equal(settled, false);
+        transport.push(turnCompleted());
+        await pending;
+      } finally { controller.abort(); await pending; }
+    } finally { await harness.close(); }
+  });
+  for (const control of ["native", "cancel", "response", "callback", "terminal", "completed-output"] as const) {
+    it(`preserves ${control} authority beyond the initial wait`, async t => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const { harness, transport } = makeHarness({ authMode: control === "native" ? "api_key" : "provider" });
+      const controller = new AbortController();
+      let failure: unknown;
+      let settled = false;
+      const pending = collect(harness.startTurn(makeRequest({ signal: controller.signal })).events)
+        .catch(error => { failure = error; }).finally(() => { settled = true; });
+      try {
+        await tick();
+        if (control === "cancel") controller.abort();
+        if (control === "response") transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "th-1", turnId: "tn-1", delta: "hello" } });
+        if (control === "callback") transport.push({ kind: "activity", method: "item/tool/call", requestId: 91,
+          params: { threadId: "th-1", turnId: "tn-1", tool: "Read", arguments: {} } });
+        if (control === "completed-output") transport.push({ kind: "activity", method: "item/completed",
+          params: { threadId: "th-1", item: { type: "agentMessage", text: "hello" } } });
+        if (control === "terminal") transport.push(turnCompleted());
+        await tick();
+        t.mock.timers.tick(10_001);
+        await tick();
+        assert.equal(failure, undefined);
+        assert.equal(settled, control === "cancel" || control === "terminal");
+        if (!settled) { transport.push(turnCompleted()); await pending; }
+      } finally { controller.abort(); await pending; await harness.close(); }
+    });
+  }
+  for (const entry of ["fresh", "resume", "prepared"] as const) {
+    it(`times out pending response after ACK (entry=${entry})`, async t => {
+      const resume = entry === "resume";
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const transport = new FakeTransport();
+      const { harness } = makeHarness({ transport, authMode: "provider" });
+      const controller = new AbortController();
+      let failure: unknown;
+      let settled = false;
+      const request = makeRequest({ signal: controller.signal, resumeSessionId: resume ? "saved" : undefined });
+      if (entry === "prepared") await harness.prepareRootAndThread(request, { allowFresh: true });
+      const pending = collect(harness.startTurn(request).events)
+        .catch(error => { failure = error; }).finally(() => { settled = true; });
+      try {
+        await tick();
+        assert.ok(transport.requests.some(r => r.method === "turn/start"));
+        transport.push({ kind: "turn_started", method: "turn/started",
+          threadId: resume ? "resumed-1" : "th-1", turnId: "tn-1", params: {} });
+        transport.push({ kind: "activity", method: "log", params: { threadId: "th-1", message: "connecting" } });
+        transport.push({ kind: "codex_error", method: "error", threadId: resume ? "resumed-1" : "th-1",
+          turnId: "tn-1", willRetry: true, params: {} });
+        transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "foreign", turnId: "tn-1", delta: "other response" } });
+        await tick();
+        t.mock.timers.tick(10_001);
+        await tick();
+        assert.equal(settled, true, "ACK, logs, retry and foreign output must not disable response deadline");
+        assert.ok(failure instanceof CodexTransportError);
+        assert.equal(failure.failure.category, "timeout");
+      } finally { controller.abort(); await pending; await harness.close(); }
+    });
+  }
+});

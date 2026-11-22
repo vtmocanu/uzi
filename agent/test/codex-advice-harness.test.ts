@@ -16,7 +16,7 @@ import {
 } from "../src/codex/codex-advice-harness.js";
 import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../src/harness.js";
-import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import type { Logger } from "../src/log.js";
 import { runReadOnlyModelPass } from "../src/model-pass.js";
@@ -281,7 +281,7 @@ function makeHarness(
     dispose?: () => Promise<void>;
     disposeThrows?: boolean;
     log?: Logger;
-    authMode?: "subscription" | "api_key";
+    authMode?: "subscription" | "api_key" | "provider";
     now?: () => Date;
   } = {},
 ): Bits {
@@ -313,6 +313,46 @@ function makeHarness(
   });
   return { harness, transport, launchSpecs, disposeCalls: () => disposeCalls };
 }
+
+describe("CodexAdviceHarness: initial provider response deadline", () => {
+  for (const control of ["timeout", "native", "cancel", "response", "terminal"] as const) {
+    it(`handles ${control} after ACK`, async t => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const bits = makeHarness({ authMode: control === "native" ? "api_key" : "provider" });
+      const controller = new AbortController();
+      let failure: unknown;
+      let settled = false;
+      const pending = bits.harness.run(makeAdviceRequest({ signal: controller.signal, timeoutMs: 60_000 }), noThrowPolicy)
+        .catch(error => { failure = error; }).finally(() => { settled = true; });
+      const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+      try {
+        await flush();
+        assert.ok(bits.transport.requests.some(r => r.method === "turn/start"));
+        if (control === "cancel") controller.abort();
+        if (control === "response") bits.transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "th-1", turnId: "tn-1", delta: "hello" } });
+        if (control === "terminal") bits.transport.push(turnCompleted());
+        await flush();
+        t.mock.timers.tick(10_001);
+        await flush();
+        if (control === "timeout") {
+          assert.equal(settled, true);
+          assert.ok(failure instanceof CodexTransportError);
+          assert.equal(failure.failure.category, "timeout");
+          assert.equal(bits.transport.closes > 0, true);
+          assert.equal(bits.disposeCalls(), 1);
+        } else if (control !== "cancel") {
+          assert.equal(failure, undefined);
+          assert.equal(settled, control === "terminal");
+          if (!settled) { bits.transport.push(turnCompleted()); await pending; }
+        } else {
+          assert.equal(settled, true);
+          assert.ok(!(failure instanceof CodexTransportError));
+        }
+      } finally { controller.abort(); await pending; }
+    });
+  }
+});
 
 // --- tests --------------------------------------------------------------------------
 

@@ -123,7 +123,7 @@ import {
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import { codexConnectionBudget, type CodexAuthSuspensionLease, type CodexAppServerAuthMode, type CodexAppServerAuthSession } from "./appserver-auth.js";
+import { codexInitialResponseWait, codexConnectionBudget, type CodexAuthSuspensionLease, type CodexAppServerAuthMode, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -1393,6 +1393,7 @@ export class CodexHarness implements RunHarness {
       if (note.kind === "activity" && note.requestId !== undefined)
         this.safeRespond(transport, note.requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
     };
+    let responseWait: ReturnType<typeof codexInitialResponseWait> | undefined;
     const refuseDeferred = (): void => {
       const transport = this.transport;
       if (transport) for (const entry of deferred) refuse(transport, entry.note);
@@ -1427,6 +1428,9 @@ export class CodexHarness implements RunHarness {
         throw new CodexHarnessError({ category: "protocol", message: "codex prepared thread is unavailable" });
       this.activeTurnId = await this.startTurnRpc(transport, threadId, rendered, request.signal, request.rootDispatch,
         () => { if (this.resumedRoot) attemptedResumedRoot = threadId; });
+      responseWait = codexInitialResponseWait(this.connectionBudget, threadId, this.activeTurnId);
+      // Setup and initial response share one allowance, consumed once per owned root.
+      this.connectionBudget = undefined;
       // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
       // that was cancelled or refused before dispatch.
       if (this.runtimeConfigPending) {
@@ -1486,6 +1490,7 @@ export class CodexHarness implements RunHarness {
           yield* this.drainOutbox();
           return;
         }
+        responseWait.assertOpen();
         // A retained read can fail while the consumer is suspended at a yield.
         // Keep normal readiness/drain ordering, but never admit a queued callback
         // once EOF or failure is already known.
@@ -1509,7 +1514,10 @@ export class CodexHarness implements RunHarness {
           this.pendingNote = source;
           const state: ReadState = { source, promise: Promise.resolve() };
           state.promise = source.then(
-            step => { state.step = step; state.ready = ++this.readinessOrdinal; },
+            step => {
+              if (!step.done) responseWait?.observe(step.value);
+              state.step = step; state.ready = ++this.readinessOrdinal;
+            },
             error => { state.error = error; state.failed = true; state.ready = ++this.readinessOrdinal; },
           );
           read = state;
@@ -1577,7 +1585,7 @@ export class CodexHarness implements RunHarness {
         }
         if (readReady === Infinity) {
           await Promise.race([
-            abortPromise, this.outboxReady(),
+            abortPromise, this.outboxReady(), responseWait.ready,
             ...(read ? [read.promise] : []),
             ...(mapping ? [mapping.promise] : []),
             ...(observation ? [observation.promise] : []),
@@ -1675,6 +1683,7 @@ export class CodexHarness implements RunHarness {
         yield this.emitted(await this.mapNote(transport, step.value, request.signal));
       }
     } finally {
+      responseWait?.clear();
       refuseDeferred();
       // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
       // A later epoch must not baseline that work away as history of this same claim.
@@ -1940,7 +1949,6 @@ export class CodexHarness implements RunHarness {
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex turn/start returned no turn id" });
     }
-    this.connectionBudget = undefined;
     this.admissionAttempt?.bind(id);
     return id;
   }

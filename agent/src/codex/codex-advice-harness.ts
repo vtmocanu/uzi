@@ -70,7 +70,7 @@ import type {
   HarnessThrownFailure,
 } from "../harness.js";
 import type { CodexProviderConfig } from "./codex-harness.js";
-import { codexConnectionBudget, type CodexAppServerAuthSession } from "./appserver-auth.js";
+import { codexInitialResponseWait, codexConnectionBudget, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexAdvice } from "./render.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -453,6 +453,7 @@ export class CodexAdviceHarness implements AdviceHarness {
 
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
+    const responseWait = codexInitialResponseWait(connectionBudget, threadId, turnId);
     let text = "";
     // Running byte sum of the accumulated advice text, so the total is bounded against an
     // unbounded/looping stream (see MAX_ADVICE_TEXT_BYTES). Kept O(n) total: each appended
@@ -477,13 +478,19 @@ export class CodexAdviceHarness implements AdviceHarness {
 
     try {
       for (;;) {
-        const step = await Promise.race([notes.next(), aborted]);
-        if (step === "aborted") {
+        // One outstanding read; expiry never starts a second reader or closes custody.
+        const step = await Promise.race([notes.next().then(step => {
+          if (!step.done) responseWait.observe(step.value);
+          return step;
+        }), aborted, responseWait.ready.then(() => "deadline" as const)]);
+        if (signal.aborted || step === "aborted") {
           // Owner/timeout abort wins. End the stream WITHOUT a terminal and WITHOUT
           // returning partial text: the race's rejection is the primary failure and this
           // throw is swallowed by awaitSettled.
           throw new CodexAdviceError({ category: "aborted", message: `codex advice ${rendered.label} aborted` });
         }
+        responseWait.assertOpen();
+        if (step === "deadline") throw new CodexAdviceError({ category: "protocol", message: "unexpected response deadline wake" });
         if (step.done) {
           // Clean EOF with no terminal is Codex's own unexpected-EOF → a protocol throw
           // (a transport failure is thrown, not returned; mirrors CodexHarness rule 9).
@@ -564,6 +571,7 @@ export class CodexAdviceHarness implements AdviceHarness {
         }
       }
     } finally {
+      responseWait.clear();
       if (onAbort) signal.removeEventListener("abort", onAbort);
       // The outer run owner closes auth admission, transport, and owned auth tasks in
       // cycle-free order after this work settles. Policy still runs before that closure.

@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   CODEX_REFRESH_BRIDGE_BUDGET_MS,
   codexConnectionBudget,
+  codexInitialResponseWait,
   CodexAppServerAuthError,
   createCodexAppServerAuth,
   type CodexSubscriptionRefreshBridge,
@@ -20,6 +21,13 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 }
+
+it("expired initial response budget throws synchronously with a typed timeout", () => {
+  assert.throws(() => codexInitialResponseWait(() => {
+    throw new CodexTransportError({ category: "timeout", message: "expired setup budget" });
+  }, "thread-1", "turn-1"), error =>
+    error instanceof CodexTransportError && error.failure.category === "timeout");
+});
 
 it("expired provider setup budget refuses before any RPC or credential send", async (t) => {
   let now = 1_000;

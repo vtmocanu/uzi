@@ -20,7 +20,7 @@ import { RunResidueBlockedError, assertResidueQuarantineOpen } from "../residue-
 /** Outer bridge budget: above WorkerClient's 8s cap, below app-server's hard 10s cap. */
 export const CODEX_REFRESH_BRIDGE_BUDGET_MS = 9_000;
 
-/** Internal per-root setup allowance; no provider configuration can extend it.
+/** Internal per-root setup and initial-response allowance; no provider configuration can extend it.
  * The transport owns timer cleanup. Abort signals retain any earlier run bound. */
 export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined): (() => number) | undefined {
   if (mode !== "provider") return undefined;
@@ -31,6 +31,66 @@ export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined):
       throw new CodexTransportError({ category: "timeout", message: "codex provider setup deadline exceeded" });
     }
     return Math.ceil(remaining);
+  };
+}
+
+/**
+ * Initial response only, sharing the per-root setup budget through the first model
+ * response. Later turns (and HTTP reconnects inside them) are not bounded here.
+ * The timer only wakes the consumer: transport/root cleanup remains with its owner.
+ */
+export function codexInitialResponseWait(budget: (() => number) | undefined, threadId: string, turnId: string) {
+  // Expiry must throw to the caller, not create a rejected wake promise that
+  // could sit unobserved while the consumer yields or prepares its next read.
+  const remaining = budget?.();
+  let expired = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const ready = new Promise<void>(resolve => {
+    if (remaining !== undefined) timer = setTimeout(() => { expired = true; resolve(); }, remaining);
+  });
+  const clear = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  return {
+    ready,
+    clear,
+    assertOpen(): void {
+      if (expired) throw new CodexTransportError({
+        category: "timeout", message: "codex provider initial response deadline exceeded",
+      });
+    },
+    observe(note: CodexNotification): void {
+      if (expired || timer === undefined) return;
+      if (note.kind === "turn_completed") {
+        if (note.threadId === threadId && note.turnId === turnId) clear();
+        return;
+      }
+      if (note.kind !== "activity") return;
+      const p = note.params as Record<string, unknown> | null;
+      if (!p || p.threadId !== threadId || (p.turnId !== undefined && p.turnId !== turnId)) return;
+      // Lifecycle, logs, auth refresh and retry errors do not prove a model response.
+      if (note.method === "item/tool/call" && note.requestId !== undefined && p.turnId === turnId && typeof p.tool === "string") {
+        clear();
+        return;
+      }
+      if ((note.method === "item/agentMessage/delta" ||
+          note.method === "item/reasoning/textDelta" ||
+          note.method === "item/reasoning/summaryTextDelta") &&
+          typeof p.delta === "string" && p.delta.length > 0) {
+        clear();
+        return;
+      }
+      const item = p.item as Record<string, unknown> | null;
+      if (!item) return;
+      if (note.method === "item/started" &&
+          ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(String(item.type))) clear();
+      if (note.method === "item/completed" &&
+          ["agentMessage", "assistantMessage", "agent_message", "reasoning"].includes(String(item.type)) &&
+          (typeof item.text === "string" && item.text.length > 0 ||
+           Array.isArray(item.content) && item.content.some(part =>
+             part && typeof part.text === "string" && part.text.length > 0))) clear();
+    },
   };
 }
 
