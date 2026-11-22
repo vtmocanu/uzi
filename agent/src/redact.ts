@@ -55,6 +55,56 @@ export function providerKeyForms(key: string): string[] {
 
 export type TextRedactor = (s: string) => string;
 
+/** Charged units one redacted string may spend (PRD 4416, owner decision B3). A unit is one consulted text
+ *  position or one UTF-16 unit a literal comparison may touch: a deterministic upper bound of the native work, so
+ *  the guard bounds the periodic worst case (a long literal against long periodic output) whatever the host's
+ *  speed. A wall deadline cannot interrupt synchronous matching, hence a counter. */
+export const REDACTION_WORK_BUDGET = 2 ** 26;
+
+/** What a redactor returns for a WHOLE input whose matching exceeded the budget: never the raw text and never a
+ *  partly redacted one. */
+export const REDACTION_WITHHELD = "[withheld: redaction work budget exceeded]";
+
+/** The charged work of one redaction. The overflowing charge is included, so a finished count never exceeds
+ *  REDACTION_WORK_BUDGET plus the longest single literal. */
+export interface RedactionWork {
+  charged: number;
+}
+
+/** Thrown inside the matcher when a redaction passes its budget; every top-level entry point catches it. */
+class RedactionBudgetExceeded extends Error {
+  constructor() {
+    super("redaction work budget exceeded");
+  }
+}
+
+function charge(work: RedactionWork, units: number): void {
+  work.charged += units;
+  if (work.charged > REDACTION_WORK_BUDGET) throw new RedactionBudgetExceeded();
+}
+
+let workObserver: ((work: RedactionWork) => void) | undefined;
+
+/** Test hook: called with the charged work of every budgeted redaction once it finishes (also on overflow).
+ *  Pass undefined to stop observing. */
+export function observeRedactionWork(observer: ((work: RedactionWork) => void) | undefined): void {
+  workObserver = observer;
+}
+
+/** Runs `fn` with a fresh work counter; undefined when the budget was exceeded (fail closed: the caller
+ *  withholds). `fn` must not itself return undefined. */
+export function runWithinBudget<T>(fn: (work: RedactionWork) => T): T | undefined {
+  const work: RedactionWork = { charged: 0 };
+  try {
+    return fn(work);
+  } catch (err) {
+    if (err instanceof RedactionBudgetExceeded) return undefined;
+    throw err;
+  } finally {
+    workObserver?.(work);
+  }
+}
+
 /** The api bounds a non_closing reason to 1..500 code points. */
 const NON_CLOSING_REASON_MAX = 500;
 
@@ -90,26 +140,26 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
   if (list.length > PER_SECRET_MAX) {
     const find = literalSpanFinder(list);
     const findVisible = !stripped ? find : visible.length > 0 ? literalSpanFinder(visible) : undefined;
-    return (s) => {
-      let out = replaceSpans(s, find(s));
-      if (findVisible && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisible);
+    return (s) => runWithinBudget((work) => {
+      let out = replaceSpans(s, find(s, work));
+      if (findVisible && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisible, work);
       return out;
-    };
+    }) ?? REDACTION_WITHHELD;
   }
   const findEach = spansOfEach(list);
   const findVisibleEach = !stripped ? findEach : spansOfEach(visible);
-  return (s) => {
-    let out = replaceSpans(s, findEach(s));
-    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisibleEach);
+  return (s) => runWithinBudget((work) => {
+    let out = replaceSpans(s, findEach(s, work));
+    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisibleEach, work);
     return out;
-  };
+  }) ?? REDACTION_WITHHELD;
 }
 
 /** The most secrets redacted one pass each; a longer list is matched in a single indexed pass. */
 export const PER_SECRET_MAX = 64;
 
 /** Finds the [start, end) spans of registered literals in a text. */
-export type SpanFinder = (text: string) => Array<[number, number]>;
+export type SpanFinder = (text: string, work: RedactionWork) => Array<[number, number]>;
 
 /** A node of a bucket's compressed radix trie: the literal ending here (if any) and the edges below, keyed by the
  *  first UTF-16 unit of each edge's label. */
@@ -227,24 +277,25 @@ export class LiteralIndex {
   }
 
   /** The [start, end) span of the longest literal at each position where one occurs: sorted by start, and
-   *  possibly overlapping (replaceSpans merges them). */
-  find(text: string): Array<[number, number]> {
+   *  possibly overlapping (replaceSpans merges them). Throws once `work` passes the budget. */
+  find(text: string, work: RedactionWork = { charged: 0 }): Array<[number, number]> {
     const spans: Array<[number, number]> = [];
-    this.scan(text, true, (literal, at) => spans.push([at, at + literal.length]));
+    this.scan(text, work, true, (literal, at) => spans.push([at, at + literal.length]));
     return spans;
   }
 
-  /** Every literal occurring in the text, not only the longest at a position. */
-  present(text: string): Set<string> {
+  /** Every literal occurring in the text, not only the longest at a position. Throws once `work` passes the budget. */
+  present(text: string, work: RedactionWork = { charged: 0 }): Set<string> {
     const found = new Set<string>();
-    this.scan(text, false, (literal) => found.add(literal));
+    this.scan(text, work, false, (literal) => found.add(literal));
     return found;
   }
 
-  private scan(text: string, longestOnly: boolean, hit: (literal: string, at: number) => void): void {
+  private scan(text: string, work: RedactionWork, longestOnly: boolean, hit: (literal: string, at: number) => void): void {
     const last = text.length - MIN_SECRET_LEN;
     for (let i = 0; i <= last; i++) {
       if (this.firstUnit[text.charCodeAt(i)] === 0) continue;
+      charge(work, 1);
       const start = this.buckets.get(text.slice(i, i + MIN_SECRET_LEN));
       if (start === undefined) continue;
       let node: TrieNode = start;
@@ -253,7 +304,10 @@ export class LiteralIndex {
       let j = i + MIN_SECRET_LEN;
       while (node.children !== undefined) {
         const edge = node.children.get(text.charCodeAt(j));
-        if (edge === undefined || !text.startsWith(edge.label, j)) break;
+        if (edge === undefined) break;
+        // The comparison may touch every unit of the label: charge it before it runs.
+        charge(work, edge.label.length);
+        if (!text.startsWith(edge.label, j)) break;
         j += edge.label.length;
         node = edge.node;
         if (node.terminal !== undefined) {
@@ -275,14 +329,16 @@ function indexOf(literals: Iterable<string>): LiteralIndex {
 /** A single-pass finder for many literals: the longest literal at each position (see {@link LiteralIndex}). */
 function literalSpanFinder(literals: readonly string[]): SpanFinder {
   const index = indexOf(new Set(literals));
-  return (text) => index.find(text);
+  return (text, work) => index.find(text, work);
 }
 
 /** One pass over a text that returns every one of `literals` occurring in it (not only the longest at a
- *  position), so a literal that is a prefix of another is still reported. */
+ *  position), so a literal that is a prefix of another is still reported. Over the work budget it fails closed
+ *  and reports EVERY literal as present, so each scan verdict built on it withholds. */
 export function literalsPresent(literals: readonly string[]): (text: string) => Set<string> {
-  const index = indexOf(new Set(literals));
-  return (text) => index.present(text);
+  const all = new Set(literals);
+  const index = indexOf(all);
+  return (text) => runWithinBudget((work) => index.present(text, work)) ?? new Set(all);
 }
 
 /** `text` with every span (sorted by start, possibly overlapping) replaced by the redaction marker. */
@@ -297,13 +353,23 @@ export function replaceSpans(text: string, spans: Array<[number, number]>): stri
   return out + text.slice(cursor);
 }
 
-/** The finder that looks for each secret by `indexOf`: cheap for a short list. */
-function spansOfEach(secrets: readonly string[]): SpanFinder {
-  return (text) => {
+/** The finder that looks for each secret (at least MIN_SECRET_LEN long): `indexOf` of its first MIN_SECRET_LEN units
+ *  finds a candidate, and the full comparison is charged, so a long secret against periodic text cannot spend more
+ *  than the budget. Matches are non-overlapping per secret; a hit resumes after it, a miss one unit later. */
+export function spansOfEach(secrets: readonly string[]): SpanFinder {
+  return (text, work) => {
     const spans: Array<[number, number]> = [];
     for (const secret of secrets) {
-      for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + secret.length)) {
-        spans.push([at, at + secret.length]);
+      const prefix = secret.slice(0, MIN_SECRET_LEN);
+      let at = text.indexOf(prefix);
+      while (at !== -1) {
+        charge(work, 1 + secret.length);
+        if (text.startsWith(secret, at)) {
+          spans.push([at, at + secret.length]);
+          at = text.indexOf(prefix, at + secret.length);
+        } else {
+          at = text.indexOf(prefix, at + 1);
+        }
       }
     }
     return spans.sort((a, b) => a[0] - b[0]);
@@ -316,7 +382,7 @@ function spansOfEach(secrets: readonly string[]): SpanFinder {
  * matched there, and every matched span is replaced in the ORIGINAL, invisible separators
  * included, so nothing of the secret survives to be re-joined.
  */
-function redactAcrossInvisible(text: string, find: SpanFinder): string {
+function redactAcrossInvisible(text: string, find: SpanFinder, work: RedactionWork): string {
   const chunks: string[] = [];
   const origin = new Int32Array(text.length); // visible UTF-16 unit i came from text[origin[i]]
   let n = 0;
@@ -332,7 +398,7 @@ function redactAcrossInvisible(text: string, find: SpanFinder): string {
   keep(last, text.length);
   const visible = chunks.join("");
 
-  const spans = find(visible).map(([from, to]): [number, number] => [origin[from]!, origin[to - 1]! + 1]);
+  const spans = find(visible, work).map(([from, to]): [number, number] => [origin[from]!, origin[to - 1]! + 1]);
   spans.sort((a, b) => a[0] - b[0]);
   return replaceSpans(text, spans);
 }
@@ -452,21 +518,25 @@ export class SecretSet {
   }
 
   private redactText(s: string): string {
+    if (this.list.length === 0) return s;
+    return runWithinBudget((work) => this.redactWithin(s, work)) ?? REDACTION_WITHHELD;
+  }
+
+  private redactWithin(s: string, work: RedactionWork): string {
     const list = this.list;
-    if (list.length === 0) return s;
     const indexed = list.length > PER_SECRET_MAX;
     const plain = indexed ? (this.plain ??= indexOf(list)) : undefined;
-    const find: SpanFinder = plain ? (t) => plain.find(t) : spansOfEach(list);
-    let out = replaceSpans(s, find(s));
+    const find: SpanFinder = plain ? (t, w) => plain.find(t, w) : spansOfEach(list);
+    let out = replaceSpans(s, find(s, work));
     if (!INVISIBLE_TEST.test(out)) return out;
     const visible = this.visible;
-    if (visible === undefined) return redactAcrossInvisible(out, find);
+    if (visible === undefined) return redactAcrossInvisible(out, find, work);
     if (visible.list.length === 0) return out;
     if (indexed) {
       const index = (visible.index ??= indexOf(visible.list));
-      out = redactAcrossInvisible(out, (t) => index.find(t));
+      out = redactAcrossInvisible(out, (t, w) => index.find(t, w), work);
     } else {
-      out = redactAcrossInvisible(out, spansOfEach(visible.list));
+      out = redactAcrossInvisible(out, spansOfEach(visible.list), work);
     }
     return out;
   }

@@ -491,6 +491,12 @@ describe("every line of 8+ characters of a multi-line value is registered, excep
     assertLineClasses([...lines, ENTROPY[0]!], [], [...lines, ENTROPY[0]!]);
   });
 
+  it("a payload-bearing label (a secret carried in the label itself) is a normal line form", () => {
+    // The old broad rule (`-----(BEGIN|END) [^-]+-----`) exempted these.
+    const lines = [marker("BEGIN", b64("label-payload", 40)), marker("END", `PRIVATE KEY ${b64("label-tail", 24)}`)];
+    assertLineClasses([...lines, ENTROPY[0]!], [], [...lines, ENTROPY[0]!]);
+  });
+
   it("a marker with a leading space, trailing content or a trailing space is a normal line form", () => {
     const lines = [` ${BEGIN}`, `${BEGIN}abc`, `${BEGIN} x`, `${END} `, `\t${END}`, `${BEGIN} `];
     assertLineClasses([...lines, ENTROPY[0]!], [], [...lines, ENTROPY[0]!]);

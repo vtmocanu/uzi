@@ -251,7 +251,7 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
+import { providerKeyForms, REDACTION_WITHHELD, redactNonClosingReason, SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
@@ -4378,7 +4378,11 @@ export class RunRunner {
   ): Promise<TerminalLaneResult> {
     const hooks = this.terminalPreservationTestOverride;
     const failureFirst = (): string | undefined => {
-      const mapped = typeof body.failure_reason === "string" ? failOriginForReason(body.failure_reason) : undefined;
+      // The reason may arrive already redacted (a withheld marker after a redaction work overflow), so a typed
+      // origin the caller classified from the RAW reason wins; the reason text is the fallback.
+      const mapped = body.fail_origin === "push_secret_blocked" || body.fail_origin === "worker_residue_blocked"
+        ? body.fail_origin
+        : typeof body.failure_reason === "string" ? failOriginForReason(body.failure_reason) : undefined;
       if (mapped === "push_secret_blocked" || mapped === "worker_residue_blocked") return mapped;
       // Defensive: the only writer of flight.secretBlocked is the terminal lane itself (a secret finding latches it); active
       // remediation is refused by the lane's own policy().blocked gate, which also runs before any universe read.
@@ -12110,7 +12114,13 @@ export class RunRunner {
         });
         return undefined;
       }
-      const patch = capReviewDiff(redactText(rawPatch));
+      const redactedPatch = redactText(rawPatch);
+      if (redactedPatch === REDACTION_WITHHELD) {
+        // The redactor passed its work budget and withheld the whole text: there is no patch to ship.
+        runLog.warn("preserved patch withheld: redaction work budget exceeded", { run_id: runId, site });
+        return undefined;
+      }
+      const patch = capReviewDiff(redactedPatch);
       const scan = await this.git.scanPatchForSecrets(patch);
       if (scan.trusted && scan.findings.length === 0) return patch;
       runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {

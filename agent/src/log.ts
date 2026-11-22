@@ -6,7 +6,7 @@
 // from the final serialized line, so an accidental `log.info("...", { url })`
 // that embedded a token cannot leak it.
 
-import { LiteralIndex, PER_SECRET_MAX, replaceSpans } from "./redact.js";
+import { LiteralIndex, PER_SECRET_MAX, REDACTION_WITHHELD, replaceSpans, runWithinBudget, spansOfEach } from "./redact.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -38,7 +38,8 @@ export interface Logger {
   child(fields: Record<string, unknown>): Logger;
 }
 
-const REDACTED = "***REDACTED***";
+/** The msg of the fixed line written in place of a record whose redaction passed the work budget. */
+const LOG_WITHHELD_MSG = "log record withheld: redaction work budget exceeded";
 
 /** Secrets are shared by reference across child loggers so a secret registered
  *  from a claim is scrubbed everywhere, not just on the logger that saw it.
@@ -82,23 +83,23 @@ class SecretRegistry {
     if (escaped !== secret) apply(escaped);
   }
 
-  scrub(line: string): string {
-    if (this.counts.size > PER_SECRET_MAX) {
-      if (this.index === undefined) {
-        const index = new LiteralIndex();
-        for (const s of this.counts.keys()) this.indexForms(s, (form) => index.add(form));
-        this.index = index;
+  /** `line` with every registered secret (and its JSON-escaped form) masked; undefined when the matching passed the
+   *  redaction work budget, so the caller must withhold the whole line rather than emit it. */
+  scrub(line: string): string | undefined {
+    return runWithinBudget((work) => {
+      if (this.counts.size > PER_SECRET_MAX) {
+        if (this.index === undefined) {
+          const index = new LiteralIndex();
+          for (const s of this.counts.keys()) this.indexForms(s, (form) => index.add(form));
+          this.index = index;
+        }
+        return replaceSpans(line, this.index.find(line, work));
       }
-      return replaceSpans(line, this.index.find(line));
-    }
-    let out = line;
-    for (const s of this.counts.keys()) {
-      out = out.split(s).join(REDACTED);
       // A JSON-serialized line carries a secret containing `"` or `\` in its escaped form.
-      const escaped = JSON.stringify(s).slice(1, -1);
-      if (escaped !== s) out = out.split(escaped).join(REDACTED);
-    }
-    return out;
+      const forms = new Set<string>();
+      for (const s of this.counts.keys()) this.indexForms(s, (form) => forms.add(form));
+      return replaceSpans(line, spansOfEach([...forms])(line, work));
+    });
   }
 }
 
@@ -118,7 +119,9 @@ class ConsoleLogger implements Logger {
       ...this.base,
       ...fields,
     };
-    const line = this.registry.scrub(JSON.stringify(record));
+    // Over the redaction work budget the whole record is withheld: a fixed, valid JSON line with no base or fields.
+    const line = this.registry.scrub(JSON.stringify(record)) ??
+      JSON.stringify({ ts: record.ts, level, msg: LOG_WITHHELD_MSG });
     // stderr for warn/error, stdout otherwise — keeps machine-readable logs
     // greppable and lets a supervisor split streams.
     if (level === "warn" || level === "error") process.stderr.write(line + "\n");
@@ -132,7 +135,7 @@ class ConsoleLogger implements Logger {
 
   addSecret(secret: string): void { this.registry.add(secret); }
   removeSecret(secret: string): void { this.registry.remove(secret); }
-  redactDiagnostic(text: string): string { return this.registry.scrub(text); }
+  redactDiagnostic(text: string): string { return this.registry.scrub(text) ?? REDACTION_WITHHELD; }
 
   child(fields: Record<string, unknown>): Logger {
     return new ConsoleLogger(this.minLevel, this.registry, { ...this.base, ...fields });
