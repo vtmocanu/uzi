@@ -313,6 +313,10 @@ func (e *cpEnv) runECell(ctx context.Context, box *secretbox.Box, runLabel strin
 			if cerr != nil {
 				fail("call %d: Claim returned error: %v", idx+1, cerr)
 			}
+			if c.Scen == "b" && ce != 1 {
+				// A queued-but-ineligible poll must reach ClaimRun on both builds (#4602).
+				fail("call %d: scenario (b) ran ClaimRun %d times, want 1", idx+1, ce)
+			}
 			outcome := "idle"
 			if payload != nil {
 				outcome = "claimed"
