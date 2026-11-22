@@ -103,6 +103,7 @@ describe("SecretRegistry indexed path (past 64 registered strings)", () => {
   it("keeps a secret registered twice until it is removed twice", () => {
     const log = createLogger("info");
     fill(log, 70, "a");
+    capture(() => log.info("warm", {}));
     const S = "twice-registered-secret-00";
     log.addSecret(S);
     log.addSecret(S);

@@ -95,6 +95,7 @@ describe("SecretSet over a run's secret variable forms", () => {
 
   it("an invisible separator inside a form added late is still matched on the indexed path", () => {
     const set = new SecretSet(claim.redaction);
+    set.text("warm the index");
     const late = "split-by-invisible-0123456789";
     set.add(late);
     assert.equal(set.text(`x ${late.slice(0, 8)}​${late.slice(8)} y`), `x ${REDACTED} y`);

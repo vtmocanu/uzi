@@ -1011,6 +1011,8 @@ class RunEnvBlockedError extends SecretRemediationPendingError {
   }
 }
 
+/** The live-set marker of a run whose claim forms passed the budget: no needle set exists, so no-flight lanes withhold. */
+const FORMS_OVER_BUDGET = "forms_over_budget" as const;
 /** The run's scan needles, `[]` when the claim carried no secret variable (or a hand-built test flight). */
 const needlesOf = (flight: Pick<RunFlight, "scanNeedles">): readonly ScanNeedle[] => flight.scanNeedles ?? [];
 
@@ -3192,6 +3194,8 @@ interface RunFlight {
   scanNeedles?: readonly ScanNeedle[];
   /** The registered line forms of this run's multi-line secret variables, per variable name. */
   scanLineForms?: readonly ScanNeedle[];
+  /** The claim's forms passed the budget: no needle set is complete, so every scanned publish withholds. */
+  scanOverBudget?: boolean;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -3960,7 +3964,7 @@ export class RunRunner {
    *  the claim's first gatePlan; cleared with gatedRuns. */
   private readonly gateResumes = new Map<string, GateResume>();
   /** PRD 4416 M2: per live run, the exact-value scan needles of the claim in flight (memory only). */
-  private readonly liveScanNeedles = new Map<string, readonly ScanNeedle[]>();
+  private readonly liveScanNeedles = new Map<string, readonly ScanNeedle[] | typeof FORMS_OVER_BUDGET>();
   /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
    *  catch fetch the committed work back before the container dies. Registered before
    *  retained discovery so shutdown can interrupt pre-clone work too; deregistered
@@ -6454,7 +6458,8 @@ export class RunRunner {
     flight.policyReservation = reservation;
     // PRD 4416 M2: a live flight's claim set is the authority for lanes that publish with no flight in hand
     // (the recovery coordinator's held, terminal and bundle lanes); removed with the run's other secrets.
-    this.liveScanNeedles.set(runId, flight.scanNeedles!);
+    // An over-budget claim has no complete needle set: lanes with no flight withhold rather than read an empty one.
+    this.liveScanNeedles.set(runId, runEnvForms.overBudget ? FORMS_OVER_BUDGET : flight.scanNeedles!);
     if (admission) {
       flight.policyAdmission = true;
       flight.policyHold = { outcomeId: admission.outcome_id, body: admission };
@@ -7536,6 +7541,8 @@ export class RunRunner {
       // The variables' forms passed the budget: no complete form set exists, so the run fails before the clone,
       // the executor or any output.
       if (runEnvForms.overBudget) {
+        // A pending policy outcome is settled first: dispatchFailure sends no report while the admission holds.
+        if (flight.policyAdmission && !await this.reconcilePolicyAdmission(claim, flight)) return;
         throw new Error(`${RUN_ENV_FORMS_OVER_BUDGET}: the run's secret variables exceed ${RUN_ENV_FORM_CHARS_MAX} characters of registered forms`);
       }
       this.bindWorkerMemory(claim, flight);
@@ -7826,7 +7833,8 @@ export class RunRunner {
       // will not resume". The park is the first path that reaches here and DOES
       // resume, so both sentences are corrected above rather than left to mislead.)
       for (const s of runScopedSecrets) this.log.removeSecret(s);
-      if (this.liveScanNeedles.get(runId) === flight.scanNeedles) this.liveScanNeedles.delete(runId);
+      const live = this.liveScanNeedles.get(runId);
+      if (live === flight.scanNeedles || (live === FORMS_OVER_BUDGET && flight.scanOverBudget)) this.liveScanNeedles.delete(runId);
       // ── The park / shutdown carve-out (PRD #35 Decision 6a; PRD #556 M1) ──────
       // EXACTLY two filesystem removals below are skipped for a parked run, and
       // nothing else in this finally is. The two are what a resume needs: the
@@ -14042,7 +14050,7 @@ export class RunRunner {
     runHome: string | undefined,
     gitBasic: string,
     runScopedSecrets: string[],
-    runEnvForms: RunEnvClaimForms = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact),
+    runEnvForms: RunEnvClaimForms,
   ): RunFlight {
     const runLog = this.log.child({
       run_id: runId,
@@ -14583,6 +14591,7 @@ export class RunRunner {
         : {}),
       providerKeyForms: claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [],
       scanNeedles: runEnvForms.needles,
+      scanOverBudget: runEnvForms.overBudget,
       scanLineForms: runEnvForms.lineForms,
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
@@ -20519,7 +20528,7 @@ export class RunRunner {
     claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
   ): Promise<{ pack: Buffer } | { reason: string }> {
     const negative = await this.bootstrapRemediationRestrictions(flight, flight.barePath, record.branch, signal);
-    if (negative.kind === "unavailable" || flight.remediationRestrictions)
+    if (negative.kind === "unavailable" || flight.remediationRestrictions || flight.scanOverBudget)
       return { reason: "secret_remediation_pending" };
     return prepareFrozenHeld({
       git: this.git, barePath: flight.barePath!, branch: record.branch, sourceSha: record.sourceSha,
@@ -23271,6 +23280,10 @@ export class RunRunner {
     flight: RunFlight, barePath: string, tip: string, excludes: readonly string[], what: string,
     excludeRemoteTracking = false,
   ): Promise<RunEnvScanVerdict> {
+    if (flight.scanOverBudget) {
+      flight.runLog.warn("run variable scan withheld an upload", { run_id: flight.runId, what, reason: RUN_ENV_FORMS_OVER_BUDGET });
+      throw new SecretRemediationPendingError();
+    }
     const needles = needlesOf(flight);
     const range = { tip, excludes, ...(excludeRemoteTracking ? { excludeRemoteTracking: true } : {}) };
     if (needles.length === 0) return { kind: "clean", range };

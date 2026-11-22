@@ -10,7 +10,7 @@ import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { sanitizeNowText, trimToolFrame } from "../src/now-summary.js";
 import type { Executor } from "../src/executor.js";
-import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import type { ClaimRunEnvVar, OutgoingMessage } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import { api, fakeGitlab, git, gitlabClaim, installHarness, runner, runnerWith, simulateCommittedWork } from "./runner-harness.js";
@@ -156,7 +156,7 @@ describe("questions, now summary, failure reasons and the merge request", () => 
   it("a question reaches the api through the batcher's payload redactor", async () => {
     const sent: OutgoingMessage[] = [];
     const client = { async postMessages(_id: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
-    const forms = runEnvRedactionForms([secretVar("DB_PASSWORD", SECRET)], []);
+    const forms = runEnvClaimForms([secretVar("DB_PASSWORD", SECRET)], []).redaction;
     const batcher = new MessageBatcher(client, "run-q", 0, 0, nullLogger(), makeRedactor(forms), makeTextRedactor(forms));
     batcher.emit({ kind: "question", agent: "lead", payload: { question_id: "q1", questions: [{ header: "h", question: `is ${SECRET} right?`, options: [{ label: `use ${SECRET}` }] }] } });
     await batcher.close();

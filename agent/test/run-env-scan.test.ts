@@ -8,7 +8,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RECOVERY_BUNDLE_REF } from "../src/git.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
-import { runEnvRedactionForms, runEnvScanNeedles, type ScanNeedle } from "../src/run-env-forms.js";
+import { type ScanNeedle, runEnvClaimForms } from "../src/run-env-forms.js";
 import {
   hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type RunEnvScanVerdict,
 } from "../src/run-env-scan.js";
@@ -26,7 +26,7 @@ const PLAIN = ["plain-visible", "value", "9876"].join("-");
 const secretVar = (name: string, value: string, secret = true): ClaimRunEnvVar =>
   ({ var_id: UUID, scope: "repo", rev: 1, name, value, secret, description: "" });
 const retired = (name: string, value: string): ClaimRunEnvRedact => ({ var_id: UUID, scope: "repo", rev: 1, name, value });
-const NEEDLES: ScanNeedle[] = runEnvScanNeedles([secretVar("DB_PASSWORD", SECRET), secretVar("QUOTED_SECRET", QUOTED)], []);
+const NEEDLES: ScanNeedle[] = runEnvClaimForms([secretVar("DB_PASSWORD", SECRET), secretVar("QUOTED_SECRET", QUOTED)], []).needles;
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
@@ -112,14 +112,14 @@ describe("scanRunEnvRange over a real range", () => {
   it("holds a retired version delivered only through run_env_redact", async () => {
     const tip = commitFile(work, "old.txt", `was ${SECRET}\n`);
     syncFeature();
-    const needles = runEnvScanNeedles([], [retired("DB_PASSWORD", SECRET)]);
+    const needles = runEnvClaimForms([], [retired("DB_PASSWORD", SECRET)]).needles;
     assert.equal((await scan(tip, [base], needles)).kind, "hit");
   });
 
   it("holds NOTHING for a plain value in the tree: plain values are never needles", async () => {
     const tip = commitFile(work, "plain.txt", `region=${PLAIN}\n`);
     syncFeature();
-    const needles = runEnvScanNeedles([secretVar("REGION", PLAIN, false), secretVar("DB_PASSWORD", SECRET)], []);
+    const needles = runEnvClaimForms([secretVar("REGION", PLAIN, false), secretVar("DB_PASSWORD", SECRET)], []).needles;
     assert.deepEqual(needles.map((n) => n.name), ["DB_PASSWORD"]);
     const v = await scan(tip, [base], needles);
     assert.deepEqual(v, { kind: "clean", range: { tip, excludes: [base] } });
@@ -153,7 +153,7 @@ describe("scanRunEnvRange when the committed bytes differ from the value in its 
   async function verdictFor(value: string, committed: string): Promise<RunEnvScanVerdict> {
     const tip = commitFile(work, "k.pem", committed);
     syncFeature();
-    return scan(tip, [base], runEnvScanNeedles([secretVar("SIGNING_KEY", value)], []));
+    return scan(tip, [base], runEnvClaimForms([secretVar("SIGNING_KEY", value)], []).needles);
   }
   const hitNames = (v: RunEnvScanVerdict): string[] => (v.kind === "hit" ? hitVariableNames(v.findings) : [`NOT a hit: ${v.kind}`]);
 
@@ -174,7 +174,7 @@ describe("scanRunEnvRange when the committed bytes differ from the value in its 
   });
 
   it("the redaction forms cover the same variants", () => {
-    const forms = runEnvRedactionForms([secretVar("SIGNING_KEY", `${SECRET}\n`)], []);
+    const forms = runEnvClaimForms([secretVar("SIGNING_KEY", `${SECRET}\n`)], []).redaction;
     assert.ok(forms.includes(SECRET));
   });
 });
@@ -247,6 +247,11 @@ describe("resolveScanNeedles", () => {
   it("a live flight's set is used as is, including an empty one, with no maintenance call", async () => {
     assert.deepEqual(await resolveScanNeedles({ live: NEEDLES, fetchProtected: never }), { kind: "needles", needles: NEEDLES });
     assert.deepEqual(await resolveScanNeedles({ live: [], fetchProtected: never }), { kind: "needles", needles: [] });
+  });
+
+  it("a live over-budget run withholds with no maintenance call", async () => {
+    assert.deepEqual(await resolveScanNeedles({ live: "forms_over_budget", fetchProtected: never }),
+      { kind: "withhold", reason: "forms_over_budget" });
   });
 
   it("with no flight, versions whose forms pass the budget withhold as forms_over_budget", async () => {

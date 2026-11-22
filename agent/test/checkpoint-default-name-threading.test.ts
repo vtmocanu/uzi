@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { performance } from "node:perf_hooks";
@@ -24,7 +25,7 @@ function fixture(defaultBranch?: string) {
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
     nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
   const claim = { repo: { default_branch: defaultBranch }, secrets: {}, last_seq: 0, kind: "issue" } as Parameters<RunRunner["buildFlight"]>[0];
-  const initialized = runner["buildFlight"](claim, "test", { run: async () => ({ branch: "task" }) }, undefined, "", []);
+  const initialized = runner["buildFlight"](claim, "test", { run: async () => ({ branch: "task" }) }, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   assert.equal(initialized.owedDefaultBranch, defaultBranch?.trim() || undefined, "custody keeps existing semantics");
   const flight = {
     ...initialized,

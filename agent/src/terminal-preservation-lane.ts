@@ -58,6 +58,8 @@ export interface TerminalLaneFlight {
   providerKeyForms?: readonly string[];
   /** The exact-value scan needles of the run's secret variables (absent or empty when it holds none). */
   scanNeedles?: readonly ScanNeedle[];
+  /** The claim's forms passed the budget: the needle set is incomplete, so nothing is prepared. */
+  scanOverBudget?: boolean;
   terminalPreservation?: TerminalLaneResult;
 }
 
@@ -252,6 +254,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
         } else if (defaultBranch) {
           ciTarget = await env.git.defaultBranchTip(barePath, defaultBranch);
         }
+        if (flight.scanOverBudget) return { reason: "secret_remediation_pending" };
         const out = await prepareFrozenHeldPinned({
           git: env.git, barePath, branch, sourceSha: tip, policy: env.policy(), deadlineMs: left(),
           literals: flight.providerKeyForms ?? [],

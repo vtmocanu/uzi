@@ -1,4 +1,5 @@
 import { describe, it, type TestContext } from "node:test";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -881,7 +882,7 @@ describe("completion boundary: the handoff claimant is the only tail left out of
     let onQuiesce: ((req: QuiesceRequest) => void) | undefined;
     p.quiesceImpl = async (req: QuiesceRequest) => { requests.push(req); onQuiesce?.(req); return quiescent; };
     const claim = gitlabClaim(3404, { run_id: claimantId, claim_generation: GENERATION + 1, inventory_guarded: true });
-    const flight = p.buildFlight(claim, claimantId, r.executor, undefined, "", []) as Record<string, any> & {
+    const flight = p.buildFlight(claim, claimantId, r.executor, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact)) as Record<string, any> & {
       steering: { endFencedFlight(r: string): void; markCancelled(): void } };
     const tail = new Promise<void>(() => {});
     p.executionTails.set(claimantId, tail);

@@ -116,11 +116,12 @@ export type NeedleResolution =
  * A withheld publish is refused now and retried later.
  */
 export async function resolveScanNeedles(opts: {
-  live: readonly ScanNeedle[] | undefined;
+  live: readonly ScanNeedle[] | "forms_over_budget" | undefined;
   fetchProtected: () => Promise<RunEnvRedactResponse>;
   /** Whether this worker ever handed the run variables: see run-env-seen.ts. */
   runEnvSeen?: () => Promise<boolean | "unknown">;
 }): Promise<NeedleResolution> {
+  if (opts.live === "forms_over_budget") return { kind: "withhold", reason: "forms_over_budget" };
   if (opts.live !== undefined) return { kind: "needles", needles: [...opts.live] };
   let body: RunEnvRedactResponse;
   try {

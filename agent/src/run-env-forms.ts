@@ -48,8 +48,8 @@ const PUBLIC_LINES: readonly RegExp[] = [
   /^\s*Proc-Type: \d+,[A-Z-]+\s*$/,
   /^\s*"(type|auth_uri|token_uri|auth_provider_x509_cert_url|universe_domain)"\s*:\s*"[^"]*"\s*,?\s*$/,
 ];
-/** The fewest distinct non-space characters a line needs to be registered alone. */
-const MIN_LINE_DISTINCT = 6;
+/** A line with no letter or digit: separators and rules such as a run of `=`. */
+const NO_ALPHANUMERIC = /^[^\p{L}\p{N}]*$/u;
 
 function distinctNonSpace(line: string): number {
   const seen = new Set<string>();
@@ -61,13 +61,14 @@ function isMultiLine(value: string): boolean {
   return value.includes("\r") || value.includes("\n");
 }
 
-/** The lines of a multi-line value that may be registered alone: at least {@link MIN_SECRET_LEN} long, with at
- *  least {@link MIN_LINE_DISTINCT} distinct non-space characters, and neither PEM armor nor a public line. */
+/** The lines of a multi-line value that may be registered alone: at least {@link MIN_SECRET_LEN} long, holding a
+ *  letter or digit and at least two distinct non-space characters (so not whitespace, a punctuation rule or one
+ *  repeated character), and neither PEM armor nor a public line. */
 function lineForms(value: string): string[] {
   const out: string[] = [];
   for (const line of value.split(LINE_BREAK)) {
     if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line) || PUBLIC_LINES.some((re) => re.test(line))) continue;
-    if (distinctNonSpace(line) < MIN_LINE_DISTINCT) continue;
+    if (NO_ALPHANUMERIC.test(line) || distinctNonSpace(line) < 2) continue;
     out.push(line, JSON.stringify(line).slice(1, -1));
   }
   return out;
@@ -100,9 +101,7 @@ export interface ScanNeedle {
   readonly forms: readonly string[];
 }
 
-/** The most UTF-16 units of forms one claim may register, every distinct form counted once. Measured: 256 KiB of
- *  live multi-line values register 6.7M (LF base64 lines) to 25.3M (symbol-dense CRLF lines) units; the full store
- *  bounds of multi-line values register over 100M. */
+/** The most UTF-16 units of forms one claim may register, every distinct form counted once. */
 export const RUN_ENV_FORM_CHARS_MAX = 40_000_000;
 
 /** The reason text of a claim whose forms passed {@link RUN_ENV_FORM_CHARS_MAX}. */
@@ -117,7 +116,9 @@ export interface RunEnvClaimForms {
   readonly needles: ScanNeedle[];
   /** Per variable name, the registered line forms of its multi-line values. Empty when over budget. */
   readonly lineForms: ScanNeedle[];
-  /** The UTF-16 units of distinct forms counted, at most one variant past {@link RUN_ENV_FORM_CHARS_MAX}. */
+  /** The UTF-16 units of distinct forms counted. The count is checked after each value variant's whole-value
+   *  forms and after a multi-line value's line and diff forms, so building stops after the group whose forms pass
+   *  {@link RUN_ENV_FORM_CHARS_MAX} and the count can exceed the cap by that group's forms. */
   readonly formChars: number;
   /** Building stopped because {@link RUN_ENV_FORM_CHARS_MAX} was passed; no partial form set is returned. */
   readonly overBudget: boolean;
@@ -184,20 +185,4 @@ function overBudgetForms(entries: ReadonlyArray<{ value: string }>, formChars: n
   const raw = new Set<string>();
   for (const { value } of entries) for (const v of valueVariants(value)) raw.add(v);
   return { redaction: [...raw].sort((a, b) => b.length - a.length), needles: [], lineForms: [], formChars, overBudget: true };
-}
-
-/** The exact-value scan needles of {@link runEnvClaimForms}. */
-export function runEnvScanNeedles(
-  runEnv: readonly ClaimRunEnvVar[] | undefined,
-  runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
-): ScanNeedle[] {
-  return runEnvClaimForms(runEnv, runEnvRedact).needles;
-}
-
-/** The redaction list of {@link runEnvClaimForms}, longest first. */
-export function runEnvRedactionForms(
-  runEnv: readonly ClaimRunEnvVar[] | undefined,
-  runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
-): string[] {
-  return runEnvClaimForms(runEnv, runEnvRedact).redaction;
 }

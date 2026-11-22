@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import type { CompletionSource, RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
@@ -69,7 +70,7 @@ async function setup(codex = true) {
       defaultIdentity: { ref: "refs/remotes/origin/main", sha: head } },
     clonePath: clone.path, attemptId, expectedHead: head, roots: [],
   };
-  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", []);
+  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   Object.assign(flight, { barePath: bare, worktreePath: clone.path, branch, runnerClone: clone });
   const remember = (s = source, e = executor) => p.rememberCompletionSource(s, flight, e,
     e.safety ? p.terminalSource(flight, e, e.safety) : undefined);

@@ -7,7 +7,7 @@ import path from "node:path";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { LimitReachedError } from "../src/limit.js";
-import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, assertCustodyRetained, commit, failingWork, heldServer, skipCheckpoints, type Work,
@@ -38,7 +38,7 @@ let iid = 46100;
 
 function assertNoValue(label: string, value: unknown): void {
   const text = JSON.stringify(value);
-  for (const form of runEnvRedactionForms(runEnv(), retired())) assert.ok(!text.includes(form), `${label}: no registered form of a value appears`);
+  for (const form of runEnvClaimForms(runEnv(), retired()).redaction) assert.ok(!text.includes(form), `${label}: no registered form of a value appears`);
 }
 
 function spyPublish(): { uploads: number } {

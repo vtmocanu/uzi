@@ -13,7 +13,7 @@ import type {
   RecoveryCaptureStatusResponse, RecoveryHoldsResponse, RecoveryReleaseResponse, RecoveryReserveRequest,
   RecoveryReserveResponse, RecoveryUploadManifest, RunEnvRedactResponse,
 } from "../src/protocol.js";
-import { runEnvScanNeedles, type ScanNeedle } from "../src/run-env-forms.js";
+import { type ScanNeedle, runEnvClaimForms } from "../src/run-env-forms.js";
 import { resolveScanNeedles, type NeedleResolution } from "../src/run-env-scan.js";
 
 // PRD 4416 M2: every recovery bundle upload (the capture, the restart sweep's re-upload and the live
@@ -85,7 +85,7 @@ afterEach(() => {
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
-const NEEDLES: ScanNeedle[] = runEnvScanNeedles([{ var_id: UUID, scope: "repo", rev: 2, name: "DB_PASSWORD", value: SECRET, secret: true, description: "" }], []);
+const NEEDLES: ScanNeedle[] = runEnvClaimForms([{ var_id: UUID, scope: "repo", rev: 2, name: "DB_PASSWORD", value: SECRET, secret: true, description: "" }], []).needles;
 
 function coordinator(client: RecoveryArchiveClient, scanNeedlesFor?: (runId: string) => Promise<NeedleResolution>): RecoveryCoordinator {
   return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,

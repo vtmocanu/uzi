@@ -5,7 +5,7 @@ import path from "node:path";
 import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
 import { buildCommandEnv, withCommandGitTrust } from "../src/codex/codex-executor.js";
 import { foldRunEnv, runEnvDropText } from "../src/run-env-inject.js";
-import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { RUN_ENV_DENIED_NAMES, RUN_ENV_DENIED_PREFIXES } from "../src/run-env-names.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
@@ -192,11 +192,11 @@ describe("only the lead lane receives run variables", () => {
 });
 
 describe("registered forms of secret variables", () => {
-  const redactor = (runEnv: ClaimRunEnvVar[], redact: ClaimRunEnvRedact[] = []) => makeTextRedactor(runEnvRedactionForms(runEnv, redact));
+  const redactor = (runEnv: ClaimRunEnvVar[], redact: ClaimRunEnvRedact[] = []) => makeTextRedactor(runEnvClaimForms(runEnv, redact).redaction);
   const SECRET = "s3cr3t-pa55word-xyz";
 
   it("hard-coded base64 alignments of a known value", () => {
-    const forms = runEnvRedactionForms([v("X", "abcdefgh", true)], []);
+    const forms = runEnvClaimForms([v("X", "abcdefgh", true)], []).redaction;
     assert.ok(forms.includes("abcdefgh"));
     for (const f of ["YWJjZGVmZ2", "FiY2RlZmdo", "hYmNkZWZna"]) assert.ok(forms.includes(f), f);
   });
@@ -230,7 +230,7 @@ describe("registered forms of secret variables", () => {
   });
 
   it("does not register a plain value", () => {
-    assert.deepEqual(runEnvRedactionForms([v("PLAIN_SETTING", "plain-value-visible", false)], []), []);
+    assert.deepEqual(runEnvClaimForms([v("PLAIN_SETTING", "plain-value-visible", false)], []).redaction, []);
     const text = "the value is plain-value-visible";
     assert.equal(redactor([v("PLAIN_SETTING", "plain-value-visible", false)])(text), text);
   });
@@ -242,8 +242,8 @@ describe("registered forms of secret variables", () => {
   });
 
   it("drops forms shorter than 8 characters and deduplicates", () => {
-    for (const f of runEnvRedactionForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], [])) assert.ok(f.length >= 8);
-    const forms = runEnvRedactionForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []);
+    for (const f of runEnvClaimForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []).redaction) assert.ok(f.length >= 8);
+    const forms = runEnvClaimForms([v("A_SECRET", "12345678", true), v("B_SECRET", "12345678", true)], []).redaction;
     assert.equal(new Set(forms).size, forms.length);
   });
 });

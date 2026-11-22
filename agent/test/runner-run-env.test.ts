@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
-import { RUN_ENV_FORMS_OVER_BUDGET, runEnvRedactionForms } from "../src/run-env-forms.js";
+import { RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms } from "../src/run-env-forms.js";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -47,7 +47,7 @@ describe("runner wiring of run variables", () => {
     };
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
 
-    const forms = runEnvRedactionForms(runEnv(), runEnvRedact());
+    const forms = runEnvClaimForms(runEnv(), runEnvRedact()).redaction;
     assert.ok(forms.length >= 2);
     for (const f of forms) {
       assert.ok(added.includes(f), `form registered: ${f.slice(0, 8)}`);
@@ -82,7 +82,7 @@ describe("runner wiring of run variables", () => {
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
     assert.ok(seen, "the executor ran");
     assert.equal(seen!.runEnv, undefined, "no variables for a non-lead lane");
-    for (const f of runEnvRedactionForms(runEnv(), runEnvRedact())) assert.ok(added.includes(f), "the redaction form is registered for every kind");
+    for (const f of runEnvClaimForms(runEnv(), runEnvRedact()).redaction) assert.ok(added.includes(f), "the redaction form is registered for every kind");
     assert.ok(!scrubbed.includes(SECRET) && !scrubbed.includes(OLD_SECRET), "and the flight redactor still scrubs both versions");
   });
 
@@ -221,5 +221,27 @@ describe("a claim over the form budget", () => {
       execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "--quiet", `refs/heads/agent/issue-${claim.issue_iid}`], { stdio: "pipe" });
     } catch { pushed = false; }
     assert.equal(pushed, false, "nothing reached origin");
+  });
+
+  it("a lane with no flight resolves needles for the live over-budget run as a withhold, never an empty set", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: overBudget() as never });
+    const exec: Executor = { run: async (ctx) => ({ branch: ctx.branch, reportOnly: true, summary: "ok" }) };
+    const runner = runnerWith(() => ({ executor: exec }), gitlab);
+    const internals = runner as unknown as {
+      liveScanNeedles: Map<string, unknown>;
+      resolveRunScanNeedles(runId: string): Promise<{ kind: string; reason?: string; needles?: unknown[] }>;
+    };
+    const resolutions: Array<Promise<{ kind: string; reason?: string; needles?: unknown[] }>> = [];
+    const set = internals.liveScanNeedles.set.bind(internals.liveScanNeedles);
+    internals.liveScanNeedles.set = (runId: string, value: unknown) => {
+      const out = set(runId, value);
+      resolutions.push(internals.resolveRunScanNeedles(runId));
+      return out;
+    };
+    await runner.execute(claim);
+    assert.equal(resolutions.length, 1, "the live set was published once for the run");
+    assert.deepEqual(await resolutions[0], { kind: "withhold", reason: "forms_over_budget" });
+    assert.equal(internals.liveScanNeedles.has(claim.run_id), false, "and it is evicted at terminal");
   });
 });

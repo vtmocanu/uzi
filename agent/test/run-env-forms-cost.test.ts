@@ -8,6 +8,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HEAP_GROWTH_MAX_MIB = 128;
 const ONE_ADD_MAX_MS = 2000;
+const BUILD_MAX_MS = 15000;
+const CHILD_TIMEOUT_MS = 120_000;
 
 // Child program: builds the claim, a SecretSet and a logger registry, then reports heap growth after gc and the
 // time of one add on each full index.
@@ -65,6 +67,7 @@ function measure(shape: [number, number, number, number]): Report {
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/", COST_SRC: pathToFileURL(fileURLToPath(new URL("../src/", import.meta.url))).href, COST_SHAPE: JSON.stringify(shape) },
     encoding: "utf8",
     maxBuffer: 1 << 20,
+    timeout: CHILD_TIMEOUT_MS,
   });
   assert.equal(res.status, 0, `child exited ${res.status}: ${res.stderr.slice(0, 500)}`);
   const report = JSON.parse(res.stdout.trim().split("\n").pop()!) as Report;
@@ -81,6 +84,7 @@ describe("the cost of a claim's forms at the store bounds", () => {
     const r = measure([50, 5242, 300, 8738]);
     assert.equal(r.overBudget, true);
     assert.ok(r.growthMiB <= HEAP_GROWTH_MAX_MIB, `heap grew ${r.growthMiB.toFixed(1)} MiB`);
+    assert.ok(r.buildMs <= BUILD_MAX_MS, `building the forms took ${r.buildMs.toFixed(0)} ms`);
     assert.ok(r.setAddMs <= ONE_ADD_MAX_MS, `SecretSet.add took ${r.setAddMs.toFixed(1)} ms`);
     assert.ok(r.logAddMs <= ONE_ADD_MAX_MS, `addSecret took ${r.logAddMs.toFixed(1)} ms`);
     assert.ok(r.setMasked && r.logMasked && r.addedMasked, "the raw values and the added form are masked");
@@ -93,6 +97,7 @@ describe("the cost of a claim's forms at the store bounds", () => {
     assert.ok(r.formChars > 20_000_000, `a realistic large claim: ${r.formChars} units`);
     assert.ok(r.needles > 0);
     assert.ok(r.growthMiB <= HEAP_GROWTH_MAX_MIB, `heap grew ${r.growthMiB.toFixed(1)} MiB`);
+    assert.ok(r.buildMs <= BUILD_MAX_MS, `building the forms took ${r.buildMs.toFixed(0)} ms`);
     assert.ok(r.setAddMs <= ONE_ADD_MAX_MS, `SecretSet.add took ${r.setAddMs.toFixed(1)} ms`);
     assert.ok(r.logAddMs <= ONE_ADD_MAX_MS, `addSecret took ${r.logAddMs.toFixed(1)} ms`);
     assert.ok(r.setMasked && r.logMasked && r.addedMasked, "a planted line and the added form are masked");

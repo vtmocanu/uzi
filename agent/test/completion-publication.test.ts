@@ -1,4 +1,5 @@
 import { describe, it, type TestContext } from "node:test";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -125,7 +126,7 @@ async function rig(t: TestContext, options: { codex: boolean; cohort?: number; u
   }
   captureIds.sort();
 
-  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", []);
+  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   Object.assign(flight, { barePath: bare, worktreePath: cloneInfo.path, branch: BRANCH, runnerClone: cloneInfo });
   await p.bindCompletionSource(flight);
   const bound = flight.completionSourceBound as CompletionSource | undefined;
