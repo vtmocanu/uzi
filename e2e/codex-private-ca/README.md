@@ -1,0 +1,9 @@
+# Private-CA UID-split proof (in progress)
+
+`run.sh` runs the baked production entrypoint, factory, executor, launcher and native helpers with synthetic local HTTPS and worker API listeners. It requires Docker, OpenSSL and a built worker image. Set `FIXTURE_IMAGE` and `FIXTURE_EXPECTED_ID` together to use an explicitly identified image; the defaults identify the locally built starting revision. No host credentials or replacement production sources are mounted.
+
+The initial two rows passed against production revision `2a1faa13cf237a545fd75ed48728cad379ed7a0c`: trusted extra CA completed Responses; absent extra CA produced no HTTP Responses requests, failed handshakes at the listener, and a bounded generic `TransientRecoveryError`. Both rows verified worker UID 10001, source ownership `0:10001` with mode `0440`, worker readability and runner read denial. Both observed settlement and accepted terminal disposal. The outer watchdog did not fire. This is not a certificate-specific runtime diagnostic or the complete typed connection-timeout proof.
+
+Remaining #4323 work includes CI integration under the existing Codex M4 target, startup-source error controls, unrelated trust and stalled connections, exact staged PEM membership/ownership/environment observations, auth/session/archive exclusion, root cleanup/recreation, vendor/no-extra controls, and the remaining lifecycle proof. A command-cache retention warning was observed (`unattested`); these rows do not establish kernel drainage or absence of retained custody. No capability activation follows from this fixture.
+
+The image has production dependencies only, so its TypeScript compiler probe was unavailable. Shell syntax and ShellCheck passed. Full mandatory integration checks and independent review remain required for the completed delivery.
