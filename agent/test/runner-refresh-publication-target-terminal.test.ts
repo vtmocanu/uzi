@@ -6,13 +6,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
-import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
+import { StubExecutor,type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { PublicationContextRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { followSuccessfulPush, sourcePublicationContext } from "./publication-fixture.js";
 import {
   api, client, fx, git, gitlabClaim, installHarness, runner, fakeGitlab, fakeGitHub,
 } from "./runner-harness.js";
+import {
+  HELD_FEATURES, HELD_LINUX_ONLY, JOIN_TOKEN, assertCustodyRetained, deferTerminalEvidence, heldServer, redrive, retained,
+  type Work,
+} from "./runner-held-publication-fixture.js";
 
 // Issue #4616 M4: the api answers `{status:"unknown", reason:"target_terminal"}` when the target MR
 // of a ci_fix / mr_rework run has merged or closed. The worker keeps its existing conservative
@@ -168,6 +172,15 @@ describe("#4616 M4 refresh publication: target_terminal context refusal", () => 
       assert.ok(failure.includes("publication stopped"));
       assert.equal(gitIn(probe.seen.clone!, ["rev-parse", "HEAD"]), h.candidate, "local source retained at H");
       assert.equal(api.publicationContextRequests.filter(r => r.runId === claim.run_id).length, 1, "refusal is not retried");
+      // The feed status (composePrepushRefusalStatus) names the reason and points at retained work.
+      const statuses = api.messages(claim.run_id)
+        .filter(m => m.kind === "status")
+        .map(m => String((m.payload as { text?: unknown }).text ?? ""))
+        .filter(text => text.includes("refresh publication refused"));
+      assert.equal(statuses.length, 1, JSON.stringify(statuses));
+      const status = statuses[0]!;
+      assert.ok(status.includes("(target_terminal)"), status);
+      assert.ok(status.includes(`uzi run held ${claim.run_id} or uzi run recovery ${claim.run_id}`), status);
     });
 
     // Compatibility control (green on base): an older worker rejects an unknown reason string and
@@ -228,29 +241,49 @@ describe("#4616 M4 refresh publication: target_terminal context refusal", () => 
       });
     }
 
-    // Refresh publications are never hold-eligible (holdEligible is false in the runner's pre-push
-    // refusal), so a held-publication failure cannot be reached: the hold request must never be
-    // attempted, and a hold endpoint that would fail changes nothing about custody.
-    it(`${lane}/github: target_terminal never requests a held publication; custody stays recoverable`, async t => {
-      const h = history("Fixes #3120");
-      const f = forgeFor(h.original);
-      sequence(h.original, ["target_terminal"]);
-      const hold = t.mock.method(client, "requestCompletionHold", async () => {
-        throw new Error("injected held-publication failure");
+    // Held publication (the failed-run refs/uzi-held path, HELD_PUBLICATION_FEATURE) IS reachable after a
+    // refresh refusal: refusePrepush's non-hold branch journals a failed terminal, and the guarded
+    // settlement defers the capture for the held step (heldEligibleTerminal). So inject failures into
+    // the held POST and the held FINAL and prove custody stays recoverable either way.
+    for (const failing of ["held POST", "held FINAL"] as const) {
+      it(`${lane}/github: target_terminal then failing ${failing} keeps custody recoverable`, { skip: HELD_LINUX_ONLY }, async t => {
+        const h = history("Fixes #3120");
+        const f = forgeFor(h.original);
+        sequence(h.original, ["target_terminal"]);
+        const claim = claimFor(lane, h.original, { inventory_guarded: true });
+        const server = heldServer(claim, HELD_FEATURES);
+        if (failing === "held POST") server.heldAnswer = () => ({ ok: false, httpStatus: 503, reason: "forge_unavailable" });
+        else server.finalAnswer = () => retained(claim, "held_publication_unavailable");
+        const push = t.mock.method(git, "pushBranch");
+        const probe = candidateExecutor(h.candidate);
+        const r = runner(probe.executor, f.gl.gitlab, JOIN_TOKEN, { github: f.gh.github });
+        deferTerminalEvidence(r, t);
+        await r.execute(claim);
+        assert.equal(push.mock.callCount(), 0);
+        assertRefused(claim.run_id, h.original, probe, /\(target_terminal\)/);
+        const work: Partial<Work> = { clone: probe.seen.clone! };
+        // The held step was genuinely attempted (not vacuous), and the failure left everything in place.
+        assert.equal(server.heldCalls.length, 1, "the held publication was attempted after the refusal");
+        const record = await assertCustodyRetained(server, claim, work, `${failing} injected, after execute()`);
+        if (failing === "held POST") {
+          assert.equal(server.archiveUploads(), 1, "a failed held POST falls back to the archive on the same record");
+          assert.equal(record.state, "uploaded");
+        }
+        await redrive(r);
+        // A retained-FINAL answer (or the archive FINAL replay) is never a destructive outcome.
+        assert.ok(fs.existsSync(probe.seen.clone!) || server.acked() === 1, "clone survives unless a FINAL was ACKed");
+        if (failing === "held FINAL") {
+          assert.equal(server.acked(), 0, "a retained FINAL never releases custody");
+          await assertCustodyRetained(server, claim, work, "held FINAL retained, after redrive");
+        }
+        assert.equal(gitIn(fx.originPath, ["rev-parse", BRANCH]), h.original, "remote branch unchanged");
       });
-      const push = t.mock.method(git, "pushBranch");
-      const claim = claimFor(lane, h.original);
-      const probe = candidateExecutor(h.candidate);
-      await runner(probe.executor, f.gl.gitlab, undefined, { github: f.gh.github }).execute(claim);
-      assert.equal(hold.mock.callCount(), 0, "no hold requested for a refresh refusal");
-      assert.equal(push.mock.callCount(), 0);
-      assertRefused(claim.run_id, h.original, probe, /\(target_terminal\)/);
-      assert.equal(gitIn(probe.seen.clone!, ["cat-file", "-t", h.candidate]), "commit", "nothing discarded");
-    });
+    }
 
-    // Guarded inventory: the existing guarded settlement owns cleanup. target_terminal must behave
-    // exactly like another context refusal (forge_mismatch) for the same guarded claim.
-    it(`${lane}/github: guarded inventory treats target_terminal like forge_mismatch`, async t => {
+    // Guarded inventory: the guarded settlement owns cleanup. With a real RecoveryCoordinator the
+    // refusal must leave the guarded hold open, send no release, and keep the clone with the archive.
+    // forge_mismatch is a secondary control: target_terminal behaves identically.
+    it(`${lane}/github: guarded inventory keeps its hold and source on target_terminal`, async t => {
       const outcomes: Record<string, unknown> = {};
       for (const reason of ["forge_mismatch", "target_terminal"]) {
         api.states.length = 0;
@@ -263,28 +296,38 @@ describe("#4616 M4 refresh publication: target_terminal context refusal", () => 
         const f = forgeFor(h.original);
         sequence(h.original, [reason]);
         const claim = claimFor(lane, h.original, { inventory_guarded: true });
-        const feature = client.hasFeature.bind(client);
-        t.mock.method(client, "hasFeature", (name: Parameters<typeof client.hasFeature>[0]) =>
-          name === "recovery_inventory_v1" || feature(name));
-        t.mock.method(client, "listRecoveryHolds", async () => ({ run_id: claim.run_id, holds: [
-          { hold_id: "fixture-hold", generation: 7, inventory_guarded: true, has_available_capture: false }] }));
+        // Inventory guarded, archive path only (no held-publication feature): the coordinator
+        // captures and uploads, and the release FINAL cannot be sent from inside the flight.
+        const server = heldServer(claim, ["recovery_inventory_v1"]);
         const push = t.mock.method(git, "pushBranch");
+        const recovery = new RecoveryCoordinator({ client, git, log: nullLogger(),
+          recoveryRoot: git.recoveryRoot, workerToken: JOIN_TOKEN });
         const probe = candidateExecutor(h.candidate);
-        await runner(probe.executor, f.gl.gitlab, undefined, { github: f.gh.github }).execute(claim);
+        await runner(probe.executor, f.gl.gitlab, JOIN_TOKEN, { github: f.gh.github, recovery }).execute(claim);
         assert.equal(push.mock.callCount(), 0);
         assert.equal(gitIn(fx.originPath, ["rev-parse", BRANCH]), h.original);
         const statuses = terminal(claim.run_id).map(s => s.body.status);
         assert.deepEqual(statuses, ["failed"]);
+        // Direct assertions: the guarded hold is kept, nothing is released, the source and archive remain.
+        // The clone is not asserted here: a verified, self-contained archive legitimately permits its
+        // physical cleanup (see the exact-stage test); the archive plus the open hold are the custody.
+        const record = await assertCustodyRetained(server, claim, {}, `${reason}: guarded refusal`);
+        assert.equal(server.finals.length, 0, `${reason}: no custody release was sent`);
+        assert.equal(server.archiveUploads(), 1, `${reason}: the archive is retained for recovery`);
+        assert.equal(record.state, "uploaded", `${reason}: the archive is on the frozen record`);
         outcomes[reason] = {
           statuses,
-          holds: api.completionHoldRequests.length,
-          cloneRetained: !!probe.seen.clone && fs.existsSync(probe.seen.clone),
+          holdOpen: server.holdOpen(),
+          finals: server.finals.length,
+          uploads: server.archiveUploads(),
+          cloneRetained: fs.existsSync(probe.seen.clone!),
+          recordState: record.state,
         };
         t.mock.restoreAll();
         await client.register("refresh-publication-target-terminal");
       }
       assert.deepEqual(outcomes["target_terminal"], outcomes["forge_mismatch"],
-        "target_terminal discards nothing beyond what the guarded path does for another context refusal");
+        "control: target_terminal is settled exactly like another context refusal");
     });
   }
 });
