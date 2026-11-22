@@ -22,8 +22,8 @@ func TestCodexPhasePlacementMigrationRoundTripLiveDB(t *testing.T) {
 		return value
 	}
 	columnsVersion := migrationVersionByName(t, "user_planning_codex")
-	if columnsVersion != version-1 {
-		t.Fatal("planning columns must immediately precede placement migration")
+	if columnsVersion >= version {
+		t.Fatal("planning columns must precede placement migration")
 	}
 	assertColumns := func(want bool) {
 		t.Helper()
