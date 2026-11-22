@@ -6524,6 +6524,8 @@ export interface HeldPublication {
 // is always an array on the wire, never null.
 export interface HeldPublications {
   publications: HeldPublication[];
+  /** True only on an admin run debug read of another user's run (issue #4198); absent otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the

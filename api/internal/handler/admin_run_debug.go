@@ -26,6 +26,7 @@ const (
 	adminRunDebugRouteInputs   adminRunDebugRoute = "runs.inputs"
 	adminRunDebugRouteArchives adminRunDebugRoute = "runs.archives"
 	adminRunDebugRouteFetches  adminRunDebugRoute = "runs.fetches"
+	adminRunDebugRouteHeld     adminRunDebugRoute = "runs.held_publications"
 	adminRunDebugRouteHolds    adminRunDebugRoute = "recovery.holds"
 	adminRunDebugRouteRuns     adminRunDebugRoute = "admin.runs"
 )
@@ -54,8 +55,8 @@ func adminRunDebugAllowed(flagOn bool, cred mw.CLICredential, credOK bool, user 
 	return flagOn && credOK && cred.Scope == clitoken.ScopeAdminRO && userOK && user.IsAdmin
 }
 
-// adminRunDebugForeignRun resolves a run the caller does not own for the three per-run
-// debug READS (inputs, archives, fetches); no write path calls it. It is reached only
+// adminRunDebugForeignRun resolves a run the caller does not own for the per-run
+// debug READS (inputs, archives, fetches, held publications list); no write path calls it. It is reached only
 // after the owner path answered ErrRunNotFound. When the request may not take the debug
 // path it writes the same 404 as an unknown run, with no further query. Otherwise it
 // loads the run as an admin (not found is 404, other errors 500). ok=false means the

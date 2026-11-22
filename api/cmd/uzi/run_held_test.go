@@ -141,6 +141,53 @@ func TestRunHeldExpireNotFoundMapsExit(t *testing.T) {
 	}
 }
 
+// A 404 on the list read prints the admin run debug hint once and keeps the exit code.
+func TestRunHeldListNotFoundPrintsHintOnce(t *testing.T) {
+	fc := &uzicli.FakeClient{HeldErr: uzicli.Exitf(uzicli.ExitNotFound, "run not found")}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "held", "run1")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitNotFound)
+	}
+	if n := strings.Count(errb, adminRunDebugHint); n != 1 {
+		t.Errorf("hint count = %d, want 1; stderr=%q", n, errb)
+	}
+}
+
+// An admin debug read prints the read-only notice on stderr (also for an empty list) and drops
+// the owner-only expire advice while keeping the fetch advice.
+func TestRunHeldAdminDebugNotice(t *testing.T) {
+	dto := heldFixture()
+	dto.AdminDebugRead = true
+	out, errb, code := runCLI(t, fakeEnv(&uzicli.FakeClient{HeldPublicationsResult: dto}), "run", "held", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(errb, adminRunDebugHeldNotice) || strings.Contains(out, adminRunDebugHeldNotice) {
+		t.Errorf("notice must be on stderr only; stdout=%q stderr=%q", out, errb)
+	}
+	if strings.Contains(out, "expire") || !strings.Contains(out, "git fetch origin <ref>") {
+		t.Errorf("hint must keep fetch and drop expire:\n%s", out)
+	}
+
+	out, errb, code = runCLI(t, fakeEnv(&uzicli.FakeClient{HeldPublicationsResult: apitypes.HeldPublicationsDTO{AdminDebugRead: true}}), "run", "held", "run1")
+	if code != uzicli.ExitOK || !strings.Contains(errb, adminRunDebugHeldNotice) || !strings.Contains(out, "has no held publications") {
+		t.Errorf("empty admin read = %d stdout=%q stderr=%q", code, out, errb)
+	}
+
+	_, errb, _ = runCLI(t, fakeEnv(&uzicli.FakeClient{HeldPublicationsResult: dto}), "--json", "run", "held", "run1")
+	if strings.Contains(errb, adminRunDebugHeldNotice) {
+		t.Errorf("--json must not print the notice: %q", errb)
+	}
+}
+
+// An owner response (no marker) carries no notice and keeps the expire advice.
+func TestRunHeldOwnerNoNotice(t *testing.T) {
+	out, errb, code := runCLI(t, fakeEnv(&uzicli.FakeClient{HeldPublicationsResult: heldFixture()}), "run", "held", "run1")
+	if code != uzicli.ExitOK || strings.Contains(errb, adminRunDebugHeldNotice) || !strings.Contains(out, "uzi run held expire run1") {
+		t.Errorf("owner read = %d stdout=%q stderr=%q", code, out, errb)
+	}
+}
+
 // `uzi run recovery` shows a released hold's held receipt: the ref and the commit it holds.
 func TestRunRecoveryRendersHeldReceipt(t *testing.T) {
 	dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
