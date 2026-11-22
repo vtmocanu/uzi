@@ -8,8 +8,8 @@ if [[ -n "${FIXTURE_IMAGE+x}" || -n "${FIXTURE_EXPECTED_ID+x}" ]]; then
   : "${FIXTURE_IMAGE:?explicit image requires FIXTURE_IMAGE and FIXTURE_EXPECTED_ID}"
   : "${FIXTURE_EXPECTED_ID:?explicit image requires FIXTURE_IMAGE and FIXTURE_EXPECTED_ID}"
 fi
-IMAGE=${FIXTURE_IMAGE:-cdr-codex-ca:2a1faa13c}
-EXPECTED=${FIXTURE_EXPECTED_ID:-sha256:94cbfddfbe588346f18ad9fa1e452c3d95b21663330918e1a88e8f0b13997903}
+IMAGE=${FIXTURE_IMAGE:-cdr-codex-ca:6b4d31d7e}
+EXPECTED=${FIXTURE_EXPECTED_ID:-sha256:eda31cfe5c9f9e9d819174eb33ecd060f69cf5e9c5e239d390ff5c909c4d2b1a}
 actual=$(docker image inspect "$IMAGE" --format '{{.Id}}')
 printf 'image=%s id=%s revision=%s\n' "$IMAGE" "$actual" "$(git rev-parse HEAD)"
 test "$actual" = "$EXPECTED"
@@ -31,7 +31,9 @@ chmod 755 "$scratch" "$scratch/mount"
 chmod 644 "$scratch/mount/"*
 set +e
 set -x
-timeout --kill-after=10s 180s docker run --rm --name "$name" --network none \
+started_seconds=$(date +%s)
+timeout --kill-after=10s 240s docker run --rm --name "$name" --network none \
+  --env "FIXTURE_CONTAINER_STARTED_SECONDS=$started_seconds" \
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
   --security-opt no-new-privileges --tmpfs /data \
   --mount "type=bind,src=$HERE,dst=/work/private-ca,readonly" \

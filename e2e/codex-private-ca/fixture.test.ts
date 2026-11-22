@@ -5,14 +5,18 @@ import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { createServer as httpsServer } from "node:https";
 import { createServer as httpServer } from "node:http";
+import { createServer as netServer, type Socket } from "node:net";
 
 // The fixture is mounted outside /app; load baked source by absolute URL.
 
 
 const source = "/run/cdr-private-ca/source.pem";
 
-for (const trusted of [true, false]) {
-  test(trusted ? "private CA completes Responses" : "no extra CA refuses private TLS", async () => {
+for (const row of ["stalled", "trusted", "no-extra"] as const) {
+  const trusted = row !== "no-extra";
+  test(row === "trusted" ? "private CA completes Responses" : row === "no-extra" ? "no extra CA refuses private TLS" : "stalled TLS has bounded typed timeout", async () => {
+    console.log("row-start", row, "container-elapsed-seconds", Date.now() / 1000 - Number(process.env.FIXTURE_CONTAINER_STARTED_SECONDS));
+    const { CodexTransportError } = await import("/app/src/codex/transport.ts");
     const { createLogger } = await import("/app/src/log.ts");
     const log = createLogger("debug");
     const { loadConfig } = await import("/app/src/config.ts");
@@ -32,7 +36,16 @@ for (const trusted of [true, false]) {
       (error: any) => error.status !== 0 && /Permission denied/.test(error.stderr.toString()));
     const credential = ["cdr", "synthetic", "provider", "claim"].join("-");
     const receipts: unknown[] = [], unexpected: unknown[] = [], apiRequests: string[] = [];
-    let tlsErrors = 0;
+    let tlsErrors = 0, connections = 0, httpRequests = 0;
+    const sockets = new Set<Socket>();
+    const stalled = netServer();
+    stalled.on("connection", socket => {
+      connections++;
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      socket.on("error", () => {});
+      socket.resume(); // Accept TCP and consume ClientHello, never send TLS bytes.
+    });
     const api = httpServer((req, res) => {
       apiRequests.push(req.url ?? "");
       res.writeHead(500).end("unexpected worker API request");
@@ -40,6 +53,8 @@ for (const trusted of [true, false]) {
     const server = httpsServer({
       key: await fs.readFile("/fixture/server.key"), cert: await fs.readFile("/fixture/server.pem"),
     }, (req, res) => {
+      httpRequests++;
+      assert.ok(httpRequests <= 16, "fixture request capacity exceeded");
       const chunks: Buffer[] = [];
       let bytes = 0;
       req.on("data", (c: Buffer) => {
@@ -91,14 +106,21 @@ for (const trusted of [true, false]) {
       });
     });
     server.on("tlsClientError", error => { tlsErrors++; console.log("tlsClientError", error.message); });
+    const observe = (stage: string) => console.log("fixture-stage", row, stage,
+      { api: api.listening, server: server.listening, stalled: stalled.listening });
+    observe("await-api-listen");
     await new Promise<void>(resolve => api.listen(0, "127.0.0.1", resolve));
+    observe("api-listened-await-server");
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    observe("server-listened-await-stalled");
+    if (row === "stalled") await new Promise<void>(resolve => stalled.listen(0, "127.0.0.1", resolve));
+    observe("listeners-ready");
     let executor: any;
     try {
       const cfg = loadConfig({ UZI_API_URL: `http://127.0.0.1:${(api.address() as any).port}`,
         UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"), UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk",
         ...(trusted ? { UZI_CODEX_CA_FILE: source } : {}) });
-      const id = trusted ? "ca-trusted" : "ca-absent";
+      const id = `ca-${row}`;
       const workspace = `/data/${id}-work`;
       await fs.mkdir(workspace, { mode: 0o2770 });
       await fs.chown(workspace, 10001, 10002);
@@ -109,7 +131,7 @@ for (const trusted of [true, false]) {
         dockerWiring: cfg.dockerWiring, codexExtraCa: cfg.codexExtraCa,
         codexCommandSandbox: cfg.codexCommandSandbox, codexSandboxDegraded: cfg.codexHarness.degraded,
       }, { provider: { provider_id: "cdr-private-ca", revision: 1, engine: "codex",
-        protocol: "openai_responses", base_url: `https://127.0.0.1:${(server.address() as any).port}/v1`,
+        protocol: "openai_responses", base_url: `https://127.0.0.1:${((row === "stalled" ? stalled : server).address() as any).port}/v1`,
         auth_style: "bearer", credential, model_map: { default: { model: "corp-code", context_window: 32768 } } } });
       executor = built.executor;
       assert.equal(executor.constructor.name, "CodexExecutor", "actual Codex executor selected");
@@ -118,26 +140,46 @@ for (const trusted of [true, false]) {
       const run = executor.run({ runId: id, kind: "task", issueIid: 42, issueTitle: "Private CA proof",
         issueDescription: "Complete approved proof", worktreePath: workspace, branch: "agent/issue-42",
         planApproved: true, approvedPlan: "Signal completion", agents: [],
-        config: { run_timeout_seconds: 20, idle_timeout_seconds: 10 }, emit: (m: unknown) => emitted.push(m) });
+        config: { run_timeout_seconds: 20, idle_timeout_seconds: 10 }, emit: (m: any) => {
+          emitted.push(m);
+          // Fixed labels only: never echo payloads, credentials, bodies or env.
+          const text = m?.payload?.text;
+          const phase = m?.kind === "status" && typeof text === "string"
+            ? text === "tools provisioned" ? "tools-provisioned"
+              : text.startsWith("provisioning ") ? "provisioning"
+              : "other-status" : "other-event";
+          observe(`emit-${phase}`);
+        } });
+      observe("await-executor.run");
       console.log("await-boundary", id, "executor.run");
-      if (trusted) {
+      const started = performance.now();
+      if (row === "trusted") {
         await run;
         console.log("await-returned", id, "executor.run");
         assert.ok(receipts.length >= 2, "tool call then assistant completion reached our listener");
         assert.ok(JSON.stringify(emitted).includes("private CA complete"));
       } else {
-        await assert.rejects(run, (error: any) =>
-          /httpConnectionFailed|certificate|TLS|tls/.test(String(error)) ||
-          (error?.name === "TransientRecoveryError" &&
-            error.message === "silence after a provider-reported rate limit or transport retry"));
+        await assert.rejects(run, (error: unknown) => {
+          console.log("actual-rejection", error);
+          assert.ok(error instanceof CodexTransportError, "baked transport class required");
+          assert.deepEqual(error.failure, { category: "timeout", message: "codex provider initial response deadline exceeded" });
+          return true;
+        });
+        const elapsed = performance.now() - started;
+        console.log("typed-timeout-elapsed-ms", row, elapsed);
+        assert.ok(elapsed < 20000, "typed rejection precedes production wall deadline");
         console.log("await-returned", id, "executor.run rejection");
         assert.equal(receipts.length, 0);
-        assert.ok(tlsErrors > 0, "our listener observed failed handshakes");
+        assert.equal(httpRequests, 0, "zero HTTP requests, including rejected routes");
+        if (row === "no-extra") assert.ok(tlsErrors > 0, "our listener observed failed handshakes");
+        else assert.ok(connections > 0, "our stalled listener accepted TCP");
       }
       assert.deepEqual(unexpected, []);
       assert.deepEqual(apiRequests, [], "zero vendor/control API requests");
     } finally {
+      observe("entered-finally");
       try {
+        assert.ok(executor?.safety, "native safety cleanup required");
         if (executor?.safety) {
           try {
             console.log("await-boundary", trusted, "settleForCredentialFreeCapture");
@@ -152,9 +194,15 @@ for (const trusted of [true, false]) {
           }
         }
       } finally {
+        for (const socket of sockets) socket.destroy();
+        observe("await-stalled-close");
+        if (row === "stalled") await new Promise<void>(r => stalled.close(() => r()));
+        observe("stalled-closed");
         server.closeAllConnections();
         api.closeAllConnections();
+        observe("await-server-api-close");
         await Promise.all([new Promise<void>(r => server.close(() => r())), new Promise<void>(r => api.close(() => r()))]);
+        observe("server-api-closed");
       }
     }
   });
