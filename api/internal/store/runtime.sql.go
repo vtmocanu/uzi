@@ -10568,6 +10568,26 @@ func (q *Queries) GetWorkerProjectionForOwner(ctx context.Context, arg GetWorker
 	return i, err
 }
 
+const hasQueuedRunForUser = `-- name: HasQueuedRunForUser :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE user_id = $1 AND status = 'queued'
+      AND kind <> 'chat' AND NOT cross_check_lane
+)::boolean AS has_queued
+`
+
+// Issue #4602: the cheap idle precheck claimCheckpointRun runs before ClaimRun. Each
+// predicate is an exact top-level conjunct of ClaimRun's target CTE (user_id, the
+// chat/cross_check_lane exclusion, status = 'queued'), so false here means ClaimRun would
+// select no target row and write nothing at this READ COMMITTED snapshot. True never
+// admits anything: ClaimRun stays the authoritative claim. Served by idx_runs_claimable.
+func (q *Queries) HasQueuedRunForUser(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasQueuedRunForUser, userID)
+	var has_queued bool
+	err := row.Scan(&has_queued)
+	return has_queued, err
+}
+
 const heartbeatWorker = `-- name: HeartbeatWorker :one
 UPDATE workers SET
     status                = 'online',
