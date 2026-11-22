@@ -53,6 +53,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -94,6 +95,14 @@ type EarlyResetNotifier interface {
 	NotifyCodexEarlyReset(ctx context.Context, fence notifysvc.CodexAccountFence, expected, observed time.Time) (store.Notification, error)
 }
 
+// WeeklyWarner receives every accepted (fenced-written) Codex reading for the weekly-limit warning
+// (PRD #4123 M3). *weeklywarn.Warner satisfies it. fence is the account authority the write
+// observed; lastSuccessAt is the exact last_success_at the write persisted (microsecond precision).
+// Optional and nil-safe; the call is best effort and never fails the poll.
+type WeeklyWarner interface {
+	ObserveCodexWeekly(ctx context.Context, fence notifysvc.CodexAccountFence, buckets []apitypes.CodexRateLimitBucketDTO, lastSuccessAt time.Time)
+}
+
 // UsageCollector reads one account's usage and returns a token-free reading or a typed
 // failure. *workersvc.Service satisfies it. The engine depends on the interface so its tests
 // can inject a fake collector returning each outcome without a live store or provider.
@@ -122,6 +131,7 @@ type Engine struct {
 	collector  UsageCollector
 	reconciler Reconciler
 	notifier   EarlyResetNotifier
+	warner     WeeklyWarner
 	interval   time.Duration
 	maxConc    int
 	now        func() time.Time
@@ -143,6 +153,9 @@ type Engine struct {
 
 // SetNotifier sets the optional early-reset collaborator before the engine runs.
 func (e *Engine) SetNotifier(n EarlyResetNotifier) { e.notifier = n }
+
+// SetWeeklyWarner sets the optional weekly-limit warning collaborator before the engine runs.
+func (e *Engine) SetWeeklyWarner(w WeeklyWarner) { e.warner = w }
 
 // New builds an Engine. interval is the poll cadence; the caller starts the engine only when
 // interval > 0 (0 disables it). logger may be nil.
@@ -435,14 +448,21 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 		e.logger.Error("codex usage poller: upsert reading", "account", t.accountID.String(), "error", err)
 		return
 	}
-	// lastSuccess is the exact persisted last_success_at (microsecond precision); a later
-	// consumer compares against it (PRD #4123 M3).
-	_ = lastSuccess
 	if !written {
 		// Fence rejected the write (generation/credential_revision moved, the last linked
 		// alias vanished, no linked alias is enabled any more, or an alias's enablement moved
 		// since the listing) — the reading is discarded, the prior good row untouched.
 		e.logger.Info("codex usage poller: reading discarded (authority moved)", "account", t.accountID.String())
+	}
+	if written && e.warner != nil && lastSuccess.Valid {
+		// lastSuccess is the exact persisted last_success_at (microsecond precision): the warning's
+		// observation instant (PRD #4123 M3). It runs after the fenced write, whatever the early-reset
+		// opt-in.
+		e.warner.ObserveCodexWeekly(ctx, notifysvc.CodexAccountFence{
+			OwnerID: t.userID, AccountID: t.accountID,
+			Generation: reading.ObservedGeneration, CredentialRevision: reading.ObservedCredentialRevision,
+			EnablementSig: t.enablementSig,
+		}, reading.Buckets, lastSuccess.Time)
 	}
 	if written && detected && e.notifier != nil {
 		fence := notifysvc.CodexAccountFence{

@@ -59,6 +59,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/usagepoller"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/weeklylimit"
+	"github.com/vtmocanu/uzi/api/internal/weeklywarn"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -115,6 +116,13 @@ var (
 // its collector, and a failed assertion silently skips the recovery pass. The production
 // collector is the workersvc Service, so this keeps a signature drift a build error.
 var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
+
+// Both pollers hand each written reading to the weekly-limit warning (PRD #4123 M3); a signature
+// drift on either hook must be a build error, not a silently unwired warning.
+var (
+	_ usagepoller.WeeklyWarner      = (*weeklywarn.Warner)(nil)
+	_ codexusagepoller.WeeklyWarner = (*weeklywarn.Warner)(nil)
+)
 
 // codexProviderRequestTimeout bounds nonrotating identity and usage reads in the
 // production codexauth.Client (PRD #1171 M1).
@@ -1439,11 +1447,18 @@ func run() error {
 	// skipped and a master-sealed token still polled. 0 disables it entirely; the
 	// Boot pass runs inside the goroutine (poller precedent) so a slow Anthropic can't
 	// delay serve. Held in an outer var so the token-save handler can poke it (D3b).
+	// PRD #4123 M3: the once-per-observed-weekly-period near-limit DM. Both pollers hand it each
+	// written reading; it shares their configured cadences for its freshness gate.
+	weeklyWarner := weeklywarn.New(weeklywarn.Config{
+		Pool: pool, Queries: q, Publisher: notifier, Blocks: weeklyLimits,
+		ClaudeInterval: cfg.UsagePollInterval, CodexInterval: cfg.CodexUsagePollInterval,
+	})
 	var usageEngine *usagepoller.Engine
 	if cfg.UsagePollInterval > 0 {
 		anthropicClient := anthropic.New(&http.Client{Timeout: cfg.AnthropicHTTPTimeout})
 		usageEngine = usagepoller.New(q, secretopen.NewOpener(vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
 		usageEngine.SetNotifier(notifier) // PRD #1020 M2: deliver the loud early-reset DM
+		usageEngine.SetWeeklyWarner(weeklyWarner)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
@@ -1473,6 +1488,7 @@ func run() error {
 			codexauth.NewClient(codexauth.WithPerRequestTimeout(codexProviderRequestTimeout)), pool)
 		codexUsageEngine = codexusagepoller.New(q, wsvc, codexReconciler, cfg.CodexUsagePollInterval, slog.Default())
 		codexUsageEngine.SetNotifier(notifier)
+		codexUsageEngine.SetWeeklyWarner(weeklyWarner)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
