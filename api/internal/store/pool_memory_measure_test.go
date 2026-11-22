@@ -3547,6 +3547,19 @@ func pmCreateOutcome(err error) (created, ambiguous bool) {
 	return false, true
 }
 
+// newPMLab builds one invocation's lab: a fresh uuid prefix, the template name derived from it,
+// and the marker-checked pmAdminExec. Every invocation calls it once, so no two invocations
+// share a template or clone name.
+func newPMLab(t *testing.T, out *pmOut, adminDSN, rawDir, jit string) (*pmLab, error) {
+	prefix := "pm_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	tpl, err := pmDBName(prefix, "_tpl")
+	if err != nil {
+		return nil, err
+	}
+	return &pmLab{t: t, out: out, adminDSN: adminDSN, rawDir: rawDir, jit: jit,
+		prefix: prefix, templateName: tpl, exec: pmAdminExec}, nil
+}
+
 // pmDSNForDB returns dsn with its database name replaced. Only URL-form DSNs are supported.
 // A dbname or database query parameter is refused: pgx copies query parameters over the path
 // database, which would silently point every "clone" connection back at the same database.
@@ -3723,13 +3736,11 @@ func TestPoolBackendMemoryMeasurement(t *testing.T) {
 	// mode still connect to the template. The marker was checked on the maintenance database above;
 	// a marker there is the evidence that this instance is a throwaway.
 	adminDSN := dsn
-	lab := &pmLab{t: t, out: out, adminDSN: adminDSN, rawDir: rawDir, jit: pmJITSetting(t),
-		prefix: "pm_" + strings.ReplaceAll(uuid.New().String(), "-", ""), exec: pmAdminExec}
-	tplName, err := pmDBName(lab.prefix, "_tpl")
+	lab, err := newPMLab(t, out, adminDSN, rawDir, pmJITSetting(t))
 	if err != nil {
 		t.Fatalf("template name: %v", err)
 	}
-	lab.templateName = tplName
+	tplName := lab.templateName
 	// The template and every clone are named from this invocation's own prefix, so no existing
 	// database can collide with them and nothing is dropped unless this run created it.
 	// TEMPLATE template0: a bare CREATE DATABASE copies template1, which fails (55006) while any

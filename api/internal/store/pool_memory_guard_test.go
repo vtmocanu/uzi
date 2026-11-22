@@ -445,25 +445,23 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	}
 	defer func() { _ = outFile.Close() }()
 
-	labPrefix := pmGuardPrefix()
-	tplName, err := pmDBName(labPrefix, "_tpl")
+	lab, err := newPMLab(t, &pmOut{f: outFile}, adminDSN, t.TempDir(), "default")
 	if err != nil {
-		t.Fatalf("template name: %v", err)
+		t.Fatalf("new lab: %v", err)
 	}
+	labPrefix, tplName := lab.prefix, lab.templateName
 	makeDB(t, tplName)
-	lab := &pmLab{t: t, out: &pmOut{f: outFile}, adminDSN: adminDSN, rawDir: t.TempDir(), jit: "default",
-		prefix: labPrefix, templateName: tplName, exec: pmAdminExec}
 
 	t.Run("unmarked connection", func(t *testing.T) {
 		p := pmGuardPrefix()
 		unmarked := p + "_unmarked"
 		probe := p + "_probe"
 		makeDB(t, unmarked)
-		t.Cleanup(func() { // safety net if the guard ever fails: drop the probe and fail the test
-			if !dbExists(t, probe) {
+		probeCreated := false
+		t.Cleanup(func() { // safety net: drop the probe only if this test's CREATE was acknowledged
+			if !probeCreated {
 				return
 			}
-			t.Errorf("probe database %s exists; dropping it", probe)
 			if err := pmDropDB(adminDSN, probe); err != nil {
 				t.Errorf("drop probe %s: %v", probe, err)
 			}
@@ -479,6 +477,7 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 			t.Fatal("precondition: the unmarked database unexpectedly carries the marker")
 		}
 		err = pmAdminExec(ctx, udsn, "CREATE DATABASE "+pgx.Identifier{probe}.Sanitize())
+		probeCreated = err == nil
 		var ae *pmAdminErr
 		if !errors.As(err, &ae) || ae.Stage != pmStageMarker {
 			t.Fatalf("pmAdminExec on unmarked db = %v, want marker-stage pmAdminErr", err)
@@ -489,10 +488,25 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	})
 
 	t.Run("distinct names", func(t *testing.T) {
-		a, b := pmGuardPrefix(), pmGuardPrefix()
-		if a == b {
-			t.Fatal("two prefixes are identical")
+		// Two invocations through the measurement's own initialization path must not share a
+		// template or clone name.
+		la, err := newPMLab(t, lab.out, adminDSN, t.TempDir(), "default")
+		if err != nil {
+			t.Fatalf("new lab: %v", err)
 		}
+		lb, err := newPMLab(t, lab.out, adminDSN, t.TempDir(), "default")
+		if err != nil {
+			t.Fatalf("new lab: %v", err)
+		}
+		if la.prefix == lb.prefix || la.templateName == lb.templateName {
+			t.Fatalf("two invocations share a prefix or template: %q/%q vs %q/%q", la.prefix, la.templateName, lb.prefix, lb.templateName)
+		}
+		ca, erra := pmDBName(la.prefix, "_mem_a_r1")
+		cb, errb := pmDBName(lb.prefix, "_mem_a_r1")
+		if erra != nil || errb != nil || ca == cb {
+			t.Fatalf("clone names %q, %q (errs %v, %v), want distinct valid names", ca, cb, erra, errb)
+		}
+		a := la.prefix
 		if _, err := pmDBName(a, strings.Repeat("a", 40)); err == nil {
 			t.Error("over-long name accepted")
 		}
@@ -575,8 +589,9 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	foreign := "pm_" + strings.ReplaceAll(uuid.New().String(), "-", "") + "_foreign"
 	makeDB(t, foreign)
 	okName := labPrefix + "_ok"
-	t.Cleanup(func() { // safety net: drop okName only if the clone's own cleanup left it behind
-		if !dbExists(t, okName) {
+	okCreated := false // set inside fn, which clone runs only after an acknowledged CREATE
+	t.Cleanup(func() { // safety net: drop okName only if this test created it and it was left behind
+		if !okCreated || !dbExists(t, okName) {
 			return
 		}
 		if err := pmDropDB(adminDSN, okName); err != nil {
@@ -589,6 +604,7 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 		ran := false
 		err := l.clone(ctx, "ok", func(name, _ string, _ *pmObserver) {
 			ran = true
+			okCreated = true
 			if name != okName {
 				t.Errorf("clone name %q, want %q", name, okName)
 			}
@@ -613,7 +629,11 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 	}
 
 	ambName := labPrefix + "_amb"
+	ambCreated := false // the injected exec saw the real CREATE acknowledged
 	t.Cleanup(func() {
+		if !ambCreated {
+			return // a failed or colliding CREATE never authorizes a drop
+		}
 		if err := pmDropDB(adminDSN, ambName); err != nil {
 			t.Errorf("drop %s: %v", ambName, err)
 		}
@@ -624,6 +644,7 @@ func TestPoolMemoryHarnessDDLGuardsLiveDB(t *testing.T) {
 		recorded = append(recorded, sql)
 		err := pmAdminExec(ctx, dsn, sql)
 		if err == nil && strings.HasPrefix(sql, "CREATE DATABASE") {
+			ambCreated = true
 			return errors.New("simulated lost acknowledgement")
 		}
 		return err
