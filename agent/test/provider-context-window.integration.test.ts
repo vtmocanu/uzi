@@ -275,7 +275,7 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
   };
 
   // Characterized at SDK 0.3.325 / CLI 2.1.325 (2026-11-22). History: at 0.3.319 an unrecognized id
-  // assumed 200k and compacted at ~170k; 0.3.323+ assumes 1M. Observed first compaction (last reported
+  // assumed 200k and compacted at ~170k; the target (measured at 0.3.325 / CLI 2.1.325; the CLI changelog dates the change to 2.1.323) assumes 1M. Observed first compaction (last reported
   // input_tokens before the summarization request) at perMessage 10_000: 970k to 980k.
   const RUNTIME_BAND_LO = RUNTIME_DEFAULT_WINDOW - 50_000; // >= one 20k step below the lowest observation
   it("runtime default (no override): a lead on an unrecognized model compacts near 1M and warns unrecognized_model", { timeout: 120_000 }, async () => {
