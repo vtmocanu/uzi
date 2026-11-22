@@ -11,8 +11,9 @@ package runenv
 // redaction, its JSON-escaped copy (the copy the worker's logger indexes beside the form)
 // when that differs from the form. Diff-shaped forms are scan needles only and have no
 // copy. The redactor's invisible-stripped copy of a form holding a control or format
-// character is never longer than the form and is not counted; the per-byte slack below
-// covers it.
+// character is not counted: it drops those characters and keeps one unit per remaining
+// unit of the form, and a byte that is not a control character is charged far fewer than
+// FormCharsPerSecretByte units by the families below, so the bound still holds.
 //
 // FormCharsPerSecretByte is an analytic upper bound of the counted units one UTF-8 byte of
 // a secret value can add. Worst case is a one-byte control character, which JSON and

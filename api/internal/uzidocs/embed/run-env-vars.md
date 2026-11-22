@@ -148,7 +148,7 @@ terminal preservation packs, recovery archives and the preserved patch.
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
 - Gaps that remain: a secret whose lines hold no qualifying token (tokens of
-  single-case letters, letters with one digit, digits with fewer than 5 distinct,
+  single-case letters alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters,
   formatted codes such as `8462-9137`, non-ASCII text, or a secret that is the
   line's leading key) and that is split across files or by elided context between
   hunks, and a value that appears only re-encoded, such as each line indented in a YAML block or in an
@@ -232,7 +232,7 @@ denied:
   `AWS_ENDPOINT_URL_SSO` and `AWS_ENDPOINT_URL_SSO_OIDC` (they override the
   endpoints of the AWS credential exchange, STS, IAM Identity Center and SSO
   OIDC, that the Bedrock harness's AWS SDK credential chain can use; denied for
-  consistency with `AWS_ENDPOINT_URL`, an owner decision), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
+  consistency with `AWS_ENDPOINT_URL`), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
   `AWS_ENDPOINT_URL_BEDROCK*` name. The other per-service names, such as
   `AWS_ENDPOINT_URL_S3`, stay allowed.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
