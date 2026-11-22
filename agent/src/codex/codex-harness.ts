@@ -1216,8 +1216,10 @@ export class CodexHarness implements RunHarness {
     this.registry.assertWorkAdmission();
     if (this.closed) throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
     request.signal.throwIfAborted();
-    if (options.verifyPhaseModel === true) this.phaseModelVerificationRequired = true;
-    if (this.phaseModelVerificationRequired && request.resumeSessionId === undefined)
+    // Require the saved thread for this preparation, but latch verification only once
+    // resume succeeds. An ordinary rejected resume may still use its existing fresh
+    // recovery path; a pending approval transition independently forbids that fallback.
+    if ((options.verifyPhaseModel === true || this.phaseModelVerificationRequired) && request.resumeSessionId === undefined)
       throw new PhaseSwitchUnverifiedError("malformed", {}, {});
     if (request.resumeSessionId === undefined && options.allowFresh !== true)
       throw new PolicyContinuationRejected("session_missing");

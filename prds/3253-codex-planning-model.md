@@ -2,10 +2,10 @@
 
 **Issue:** #3253
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r4, refreshed 2026-11-21. Child Q-codex of epic #1703 (r1 was the single Q draft). Current baseline: origin/main `10876dee680859e4e468ae5f004475f44b31a80a`; Codex runtime pin `0.167.0`.
+**Status:** Implementation in progress, refreshed 2026-11-22. Child Q-codex of epic #1703 (r1 was the single Q draft). Approved implementation baseline: `b8ca3f6e1` (#4580 merged); Codex runtime pin `0.167.0`. Required execution and review evidence remains incomplete; this PRD is not archived.
 **Priority:** `priority::normal`.
 **Parent:** #1703.
-**Blocked by:** #4580 ([accounting child](done/4580-codex-usage-model-segments.md)), whose merge supplies the tested segment interface. #3246 and #3252 are closed and their code is on this base. #3244's resolver/reporting seam merged in PR #3695; its remaining owner landing acceptance is not an unfinished-code dependency. #3245, #3247 and #3250 are already on base.
+**Accounting prerequisite:** #4580 ([accounting child](done/4580-codex-usage-model-segments.md)) merged at `b8ca3f6e1`, supplying the tested segment interface. #3246 and #3252 are closed and their code is on this base. #3244's resolver/reporting seam merged in PR #3695; its remaining owner landing acceptance is not an unfinished-code dependency. #3245, #3247 and #3250 are already on base.
 
 **Related:**
 - P: a run choice wins in both phases.
@@ -19,9 +19,9 @@
 - One uzi run, one PR, Codex harness because this changes the Codex SDK/app-server integration, after #4580 merges. The owner approved splitting accounting first on 2026-11-21.
 - Risk class: billing and data integrity. Use reviewer, tester and auditor (CLAUDE.md "Run economy").
 - No implementation or validation writes under `.github/workflows/`.
-- Migration `NNNNN_user_planning_codex.sql` gets the next free number at implementation and is renumbered at landing with `task migration:renumber`; fix postflight references (dba 17). Main is at `00499` on this baseline; read the live head rather than reserving a number.
+- Migration `NNNNN_user_planning_codex.sql` gets the next free number at implementation and is renumbered at landing with `task migration:renumber`; fix postflight references (dba 17). The approved baseline already contains `00500_outcome_kind.sql`; this branch adds 00501 for columns and 00502 for placement. Read the live head and re-derive the predecessor function at landing rather than reserving these numbers.
 - LiveDB tests need Docker.
-- **Dispatch check:** D1 selects same-conversation switching at the cold approval epoch and closes the live effort decision. **Q-claude D18 was reviewed in PR #4548 and implemented by PR #4571; this prerequisite is met. Do not dispatch until #4580 merges.** This proof does not authorize a warm-epoch alternative or an unreviewed fresh-conversation fallback.
+- **Dispatch check:** D1 selects same-conversation switching at the cold approval epoch and closes the live effort decision. **Q-claude D18 was reviewed in PR #4548 and implemented by PR #4571; #4580 merged at `b8ca3f6e1`; these code prerequisites are met.** The #3244 resolver/reporting seam is locally shipped at `075c54de2` (#3695); its external owner acceptance remains unverified, not unfinished code. Pinned cold-guard execution evidence must accompany delivery. This proof does not authorize a warm-epoch alternative or an unreviewed fresh-conversation fallback.
 
 ## Problem
 
@@ -29,7 +29,9 @@ Q-claude lets Claude runs plan on a planning pair and implement on the run pair.
 
 On Codex the naive switch would misattribute usage. The usage accountant binds each thread to one model for the whole claim. If the implement epoch resumes the plan thread on another model, every implementation token is priced and attributed to the planning model, in run cost, in per-model usage and in the ADR-2555 attribution records.
 
-## Verified baseline (origin/main 10876dee)
+## Historical baseline (origin/main 10876dee)
+
+The table records the pre-#4580 investigation, not the current implementation. The approved implementation reuses #4580 at `b8ca3f6e1`; the accountant contract below describes that merged interface.
 
 | Seam | Anchor (symbol, file) | Current behavior |
 |---|---|---|
@@ -45,14 +47,14 @@ On Codex the naive switch would misattribute usage. The usage accountant binds e
 | Capability advertising | `codexHarness?.advertise` block in `agent/src/worker.ts` | Codex protocol capabilities, `codex_custom_model_v1` included, are pushed here. |
 | Shipped Q-claude pieces | `resolvePlanPhase` (`claim_phase.go`), called from inside H's `resolveLeadSettings` (`LeadSettingsInput.PlanningModel`/`PlanningEffort`, result `LeadSettings.Plan`); `ClaimConfig.PlanPhase`; the phase-capability predicate in every mirror; `enterPhaseSwitchHold` and `SetRunPhaseSwitchHold` (`phase_switch_unavailable`); the atomic `SetUserPlanningClaude` planning-pair write (no locked cross-field combination helper); the `planning_models` / `planning_efforts` cells; the Planning card; H `resolveLeadRequest` with `phase` and plan cases in `request_cases` (`fixtures/lead-config/contract.json`); ADR 3252-phase-model-switch | Claude only. |
 
-Accountant details on the current base (changed by prerequisite #4580 before this PRD starts):
+Accountant contract supplied by merged #4580 (`b8ca3f6e1`):
 - **One per claim leg.** It is created in the epoch-shared context and handed to every epoch.
-- **`registerThread`.** The first registration wins, and `ThreadAccount.model` is readonly. The root is registered only on a harness instance's first turn.
+- **`registerThread`.** First registration wins. `beginModelSegment` closes the previous model segment after all of its replay has been recorded and rebinds the root for subsequent proved work. Harness epoch model immutability is a separate admission rule; children retain their own registrations.
 - **`record`.**
   - Adoption gate: a note is adopted only if its magnitude is strictly greater than the last one.
-  - Regression gate: a note whose input, cached, cache-write, output or uncached input is lower than the last adopted note is refused with `advancing_regression`. `reasoningOutputTokens` and `totalTokens` are not checked.
+  - Seven-column regression gate (`token-accounting.ts`, `advancing_regression`): input, cached input, cache-write input, output, reasoning output, total and derived uncached input cannot regress on an advancing accepted note. Reasoning and total are checked, including when unpriced.
   - `adopted.model = acct.model`.
-- **`aggregateByModel`.** Charged usage is `diffClamp(maxTotal, baseline)` per thread, with each column clamped at 0. Responses are reconciled per thread, then priced with `acct.model`.
+- **`aggregateByModel`.** Proved cumulative deltas are segmented by model, then reconciled and priced per segment. Empty-segment rebind, reclaim baseline exclusion and sticky quarantine remain accountant responsibilities. This is conservation within a claim, not recovery of never-delivered provider spend after a process crash.
 - **`markIncomplete`.** Sets `attributionQuarantined` on a resumed thread that has no baseline.
 
 ## Outcome
@@ -147,7 +149,7 @@ Acceptance examples (each one a test):
 
 **Harness use (`codex-harness.ts`), in this order:**
 1. Establish the independently proved cold approval epoch and verify its `thread/resume` response model (section 4). On failure, no implementation turn or cut occurs.
-2. Ensure the prior epoch cannot deliver further usage into the shared accountant before the new epoch's accounting boundary. On this baseline, ordinary approval starts the new epoch and swaps safety before disposing the old one (`codex-executor.ts:4702-4719`); only the captured path disposes first. That is current behavior, not a preexisting proof of the desired ordering. Implement and test the necessary quiescence/disposal handoff while preserving failed-start cleanup, guarded sink ownership and `CodexCredentialDeferredError` behavior. Do not assume that changing a comment or blindly moving disposal is sufficient.
+2. Ensure the prior epoch cannot deliver further usage into the shared accountant before the new epoch's accounting boundary. On this baseline, ordinary approval starts the new epoch and swaps safety before disposing the old one (`codex-executor.ts:4702-4719`); only the captured path disposes first. That is historical behavior, not a preexisting proof of the desired ordering. The implementation constructs an unpublished lazy candidate (credential release and fileop registration are allowed), disposes and proves the predecessor, then publishes synchronously before provider launch/resume. Candidate construction is not provider admission. Implement and test the necessary quiescence/disposal handoff while preserving failed-start cleanup, guarded sink ownership and `CodexCredentialDeferredError` behavior. Do not assume that changing a comment or blindly moving disposal is sufficient.
 3. Send `turn/start` only after the guard passes. At the first root `turn_started` note, record buffered historical `resumeReplay` into the previous segment, then call `beginModelSegment` exactly once for the new model (also when no replay is pending). No late old-epoch note may cross that cut.
 4. Later turns of the same instance must refuse a changed lead model before `turn/start`, with "codex lead model changed inside a provider epoch". Child threads keep their own registration and are never cut.
 
@@ -242,7 +244,7 @@ F and the Claude planning extensions are on this base. Extend their files uncond
 
 ## Decision Log
 
-- **D1. Mechanism: same conversation at the cold approval epoch (#3246, live evidence 2026-11-20).** User-run native ChatGPT-login probes on Codex 0.167.0: the full matrix and corrected effort-only report are retained in the durable #3246 evidence comment linked below. Implementation provenance is the squash-merge of the Q-spike PR. All twelve original and eight focused turns completed and returned the nonce. Both probes reported unchanged auth-file mtime; credentials were subsequently removed by the operator. The model/effort mechanism is established for this cold shape; the Q-claude guard dependency is now met by PR #4571; #4580 remains the dispatch blocker.
+- **D1. Mechanism: same conversation at the cold approval epoch (#3246, live evidence 2026-11-20).** User-run native ChatGPT-login probes on Codex 0.167.0: the full matrix and corrected effort-only report are retained in the durable #3246 evidence comment linked below. Implementation provenance is the squash-merge of the Q-spike PR. All twelve original and eight focused turns completed and returned the nonce. Both probes reported unchanged auth-file mtime; credentials were subsequently removed by the operator. The model/effort mechanism is established for this cold shape; the Q-claude guard dependency is now met by PR #4571; #4580 has since merged at `b8ca3f6e1`; its code dependency is satisfied.
   - **Switch/re-plan/reclaim:** the warm process ran `gpt-6-astra`/high -> `gpt-6.1-sol`/medium -> Astra/high. A second process sharing the same selected CODEX_HOME resumed the recorded thread with Sol, returned `model=gpt-6.1-sol`, and completed the retained-nonce control without another turn-level model override. The credential-free pinned test independently checked actual provider model B in that no-override control and zero provider requests before `turn/start`.
   - **Warm and cold reports differ.** Warm `thread/resume(model=B)` reported A/high. The independent no-turn-model control also sent A, showing that warm resume did not apply B; an explicit B on `turn/start` switched the request. Cold resume reported B and sent B without a repeated model override. The model-verification mechanism is the cold epoch, not a warm-resume echo or the subsequent `turn/start` override.
   - **Model omission is not a production setting:** `buildRunRequest` uses `leadRequestFor` / `resolveLeadRequest` (`agent/src/lead-config-report.ts`) and always supplies the provider/model fallback. Model omission above is a test-only resume-effectiveness control.
