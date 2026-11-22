@@ -1699,7 +1699,10 @@ done
 
 fixture_archive_receipt() {
   local mode="$1" fixture_id=b4dec5cf-e6d4-413b-b3a8-0005a2835770
-  local ADMIN_EMAIL=fixture@example.com n=0
+  local ADMIN_EMAIL=fixture@example.com n=0 budget=2
+  # A capture that settles first spends a second of the shared deadline before the
+  # receipt wait starts, and no read starts once the deadline is reached.
+  [ "$mode" != capturing-available ] || budget=3
   # shellcheck disable=SC2034  # read by the extracted real helper on timeout
   local COMPOSE=(fixture_agent_log)
   fixture_agent_log() { echo 'recreated agent log tail'; }
@@ -1722,8 +1725,11 @@ fixture_archive_receipt() {
   }
   apiget_before() { apiget "$2"; }
   uzi_cli() { fail 'captured hold must never be discarded'; }
-  db_psql() {
+  db_psql() { fail 'unexpected receipt SQL: unbounded db_psql'; }
+  # The receipt SQL is bounded by the remaining shared deadline (db_psql_rows SECS).
+  db_psql_rows() {
     [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unexpected receipt SQL mutation'
+    [[ "${2:-}" =~ ^[1-9][0-9]*$ && "$2" -le "$budget" ]] || fail "unexpected receipt SQL bound: [${2:-}]"
     n="$(cat "$SEQ_DIR/receipt-polls")"
     echo $((n + 1)) > "$SEQ_DIR/receipt-polls"
     jq -nc --arg run "$UUID" --arg id "$fixture_id" --arg mode "$mode" --argjson n "$n" '
@@ -1748,7 +1754,7 @@ fixture_archive_receipt() {
     printf '%s\n' "$output"
     return 1
   fi
-  resolve_fixture_source_hold "$UUID" 1 2 '2026-10-08T09:08:20Z'
+  resolve_fixture_source_hold "$UUID" 1 "$budget" '2026-10-08T09:08:20Z'
   [ "$(cat "$SEQ_DIR/receipt-polls")" -ge 2 ] || fail 'receipt returned before archive release'
 }
 custody_case "captured fixture waits for exact archive FINAL without discard" pass 'fixture archive custody receipt:' fixture_archive_receipt released
@@ -1804,25 +1810,47 @@ for mode in retry expired exhaust; do
 done
 
 fixture_hold_deadline() {
-  # shellcheck disable=SC2034  # JAR and BASE are read by the extracted real apiget_before
+  # shellcheck disable=SC2034  # JAR, BASE and ADMIN_EMAIL are read by the extracted real helpers
   local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 JAR=fixture-jar BASE=http://fixture output timeout=2
+  # shellcheck disable=SC2034
+  local ADMIN_EMAIL=fixture@example.com holds_kind=source_only slow_route=none slow_from=1 start_wall
   echo 0 > "$SEQ_DIR/deadline-discards"
   echo 0 > "$SEQ_DIR/deadline-reads"
+  echo 0 > "$SEQ_DIR/deadline-route-calls"
+  echo open > "$SEQ_DIR/deadline-state"
   : > "$SEQ_DIR/deadline-budgets"
   deadline_holds() {
+    if [ "$1" = archive ]; then
+      jq -nc --arg run "$UUID" --arg id "$target" \
+        '{holds:[{id:$id,run_id:$run,generation:1,state:"open",inventory_guarded:true,attention:"archive_ready",
+          has_available_capture:true,capture_state:"available"}]}'
+      return
+    fi
     jq -nc --arg run "$UUID" --arg id "$target" --arg attention "$1" \
       '{holds:[{id:$id,run_id:$run,generation:1,state:"open",attention:$attention,has_available_capture:false}
         | if $attention=="capturing" then .capture_state="uploading" else . end]}'
   }
-  apiget() {
-    case "$1" in
-      "/api/runs/$UUID/archives") echo '{"archives":[]}' ;;
-      "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
-      *) fail 'unexpected deadline read' ;;
+  # Every read the helper makes must go through a bound; an unbounded one is a finding.
+  apiget() { fail "unexpected deadline read: unbounded apiget $1"; }
+  db_psql() { fail "unexpected deadline read: unbounded db_psql"; }
+  # The run and archive routes of a curl call (the URL is its last argument); returns 1
+  # for the holds route, which each mode answers itself.
+  deadline_route() {
+    case "${*: -1}" in
+      "$BASE/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
+      "$BASE/api/runs/$UUID/archives") echo '{"archives":[]}' ;;
+      "$BASE/api/recovery/holds") return 1 ;;
+      *) fail "unexpected deadline read: ${*: -1}" ;;
     esac
+  }
+  receipt_released() {
+    jq -nc --arg run "$UUID" --arg id "$target" \
+      '{run_id:$run,run_status:"cancelled",holds:[{id:$id,run_id:$run,generation:1,inventory_guarded:true,
+        state:"released",final_disposition:"archive",release_evidence:"archive",archive_matches:true,captures:[{state:"available"}]}]}'
   }
   uzi_cli() {
     echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
+    echo discarded > "$SEQ_DIR/deadline-state"
     echo '{"discarded":true}'
   }
   case "$mode" in
@@ -1831,6 +1859,7 @@ fixture_hold_deadline() {
       # one is blocked and, like curl, gives up at its --max-time budget with rc 28.
       curl() {
         local reads budget=""
+        deadline_route "$@" && return 0
         reads=$(( $(cat "$SEQ_DIR/deadline-reads") + 1 ))
         echo "$reads" > "$SEQ_DIR/deadline-reads"
         [ "$1 $2" = '-fsS --max-time' ] && budget="$3"
@@ -1842,10 +1871,15 @@ fixture_hold_deadline() {
     late-transition)
       # One wall clock only: the pause is free (no virtual second on top of real time),
       # so the poll starts inside the budget; its source_only reply lands only once the
-      # real clock has reached the deadline it was handed.
+      # real clock has reached the deadline it was handed. Only holds reads count.
       sleep() { :; }
       apiget_before() {
         local reads
+        case "$2" in
+          "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}'; return 0 ;;
+          /api/recovery/holds) ;;
+          *) fail "unexpected deadline read: $2" ;;
+        esac
         reads=$(( $(cat "$SEQ_DIR/deadline-reads") + 1 ))
         echo "$reads" > "$SEQ_DIR/deadline-reads"
         if [ "$reads" = 1 ]; then deadline_holds capturing; return 0; fi
@@ -1855,9 +1889,9 @@ fixture_hold_deadline() {
     post-discard-late)
       # Real bounded reader on the wall clock: the owner discard is acknowledged only
       # after the deadline, so the verifying re-read is refused rather than unbounded.
-      echo open > "$SEQ_DIR/deadline-state"
       curl() {
         echo "$*" >> "$SEQ_DIR/deadline-budgets"
+        deadline_route "$@" && return 0
         deadline_holds source_only | jq -c --arg state "$(cat "$SEQ_DIR/deadline-state")" '.holds[0].state=$state'
       }
       uzi_cli() {
@@ -1871,28 +1905,95 @@ fixture_hold_deadline() {
     capturing-real)
       # The real bounded reader over a capture that never settles: when the pause spends
       # the budget the helper reports the capture, not a refused read.
-      curl() { deadline_holds capturing; } ;;
+      curl() { deadline_route "$@" && return 0; deadline_holds capturing; } ;;
     slow-archives)
       # Real wall clock (no custody_case reset): the hold is already source_only, but the
       # pre-discard archive listing takes 2s against a 1s budget.
-      apiget_before() { deadline_holds source_only; }
-      apiget() {
-        case "$1" in
-          "/api/runs/$UUID/archives") command sleep 2; echo '{"archives":[]}' ;;
+      apiget_before() {
+        case "$2" in
           "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
-          *) fail 'unexpected deadline read' ;;
+          "/api/runs/$UUID/archives") command sleep 2; echo '{"archives":[]}' ;;
+          /api/recovery/holds) deadline_holds source_only ;;
+          *) fail "unexpected deadline read: $2" ;;
         esac
       }
       timeout=1 ;;
+    slow-run-read|slow-archives-before-receipt|slow-archives-after-receipt|slow-discard-archives-before|slow-discard-archives-after|slow-receipt-sql|slow-receipt-sql-error|slow-receipt-sql-real)
+      # The real bounded reader over every route. From the slow_from-th call on, the slow
+      # route is blocked and, like curl at its --max-time, gives up with rc 28.
+      case "$mode" in
+        slow-run-read) slow_route=run ;;
+        slow-archives-before-receipt) slow_route=archives holds_kind=archive ;;
+        slow-archives-after-receipt) slow_route=archives slow_from=2 holds_kind=archive ;;
+        slow-discard-archives-before) slow_route=archives ;;
+        slow-discard-archives-after) slow_route=archives slow_from=2 ;;
+        slow-receipt-sql*) holds_kind=archive ;;
+      esac
+      curl() {
+        local url="${*: -1}" route budget="" calls
+        [ "$1 $2" = '-fsS --max-time' ] && budget="$3"
+        case "$url" in
+          "$BASE/api/runs/$UUID") route=run ;;
+          "$BASE/api/runs/$UUID/archives") route=archives ;;
+          "$BASE/api/recovery/holds") route=holds ;;
+          *) fail "unexpected deadline read: $url" ;;
+        esac
+        [[ "$budget" =~ ^[1-9][0-9]*$ ]] || fail "unexpected deadline read: $route read was not time-bounded: $*"
+        if [ "$route" = "$slow_route" ]; then
+          calls=$(( $(cat "$SEQ_DIR/deadline-route-calls") + 1 ))
+          echo "$calls" > "$SEQ_DIR/deadline-route-calls"
+          if [ "$calls" -ge "$slow_from" ]; then echo "$budget" >> "$SEQ_DIR/deadline-budgets"; return 28; fi
+        fi
+        case "$route" in
+          run) jq -nc --arg run "$UUID" '{run:{id:$run,status:"cancelled"}}' ;;
+          archives) echo '{"archives":[]}' ;;
+          holds)
+            if [ "$holds_kind" = archive ]; then deadline_holds archive
+            else deadline_holds source_only | jq -c --arg state "$(cat "$SEQ_DIR/deadline-state")" '.holds[0].state=$state'; fi ;;
+        esac
+      }
+      db_psql_rows() {
+        [[ "${2:-}" =~ ^[1-9][0-9]*$ && "$2" -le "$timeout" ]] || fail "unexpected deadline read: receipt SQL bound [${2:-}]"
+        echo "$2" >> "$SEQ_DIR/deadline-budgets"
+        receipt_released
+      }
+      case "$mode" in
+        slow-receipt-sql)
+          # Wall clock: the receipt SQL holds until the real clock reaches the helper's
+          # deadline (dynamic scope), then dies as if its limiter killed it.
+          sleep() { :; }
+          db_psql_rows() {
+            [[ "${2:-}" =~ ^[1-9][0-9]*$ && "$2" -le "$timeout" ]] || fail "unexpected deadline read: receipt SQL bound [${2:-}]"
+            echo "$2" >> "$SEQ_DIR/deadline-budgets"
+            # shellcheck disable=SC2154  # deadline is resolve_fixture_source_hold's local
+            while [ "$SECONDS" -lt "$deadline" ]; do command sleep 0.2; done
+            return 137
+          } ;;
+        slow-receipt-sql-error)
+          db_psql_rows() { echo "$2" >> "$SEQ_DIR/deadline-budgets"; return 1; } ;;
+        slow-receipt-sql-real)
+          # Wall clock through the REAL db_psql_rows and its timeout limiter: the compose
+          # exec hangs for 10s and must be killed at the remaining budget.
+          sleep() { :; }
+          eval "$(awk '/^db_psql_rows\(\) \(/,/^\)/' "$LIB")"
+          printf '#!/bin/sh\nexec sleep 10\n' > "$SEQ_DIR/compose-hang"
+          chmod +x "$SEQ_DIR/compose-hang"
+          # shellcheck disable=SC2034  # read by the extracted real db_psql_rows
+          local COMPOSE=("$SEQ_DIR/compose-hang") PGPW=fixture ENVFILE="$SEQ_DIR/no-envfile" ;;
+      esac ;;
+    *) fail "unknown deadline mode $mode" ;;
   esac
+  start_wall=$SECONDS
   if output="$(resolve_fixture_source_hold "$UUID" 1 "$timeout" 2>&1)"; then
     fail "deadline overrun resolved the hold: $output"
   fi
-  if [ "$mode" = post-discard-late ]; then
-    [ "$(cat "$SEQ_DIR/deadline-discards")" = 1 ] || fail "expected exactly one acknowledged discard: $output"
-  else
-    [ "$(cat "$SEQ_DIR/deadline-discards")" = 0 ] || fail "discarded after the deadline: $output"
-  fi
+  [[ "$output" != *'unexpected deadline read'* ]] || fail "a read bypassed the deadline bound: $output"
+  case "$mode" in
+    post-discard-late|slow-discard-archives-after)
+      [ "$(cat "$SEQ_DIR/deadline-discards")" = 1 ] || fail "expected exactly one acknowledged discard: $output" ;;
+    *)
+      [ "$(cat "$SEQ_DIR/deadline-discards")" = 0 ] || fail "discarded after the deadline: $output" ;;
+  esac
   case "$mode" in
     blocked-read)
       [[ "$output" == *'exceeded the 2s deadline'* ]] || fail "blocked read missed the deadline diagnostic: $output"
@@ -1903,14 +2004,40 @@ fixture_hold_deadline() {
     capturing-real)
       [[ "$output" == *'still capturing after 2s'* ]] || fail "capture timeout lost its diagnostic: $output" ;;
     post-discard-late)
-      [[ "$output" == *'re-read failed or exceeded the 2s deadline'* && "$output" != *'unexpected deadline read'* ]] \
+      [[ "$output" == *'re-read failed or exceeded the 2s deadline'* ]] \
         || fail "late post-discard re-read was not refused: $output"
       # Only the pre-discard holds read reached curl, bounded: the re-read was refused
       # by the bounded reader itself, not by a transport error.
-      [ "$(wc -l < "$SEQ_DIR/deadline-budgets")" = 1 ] && grep -qF -- '--max-time' "$SEQ_DIR/deadline-budgets" \
+      [ "$(grep -c 'recovery/holds' "$SEQ_DIR/deadline-budgets")" -eq 1 ] \
+        && grep 'recovery/holds' "$SEQ_DIR/deadline-budgets" | grep -qF -- '--max-time' \
         || fail "post-discard re-read was not refused by the bounded reader: $(cat "$SEQ_DIR/deadline-budgets")" ;;
     slow-archives)
       [[ "$output" == *'passed before the owner disposition'* ]] || fail "slow pre-discard read missed the deadline diagnostic: $output" ;;
+    slow-run-read)
+      [[ "$output" == *'run read failed or exceeded the 2s deadline'* ]] || fail "slow run read missed the deadline diagnostic: $output" ;;
+    slow-archives-before-receipt|slow-archives-after-receipt|slow-discard-archives-before)
+      [[ "$output" == *'archive listing failed or exceeded the 2s deadline'* && "$output" != *'discard was acknowledged'* ]] \
+        || fail "slow archive listing missed the deadline diagnostic: $output" ;;
+    slow-discard-archives-after)
+      [[ "$output" == *'archive listing failed or exceeded the 2s deadline (discard was acknowledged)'* ]] \
+        || fail "slow post-discard archive listing missed the deadline diagnostic: $output" ;;
+    slow-receipt-sql)
+      [[ "$output" == *'read_rc=137'* && "$output" == *'snapshot=none'* && "$output" == *'receipt timeout after 2s'* ]] \
+        || fail "slow receipt SQL missed the deadline diagnostic: $output" ;;
+    slow-receipt-sql-error)
+      [[ "$output" == *'receipt read failed (rc=1) before the 2s deadline'* && "$output" != *'receipt timeout'* ]] \
+        || fail "fast receipt SQL error was misreported: $output" ;;
+    slow-receipt-sql-real)
+      [[ "$output" == *'read_rc=137'* && "$output" == *'receipt timeout after 2s'* ]] \
+        || fail "hung receipt SQL was not killed at the deadline: $output"
+      [ $((SECONDS - start_wall)) -lt 8 ] || fail "hung receipt SQL outlived the deadline: $((SECONDS - start_wall))s" ;;
+  esac
+  case "$mode" in
+    slow-*)
+      [ "$mode" = slow-archives ] || [ "$mode" = slow-receipt-sql-real ] || {
+        [ -s "$SEQ_DIR/deadline-budgets" ] && [ "$(sort -n "$SEQ_DIR/deadline-budgets" | tail -n 1)" -le "$timeout" ] \
+          || fail "the slow read was not bounded by the deadline: [$(tr '\n' ' ' < "$SEQ_DIR/deadline-budgets")]"
+      } ;;
   esac
   echo "deadline $mode failed closed with zero discards past the deadline"
 }
@@ -1918,6 +2045,10 @@ custody_case "a blocked holds read past the deadline fails with zero discards" p
   fixture_hold_deadline blocked-read
 custody_case "a capture that never settles keeps its diagnostic under the real bounded reader" pass 'deadline capturing-real failed closed with zero discards past the deadline' \
   fixture_hold_deadline capturing-real
+for mode in slow-run-read slow-archives-before-receipt slow-archives-after-receipt slow-discard-archives-before slow-discard-archives-after slow-receipt-sql-error; do
+  custody_case "a bounded read past the deadline fails closed: $mode" pass "deadline $mode failed closed with zero discards past the deadline" \
+    fixture_hold_deadline "$mode"
+done
 # Deliberately outside custody_case, so SECONDS keeps counting real time; each mode run
 # here keeps to that one clock (no virtual sleep second is mixed into the budget).
 wall_clock_deadline_case() {
@@ -1931,6 +2062,10 @@ wall_clock_deadline_case() {
 wall_clock_deadline_case "a capturing to source_only transition seen after the deadline fails with zero discards" late-transition
 wall_clock_deadline_case "a read that outlives the deadline before the owner disposition discards nothing" slow-archives
 wall_clock_deadline_case "a discard acknowledged after the deadline gets a bounded, refused re-read" post-discard-late
+wall_clock_deadline_case "a receipt SQL read held to the deadline fails with its last evidence and zero discards" slow-receipt-sql
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  wall_clock_deadline_case "a hung receipt SQL is killed at the remaining budget by the real limiter" slow-receipt-sql-real
+fi
 
 # Execute the actual owning phase boundaries against the real owner helper. The
 # fixture holds every phase's runs plus the completed outage case (which must

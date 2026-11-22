@@ -274,6 +274,7 @@ rc=0
     esac
   }
   apiget_before() { apiget "$2"; }
+  db_psql_rows() { db_psql "$1"; }
   db_psql() {
     jq -nc --arg run "$RUN_B1" --arg id "$hold_id" \
       '{run_id:$run,run_status:"cancelled",holds:[{id:$id,run_id:$run,generation:1,inventory_guarded:true,
