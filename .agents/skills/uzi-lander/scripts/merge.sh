@@ -230,7 +230,7 @@ fi
 # Helper guard: repeat after the expensive preflights. A snapshot is not a lease.
 # Keep --no-rework-check restricted to repos not on uzi; no active-run bypass.
 helper_guard() {
-  local rl repo_id runs branch active
+  local rl repo_id branch active
   [ "$REWORK_CHECK" -eq 1 ] || return 0
   command -v uzi >/dev/null 2>&1 || { echo "uzi CLI absent; cannot rule out active helpers (pass --no-rework-check for a repo not on uzi)"; return 4; }
   rl=$(uzi repo list --json 2>/dev/null) && printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1 \
@@ -239,10 +239,10 @@ helper_guard() {
   if [ -n "$repo_id" ]; then
     branch=$(printf '%s' "$pj" | jq -er '.headRefName | select(type=="string" and length>0)') \
       || { echo "PR source branch unreadable; cannot rule out active helpers"; return 4; }
-    runs=$(uzi run list --json 2>/dev/null) \
-      || { echo "uzi run list failed; cannot rule out active helpers"; return 4; }
-    active=$(branch_helper_active_runs "$runs" "$repo_id" "$branch" "$PR" 2>/dev/null) \
-      || { echo "could not parse uzi run list; cannot rule out active helpers"; return 4; }
+    branch_writers_read "$repo_id" "$branch" "$PR" \
+      || { echo "$WRITERS_ERR; cannot rule out active helpers"; return 4; }
+    active=$WRITERS
+    print_writers_visibility
     if [ "$(printf '%s' "$active" | jq length)" -gt 0 ]; then
       printf '%s' "$active" | jq -r '.[] | "ACTIVE_HELPER=\(.id) kind=\(.kind) status=\(.status)"'
       echo "wait (mr_rework: scripts/wait-mrrework.sh), or cancel the exact run and confirm terminal state; inspect branch delta, preserved_patch, recovery and held publications before retrying"

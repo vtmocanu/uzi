@@ -16,6 +16,9 @@ cat > "$WORK/bin/uzi" <<'STUB'
 # Default to disconnected; ownership cases supply explicit repo and run fixtures.
 if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then [ "${UZI_REPO_FAIL:-}" = 1 ] && exit 1; echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
 if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
+# cobra prints the parent help (rc 0) for any admin subcommand; the verb line exists only on a new CLI.
+if [ "${1:-}" = admin ] && [ "${2:-}" = --help ]; then printf 'Available Commands:\n  review       x\n'; [ -z "${UZI_ADMIN_RW:-}" ] || printf '  run-writers  y\n'; exit 0; fi
+if [ "${1:-}" = admin ] && [ "${2:-}" = run-writers ]; then [ "${UZI_WRITERS_RC:-0}" -eq 0 ] || exit "$UZI_WRITERS_RC"; printf '%s\n' "$UZI_WRITERS_OUT"; exit 0; fi
 echo "unexpected uzi call: $*" >&2; exit 1
 STUB
 cat > "$WORK/bin/gh" <<'STUB'
@@ -421,6 +424,45 @@ for failure in repo runs malformed; do
   has "ci-unknown-$failure" 'NEXT=unknown'
   unset UZI_REPO_FAIL UZI_RUN_LIST_FAIL
 done
+# Authorized all-owners read (uzi admin run-writers): writers absent from the owner list still count,
+# CI_FIX_RECENT stays owner-scoped, and visibility is printed.
+export UZI_ADMIN_RW=1
+at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UZI_RUNS_JSON=$(jq -nc --arg at "$at" '[{id:"fix-recent",kind:"ci_fix",repo_id:"r1",pipeline_ref:"agent/issue-1",status:"completed",finished_at:$at}]'); export UZI_RUNS_JSON
+export UZI_WRITERS_OUT='{"writers":[{"run_id":"foreign-fix","kind":"ci_fix","status":"running","owner_id":"o2","repo_id":"r1","pipeline_ref":"agent/issue-1","mr_iid":null,"created_at":"t"}],"complete":true}'
+snap head_clean wr-ci
+has_line wr-ci 'CI_FIX_ACTIVE=foreign-fix running'
+has_line wr-ci "CI_FIX_RECENT=fix-recent completed $at"
+has_line wr-ci 'VISIBILITY=all_owners'
+has_line wr-ci 'NEXT=ci_fix_active'
+export UZI_WRITERS_OUT='{"writers":[{"run_id":"foreign-rw","kind":"mr_rework","status":"running","owner_id":"o2","repo_id":"r1","pipeline_ref":null,"mr_iid":42,"created_at":"t"}],"complete":true}'
+snap head_clean wr-rw
+has_line wr-rw 'MR_REWORK_ACTIVE=1'
+has_line wr-rw 'NEXT=mr_rework_active'
+export UZI_WRITERS_OUT='{"writers":[],"complete":true}'
+snap head_clean wr-empty
+has_line wr-empty 'CI_FIX_ACTIVE=none'; has_line wr-empty 'MR_REWORK_ACTIVE=0'; has_line wr-empty 'VISIBILITY=all_owners'
+has wr-empty 'NEXT=ready'
+for bad in 'junk' '{"writers":[],"complete":false}' '{"writers":[{"run_id":"a","kind":"ci_fix","status":"running","pipeline_ref":"other"}],"complete":true}'; do
+  UZI_WRITERS_OUT=$bad snap head_clean wr-bad
+  has_line wr-bad 'MR_REWORK=unreadable'; has wr-bad 'NEXT=unknown'; has_line wr-bad 'CI_FIX_ACTIVE=unknown'
+done
+for rc_ in 1 2 6; do
+  UZI_WRITERS_RC=$rc_ snap head_clean wr-rc; has wr-rc 'NEXT=unknown'; has_line wr-rc 'MR_REWORK=unreadable'
+done
+# HTTP 401/403 (rc 3) and 404 (rc 4) fall back to the owner list, labelled owner-only; older CLI too.
+export UZI_RUNS_JSON='[{"id":"own-fix","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"running"}]'
+for rc_ in 3 3 4; do
+  UZI_WRITERS_RC=$rc_ snap head_clean wr-fb
+  has_line wr-fb 'VISIBILITY=owner_only'; has_line wr-fb 'note: owner-only visibility; foreign or older writers are not excluded'
+  has_line wr-fb 'CI_FIX_ACTIVE=own-fix running'; has_line wr-fb 'NEXT=ci_fix_active'
+done
+UZI_RUNS_JSON='[]'; export UZI_RUNS_JSON
+UZI_WRITERS_RC=3 snap head_clean wr-fb-empty
+has_line wr-fb-empty 'VISIBILITY=owner_only'; has_line wr-fb-empty 'CI_FIX_ACTIVE=none'
+UZI_WRITERS_RC=3 UZI_RUN_LIST_FAIL=1 snap head_clean wr-fb-fail
+has wr-fb-fail 'NEXT=unknown'; has_line wr-fb-fail 'CI_FIX_ACTIVE=unknown'
+unset UZI_ADMIN_RW UZI_WRITERS_OUT UZI_WRITERS_RC
 unset UZI_REPO_JSON UZI_RUNS_JSON
 
 echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit; a conflicting PR is NEXT=conflict"
