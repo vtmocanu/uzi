@@ -1729,7 +1729,11 @@ fixture_archive_receipt() {
   # The receipt SQL is bounded by the remaining shared deadline (db_psql_rows SECS).
   db_psql_rows() {
     [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unexpected receipt SQL mutation'
-    [[ "${2:-}" =~ ^[1-9][0-9]*$ && "$2" -le "$budget" ]] || fail "unexpected receipt SQL bound: [${2:-}]"
+    # Exactly the time remaining on the shared deadline (the helper's own local, in
+    # dynamic scope), never the whole budget, and never a read once nothing remains.
+    # shellcheck disable=SC2154  # deadline is resolve_fixture_source_hold's local
+    [[ "${2:-}" =~ ^[1-9][0-9]*$ && "$2" -eq $((deadline - SECONDS)) ]] \
+      || fail "unexpected receipt SQL bound: [${2:-}] with $((deadline - SECONDS))s remaining"
     n="$(cat "$SEQ_DIR/receipt-polls")"
     echo $((n + 1)) > "$SEQ_DIR/receipt-polls"
     jq -nc --arg run "$UUID" --arg id "$fixture_id" --arg mode "$mode" --argjson n "$n" '
@@ -1749,8 +1753,11 @@ fixture_archive_receipt() {
     fi
     [[ "$output" == *'restore_at=2026-10-08T09:08:20Z'* && "$output" == *'fixture-heartbeat'* \
       && "$output" == *'fixture-register'* && "$output" == *'"captures"'* \
-      && "$output" == *'recreated agent log tail'* && "$output" == *'receipt timeout'* ]] \
+      && "$output" == *'recreated agent log tail'* && "$output" == *'receipt timeout'* \
+      && "$output" == *'read_rc=28'* ]] \
       || fail "timeout diagnostic omitted evidence: $output"
+    # Polls at 0s and 1s; at the 2s deadline no receipt SQL starts at all.
+    [ "$(cat "$SEQ_DIR/receipt-polls")" -eq 2 ] || fail "receipt SQL started at or past the deadline: $(cat "$SEQ_DIR/receipt-polls") polls"
     printf '%s\n' "$output"
     return 1
   fi
@@ -1765,9 +1772,10 @@ custody_case "captured fixture timeout retains row worker and recreation log" fa
 custody_case "capturing fixture that never settles times out on the shared deadline" fail 'still capturing after 2s' fixture_archive_receipt capturing-timeout
 custody_case "capturing fixture that becomes available waits for archive FINAL" pass 'fixture archive custody receipt:' fixture_archive_receipt capturing-available
 
-# The shared deadline is enforced by the real bounded reader. Extract it, then drive
-# the helper through holds reads that block (curl --max-time expiry) or that observe
-# the capturing -> source_only transition only at the deadline: neither may discard.
+# The shared deadline is enforced by the real bounded readers. Extract apiget_before, then
+# drive the helper through run, holds and archive reads that block (curl --max-time
+# expiry), receipt SQL that is held or killed at the deadline, or a capturing ->
+# source_only transition observed only at the deadline: none may discard past it.
 eval "$(awk '/^apiget_before\(\) \{/,/^\}/' "$LIB")"
 apiget_before_unit() {
   local mode="$1" JAR=fixture-jar BASE=http://fixture rc=0
@@ -1962,9 +1970,16 @@ fixture_hold_deadline() {
           # Wall clock: the receipt SQL holds until the real clock reaches the helper's
           # deadline (dynamic scope), then dies as if its limiter killed it.
           sleep() { :; }
+          # The first read is a good, still-open receipt; the second is killed, and the
+          # evidence must still carry the first.
           db_psql_rows() {
             [[ "${2:-}" =~ ^[1-9][0-9]*$ && "$2" -le "$timeout" ]] || fail "unexpected deadline read: receipt SQL bound [${2:-}]"
             echo "$2" >> "$SEQ_DIR/deadline-budgets"
+            if [ "$(wc -l < "$SEQ_DIR/deadline-budgets")" -eq 1 ]; then
+              receipt_released | jq -c '.holds[0] += {state:"open",final_disposition:null,release_evidence:null,
+                archive_matches:false,worker:{last_heartbeat_at:"good-snapshot-heartbeat"}}'
+              return 0
+            fi
             # shellcheck disable=SC2154  # deadline is resolve_fixture_source_hold's local
             while [ "$SECONDS" -lt "$deadline" ]; do command sleep 0.2; done
             return 137
@@ -2022,13 +2037,13 @@ fixture_hold_deadline() {
       [[ "$output" == *'archive listing failed or exceeded the 2s deadline (discard was acknowledged)'* ]] \
         || fail "slow post-discard archive listing missed the deadline diagnostic: $output" ;;
     slow-receipt-sql)
-      [[ "$output" == *'read_rc=137'* && "$output" == *'snapshot=none'* && "$output" == *'receipt timeout after 2s'* ]] \
-        || fail "slow receipt SQL missed the deadline diagnostic: $output" ;;
+      [[ "$output" == *'read_rc=137'* && "$output" == *'good-snapshot-heartbeat'* && "$output" == *'receipt timeout after 2s'* ]] \
+        || fail "killed receipt SQL lost its last good snapshot or diagnostic: $output" ;;
     slow-receipt-sql-error)
       [[ "$output" == *'receipt read failed (rc=1) before the 2s deadline'* && "$output" != *'receipt timeout'* ]] \
         || fail "fast receipt SQL error was misreported: $output" ;;
     slow-receipt-sql-real)
-      [[ "$output" == *'read_rc=137'* && "$output" == *'receipt timeout after 2s'* ]] \
+      [[ "$output" == *'read_rc=137'* && "$output" == *'snapshot=none'* && "$output" == *'receipt timeout after 2s'* ]] \
         || fail "hung receipt SQL was not killed at the deadline: $output"
       [ $((SECONDS - start_wall)) -lt 8 ] || fail "hung receipt SQL outlived the deadline: $((SECONDS - start_wall))s" ;;
   esac
@@ -2062,9 +2077,11 @@ wall_clock_deadline_case() {
 wall_clock_deadline_case "a capturing to source_only transition seen after the deadline fails with zero discards" late-transition
 wall_clock_deadline_case "a read that outlives the deadline before the owner disposition discards nothing" slow-archives
 wall_clock_deadline_case "a discard acknowledged after the deadline gets a bounded, refused re-read" post-discard-late
-wall_clock_deadline_case "a receipt SQL read held to the deadline fails with its last evidence and zero discards" slow-receipt-sql
+wall_clock_deadline_case "a receipt SQL read killed at the deadline keeps its last good snapshot, zero discards" slow-receipt-sql
 if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
   wall_clock_deadline_case "a hung receipt SQL is killed at the remaining budget by the real limiter" slow-receipt-sql-real
+else
+  echo "SKIP: hung receipt SQL real-limiter case (neither timeout nor gtimeout installed)"
 fi
 
 # Execute the actual owning phase boundaries against the real owner helper. The
