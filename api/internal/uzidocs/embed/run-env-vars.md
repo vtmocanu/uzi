@@ -67,17 +67,14 @@ these forms of the value: JSON-escaped (with and without escaped slashes),
 HTML-safe `\u00XX`, percent-encoded, and base64 or base64url text that embeds
 it (such as the entry a registry login stores, or an HTTP Basic header). Each
 form is also registered without a trailing line break, and for a multi-line
-value with LF line endings. Each line of a multi-line value that is not PEM header or footer armor is
-redacted on its own when its value part holds a token. The value part is the
-line without a leading `key:` or `key=` (optionally after `- ` and quotes; an
-`=` that only pads the end and a `:` followed by `//` are not key separators),
-and with the scheme and host (and port) of each URL removed; userinfo, path and
-query stay. Tokens are maximal runs of `A-Z a-z 0-9 + = _ -` (`/` separates
-them). A token qualifies with at least 8 characters and at least 5 distinct
-ones, and is either all digits, or has both letter cases, or has a letter and at
-least 2 digits. This over-masks identifier-like values with letters and several
-digits (such as a cloud kubeconfig context name) and CamelCase values of 8 or
-more characters. Redaction is exact-match with an 8-character floor, so it is a net, not a boundary: another
+value with LF line endings. Every line of a multi-line value that is at least 8
+characters long is redacted on its own, with no condition on letter case,
+digits or key name. The only lines left out are PEM header and footer armor
+(`-----BEGIN ...-----`, `-----END ...-----`) and whitespace-only lines; both
+exclusions are carve-outs proposed for owner approval (pending owner decision).
+So structural lines of a secret file, such as `apiVersion: v1` or
+`"type": "service_account",`, are masked wherever they appear in run output.
+Redaction is exact-match with an 8-character floor, so it is a net, not a boundary: another
 encoding of the value is not caught.
 
 A run's secret forms are computed once per claim and capped at 40,000,000
@@ -136,24 +133,34 @@ terminal preservation packs, recovery archives and the preserved patch.
   bounded at 1,000,000 paths, 256 MiB of path bytes and the scan deadline; past
   any of them the publish is withheld with the reason `path_scan_incomplete`.
 - A plain value found in tracked files holds nothing.
-- The preserved patch is withheld, not redacted, when the claim is over the form
-  cap; when a git-quoted header path decodes to a secret form (reason
-  `header_path`); when a whole-value form occurs in the raw patch or in a rebuilt per-hunk
-  pre-image or post-image (context plus removed or added lines, also with line
-  breaks normalized to LF); when any registered line form occurs in it; or, for
-  a run with secret variables, when the patch cannot be parsed (binary, combined
-  diff, a line-count mismatch, or a stray line such as a non-header line between a file
-  header and its first hunk). The image, line-form and parse checks apply when
+- The preserved patch is withheld, not redacted, in this order: when the claim
+  is over the form cap; when a whole-value form occurs in the raw patch (reason
+  `raw_value`); when any registered line form occurs in it (`line_form`); and
+  when the run holds any multi-line secret (`multi_line_secret`). That means any
+  live secret or retained version whose value contains a line break, of any
+  length; a secret saved with a trailing line break counts. For a run whose
+  secrets are all single-line it is also withheld when a git-quoted header path
+  decodes to a secret form (`header_path`), when the patch cannot be parsed
+  (`unparseable_patch`: binary, combined diff, a line-count mismatch, or a stray
+  line such as a non-header line between a file header and its first hunk), or
+  when a whole-value form occurs in a rebuilt per-hunk pre-image or post-image
+  (`hunk_image_value`, a backstop only: a single-line value holds no line
+  break, so a hit is already `raw_value`). The image and parse checks apply when
   the run has any secret variable, retired versions included, so such a run
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
-- Gaps that remain: a secret whose lines hold no qualifying token (tokens of
-  single-case letters (with any `+=_-`) alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters, a secret in a URL's host,
-  formatted codes such as `8462-9137`, non-ASCII text, or a secret that is the
-  line's leading key) and that is split across files or by elided context between
-  hunks, and a value that appears only re-encoded, such as each line indented in a YAML block or in an
-  encoding other than those registered. A committed file that holds the whole
-  secret is still blocked.
+- A run with a multi-line secret therefore has no preserved patch. Its work is
+  not lost: recover it through the run's custody (the held pack or recovery
+  capture) with `uzi run export`.
+- Pending owner decision, gaps that remain: a fragment of a secret line shorter
+  than 8 characters, or a line that appears only re-encoded (for example indented
+  in a YAML block, or in an encoding other than those registered), is not
+  masked in run output; the redaction cost grows with the number of forms times
+  the longest literal for long periodic secret lines; a terminal report journaled
+  with a patch by an older worker and replayed after an upgrade keeps that patch;
+  and the whitespace-only exemption uses JavaScript's `\s`, which includes
+  Unicode spaces such as NBSP. A committed file that holds the whole secret is
+  still blocked.
 - Known gap: the planning diff sent to a cross-check and the diff context in a
   pull request description are only redacted, not path-scanned. A secret with
   non-ASCII characters used as a path name reaches them octal-escaped

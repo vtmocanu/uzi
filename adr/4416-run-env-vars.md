@@ -205,13 +205,14 @@ and three standard and three URL-safe base64 alignments trimmed to the character
 depend on neighbouring bytes. Each is also registered for the value without its trailing line
 break and, for a multi-line value, with line endings normalized to LF. A multi-line value also
 registers each of its lines for redaction (and for the preserved-patch line check) only, never as a
-scan needle, because a public line would hit unrelated files. A line that is not PEM armor is
-registered only when its value part holds a token (`lineForms` in `run-env-forms.ts`). The value part
-is the line without a leading `key:` or `key=` (optionally after `- ` and quotes; an `=` that only
-pads the end and a `:` followed by `//` are not key separators), with the scheme and host[:port] of
-each URL removed (userinfo, path and query stay). Tokens are maximal runs of `A-Z a-z 0-9 + = _ -`
-(`/` separates). A token qualifies with at least 8 characters and 5 distinct ones, and is all digits,
-or has both letter cases, or has a letter and at least 2 digits. The scan needles instead add
+scan needle, because a public line would hit unrelated files. Every line of 8 or more characters is
+registered (`lineForms` in `run-env-forms.ts`), with no condition on letter case, token, digits or
+key name; the token rule, the leading-key strip and the URL scheme and host carve-out are removed.
+The only lines excluded are PEM armor (`-----BEGIN ...-----` and `-----END ...-----`) and
+whitespace-only lines. Structural lines of a secret file, such as `apiVersion: v1` or
+`"type": "service_account",`, are therefore masked wherever they appear in run output. The two
+exclusions are carve-outs proposed for owner approval (pending owner decision): PEM armor is public
+text that carries no secret, and a whitespace-only line holds nothing to mask. The scan needles instead add
 diff-shaped forms of the value, its lines joined by `\n+`, `\n-` and `\n ` (LF and CRLF). Plain
 values are never registered. The forms join the run's existing redactor, so every sink it already
 covers masks them; the plan, the plan summary, the intent summary and
@@ -265,14 +266,23 @@ Sites:
 - **Finalize, on every forge**, before the branch push. A hit, or a scan that cannot prove the
   range clean, fails the run with `fail_origin = push_secret_blocked`, no push and no preserved
   patch.
-- **The preserved patch** (`scanGatedPatch`, `patchScanVerdict`, `patchImages`): the raw patch is
-  withheld whole when the claim is over budget; when a whole-value form occurs in it; when one occurs
-  in a rebuilt per-hunk pre-image or post-image (context plus removed or added lines, also with line
-  breaks normalized to LF); when any registered line form occurs; or when it cannot be parsed
-  (binary, combined diff, a line-count mismatch, or a stray line such as a non-header line between a file
-  header and its first hunk). The image, line-form and parse checks apply when the run has any
-  secret variable, retired versions included, so a run with a secret variable loses its preserved patch when the diff touches a binary file. Otherwise it is
-  redacted and gitleaks-scanned as before.
+- **The preserved patch** (`scanGatedPatch` in `agent/src/runner.ts`, `patchScanVerdict`,
+  `patchImages`): the raw patch is withheld whole, checked in this order, when the claim is over
+  budget; when a whole-value form occurs in it (`raw_value`); when any registered line form occurs
+  (`line_form`); when the run holds any multi-line secret (`multi_line_secret`), meaning any live
+  secret or retained version whose value contains a CR or LF, of any length, so a value saved with a
+  trailing line break counts; and, for a run whose secrets are all single-line, when a git-quoted
+  header path decodes to a secret form (`header_path`), when it cannot be parsed (`unparseable_patch`:
+  binary, combined diff, a line-count mismatch, or a stray line such as a non-header line between a
+  file header and its first hunk), or when a whole-value form occurs in a rebuilt per-hunk pre-image
+  or post-image (`hunk_image_value`; context plus removed or added lines, also with line breaks
+  normalized to LF). The multi-line rule closes the gaps of a secret split across files or by elided
+  context between hunks, which no check on fragments below the line-form floor can close; the work
+  stays recoverable through the run's custody (held pack, recovery capture, `uzi run export`). With
+  every secret single-line, `hunk_image_value` is a backstop only: a single-line form holds no line
+  break, so a single-line hit is already `raw_value`. The image and parse checks apply when the run
+  has any secret variable, retired versions included. Otherwise the patch is redacted and
+  gitleaks-scanned as before.
 
 ## Where the PRD differed from the code
 
@@ -306,10 +316,6 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
-- **Patch gaps.** The patch check misses a secret whose lines hold no qualifying token (single-case letters (with any `+=_-`) alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters, a secret in a URL's host, formatted codes such as
-  `8462-9137`, non-ASCII text, a secret that is the line's leading key) and that is split across files or by elided context between hunks, and a value that appears only re-encoded
-  (each line indented in a YAML block, or an encoding other than those registered). The blob scan
-  still blocks a committed file.
 - **Path gap in two sinks.** The planning diff sent to a cross-check
   and the PR description diff context are redacted, not path-scanned: a secret with non-ASCII
   characters used as a path name reaches them C-quoted (octal-escaped) and unredacted.
@@ -325,6 +331,21 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   to a `run_env_v1` worker. During a rolling deploy a child claimed by an old worker ends
   `checker_unavailable`, which forces a human gate.
 - Neither of the last two is a leak: both withhold or force a human decision.
+
+Pending owner decision (not accepted). The split-across-files and elided-context patch gaps are
+closed by the `multi_line_secret` rule above. These exceptions remain from this change:
+
+- **(a) Short fragments and re-encoded lines.** A fragment of a secret line shorter than 8
+  characters, or a line that appears only re-encoded (for example indented in a YAML block, or in an
+  unregistered encoding), is not masked in run output. The blob scan still blocks a committed file
+  that holds the whole value.
+- **(b) Redaction cost for periodic secret lines.** The radix-trie index removes the cost of many
+  forms sharing a prefix, but the worst case of n x longest-literal for long periodic secret lines is
+  unchanged.
+- **(c) A replayed terminal report keeps its patch.** A terminal report journaled with a patch by an
+  older worker and replayed after an upgrade keeps that patch.
+- **(d) Whitespace-only lines use `\s`.** The whitespace-only exemption uses JavaScript's `\s`, which
+  includes Unicode spaces such as NBSP, so a line made only of such characters is not registered.
 
 ## Not shipped in M2
 
