@@ -10377,6 +10377,26 @@ describe("CodexExecutor: Docker wiring", () => {
   });
 });
 
+// PRD 4416 M2: the Codex prompts list the variables the command env builder actually injected.
+describe("CodexExecutor prompts: the listed run variables are the injected ones", () => {
+  const rv = (name: string, value: string) =>
+    ({ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: 1, name, value, secret: false, description: "" });
+
+  it("omits a variable the tool profile already set, and lists a normal one", async () => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: { NPM_TOKEN: "x" } }) };
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(
+      makeCtx({ runEnv: [rv("NPM_TOKEN", "run-value"), rv("REGION", "eu-west")] }).ctx), 3000, "run");
+    assert.equal(rig.fileopSpawns[0]!.env.NPM_TOKEN, "x", "the tool profile wins");
+    assert.equal(rig.fileopSpawns[0]!.env.REGION, "eu-west");
+    const sent = JSON.stringify(rig.transport.requests);
+    assert.match(sent, /<run_env_[0-9a-f]+>/);
+    assert.match(sent, /- REGION \(repo scope\)/);
+    assert.doesNotMatch(sent, /- NPM_TOKEN/);
+  });
+});
+
 describe("CodexExecutor: credential-free command env (item 6)", () => {
   const FIXED_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -37287,7 +37307,7 @@ describe("CodexExecutor prompts: run variables", () => {
 
   for (const phase of ["planPrompt", "implementPrompt"] as const) {
     it(`${phase} lists the variables and never a secret value`, () => {
-      const prompt = builders[phase](makeCtx({ runEnv }).ctx);
+      const prompt = builders[phase](makeCtx({ runEnv, injectedRunEnv: runEnv }).ctx);
       assert.match(prompt, /<run_env_[0-9a-f]+>/);
       assert.ok(prompt.includes("DB_PASSWORD") && prompt.includes("login"));
       assert.ok(!prompt.includes(SECRET));
@@ -37299,7 +37319,7 @@ describe("CodexExecutor prompts: run variables", () => {
     it(`${phase} is unchanged without variables`, () => {
       const fresh = makeCtx().ctx;
       assert.ok(!builders[phase](fresh).includes("run_env_"));
-      assert.equal(norm(builders[phase]({ ...fresh, runEnv: [] })), norm(builders[phase](fresh)));
+      assert.equal(norm(builders[phase]({ ...fresh, runEnv: [], injectedRunEnv: [] })), norm(builders[phase](fresh)));
     });
   }
 });

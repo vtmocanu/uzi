@@ -1,6 +1,7 @@
 import { runEnvRedactionForms, runEnvScanNeedles, type ScanNeedle } from "./run-env-forms.js";
 import { hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
 import { runEnvContextField } from "./run-env-lane.js";
+import { markRunEnvSeen, runEnvSeen } from "./run-env-seen.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
@@ -64,6 +65,7 @@ import {
   isWorkflowScopeRejection,
   INVENTORY_CONTENT_PROOF_BOUNDS,
   RECOVERY_MAX_BUNDLE_BYTES,
+  capReviewDiff,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
 import {
@@ -347,6 +349,14 @@ const RECEIPT_REPAIR_NEEDED_MESSAGE = "recovery source does not belong to this k
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** `body` with its `failure_reason` scrubbed of the run's secrets and re-capped to MAX_FAILURE_REASON_LEN (the
+ *  redaction marker can lengthen a short secret). The same object when the reason is absent or carries none. */
+function redactFailureReason<T extends { failure_reason?: string }>(redactText: (text: string) => string, body: T): T {
+  if (typeof body.failure_reason !== "string") return body;
+  const safe = redactText(body.failure_reason);
+  return safe === body.failure_reason ? body : { ...body, failure_reason: safe.slice(0, MAX_FAILURE_REASON_LEN) };
+}
 /** Bound remembered unsafe markers per flight; unknown identity or overflow stays blocked. */
 const WIP_UNSAFE_MARKER_LIMIT = 64;
 
@@ -6375,6 +6385,12 @@ export class RunRunner {
     const runId = claim.run_id;
     const admission = await this.preparePolicyAdmission(claim);
     if (admission === false) return;
+    // PRD 4416 M2: a claim that carries variables is recorded durably BEFORE the executor, the redactor
+    // registrations or the scan needles exist, so no variable is handed out without the marker. A failed write
+    // throws out of the claim: the run never starts with variables.
+    if ((claim.secrets.run_env?.length ?? 0) > 0 || (claim.secrets.run_env_redact?.length ?? 0) > 0) {
+      await markRunEnvSeen(this.git.runEnvSeenRoot, runId);
+    }
     // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
     // canaries with the logger BEFORE makeExecutor, so a construction error inside the
     // Codex executor factory can never log an unredacted token. Both are secrets; absent on
@@ -8707,6 +8723,8 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
+    // Every terminal report is journaled and sent from here, so the reason is scrubbed once, before it is stored.
+    body = redactFailureReason(flight.redactText, body);
     const deps = this.terminalDeps();
     const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
     const previouslyAttempted = flight.completionSendAttempted ||
@@ -12043,8 +12061,9 @@ export class RunRunner {
     // is not enough on its own: it can be trustworthy AND carry findings.
     const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
       if (rawPatch === null) return undefined;
-      // PRD 4416 M2: the RAW patch is searched for the run's secret variable values first. Redaction below would
-      // scrub a registered form, but a patch that carries one is withheld whole rather than shipped scrubbed.
+      // PRD 4416 M2: the RAW, uncapped patch is searched for the run's secret variable values first (a value
+      // straddling the byte cap must still be seen). Redaction below would scrub a registered form, but a patch
+      // that carries one is withheld whole rather than shipped scrubbed.
       const variableHits = textHitVariables(rawPatch, needlesOf(flight));
       if (variableHits.length > 0) {
         runLog.warn("preserved patch withheld: it carries the value of a run secret variable", {
@@ -12052,7 +12071,7 @@ export class RunRunner {
         });
         return undefined;
       }
-      const patch = redactText(rawPatch);
+      const patch = redactText(capReviewDiff(rawPatch));
       const scan = await this.git.scanPatchForSecrets(patch);
       if (scan.trusted && scan.findings.length === 0) return patch;
       runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
@@ -12081,7 +12100,7 @@ export class RunRunner {
     const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
       if (ciConfigGuardReported) return;
       ciConfigGuardReported = true;
-      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
+      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref, { untruncated: true }), "ci_config_guard");
       const reason = composeCIConfigGuardReason(paths, patch !== undefined);
       batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
       runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
@@ -12215,7 +12234,7 @@ export class RunRunner {
       await this.git.scratchPublicationPreflight(workflowBarePath, result.branch);
       workflowReported = true;
       const patch = await scanGatedPatch(
-        originalWorkflowTip ? await this.git.workflowScopeDiff(workflowBarePath, originalWorkflowTip) : null,
+        originalWorkflowTip ? await this.git.workflowScopeDiff(workflowBarePath, originalWorkflowTip, { untruncated: true }) : null,
         "workflow_scope_missing",
       );
       batcher.emit({ kind: "status", agent: "worker", payload: {
@@ -12708,7 +12727,7 @@ export class RunRunner {
       if (scanRangeTrusted) {
         // Reuse the same diff helper failBaseAlignConflict uses, behind the same exact-text gate.
         patch = await scanGatedPatch(
-          await this.git.workflowScopeDiff(finalizeBarePath, trackingRef),
+          await this.git.workflowScopeDiff(finalizeBarePath, trackingRef, { untruncated: true }),
           "history_rewritten",
         );
       }
@@ -12844,7 +12863,7 @@ export class RunRunner {
             // reason, byte-identical.
             const failBaseAlignConflict = async (stage: "align" | "import" = "align") => {
               const patch = await scanGatedPatch(
-                await this.git.workflowScopeDiff(alignBarePath, originalAgentTip),
+                await this.git.workflowScopeDiff(alignBarePath, originalAgentTip, { untruncated: true }),
                 "finalize_base_align_conflict",
               );
               const what = stage === "import"
@@ -13646,7 +13665,7 @@ export class RunRunner {
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
     const issueTitleLabel = linkedDelivery ? linkedIssueLabel(linkedIssueKey(claim)) : undefined;
     const titleFor = (): string => {
-      const title = mrTitle(claim, result.scopeCapped, completionScope);
+      const title = redactText(mrTitle(claim, result.scopeCapped, completionScope));
       return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath, issueTitleLabel) : title;
     };
     let mr: Awaited<ReturnType<typeof forge.createMergeRequest>>;
@@ -14295,6 +14314,7 @@ export class RunRunner {
               body.status === "failed" && body.failure_reason === "run cancelled"))
           throw new RetainedRecoveryStop();
         if (steering.claimFence() !== undefined) throw new StaleClaimError();
+        body = redactFailureReason(redactText, body);
         const memory = flight.workerMemory;
         const memorySequence = memory && body.status !== undefined ? ++memory.stateSequence : undefined;
         const reportOrdinal = body.status !== undefined ? (flight.stateReportOrdinal = (flight.stateReportOrdinal ?? 0) + 1) : undefined;
@@ -23276,6 +23296,7 @@ export class RunRunner {
     return resolveScanNeedles({
       live: this.liveScanNeedles.get(runId),
       fetchProtected: () => this.client.getRunEnvRedact(runId, signal),
+      runEnvSeen: () => runEnvSeen(this.git.runEnvSeenRoot, runId),
     });
   }
 

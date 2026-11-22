@@ -2,8 +2,9 @@
 //
 // Before each scanned publish every object the publication would carry (commits, trees, blobs: messages,
 // paths and contents, in every commit of the outgoing range, not only the final tree) is searched for the
-// REGISTERED forms of the run's secret values (run-env-forms.ts: the value, its JSON-escaped form and the
-// three base64 alignments). Plain values are never needles. The verdict is one of:
+// REGISTERED forms of the run's secret values (run-env-forms.ts: the value in its raw, JSON, HTML-safe and
+// percent-encoded forms, the standard and URL-safe base64 alignments, and for a multi-line value its
+// diff-shaped forms). Plain values are never needles. The verdict is one of:
 //   clean    the range was read in full and holds no needle; it names the exact {tip, excludes} it covers
 //   hit      at least one needle occurs; findings carry the variable NAME (never a value) under `uzi-run-env`
 //   withhold the range could not be proven clean (deadline, git error, unresolved ref, over the byte cap,
@@ -77,6 +78,18 @@ export function hitVariableNames(findings: readonly SecretFinding[]): string[] {
   return [...new Set(findings.flatMap((f) => (typeof f.variable === "string" ? [f.variable] : [])))];
 }
 
+/** The `code` of a JSON error body, or undefined when the body is not a JSON object with a string `code`. */
+function errorCode(body: unknown): string | undefined {
+  if (typeof body !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const code = typeof parsed === "object" && parsed !== null ? (parsed as { code?: unknown }).code : undefined;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export type NeedleResolution =
   | { kind: "needles"; needles: ScanNeedle[] }
   | { kind: "withhold"; reason: string };
@@ -88,14 +101,21 @@ export type NeedleResolution =
  *    receives variables is never withheld while its flight is live.
  *  - With no flight (the run is terminal, the worker restarted, or a held or terminal publication lane runs
  *    after the flight is gone) the api is asked. `{protected:false}` means no needles, and is also the answer
- *    for a run with no governing run (neither a lead-lane run nor a cross-check child). A 404 (the run is
- *    deleted or is not this worker's), a 409 (vault locked or a receipted version
- *    unavailable), a network or decode error all withhold: nothing local can prove the run holds no secret
- *    versions, so the publish is refused now and retried later.
+ *    for a run with no governing run (neither a lead-lane run nor a cross-check child).
+ *  - A 404 carrying the code `run_env_run_not_found` (the run is deleted or is not this worker's) withholds.
+ *    A 409 carrying `run_env_redact_closed` (the protection window is closed) withholds, as does any other
+ *    409 (vault locked, a receipted version unavailable), a network or decode error, and any other status.
+ *  - A 404 WITHOUT that code means the route itself is absent (a proxy or an older api answered). It yields
+ *    no needles only when the local marker proves this worker never handed the run variables
+ *    (`runEnvSeen` resolves `false`); a marker that exists, a read error (`"unknown"`) or a missing check
+ *    withholds.
+ * A withheld publish is refused now and retried later.
  */
 export async function resolveScanNeedles(opts: {
   live: readonly ScanNeedle[] | undefined;
   fetchProtected: () => Promise<RunEnvRedactResponse>;
+  /** Whether this worker ever handed the run variables: see run-env-seen.ts. */
+  runEnvSeen?: () => Promise<boolean | "unknown">;
 }): Promise<NeedleResolution> {
   if (opts.live !== undefined) return { kind: "needles", needles: [...opts.live] };
   let body: RunEnvRedactResponse;
@@ -104,7 +124,21 @@ export async function resolveScanNeedles(opts: {
   } catch (e) {
     const status = typeof e === "object" && e !== null && typeof (e as { status?: unknown }).status === "number"
       ? (e as { status: number }).status : undefined;
-    return { kind: "withhold", reason: status === undefined ? "protection_unavailable" : `protection_http_${status}` };
+    if (status === undefined) return { kind: "withhold", reason: "protection_unavailable" };
+    const code = errorCode((e as { body?: unknown }).body);
+    if (status === 404 && code === "run_env_run_not_found") return { kind: "withhold", reason: "protection_run_not_found" };
+    if (status === 409 && code === "run_env_redact_closed") return { kind: "withhold", reason: "protection_closed" };
+    if (status === 404 && code === undefined && opts.runEnvSeen !== undefined) {
+      let seen: boolean | "unknown";
+      try {
+        seen = await opts.runEnvSeen();
+      } catch {
+        seen = "unknown";
+      }
+      if (seen === false) return { kind: "needles", needles: [] };
+      return { kind: "withhold", reason: seen === true ? "protection_route_missing_variables_seen" : "protection_route_missing_marker_unreadable" };
+    }
+    return { kind: "withhold", reason: `protection_http_${status}` };
   }
   if (!body.protected) return { kind: "needles", needles: [] };
   return { kind: "needles", needles: runEnvScanNeedles(undefined, body.versions) };

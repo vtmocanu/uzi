@@ -5,7 +5,8 @@ import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { runEnvRedactionForms } from "../src/run-env-forms.js";
 import fs from "node:fs";
 import path from "node:path";
-import { api, fakeGitlab, fx, gitlabClaim, homeDir, installHarness, runnerWith, secretRecordingLogger } from "./runner-harness.js";
+import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, secretRecordingLogger } from "./runner-harness.js";
+import { runEnvSeen } from "../src/run-env-seen.js";
 
 installHarness();
 
@@ -90,6 +91,43 @@ describe("runner wiring of run variables", () => {
     const exec: Executor = { run: async (ctx) => { seen = ctx; return { branch: ctx.branch, reportOnly: true, summary: "ok" }; } };
     await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
     assert.equal(seen!.runEnv, undefined);
+  });
+});
+
+// PRD 4416 M2: a claim that carries variables leaves a durable marker before any executor exists, and a run that
+// cannot write it never starts with variables.
+describe("the run variable marker", () => {
+  it("is written before the executor runs, and only for a claim that carries variables", async () => {
+    const { gitlab } = fakeGitlab();
+    const withVars = gitlabClaim(iid++, { secrets: secrets() });
+    const without = gitlabClaim(iid++);
+    const during: Array<boolean | "unknown"> = [];
+    const exec: Executor = {
+      run: async (ctx) => {
+        during.push(await runEnvSeen(git.runEnvSeenRoot, ctx.runId));
+        return { branch: ctx.branch, reportOnly: true, summary: "ok" };
+      },
+    };
+    await runnerWith(() => ({ executor: exec }), gitlab).execute(withVars);
+    await runnerWith(() => ({ executor: exec }), gitlab).execute(without);
+    assert.deepEqual(during, [true, false]);
+    assert.equal(await runEnvSeen(git.runEnvSeenRoot, withVars.run_id), true, "and it stays after the run ends");
+  });
+
+  it("a marker that cannot be written stops the run before any executor is built", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(iid++, { secrets: secrets() });
+    const original = git.runEnvSeenRoot;
+    const blocker = path.join(fx.dataDir, "not-a-directory");
+    fs.writeFileSync(blocker, "x");
+    Object.defineProperty(git, "runEnvSeenRoot", { value: path.join(blocker, "run-env-seen"), configurable: true, writable: true });
+    let built = 0;
+    try {
+      await runnerWith(() => { built++; return { executor: { run: async () => { throw new Error("must not run"); } } }; }, gitlab).execute(claim).catch(() => undefined);
+    } finally {
+      Object.defineProperty(git, "runEnvSeenRoot", { value: original, configurable: true, writable: true });
+    }
+    assert.equal(built, 0, "no executor was built");
   });
 });
 

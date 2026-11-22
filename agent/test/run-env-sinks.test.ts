@@ -6,17 +6,22 @@ import { makeMemoryToolHandlers } from "../src/memory-tools.js";
 import { makeForgeToolHandlers } from "../src/forge-tools.js";
 import { makeFindingsToolHandlers } from "../src/findings-tools.js";
 import { redactPlanSummary } from "../src/summary-runner.js";
-import { makeTextRedactor } from "../src/redact.js";
+import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { MessageBatcher } from "../src/batcher.js";
+import { sanitizeNowText, trimToolFrame } from "../src/now-summary.js";
+import type { Executor } from "../src/executor.js";
+import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import type { ClaimRunEnvVar, OutgoingMessage } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
-import { fakeGitlab, git, installHarness, runnerWith } from "./runner-harness.js";
+import { api, fakeGitlab, git, gitlabClaim, installHarness, runner, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 import { nullLogger } from "./helpers.js";
 
 installHarness();
 
-// PRD 4416 M2 (W2b): sinks that carry agent-authored or model-authored text out of the worker redact it with
-// the run's redactor, so a registered run-variable secret never reaches the outbound payload. The memory,
-// MR-thread reply and finding sinks already redacted (pin tests here); the plan summary, the planning diff
-// and the code cross-check repository instructions are redacted by this change. Dummy values only.
+// PRD 4416 M2: sinks that carry agent-authored or model-authored text out of the worker redact it with the
+// run's redactor, so a registered run-variable secret never reaches the outbound payload. Dummy values only.
+// CI evidence is not a sink: ci-evidence.ts and ci-evidence-tools.ts only download evidence and hand it to the
+// model, and no module sends CI evidence notes out of the worker.
 
 const SECRET = "dummy-secret-run-value-000000";
 const redactText = makeTextRedactor([SECRET]);
@@ -55,7 +60,7 @@ describe("already-redacted sinks (pins)", () => {
   });
 });
 
-describe("sinks redacted by this change", () => {
+describe("plan summary and planning diff sinks", () => {
   it("the plan summary and its deltas", () => {
     const out = redactPlanSummary({ summary: `s ${SECRET}`, deltas: [{ kind: "added", text: `d ${SECRET}` }, { kind: "dropped", text: "clean" }] }, redactText);
     assert.ok(!leaked(out));
@@ -139,5 +144,82 @@ describe("source pins: the executors and the runner route these payloads through
     const text = src("runner.ts");
     assert.match(text, /return "text" in read \? flight\.redactText\(read\.text\) : "";/);
     assert.equal((text.match(/this\.captureCheckedPlanningDiff\(.*runLog, flight\.redactText\)/g) ?? []).length, 2);
+  });
+});
+
+const src = (rel: string): string => fs.readFileSync(path.join(new URL("../src/", import.meta.url).pathname, rel), "utf8");
+const secretVar = (name: string, value: string): ClaimRunEnvVar =>
+  ({ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name, value, secret: true, description: "" });
+const claimSecrets = () => ({ forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: [secretVar("DB_PASSWORD", SECRET)] });
+
+describe("questions, now summary, failure reasons and the merge request", () => {
+  it("a question reaches the api through the batcher's payload redactor", async () => {
+    const sent: OutgoingMessage[] = [];
+    const client = { async postMessages(_id: string, messages: OutgoingMessage[]) { sent.push(...messages); } } as unknown as WorkerClient;
+    const forms = runEnvRedactionForms([secretVar("DB_PASSWORD", SECRET)], []);
+    const batcher = new MessageBatcher(client, "run-q", 0, 0, nullLogger(), makeRedactor(forms), makeTextRedactor(forms));
+    batcher.emit({ kind: "question", agent: "lead", payload: { question_id: "q1", questions: [{ header: "h", question: `is ${SECRET} right?`, options: [{ label: `use ${SECRET}` }] }] } });
+    await batcher.close();
+    assert.equal(sent.length, 1);
+    assert.ok(!leaked(sent));
+  });
+
+  it("the now summary scrubs the frame fields and the note text", () => {
+    const frame = trimToolFrame({ kind: "tool_use", agent: "lead", payload: { name: "Bash", input: { description: `deploy ${SECRET}` } } } as never, redactText);
+    assert.ok(frame !== undefined && !leaked(frame));
+    assert.ok(!leaked(sanitizeNowText(`working on ${SECRET}`, redactText)));
+    assert.match(src("runner.ts"), /new NowSummaryController\(\{[\s\S]{0,1200}?redact: flight\.redactText,/);
+  });
+
+  it("a failed run reports a failure reason without the value", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(46101, { secrets: claimSecrets() });
+    const exec: Executor = { run: async () => { throw new Error(`deploy failed with ${SECRET}`); } };
+    await runner(exec, gitlab).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed.length > 0 && failed.every((s) => typeof s.body.failure_reason === "string" && s.body.failure_reason.length > 0));
+    assert.ok(!leaked(failed.map((s) => s.body)));
+  });
+
+  it("the merge request title and body carry no value from the issue", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(46102, { secrets: claimSecrets(), issue_title: `rotate ${SECRET}` });
+    simulateCommittedWork();
+    const exec: Executor = { run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "own", agents: ["coder", "reviewer"] } }) };
+    await runner(exec, gitlab).execute(claim);
+    assert.equal(calls.length > 0, true, "a merge request was opened: " + JSON.stringify(api.states.filter((s) => s.runId === claim.run_id).map((s) => [s.body.status, s.body.failure_reason])));
+    assert.match(calls[0]!.body ?? "", /rotate /, "the title is still built from the issue");
+    for (const call of calls) assert.ok(!(call.body ?? "").includes(SECRET), "no outbound forge body carries the value");
+  });
+
+  it("every failure and park reason write goes through the run's redactor", () => {
+    const text = src("runner.ts");
+    // The terminal journal and the state report choke point scrub the reason before it is stored or sent.
+    assert.match(text, /body = redactFailureReason\(flight\.redactText, body\);/);
+    assert.match(text, /body = redactFailureReason\(redactText, body\);/);
+    // Reasons composed from diff and finding text are redacted where they are composed.
+    assert.match(text, /scratchPublicationFailureReason\(err, redactText\)/);
+    assert.match(text, /composeLocalScanBlockedReason\(findings, \{ redact: redactText/);
+    assert.match(text, /composeLocalScanBlockedReason\(scan\.findings, \{ redact: redactText/);
+    assert.match(text, /const reason = sanitizeForLog\(redactText\(rawReason\), Number\.POSITIVE_INFINITY\);/);
+  });
+
+  it("the decisions memo, the non-closing reason and the merge request title are redacted where they are built", () => {
+    const text = src("runner.ts");
+    assert.match(text, /clampUtf8Bytes\(flight\.redactText\(memo\), DECISIONS_MEMO_MAX_BYTES\)/);
+    assert.match(text, /const effectiveNonClosing = declaration \? \{ reason: flight\.redactText\(declaration\.reason\) \} : undefined;/);
+    assert.match(text, /redactNonClosingReason\(flight\.redactText, effectiveDeclared\.reason\)/);
+    assert.match(text, /redactNonClosingReason\(flight\.redactText, nonClosing\.reason\)/);
+    assert.match(text, /const title = redactText\(mrTitle\(claim, result\.scopeCapped, completionScope\)\);/);
+    assert.match(text, /title: sliceWellFormed\(redactText\(mrTitle\(claim, result\.scopeCapped, completionScope\)\), 1024\)/);
+  });
+
+  it("the merge request body is built from redacted inputs", () => {
+    const text = src("runner.ts");
+    assert.match(text, /lead: result\.prSummary \? redactStrings\(result\.prSummary, redactText\) : result\.prSummary,/);
+    const ctx = src("pr-description-context.ts");
+    for (const input of ["Title: ${input.issueTitle}", "input.prdText", "planRaw", "renderPrevious(input.previous)", "claimsRaw"]) {
+      assert.ok(ctx.includes(`part(redact, ${input.startsWith("Title") ? "`" + input : input}`), input);
+    }
   });
 });

@@ -153,7 +153,7 @@ describe("only the lead lane receives run variables", () => {
   // The files that may mention the run env at all: the seam, the claim path, the lead-lane builders and executors.
   const ALLOWED_FILES = new Set([
     "client.ts", "executor.ts", "protocol.ts", "runner.ts", "sdk-env.ts", "sdk-executor.ts", "worker.ts",
-    "run-env-claim.ts", "run-env-forms.ts", "run-env-inject.ts", "run-env-lane.ts", "run-env-names.ts", "run-env-prompt.ts",
+    "run-env-claim.ts", "run-env-forms.ts", "run-env-inject.ts", "run-env-lane.ts", "run-env-names.ts", "run-env-prompt.ts", "run-env-seen.ts",
     "prompt.ts", "agents.ts", path.join("codex", "render.ts"),
     path.join("codex", "codex-executor.ts"),
   ]);

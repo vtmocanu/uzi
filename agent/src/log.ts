@@ -6,7 +6,12 @@
 // from the final serialized line, so an accidental `log.info("...", { url })`
 // that embedded a token cannot leak it.
 
-export type LogLevel = "debug" | "info" | "warn" | "error";
+import { literalSpanFinder, replaceSpans, type SpanFinder } from "./redact.js";
+
+/** The most registered strings scrubbed one pass each. */
+const INDEXED_REGISTRY_MIN = 64;
+
+export type LogLevel ="debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
   debug: 10,
@@ -49,20 +54,38 @@ const REDACTED = "***REDACTED***";
 class SecretRegistry {
   private readonly counts = new Map<string, number>();
 
+  /** The single-pass finder over every registered string and its JSON-escaped form, built when a long list
+   *  is first scrubbed against and dropped whenever the set of strings changes. */
+  private indexed: SpanFinder | undefined;
+
   add(secret: string): void {
     // Guard against short/empty values whose blanket replacement would corrupt
     // unrelated output.
-    if (secret && secret.length >= 8) this.counts.set(secret, (this.counts.get(secret) ?? 0) + 1);
+    if (secret && secret.length >= 8) {
+      if (!this.counts.has(secret)) this.indexed = undefined;
+      this.counts.set(secret, (this.counts.get(secret) ?? 0) + 1);
+    }
   }
 
   remove(secret: string): void {
     const n = this.counts.get(secret);
     if (n === undefined) return; // never added, or already fully evicted
-    if (n <= 1) this.counts.delete(secret);
-    else this.counts.set(secret, n - 1);
+    if (n <= 1) {
+      this.counts.delete(secret);
+      this.indexed = undefined;
+    } else this.counts.set(secret, n - 1);
   }
 
   scrub(line: string): string {
+    // A run's secret variables register a form per line of every multi-line value: past this many strings one
+    // indexed pass replaces the pass per string.
+    if (this.counts.size > INDEXED_REGISTRY_MIN) {
+      this.indexed ??= literalSpanFinder([...this.counts.keys()].flatMap((s) => {
+        const escaped = JSON.stringify(s).slice(1, -1);
+        return escaped === s ? [s] : [s, escaped];
+      }));
+      return replaceSpans(line, this.indexed(line));
+    }
     let out = line;
     for (const s of this.counts.keys()) {
       out = out.split(s).join(REDACTED);

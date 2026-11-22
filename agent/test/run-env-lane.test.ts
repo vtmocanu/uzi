@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { isRunEnvLeadLane, leadLaneRunEnv } from "../src/run-env-lane.js";
 import { RUN_KINDS, type ClaimRunEnvVar } from "../src/protocol.js";
 
@@ -8,7 +9,19 @@ import { RUN_KINDS, type ClaimRunEnvVar } from "../src/protocol.js";
 const VARS: ClaimRunEnvVar[] = [
   { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "FOO", value: "dummy-value", secret: false, description: "" },
 ];
-const LEAD_KINDS = ["issue", "ci_fix", "prompt", "self_improve", "mr_rework", "task"];
+const readFixture = <T>(rel: string): T => JSON.parse(fs.readFileSync(new URL(`../../fixtures/${rel}`, import.meta.url), "utf8")) as T;
+const REGISTRY_KINDS = readFixture<{ kinds: string[] }>("run-kinds/registry.json").kinds;
+const LEAD_KINDS = readFixture<{ vocabulary: { lead_lane_kinds: string[] } }>("lead-config/contract.json").vocabulary.lead_lane_kinds;
+
+describe("the lead lane agrees with the shared fixtures", () => {
+  it("every registry kind is a lead kind exactly when the contract lists it", () => {
+    for (const kind of REGISTRY_KINDS) assert.equal(isRunEnvLeadLane({ kind }), LEAD_KINDS.includes(kind), kind);
+  });
+
+  it("every lead kind of the contract is a registry kind", () => {
+    for (const kind of LEAD_KINDS) assert.ok(REGISTRY_KINDS.includes(kind), kind);
+  });
+});
 
 describe("leadLaneRunEnv", () => {
   for (const kind of RUN_KINDS) {

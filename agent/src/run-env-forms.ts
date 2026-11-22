@@ -1,16 +1,23 @@
 // The strings registered for redaction on behalf of a run's secret variables (PRD 4416 M2).
 //
-// A secret variable's value can reach run output re-encoded: JSON-escaped inside a tool result, or
-// base64-embedded in a larger string (a docker auth entry base64("user:password"), an HTTP Basic
-// header). Plain (non-secret) variables are NOT registered: they are meant to be readable.
+// A secret variable's value can reach run output re-encoded: JSON-escaped inside a tool result, percent-
+// encoded in a URL, or base64-embedded in a larger string (a docker auth entry base64("user:password"), an
+// HTTP Basic header). Plain (non-secret) variables are NOT registered: they are meant to be readable.
 //
 // Base64 embeds a value at an unknown byte offset, so the same value encodes three different ways
 // depending on its offset modulo 3. For k = 0, 1, 2 the value is encoded behind k zero bytes, and only
 // the characters whose six bits lie wholly inside the value bytes are kept: the leading characters that
 // mix in the padding or the preceding bytes, and the trailing characters that mix in the following
-// bytes or the final padding, depend on data the worker cannot know and are dropped.
+// bytes or the final padding, depend on data the worker cannot know and are dropped. The same three
+// alignments are also kept in the URL-safe alphabet.
+//
+// A multi-line value (a PEM key, a JSON credential file) is also split by line, but only for REDACTION: a
+// line of it can appear alone in output and must be masked there. A line is never a scan needle, because a
+// public line (`"type": "service_account",`) would hit every file that happens to carry it. The scan
+// instead gets the value as it reads inside a unified diff, where every line after the first carries a
+// `+`, `-` or ` ` prefix.
 
-import { MIN_SECRET_LEN } from "./redact.js";
+import { MIN_SECRET_LEN, providerKeyForms } from "./redact.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "./protocol.js";
 
 /** The base64 characters that depend only on the value bytes when the value sits `offset` bytes into a
@@ -22,15 +29,67 @@ function base64Interior(value: Buffer, offset: number): string {
   return padded.slice(first, end);
 }
 
-/** Every form of one secret value to register: the value, its JSON-escaped form when different, and the
- *  three base64 alignments. Forms shorter than {@link MIN_SECRET_LEN} are dropped. */
-export function secretForms(value: string): string[] {
-  const forms = [value];
-  const json = JSON.stringify(value).slice(1, -1);
-  if (json !== value) forms.push(json);
+/** The whole-value forms of one secret: every encoding {@link providerKeyForms} lists (raw, JSON, JSON with
+ *  `\/`, HTML-safe, percent-encoded) plus the three standard and the three URL-safe base64 alignments. */
+function wholeValueForms(value: string): string[] {
+  const forms = providerKeyForms(value);
   const bytes = Buffer.from(value, "utf8");
-  for (let offset = 0; offset < 3; offset++) forms.push(base64Interior(bytes, offset));
-  return forms.filter((f) => f.length >= MIN_SECRET_LEN);
+  for (let offset = 0; offset < 3; offset++) {
+    const std = base64Interior(bytes, offset);
+    forms.push(std, std.replaceAll("+", "-").replaceAll("/", "_"));
+  }
+  return forms;
+}
+
+const LINE_BREAK = /\r\n|\r|\n/;
+const PEM_ARMOR = /^-----(BEGIN|END) [^-]+-----$/;
+
+function isMultiLine(value: string): boolean {
+  return value.includes("\r") || value.includes("\n");
+}
+
+/** The lines of a multi-line value that may be registered alone: long enough, and not PEM armor (the
+ *  `-----BEGIN ...-----` lines are public text shared by every key). */
+function lineForms(value: string): string[] {
+  const out: string[] = [];
+  for (const line of value.split(LINE_BREAK)) {
+    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line)) continue;
+    out.push(line, JSON.stringify(line).slice(1, -1));
+  }
+  return out;
+}
+
+/** A multi-line value as it reads inside a unified diff: its lines joined by each line break followed by one
+ *  diff prefix (`+`, `-` or a space), with LF and CRLF breaks. Empty when the value is one line. */
+function diffShapedForms(value: string): string[] {
+  const lines = value.replace(/[\r\n]+$/, "").split(LINE_BREAK);
+  if (lines.length < 2) return [];
+  const out: string[] = [];
+  for (const prefix of ["+", "-", " "]) {
+    out.push(lines.join(`\n${prefix}`), lines.join(`\r\n${prefix}`));
+  }
+  return out;
+}
+
+function usable(forms: readonly string[]): string[] {
+  return [...new Set(forms.filter((f) => f.length >= MIN_SECRET_LEN))];
+}
+
+/** The whole-value forms of one secret, deduplicated, with forms shorter than {@link MIN_SECRET_LEN} dropped. */
+export function secretForms(value: string): string[] {
+  return usable(wholeValueForms(value));
+}
+
+/** Every form of one secret value to register for redaction: the whole-value forms, plus each line of a
+ *  multi-line value (raw and JSON-escaped). Forms shorter than {@link MIN_SECRET_LEN} are dropped. */
+function redactionFormsOf(value: string): string[] {
+  return usable([...wholeValueForms(value), ...(isMultiLine(value) ? lineForms(value) : [])]);
+}
+
+/** Every form of one secret value to search for: the whole-value forms, plus the diff-shaped forms of a
+ *  multi-line value. Never a single line of a multi-line value. */
+function scanFormsOf(value: string): string[] {
+  return usable([...wholeValueForms(value), ...(isMultiLine(value) ? diffShapedForms(value) : [])]);
 }
 
 /** One variable's scan needle: its NAME (the only text a finding may show) and every registered form of
@@ -41,8 +100,7 @@ export interface ScanNeedle {
 }
 
 /** The exact-value scan needles for a claim's (or the maintenance endpoint's) secret variables, grouped by
- *  name so a hit names the variable. Same forms as {@link runEnvRedactionForms}; a name with no usable form
- *  (every value too short) is dropped. */
+ *  name so a hit names the variable. A name with no usable form (every value too short) is dropped. */
 export function runEnvScanNeedles(
   runEnv: readonly ClaimRunEnvVar[] | undefined,
   runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
@@ -50,7 +108,7 @@ export function runEnvScanNeedles(
   const byName = new Map<string, Set<string>>();
   const add = (name: string, value: string): void => {
     const set = byName.get(name) ?? new Set<string>();
-    for (const f of secretForms(value)) set.add(f);
+    for (const f of scanFormsOf(value)) set.add(f);
     byName.set(name, set);
   };
   for (const v of runEnv ?? []) if (v.secret) add(v.name, v.value);
@@ -67,7 +125,7 @@ export function runEnvRedactionForms(
   runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
 ): string[] {
   const out = new Set<string>();
-  for (const v of runEnv ?? []) if (v.secret) for (const f of secretForms(v.value)) out.add(f);
-  for (const r of runEnvRedact ?? []) for (const f of secretForms(r.value)) out.add(f);
+  for (const v of runEnv ?? []) if (v.secret) for (const f of redactionFormsOf(v.value)) out.add(f);
+  for (const r of runEnvRedact ?? []) for (const f of redactionFormsOf(r.value)) out.add(f);
   return [...out].sort((a, b) => b.length - a.length);
 }

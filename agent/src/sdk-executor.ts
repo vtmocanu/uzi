@@ -1706,7 +1706,7 @@ export class SdkExecutor implements Executor {
     // dropped name is reported as a run event naming the rule, never the value.
     const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir,
       ctx.runEnv && ctx.runEnv.length > 0
-        ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+        ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }), onInjected: (vars) => { ctx.injectedRunEnv = [...vars]; } }
         : undefined);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
@@ -1835,7 +1835,7 @@ export class SdkExecutor implements Executor {
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
     const survivorNames = new Set(runSkills.map((s) => s.name));
     // PRD #4416 M2: the run-variables block rides every subagent's prompt (own and repo rosters).
-    const runEnvAppend = buildRunEnvBlock(ctx.runEnv);
+    const runEnvAppend = buildRunEnvBlock(ctx.injectedRunEnv);
     const assembled = assembleAgents(
       ctx.agents ?? [],
       survivorNames,
@@ -2654,7 +2654,7 @@ export class SdkExecutor implements Executor {
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
             // PRD #4416 M2: the run's user variables (names, descriptions, plain values; never a secret value).
-            runEnv: ctx.runEnv,
+            runEnv: ctx.injectedRunEnv,
           });
         } else if (isSelfImprove) {
           // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -2687,7 +2687,7 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
-            runEnv: ctx.runEnv,
+            runEnv: ctx.injectedRunEnv,
           });
         } else {
           planPrompt = buildPlanPrompt({
@@ -2723,7 +2723,7 @@ export class SdkExecutor implements Executor {
             autoApprove: ctx.autoApprove,
             // issue #1866 M2: the run-start environment facts (no block when nothing to say).
             environmentFacts,
-            runEnv: ctx.runEnv,
+            runEnv: ctx.injectedRunEnv,
           });
         }
         const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
@@ -3156,7 +3156,7 @@ export class SdkExecutor implements Executor {
         selection.exclusions,
         survivorNames,
         prepared.repoSurvivorNames,
-        buildRunEnvBlock(ctx.runEnv),
+        buildRunEnvBlock(ctx.injectedRunEnv),
       );
       // PRD #305: repo-source defs are freshly built from repo files here and were NOT
       // touched by the own-roster override above; apply it so the flag covers the repo
@@ -3832,7 +3832,7 @@ export class SdkExecutor implements Executor {
             // (gated inside buildImplementPrompt).
             environmentFacts,
             // PRD #4416 M2: first turn only (gated inside buildImplementPrompt).
-            runEnv: ctx.runEnv,
+            runEnv: ctx.injectedRunEnv,
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,

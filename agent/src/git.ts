@@ -1304,6 +1304,15 @@ const RUNNER_CLONE_BUSY_MARKERS = [
 // while staying an order of magnitude under runGit's 64 MiB maxBuffer.
 const REVIEW_DIFF_MAX_BYTES = 512 * 1024;
 
+/** `diff` capped at REVIEW_DIFF_MAX_BYTES with a truncation marker, cut on a byte boundary (a cut through a
+ *  multi-byte rune yields at most one U+FFFD). Text within the cap is returned as is. */
+export function capReviewDiff(diff: string): string {
+  const buf = Buffer.from(diff, "utf8");
+  if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return diff;
+  const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
+  return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+}
+
 // PRD #1296 M3 (D4/D5) — durable-recovery bundle limits.
 // The maximum COMPLETE bundle byte size the worker will produce before it declares the
 // source un-archivable within limits (needs_action) rather than emitting an oversized
@@ -4538,6 +4547,9 @@ export class GitCache {
    *  inside it: it is not custody (nothing reads it to release or retire anything), and the
    *  recovery restart sweep treats every entry under `recovery/` as a runId. */
   readonly recoveryArchiveRoot: string;
+  /** The per-run markers recording that a run was handed variables on this worker. A
+   *  SIBLING of `recovery/`, never inside it: the recovery restart sweep treats every entry under it as a runId. */
+  readonly runEnvSeenRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   /** The current holder of each `locks` key, keyed the same way: an identity token whose `since`
@@ -6288,6 +6300,7 @@ export class GitCache {
     this.recoveryMaintenanceRoot = path.join(dataDir, "recovery-maintenance");
     this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
     this.recoveryArchiveRoot = path.join(dataDir, "recovery-archive");
+    this.runEnvSeenRoot = path.join(dataDir, "run-variables-seen");
   }
 
   private authorityRefusal(op: string): Error {
@@ -24821,12 +24834,7 @@ try {
     const baseRef = (await this.refExists(barePath, remoteBaseRef)) ? remoteBaseRef : base;
     const branchRef = `refs/remotes/origin/${branch}`;
     const out = await this.runGit(barePath, ["diff", "--no-color", "--no-ext-diff", `${baseRef}...${branchRef}`]);
-    const buf = Buffer.from(out, "utf8");
-    if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
-    const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
-    // Slice on a byte boundary so a giant diff cannot balloon the string we keep. A cut
-    // through a multi-byte rune yields at most one U+FFFD; harmless for review text.
-    return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+    return capReviewDiff(out);
   }
 
   /**
@@ -25024,7 +25032,9 @@ try {
    * `null` on ANY failure (try/catch), so the caller can still report the failed outcome without
    * a patch rather than turning a diff-computation error into a second failure.
    */
-  async workflowScopeDiff(barePath: string, trackingRef: string): Promise<string | null> {
+  async workflowScopeDiff(
+    barePath: string, trackingRef: string, opts?: { readonly untruncated?: boolean },
+  ): Promise<string | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
       const out = await this.runGit(barePath, [
@@ -25033,10 +25043,7 @@ try {
         "--no-ext-diff",
         `${baseRef}...${trackingRef}`,
       ]);
-      const buf = Buffer.from(out, "utf8");
-      if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
-      const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
-      return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+      return opts?.untruncated === true ? out : capReviewDiff(out);
     } catch {
       return null;
     }

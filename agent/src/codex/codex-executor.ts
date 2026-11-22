@@ -3766,7 +3766,7 @@ export class CodexExecutor implements Executor {
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
           ctx.runEnv && ctx.runEnv.length > 0
-            ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+            ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }), onInjected: (vars) => { ctx.injectedRunEnv = [...vars]; } }
             : undefined,
         ),
         await canonicalCheckoutPath(worktreePath),
@@ -7232,7 +7232,7 @@ export class CodexExecutor implements Executor {
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
-    const runEnvAppend = buildRunEnvBlock(ctx.runEnv);
+    const runEnvAppend = buildRunEnvBlock(ctx.injectedRunEnv);
     const request: RunTurnRequest = {
       semanticPlanning: ctx.semanticPlanning,
       ciEvidencePrepared: !!ctx.ciEvidence,
@@ -7293,7 +7293,7 @@ export class CodexExecutor implements Executor {
     const withReview = review ? `${head}\n\n${review}` : head;
     const block = buildEnvironmentFactsBlock(facts);
     // PRD #4416 M2: the run's user variables (lead lane; absent otherwise), after the facts block.
-    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const runEnvBlock = buildRunEnvBlock(ctx.injectedRunEnv);
     const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}${runEnvBlock ? `\n\n${runEnvBlock}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
@@ -7388,7 +7388,7 @@ export class CodexExecutor implements Executor {
     const block = buildEnvironmentFactsBlock(facts);
     const withFactsOnly = block ? `${prompt}\n\n${block}` : prompt;
     // PRD #4416 M2: the run's user variables ride every implement prompt this builder returns, like the facts.
-    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const runEnvBlock = buildRunEnvBlock(ctx.injectedRunEnv);
     const withFacts = runEnvBlock ? `${withFactsOnly}\n\n${runEnvBlock}` : withFactsOnly;
     const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
     return dockerResume ? `${withFacts}\n\n${dockerResume}` : withFacts;

@@ -85,11 +85,90 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
   const list = usableSecrets(secrets);
   if (list.length === 0) return (s) => s;
   const visible = list.map((secret) => secret.replace(INVISIBLE, "")).filter((v) => v.length >= MIN_SECRET_LEN);
+  if (list.length > INDEXED_MIN_SECRETS) {
+    // Many secrets (a run's secret variables, with a form per line of every multi-line value): one pass over
+    // the text, not one pass per secret.
+    const find = literalSpanFinder(list);
+    const findVisible = visible.length > 0 ? literalSpanFinder(visible) : undefined;
+    return (s) => {
+      let out = replaceSpans(s, find(s));
+      if (findVisible && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisible);
+      return out;
+    };
+  }
   return (s) => {
     let out = s;
     for (const secret of list) out = out.split(secret).join(REDACTED);
-    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, visible);
+    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, spansOfEach(visible));
     return out;
+  };
+}
+
+/** The most secrets redacted one pass each; a longer list is matched in a single indexed pass. */
+const INDEXED_MIN_SECRETS = 64;
+
+/** Finds the [start, end) spans of registered literals in a text. */
+export type SpanFinder = (text: string) => Array<[number, number]>;
+
+/**
+ * A single-pass finder for many literals. Every literal is at least MIN_SECRET_LEN long, so the first
+ * MIN_SECRET_LEN UTF-16 units of a literal key a table: at each text position the table is consulted once
+ * and only the literals sharing that key are compared. Matches are leftmost, longest first, and do not
+ * overlap. The cost is linear in the text for any number of literals.
+ */
+export function literalSpanFinder(literals: readonly string[]): SpanFinder {
+  const key = MIN_SECRET_LEN;
+  const byKey = new Map<string, string[]>();
+  const firstUnit = new Uint8Array(0x10000);
+  for (const literal of new Set(literals)) {
+    if (literal.length < key) continue;
+    const k = literal.slice(0, key);
+    const bucket = byKey.get(k);
+    if (bucket) bucket.push(literal); else byKey.set(k, [literal]);
+    firstUnit[literal.charCodeAt(0)] = 1;
+  }
+  for (const bucket of byKey.values()) bucket.sort((a, b) => b.length - a.length);
+  return (text) => {
+    const spans: Array<[number, number]> = [];
+    const last = text.length - key;
+    for (let i = 0; i <= last; i++) {
+      if (firstUnit[text.charCodeAt(i)] === 0) continue;
+      const bucket = byKey.get(text.slice(i, i + key));
+      if (bucket === undefined) continue;
+      for (const literal of bucket) {
+        if (text.startsWith(literal, i)) {
+          spans.push([i, i + literal.length]);
+          i += literal.length - 1;
+          break;
+        }
+      }
+    }
+    return spans;
+  };
+}
+
+/** `text` with every span (sorted by start, possibly overlapping) replaced by the redaction marker. */
+export function replaceSpans(text: string, spans: Array<[number, number]>): string {
+  if (spans.length === 0) return text;
+  let out = "";
+  let cursor = 0;
+  for (const [start, end] of spans) {
+    if (start >= cursor) out += text.slice(cursor, start) + REDACTED;
+    cursor = Math.max(cursor, end);
+  }
+  return out + text.slice(cursor);
+}
+
+/** The finder that looks for each secret by `indexOf`: cheap for a short list. */
+function spansOfEach(secrets: readonly string[]): SpanFinder {
+  return (text) => {
+    const spans: Array<[number, number]> = [];
+    for (const secret of secrets) {
+      for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + secret.length)) {
+        spans.push([at, at + secret.length]);
+      }
+    }
+    return spans.sort((a, b) => a[0] - b[0]);
   };
 }
 
@@ -99,7 +178,7 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
  * matched there, and every matched span is replaced in the ORIGINAL, invisible separators
  * included, so nothing of the secret survives to be re-joined.
  */
-function redactAcrossInvisible(text: string, secrets: string[]): string {
+function redactAcrossInvisible(text: string, find: SpanFinder): string {
   const chunks: string[] = [];
   const origin = new Int32Array(text.length); // visible UTF-16 unit i came from text[origin[i]]
   let n = 0;
@@ -115,21 +194,9 @@ function redactAcrossInvisible(text: string, secrets: string[]): string {
   keep(last, text.length);
   const visible = chunks.join("");
 
-  const spans: Array<[number, number]> = [];
-  for (const secret of secrets) {
-    for (let at = visible.indexOf(secret); at !== -1; at = visible.indexOf(secret, at + secret.length)) {
-      spans.push([origin[at]!, origin[at + secret.length - 1]! + 1]);
-    }
-  }
-  if (spans.length === 0) return text;
+  const spans = find(visible).map(([from, to]): [number, number] => [origin[from]!, origin[to - 1]! + 1]);
   spans.sort((a, b) => a[0] - b[0]);
-  let out = "";
-  let cursor = 0;
-  for (const [start, end] of spans) {
-    if (start >= cursor) out += text.slice(cursor, start) + REDACTED;
-    cursor = Math.max(cursor, end);
-  }
-  return out + text.slice(cursor);
+  return replaceSpans(text, spans);
 }
 
 /** Scrub string values and member names without dropping colliding data. Finite numeric sums merge,

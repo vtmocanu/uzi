@@ -15,15 +15,19 @@ export interface RunEnvInjection {
   readonly vars: readonly ClaimRunEnvVar[];
   /** Called once per dropped variable with its name and the rule it broke. Must never receive a value. */
   readonly onDrop?: (name: string, rule: string) => void;
+  /** Called once per fold with the variables that were injected, in order (possibly none). */
+  readonly onInjected?: (vars: readonly ClaimRunEnvVar[]) => void;
 }
 
-/** Folds `injection.vars` into `env`. `isProtected` names the keys the builder pins. */
+/** Folds `injection.vars` into `env`. `isProtected` names the keys the builder pins. Returns the variables
+ *  that were injected, in order: a variable that was dropped is not in the list. */
 export function foldRunEnv(
   env: Record<string, string | undefined>,
   injection: RunEnvInjection | undefined,
   isProtected: (key: string) => boolean,
-): void {
-  if (injection === undefined) return;
+): ClaimRunEnvVar[] {
+  const injected: ClaimRunEnvVar[] = [];
+  if (injection === undefined) return injected;
   for (const v of injection.vars) {
     const violation = runEnvNameViolation(v.name);
     if (violation !== null) {
@@ -39,7 +43,10 @@ export function foldRunEnv(
       continue;
     }
     env[v.name] = v.value;
+    injected.push(v);
   }
+  injection.onInjected?.(injected);
+  return injected;
 }
 
 /** The run event text for a dropped variable. The name is attacker-influenced, so it is sanitized. */
