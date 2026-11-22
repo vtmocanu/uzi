@@ -164,6 +164,21 @@ describe("runEnvInjectedSet", () => {
     assert.deepEqual(Object.keys(target), ["FIRST_ONE"]);
   });
 
+  it("foldRunEnv throws on a precomputed set that holds a protected, invalid or already-set name, leaving env unchanged", () => {
+    const secretValue = "dummy-secret-run-value-000000";
+    const bad = (name: string): ClaimRunEnvVar => v(name, secretValue);
+    for (const name of ["PINNED_KEY", "PATH", "lower-case", "PRESET_KEY"]) {
+      const target: Record<string, string | undefined> = { PRESET_KEY: "x" };
+      const vars = [v("FIRST_ONE"), bad(name)];
+      assert.throws(
+        () => foldRunEnv(target, { vars, set: { injected: vars, dropped: [] } }, (k) => k === "PINNED_KEY"),
+        (e: Error) => e.message.includes(name) && !e.message.includes(secretValue),
+        name,
+      );
+      assert.deepEqual(target, { PRESET_KEY: "x" }, `${name}: env unchanged`);
+    }
+  });
+
   it("is pure: it reads no env and leaves its inputs unchanged", () => {
     const vars = [v("A_ONE"), v("PATH")];
     const keys = ["X_KEY"];

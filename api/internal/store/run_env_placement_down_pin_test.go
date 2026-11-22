@@ -3,43 +3,92 @@ package store_test
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
 
-// createFunctionBlock returns the first CREATE OR REPLACE FUNCTION ... $$ ... $$; block of one
-// section of a migration file (the Up section when down is false, the Down section otherwise).
-func createFunctionBlock(t *testing.T, file string, down bool) string {
+const placementFunction = "fn_placement_admitting_workers"
+
+// migrationSection returns the Up section (down false) or the Down section (down true) of one
+// migration file; ok is false when a Down section is asked for and the file has none.
+func migrationSection(t *testing.T, file string, down bool) (string, bool) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // fixed migrations directory
 	if err != nil {
 		t.Fatal(err)
 	}
 	up, dn, found := strings.Cut(string(raw), "-- +goose Down")
-	section := up
 	if down {
-		if !found {
-			t.Fatalf("%s has no Down section", file)
-		}
-		section = dn
+		return dn, found
 	}
-	_, rest, ok := strings.Cut(section, "CREATE OR REPLACE FUNCTION")
+	return up, true
+}
+
+// functionBlock returns the CREATE OR REPLACE FUNCTION <name>( ... $$; block inside section, or
+// "" when the section does not define that function (a mention is not a definition).
+func functionBlock(t *testing.T, file, section, name string) string {
+	t.Helper()
+	head := "CREATE OR REPLACE FUNCTION " + name + "("
+	_, rest, ok := strings.Cut(section, head)
 	if !ok {
-		t.Fatalf("%s has no CREATE OR REPLACE FUNCTION in its %s section", file, map[bool]string{false: "Up", true: "Down"}[down])
+		return ""
 	}
 	end := strings.Index(rest, "$$;")
 	if end < 0 {
-		t.Fatalf("%s: the function has no closing $$;", file)
+		t.Fatalf("%s: the %s definition has no closing $$;", file, name)
 	}
-	return "CREATE OR REPLACE FUNCTION" + rest[:end+len("$$;")]
+	return head + rest[:end+len("$$;")]
 }
 
-// The run env placement migration's Down restores the placement function exactly as the phase
-// models migration created it: the Down body equals 00499's Up body.
-func TestRunEnvPlacementDownRestoresPhaseModelsFunction(t *testing.T) {
-	down := createFunctionBlock(t, "00502_run_env_placement.sql", true)
-	prior := createFunctionBlock(t, "00499_placement_phase_models.sql", false)
+// The run env placement migration's Down restores fn_placement_admitting_workers exactly as the
+// latest earlier migration that defines it left it. That predecessor is derived, not named: the
+// run env placement migration is the one file matching *_run_env_placement.sql, and the
+// predecessor is the highest-numbered earlier migration whose Up section defines the function.
+func TestRunEnvPlacementDownRestoresPredecessorFunction(t *testing.T) {
+	matches, err := filepath.Glob(filepath.Join("migrations", "*_run_env_placement.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("want exactly one migrations/*_run_env_placement.sql, got %v", matches)
+	}
+	placement := filepath.Base(matches[0])
+
+	all, err := filepath.Glob(filepath.Join("migrations", "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var earlier []string
+	for _, m := range all {
+		if base := filepath.Base(m); base < placement {
+			earlier = append(earlier, base)
+		}
+	}
+	sort.Strings(earlier)
+
+	var prior, priorFile string
+	for i := len(earlier) - 1; i >= 0; i-- {
+		up, _ := migrationSection(t, earlier[i], false)
+		if block := functionBlock(t, earlier[i], up, placementFunction); block != "" {
+			prior, priorFile = block, earlier[i]
+			break
+		}
+	}
+	if prior == "" {
+		t.Fatalf("no migration below %s defines %s in its Up section", placement, placementFunction)
+	}
+	t.Logf("%s Down is compared with the Up of %s", placement, priorFile)
+
+	downSection, found := migrationSection(t, placement, true)
+	if !found {
+		t.Fatalf("%s has no Down section", placement)
+	}
+	down := functionBlock(t, placement, downSection, placementFunction)
+	if down == "" {
+		t.Fatalf("%s Down does not define %s", placement, placementFunction)
+	}
 	if down != prior {
-		t.Fatalf("00502 Down function (%d bytes) differs from 00499 Up function (%d bytes)", len(down), len(prior))
+		t.Fatalf("%s Down function (%d bytes) differs from %s Up function (%d bytes)", placement, len(down), priorFile, len(prior))
 	}
 }

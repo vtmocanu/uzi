@@ -122,8 +122,8 @@ func TestRunEnvWorstCaseClaimStaysUnderQuarterOfClaimLimit(t *testing.T) {
 	if quarter := fx.Max / 4; size >= quarter {
 		t.Fatalf("worst-case run_env + run_env_redact = %d bytes, not below a quarter (%d) of claim_response_max_bytes %d", size, quarter, fx.Max)
 	}
-	if size > pinnedRunEnvWorstCaseBytes {
-		t.Fatalf("worst-case run_env + run_env_redact = %d bytes, over the pinned %d: recompute the arithmetic above and update the pin", size, pinnedRunEnvWorstCaseBytes)
+	if size > pinnedRunEnvWorstCaseBytes || pinnedRunEnvWorstCaseBytes-size > 64*1024 {
+		t.Fatalf("worst-case run_env + run_env_redact = %d bytes, outside the pin %d (the pin must be at or above the measure and within 64 KiB of it): recompute the arithmetic above and update the pin", size, pinnedRunEnvWorstCaseBytes)
 	}
 	t.Logf("worst-case run_env + run_env_redact = %d bytes", size)
 }

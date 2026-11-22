@@ -36,7 +36,7 @@ export interface RunEnvInjectedSet {
 /** The ONE source of the injection rules: a variable is injected unless its name breaks the shared name
  *  rules, is a key the builder protects, or is already set (in `preFoldKeys`, the keys the builder's env holds
  *  before the fold, or by an earlier variable of the same list). Pure: it reads no env and has no effect, so
- *  an executor can compute the injected set once per claim, before any prompt is built, from the same
+ *  an executor can compute the injected set once per executor run, before any prompt is built, from the same
  *  pre-fold keys its builder folds over. The order of `vars` is kept. */
 export function runEnvInjectedSet(
   vars: readonly ClaimRunEnvVar[],
@@ -72,6 +72,17 @@ export function foldRunEnv(
 ): ClaimRunEnvVar[] {
   if (injection === undefined) return [];
   const { injected, dropped } = injection.set ?? runEnvInjectedSet(injection.vars, Object.keys(env), isProtected);
+  if (injection.set !== undefined) {
+    // Defence in depth: a precomputed set must equal what the fold would compute. Check every entry before
+    // touching `env`, so a bad set leaves it unchanged. The error names the variable, never its value.
+    const seen = new Set<string>();
+    for (const v of injected) {
+      if (runEnvNameViolation(v.name) !== null || isProtected(v.name) || Object.hasOwn(env, v.name) || seen.has(v.name)) {
+        throw new Error(`run env: precomputed injected set holds ${sanitizeName(v.name)}, which the fold would not inject`);
+      }
+      seen.add(v.name);
+    }
+  }
   for (const d of dropped) injection.onDrop?.(d.name, d.rule);
   for (const v of injected) env[v.name] = v.value;
   return injected;
