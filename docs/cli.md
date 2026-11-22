@@ -3486,6 +3486,7 @@ the instance defaults are untouched.
 | `effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` | [Reasoning effort](./worker-effort.md) |
 | `judge-model` | `claude` or `codex`, required | A model id, validated by the server (the Codex judge lane accepts only curated models) | [Run judge](./judge.md#which-model-it-runs-on) |
 | `summary-model` | `claude` or `codex`, required | A model id, validated by the server | [Run summaries](./run-summaries.md#which-model-it-runs-on) |
+| `task-review-model` | `claude` or `codex`, required | A model id, validated by the server (Claude: any Claude id, Codex ids refused; Codex: a supported Codex role model). `reset` returns to the built-in (Claude: the SDK default, Codex: `gpt-6-sol`) | [Task review model](./worker-model.md#task-review-model) |
 | `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
 | `cross-check` | `claude` or `codex`, required, plus `--stage plan` or `--stage code`, required | No positional value; `--model <id>` and `--effort low`, `medium`, `high`, `xhigh` or `max`, at least one of them (`runtime` is not a checker effort) | [Cross-check pins](./configuration.md#plan-cross-check-model-and-effort-pins) |
 
@@ -3542,12 +3543,12 @@ server could not confirm or read back the write, while the exit 0 line means
 the server confirmed the write and only the CLI's own effective-settings read
 failed.
 
-The route is an allowlist of ten fields (the two worker-model lanes, the two
-effort lanes, the two judge-model lanes, the two summary-model lanes,
-`judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
+The route is an allowlist of twelve fields (the two worker-model lanes, the two
+effort lanes, the two judge-model lanes, the two summary-model lanes, the two
+task-review-model lanes, `judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
 are written in one transaction. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
-`judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
+`judge-runs-on`, `judge-model`, `summary-model` and `task-review-model` choose which harness or model
 already-enabled judge and summary work uses, and cannot turn that work on.
 
 ### Agent-template model and effort pins
@@ -3625,7 +3626,7 @@ setting prints once. The rows, in order:
 | `worker effort` | `claude`, `codex` | As the existing effort rows. `SOURCE` reads `lead template` when you have no per-harness effort preference and the lead template's effort is used (see [the lead template's effort](./worker-effort.md#the-lead-templates-effort)). |
 | `planning model`, `planning effort` | `claude` | The optional [Claude planning settings](./worker-model.md#planning-model-and-effort), shown only for Claude. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
-| `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
+| `task review model` | `claude`, `codex` | Your stored model (`your choice`) or the built-in; an unset Claude model notes `the SDK decides`. Set it with `uzi settings set task-review-model`. |
 | `task review effort` | `claude`, `codex` | `not sent` for both. |
 
 `SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.

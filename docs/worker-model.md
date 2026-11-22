@@ -319,14 +319,35 @@ ordinary Codex capability). Until one is online, a run with a custom Codex
 default stays queued rather than silently falling back to `gpt-6-astra`;
 see [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-custom-codex-models-is-online).
 
-## Task review uses its own built-in model
+## Task review model
 
-Codex task review always runs on the built-in `gpt-6-sol`, independent of
-your saved Codex worker model. It is not affected by your custom ID or
-curated choice. Claude task review keeps its own ambient default the same
-way. There is no setting to choose the task-review model in this release;
-it's tracked as possible future work in [issue
-#1570](https://github.com/vtmocanu/uzi/issues/1570).
+The review pass of a [handoff](./handoff.md#the-review--then-fix-loop)
+(`uzi handoff --review`) has its own model per harness, set under **Settings →
+Run defaults → Task review**. It is independent of your worker model: a custom
+or curated worker choice never reaches the review.
+
+| Harness | Accepts | Empty means |
+| --- | --- | --- |
+| Claude | Any Claude model id; Codex ids are refused. | The review sends no model, so the SDK decides. |
+| Codex | One of the supported Codex role models. | The built-in `gpt-6-sol`. |
+
+From the CLI, use `uzi settings set task-review-model <id> --harness
+claude|codex` and `uzi settings reset task-review-model --harness
+claude|codex` (see [CLI](./cli.md#changing-model-and-effort-settings)). The API
+keys are `task_review_model` (Claude) and `codex_task_review_model` (Codex) on
+`PUT /api/me/model-settings` and `PUT /api/me/settings`; `null` or a blank
+value clears the setting.
+
+- A stored model that later becomes invalid (for example a Codex model that
+  leaves the supported list) falls back to the built-in at review time, and
+  the effective view shows the built-in as the source.
+- A worker older than this release does not read the setting. It runs the
+  built-in review model, and the run feed records a
+  `task_review_settings_omitted` notice.
+- The server does not call the provider when you save. A configured model the
+  provider cannot run produces the existing failed review.
+
+This release adds the model only. Neither review pass sends a reasoning effort.
 
 ## Per-schedule model
 

@@ -451,7 +451,7 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.1-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
 | Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. The `judge_model` cell of the lane the judge will not run on (your explicit **Judge runs on** choice names the other harness) also carries note `not_used`. | `user_default`, `instance_default`, `builtin` |
 | Judge harness | Your **Judge runs on** choice (`claude` or `codex`); else the harness of the run being reviewed. | `user_default`, `same_as_run` |
-| Task-review model | A built-in you cannot configure. Codex carries note `not_configurable`; the Claude review sends no model, so the SDK decides. | `builtin` |
+| Task-review model | Your lane for the harness (a stored value that is no longer valid is ignored); else the built-in (Codex `gpt-6-sol`; the Claude review sends no model, so the SDK decides). See [Task review model](./worker-model.md#task-review-model). | `user_default`, `builtin` |
 | Worker effort | Your effort preference for the harness, then the product default. | see [Reasoning effort](./worker-effort.md) |
 | Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
 | Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
