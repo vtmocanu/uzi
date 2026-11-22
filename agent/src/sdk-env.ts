@@ -134,10 +134,12 @@ const MODEL_ALIAS_ENV = {
 } as const;
 
 /** The window a provider credential gets when none of its mapped models configures one. Owner
- *  decision 2026-11-22 (#4611, PRD #4320 Decision Log): the CLI (from 2.1.323 per its changelog; measured at 2.1.325) assumes 1M tokens for a model id
- *  it does not recognize; uzi keeps a conservative 200K so an unconfigured provider compacts early
- *  instead of overrunning a gateway's real limit. An explicit window always wins through the
- *  smallest-window rule in {@link smallestContextWindow}, and a partial map (some slots configured,
+ *  decision 2026-11-22 (#4611, PRD #4320 Decision Log): the CLI (from 2.1.323 per its changelog;
+ *  measured at 2.1.325) assumes 1M tokens for a model id it does not recognize; uzi keeps a
+ *  conservative 200K so such a provider compacts early instead of overrunning a gateway's real limit.
+ *  The env value always carries the smallest explicit window ({@link smallestContextWindow}), but the
+ *  measured CLI ignores it (and this fallback) for ids it recognizes, such as claude-sonnet-4-5 and
+ *  us.anthropic.claude-sonnet-4-5 (provider-context-window.integration.test.ts). A partial map (some slots configured,
  *  others not) uses the smallest explicit window for the whole process: a documented limitation,
  *  because CLAUDE_CODE_MAX_CONTEXT_TOKENS cannot differ per model. */
 export const PROVIDER_FALLBACK_CONTEXT_WINDOW = 200_000;

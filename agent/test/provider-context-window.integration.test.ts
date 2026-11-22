@@ -22,8 +22,10 @@ import { buildSdkEnv, PROVIDER_FALLBACK_CONTEXT_WINDOW } from "../src/sdk-env.js
 //    1M. At 0.3.319 the same case compacted near 200k, so this one is a dependency-induced change.
 //  - the uzi PRODUCTION policy: buildSdkEnv always sets CLAUDE_CODE_MAX_CONTEXT_TOKENS for a provider
 //    credential, to the configured window or PROVIDER_FALLBACK_CONTEXT_WINDOW (200k) when none is
-//    configured. That is what keeps an unconfigured provider compacting early; it is uzi's choice, not
-//    the CLI's.
+//    configured. For a model id the CLI does not recognize that is what keeps an unconfigured provider
+//    compacting early; it is uzi's choice, not the CLI's. For ids the CLI recognizes (claude-sonnet-4-5,
+//    us.anthropic.claude-sonnet-4-5) the measured CLI ignores both the fallback and an explicit window:
+//    see the mapped-name cases below.
 // The compaction point itself is chosen by the CLI and moves by a turn or two between runs, so every
 // assertion is a MEASURED BAND: its lower bound is at least one reported-token step (2 * perMessage,
 // the increment between consecutive lead calls) below the observed first compaction and its upper bound
