@@ -84,33 +84,47 @@ func effortSettingCells(claude, codex *string, catalog *apitypes.CatalogDefaultD
 // planningSourceUserPlanningDefault is the provenance token of a stored planning value (PRD #3252).
 const planningSourceUserPlanningDefault = "user_planning_default"
 
-// planningModelCells builds the read-only Claude planning model cell (PRD #3252). planning is the
+// planningModelCells builds the read-only planning model cells, Claude then Codex (PRD #3252). planning is the
 // stored planning model (nil = "Same as the run"). The default pair is the implement lane's
-// resolution: the user's default_claude_model lane (user_default), else the lead template's model
-// (template), else the built-in (the SDK decides). A set planning value resolves with
+// resolution: the user's harness-specific model lane (user_default), else the lead template's
+// model (template), else the harness built-in. A set planning value resolves with
 // user_planning_default; otherwise the cell resolves to the default pair.
-func planningModelCells(planning, claudeLane, leadClaudePin *string) []apitypes.ModelSettingCellDTO {
-	defModel, defSource := agenttmpl.ResolveWorkerDefaultModel("claude", claudeLane, leadClaudePin, nil)
+func planningModelCells(planning, claudeLane, leadClaudePin, codexPlanning, codexLane, leadCodexPin *string) []apitypes.ModelSettingCellDTO {
+	return []apitypes.ModelSettingCellDTO{
+		planningModelSettingCell("claude", planning, claudeLane, leadClaudePin, nil),
+		planningModelSettingCell("codex", codexPlanning, codexLane, nil, leadCodexPin),
+	}
+}
+
+func planningModelSettingCell(harness string, planning, lane, claudePin, codexPin *string) apitypes.ModelSettingCellDTO {
+	defModel, defSource := agenttmpl.ResolveWorkerDefaultModel(harness, lane, claudePin, codexPin)
 	cell := apitypes.ModelSettingCellDTO{
-		Harness: "claude", Model: planning,
+		Harness: harness, Model: planning,
 		DefaultModel: defModel, DefaultSource: defSource,
 		ResolvedModel: defModel, Source: defSource,
 	}
 	if planning != nil {
-		if m := strings.TrimSpace(*planning); m != "" && !agenttmpl.CodexRoleModels[m] {
+		m := strings.TrimSpace(*planning)
+		valid := !agenttmpl.CodexRoleModels[m]
+		if harness == "codex" {
+			_, err := agenttmpl.ValidateModel(m)
+			valid = err == nil && !agenttmpl.KnownClaudeAliases[m]
+		}
+		if m != "" && valid {
 			cell.ResolvedModel, cell.Source = m, planningSourceUserPlanningDefault
 		}
 	}
-	return []apitypes.ModelSettingCellDTO{cell}
+	return cell
 }
 
-// planningEffortCellFromOrdinary builds the read-only Claude planning effort cell (PRD #3252). The
-// default pair is the ordinary Claude effort cell's resolution (including Runtime default mode,
+// planningEffortCellFromOrdinary builds the read-only per-harness planning effort cell (PRD #3252). The
+// default pair is the ordinary harness effort cell's resolution (including Runtime default mode,
 // where no level is sent and DefaultEffort carries the preference token); a stored planning level
 // resolves with user_planning_default and explicit mode.
 func planningEffortCellFromOrdinary(planning *string, ordinary apitypes.EffortSettingCellDTO) apitypes.EffortSettingCellDTO {
+	harness := ordinary.Harness
 	cell := apitypes.EffortSettingCellDTO{
-		Harness: "claude", Effort: planning,
+		Harness: harness, Effort: planning,
 		DefaultSource:  ordinary.Source,
 		ResolvedEffort: ordinary.ResolvedEffort,
 		Source:         ordinary.Source,
@@ -122,7 +136,7 @@ func planningEffortCellFromOrdinary(planning *string, ordinary apitypes.EffortSe
 		cell.DefaultEffort = agenttmpl.EffortRuntime
 	}
 	if planning != nil {
-		if r := agenttmpl.ResolveHarnessEffort("claude", planning); r.Mode == agenttmpl.EffortModeExplicit && r.Source == agenttmpl.EffortSourceUserDefault {
+		if r := agenttmpl.ResolveHarnessEffort(harness, planning); r.Mode == agenttmpl.EffortModeExplicit && r.Source == agenttmpl.EffortSourceUserDefault {
 			level := r.Level
 			cell.ResolvedEffort, cell.Source, cell.Mode = &level, planningSourceUserPlanningDefault, agenttmpl.EffortModeExplicit
 		}
