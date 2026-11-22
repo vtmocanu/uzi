@@ -37105,6 +37105,55 @@ describe("M2 provider executor composition", () => {
     });
   }
 
+  it("provider auth-state canary reaches production staging via branch instrumentation", async (t) => {
+    const root = await fs.mkdtemp(path.join(process.env.TMPDIR!, "provider-executor-canary-"));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const home = path.join(root, "run");
+    await fs.mkdir(path.join(home, "codex-data"), { recursive: true });
+    const source = path.join(root, "source");
+    await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+    const transcript = JSON.stringify({ type: "session_meta", payload: { id: "controlled-session" } }) + "\n";
+    await fs.writeFile(path.join(source, "sessions/rollout-safe.jsonl"), transcript);
+    for (const name of ["auth.json", "config.toml", "cache.json"]) {
+      await fs.writeFile(path.join(source, name), ["private", name, "canary"].join("-"));
+    }
+    await CodexSessionStore.persist(source, path.join(home, "codex-session-store"));
+    const rig = makeRig();
+    const { launchProviderRoot: unused, ...rest } = rig.deps;
+    void unused;
+    let staged = "";
+    let reached = false;
+    const sentinel = new Error("canary default launcher captured");
+    rig.deps = { ...rest, sessionStore: {
+      ...CodexSessionStore,
+      adopt: async (store, destination, opts) => {
+        assert.equal(opts?.destination, "runner-seed");
+        staged = destination;
+        return CodexSessionStore.adopt(store, destination, opts);
+      },
+    }, launchCodexRootForTest: async spec => {
+      reached = true;
+      assert.equal(spec.authMode, "provider");
+      assert.equal(spec.seedSession, true);
+      assert.equal(staged, spec.ownedDataRoot + ".session-seed");
+      assert.deepEqual(await fs.readdir(staged), ["sessions"]);
+      assert.deepEqual(await fs.readdir(path.join(staged, "sessions")), ["rollout-safe.jsonl"]);
+      assert.equal(await fs.readFile(path.join(staged, "sessions/rollout-safe.jsonl"), "utf8"), transcript);
+      throw sentinel;
+    } };
+    const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()), noopLog, undefined, provider, home);
+    // Host is command uid. Model parent preparation only; enable the actual
+    // production staging branch after its two parent checks. The launcher hook
+    // itself would otherwise bypass staging, so merely capturing spec is insufficient.
+    let parentChecks = 0;
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => ++parentChecks <= 2 });
+    await assert.rejects(executor.run(makeCtx().ctx), error => error === sentinel);
+    assert.equal(parentChecks, 3, "two parent checks followed by actual staging admission");
+    assert.equal(reached, true);
+    await assert.rejects(fs.stat(staged), { code: "ENOENT" });
+    // No claim about final-root provisioning/disposal: the hook stops before it.
+  });
+
   it("refuses unmapped explicit models before login or vendor release", async () => {
     const rig = makeRig();
     const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()));

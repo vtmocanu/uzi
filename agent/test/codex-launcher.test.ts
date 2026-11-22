@@ -36,6 +36,7 @@ import { assertGone } from "./runner-teardown-fixtures.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { makeTextRedactor } from "../src/redact.js";
+import { CodexSessionStore, seedCodexSessionArtifacts } from "../src/codex/session-state.js";
 import { SESSION_SEED_ENTRYPOINT } from "../src/codex/session-seed-cli.js";
 import type { ProvisionSpawnSync } from "../src/codex/launcher.js";
 import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
@@ -417,6 +418,89 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     auth_style: "bearer" as const, credential: "provider-fixture-credential",
     model_map: { default: { model: "gateway-model", context_window: 64000 } },
   };
+  // Real launcher and filesystem, existing supervisor evidence fixture. The local
+  // provisioning adapter does NOT prove chown/setpriv or pinned Codex execution (M3).
+  for (const terminal of ["success", "failure", "unconfirmed"] as const) {
+    it(`provider auth-state canary launcher lifecycle: ${terminal}`, async (t) => {
+      const parent = await fs.mkdtemp(path.join(process.env.TMPDIR!, "launcher-canary-"));
+      t.after(() => fs.rm(parent, { recursive: true, force: true }));
+      const root = path.join(parent, "epoch");
+      const home = path.join(root, "codex");
+      const transcript = '{"type":"session_meta","payload":{"id":"controlled-session"}}\n';
+      const auth = binding.credential;
+      let removals = 0;
+      const fake = newFake({ disposeState: terminal === "unconfirmed" ? "unconfirmed" : "drained" });
+      const handle = await launchCodexRoot(baseSpec({
+        ownedDataRoot: root, provider: undefined, providerBinding: binding,
+        model: "default", useAppServerAuth: true, authMode: "provider",
+      }), baseDeps(fake, {
+        makeRunnerTrees: req => {
+          assert.equal(req.uid, RUNNER_UID);
+          assert.deepEqual(req.sharedSessionRead, {
+            gid: CODEX_SESSION_GID, codexHome: home, sessionDir: path.join(home, "sessions"),
+          });
+          for (const dir of req.dirs) syncFs.mkdirSync(dir, { recursive: true });
+          for (const file of req.files) syncFs.writeFileSync(file.path, file.content, { mode: file.mode });
+        },
+        removeRunnerTree: req => {
+          assert.equal(req.root, root);
+          removals++;
+          syncFs.rmSync(req.root, { recursive: true });
+        },
+      }));
+      // Model the app-server's auth write; no login RPC or real provider process is claimed.
+      await fs.writeFile(path.join(home, "auth.json"), auth);
+      await fs.mkdir(path.join(home, "cache"));
+      await fs.writeFile(path.join(home, "cache/state.json"), "distinct-cache-canary");
+      await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+      await fs.writeFile(path.join(home, "sessions/rollout-safe.jsonl"), transcript);
+      const config = await fs.readFile(path.join(home, "config.toml"), "utf8");
+      assert.match(config, /requires_openai_auth = true/);
+      assert.match(config, /gateway-model/);
+      assert.equal(config.includes(binding.credential), false);
+      assert.equal(JSON.stringify(spawnCalls[0]!.options.env).includes(binding.credential), false);
+      assert.equal(await fs.readFile(path.join(home, "auth.json"), "utf8"), auth);
+      const store = path.join(parent, "store");
+      const staging = path.join(parent, "staging");
+      const seeded = path.join(parent, "seeded");
+      assert.equal((await CodexSessionStore.persist(home, store)).files, 1);
+      const generation = (await fs.readFile(path.join(store, "current"), "utf8")).trim();
+      assert.match(generation, /^g[0-9a-f]{24}$/);
+      assert.equal((await CodexSessionStore.adopt(store, staging, { destination: "runner-seed" })).files, 1);
+      assert.equal((await seedCodexSessionArtifacts(path.join(staging, "sessions"), path.join(seeded, "sessions"))).files, 1);
+      for (const subset of [path.join(store, "generations", generation), staging, seeded]) {
+        const names = (await fs.readdir(subset, { recursive: true, withFileTypes: true }))
+          .filter(entry => entry.isFile())
+          .map(entry => path.relative(subset, path.join(entry.parentPath, entry.name))).sort();
+        assert.deepEqual(names, ["sessions/rollout-safe.jsonl"]);
+        assert.equal(await fs.readFile(path.join(subset, names[0]!), "utf8"), transcript);
+        assert.equal(transcript.includes(auth), false);
+      }
+      // An application failure still disposes the live provider in finally.
+      // A premature provider-process exit is a different, sticky uncertainty.
+      const applicationFailure = new Error("controlled application failure");
+      let disposed: Awaited<ReturnType<typeof handle.dispose>> | undefined;
+      const operation = async () => {
+        try {
+          if (terminal === "failure") throw applicationFailure;
+        } finally {
+          disposed = await handle.dispose(1000);
+        }
+      };
+      if (terminal === "failure") await assert.rejects(operation(), error => error === applicationFailure);
+      else await operation();
+      assert.ok(disposed);
+      assert.equal(disposed.clean, terminal !== "unconfirmed", JSON.stringify(disposed));
+      assert.equal(removals, terminal === "unconfirmed" ? 0 : 1);
+      if (terminal === "unconfirmed") {
+        assert.equal(await fs.readFile(path.join(home, "auth.json"), "utf8"), auth);
+        assert.equal(await fs.readFile(path.join(home, "config.toml"), "utf8"), config);
+      } else {
+        await assert.rejects(fs.stat(root), { code: "ENOENT" });
+      }
+    });
+  }
+
   it("launches frozen provider mapped config without credential environment injection", async () => {
     await launchCodexRoot(baseSpec({
       provider: undefined, providerBinding: binding, model: "default",
