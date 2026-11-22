@@ -1514,9 +1514,11 @@ WITH checker_template_pins AS MATERIALIZED (
            OR 'codex_completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause (standalone, outside fn_worker_can_claim,
       -- required_capabilities and @capability_aware). A provider-bound run (model_provider_key_mode set)
-      -- is claimable only by a worker reporting 'claude_provider_v1': an older worker would ignore the
+      -- requires its engine's provider protocol capability: an older worker would ignore the
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
-      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(@worker_protocol_caps::text[])))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1797,8 +1799,10 @@ WITH checker_template_pins AS MATERIALIZED (
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
-                -- provider-bound run to a peer that lacks 'claude_provider_v1' and could never claim it.
-                AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(p.protocol_capabilities))
+                -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
+                AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -11460,7 +11464,7 @@ WHERE id = @id;
 -- implements the completion protocol — the non-bypassable claim clause can never be satisfied.
 -- PRD #4320 module 5: model_provider_key_mode rides this read so the queued arm can surface a
 -- provider-capability reason for a PROVIDER-BOUND run that no online worker advertises
--- 'claude_provider_v1' for: the non-bypassable provider claim clause can never be satisfied.
+-- its engine's provider capability for: the non-bypassable provider claim clause cannot be satisfied.
 -- PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
 -- queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 -- that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
@@ -11927,7 +11931,9 @@ WHERE run.id = @run_id
   -- Issue #4476: Codex claim provenance, mirrored (see ClaimRun).
   AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (run.model_provider_key_mode IS NULL
+           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -12233,15 +12239,10 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities);
 
--- name: CountOnlineWorkersSatisfyingClaudeProvider :one
--- PRD #4320 module 5: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
--- 'claude_provider_v1' PROTOCOL capability (the worker advertises it since #4505). It drives the queued-reason resolver's provider rung
--- (reasonNoProviderCapableWorker): a 0 here for a PROVIDER-BOUND queued run (model_provider_key_mode
--- set) means every online worker predates provider claims, so ClaimRun's NON-BYPASSABLE provider clause
--- ('claude_provider_v1' = ANY(@worker_protocol_caps)) can never be satisfied. Same filters as
--- CountOnlineWorkersSatisfyingCodexHarness, the twin this mirrors; only called for a provider-bound
--- queued run already past its health threshold (or one the early docker-allowlist probe found
--- online-but-ineligible), so it is off the hot path.
+-- name: CountOnlineWorkersSatisfyingProvider :one
+-- Provider-bound queued health uses the frozen engine. Codex needs its provider,
+-- harness and current runtime on the same worker; Claude retains its legacy rule.
+-- Unknown engines fail closed. Keep the Codex-harness count's intake/lane filters.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -12250,7 +12251,13 @@ WHERE w.user_id = @user_id
   -- The lane half of ClaimRun's isolated-lane clause: these rungs only run for an UNBOUND run, and a
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
-  AND 'claude_provider_v1' = ANY(w.protocol_capabilities);
+  AND (
+    (@engine::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+    OR (@engine::text = 'codex'
+        AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
+        AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))
+  );
 
 -- name: CountOnlineWorkersSatisfyingCodexRuntime :one
 -- Current Codex baseline for the worker-roll queued reason.
@@ -12701,7 +12708,9 @@ WHERE r.status = 'queued'
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -12795,7 +12804,9 @@ WHERE r.status = 'queued'
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
                          r.harness = 'codex'

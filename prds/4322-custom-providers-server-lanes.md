@@ -41,7 +41,7 @@ Add one protocol capability per newly wired consumer, alongside #4505's claude_p
 
 Update applicable placement, demand, wake and reap predicates, including isolated job paths. Preserve #4505 provider-only demand and capable-worker suppression, saturation checks, paired old-image reap predicates and busy/custody guards, and provider-chat wake filtering. `LockUnservableEphemeralJobWorkers` must account for both provider and new lane capabilities on provider-bound jobs: an incapable bound ephemeral job worker leads to terminal no_job_capable_worker through that job path, rather than endless generic provider reprovisioning. Vendor jobs and ordinary issue/chat rules remain unchanged. No image-proof service, version floor or provisioning subsystem.
 
-fn_placement_admitting_workers is replaced by a migration (draft number; its Down restores the 00486 body). ClaimRun's provider clause (runtime.sql, claude_provider_v1) gains the lane capability. The provider queued-reason rung in health.go (CountOnlineWorkersSatisfyingClaudeProvider) counts lane-capable workers for provider-bound lane runs, so a run waiting on a #4505-only fleet names the missing capability. Sweep e2e/ for any changed string.
+fn_placement_admitting_workers is replaced by a migration (draft number; its Down restores the 00486 body). ClaimRun's provider clause (runtime.sql, claude_provider_v1) gains the lane capability. The provider queued-reason rung in health.go (CountOnlineWorkersSatisfyingProvider) counts lane-capable workers for provider-bound lane runs, so a run waiting on a #4505-only fleet names the missing capability. Sweep e2e/ for any changed string.
 
 ### Exact-key redaction and output publication
 
