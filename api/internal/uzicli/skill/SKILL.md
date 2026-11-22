@@ -312,6 +312,7 @@ uzi job files <job-id>
 uzi job file get <file-id> [-o <path>]
 uzi admin users
 uzi admin runs
+uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]   # active ci_fix/mr_rework writers, all owners; needs UZI_ADMIN_RUN_DEBUG + admin_ro token; exits 1 when the answer is incomplete (absence unknown)
 uzi admin workers
 uzi admin health [--all] [--strict]
 uzi admin usage

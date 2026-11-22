@@ -1773,6 +1773,22 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
   the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
   prints a `{runs, truncated}` envelope of summary rows instead of the table.
+- **`uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]`** lists the active `ci_fix` and
+  `mr_rework` runs, across all owners, that may push to a branch. Same prerequisites as the rest of this
+  section (`UZI_ADMIN_RUN_DEBUG` and an `admin_ro` token; an older server answers 404). `--repo` and
+  `--branch` are required; `--mr` must be positive. Each read is audited.
+  - **Matching.** `ci_fix` runs match by exact branch; `mr_rework` runs match only by `--mr`, never by
+    branch alone. Equivalent connections across owners count as the same repo: the match is by forge
+    type, the canonical base URL (`:443` and `api.github.com` folded) and the project id.
+  - **Completeness.** `complete=false` means more than 500 matched and the answer is unknown: the CLI
+    prints `incomplete: more than 500 matching writers; absence is unknown` on stderr and exits 1,
+    unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
+    no matching writer at that database snapshot only: a writer may start after the read.
+  - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
+    `{writers, complete}` document as received.
+  - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
+    the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
+    `VISIBILITY=owner_only`.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.

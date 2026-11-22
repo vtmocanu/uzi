@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -126,6 +127,49 @@ func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since strin
 	}
 	if out.Runs == nil {
 		out.Runs = []apitypes.RunSummaryItemDTO{}
+	}
+	return out, nil
+}
+
+// AdminRunWriters is GET /api/admin/run-writers (issue #4618): the active ci_fix / mr_rework
+// writers for a repo and branch (and optionally an MR), across all owners. mrIID 0 means no MR.
+// The body is decoded strictly: it must be a JSON object whose "complete" key is a boolean and
+// whose "writers" key is an array, so an unrelated or partial reply is never read as "no writers".
+func (c *HTTPClient) AdminRunWriters(ctx context.Context, repoID, branch string, mrIID int64) (apitypes.RunWritersDTO, error) {
+	const route = "/api/admin/run-writers"
+	q := url.Values{}
+	q.Set("repo", repoID)
+	q.Set("branch", branch)
+	if mrIID > 0 {
+		q.Set("mr_iid", strconv.FormatInt(mrIID, 10))
+	}
+	resp, body, err := c.doJSONRead(ctx, http.MethodGet, route+"?"+q.Encode(), nil)
+	if err != nil {
+		return apitypes.RunWritersDTO{}, err
+	}
+	if resp.StatusCode/100 != 2 {
+		return apitypes.RunWritersDTO{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
+	}
+	malformed := Exitf(ExitGeneric, "malformed response from uzi (%s)", route)
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(body, &keys) != nil || keys == nil {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	// "complete" must be a JSON boolean (a string, number or null is refused) and "writers" an
+	// array (null or absent is refused).
+	var complete bool
+	if raw, ok := keys["complete"]; !ok || json.Unmarshal(raw, &complete) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	if raw, ok := keys["writers"]; !ok || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	var out apitypes.RunWritersDTO
+	if err := json.Unmarshal(body, &out); err != nil {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	if out.Writers == nil {
+		out.Writers = []apitypes.RunWriterDTO{}
 	}
 	return out, nil
 }

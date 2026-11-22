@@ -47,6 +47,19 @@ func (f *FakeClient) AdminListRunsDebug(_ context.Context, userID, since string)
 	return f.AdminRunsDebugResult, nil
 }
 
+// AdminRunWriters records its arguments and returns AdminRunWritersOut (AdminRunWritersErr,
+// then the blanket Err, win).
+func (f *FakeClient) AdminRunWriters(_ context.Context, repoID, branch string, mrIID int64) (apitypes.RunWritersDTO, error) {
+	f.AdminRunWritersCalls = append(f.AdminRunWritersCalls, AdminRunWritersCall{RepoID: repoID, Branch: branch, MRIID: mrIID})
+	if f.AdminRunWritersErr != nil {
+		return apitypes.RunWritersDTO{}, f.AdminRunWritersErr
+	}
+	if f.Err != nil {
+		return apitypes.RunWritersDTO{}, f.Err
+	}
+	return f.AdminRunWritersOut, nil
+}
+
 func (f *FakeClient) AdminHealth(context.Context) (apitypes.HealthDocDTO, error) {
 	if f.Err != nil {
 		return apitypes.HealthDocDTO{}, f.Err

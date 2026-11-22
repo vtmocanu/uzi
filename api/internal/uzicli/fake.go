@@ -808,7 +808,11 @@ type FakeClient struct {
 	AdminRunsDebugErr         error
 	AdminListRunsDebugCalls   []AdminListRunsDebugCall
 	RunInputsAdminDebug       map[string]bool
-	RunInputsMetaCalls        int
+	// AdminRunWritersOut/Err back AdminRunWriters (issue #4618); the Err wins over the blanket Err.
+	AdminRunWritersOut   apitypes.RunWritersDTO
+	AdminRunWritersErr   error
+	AdminRunWritersCalls []AdminRunWritersCall
+	RunInputsMetaCalls   int
 
 	// Owner held-publication list + early expiry (issue #2545). HeldPublicationsResult backs
 	// HeldPublications and HeldExpireResult backs ExpireHeldPublications; HeldErr wins over the
@@ -844,6 +848,13 @@ var _ Client = (*FakeClient)(nil)
 type RecoveryHoldsScopedCall struct {
 	UserID string
 	RunID  string
+}
+
+// AdminRunWritersCall is one AdminRunWriters argument set.
+type AdminRunWritersCall struct {
+	RepoID string
+	Branch string
+	MRIID  int64
 }
 
 // AdminListRunsDebugCall is one AdminListRunsDebug filter pair.
