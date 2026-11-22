@@ -15255,7 +15255,11 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     m2Runner.installHarness();
 
     for (const decision of ["partial", "accept", "missing scope"] as const) {
-      it(`issue3089 Codex live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async (t) => {
+      // issue #4596: each case drives ~620-705 real production git subprocesses through the runner,
+      // publication and guard path, with no fixed wait (polls 5 ms, sleeps no-op), so its duration
+      // scales with host CPU load: ~4 s idle, but 15194 / 14036 / 13811 ms on loaded CI shard 2,
+      // where 15000 timed out. 60 s keeps ~4x headroom; the abort diagnostic below still fires.
+      it(`issue3089 Codex live ${decision} binds refreshed permit scope through finalization`, { timeout: 60_000 }, async (t) => {
         m2Runner.api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
         await m2Runner.client.register("codex-live-owner-decision");
         const forge = m2Runner.fakeGitlab();
