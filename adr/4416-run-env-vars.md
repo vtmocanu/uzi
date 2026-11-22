@@ -81,6 +81,11 @@ caught beyond the PRD list:
   (all `network_wiring`). The `AWS_ENDPOINT_URL_BEDROCK` prefix has no trailing underscore on
   purpose, so it also covers `AWS_ENDPOINT_URL_BEDROCK_AGENT*`. `OTEL_EXPORTER_OTLP_*` and
   `GCE_METADATA_*` are denied as network wiring because the harness reads them.
+- `AWS_ENDPOINT_URL` (`network_wiring`), by exact name: the global AWS endpoint override also
+  routes Bedrock traffic. `AWS_ENDPOINT_URL_STS` and the other per-service names stay allowed.
+  Names are checked on write only, so a stored `AWS_ENDPOINT_URL` variable stays; a worker with
+  the rule drops it at injection with a run event naming the rule, and an older worker injects it
+  until updated.
 
 Names that a harness also reads but that are application configuration (`AWS_REGION`, cloud
 credentials, `CLOUD_ML_REGION`) stay allowed and are recorded in the fixture's `overlaps` with the
@@ -196,13 +201,26 @@ slashes, HTML-safe `\u00XX` (both hex cases), percent-encoded (both hex cases, `
 and three standard and three URL-safe base64 alignments trimmed to the characters that do not
 depend on neighbouring bytes. Each is also registered for the value without its trailing line
 break and, for a multi-line value, with line endings normalized to LF. A multi-line value also
-registers each of its lines (8 characters or more, PEM armor lines excluded) for redaction only,
-never as a scan needle, because a public line would hit unrelated files. The scan needles instead add
+registers each of its lines for redaction (and for the preserved-patch line check) only, never as a
+scan needle, because a public line would hit unrelated files. A line is registered only when it is at
+least 8 characters, has a letter or digit, has at least 2 distinct non-space characters, and is neither
+PEM armor nor on the public-line list (`Proc-Type` lines and the service-account JSON members `type`,
+`auth_uri`, `token_uri`, `auth_provider_x509_cert_url`, `universe_domain`; `lineForms` and
+`PUBLIC_LINES` in `run-env-forms.ts`). The scan needles instead add
 diff-shaped forms of the value, its lines joined by `\n+`, `\n-` and `\n ` (LF and CRLF). Plain
 values are never registered. The forms join the run's existing redactor, so every sink it already
 covers masks them; the plan, the plan summary, the intent summary and
 the planning diff also go through it. The lead's prompt lists only the variables the executor actually
-injected: a name dropped as protected or already set by the tool profile is not listed.
+injected: a name dropped as protected or already set by the tool profile is not listed. That set is
+computed once per executor run, after tool provisioning and before any prompt, with the rules the env
+build applies (`runEnvInjectedSet`, `agent/src/run-env-inject.ts`), and the env build folds exactly that set.
+
+A claim's forms are computed once (`runEnvClaimForms`) and capped at `RUN_ENV_FORM_CHARS_MAX`
+(40,000,000 UTF-16 units of distinct forms). Over the cap no partial form set is used: the claim
+fails before the clone and any output with a failure reason starting `run_env_forms_over_budget` (no
+value), and nothing is published. A lane with no live flight (held, terminal, bundle publication)
+withholds with the reason `forms_over_budget`. A store filled to its bounds with multi-line values
+can pass the cap. The worker log and `SecretSet` keep incremental, reference-counted literal indexes.
 
 Every publish is searched for the registered forms by `scanRunEnvRange`
 (`agent/src/run-env-scan.ts`): every object reachable from the candidate tip and not from the
@@ -233,7 +251,13 @@ Sites:
 - **Finalize, on every forge**, before the branch push. A hit, or a scan that cannot prove the
   range clean, fails the run with `fail_origin = push_secret_blocked`, no push and no preserved
   patch.
-- **The preserved patch**: the raw patch is searched first and withheld whole on a hit, then
+- **The preserved patch** (`scanGatedPatch`, `patchScanVerdict`, `patchImages`): the raw patch is
+  withheld whole when the claim is over budget; when a whole-value form occurs in it; when one occurs
+  in a rebuilt per-hunk pre-image or post-image (context plus removed or added lines, also with line
+  breaks normalized to LF); when any registered line form occurs; or when it cannot be parsed
+  (binary, combined diff, a line-count mismatch, a non-header line before the first hunk). The
+  image, line-form and parse checks apply only when the run has secret variables, so a run with a
+  secret variable loses its preserved patch when the diff touches a binary file. Otherwise it is
   redacted and gitleaks-scanned as before.
 
 ## Where the PRD differed from the code
@@ -268,8 +292,9 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
-- **Mixed hunk.** A diff hunk that mixes context and added lines of one multi-line secret is not
-  matched as a whole by the patch text check. Per-line redaction still masks it, and the blob scan
+- **Patch gaps.** The patch check misses a secret whose lines are all short or public and that is
+  split across files or by elided context between hunks, and a value that appears only re-encoded
+  (each line indented in a YAML block, or an encoding other than those registered). The blob scan
   still blocks a committed file.
 - **Marker coverage.** The absent-route fallback relies on the per-run marker, which exists only
   for runs this worker received variables for, as described above.
