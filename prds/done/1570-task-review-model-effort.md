@@ -2,7 +2,7 @@
 
 **Issue:** #1570  
 **Parent:** #1703 (consistent model configuration across Claude and Codex).  
-**Status:** Draft r4, 2026-11-22, against main `0095b4361` (r2 folded the independent architect review; r3 records the owner's decision D4; r4 folds the buddy's resolver review).
+**Status:** Done, 2026-11-22: M1 and M2 implemented on branch `agent/issue-1570` (one PR). Draft r4 was written against main `0095b4361` (r2 folded the independent architect review; r3 records the owner's decision D4; r4 folds the buddy's resolver review). Full suites remain exact-head PR CI (Landing obligations).
 **Priority:** Normal.  
 **Blocked by:** none.  
 **Delivery:** one PRD, one uzi run, one PR, two serial milestones. Use the in-run/CI boundary in AGENTS.md *Run economy*. Neither implementation nor validation touches `.github/workflows/**`. Draft migration numbers sit above main's head (`00503` at drafting; `00504`-`00507` are held by open PRs); run `task migration:renumber` on the landing rebase.
@@ -78,13 +78,13 @@ Resource bounds: the new input is the owner's own setting, bounded by the existi
 
 ## Milestones
 
-### M1: Task-review model per harness
+### M1: Task-review model per harness (done)
 
 Blocked by: none.  
 Storage (two model columns), write/read API and fixtures, claim field with re-validation, `task_review_settings_v1` capability and notice, agent pass-through, effective model cells, CLI `task-review-model`, Run defaults model controls, mock API, docs (`worker-model.md` section rewritten, `configuration.md`, `cli.md`, `handoff.md`; `task docs:sync`), `specs/human.md` line, changelog fragment, the stale comments in `task-review-model.ts` and `worker_default.go`.  
 Acceptance: examples 1 (model half), 2 (model half), 3, 4 pass; tests above for model; `check-docs:web` clean.
 
-### M2: Task-review effort per harness
+### M2: Task-review effort per harness (done)
 
 Blocked by: M1.  
 Storage (two effort columns, own migration), write/read API and fixtures, claim field under the same capability, agent pass-through, effective effort cells, CLI `task-review-effort`, Run defaults effort selects, docs (`worker-effort.md`, `configuration.md`, `cli.md`).  
@@ -108,3 +108,4 @@ None required; no hosted-only behaviour.
 - D7: the review fields are top-level claim fields beside `judge_model` / `summary_model`, and the runner keeps ignoring `config.default_model` / `config.default_effort`. Reason: `config.default_model` is the worker lane, which would silently replace the Claude review's SDK default, and a single resolved review field keeps the claim and the view on one rule. The inheritance is resolved on the server into `task_review_effort`, so the agent has one source and the effective view uses the same resolver.
 - D8: stored values are re-validated at claim time and an invalid one falls back to the built-in. Reason: a curated Codex model can be removed later, and the renderer would then run the provider default instead of today's built-in.
 - D6: unavailable configured model fails visibly through the existing failed-review summary, not a new health reason. Reason: the review run already posts that failure on the target run; a run-level health reason would duplicate it.
+- D9 (implementation, 2026-11-22): the claim omits `task_review_model` whenever the resolution is the built-in (unset or invalid stored value), Codex included, so the worker's own built-in applies and the wire carries only an owner-configured, re-validated model. The omission notice names each withheld setting; its text says the old worker runs its built-in model and sends no effort. Rejected: shipping `gpt-6-sol` explicitly on every capable Codex review (same behaviour, wider wire, and it contradicts "omitted when unset").

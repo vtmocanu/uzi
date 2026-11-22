@@ -39,7 +39,6 @@ const (
 	sourceCrossCheckPin           = "cross_check_pin"
 	sourceCrossCheckWorkerDefault = "cross_check_worker_default"
 	sourceCrossCheckDefault       = "cross_check_default"
-	sourceBuiltin                 = "builtin"
 
 	noteSDKDefault             = "sdk_default"
 	noteNotSent                = "not_sent"

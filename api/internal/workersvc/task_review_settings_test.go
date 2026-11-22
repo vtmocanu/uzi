@@ -114,6 +114,21 @@ func TestPredictLeadReviewEffort(t *testing.T) {
 	}
 }
 
+// TestPredictLeadReviewInheritsTheHarnessWorkerEffort pins which stored worker-effort column each
+// harness inherits from: Claude default_effort, Codex default_codex_effort (never the other lane).
+func TestPredictLeadReviewInheritsTheHarnessWorkerEffort(t *testing.T) {
+	f := &predictFake{poolFakeStore: &poolFakeStore{}, taskReview: store.GetUserTaskReviewSettingsRow{
+		DefaultEffort: pgconv.TextOrNull("max"), DefaultCodexEffort: pgconv.TextOrNull("low"),
+	}}
+	if got := predictLead(t, f, HarnessClaude, nil, false, true); got.Effort == nil || *got.Effort != "max" || !got.ReviewEffortInherited {
+		t.Fatalf("claude review effort = %+v, want inherited max", got)
+	}
+	if got := predictLead(t, f, HarnessCodex, nil, false, true); got.Effort == nil || *got.Effort != "low" || !got.ReviewEffortInherited ||
+		got.ReviewWorkerEffort.Level != "low" {
+		t.Fatalf("codex review effort = %+v, want inherited low", got)
+	}
+}
+
 func TestPredictLeadReviewUsesStoredModel(t *testing.T) {
 	f := &predictFake{poolFakeStore: &poolFakeStore{}, taskReview: store.GetUserTaskReviewSettingsRow{
 		TaskReviewModel: pgconv.TextOrNull("opus"), CodexTaskReviewModel: pgconv.TextOrNull("gpt-6.1-sol"),

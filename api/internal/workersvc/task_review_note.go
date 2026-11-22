@@ -34,7 +34,7 @@ type taskReviewSettingsOmittedPayload struct {
 // taskReviewSettingsOmittedText is the nonsecret note text naming the withheld settings.
 func taskReviewSettingsOmittedText(withheld []string) string {
 	return "task review settings omitted (" + strings.Join(withheld, ", ") +
-		"): this worker predates task review settings; the review runs the built-in"
+		"): this worker predates task review settings; the review runs on its built-in model and sends no effort"
 }
 
 // recordTaskReviewSettingsOmittedNote appends the nonsecret status line to the run's feed and

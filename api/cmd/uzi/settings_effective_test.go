@@ -70,7 +70,7 @@ func effectiveFixture() *apitypes.EffectiveSettingsDTO {
 			effortCell("worker_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
 			effortCell("worker_effort", "codex", sptr("runtime"), nil, "user_default", "runtime_default"),
 			// An unset Claude review effort inherits the worker effort (medium, built-in); an explicit
-			// Codex `runtime` sends no level even though the worker effort is Runtime default too.
+			// Codex `runtime` (an explicit review preference) sends no level. (effortCell fixes DefaultEffort to medium.)
 			effortCell("task_review_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
 			effortCell("task_review_effort", "codex", sptr("runtime"), nil, "user_default", "runtime_default", "not_sent"),
 		},
