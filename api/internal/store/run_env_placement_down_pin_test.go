@@ -149,6 +149,9 @@ func TestRunEnvPlacementDownRestoresPredecessorFunction(t *testing.T) {
 	if down == "" {
 		t.Fatalf("%s Down does not define %s", placement, placementFunction)
 	}
+	if !regexp.MustCompile(`(?is)^CREATE\s+OR\s+REPLACE\s+FUNCTION\b`).MatchString(down) {
+		t.Fatalf("%s Down must redefine %s with CREATE OR REPLACE FUNCTION", placement, placementFunction)
+	}
 	if fromFunctionKeyword(down) != fromFunctionKeyword(prior) {
 		t.Fatalf("%s Down function (%d bytes) differs from %s Up function (%d bytes)", placement, len(down), priorFile, len(prior))
 	}

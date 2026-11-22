@@ -82,9 +82,9 @@ value), and publishes nothing. A publish with no live flight (held, terminal and
 bundle publication) is withheld with the reason `forms_over_budget`. A
 cross-check child whose claim is over the cap ends as checker unavailable
 instead. A store filled to its limits with multi-line values can pass the cap.
-To get under it, remove or shorten secret variables, multi-line ones first;
-retired versions still count until they leave the retention window (see
-[Rotating and deleting while runs are active](#rotating-and-deleting-while-runs-are-active)).
+To get under it, remove or shorten secret variables, multi-line ones first. A
+run keeps counting the older versions it was given; a new run counts only the
+current values.
 
 Before work leaves the worker, every commit in the outgoing range is searched
 for those forms, not only the final tree. For a multi-line secret it also
@@ -108,13 +108,13 @@ terminal preservation packs, recovery archives and the preserved patch.
   pre-image or post-image (context plus removed or added lines, also with line
   breaks normalized to LF); when any registered line form occurs in it; or, for
   a run with secret variables, when the patch cannot be parsed (binary, combined
-  diff, a line-count mismatch, or for example a non-header line between a file
+  diff, a line-count mismatch, or a stray line such as a non-header line between a file
   header and its first hunk). The image, line-form and parse checks apply when
   the run has any secret variable, retired versions included, so such a run
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
 - Gaps that remain: a secret whose lines are all short, public, or without a
-  letter, digit or second distinct character, and that is
+  letter or digit, or with only one distinct character, and that is
   split across files or by elided context between hunks, and a value that
   appears only re-encoded, such as each line indented in a YAML block or in an
   encoding other than those registered. A committed file that holds the whole

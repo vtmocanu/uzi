@@ -255,7 +255,7 @@ Sites:
   withheld whole when the claim is over budget; when a whole-value form occurs in it; when one occurs
   in a rebuilt per-hunk pre-image or post-image (context plus removed or added lines, also with line
   breaks normalized to LF); when any registered line form occurs; or when it cannot be parsed
-  (binary, combined diff, a line-count mismatch, for example a non-header line between a file
+  (binary, combined diff, a line-count mismatch, or a stray line such as a non-header line between a file
   header and its first hunk). The image, line-form and parse checks apply when the run has any
   secret variable, retired versions included, so a run with a secret variable loses its preserved patch when the diff touches a binary file. Otherwise it is
   redacted and gitleaks-scanned as before.
@@ -292,9 +292,8 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
-- **Patch gaps.** The patch check misses a secret whose lines are all short, public, or without a letter, digit or second
-  distinct character, and that is
-  split across files or by elided context between hunks, and a value that appears only re-encoded
+- **Patch gaps.** The patch check misses a secret whose lines are all short, public, or without a letter or digit, or with only one
+  distinct character, and that is split across files or by elided context between hunks, and a value that appears only re-encoded
   (each line indented in a YAML block, or an encoding other than those registered). The blob scan
   still blocks a committed file.
 - **Marker coverage.** The absent-route fallback relies on the per-run marker, which exists only
