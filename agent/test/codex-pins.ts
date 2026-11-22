@@ -45,6 +45,11 @@ export const EXPLICIT_PIN_SITES: readonly ExplicitSite[] = [
     { file, pattern: new RegExp(`(assertBinaryVersion\\(bin, ")(${SEMVER})("\\))`, "g"), count: 1, value: version },
     { file, pattern: new RegExp(`(\\bversion: ")(${SEMVER})(")`, "g"), count: 1, value: version },
   ]),
+  // The phase-model proofs assert the binary and stamp the pin into their emitted evidence.
+  ...["e2e/codex-m4/phase-model-switch.test.ts", "e2e/codex-m4/phase-model-live-codex.probe.ts"].flatMap((file) => [
+    { file, pattern: new RegExp(`(assertBinaryVersion\\(bin, ")(${SEMVER})("\\))`, "g"), count: 1, value: version },
+    { file, pattern: new RegExp(`(\\bpin: ")(${SEMVER})(")`, "g"), count: 1, value: version },
+  ]),
 ];
 
 export interface CodexLock {

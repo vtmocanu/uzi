@@ -70,10 +70,10 @@ export const CODEX_PROBE_EXPECTATION: {
   readonly version: string;
   readonly lockDigest: Readonly<Record<string, string>>;
 } = {
-  version: "0.167.0",
+  version: "0.169.0",
   lockDigest: {
-    amd64: "3bbf75e83de6b58aed28f2cf6e33ad423ec31fd4700a1457b94be557ea5a7c6e",
-    arm64: "0de261ecf1e7f3028a7952f03fca2093f749277d38590b78bb32f8567756bbb7",
+    amd64: "3b8ed091149cc63a59046b9f094bcfa21cdb4dda15ede441ce369bcee4a71ba0",
+    arm64: "c8d0b4ab2a97c595b70b10412d36d0d5464dcef1e1d3246b073d48017cdf5a4f",
   },
 };
 
