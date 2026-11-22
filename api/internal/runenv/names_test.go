@@ -178,7 +178,8 @@ func TestWindowsSpellingsAndTscNames(t *testing.T) {
 	}
 	for _, n := range []string{"TEMP", "TMP", "SYSTEMDRIVE", "NODE_INSPECTOR_IPC", "VSCODE_INSPECTOR_OPTIONS",
 		"API_FORCE_IDLE_TIMEOUT", "ENABLE_TOOL_SEARCH", "SLASH_COMMAND_TOOL_CHAR_BUDGET", "AUTOMODE_DECISION_LOG",
-		"NODE_USE_SYSTEM_CA", "ENABLE_BETA_TRACING_DETAILED", "ENABLE_ENHANCED_TELEMETRY_BETA", "BETA_TRACING_ENDPOINT"} {
+		"NODE_USE_SYSTEM_CA", "ENABLE_BETA_TRACING_DETAILED", "ENABLE_ENHANCED_TELEMETRY_BETA", "BETA_TRACING_ENDPOINT",
+		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"} {
 		err := ValidateName(n)
 		if err == nil || !strings.Contains(err.Error(), "(denied name)") {
 			t.Errorf("ValidateName(%q) = %v, want the denied-name rule", n, err)

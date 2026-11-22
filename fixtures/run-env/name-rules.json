@@ -73,7 +73,8 @@
     "NODE_USE_SYSTEM_CA",
     "ENABLE_BETA_TRACING_DETAILED",
     "ENABLE_ENHANCED_TELEMETRY_BETA",
-    "BETA_TRACING_ENDPOINT"
+    "BETA_TRACING_ENDPOINT",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"
   ],
   "denied_prefixes": [
     "UZI_",
@@ -258,13 +259,19 @@
       "name": "ENABLE_ENHANCED_TELEMETRY_BETA",
       "harness": "claude",
       "decision": "denied",
-      "reason": "harness control outside the denied prefixes: enables the Claude CLI's enhanced telemetry (trace export) beta, the unprefixed alias of CLAUDE_CODE_ENHANCED_TELEMETRY_BETA (owner decision #4611)"
+      "reason": "harness control outside the denied prefixes: with CLAUDE_CODE_ENABLE_TELEMETRY, adds the Claude CLI's enhanced telemetry (trace export) beta; the unprefixed alias of CLAUDE_CODE_ENHANCED_TELEMETRY_BETA (owner decision #4611)"
     },
     {
       "name": "BETA_TRACING_ENDPOINT",
       "harness": "claude",
       "decision": "denied",
       "reason": "harness control outside the denied prefixes: OTLP endpoint of the Claude CLI's beta trace and log export (owner decision #4611)"
+    },
+    {
+      "name": "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "provider selector outside the denied prefixes (its leading underscore escapes CLAUDE_): makes the Claude CLI treat the worker-set ANTHROPIC_BASE_URL gateway as the first-party Anthropic API; denied under the provider-selection invariant (#4611)"
     },
     {
       "name": "TSC_NONPOLLING_WATCHER",
