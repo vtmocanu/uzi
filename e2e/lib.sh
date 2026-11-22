@@ -1453,6 +1453,9 @@ resolve_fixture_source_hold() {
       fail "fixture hold still capturing after ${timeout}s: run=$run generation=$generation hold=$id"
     fi
     sleep 1
+    # The pause itself may spend the budget: report the capture, not a refused read.
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "fixture hold still capturing after ${timeout}s: run=$run generation=$generation hold=$id"
     view="$(apiget_before "$deadline" /api/recovery/holds)" \
       || fail "fixture hold read failed or exceeded the ${timeout}s deadline: run=$run generation=$generation hold=$id"
     hold="$(printf '%s' "$view" | jq -c --arg run "$run" --argjson generation "$generation" \
@@ -1531,7 +1534,8 @@ resolve_fixture_source_hold() {
     || fail "fixture hold deadline of ${timeout}s passed before the owner disposition: run=$run generation=$generation hold=$id"
   reply="$(uzi_cli run discard "$run" --hold "$id" --yes --json)" || fail "fixture owner disposition failed: run=$run hold=$id"
   printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "fixture owner disposition not acknowledged: $reply"
-  view="$(apiget /api/recovery/holds)"
+  view="$(apiget_before "$deadline" /api/recovery/holds)" \
+    || fail "fixture owner disposition re-read failed or exceeded the ${timeout}s deadline: run=$run hold=$id"
   printf '%s' "$view" | jq -e --arg run "$run" --arg id "$id" --argjson generation "$generation" \
     '[.holds[] | select(.id==$id and .run_id==$run and .generation==$generation)] | length==1 and .[0].state=="discarded"' >/dev/null \
     || fail "fixture owner disposition has no exact discarded row: run=$run hold=$id"

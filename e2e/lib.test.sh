@@ -1836,10 +1836,20 @@ fixture_hold_deadline() {
         return 28
       } ;;
     late-transition)
-      # Fast reads; the capture only turns source_only on the poll taken at the deadline.
+      # Real wall clock (no custody_case reset): the poll starts inside the budget, but
+      # the capture turns source_only in a reply that lands 2s later, past the deadline.
+      echo 0 > "$SEQ_DIR/deadline-reads"
       apiget_before() {
-        if [ "$SECONDS" -ge "$1" ]; then deadline_holds source_only; else deadline_holds capturing; fi
+        local reads
+        reads=$(( $(cat "$SEQ_DIR/deadline-reads") + 1 ))
+        echo "$reads" > "$SEQ_DIR/deadline-reads"
+        if [ "$reads" = 1 ]; then deadline_holds capturing; return 0; fi
+        command sleep 2; deadline_holds source_only
       } ;;
+    capturing-real)
+      # The real bounded reader over a capture that never settles: when the pause spends
+      # the budget the helper reports the capture, not a refused read.
+      curl() { deadline_holds capturing; } ;;
     slow-archives)
       # Real wall clock (no custody_case reset): the hold is already source_only, but the
       # pre-discard archive listing takes 2s against a 1s budget.
@@ -1868,6 +1878,8 @@ fixture_hold_deadline() {
         || fail "a holds read budget exceeded the 2s deadline: $(cat "$SEQ_DIR/deadline-budgets")" ;;
     late-transition)
       [[ "$output" == *'changed after the 2s deadline'* ]] || fail "late transition missed the deadline diagnostic: $output" ;;
+    capturing-real)
+      [[ "$output" == *'still capturing after 2s'* ]] || fail "capture timeout lost its diagnostic: $output" ;;
     slow-archives)
       [[ "$output" == *'passed before the owner disposition'* ]] || fail "slow pre-discard read missed the deadline diagnostic: $output" ;;
   esac
@@ -1875,13 +1887,18 @@ fixture_hold_deadline() {
 }
 custody_case "a blocked holds read past the deadline fails with zero discards" pass 'deadline blocked-read failed closed with zero discards' \
   fixture_hold_deadline blocked-read
-custody_case "a capturing to source_only transition seen at the deadline fails with zero discards" pass 'deadline late-transition failed closed with zero discards' \
-  fixture_hold_deadline late-transition
+custody_case "a capture that never settles keeps its diagnostic under the real bounded reader" pass 'deadline capturing-real failed closed with zero discards' \
+  fixture_hold_deadline capturing-real
 # Deliberately outside custody_case: SECONDS must keep its wall-clock behaviour here.
-cases=$((cases + 1))
-if output="$(fixture_hold_deadline slow-archives 2>&1)" && [[ "$output" == *'deadline slow-archives failed closed with zero discards'* ]]; then
-  passed=$((passed + 1)); echo "PASS: a read that outlives the deadline before the owner disposition discards nothing"
-else echo "FAIL: a read that outlives the deadline before the owner disposition discards nothing: output [$output]"; fi
+wall_clock_deadline_case() {
+  local name="$1" mode="$2" output
+  cases=$((cases + 1))
+  if output="$(fixture_hold_deadline "$mode" 2>&1)" && [[ "$output" == *"deadline $mode failed closed with zero discards"* ]]; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else echo "FAIL: $name: output [$output]"; fi
+}
+wall_clock_deadline_case "a capturing to source_only transition seen after the deadline fails with zero discards" late-transition
+wall_clock_deadline_case "a read that outlives the deadline before the owner disposition discards nothing" slow-archives
 
 # Execute the actual owning phase boundaries against the real owner helper. The
 # fixture holds every phase's runs plus the completed outage case (which must
