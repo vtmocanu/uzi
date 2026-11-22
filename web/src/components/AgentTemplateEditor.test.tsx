@@ -39,7 +39,7 @@ describe("AgentTemplateEditor model Default label (#3255)", () => {
 
   it("names the lead's model for a subagent and omits the lead-only help", () => {
     const select = renderEditor("coder");
-    expect(select.options[0]?.text).toBe("Default · lead's model");
+    expect(select.options[0]?.text).toBe("Default · follows lead");
     expect(screen.queryByText(WORKER_MODEL_HELP)).toBeNull();
   });
 
@@ -57,7 +57,7 @@ describe("AgentTemplateEditor model Default label (#3255)", () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.getByText("Default · lead's model", { selector: "span.text-ok" })).toBeTruthy();
+    expect(screen.getByText("Default · follows lead", { selector: "span.text-ok" })).toBeTruthy();
     expect(screen.queryByText(/^inherit$/i)).toBeNull();
   });
 });
@@ -83,7 +83,7 @@ describe("AgentTemplateEditor Codex contract plumbing", () => {
     );
     expect(ref.current?.currentContent().codex_model).toBe("gpt-6-sol");
     expect(screen.getByLabelText("Codex model")).toBeTruthy();
-    expect(screen.getByText("Default · lead's model", { selector: "span.text-ok" })).toBeTruthy();
+    expect(screen.getByText("Default · follows lead", { selector: "span.text-ok" })).toBeTruthy();
     expect(screen.getByText("gpt-6-sol", { selector: "span.text-danger" })).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "sonnet" } });
     expect(ref.current?.currentContent()).toMatchObject({ model: "sonnet", codex_model: "gpt-6-sol" });

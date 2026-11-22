@@ -54,9 +54,9 @@ describe("AgentSourceSettingsCard staged review model label (#3255)", () => {
     expect(row.getByText(/Hidden formatting characters were removed/)).toBeTruthy();
     fireEvent.click(button);
     expect(row.getByText("Claude model").nextElementSibling?.textContent)
-      .toBe(claudeModel || "Default · lead's model");
+      .toBe(claudeModel || "Default · follows lead");
     expect(row.getByText("Codex model").nextElementSibling?.textContent)
-      .toBe(codexModel || "Default · lead's model");
+      .toBe(codexModel || "Default · follows lead");
     expect(row.queryByText("Model", { exact: true })).toBeNull();
   });
 
@@ -72,8 +72,8 @@ describe("AgentSourceSettingsCard staged review model label (#3255)", () => {
     const button = await screen.findByRole("button", { name: "Show body" });
     fireEvent.click(button);
     const row = within(button.closest("li")!);
-    expect(row.getByText("Claude model").nextElementSibling?.textContent).toBe("Default · lead's model");
-    expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe("Default · lead's model");
+    expect(row.getByText("Claude model").nextElementSibling?.textContent).toBe("Default · follows lead");
+    expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe("Default · follows lead");
     expect(row.queryByText("gpt-6-sol")).toBeNull();
   });
 
@@ -86,7 +86,7 @@ describe("AgentSourceSettingsCard staged review model label (#3255)", () => {
     const coder = within(screen.getByText("coder", { selector: "code" }).closest("li")!);
     expect(lead.getByText("Default · SDK/account default (built-in)")).toBeTruthy();
     expect(lead.getByText("Default · built-in (gpt-6.1-sol)")).toBeTruthy();
-    expect(coder.getAllByText("Default · lead's model")).toHaveLength(2);
+    expect(coder.getAllByText("Default · follows lead")).toHaveLength(2);
     for (const row of [lead, coder]) {
       expect(row.getByText("Claude model")).toBeTruthy();
       expect(row.getByText("Codex model")).toBeTruthy();

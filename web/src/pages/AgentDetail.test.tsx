@@ -113,7 +113,7 @@ describe("AgentDetail read-only model label (#3255)", () => {
 
     renderPage();
 
-    expect(await screen.findByText("Claude: Default · lead's model · Codex: Default · lead's model")).toBeTruthy();
+    expect(await screen.findByText("Claude: Default · follows lead · Codex: Default · follows lead")).toBeTruthy();
     expect(screen.queryByText(/^inherit$/i)).toBeNull();
   });
 });
@@ -228,7 +228,7 @@ describe("AgentDetail real editor model pins", () => {
 
 describe("AgentDetail read-only pin labels match the Agents list", () => {
   it.each([
-    { name: "coder", model: null, codex_model: "gpt-6-luna", label: "Claude: Default · lead's model · Codex: gpt-6-luna" },
+    { name: "coder", model: null, codex_model: "gpt-6-luna", label: "Claude: Default · follows lead · Codex: gpt-6-luna" },
     { name: "coder", model: "sonnet", codex_model: "gpt-6-sol", label: "Claude: sonnet · Codex: gpt-6-sol" },
     { name: "lead", model: null, codex_model: null, label: "Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)" },
   ])("renders $label", async ({ label, ...pins }) => {
@@ -289,7 +289,7 @@ describe("AgentDetail effort pins (#3258)", () => {
 
     mockApi.getAgentTemplate.mockResolvedValue({ template: row() });
     renderPage();
-    expect(await screen.findByText("Claude: Default · lead's model · Codex: Default · lead's model")).toBeTruthy();
+    expect(await screen.findByText("Claude: Default · follows lead · Codex: Default · follows lead")).toBeTruthy();
     expect(screen.queryByText(/Claude effort:/)).toBeNull();
   });
 });
