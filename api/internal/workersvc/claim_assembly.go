@@ -564,8 +564,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// precedence rule stays in resolvePlanPhase.
 		leadInput.UserEffort = defaultEffort
 		leadSettings.Plan = resolvePlanPhase(leadInput, leadSettings)
-		// A claim carrying a plan_phase needs its harness capability. The requeue is non-looping: the
-		// next ClaimRun pass excludes this worker once the owner's planning value is set.
+		// A claim carrying a plan_phase needs its harness capability, including when the owner's
+		// planning setting changed after SQL admission. Requeue retains Codex claim provenance
+		// (ADR-4476), so another worker cannot take over a rejected Codex claim.
 		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, phaseModelsCapability(harness)) {
 			return nil, errPhaseModelsCapabilityMissing
 		}

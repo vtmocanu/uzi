@@ -589,8 +589,8 @@ function makeMultiEpochRig(canaries: CodexCanaries, responders: Responder[]): Mu
 
 // Build a per-epoch responder for a MULTI-epoch rig. Each recreated epoch gets its OWN
 // FakeTransport, so its counters restart (turnStartCount === 1 within the epoch). thread/start AND
-// thread/resume both return this epoch's thread id (epoch 0 starts fresh; a recreated epoch resumes
-// the prior thread on its fresh transport). turn/start pushes this epoch's threadStarted + turn
+// thread/resume keep the requested saved thread id on the fresh transport and report the requested
+// model, as required by phase verification. turn/start pushes threadStarted + turnStarted + turn
 // frames, then returns the turn id (the harness consumes the queued frames after the RPC).
 function epochResponder(
   threadId: string,
@@ -598,9 +598,14 @@ function epochResponder(
   pushFrames: (t: FakeTransport, threadId: string, turnId: string) => void,
 ): Responder {
   return (c) => {
-    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: threadId } };
+    if (c.method === "thread/start" || c.method === "thread/resume") {
+      if (c.method === "thread/resume") threadId = String(rec(c.params).threadId);
+      return { thread: { id: threadId }, model: rec(c.params).model };
+    }
     if (c.method === "turn/start") {
       c.transport.push(threadStarted(threadId));
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId, turnId,
+        params: { threadId, turn: { id: turnId } } });
       pushFrames(c.transport, threadId, turnId);
       return { turn: { id: turnId } };
     }
@@ -834,6 +839,7 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
     for (const e of rig.epochs) counts.roots += e.reaped();
 
     assert.equal(gated, true, "the folded plan reached the approval gate (m2 signal routing is wired)");
+    assert.equal(result.phaseSwitchHeld, undefined, "the saved thread and implementation model were verified");
     assert.equal(result.branch, "agent/issue-42", "approval drove the implement loop on the NEW epoch to a root signal_done");
     assert.equal(rig.providerLaunches(), 2, "plan approval recreated a fresh provider epoch (new-root resume)");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the plan turn ran on epoch 0");

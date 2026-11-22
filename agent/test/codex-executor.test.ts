@@ -37652,6 +37652,72 @@ describe("B2 cold approval model handoff", () => {
     });
   }
 
+  it("restored gate credential replacement cold-resumes implementation after approval", async () => {
+    const rig = makeMultiEpochRig([implementation("gpt-6-astra"), implementation()]);
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let gates = 0, switches = 0;
+    const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+      approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+      gatePlan: async () => { if (++gates === 1) throw new CredentialSwitchSignal(); return approval(); },
+      attemptCodexCredentialSwitch: async () => {
+        switches++;
+        const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+        const lease = await exec.suspendCodexEpoch(bounds);
+        assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+        assert.equal((await lease.persistRollout(bounds)).kind, "usable");
+        assert.equal(await lease.teardown(bounds), true);
+        await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+        assert.deepEqual(await lease.restartAndResume(saved, bounds), { kind: "resumed" });
+        await lease.finishB(bounds);
+        return "resumed_B";
+      },
+    });
+    const result = await withTimeout(exec.run(ctx), 5000, "restored gate credential replacement");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(switches, 1);
+    assert.equal(gates, 2);
+    assert.equal(rig.providerLaunches(), 2, "approval replaces the prepared planning root");
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 0);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assertImplementationTurn(rig.epochs[1]!.transport);
+  });
+
+  for (const restored of [true, false]) {
+    for (const turnFallback of [false, true]) {
+      it(`${restored ? "restored gate" : "ordinary resume"} rejected implementation resume ${restored ? "holds" : "falls back"} at ${turnFallback ? "turn preparation" : "preflight"}`, async () => {
+        let skipPreflight = !restored && turnFallback;
+        let reports = 0;
+        const bounded = implementation();
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/resume") throw new CodexTransportError({
+            category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+          });
+          if (c.method === "thread/start") return { thread: { id: saved }, model: "gpt-6.1-sol" };
+          return bounded(c);
+        } });
+        const { ctx, emitted } = makeCtx({ config, sessionId: saved, planApproved: !restored,
+          approvedPlan: "persisted candidate", resumePhase: restored ? "awaiting_approval" : "implementing",
+          gatePlan: async () => { skipPreflight = turnFallback; return approval(); },
+          reportIteration: async () => { reports++; skipPreflight = false; },
+          pauseModeRequested: () => skipPreflight ? "milestone" : null });
+        const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "implementation resume refusal");
+        if (restored) {
+          assert.equal(result.phaseSwitchHeld?.phase, "implement");
+          assert.equal(reports, turnFallback ? 1 : 0, "the rejection reached the intended verification seam");
+          assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), false);
+          assert.equal(rig.transport.turnStartCount, 0);
+        } else {
+          assert.equal(result.phaseSwitchHeld, undefined);
+          assert.equal(result.branch, ctx.branch);
+          assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), true);
+          assert.equal(rig.transport.turnStartCount, 1);
+        }
+        assert.equal(emitted.some(m => m.payload.event === "resume_lineage_break"), !restored);
+      });
+    }
+  }
+
   for (const control of ["cancel", "reject"] as const) {
     it(`restored gate consumes pending ${control} before presentation or provider work`, async () => {
       const rig = makeRig();

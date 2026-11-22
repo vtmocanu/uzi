@@ -598,6 +598,13 @@ const NOOP_CONTEXT_HOOK: HarnessContextHook = {
   get: async (): Promise<undefined> => undefined,
 };
 
+// A restored gate can still owe a plan-to-implementation handoff even though this claim
+// ran no planning turn and owns no prior claim's accounting cut. Its saved thread is mandatory.
+function restoredPlanPhaseRequiresResume(ctx: RunContext): boolean {
+  return ctx.planApproved !== true && ctx.resumePhase === "awaiting_approval" &&
+    !!ctx.sessionId && !!ctx.approvedPlan?.trim() && ctx.config?.plan_phase !== undefined;
+}
+
 /** Derive a positive integer budget from a claim-config value, mirroring sdk-executor's
  *  `positive`: a finite value > 0 is floored, anything else (absent/zero/negative/garbage)
  *  falls back to the default. */
@@ -4809,9 +4816,10 @@ export class CodexExecutor implements Executor {
         // propagates out of run() unchanged (startProviderEpoch rethrows it unwrapped and
         // `this.safety` is still the OLD live epoch, since it is swapped only after a
         // successful start), and the runner does the fenced positive running report itself.
-        // A restored gate has no live planning root to cut or persist. Reuse its lazy
-        // epoch and let the ordinary implementation preflight verify the saved session.
-        if (planningTurnRan) await this.withCaptureOwnership(async () => {
+        // A restored gate normally keeps its unlaunched epoch. A credential replacement may
+        // already have prepared that epoch on the planning model, so cold-resume implementation
+        // just as after a planning turn rather than changing a latched provider model in place.
+        if (planningTurnRan || (resumeAtGate && epoch!.harness.rootThreadId !== undefined)) await this.withCaptureOwnership(async () => {
           const old = epoch!;
           // Ordinary approval keeps plan advice alive during implementation. A
           // changed-milestone capture already saved and drained this HOME.
@@ -4889,7 +4897,7 @@ export class CodexExecutor implements Executor {
           lastSessionId = await epoch!.harness.prepareRootAndThread(request, { verifyPhaseModel: true });
         } catch (error) {
           if (!(error instanceof CodexResumeError)) throw error;
-          if (shared.phaseTransition.current?.pending) throw new PhaseSwitchUnverifiedError("malformed", {}, {});
+          if (shared.phaseTransition.current?.pending || restoredPlanPhaseRequiresResume(ctx)) throw new PhaseSwitchUnverifiedError("malformed", {}, {});
           if (ctx.preserveConversation) throw new PolicyContinuationRejected("provider_resume_rejected");
           lastSessionId = undefined;
           ctx.emit({ kind: "status", agent: "worker", payload: {
@@ -6556,7 +6564,7 @@ export class CodexExecutor implements Executor {
           // A rejected thread/resume has started no model turn. The persisted rollout may
           // have disappeared or the provider may refuse it despite a successful preflight.
           if (!resumeId || !(error instanceof CodexResumeError)) throw error;
-          if (this.phaseTransition.current?.pending) throw new PhaseSwitchUnverifiedError("malformed", {}, {});
+          if (this.phaseTransition.current?.pending || restoredPlanPhaseRequiresResume(ctx)) throw new PhaseSwitchUnverifiedError("malformed", {}, {});
           // A policy-held conversation never falls back: no lineage-break notice (no fresh admission
           // happened) and no thread/start. The runner re-holds the run for its owner.
           if (ctx.preserveConversation === true) throw new PolicyContinuationRejected("provider_resume_rejected");
