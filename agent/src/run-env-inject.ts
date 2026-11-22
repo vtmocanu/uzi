@@ -13,6 +13,10 @@ import { runEnvNameViolation } from "./run-env-names.js";
 /** The run's variables plus the sink for names that are not injected. */
 export interface RunEnvInjection {
   readonly vars: readonly ClaimRunEnvVar[];
+  /** The set the executor computed once for this run (runEnvInjectedSet over the builder's pre-fold keys).
+   *  When present the fold applies exactly it and reports its drops, so the env and every prompt agree by
+   *  construction; absent, the fold computes the set over the keys the env holds at the call. */
+  readonly set?: RunEnvInjectedSet;
   /** Called once per dropped variable with its name and the rule it broke. Must never receive a value. */
   readonly onDrop?: (name: string, rule: string) => void;
 }
@@ -58,16 +62,16 @@ export function runEnvInjectedSet(
   return { injected, dropped };
 }
 
-/** Folds `injection.vars` into `env`. `isProtected` names the keys the builder pins. Returns the variables
+/** Folds the injection into `env`. `isProtected` names the keys the builder pins. Returns the variables
  *  that were injected, in order: a variable that was dropped is not in the list. The set is
- *  {@link runEnvInjectedSet} over the keys `env` holds at the call. */
+ *  `injection.set` when given, else {@link runEnvInjectedSet} over the keys `env` holds at the call. */
 export function foldRunEnv(
   env: Record<string, string | undefined>,
   injection: RunEnvInjection | undefined,
   isProtected: (key: string) => boolean,
 ): ClaimRunEnvVar[] {
   if (injection === undefined) return [];
-  const { injected, dropped } = runEnvInjectedSet(injection.vars, Object.keys(env), isProtected);
+  const { injected, dropped } = injection.set ?? runEnvInjectedSet(injection.vars, Object.keys(env), isProtected);
   for (const d of dropped) injection.onDrop?.(d.name, d.rule);
   for (const v of injected) env[v.name] = v.value;
   return injected;

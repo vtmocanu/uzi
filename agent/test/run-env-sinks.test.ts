@@ -124,7 +124,7 @@ describe("the planning diff cap holds after redaction", () => {
 });
 
 describe("source pins: the executors and the runner route these payloads through the redactor", () => {
-  it("both executors post the redacted intent summary", () => {
+  it("both executors post the redacted intent summary (call-site pin)", () => {
     const src = (rel: string): string => fs.readFileSync(path.join(new URL("../src/", import.meta.url).pathname, rel), "utf8");
     for (const rel of ["sdk-executor.ts", path.join("codex", "codex-executor.ts")]) {
       assert.match(src(rel), /postIntentSummary\(ctx\.runId, ctx\.redactText\?\.\(summary\) \?\? summary\)/, rel);
@@ -133,14 +133,14 @@ describe("source pins: the executors and the runner route these payloads through
 
   const src = (rel: string): string => fs.readFileSync(path.join(new URL("../src/", import.meta.url).pathname, rel), "utf8");
 
-  it("both executors post the redacted plan summary and plan text", () => {
+  it("both executors post the redacted plan summary and plan text (call-site pin)", () => {
     for (const rel of ["sdk-executor.ts", path.join("codex", "codex-executor.ts")]) {
       const text = src(rel);
       assert.match(text, /const safe = redactPlanSummary\(result, ctx\.redactText\);\s*await [\w.!]*client[!]?\.postPlanSummary\(ctx\.runId, \{\s*\.\.\.safe, plan_md: \(ctx\.redactText\?\.\(planMd\) \?\? planMd\)/, rel);
     }
   });
 
-  it("the runner redacts the code cross-check repository instructions and passes the redactor to the planning diff", () => {
+  it("the runner redacts the code cross-check repository instructions and passes the redactor to the planning diff (call-site pin)", () => {
     const text = src("runner.ts");
     assert.match(text, /return "text" in read \? flight\.redactText\(read\.text\) : "";/);
     assert.equal((text.match(/this\.captureCheckedPlanningDiff\(.*runLog, flight\.redactText\)/g) ?? []).length, 2);
@@ -176,8 +176,10 @@ describe("questions, now summary, failure reasons and the merge request", () => 
     api.nowSummary.set(claim.run_id, true);
     simulateCommittedWork();
     const HAIKU = "claude-haiku-4-5-20251001";
+    // The value starts inside the 120 rune note cap, so a cut that ran before the redaction would leave a prefix of it.
+    const NOW_FILLER = "filler ".repeat(14);
     const queryFn = (() => (async function* () {
-      yield { type: "assistant", message: { id: "m1", model: HAIKU, role: "assistant", content: [{ type: "text", text: `Rotating ${SECRET} for the api gate` }], usage: { input_tokens: 2, output_tokens: 2 } } };
+      yield { type: "assistant", message: { id: "m1", model: HAIKU, role: "assistant", content: [{ type: "text", text: `${NOW_FILLER}${SECRET} for the api gate` }], usage: { input_tokens: 2, output_tokens: 2 } } };
       yield { type: "result", subtype: "success", is_error: false, modelUsage: { [HAIKU]: { inputTokens: 2, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0001 } } };
     })()) as unknown as SdkQueryFn;
     const notes = () => api.messages(claim.run_id).filter((m) => m.kind === "progress_note");
@@ -195,6 +197,9 @@ describe("questions, now summary, failure reasons and the merge request", () => 
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { nowSummary: { homeRoot: homeDir, queryFn } }).execute(claim);
     assert.ok(notes().length > 0, "the summary pass posted a note");
     assert.ok(!leaked(api.messages(claim.run_id)), "no outbound message carries the value");
+    const noteText = JSON.stringify(notes());
+    for (let i = 0; i + 8 <= SECRET.length; i++)
+      assert.ok(!noteText.includes(SECRET.slice(i, i + 8)), `no note carries the fragment at ${i}`);
   });
 
   it("a failed run reports a failure reason without the value", async () => {
@@ -273,7 +278,7 @@ describe("questions, now summary, failure reasons and the merge request", () => 
     assert.match(text, /redactNonClosingReason\(flight\.redactText, nonClosing\.reason\)/);
   });
 
-  it("the merge request body is built from redacted inputs", () => {
+  it("the merge request body is built from redacted inputs (call-site pin)", () => {
     const text = src("runner.ts");
     assert.match(text, /lead: result\.prSummary \? redactStrings\(result\.prSummary, redactText\) : result\.prSummary,/);
     const ctx = src("pr-description-context.ts");

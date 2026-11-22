@@ -71,7 +71,7 @@ import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
-import { foldRunEnv, runEnvDropText, runEnvInjectedSet, type RunEnvInjection } from "../run-env-inject.js";
+import { foldRunEnv, runEnvDropText, runEnvInjectedSet, type RunEnvInjectedSet, type RunEnvInjection } from "../run-env-inject.js";
 import { buildRunEnvBlock } from "../run-env-prompt.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
@@ -3757,12 +3757,13 @@ export class CodexExecutor implements Executor {
       // run's canonical checkout, via worker-set command-line-scope config (see
       // withCommandGitTrust). Composed HERE, never in commandEffectSpec: the post-run
       // boundary sink shares that function and must keep its own gitEnv() untouched.
-      // PRD #4416 M2: the variables the builder injects are named ONCE per claim, here, after provisioning
-      // (the tool env is the only pre-fold input that varies) and before the env build and every prompt:
-      // each prompt site reads ctx.injectedRunEnv, and the fold below injects exactly this list.
-      if (ctx.runEnv && ctx.runEnv.length > 0) {
-        ctx.injectedRunEnv = commandRunEnvInjected(ctx.runEnv, this.deps.commandTmpdir ?? "/tmp", provisioned.toolEnv);
-      }
+      // PRD #4416 M2: the variables the builder injects are named once per executor run, here, after provisioning
+      // (the builder's pre-fold inputs are known by now) and before the env build and every prompt: each prompt
+      // site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+      const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
+        ? commandRunEnvInjected(ctx.runEnv, this.deps.commandTmpdir ?? "/tmp", provisioned.toolEnv)
+        : undefined;
+      if (runEnvSet) ctx.injectedRunEnv = runEnvSet.injected;
       const commandEnv: NodeJS.ProcessEnv = withCommandGitTrust(
         buildCommandEnv(
           this.deps.commandTmpdir ?? "/tmp",
@@ -3771,8 +3772,8 @@ export class CodexExecutor implements Executor {
           // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
-          ctx.runEnv && ctx.runEnv.length > 0
-            ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+          ctx.runEnv && runEnvSet
+            ? { vars: ctx.runEnv, set: runEnvSet, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
             : undefined,
         ),
         await canonicalCheckoutPath(worktreePath),
@@ -8291,15 +8292,15 @@ export function buildCommandEnv(
 /** The keys {@link buildCommandEnv} refuses to let a user variable take. */
 const isCommandRunEnvProtected = (k: string): boolean => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k);
 
-/** PRD #4416 M2: the variables of `vars` that {@link buildCommandEnv} injects for these inputs, computed over
+/** PRD #4416 M2: which of `vars` {@link buildCommandEnv} injects and which it drops for these inputs, computed over
  *  the same pre-fold env the builder folds into and with the same predicate, so the executor can name them
- *  once per claim (before any prompt) and the fold injects exactly this list. */
+ *  once per run (before any prompt) and pass it to the builder as `RunEnvInjection.set`, which folds exactly it. */
 export function commandRunEnvInjected(
   vars: readonly ClaimRunEnvVar[],
   tmpdir: string,
   toolEnv: Record<string, string>,
-): ClaimRunEnvVar[] {
-  return runEnvInjectedSet(vars, Object.keys(commandPreFoldEnv(tmpdir, toolEnv)), isCommandRunEnvProtected).injected;
+): RunEnvInjectedSet {
+  return runEnvInjectedSet(vars, Object.keys(commandPreFoldEnv(tmpdir, toolEnv)), isCommandRunEnvProtected);
 }
 
 /** The command env before the run's variables fold in: the fixed boundary keys, UZI_SQLC_DIR and the

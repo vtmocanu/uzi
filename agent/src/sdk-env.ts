@@ -25,7 +25,7 @@ import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
-import { foldRunEnv, runEnvInjectedSet, type RunEnvInjection } from "./run-env-inject.js";
+import { foldRunEnv, runEnvInjectedSet, type RunEnvInjectedSet, type RunEnvInjection } from "./run-env-inject.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
 
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
@@ -167,38 +167,7 @@ function credentialEnv(credential: SdkCredential): Record<string, string | undef
   return env;
 }
 
-/**
- * Build the sparse env handed to `query({ options: { env } })`. This block documents the parameters of
- * {@link buildSdkEnv}; the function it sits on is its pre-fold half (everything before the run's variables
- * fold in), shared with {@link sdkRunEnvInjected} so both see the same keys.
- *
- * @param credential the OAuth token (CLAUDE_CODE_OAUTH_TOKEN) or the frozen provider binding (PRD #4320)
- * @param homeDir    the pinned HOME (a dir on $UZI_DATA_DIR) for session persistence
- * @param toolEnv    PRD #18 M3: allowlisted vars from devbox provisioning. Already
- *                   filtered by provision.ts (only PROVISION_ENV_ALLOWLIST keys),
- *                   so widening the agent env stays deliberate. PATH here REPLACES
- *                   the inherited PATH (devbox's PATH already prepends tool bins to
- *                   it). Empty ⇒ today's behavior exactly.
- * @param dockerHost PRD #83 Q3/Q4: the resolved DOCKER_HOST for a WIRED worker (the
- *                   keystone resolver's output). When set, the agent's docker CLI
- *                   reaches the sidecar daemon through it. Undefined ⇒ the key is
- *                   omitted entirely, so a sidecar-less worker's docker fails loudly
- *                   ("cannot connect to the Docker daemon") rather than reaching for a
- *                   host socket. Widening the deliberately-minimal agent env is safe:
- *                   it is a socket path/URL, NOT a secret, and is present only when a
- *                   sidecar is wired.
- * @param attempt    issue #1783 (R2): the execution attempt marker (see
- *                   {@link SdkAttemptEnv}). Undefined ⇒ no marker keys are emitted.
- * @param goWorkDir  issue #3870: the managed Go work dir (`RunContext.managedGoWorkDir`).
- *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
- *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
- *                   this parameter (a provisioned GOTMPDIR behaves as before).
- * @param runTmpdir  issue #4420: the run-owned scratch leaf (`RunContext.runTmpdir`). When set it
- *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
- * @param runEnv     PRD #4416 M2: the run's user variables. Lead-lane spawn sites only. Folded in
- *                   right after the toolEnv fold with the lowest precedence (see foldRunEnv); every
- *                   worker-set key below still wins. Undefined ⇒ the env is byte-identical to before.
- */
+/** The SDK env before the run's variables fold in: the credential, HOME, the pinned keys and the tool env. */
 function sdkPreFoldEnv(
   credential: SdkCredential,
   homeDir: string,
@@ -255,20 +224,52 @@ function sdkPreFoldEnv(
 /** The keys buildSdkEnv refuses to let a user variable take (the credential, HOME and the pinned ANTHROPIC_* keys). */
 const isSdkRunEnvProtected = (k: string): boolean => PROTECTED_ENV_KEYS.has(k);
 
-/** PRD #4416 M2: the variables of `vars` that {@link buildSdkEnv} injects for these inputs, computed over the
- *  same pre-fold env the builder folds into and with the same predicate, so the executor can name them once
- *  per claim (before any prompt) and the fold injects exactly this list. Pass the `credential`, `homeDir`,
- *  `toolEnv` and `runTmpdir` the builder is given. */
+/** PRD #4416 M2: which of `vars` {@link buildSdkEnv} injects and which it drops for these inputs, computed over
+ *  the same pre-fold env and with the same predicate as the builder's fold. The executor names the set once
+ *  per run (before any prompt) and passes it to the builder as `RunEnvInjection.set`, which folds exactly it.
+ *  Pass the `credential`, `homeDir`, `toolEnv` and `runTmpdir` the builder is given. */
 export function sdkRunEnvInjected(
   vars: readonly ClaimRunEnvVar[],
   credential: SdkCredential,
   homeDir: string,
   toolEnv: Record<string, string>,
   runTmpdir?: string,
-): ClaimRunEnvVar[] {
-  return runEnvInjectedSet(vars, Object.keys(sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir)), isSdkRunEnvProtected).injected;
+): RunEnvInjectedSet {
+  return runEnvInjectedSet(vars, Object.keys(sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir)), isSdkRunEnvProtected);
 }
 
+/**
+ * Build the sparse env handed to `query({ options: { env } })`.
+ *
+ * @param credential the OAuth token (CLAUDE_CODE_OAUTH_TOKEN) or the frozen provider binding (PRD #4320)
+ * @param homeDir    the pinned HOME (a dir on $UZI_DATA_DIR) for session persistence
+ * @param toolEnv    PRD #18 M3: allowlisted vars from devbox provisioning. Already
+ *                   filtered by provision.ts (only PROVISION_ENV_ALLOWLIST keys),
+ *                   so widening the agent env stays deliberate. PATH here REPLACES
+ *                   the inherited PATH (devbox's PATH already prepends tool bins to
+ *                   it). Empty ⇒ today's behavior exactly.
+ * @param dockerHost PRD #83 Q3/Q4: the resolved DOCKER_HOST for a WIRED worker (the
+ *                   keystone resolver's output). When set, the agent's docker CLI
+ *                   reaches the sidecar daemon through it. Undefined ⇒ the key is
+ *                   omitted entirely, so a sidecar-less worker's docker fails loudly
+ *                   ("cannot connect to the Docker daemon") rather than reaching for a
+ *                   host socket. Widening the deliberately-minimal agent env is safe:
+ *                   it is a socket path/URL, NOT a secret, and is present only when a
+ *                   sidecar is wired.
+ * @param attempt    issue #1783 (R2): the execution attempt marker (see
+ *                   {@link SdkAttemptEnv}). Undefined ⇒ no marker keys are emitted.
+ * @param goWorkDir  issue #3870: the managed Go work dir (`RunContext.managedGoWorkDir`).
+ *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
+ *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
+ *                   this parameter (a provisioned GOTMPDIR behaves as before).
+ * @param runTmpdir  issue #4420: the run-owned scratch leaf (`RunContext.runTmpdir`). When set it
+ *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
+ * @param runEnv     PRD #4416 M2: the run's user variables. Lead-lane spawn sites only. Folded in
+ *                   right after the toolEnv fold with the lowest precedence (see foldRunEnv); every
+ *                   worker-set key below still wins; its `set`, when given, is the precomputed
+ *                   list the fold applies (see {@link sdkRunEnvInjected}). Undefined ⇒ the env is
+ *                   byte-identical to before.
+ */
 export function buildSdkEnv(
   credential: SdkCredential,
   homeDir: string,

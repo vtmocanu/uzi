@@ -113,12 +113,12 @@ describe("buildRunEnvBlock", () => {
   });
 });
 
-describe("prompts built from the precomputed injected set, before any env build", () => {
+describe("prompts built from the precomputed set list the injected names and omit shadowed and denied ones", () => {
   const cred: SdkCredential = { kind: "oauth", token: "dummy-oauth-token-do-not-scan-0000" };
   const claimVars = [v("NPM_TOKEN"), v("REGION"), v("PATH"), v("DB_PASSWORD", { value: SECRET, secret: true })];
 
   it("a Claude plan prompt lists the injected names and leaves out a tool-profile shadow and a denied name", () => {
-    const injected = sdkRunEnvInjected(claimVars, cred, "/h", { NPM_TOKEN: "from-tool-profile" });
+    const injected = sdkRunEnvInjected(claimVars, cred, "/h", { NPM_TOKEN: "from-tool-profile" }).injected;
     const prompt = buildPlanPrompt({ branch: "agent/issue-9", subagentNames: ["coder"], issueIid: 9, issueTitle: "t", issueDescription: "d", runEnv: injected });
     assert.match(prompt, /- REGION \(repo scope\)/);
     assert.match(prompt, /- DB_PASSWORD \(repo scope, secret/);
@@ -127,7 +127,7 @@ describe("prompts built from the precomputed injected set, before any env build"
   });
 
   it("a Codex block lists the injected names and leaves out a tool-profile shadow and a denied name", () => {
-    const injected = commandRunEnvInjected(claimVars, "/private/tmp", { NPM_TOKEN: "from-tool-profile", PATH: "/nix/bin" });
+    const injected = commandRunEnvInjected(claimVars, "/private/tmp", { NPM_TOKEN: "from-tool-profile", PATH: "/nix/bin" }).injected;
     const block = buildRunEnvBlock(injected);
     assert.match(block, /- REGION \(repo scope\)/);
     assert.match(block, /- DB_PASSWORD \(repo scope, secret/);

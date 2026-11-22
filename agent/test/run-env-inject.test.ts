@@ -156,6 +156,14 @@ describe("runEnvInjectedSet", () => {
     assert.ok(!set.injected.some((x) => ["PRESET_KEY", "UNSET_KEY", "PINNED_KEY"].includes(x.name)));
   });
 
+  it("foldRunEnv applies exactly a precomputed set and nothing else", () => {
+    const vars = [v("FIRST_ONE"), v("SECOND_ONE")];
+    const target: Record<string, string | undefined> = {};
+    const folded = foldRunEnv(target, { vars, set: { injected: [vars[0]!], dropped: [{ name: "SECOND_ONE", rule: "test rule" }] } }, () => false);
+    assert.deepEqual(names(folded), ["FIRST_ONE"]);
+    assert.deepEqual(Object.keys(target), ["FIRST_ONE"]);
+  });
+
   it("is pure: it reads no env and leaves its inputs unchanged", () => {
     const vars = [v("A_ONE"), v("PATH")];
     const keys = ["X_KEY"];
@@ -169,23 +177,34 @@ describe("runEnvInjectedSet", () => {
     const tool = { NPM_TOKEN: "from-tool-profile", NIX_SSL_CERT_FILE: "/nix/ca.pem" };
     const vars = [...hostile, v("NPM_TOKEN"), v("REGION")];
     const base = buildSdkEnv(cred, "/h", tool);
-    const env = buildSdkEnv(cred, "/h", tool, undefined, undefined, undefined, undefined, { vars });
-    const injected = sdkRunEnvInjected(vars, cred, "/h", tool);
+    const set = sdkRunEnvInjected(vars, cred, "/h", tool);
+    const injected = set.injected;
+    const { drops, onDrop } = collector();
+    const env = buildSdkEnv(cred, "/h", tool, undefined, undefined, undefined, undefined, { vars, set, onDrop });
     assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(base, k)).sort(), names(injected).sort());
+    assert.ok(names(injected).includes("REGION"), "the set is not empty");
     assert.ok(!names(injected).includes("NPM_TOKEN"));
     assert.equal(env.NPM_TOKEN, "from-tool-profile");
-    assert.deepEqual(sdkRunEnvInjected([], cred, "/h", tool), []);
+    assert.deepEqual(drops, set.dropped.map((d) => [d.name, d.rule]), "the builder reports the set's drops");
+    assert.deepEqual(sdkRunEnvInjected([], cred, "/h", tool).injected, []);
+    const computed = buildSdkEnv(cred, "/h", tool, undefined, undefined, undefined, undefined, { vars });
+    assert.deepEqual(env, computed, "folding the precomputed set equals folding over the env");
   });
 
   it("buildCommandEnv injects exactly commandRunEnvInjected's list, tool-profile shadows included", () => {
     const tool = { PATH: "/nix/bin", NPM_TOKEN: "from-tool-profile" };
     const vars = [...hostile, v("NPM_TOKEN"), v("REGION")];
     const base = buildCommandEnv("/private/tmp", tool);
-    const env = buildCommandEnv("/private/tmp", tool, undefined, false, { vars });
-    const injected = commandRunEnvInjected(vars, "/private/tmp", tool);
+    const set = commandRunEnvInjected(vars, "/private/tmp", tool);
+    const injected = set.injected;
+    const { drops, onDrop } = collector();
+    const env = buildCommandEnv("/private/tmp", tool, undefined, false, { vars, set, onDrop });
     assert.deepEqual(Object.keys(env).filter((k) => !Object.hasOwn(base, k)).sort(), names(injected).sort());
+    assert.ok(names(injected).includes("REGION"), "the set is not empty");
     assert.ok(!names(injected).includes("NPM_TOKEN"));
     assert.equal(env.NPM_TOKEN, "from-tool-profile");
+    assert.deepEqual(drops, set.dropped.map((d) => [d.name, d.rule]), "the builder reports the set's drops");
+    assert.deepEqual(env, buildCommandEnv("/private/tmp", tool, undefined, false, { vars }), "folding the precomputed set equals folding over the env");
   });
 });
 
@@ -314,10 +333,10 @@ describe("the executors pass the run variables to the env builders", () => {
     assert.equal(cmd.DB_PASSWORD, "dummy-secret-run-value-000000");
   });
 
-  it("the spawn sites of both executors pass ctx.runEnv", () => {
+  it("the spawn sites of both executors pass ctx.runEnv and the precomputed set (call-site pin)", () => {
     const sdkSrc = fs.readFileSync(path.join(srcDir, "sdk-executor.ts"), "utf8");
-    assert.match(sdkSrc, /buildSdkEnv\(credential,[^;]*ctx\.runEnv && ctx\.runEnv\.length > 0\s*\?\s*\{ vars: ctx\.runEnv/s);
+    assert.match(sdkSrc, /buildSdkEnv\(credential,[^;]*ctx\.runEnv && runEnvSet\s*\?\s*\{ vars: ctx\.runEnv, set: runEnvSet/s);
     const codexSrc = fs.readFileSync(path.join(srcDir, "codex", "codex-executor.ts"), "utf8");
-    assert.match(codexSrc, /buildCommandEnv\([\s\S]{0,900}?ctx\.runEnv && ctx\.runEnv\.length > 0\s*\?\s*\{ vars: ctx\.runEnv/s);
+    assert.match(codexSrc, /buildCommandEnv\([\s\S]{0,900}?ctx\.runEnv && runEnvSet\s*\?\s*\{ vars: ctx\.runEnv, set: runEnvSet/s);
   });
 });

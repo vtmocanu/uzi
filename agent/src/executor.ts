@@ -336,9 +336,9 @@ export interface RunContext {
    *  lane's env builders read it. */
   runEnv?: ClaimRunEnvVar[];
   /** The variables of `runEnv` the executor's env builder injects: a variable dropped for its name, a
-   *  protected key or a tool-profile collision is absent. The executor sets it ONCE per claim, after tool
+   *  protected key or a tool-profile collision is absent. The executor sets it once per executor run, after tool
    *  provisioning and before any prompt or env build, from the same pre-fold keys and predicate the builder
-   *  folds with (runEnvInjectedSet). Every prompt that lists the run's variables reads this list, never `runEnv`. */
+   *  folds with (runEnvInjectedSet), and hands the same set to the builder, which folds exactly it. Every prompt that lists the run's variables reads this list, never `runEnv`. */
   injectedRunEnv?: ClaimRunEnvVar[];
   /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
    *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
