@@ -38,10 +38,10 @@ const CTX_MIN = 8192;
 const CTX_MAX = 10_000_000;
 
 const NO_CONTEXT_WARNING =
-  "No context window set. Without it the Claude CLI assumes a 200k-token window for unrecognized model names and compacts too late if the gateway's window is smaller.";
+  "No context window set. uzi assumes a 200k-token window unless one is configured; set the gateway model's real window.";
 
 const CATALOG_CONTEXT_WARNING =
-  "context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for some such names.";
+  "The Claude CLI may apply its own window to model names it recognizes as Anthropic models (for example claude-sonnet-4-5), ignoring both a configured window and uzi's 200k default (measured at Claude Code 2.1.325).";
 
 interface ModelRow {
   model: string;
@@ -205,7 +205,7 @@ function ModelMapFields({
                 {label}: {NO_CONTEXT_WARNING}
               </p>
             )}
-            {row.model.toLowerCase().includes("claude") && row.ctx.trim() !== "" && (
+            {row.model.toLowerCase().includes("claude") && (
               <p className="text-xs text-warn" data-testid={`ctx-unenforced-${role}`}>
                 {label}: {CATALOG_CONTEXT_WARNING}
               </p>
@@ -408,7 +408,7 @@ function ProviderRow({
               return (
                 <li key={role}>
                   {label}: <code>{sanitizeLabel(e.model)}</code>
-                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : " (no context window)"}
+                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : " (no context window: 200k assumed)"}
                 </li>
               );
             })}

@@ -123,6 +123,16 @@ The judge, job and cross-check lanes refuse **any run of an owner whose source i
 
 An attacker with database write could repoint a binding or the unsealed `base_url`. Binding the provider id into the AAD would not close that, because the URL is unsealed. It is the same residual as the other secrets, recorded as residual 9 in [docs/vault-threat-model.md](../docs/vault-threat-model.md#residual-risks-accepted).
 
+## Context window
+
+The `CLAUDE_CODE_MAX_CONTEXT_TOKENS` key is process-wide, so it cannot differ between the lead and subagents.
+
+- **Fallback.** For a provider credential (never OAuth) with no `context_window` in any mapped slot, the worker sets it to 200000 from `PROVIDER_FALLBACK_CONTEXT_WINDOW` in `agent/src/sdk-env.ts` (owner decision, 2026-11-22, #4611). At Claude Code 2.1.325 the CLI's own default for an unrecognized id is 1M, so without this a gateway model compacts far too late. Measured: the fallback compacts at 170k, for lead and subagent.
+- **Process-wide rule.** The smallest configured `context_window` across all mapped models applies to the whole process. A partially specified map uses the smallest explicit window for every model: a documented limitation, not changed.
+- **Measured exceptions (Claude Code 2.1.325).** `claude-corp-custom` and `corp-claude-x` honour a 50000 window (compaction at 20k). `claude-sonnet-4-5` and `us.anthropic.claude-sonnet-4-5` honour neither a configured window nor the 200k fallback (no compaction up to 605k reported tokens); the CLI recognizes these ids. We record what was seen, not why. The web form warns for any model name containing "claude".
+
+Evidence and history: the Decision Log in [PRD #4320](../prds/4320-custom-providers-core-anthropic.md), the 2026-11-17, 2026-11-18 and 2026-11-22 entries.
+
 ## Rollback hazards
 
 - **Image-only api rollback.** Pause or cancel queued provider runs and gateway waits first. An older api does not know the `provider_gateway_limit` type, the provider holds or the claim `provider` object.
