@@ -10,7 +10,7 @@ import { GitCache, RECOVERY_BUNDLE_REF } from "../src/git.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { type ScanNeedle, runEnvClaimForms } from "../src/run-env-forms.js";
 import {
-  hitVariableNames, patchImages, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type RunEnvScanVerdict,
+  FORMS_OVER_BUDGET, hitVariableNames, patchImages, patchScanVerdict, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type RunEnvScanVerdict,
 } from "../src/run-env-scan.js";
 import { renderSecretFinding } from "../src/secret-finding-render.js";
 
@@ -250,8 +250,8 @@ describe("resolveScanNeedles", () => {
   });
 
   it("a live over-budget run withholds with no maintenance call", async () => {
-    assert.deepEqual(await resolveScanNeedles({ live: "forms_over_budget", fetchProtected: never }),
-      { kind: "withhold", reason: "forms_over_budget" });
+    assert.deepEqual(await resolveScanNeedles({ live: FORMS_OVER_BUDGET, fetchProtected: never }),
+      { kind: "withhold", reason: FORMS_OVER_BUDGET });
   });
 
   it("with no flight, versions whose forms pass the budget withhold as forms_over_budget", async () => {
@@ -260,7 +260,7 @@ describe("resolveScanNeedles", () => {
     const versions = Array.from({ length: 300 }, (_, i) => retired(`OLD_${i % 9}`, big(i)));
     assert.deepEqual(
       await resolveScanNeedles({ live: undefined, fetchProtected: async () => ({ protected: true, versions }) }),
-      { kind: "withhold", reason: "forms_over_budget" });
+      { kind: "withhold", reason: FORMS_OVER_BUDGET });
   });
 
   it("with no flight, protected:false means nothing to scan for", async () => {
@@ -356,6 +356,63 @@ describe("patchImages", () => {
     assert.equal(patchImages(file("a.bin", "GIT binary patch", "literal 3", "Kc${2")), "unparseable");
     assert.equal(patchImages("diff --git a/a.bin b/a.bin\nBinary files a/a.bin and b/a.bin differ\n"), "unparseable");
     assert.equal(patchImages("diff --cc a.txt\n@@@ -1 -1 +1 @@@\n- a\n"), "unparseable");
+  });
+
+  it("accepts the header-only forms git emits: mode change, rename, deletion", () => {
+    const mode = "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+    assert.deepEqual(patchImages(mode), { images: [] });
+    const rename = "diff --git a/a.txt b/b.txt\nsimilarity index 100%\nrename from a.txt\nrename to b.txt\n";
+    assert.deepEqual(patchImages(rename), { images: [] });
+    const copy = "diff --git a/a.txt b/b.txt\ndissimilarity index 12%\ncopy from a.txt\ncopy to b.txt\n";
+    assert.deepEqual(patchImages(copy), { images: [] });
+    const removed = "diff --git a/a.txt b/a.txt\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/a.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n";
+    assert.deepEqual(patchImages(removed), { images: ["one\ntwo\n"] });
+    const added = "diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..2222222\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+fresh\n";
+    assert.deepEqual(patchImages(added), { images: ["fresh\n"] });
+  });
+
+  it("is unparseable when a line that is no file header precedes the first hunk", () => {
+    assert.equal(patchImages("diff --git a/a.txt b/a.txt\nindex 1111111..2222222 100644\nstray line\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n"), "unparseable");
+    assert.equal(patchImages("diff --git a/a.txt b/a.txt\nsome-secret-looking-text\n"), "unparseable");
+  });
+});
+
+describe("patchScanVerdict", () => {
+  const multi = ["ab12", "cd34", "ef56"];
+  const long = ["Qm9k7Zp3Wd", "ab12", "cd34"];
+  const forms = (name: string, lines: string[]) => runEnvClaimForms([secretVar(name, lines.join("\n"))], []);
+  const hunk = (...body: string[]): string => ["diff --git a/f.txt b/f.txt", "index 1111111..2222222 100644", "--- a/f.txt", "+++ b/f.txt", ...body, ""].join("\n");
+
+  it("withholds a whole value in the raw text as raw_value, naming the variable only", () => {
+    const f = forms("DB_PASSWORD", [SECRET]);
+    const verdict = patchScanVerdict(hunk("@@ -0,0 +1 @@", `+token=${SECRET}`), f.needles, f.lineForms);
+    assert.deepEqual(verdict, { withhold: true, reason: "raw_value", variables: ["DB_PASSWORD"] });
+  });
+
+  it("withholds a value split across diff prefixes as hunk_image_value, also under CRLF", () => {
+    const f = forms("SVC_BLOB", multi);
+    const lf = hunk("@@ -1,2 +1,3 @@", ` ${multi[0]}`, `+${multi[1]}`, ` ${multi[2]}`);
+    assert.deepEqual(patchScanVerdict(lf, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
+    const crlf = hunk("@@ -1,2 +1,3 @@", ` ${multi[0]}\r`, `+${multi[1]}\r`, ` ${multi[2]}\r`);
+    assert.deepEqual(patchScanVerdict(crlf, f.needles, f.lineForms), { withhold: true, reason: "hunk_image_value", variables: ["SVC_BLOB"] });
+  });
+
+  it("withholds an unreadable patch as unparseable_patch once the claim has any form", () => {
+    const f = forms("SVC_BLOB", multi);
+    const binary = "diff --git a/a.bin b/a.bin\nBinary files a/a.bin and b/a.bin differ\n";
+    assert.deepEqual(patchScanVerdict(binary, f.needles, f.lineForms), { withhold: true, reason: "unparseable_patch", variables: [] });
+    assert.deepEqual(patchScanVerdict(binary, [], []), { withhold: false }, "a claim with no secret forms ships any patch");
+  });
+
+  it("withholds one registered line of a multi-line secret as line_form", () => {
+    const f = forms("SVC_BLOB", long);
+    assert.deepEqual(patchScanVerdict(hunk("@@ -0,0 +1 @@", `+${long[0]}`), f.needles, f.lineForms),
+      { withhold: true, reason: "line_form", variables: ["SVC_BLOB"] });
+  });
+
+  it("lets a clean patch through", () => {
+    const f = forms("SVC_BLOB", multi);
+    assert.deepEqual(patchScanVerdict(hunk("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"), f.needles, f.lineForms), { withhold: false });
   });
 });
 

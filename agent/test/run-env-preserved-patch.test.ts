@@ -46,20 +46,26 @@ const claimFor = (iid: number, vars: ClaimRunEnvVar[] = [var1]) => gitlabClaim(i
 const diffOf = (full: string) => (async () => full) as typeof git.workflowScopeDiff;
 const header = `diff --git a/${WORKFLOW} b/${WORKFLOW}\n`;
 const filler = "+".concat("y".repeat(79), "\n").repeat(8000);
+/** The file header and hunk header of an all-added hunk of `n` lines. */
+const bigHead = (n: number): string => `${header}index 1111111..2222222 100644\n--- a/${WORKFLOW}\n+++ b/${WORKFLOW}\n@@ -0,0 +1,${n} @@\n`;
 
-async function failedReport(iid: number, full: string, vars?: ClaimRunEnvVar[]): Promise<{ fail_origin?: string; preserved_patch?: string }> {
+async function failedReport(
+  iid: number, full: string, vars?: ClaimRunEnvVar[], tweak?: (runner: RunRunner) => void,
+): Promise<{ fail_origin?: string; preserved_patch?: string }> {
   const { github } = fakeGitHub();
   git.pushBranch = (async () => undefined) as typeof git.pushBranch;
   git.branchWorkflowFiles = (async () => [WORKFLOW]) as typeof git.branchWorkflowFiles;
   git.workflowScopeDiff = diffOf(full);
   const claim = claimFor(iid, vars);
-  await githubRunner(github).execute(claim);
+  const runner = githubRunner(github);
+  tweak?.(runner);
+  await runner.execute(claim);
   return api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
 }
 
 describe("the preserved patch check sees the whole diff", () => {
   it("withholds the patch when the value sits past the byte cap", async () => {
-    const full = `${header}${filler}+token=${SECRET}\n`;
+    const full = `${bigHead(8001)}${filler}+token=${SECRET}\n`;
     assert.ok(capReviewDiff(full).indexOf(SECRET) === -1 && full.includes(SECRET), "the value is cut off by the cap");
     const failed = await failedReport(46201, full);
     assert.equal(failed.fail_origin, "workflow_scope_missing");
@@ -69,9 +75,10 @@ describe("the preserved patch check sees the whole diff", () => {
   it("masks a registered secret that straddles the byte cap before the cap cuts it", async () => {
     const cap = 512 * 1024;
     const pat = "fixture-forge-pat-000000";
-    const lead = cap - 10 - header.length - 3;
-    const full = `${header}+${"y".repeat(lead)}\n+${pat}\n${filler}`;
-    assert.equal(Buffer.byteLength(full.slice(0, header.length + 1 + lead + 2 + 10)), cap, "the cap falls 10 characters into the value");
+    const head = bigHead(8002);
+    const lead = cap - 10 - head.length - 3;
+    const full = `${head}+${"y".repeat(lead)}\n+${pat}\n${filler}`;
+    assert.equal(Buffer.byteLength(full.slice(0, head.length + 1 + lead + 2 + 10)), cap, "the cap falls 10 characters into the value");
     const failed = await failedReport(46203, full);
     assert.equal(failed.fail_origin, "workflow_scope_missing");
     assert.ok(failed.preserved_patch !== undefined, "the clean patch is kept");
@@ -79,7 +86,7 @@ describe("the preserved patch check sees the whole diff", () => {
   });
 
   it("keeps a clean patch, capped", async () => {
-    const failed = await failedReport(46202, `${header}${filler}+on: [push]\n`);
+    const failed = await failedReport(46202, `${bigHead(8001)}${filler}+on: [push]\n`);
     assert.equal(failed.fail_origin, "workflow_scope_missing");
     assert.match(failed.preserved_patch ?? "", /diff truncated at \d+ bytes/);
   });
@@ -108,7 +115,28 @@ describe("the preserved patch fails closed on what the raw text cannot show", ()
     assert.equal(failed.preserved_patch, undefined);
   });
 
-  it("withholds a patch carrying one filtered line of a multi-line secret", async () => {
+  it("withholds a mixed hunk of CRLF lines whose secret was stored with LF line breaks", async () => {
+    const full = hunkPatch("@@ -1,2 +1,3 @@", ` ${SHORT_LINES[0]}\r`, `+${SHORT_LINES[1]}\r`, ` ${SHORT_LINES[2]}\r`);
+    assert.ok(!full.includes(SHORT_LINES.join("\r\n")) && !full.includes(SHORT_LINES.join("\n")), "no form of the value in the raw text");
+    const failed = await failedReport(46214, full, [multiVar(SHORT_LINES)]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
+    assert.equal(failed.preserved_patch, undefined);
+  });
+
+  it("withholds a clean patch when the claim's forms were over budget", async () => {
+    const clean = hunkPatch("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}");
+    const control = await failedReport(46215, clean, [multiVar(SHORT_LINES)]);
+    assert.match(control.preserved_patch ?? "", /\+on: \[push\]/, "control: the same patch is attached when the claim is within budget");
+    const failed = await failedReport(46216, clean, [multiVar(SHORT_LINES)], (runner) => {
+      const internals = runner as unknown as { buildFlight(...a: unknown[]): { scanOverBudget?: boolean } };
+      const build = internals.buildFlight.bind(runner);
+      internals.buildFlight = (...a) => { const f = build(...a); f.scanOverBudget = true; return f; };
+    });
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.equal(failed.preserved_patch, undefined);
+  });
+
+  it("withholds a patch carrying one registered line of a multi-line secret", async () => {
     const lines = ["Qm9k7Zp3Wd", "ab12", "cd34"];
     const failed = await failedReport(46212, hunkPatch("@@ -0,0 +1 @@", `+${lines[0]}`), [multiVar(lines)]);
     assert.equal(failed.fail_origin, "workflow_scope_missing");

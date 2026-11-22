@@ -8656,7 +8656,7 @@ export class RunRunner {
     if (!await this.provePolicyClaim(claim)) return false;
     await this.resolveRunPendingTerminals(flight.runId, {
       claimGeneration: flight.claimGeneration,
-      // phaseClone has not yet set effectiveAttemptPaths on the pre-clone over-budget call.
+      // Before phaseClone sets effectiveAttemptPaths, the runner's own attemptPaths mode applies.
       continuationMode: (flight.effectiveAttemptPaths ?? this.attemptPaths) ? "fresh_from_saved_work" : "same_conversation",
     });
     // A void resolver return is not settlement proof; authenticate through EOF.
@@ -21744,7 +21744,7 @@ export class RunRunner {
         if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };
         return untrusted("range_unresolved");
       }
-      // No needle set exists for an over-budget claim, so the scan below would read as clean.
+      // An over-budget claim carries no needle set: report it untrusted rather than scan.
       if (flight.scanOverBudget) return untrusted(FORMS_OVER_BUDGET);
       const scan = await (scanScope ?? ((fn) => fn()))(() =>
         this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }),
@@ -21844,7 +21844,7 @@ export class RunRunner {
     if (options?.unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
-    // No needle set exists for an over-budget claim, so the scan below would read as clean.
+    // An over-budget claim carries no needle set: report it untrusted rather than scan.
     if (flight.scanOverBudget) return { trusted: false, why: FORMS_OVER_BUDGET };
     const scan = await (options?.scanScope ?? ((fn) => fn()))(() =>
       this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }));

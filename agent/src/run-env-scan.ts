@@ -154,7 +154,13 @@ export async function resolveScanNeedles(opts: {
   return { kind: "needles", needles: forms.needles };
 }
 
-const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+/** The only lines git emits between a `diff --git` line and the first hunk of a file. */
+const FILE_HEADER_PREFIXES = [
+  "index ", "--- ", "+++ ", "old mode ", "new mode ", "new file mode ", "deleted file mode ",
+  "similarity index ", "dissimilarity index ", "rename from ", "rename to ", "copy from ", "copy to ",
+];
+
+const HUNK_HEADER =/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 /**
  * The pre-image and post-image text of every hunk of a unified diff, rebuilt per file and per hunk. The
@@ -196,7 +202,7 @@ export function patchImages(patch: string): { images: string[] } | "unparseable"
       if (line.startsWith("@@")) return "unparseable";
       // After a hunk only another hunk or the next file may follow.
       if (afterHunk) return "unparseable";
-      // A file header line (index, ---, +++, mode, rename, similarity ...) before the first hunk.
+      if (!FILE_HEADER_PREFIXES.some((p) => line.startsWith(p))) return "unparseable";
       i++;
       continue;
     }
@@ -269,8 +275,11 @@ export function patchScanVerdict(
   const present = literalsPresent(needles.flatMap((n) => n.forms));
   const hit = new Set<string>();
   for (const image of rebuilt.images) {
-    const found = present(image);
-    if (found.size > 0) for (const n of needles) if (n.forms.some((f) => found.has(f))) hit.add(n.name);
+    // Each image is read as written and with CRLF and lone CR normalized to LF, as valueVariants does for a value.
+    for (const text of new Set([image, image.replace(/\r\n?/g, "\n")])) {
+      const found = present(text);
+      if (found.size > 0) for (const n of needles) if (n.forms.some((f) => found.has(f))) hit.add(n.name);
+    }
   }
   if (hit.size > 0) return { withhold: true, reason: "hunk_image_value", variables: [...hit] };
   const lines = textHitVariables(rawPatch, lineForms);
