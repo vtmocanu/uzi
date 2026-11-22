@@ -121,6 +121,9 @@ type userSettingsDTO struct {
 	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
+	// WeeklyWarningMarginPts is the weekly-limit early-warning margin in percentage points (PRD
+	// #4123), 0..50, 0 = off; read-only here: PUT /api/me/weekly-warning-margin owns the write.
+	WeeklyWarningMarginPts int `json:"weekly_warning_margin_pts"`
 	// CodexAccountMode is the user's Codex account mode (issue #3719): "default" binds the
 	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
 	// PUT /api/me/codex-account-mode owns the write.
@@ -257,6 +260,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		PlanningEfforts:           planningEffortCellsFor(planningEffort, s.DefaultEffort, leadClaudeEffort),
 		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
+		WeeklyWarningMarginPts:    int(s.WeeklyWarningMarginPts),
 		CodexAccountMode:          codexMode,
 		HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
 	}, nil

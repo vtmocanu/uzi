@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/shellquote"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -69,13 +70,50 @@ func parked(run store.Run) bool {
 	return false
 }
 
+// boundNonTerminal is the read-free half of the near/at presence condition (PRD #4123 M2): the run is
+// not terminal and already names the vendor credential it spends. An unbound queued run has none, so
+// no credential warning is fabricated for it; whether that credential is actually near its limit needs
+// the snapshot's margin and reading.
+func boundNonTerminal(run store.Run) bool {
+	if apitypes.IsTerminalRunStatus(run.Status) {
+		return false
+	}
+	if run.Harness == harnessCodex {
+		return run.CodexSecretID.Valid
+	}
+	return run.AnthropicSecretID.Valid || run.LimitDeadSecretID.Valid
+}
+
 // needsSnapshot is the cheap, read-free pre-filter: structural exclusion first, then every presence
-// predicate that can hold for the run. A later milestone's near/at predicate is one more clause here.
+// predicate that can hold for the run (a weekly park, or a bound non-terminal run that may be near its
+// limit).
 func needsSnapshot(run store.Run) bool {
 	if excluded(run) {
 		return false
 	}
-	return parked(run)
+	return parked(run) || boundNonTerminal(run)
+}
+
+// nearOrAt reports the M2 presence condition on a loaded snapshot: the early warnings are on (margin >
+// 0) and the run's credential has a usable fresh weekly reading that is near or at its effective limit
+// (the reserve threshold, else 100). A stale, missing or invalid reading is unknown, never near.
+func nearOrAt(run store.Run, snap *workersvc.NextClaimSnapshot) bool {
+	if !boundNonTerminal(run) || snap.MarginPts <= 0 {
+		return false
+	}
+	key, _, ok := snap.CurrentCredential(run)
+	if !ok {
+		return false
+	}
+	raw, found := snap.Weekly(key)
+	if !found {
+		return false
+	}
+	switch usagereserve.EvaluateNear(snap.ReserveThreshold(), snap.MarginPts, raw.Weekly()).State {
+	case usagereserve.NearNear, usagereserve.NearAt:
+		return true
+	}
+	return false
 }
 
 // ForRuns builds the blocks for one owner's runs. Runs that cannot carry a block are dropped before
@@ -113,6 +151,9 @@ func (l *Loader) ForRun(run store.Run, snap *workersvc.NextClaimSnapshot) *apity
 	if !needsSnapshot(run) {
 		return nil
 	}
+	if !parked(run) && !nearOrAt(run, snap) {
+		return nil
+	}
 	res := l.svc.NextClaimReason(run, snap)
 	if res == nil {
 		return nil
@@ -127,7 +168,7 @@ func (l *Loader) ForRun(run store.Run, snap *workersvc.NextClaimSnapshot) *apity
 		Harness:         run.Harness,
 		EffectiveLimit:  snap.EffectiveLimit(),
 		Reason:          res.Reason,
-		Wait:            snap.PreviewWait(run),
+		Wait:            previewWait(run, snap),
 		Fix:             []apitypes.WeeklyLimitFixDTO{},
 		FutureRuns:      []apitypes.WeeklyLimitFixDTO{},
 	}
@@ -154,6 +195,16 @@ func (l *Loader) ForRun(run store.Run, snap *workersvc.NextClaimSnapshot) *apity
 		dto.Tier = apitypes.WeeklyLimitTierWarning
 	}
 	return dto
+}
+
+// previewWait is what will happen to the run when its weekly window is hit. A run parked on another
+// window (five_hour, a per-model window) is not parked on this one, so its stored retry stamps say
+// nothing about the weekly window: its wait is unknown rather than a promise taken from the wrong park.
+func previewWait(run store.Run, snap *workersvc.NextClaimSnapshot) string {
+	if run.Status == "limit_wait" && !parked(run) {
+		return workersvc.WaitUnknown
+	}
+	return snap.PreviewWait(run)
 }
 
 // fixes returns the run-level fixes and the future-run advice. A fix appears only when its own

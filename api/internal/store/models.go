@@ -2055,6 +2055,7 @@ type User struct {
 	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
 	PlanningClaudeModel       pgtype.Text        `json:"planning_claude_model"`
 	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
+	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
 }
 
 type UserCrossCheckPin struct {

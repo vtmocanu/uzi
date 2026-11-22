@@ -48,6 +48,7 @@ type fakeSettingsDB struct {
 	nowSummary      pgtype.Bool
 	weeklyPct       pgtype.Int2
 	weeklyPause     bool
+	weeklyMargin    int16
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -241,6 +242,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		nowSummary:      f.nowSummary,
 		weeklyPct:       f.weeklyPct,
 		weeklyPause:     f.weeklyPause,
+		weeklyMargin:    f.weeklyMargin,
 		sidebarIDs:      f.sidebarIDs,
 		sidebarCodexIDs: f.sidebarCodexIDs,
 		apprMode:        f.apprMode,
@@ -270,6 +272,7 @@ type fakeSettingsRow struct {
 	nowSummary      pgtype.Bool
 	weeklyPct       pgtype.Int2
 	weeklyPause     bool
+	weeklyMargin    int16
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -318,7 +321,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 26: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion and the planning pair (PRD #3252)
+	case 27: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion, the planning pair (PRD #3252) and the weekly warning margin (PRD #4123)
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -407,6 +410,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[25].(*pgtype.Text); ok {
 			*p = r.planningEffort
+		}
+		// weekly_warning_margin_pts (PRD #4123) is the 27th column.
+		if p, ok := dest[26].(*int16); ok {
+			*p = r.weeklyMargin
 		}
 	}
 	return nil

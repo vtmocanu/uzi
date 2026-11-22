@@ -126,8 +126,10 @@ type NextClaimSnapshot struct {
 	// LoadNextClaimSettling for the runs the caller will ask about.
 	settling map[uuid.UUID]bool
 
-	// MarginPts is the warning margin in percentage points (read by the near-limit evaluation; zero
-	// until the margin setting exists).
+	// MarginPts is the owner's warning margin in percentage points (users.weekly_warning_margin_pts,
+	// read in the same query as the reserve settings): how far below its effective limit a credential
+	// is "near". Zero turns the early warnings off, and is also what a store that cannot serve the
+	// reserve reads reports.
 	MarginPts int
 }
 
@@ -170,6 +172,7 @@ func (s *Service) LoadNextClaimSnapshot(ctx context.Context, ownerID uuid.UUID, 
 		if snap.reserve, err = buildReserveSnapshot(ctx, q, ownerID, now, s.reserveIntervals(), true); err != nil {
 			return nil, fmt.Errorf("next claim: %w", err)
 		}
+		snap.MarginPts = snap.reserve.marginPts
 	} else {
 		// A store that cannot serve the reserve reads reads as OFF, but the judge binding is still
 		// one plain read.

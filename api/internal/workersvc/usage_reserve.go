@@ -92,6 +92,9 @@ type reserveSnap struct {
 	// built with keepWeekly (the next-claim preview); nil otherwise. Codex readings are read by
 	// the preview from the account rate limits instead.
 	weeklyClaude map[uuid.UUID]usagereserve.WeeklyReading
+	// marginPts is the owner's weekly-limit warning margin (users.weekly_warning_margin_pts, PRD #4123),
+	// read with the reserve settings in the same one query. The claim path never reads it.
+	marginPts int
 }
 
 func (r *reserveSnap) on() bool { return r != nil && r.threshold != nil }
@@ -127,7 +130,7 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 	if err != nil {
 		return nil, fmt.Errorf("weekly reserve settings: %w", err)
 	}
-	snap := &reserveSnap{userID: userID}
+	snap := &reserveSnap{userID: userID, marginPts: int(set.WeeklyWarningMarginPts)}
 	if !set.WeeklyReservePct.Valid && !keepWeekly {
 		return snap, nil
 	}

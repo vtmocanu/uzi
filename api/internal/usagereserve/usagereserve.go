@@ -248,6 +248,80 @@ func CodexWeekly(r CodexReading, interval time.Duration, now time.Time) CodexWee
 	return CodexWeeklyReading{OK: true, Pct: clampPercent(*best.UsedPercent), ResetsAt: resetsAt, Windows: windows}
 }
 
+// Weekly is the reading's headline weekly window as a WeeklyReading: OK only for a usable reading, with
+// the highest-utilization window's percent and reset (PRD #4123 module 3). It is the Codex input of
+// EvaluateNear.
+func (c CodexWeeklyReading) Weekly() WeeklyReading {
+	return WeeklyReading{OK: c.OK, Pct: c.Pct, ResetsAt: c.ResetsAt}
+}
+
+// NearState is the outcome of EvaluateNear.
+type NearState int
+
+const (
+	// NearUnknown: the reading is not usable (missing, stale, pre-reset, invalid or utilization-less).
+	NearUnknown NearState = iota
+	// NearBelow: the reading is below limit - margin.
+	NearBelow
+	// NearNear: the reading is within the margin below the limit.
+	NearNear
+	// NearAt: the reading is at or above the limit.
+	NearAt
+)
+
+func (s NearState) String() string {
+	switch s {
+	case NearUnknown:
+		return "unknown"
+	case NearBelow:
+		return "below"
+	case NearNear:
+		return "near"
+	case NearAt:
+		return "at"
+	}
+	return "invalid"
+}
+
+// NearVerdict is EvaluateNear's result. EffectiveLimit is the reserve threshold, or 100 with none, and
+// is set for every state. Pct (the used percent rounded down, never above 100) and ResetsAt are set
+// when the reading is usable.
+type NearVerdict struct {
+	State          NearState
+	EffectiveLimit int
+	Pct            int
+	ResetsAt       *time.Time
+}
+
+// EvaluateNear places a credential's weekly reading relative to its effective limit: the threshold
+// when set, else 100 (a nil threshold is a limit of 100, not "no reading"). The comparisons use the
+// unrounded percent, like the reserve's own Held rule: at is pct >= limit, near is pct >= limit -
+// margin, and a not-OK reading is Unknown. A margin of 0 (or less) leaves only below and at.
+func EvaluateNear(threshold *int16, marginPts int, w WeeklyReading) NearVerdict {
+	limit := 100
+	if threshold != nil {
+		limit = int(*threshold)
+	}
+	v := NearVerdict{State: NearUnknown, EffectiveLimit: limit}
+	if !w.OK || math.IsNaN(w.Pct) || w.Pct < 0 {
+		return v
+	}
+	if marginPts < 0 {
+		marginPts = 0
+	}
+	pct := clampPercent(w.Pct)
+	v.Pct, v.ResetsAt = int(math.Floor(pct)), w.ResetsAt
+	switch {
+	case pct >= float64(limit):
+		v.State = NearAt
+	case pct >= float64(limit-marginPts):
+		v.State = NearNear
+	default:
+		v.State = NearBelow
+	}
+	return v
+}
+
 // EvaluateCodex evaluates a Codex account against the user's threshold using CodexWeekly's
 // reading policy: a not-OK reading is Unknown.
 //

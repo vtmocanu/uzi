@@ -86,3 +86,13 @@ func (n *NextClaimSnapshot) UsableAlternative(run store.Run) *CredentialRef {
 	}
 	return best
 }
+
+// ReserveThreshold is the owner's weekly reserve threshold, or nil with none (the effective limit is
+// then 100). It is the threshold input of usagereserve.EvaluateNear.
+func (n *NextClaimSnapshot) ReserveThreshold() *int16 {
+	if n.reserve == nil || n.reserve.threshold == nil {
+		return nil
+	}
+	t := *n.reserve.threshold
+	return &t
+}

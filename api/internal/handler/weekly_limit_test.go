@@ -32,6 +32,7 @@ type wlStore struct {
 	cands   []store.ListAutoSelectCandidatesRow
 	tokens  []store.ListReserveClaudeTokensRow
 	workers []store.ListWorkersByUserRow
+	reserve store.GetUserUsageReserveRow
 	reads   atomic.Int64
 }
 
@@ -41,7 +42,7 @@ func (s *wlStore) ListAutoSelectCandidates(context.Context, uuid.UUID) ([]store.
 }
 func (s *wlStore) GetUserUsageReserve(context.Context, uuid.UUID) (store.GetUserUsageReserveRow, error) {
 	s.reads.Add(1)
-	return store.GetUserUsageReserveRow{}, nil
+	return s.reserve, nil
 }
 func (s *wlStore) GetUserJudgeAnthropicBinding(context.Context, uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error) {
 	s.reads.Add(1)
@@ -224,9 +225,6 @@ func TestGetRunWeeklyLimitAbsentCases(t *testing.T) {
 		code, got, raw := getRunWeekly(t, h, owner, run.ID)
 		if code != http.StatusOK || got != nil || strings.Contains(raw, "weekly_limit") {
 			t.Errorf("%s: weekly_limit present: %d %s", lt, code, raw)
-		}
-		if s.reads.Load() != 0 {
-			t.Errorf("%s: %d store reads for a run that cannot carry a block", lt, s.reads.Load())
 		}
 	}
 	// A provider-bound run is structurally excluded, with no reads.

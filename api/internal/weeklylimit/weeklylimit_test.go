@@ -29,6 +29,7 @@ type fakeStore struct {
 	tokens  []store.ListReserveClaudeTokensRow
 	workers []store.ListWorkersByUserRow
 	codex   *codexData
+	reserve store.GetUserUsageReserveRow
 	reads   atomic.Int64
 	candCnt atomic.Int64
 }
@@ -40,7 +41,7 @@ func (f *fakeStore) ListAutoSelectCandidates(context.Context, uuid.UUID) ([]stor
 }
 func (f *fakeStore) GetUserUsageReserve(context.Context, uuid.UUID) (store.GetUserUsageReserveRow, error) {
 	f.reads.Add(1)
-	return store.GetUserUsageReserveRow{}, nil
+	return f.reserve, nil
 }
 func (f *fakeStore) GetUserJudgeAnthropicBinding(context.Context, uuid.UUID) (store.GetUserJudgeAnthropicBindingRow, error) {
 	f.reads.Add(1)
@@ -203,16 +204,15 @@ func TestPinnedSevenDayParkExplainsAndOffersSetToken(t *testing.T) {
 	}
 }
 
-func TestOnlySevenDayWeeklyParksCarryABlock(t *testing.T) {
+// With the early warnings off (margin 0, the fake store's default) only a weekly park carries a block:
+// a five_hour or per-model park of a run on a credential near its weekly limit has none.
+func TestOnlySevenDayWeeklyParksCarryABlockWithMarginOff(t *testing.T) {
 	for _, lt := range []string{"five_hour", "seven_day_opus", "seven_day_sonnet", ""} {
 		f := twoTokens("spare")
 		l := newLoader(t, f)
 		run := parkedRun(lt)
 		if got := l.ForRuns(context.Background(), owner, []store.Run{run}); len(got) != 0 {
 			t.Errorf("rate_limit_type %q carried a block: %+v", lt, got[run.ID])
-		}
-		if f.reads.Load() != 0 {
-			t.Errorf("rate_limit_type %q read the store %d times", lt, f.reads.Load())
 		}
 	}
 }
@@ -226,9 +226,7 @@ func TestExcludedRunsLoadNothing(t *testing.T) {
 	apiKey := parkedRun("seven_day")
 	apiKey.ID, apiKey.Harness = uuid.New(), "codex"
 	apiKey.CodexAuthMode = pgtype.Text{String: "api_key", Valid: true}
-	queued := parkedRun("seven_day")
-	queued.ID, queued.Status = uuid.New(), "queued"
-	got := l.ForRuns(context.Background(), owner, []store.Run{provider, apiKey, queued})
+	got := l.ForRuns(context.Background(), owner, []store.Run{provider, apiKey})
 	if len(got) != 0 {
 		t.Fatalf("excluded runs carried blocks: %+v", got)
 	}
