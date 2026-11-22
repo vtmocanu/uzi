@@ -34,7 +34,6 @@ set -x
 timeout --kill-after=10s 180s docker run --rm --name "$name" --network none \
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
   --security-opt no-new-privileges --tmpfs /data \
-  --env "FIXTURE_TEST_NAME_PATTERN=${FIXTURE_TEST_NAME_PATTERN:-.*}" \
   --mount "type=bind,src=$HERE,dst=/work/private-ca,readonly" \
   --mount "type=bind,src=$scratch/mount,dst=/fixture,readonly" \
   --entrypoint /bin/sh "$IMAGE" -c '
@@ -43,7 +42,7 @@ timeout --kill-after=10s 180s docker run --rm --name "$name" --network none \
     cp /fixture/ca.pem /run/cdr-private-ca/source.pem
     chown 0:10001 /run/cdr-private-ca/source.pem
     chmod 0440 /run/cdr-private-ca/source.pem
-    exec /usr/local/sbin/uzi-entrypoint /bin/sh -c "cd /app && exec node --import tsx --test --test-concurrency=1 --test-timeout=120000 --test-name-pattern=\"\$FIXTURE_TEST_NAME_PATTERN\" /work/private-ca/fixture.test.ts"
+    exec /usr/local/sbin/uzi-entrypoint /bin/sh -c "cd /app && exec node --import tsx --test --test-concurrency=1 --test-timeout=120000 /work/private-ca/fixture.test.ts"
   '
 rc=$?
 set +x
