@@ -98,7 +98,7 @@ func (s *removalSettings) UziLabel(context.Context) (string, error) {
 	return s.uziLabel, s.err
 }
 
-func (r *removalRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, desc string, _ *bool, _ *bool, _ *string, _ bool, _ *workersvc.CredentialOverride, _ *workersvc.Harness) (store.Run, error) {
+func (r *removalRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, desc string, _ *bool, _ *bool, _ *string, _ bool, _ *workersvc.CredentialOverride, _ *workersvc.Harness, _ *workersvc.OnceFireProgress) (store.Run, error) {
 	if r.createErr != nil {
 		return store.Run{}, r.createErr
 	}

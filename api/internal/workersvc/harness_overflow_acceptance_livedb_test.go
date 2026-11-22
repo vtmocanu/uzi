@@ -12,7 +12,7 @@ import (
 func TestHarnessOverflowScheduledCreationLiveDB(t *testing.T) {
 	fx := newOverflowFix(t)
 	run, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
-		"scheduled overflow", nil, nil, nil, false, nil, nil, nil)
+		"scheduled overflow", nil, nil, nil, false, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestHarnessOverflowPublicCreationExclusionsLiveDB(t *testing.T) {
 					override = &CredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &fx.token}
 				}
 				run, err = fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
-					"excluded schedule", nil, nil, pinnedModel, false, nil, override, explicit)
+					"excluded schedule", nil, nil, pinnedModel, false, nil, override, explicit, nil)
 			}
 			if err != nil {
 				t.Fatal(err)

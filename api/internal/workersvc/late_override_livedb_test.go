@@ -22,14 +22,14 @@ func TestLateSoleStoredOverrideResolverRefusalLiveDB(t *testing.T) {
 	disableSecret(env, alias, true)
 	claude := HarnessClaude
 	seedEligibleIssue(t, env, repo, 96000)
-	_, err := svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 96000, "body", nil, nil, nil, false, override, &claude)
+	_, err := svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 96000, "body", nil, nil, nil, false, override, &claude, nil)
 	if !errors.Is(err, ErrHarnessCredentialDisabled) || errors.Is(err, ErrCredentialDisabled) {
 		t.Fatalf("expected harness refusal before stored-token closure, got %v", err)
 	}
 	// Old unlabelled selection would resolve usable Codex and reach the stored-token
 	// check; the scheduler treats that refusal as schedule-wide rather than a label skip.
 	seedEligibleIssue(t, env, repo, 96001)
-	_, err = svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 96001, "body", nil, nil, nil, false, override, nil)
+	_, err = svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 96001, "body", nil, nil, nil, false, override, nil, nil)
 	if !errors.Is(err, ErrCredentialDisabled) {
 		t.Fatalf("old selection refusal=%v", err)
 	}

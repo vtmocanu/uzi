@@ -57,9 +57,9 @@ func TestM2CreatePolicyScheduleOnly(t *testing.T) {
 				case "poller":
 					_, err = svc.CreateAutopilotRun(context.Background(), user, repo, 4, "caller raw body", nil)
 				case "schedule_manual":
-					_, err = svc.CreateScheduledRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, nil, false, nil, nil, nil)
+					_, err = svc.CreateScheduledRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, nil, false, nil, nil, nil, nil)
 				case "schedule_auto":
-					_, err = svc.CreateScheduledAutopilotRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, nil, false, nil, nil)
+					_, err = svc.CreateScheduledAutopilotRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, nil, false, nil, nil, nil)
 				}
 				if err != nil {
 					t.Fatal(err)
@@ -102,7 +102,7 @@ func TestM2CreateCapturedGuidanceAndDedup(t *testing.T) {
 	ctx := issueinput.WithCapture(context.Background(), capture)
 	fs := &fakeStore{repoRow: store.GetRepoForUserRow{BotForgeUserID: 1}, issueByID: store.Issue{Labels: uziLabels()}, createRunResult: store.Run{ID: uuid.New()}}
 	svc := New(fs, newBox(t), testParams())
-	_, err = svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), 4, "captured body\n\nSchedule guidance: test", nil, nil, nil, false, nil, nil)
+	_, err = svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), 4, "captured body\n\nSchedule guidance: test", nil, nil, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestM2CreateCapturedGuidanceAndDedup(t *testing.T) {
 		t.Fatalf("%+v", fs.createRunParams)
 	}
 	fs.hasActiveRunForIssue = true
-	_, err = svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil)
+	_, err = svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil, nil)
 	if !errors.Is(err, ErrActiveRunExists) {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestM2CreateCapturedGuidanceAndDedup(t *testing.T) {
 func TestM2ScheduledWithoutCaptureBlocksAutoApproval(t *testing.T) {
 	fs := &fakeStore{issueByID: store.Issue{Labels: uziLabels()}, createRunResult: store.Run{ID: uuid.New()}}
 	svc := New(fs, newBox(t), testParams())
-	_, err := svc.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "fixture body", nil, nil, nil, false, nil, nil)
+	_, err := svc.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "fixture body", nil, nil, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,9 +153,9 @@ func TestM2ScheduledEligibleAndFailedComments(t *testing.T) {
 			svc.SetForges(m2Builder{f})
 			var err error
 			if mode == "requested_false" {
-				_, err = svc.CreateScheduledRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil, nil)
+				_, err = svc.CreateScheduledRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil, nil, nil)
 			} else {
-				_, err = svc.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil)
+				_, err = svc.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, nil, false, nil, nil, nil)
 			}
 			if err != nil {
 				t.Fatal(err)

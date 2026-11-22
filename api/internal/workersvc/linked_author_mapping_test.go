@@ -170,7 +170,7 @@ func TestLinkedUnmappedIssueAuthorManualStartProceedsAndScheduledIsNotAutoApprov
 
 	t.Run("scheduled start is created without auto-approval", func(t *testing.T) {
 		x := newLinkedMappingFixture(t, youtracktest.OtherLogin, nil)
-		if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, nil, false, nil, nil); err != nil {
+		if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, nil, false, nil, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		p := x.fs.createRunParams
@@ -188,7 +188,7 @@ func TestLinkedUnmappedIssueAuthorManualStartProceedsAndScheduledIsNotAutoApprov
 		srv.SeedComment(n, youtracktest.BotLogin, "own")
 		x := newLinkedMappingFixture(t, youtracktest.BotLogin, nil)
 		x.svc.SetIssueSources(&fakeSources{tr: linkedYouTrack{Driver: youTrackDriver(t, srv)}})
-		if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), n, "", nil, nil, nil, false, nil, nil); err != nil {
+		if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), n, "", nil, nil, nil, false, nil, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		p := x.fs.createRunParams
@@ -199,7 +199,7 @@ func TestLinkedUnmappedIssueAuthorManualStartProceedsAndScheduledIsNotAutoApprov
 
 	t.Run("a failing account lookup maps nobody", func(t *testing.T) {
 		x := newLinkedMappingFixture(t, youtracktest.BotLogin, errors.New("users/me: 503"))
-		if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, nil, false, nil, nil); err != nil {
+		if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, nil, false, nil, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		p := x.fs.createRunParams
@@ -232,7 +232,7 @@ func TestLinkedIssueTextEditedByAnotherUserBlocksAutoApproval(t *testing.T) {
 				changed := "injected by someone else"
 				x.srv.SeedTextEdit(x.issue, youtracktest.OtherLogin, nil, &changed)
 			}
-			if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, nil, false, nil, nil); err != nil {
+			if _, err := x.svc.CreateScheduledAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, nil, false, nil, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			p := x.fs.createRunParams

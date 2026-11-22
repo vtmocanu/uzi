@@ -78,8 +78,8 @@ func (s *Service) insertGatedNoBeginner(ctx context.Context, q *store.Queries, r
 	if err != nil {
 		return store.Run{}, err
 	}
-	if s.createBeforeCommitHook != nil {
-		s.createBeforeCommitHook(run)
+	if err := s.beforeCommit(run); err != nil {
+		return store.Run{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, err

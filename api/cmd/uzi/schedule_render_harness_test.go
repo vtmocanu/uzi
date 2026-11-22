@@ -136,3 +136,21 @@ func TestScheduleHarnessSkipRendering(t *testing.T) {
 		})
 	}
 }
+
+// Issue #4512: the consumer_gate_busy run-now hint is timing-neutral and no longer claims a
+// one-time sweep never retries the skipped issue.
+func TestScheduleConsumerGateBusyRunNowHint(t *testing.T) {
+	skips := []apitypes.LastFireSkip{{IssueIID: ptrInt64(97), Title: "Busy repo", Reason: "consumer_gate_busy"}}
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{Matched: 1, Skips: skips}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_busy")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	want := "#97  repository busy   # start the skipped issue manually; a one-time scheduled fire retries its remaining slots"
+	if !strings.Contains(out, want) {
+		t.Errorf("run-now missing %q\n%s", want, out)
+	}
+	if strings.Contains(out, "does not retry") {
+		t.Errorf("run-now still carries the narrowed no-retry hint\n%s", out)
+	}
+}

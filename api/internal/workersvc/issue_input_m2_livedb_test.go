@@ -25,7 +25,7 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	svc.SetForges(m2Builder{&m2Forge{disposition: forge.AuthorNotEligible, comments: []forge.IssueComment{{AuthorForgeUserID: 3, Body: "WITHHELD_RAW_CREATE"}, {AuthorForgeUserID: 4, Body: "UNKNOWN_RAW_CREATE"}}}})
-	run, err := svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 4, "raw argument", nil, nil, nil, false, nil, nil)
+	run, err := svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 4, "raw argument", nil, nil, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
