@@ -32,7 +32,10 @@ package store_test
 //	UZI_CLAIMRUN_PLAN_WINNER    C1|C2|C1C2, required for T4, T5 and R.
 //	UZI_CLAIMRUN_PLAN_RUNNERUP  C1|C2|C1C2, required for R, and different from the winner.
 //	UZI_CLAIMRUN_PLAN_N         timed calls per cell. Default 100, minimum 50. P0 always uses 20.
-//	UZI_CLAIMRUN_PLAN_ISOLATED  "0" skips the isolated-statement pass (default on).
+//	UZI_CLAIMRUN_PLAN_ISOLATED  "1" adds the isolated-statement pass (default off). It runs on the
+//	                            cell's clone after the segment phase, so it inherits that phase's
+//	                            rolled-back-write residue and doubles the cell's ClaimRun executions;
+//	                            its numbers are indicative only. The #4602 record ran with it on.
 //	UZI_CLAIMRUN_PLAN_BACKLOG   queued claimable runs scenario (d) adds (default 300; 2000 made one
 //	                            ClaimRun take about 1.3 s on the pilot host).
 //	UZI_CLAIMRUN_PLAN_SCALES    stage S only: a comma list of completed-run history sizes
@@ -203,7 +206,7 @@ func cpLoadConfig(t *testing.T) cpConfig {
 		}
 		cfg.runnerUp = r
 	}
-	cfg.isolated = strings.TrimSpace(os.Getenv("UZI_CLAIMRUN_PLAN_ISOLATED")) != "0"
+	cfg.isolated = strings.TrimSpace(os.Getenv("UZI_CLAIMRUN_PLAN_ISOLATED")) == "1"
 	cfg.cloneAnalyze = strings.TrimSpace(os.Getenv("UZI_CLAIMRUN_PLAN_CLONE_ANALYZE")) != "0"
 	cfg.backlog = pmEnvMinInt(t, "UZI_CLAIMRUN_PLAN_BACKLOG", cpBacklogDef, 1)
 	cfg.scales = cpParseScales(t)
@@ -503,9 +506,21 @@ func (e *cpEnv) binding(ctx context.Context, p *cpProfile) *cpBinding {
 	t := e.t
 	var args []any
 	e.lab.withClone(ctx, "cap_"+p.name, func(_, dsn string, obs *pmObserver) {
-		// Bindings do not depend on a run existing: capture on an idle queue.
+		// Bindings do not depend on which run is queued. Capture with exactly one queued run this
+		// worker can never claim (a required capability it lacks): the owner's queue is non-empty,
+		// so the #4602 idle precheck (HasQueuedRunForUser) passes on a fixed tree and ClaimRun
+		// executes authoritatively on base and fix alike, yet claims nothing.
 		if err := obs.exec(ctx, `DELETE FROM runs WHERE user_id = $1 AND status = 'queued'`, p.user); err != nil {
 			t.Fatalf("capture %s: idle the queue: %v", p.name, err)
+		}
+		capRepo := e.fx.Repo
+		if p.user == e.cx.Fresh {
+			capRepo = e.cx.FreshRepo
+		}
+		if err := obs.exec(ctx, `INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, required_capabilities, created_at, updated_at)
+		    VALUES ($1, $2, $3, 300000, 'q', 'd', 'queued', 'issue', $4, now() - interval '2 hours', now() - interval '2 hours')`,
+			uuid.New(), p.user, capRepo, []string{cpMissingCap}); err != nil {
+			t.Fatalf("capture %s: seed the ineligible queued run: %v", p.name, err)
 		}
 		cpRefresh(ctx, t, obs)
 		tr := &cpTracer{claimSQL: e.claimSQL}
@@ -549,7 +564,7 @@ func (e *cpEnv) binding(ctx context.Context, p *cpProfile) *cpBinding {
 			payload, err = svc.Claim(ctx, wkr, nil)
 		}
 		if err != nil || payload != nil {
-			t.Fatalf("capture %s: Service claim on an idle queue returned payload=%v err=%v", p.name, payload != nil, err)
+			t.Fatalf("capture %s: Service claim with only an ineligible queued run returned payload=%v err=%v", p.name, payload != nil, err)
 		}
 		if n := tr.claimExecs.Load(); n != 1 {
 			t.Fatalf("capture %s: expected exactly one ClaimRun execution, saw %d", p.name, n)

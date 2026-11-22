@@ -296,7 +296,7 @@ profile.
 | (a) idle-empty | 2.19 / 414-433 | 2.38 / 121-124 | 0.92 / 17.8-18.1 | 1.01 / 18-21 |
 | (c) claimable | 8.44 / 474-501 | 8.77 / 200-205 | 8.67 / 492-511 | 9.09 / 212-217 |
 
-1. The isolated statement's p50 was about 0.95 ms for (a) and 6.9-7.3 ms for (c) across candidates and reps.
+1. The isolated statement's p50 was about 0.95 ms for (a) and 6.9-7.3 ms for (c) across candidates and reps. Indicative only: this pass ran on each cell's clone after the segment phase, so it inherits that phase's rolled-back-write residue; no decision used it.
 2. Round trips per call, base vs C2: 7 vs 4 for (a), 8 vs 9 for (c).
 
 **T2** (base, forced modes). Segment p50 / cold + warm-ups, ms.
@@ -326,8 +326,10 @@ So `auto` never stayed custom, and steady-state idle `ClaimRun` is about 0.95 ms
 per fresh connection or per re-prepare: 5 custom plans plus the generic build, about 420 ms
 over the first 11 calls.
 
-**Not explained.** The production per-call planning/execution split (about 75 ms per call,
-inferred from read-only sampling) is unexplained. Unverified candidate causes: connection
+**Not explained.** The production planning/execution split is not established. The issue's
+read-only samples (frequent `ClaimRun` activity, sampled in-flight ages) are length-biased and
+give no per-call duration, and its fresh-session EXPLAIN planning figure is a different
+measurement, so this record assigns no per-call production cost. Unverified candidate causes: connection
 churn; pgx statement-cache eviction; plan invalidation, for example from autovacuum/ANALYZE
 on referenced tables. The harness disables autovacuum, so it could not exhibit that last
 candidate. The maintainer observed autovacuum ANALYZE on `runs` in production; its
@@ -365,10 +367,19 @@ owner accepted about 0.25 ms (about 3%) of extra cost on claimable polls. The en
 figure is +0.88 ms (+4%), recorded as measured: larger in absolute terms than the M1 segment
 estimate, similar in relative terms.
 
+**Improvement target, stated after measurement.** On an idle-empty owner queue, end-to-end
+`Service.Claim` p50 falls by at least 40% and a fresh connection's first 11 polls by at least
+90%, with `ClaimRun` sent 0 times. Measured: -45.6% and -94%, with 0 `ClaimRun`, so the target
+is met. Accepted cost on non-empty queues: one extra round trip, at most about 1 ms per poll end
+to end. Measured: +0.88 ms (+4.0%) for claimable and +0.15 ms (+5.3%) for
+queued-but-ineligible polls, inside that absolute bound. The claimable figure exceeds the about 0.25 ms
+segment estimate the owner accepted before M3, and is reported with this PR rather than
+treated as pre-approved.
+
 **Method notes and deviations.**
 
 1. Stage F (a fixture feasibility check: 13 cell clones, plus 4 profile-capture clones) and stage S (the scale diagnostic: 6 templates, each with 2 measured clones and 2 EXPLAIN clones, plus 1 capture clone per invocation) ran in addition to the pre-registered 119-cell table. Together with the table they exceed the plan's 120-cell cap. That expansion was not reported to the owner beforehand; the owner was told about S's results when choosing the fix, and F produced no timing claim.
-2. By default the harness also runs an isolated-statement pass in each M1 cell. That roughly doubles the `ClaimRun` executions above the plan's stated bound of 11,861, and it shares the cell's clone.
+2. When this record was taken, the harness also ran an isolated-statement pass in each M1 cell. That roughly doubled the `ClaimRun` executions above the plan's stated bound of 11,861, and it shared the cell's clone. The pass is now off by default (`UZI_CLAIMRUN_PLAN_ISOLATED=1` enables it), so a default reproduction stays within the bound and never measures on a clone that carries rolled-back writes.
 3. The harness re-runs ANALYZE on `runs`, `workers` and `cross_checks` in each clone after the scenario change (`UZI_CLAIMRUN_PLAN_CLONE_ANALYZE`, on by default).
 4. Profile p1 replays lane `''`, while the real service sends `'run'`. The SQL treats them identically.
 5. The backlog (d) used 300 runs.
