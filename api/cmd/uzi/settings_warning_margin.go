@@ -17,8 +17,8 @@ func newSettingsWarningMarginCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "warning-margin <0..50|off>",
 		Short: "Set the weekly-limit warning margin",
 		Long: "Set the weekly-limit warning margin: how many percentage points before a weekly\n" +
-			"limit uzi starts warning you (early warnings on runs). The value is an integer from 0\n" +
-			"to 50. 0 (or off) turns early warnings off;\n" +
+			"limit uzi starts warning you (early warnings on runs and one Slack DM per weekly period). The value is an integer from 0\n" +
+			"to 50. 0 (or off) turns early warnings and the Slack warning off;\n" +
 			"the explanation on a run parked by a weekly limit stays.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -61,7 +61,7 @@ func parseWarningMargin(s string) (int, error) {
 // warningMarginLine renders the margin for `settings get` and `settings warning-margin`.
 func warningMarginLine(pts int) string {
 	if pts == 0 {
-		return "Weekly warning margin: 0 (off: no early warnings; park explanations stay)"
+		return "Weekly warning margin: 0 (off: no early warnings or Slack warning; park explanations stay)"
 	}
 	return "Weekly warning margin: " + strconv.Itoa(pts) + " points"
 }

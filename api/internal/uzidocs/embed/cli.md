@@ -3754,7 +3754,8 @@ uzi settings warning-margin off
 `uzi settings warning-margin <0..50|off>` sets how many percentage points below its
 effective weekly limit a credential must be before the [early
 warning](./rate-limits.md#early-warning-before-the-weekly-limit) shows. The
-default is 15; `0` (or `off`) turns early warnings off (park explanations stay).
+default is 15; `0` (or `off`) turns early warnings off, including the [Slack
+warning](./rate-limits.md#slack-warning) (park explanations stay).
 A value outside 0..50 is a usage error. It posts to `PUT /api/me/weekly-warning-margin`
 (`{"margin_pts": <0..50>}`), which accepts a `uzc_` Bearer token; the response
 is `{"weekly_warning_margin_pts": <n>}`. Human output prints `Weekly warning

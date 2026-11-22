@@ -547,7 +547,35 @@ You do not have to wait for a park to learn that a run is heading for its weekly
 
 **Nothing switches automatically.** The warning is information plus the fix commands that would apply; it never changes a run's token or account, pauses it, or holds work. Only the [weekly usage reserve](#weekly-usage-reserve) holds or pauses, and only a real provider limit parks a run.
 
-**Not shipped yet:** Slack warning DMs. Slack still posts only the park messages.
+### Slack warning
+
+uzi also sends one Slack DM when a credential reaches the warning, so you hear about it without opening uzi.
+
+**When it is sent.** Once per credential per observed anchored weekly period, when all of these hold:
+
+- An accepted, fresh reading puts the credential near or at its effective limit (your reserve threshold, or 100%).
+- Your [warning margin](#early-warning-before-the-weekly-limit) is above 0. A margin of `0` turns the Slack DM off along with the banner.
+- The reading carries a usable reset time after the reading itself. Without one, nothing is sent.
+- The credential is still the current one.
+- At least one run that is not finished is using it.
+
+**What it says.** The credential, its usage against the effective limit, and when the window resets. It lists the total number of affected runs and up to 5 of them, each with its reason and the fix command that would apply.
+
+**Delivery needs Slack.** You need a linked, confirmed Slack account with notifications on (see [Slack notifications](slack.md)). With no Slack link, or notifications off, the DM is dropped silently.
+
+**Best effort, never replayed.** The DM names a specific credential, so it is never queued for later delivery or replayed: a DM that cannot be sent when the warning fires is lost. The run-page banner is the guaranteed surface; it shows the warning whether or not the DM arrived.
+
+**At most one DM per observed period, not per seven days.** uzi tracks one state row per credential. A new period starts only when a fresh reading shows the weekly window reset, or a reading past the old boundary shows a new one. This is the number of weekly periods uzi observed, not a guaranteed seven elapsed days.
+
+- **Deleting an Anthropic token, or a full vault reset,** starts a new ledger for that credential. It can warn again in the same week.
+- **Relinking a Codex account** keeps its ledger, so it does not warn again.
+
+**Known edge cases.**
+
+- A crash between uzi recording a usage reading and recording the warning state can lose the observation of a refill. That period then gets no second DM.
+- Codex can report two weekly windows. If the second one was never present in any accepted reading of the period, uzi cannot tell its later appearance from a genuine early reset, and that period can get one extra DM.
+
+Slack still posts the park messages as before.
 
 ## Weekly usage reserve
 
