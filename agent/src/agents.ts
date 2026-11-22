@@ -46,6 +46,7 @@
 
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentSource, AgentTemplate } from "./protocol.js";
+import { isHarnessEffort, type HarnessEffort } from "./harness.js";
 import { NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -222,6 +223,9 @@ function toDefinition(
     if (servers.length > 0) def.mcpServers = servers;
   }
   if (t.model) def.model = t.model;
+  // Template effort pin: only one of the five exact levels is projected; anything
+  // else (wrong case, "runtime", junk) is ignored so the subagent follows the run.
+  if (isHarnessEffort(t.effort)) def.effort = t.effort;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill
   // dropped by cap/collision) PLUS every all-templates skill — those carry no
@@ -351,6 +355,24 @@ export function applySubagentModelOverride(
   for (const def of Object.values(subagents)) {
     def.model = model;
   }
+}
+
+/**
+ * Template effort precedence for Claude subagents: a subagent's own pin wins, else
+ * it runs at the lead's resolved effort, else (lead on the Runtime default) no
+ * effort key at all. Returns NEW definitions and never mutates its input, so
+ * `assembled.subagents` stays untouched. Applied to the copies the SDK receives.
+ */
+export function fillSubagentEffort(
+  roster: Record<string, AgentDefinition>,
+  leadEffort: HarnessEffort | undefined,
+): Record<string, AgentDefinition> {
+  const out: Record<string, AgentDefinition> = {};
+  for (const [name, def] of Object.entries(roster)) {
+    const effort = def.effort ?? leadEffort;
+    out[name] = effort === undefined ? { ...def } : { ...def, effort };
+  }
+  return out;
 }
 
 /** What a planning turn runs with (#203): the write-stripped roster, plus the

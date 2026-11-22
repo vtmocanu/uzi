@@ -1047,6 +1047,9 @@ export class Worker {
           "cross_check_v1",
           "cross_check_rounds_v1",
           "cross_check_pins_v1",
+          // Issue #3258: this image applies `agents[].effort` template pins on both harnesses
+          // (Claude AgentDefinition.effort, Codex per-role effort). Advertised unconditionally.
+          "template_effort_v1",
           // PRD #2460: this image runs a Codex lead's checked plan gate and a Claude plan
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.

@@ -334,6 +334,38 @@ describe("detectRepoAgents", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" :
     assert.equal(notes[0]!.name, "spaced");
   });
 
+  it("issue #3258: reads a Markdown effort; an invalid one is noted with the file and never echoed", async () => {
+    writeAgent("deep.md", "---\nname: deep\ndescription: x.\neffort: high\n---\n\nbody\n");
+    writeAgent("quoted.md", "---\nname: quoted\ndescription: x.\neffort: \"max\"\n---\n\nbody\n");
+    writeAgent("blank.md", "---\nname: blank\ndescription: x.\neffort:\n---\n\nbody\n");
+    writeAgent("bad-file.md", "---\nname: bad\ndescription: x.\neffort: SECRETLEVEL\n---\n\nbody\n");
+    writeAgent("Odd_Name.md", "---\nname: odd\ndescription: x.\neffort: runtime\n---\n\nbody\n");
+    const { agents, notes } = await detectRepoAgents(clone);
+    assert.equal(agents.find((a) => a.name === "deep")!.effort, "high");
+    assert.equal(agents.find((a) => a.name === "quoted")!.effort, "max");
+    assert.ok(!Object.hasOwn(agents.find((a) => a.name === "blank")!, "effort"), "a blank effort inherits silently");
+    assert.ok(!Object.hasOwn(agents.find((a) => a.name === "bad")!, "effort"));
+    assert.ok(!Object.hasOwn(agents.find((a) => a.name === "odd")!, "effort"), "runtime is not a pin");
+    assert.deepEqual(notes, [
+      { name: "odd", reason: "effort_ignored" },
+      { name: "bad", reason: "effort_ignored", file: "bad-file" },
+    ]);
+    const text = describeRepoAgentNote(notes[1]!);
+    assert.equal(text, 'repo agent "bad" (file "bad-file") declared an invalid effort; it follows the run\'s effort');
+    assert.ok(!text.includes("SECRETLEVEL"));
+    assert.equal(describeRepoAgentNote(notes[0]!), 'repo agent "odd" declared an invalid effort; it follows the run\'s effort');
+  });
+
+  it("issue #3258: a .claude effort is Claude-family, kept on a Claude run and dropped on a Codex run", async () => {
+    writeAgent("deep.md", "---\nname: deep\ndescription: x.\neffort: xhigh\n---\n\nbody\n");
+    const claude = await detectRepoAgents(clone, "claude");
+    assert.equal(claude.agents[0]!.effort, "xhigh");
+    const codex = await detectRepoAgents(clone, "codex");
+    assert.equal(codex.folder, ".claude/agents");
+    assert.deepEqual(codex.agents.map((a) => a.name), ["deep"]);
+    assert.ok(!Object.hasOwn(codex.agents[0]!, "effort"), "a .claude effort never reaches a Codex run");
+  });
+
   it("regression (c): Markdown Codex pins never reach Claude SDK definitions", async () => {
     const roleModels = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
     for (const [i, model] of roleModels.entries()) {

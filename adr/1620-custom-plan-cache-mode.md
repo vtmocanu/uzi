@@ -3,7 +3,7 @@
 **Status**: Accepted (issue #1620). The candidate pool default, `plan_cache_mode = force_custom_plan`, was measured and **not adopted**; the fix that shipped is the query-shape rule below.
 **Date**: 2026-09-24
 **Deciders**: lead (plan), coder (measurement and implementation), reviewer.
-**Related**: [ADR-1079](1079-run-usage-per-leg-fold.md) and [ADR-1562](1562-run-usage-session-cumulative-basis.md) define the `run_usage_totals` fold whose cost this ADR is about; neither is changed.
+**Related**: [ADR-1079](1079-run-usage-per-leg-fold.md) and [ADR-1562](1562-run-usage-session-cumulative-basis.md) define the `run_usage_totals` fold whose cost this ADR is about; neither is changed. [ADR-4591](4591-api-pool-backend-memory.md) later measured statement-cache and lifetime candidates on the same pool and changed no default; `plan_cache_mode` stays as decided here.
 **PRD**: none. The spec lived in the issue body; this ADR records the measurement behind the one decision the issue left open.
 
 ## Decision (summary)
@@ -227,7 +227,8 @@ view join coming back into the run list.
 
 - No runtime change. The API keeps pgx's default statement cache and PostgreSQL's
   `auto` plan choice. The operator stopgap remains available for an incident, at the
-  per-call cost measured above.
+  per-call cost measured above. ADR-4591 later measured further pool candidates and also
+  changed no default.
 - **Follow-up (not scheduled): the pool default.** Revisit `force_custom_plan` as a pool
   default only with a new measurement showing the hot-path planning overhead is small.
   That could follow a PostgreSQL planner change, a simpler `ClaimRun`, or a per-statement

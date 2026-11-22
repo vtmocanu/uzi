@@ -1021,6 +1021,10 @@ export interface AgentTemplate {
   model?: string | null;
   /** null/absent = inherit all tools; else an allowlist. */
   tools?: string[] | null;
+  /** One of low|medium|high|xhigh|max for the run's harness; absent/null = no
+   *  pin (the subagent follows the run's effort). Sent only to workers that
+   *  advertise `template_effort_v1`. */
+  effort?: string | null;
   prompt_body: string;
   /** This template's allocated skill names (PRD #16), restricted server-side to
    *  names present in the run's skill union. The worker maps these onto the

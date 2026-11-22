@@ -92,14 +92,17 @@ const (
 // (OK=true, full definition, plus any non-fatal clamp notes) or a skipped/failed one
 // (OK=false, Reason carries the NoteReason).
 type StagedRole struct {
-	Name        string   `json:"name"`
-	OK          bool     `json:"ok"`
-	Reason      string   `json:"reason,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Tools       []string `json:"tools,omitempty"`
-	PromptBody  string   `json:"prompt_body,omitempty"`
-	Notes       []string `json:"notes,omitempty"`
+	Name        string `json:"name"`
+	OK          bool   `json:"ok"`
+	Reason      string `json:"reason,omitempty"`
+	Description string `json:"description,omitempty"`
+	Model       string `json:"model,omitempty"`
+	// Effort is the role's Claude-family effort pin (PRD #3258 N8); a snapshot staged
+	// before it existed decodes as "" (no pin, stored NULL).
+	Effort     string   `json:"effort,omitempty"`
+	Tools      []string `json:"tools,omitempty"`
+	PromptBody string   `json:"prompt_body,omitempty"`
+	Notes      []string `json:"notes,omitempty"`
 }
 
 // normalizeRawDefinition classifies a source's single raw model exactly once.
@@ -113,7 +116,7 @@ func normalizeRawDefinition(raw agenttmpl.Definition) agenttmpl.Definition {
 // and approval DTOs. It does not change the staged snapshot or its raw Model.
 func (r StagedRole) Definition() agenttmpl.Definition {
 	return normalizeRawDefinition(agenttmpl.Definition{
-		Name: r.Name, Description: r.Description, Model: r.Model,
+		Name: r.Name, Description: r.Description, Model: r.Model, Effort: r.Effort,
 		Tools: r.Tools, PromptBody: r.PromptBody,
 	})
 }
@@ -318,7 +321,7 @@ func buildStagedRoles(set SetResult) []StagedRole {
 	var failures []StagedRole
 	for _, n := range set.Notes {
 		switch n.Reason {
-		case NoteToolsFiltered, NoteModelIgnored:
+		case NoteToolsFiltered, NoteModelIgnored, NoteEffortIgnored:
 			clampNotes[n.Name] = append(clampNotes[n.Name], string(n.Reason))
 		default:
 			// invalid / tools_all_denied / too_large / duplicate / over_limit
@@ -333,6 +336,7 @@ func buildStagedRoles(set SetResult) []StagedRole {
 			OK:          true,
 			Description: role.Description,
 			Model:       role.Model,
+			Effort:      role.Effort,
 			Tools:       role.Tools,
 			PromptBody:  role.PromptBody,
 			Notes:       clampNotes[role.Name],
@@ -426,6 +430,12 @@ func rowToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	}
 	if t.CodexModel.Valid {
 		d.CodexModel = t.CodexModel.String
+	}
+	if t.Effort.Valid {
+		d.Effort = t.Effort.String
+	}
+	if t.CodexEffort.Valid {
+		d.CodexEffort = t.CodexEffort.String
 	}
 	return d
 }

@@ -95,3 +95,26 @@ describe("AgentSourceSettingsCard staged review model label (#3255)", () => {
     expect(screen.queryByText(/^inherit$/i)).toBeNull();
   });
 });
+
+describe("AgentSourceSettingsCard staged review effort (#3258)", () => {
+  it("shows a staged effort pin, Default when unpinned, and flags an ignored source effort", async () => {
+    const snapshot = structuredClone(view);
+    snapshot.staged!.roles = [
+      { name: "coder", ok: true, claude_model: "", codex_model: "", effort: "high", prompt_body: "coder body" },
+      { name: "plain", ok: true, claude_model: "", codex_model: "", effort: "", prompt_body: "plain body" },
+      { name: "bad", ok: true, claude_model: "", codex_model: "", prompt_body: "bad body", notes: ["effort_ignored"] },
+    ];
+    snapshot.staged!.diff = snapshot.staged!.roles.map((r) => ({ name: r.name, action: "add" }));
+    mockApi.getAgentSource.mockResolvedValue({ agent_source: snapshot });
+    render(<AgentSourceSettingsCard />);
+    const buttons = await screen.findAllByRole("button", { name: "Show body" });
+    buttons.forEach((b) => fireEvent.click(b));
+    const effortOf = (name: string) =>
+      within(screen.getByText(name, { selector: "code" }).closest("li")!).getByText("Claude effort").nextElementSibling?.textContent;
+    expect(effortOf("coder")).toBe("high");
+    expect(effortOf("plain")).toBe("Default · follows the run's effort");
+    expect(effortOf("bad")).toBe(
+      "Default · follows the run's effort (the source's effort is not one of low, medium, high, xhigh or max, so it was ignored)",
+    );
+  });
+});

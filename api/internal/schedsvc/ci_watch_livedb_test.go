@@ -106,7 +106,7 @@ func (l *ciLive) fire(t *testing.T) FireOutcome {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := l.sc.fireOne(l.ctx, sched)
+	out, err := l.sc.fireOne(l.ctx, sched, false)
 	if err != nil {
 		t.Fatalf("fireOne: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestCIWatchConcurrentFiresLiveDB(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-gate
-			outs[i], errs[i] = sc.fireOne(l.ctx, sched)
+			outs[i], errs[i] = sc.fireOne(l.ctx, sched, false)
 		}()
 	}
 	close(gate)
@@ -292,7 +292,7 @@ func TestCIWatchScheduleDeletedDuringFireLiveDB(t *testing.T) {
 		}
 	}
 	sched := l.sched
-	out, err := l.sc.fireOne(l.ctx, sched)
+	out, err := l.sc.fireOne(l.ctx, sched, false)
 	if err != nil {
 		t.Fatalf("fireOne: %v", err)
 	}

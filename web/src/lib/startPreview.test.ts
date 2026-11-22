@@ -113,6 +113,29 @@ describe("startPreviewView", () => {
     expect(v.model?.source).toBe("lead template");
   });
 
+  // Issue #3258 N3: the server's start preview carries worker_effort only when the request names an
+  // effort, so a default start reads the GET cell, which resolves the lead template's effort.
+  it("falls back to the GET effort cell and shows the lead template as its source", () => {
+    const get = structuredClone(GET);
+    const cell = get.efforts.find((c) => c.setting === "worker_effort" && c.harness === "claude")!;
+    cell.effort = null;
+    cell.resolved_effort = "high";
+    cell.source = "template";
+    cell.mode = "explicit";
+    const v = startPreviewView(recorded("auto token"), get);
+    expect(v.effort).toEqual({ text: "high", short: "high", source: "lead template" });
+    expect(compactSummary(v)).toBe("Claude · opus · high");
+  });
+
+  it("an effort chosen for this run beats the lead template effort in the GET cell", () => {
+    const get = structuredClone(GET);
+    const cell = get.efforts.find((c) => c.setting === "worker_effort" && c.harness === "claude")!;
+    cell.resolved_effort = "low";
+    cell.source = "template";
+    const v = startPreviewView(recorded("effort only on claude"), get);
+    expect(v.effort).toEqual({ text: "high", short: "high", source: "this run" });
+  });
+
   it("lists each alternative for a chosen-at-create harness without inventing one", () => {
     const v = startPreviewView(recorded("default start"), GET);
     expect(v.chosenAtCreate).toBe(true);

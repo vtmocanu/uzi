@@ -29,7 +29,11 @@ import type { AgentTemplate, BuiltinDefinition } from "./api";
 
 const FIXTURE = "../../../fixtures/agent-template-drift/cases.json";
 
-type FixtureContent = Omit<TemplateContent, "codex_model"> & { codex_model?: string | null };
+type FixtureContent = Omit<TemplateContent, "codex_model" | "effort" | "codex_effort"> & {
+  codex_model?: string | null;
+  effort?: string | null;
+  codex_effort?: string | null;
+};
 
 interface DriftCase {
   name: string;
@@ -55,7 +59,7 @@ function loadTable(): DriftTable {
   return JSON.parse(raw) as DriftTable;
 }
 
-// sameContent takes the stored row and the shipped definition. Only the five content
+// sameContent takes the stored row and the shipped definition. Only the seven content
 // columns vary; the rest are inert defaults, present because AgentTemplate requires them.
 function asRow(c: FixtureContent): AgentTemplate {
   return {
@@ -64,6 +68,8 @@ function asRow(c: FixtureContent): AgentTemplate {
     description: c.description,
     model: c.model,
     codex_model: c.codex_model ?? null,
+    effort: c.effort ?? null,
+    codex_effort: c.codex_effort ?? null,
     tools: c.tools,
     prompt_body: c.prompt_body,
     is_builtin: true,
@@ -81,6 +87,8 @@ function asDef(c: FixtureContent): BuiltinDefinition {
     description: c.description,
     model: c.model,
     codex_model: c.codex_model ?? null,
+    effort: c.effort ?? null,
+    codex_effort: c.codex_effort ?? null,
     tools: c.tools,
     prompt_body: c.prompt_body,
   };
@@ -114,14 +122,17 @@ describe("agent-template drift-predicate contract (issue #223 item 3)", () => {
     expect(sameContent(asRow(legacy), asDef(explicit))).toBe(true);
   });
 
-  it("reports all five columns in display order", () => {
+  it("reports all seven columns in display order", () => {
     const shipped: TemplateContent = {
-      description: "d", model: "sonnet", codex_model: null, tools: null, prompt_body: "b",
+      description: "d", model: "sonnet", codex_model: null, effort: null, codex_effort: null, tools: null, prompt_body: "b",
     };
     const current: TemplateContent = {
-      description: "edited", model: "opus", codex_model: "gpt-6-sol", tools: ["Read"], prompt_body: "edited",
+      description: "edited", model: "opus", codex_model: "gpt-6-sol", effort: "high", codex_effort: "low",
+      tools: ["Read"], prompt_body: "edited",
     };
-    expect(driftedColumns(shipped, current)).toEqual(["description", "model", "codex model", "tools", "prompt body"]);
+    expect(driftedColumns(shipped, current)).toEqual([
+      "description", "model", "codex model", "effort", "codex effort", "tools", "prompt body",
+    ]);
   });
 
   // The load-bearing discriminating cases must stay: an implementation that sorted tools,
@@ -141,6 +152,10 @@ describe("agent-template drift-predicate contract (issue #223 item 3)", () => {
       "codex-model-value-change",
       "codex-model-null-vs-empty-agree",
       "model-moved-between-harnesses",
+      "effort-value-change",
+      "codex-effort-value-change",
+      "effort-null-equals-null",
+      "effort-moved-between-harnesses",
     ]) {
       expect(names.has(required)).toBe(true);
     }

@@ -50,7 +50,7 @@ type ondeckRuns struct {
 	f scheduleFixture
 }
 
-func (r ondeckRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, desc string, _ *bool, _ *bool, _ *string, _ bool, _ *workersvc.CredentialOverride, _ *workersvc.Harness) (store.Run, error) {
+func (r ondeckRuns) CreateScheduledAutopilotRun(ctx context.Context, user, repo uuid.UUID, iid int64, desc string, _ *bool, _ *bool, _ *string, _ bool, _ *workersvc.CredentialOverride, _ *workersvc.Harness, _ *workersvc.OnceFireProgress) (store.Run, error) {
 	var id uuid.UUID
 	err := r.f.pool.QueryRow(ctx, `INSERT INTO runs(user_id,repo_id,issue_iid,kind,status,issue_title,issue_description) VALUES($1,$2,$3,'issue','queued','next',$4) RETURNING id`, user, repo, iid, desc).Scan(&id)
 	return store.Run{ID: id}, err

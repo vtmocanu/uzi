@@ -72,6 +72,7 @@ describe("agentsource parser parity (repoagents.ts ↔ api/internal/agentsource)
             prompt_body: a.prompt_body,
             tools: a.tools ?? null,
             model: a.model ?? "",
+            effort: a.effort ?? "",
             notes: notes.map(noteShape),
           };
         } else {

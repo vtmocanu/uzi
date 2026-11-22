@@ -334,3 +334,127 @@ func TestPristineBuiltinRefreshLiveDB(t *testing.T) {
 		t.Errorf("identical model/tools re-refresh must be a no-op; got %d rows err=%v", same9, err)
 	}
 }
+
+// TestPristineBuiltinEffortRefreshLiveDB pins the PRD #3258 effort pins through the boot refresh:
+// the SET list and the IS DISTINCT FROM guard move in lockstep (a second boot rewrites nothing),
+// a customized row keeps its effort, and a pristine row follows a changed shipped effort.
+func TestPristineBuiltinEffortRefreshLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+	text := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
+
+	// A second boot rewrites nothing: every embedded builtin keeps its updated_at.
+	if _, err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	snapshot := func() map[string]string {
+		rows, err := pool.Query(ctx, `SELECT name, updated_at::text FROM agent_templates WHERE scope = 'builtin'`)
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		defer rows.Close()
+		out := map[string]string{}
+		for rows.Next() {
+			var name, ts string
+			if err := rows.Scan(&name, &ts); err != nil {
+				t.Fatal(err)
+			}
+			out[name] = ts
+		}
+		return out
+	}
+	before := snapshot()
+	if len(before) == 0 {
+		t.Fatal("no builtin rows after reconcile")
+	}
+	if _, err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	for name, ts := range snapshot() {
+		if before[name] != ts {
+			t.Errorf("second boot rewrote %q (updated_at %s -> %s)", name, before[name], ts)
+		}
+	}
+
+	suffix := uuid.NewString()[:8]
+	admin := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash, is_admin) VALUES ($1, $2, 'x', true)`,
+		admin, fmt.Sprintf("effort-refresh-%s@e2e", suffix))
+	seed := func(name string) store.AgentTemplate {
+		t.Helper()
+		if _, err := q.InsertBuiltinAgentTemplate(ctx, store.InsertBuiltinAgentTemplateParams{Name: name, Description: "d", PromptBody: "b\n"}); err != nil {
+			t.Fatalf("seed %q: %v", name, err)
+		}
+		row, err := q.GetSharedAgentTemplateByName(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+	refresh := func(name string, effort, codex pgtype.Text) int64 {
+		t.Helper()
+		n, err := q.RefreshPristineBuiltin(ctx, store.RefreshPristineBuiltinParams{
+			Name: name, Description: "d", PromptBody: "b\n", Effort: effort, CodexEffort: codex,
+		})
+		if err != nil {
+			t.Fatalf("refresh %q: %v", name, err)
+		}
+		return n
+	}
+
+	// NULL shipped and NULL stored is not a difference (the guard is NULL-safe).
+	pristine := "eff-pristine-" + suffix
+	seed(pristine)
+	if n := refresh(pristine, pgtype.Text{}, pgtype.Text{}); n != 0 {
+		t.Errorf("NULL vs NULL effort must not rewrite; got %d rows", n)
+	}
+	// A shipped effort change reaches a pristine row, once.
+	if n := refresh(pristine, text("high"), pgtype.Text{}); n != 1 {
+		t.Fatalf("a changed shipped effort must refresh a pristine row; got %d", n)
+	}
+	got, _ := q.GetSharedAgentTemplateByName(ctx, pristine)
+	if got.Effort.String != "high" || got.CodexEffort.Valid || got.Customized {
+		t.Errorf("pristine row after refresh: effort=%+v codex=%+v customized=%v", got.Effort, got.CodexEffort, got.Customized)
+	}
+	if n := refresh(pristine, text("high"), pgtype.Text{}); n != 0 {
+		t.Errorf("the same shipped effort again must be a no-op; got %d rows", n)
+	}
+	// The same value moved to the other lane is a change.
+	if n := refresh(pristine, pgtype.Text{}, text("high")); n != 1 {
+		t.Errorf("effort moved to codex_effort must refresh; got %d rows", n)
+	}
+	// Removing the shipped effort clears it.
+	if n := refresh(pristine, pgtype.Text{}, pgtype.Text{}); n != 1 {
+		t.Errorf("a removed shipped effort must refresh to NULL; got %d rows", n)
+	}
+	if got, _ := q.GetSharedAgentTemplateByName(ctx, pristine); got.Effort.Valid || got.CodexEffort.Valid {
+		t.Errorf("efforts must be NULL after the shipped effort is removed: %+v %+v", got.Effort, got.CodexEffort)
+	}
+
+	// A customized row (an effort-only admin edit) is left exactly as it is.
+	custom := "eff-custom-" + suffix
+	row := seed(custom)
+	if _, err := q.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
+		ID: row.ID, Description: "d", PromptBody: "b\n", UpdatedBy: pgUUID(admin), Customized: true, Effort: text("max"),
+	}); err != nil {
+		t.Fatalf("customize: %v", err)
+	}
+	if n := refresh(custom, text("low"), text("low")); n != 0 {
+		t.Errorf("a customized row must be excluded; got %d rows", n)
+	}
+	if got, _ := q.GetSharedAgentTemplateByName(ctx, custom); got.Effort.String != "max" || got.CodexEffort.Valid {
+		t.Errorf("customized row changed: effort=%+v codex=%+v", got.Effort, got.CodexEffort)
+	}
+}

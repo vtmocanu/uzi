@@ -6462,7 +6462,7 @@ func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
 		{"codex", []string{"", "", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}},
 	} {
 		t.Run(tc.harness, func(t *testing.T) {
-			agents := agentsFromTemplates(rows, nil, tc.harness)
+			agents := agentsFromTemplates(rows, nil, tc.harness, false)
 			if len(agents) != len(rows) {
 				t.Fatalf("agents=%d", len(agents))
 			}
@@ -6477,6 +6477,66 @@ func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
 				if tc.want[i] == "" && agent.Model != nil {
 					t.Errorf("%s must omit model", agent.Name)
 				}
+			}
+		})
+	}
+}
+
+func TestAgentsFromTemplatesEffortProjection(t *testing.T) {
+	rows := []store.AgentTemplate{
+		{Name: "claude-only", Effort: pgconv.TextOrNull("high")},
+		{Name: "codex-only", CodexEffort: pgconv.TextOrNull("low")},
+		{Name: "dual", Effort: pgconv.TextOrNull("max"), CodexEffort: pgconv.TextOrNull("xhigh")},
+		{Name: "hostile", Effort: pgconv.TextOrNull("High"), CodexEffort: pgconv.TextOrNull("runtime")},
+		{Name: "unpinned"},
+		{Name: "lead", Effort: pgconv.TextOrNull("max"), CodexEffort: pgconv.TextOrNull("xhigh")},
+	}
+	for _, tc := range []struct {
+		name    string
+		harness string
+		flag    bool
+		want    []string
+	}{
+		{"claude with capability", "claude", true, []string{"high", "", "max", "", "", ""}},
+		{"codex with capability", "codex", true, []string{"", "low", "xhigh", "", "", ""}},
+		{"claude without capability", "claude", false, []string{"", "", "", "", "", ""}},
+		{"codex without capability", "codex", false, []string{"", "", "", "", "", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agents := agentsFromTemplates(rows, nil, tc.harness, tc.flag)
+			for i, a := range agents {
+				got := ""
+				if a.Effort != nil {
+					got = *a.Effort
+				}
+				if got != tc.want[i] {
+					t.Errorf("%s effort=%q, want %q", a.Name, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestHasWithheldTemplateEffort(t *testing.T) {
+	pinned := func(name string) store.AgentTemplate {
+		return store.AgentTemplate{Name: name, Effort: pgconv.TextOrNull("high"), CodexEffort: pgconv.TextOrNull("low")}
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []store.AgentTemplate
+		harness string
+		want    bool
+	}{
+		{"subagent pin", []store.AgentTemplate{pinned("coder")}, "claude", true},
+		{"lead pin is not a subagent pin", []store.AgentTemplate{pinned("lead")}, "claude", false},
+		{"orchestrator is lead-shaped", []store.AgentTemplate{pinned("orchestrator")}, "codex", false},
+		{"other family only", []store.AgentTemplate{{Name: "coder", CodexEffort: pgconv.TextOrNull("low")}}, "claude", false},
+		{"hostile value", []store.AgentTemplate{{Name: "coder", Effort: pgconv.TextOrNull("ultra")}}, "claude", false},
+		{"none", []store.AgentTemplate{{Name: "coder"}}, "claude", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasWithheldTemplateEffort(tc.rows, tc.harness); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})
 	}

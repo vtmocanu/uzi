@@ -285,12 +285,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 		out := ApplyOutcome{Name: op.Name, Action: op.Action, Detail: op.Detail}
 		switch op.Action {
 		case ActionOverrideBuiltin:
-			model, codexModel, tools, err := storeColumns(op.Def)
+			cols, err := storeColumns(op.Def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode %q: %w", op.Name, err)
 			}
 			if _, err := q.ApplySyncedOverrideBuiltin(ctx, store.ApplySyncedOverrideBuiltinParams{
-				Description: op.Def.Description, Model: model, CodexModel: codexModel, Tools: tools,
+				Description: op.Def.Description, Model: cols.model, CodexModel: cols.codexModel, Effort: cols.effort, CodexEffort: cols.codexEffort, Tools: cols.tools,
 				PromptBody: op.Def.PromptBody, UpdatedBy: actor, ID: op.Row.ID,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("override builtin %q: %w", op.Name, err)
@@ -298,12 +298,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 			res.Applied++
 
 		case ActionAddGlobal:
-			model, codexModel, tools, err := storeColumns(op.Def)
+			cols, err := storeColumns(op.Def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode %q: %w", op.Name, err)
 			}
 			if _, err := q.InsertSyncedGlobalTemplate(ctx, store.InsertSyncedGlobalTemplateParams{
-				Name: op.Def.Name, Description: op.Def.Description, Model: model, CodexModel: codexModel, Tools: tools,
+				Name: op.Def.Name, Description: op.Def.Description, Model: cols.model, CodexModel: cols.codexModel, Effort: cols.effort, CodexEffort: cols.codexEffort, Tools: cols.tools,
 				PromptBody: op.Def.PromptBody, UpdatedBy: actor,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("insert global %q: %w", op.Name, err)
@@ -315,12 +315,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 			res.Applied++
 
 		case ActionUpdateGlobal:
-			model, codexModel, tools, err := storeColumns(op.Def)
+			cols, err := storeColumns(op.Def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode %q: %w", op.Name, err)
 			}
 			if _, err := q.UpdateSyncedGlobalTemplate(ctx, store.UpdateSyncedGlobalTemplateParams{
-				Description: op.Def.Description, Model: model, CodexModel: codexModel, Tools: tools,
+				Description: op.Def.Description, Model: cols.model, CodexModel: cols.codexModel, Effort: cols.effort, CodexEffort: cols.codexEffort, Tools: cols.tools,
 				PromptBody: op.Def.PromptBody, UpdatedBy: actor, Name: op.Def.Name,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("update global %q: %w", op.Name, err)
@@ -344,12 +344,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 				res.Outcomes = append(res.Outcomes, out)
 				continue
 			}
-			model, codexModel, tools, err := storeColumns(def)
+			cols, err := storeColumns(def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode embedded %q: %w", op.Name, err)
 			}
 			if _, err := q.ResetBuiltinAgentTemplate(ctx, store.ResetBuiltinAgentTemplateParams{
-				Description: def.Description, Model: model, CodexModel: codexModel, Tools: tools,
+				Description: def.Description, Model: cols.model, CodexModel: cols.codexModel, Effort: cols.effort, CodexEffort: cols.codexEffort, Tools: cols.tools,
 				PromptBody: def.PromptBody, UpdatedBy: actor, ID: op.Row.ID,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("reset builtin %q: %w", op.Name, err)
@@ -384,26 +384,40 @@ func (r *Reconciler) recordApplied(ctx context.Context, sha string, actor pgtype
 	r.settings.Invalidate()
 }
 
-// storeColumns converts a normalized Definition into both model columns and tools.
-// Empty pins become NULL pgtype.Text, and Tools a non-empty slice →
-// its jsonb encoding (an empty/nil slice → NULL = inherit-all). The agentsource-local
-// twin of the handler's storeColumns (that one is not importable here).
-func storeColumns(def agenttmpl.Definition) (pgtype.Text, pgtype.Text, []byte, error) {
-	var model pgtype.Text
-	if def.Model != "" {
-		model = pgtype.Text{String: def.Model, Valid: true}
+// storedColumns is the DB-typed form of a Definition's pins and tools.
+type storedColumns struct {
+	model, codexModel, effort, codexEffort pgtype.Text
+	tools                                  []byte
+}
+
+// storeColumns converts a normalized Definition into the pin columns and tools.
+// Empty pins (model, codex_model, effort, codex_effort) become NULL pgtype.Text, and Tools a
+// non-empty slice → its jsonb encoding (an empty/nil slice → NULL = inherit-all). The
+// agentsource-local twin of the handler's storeColumns (that one is not importable here).
+func storeColumns(def agenttmpl.Definition) (storedColumns, error) {
+	text := func(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }
+	// Efforts go through agenttmpl.ValidateEffort: blank or whitespace is NULL, and an
+	// out-of-contract value is a named error here rather than a CHECK violation inside the apply
+	// transaction. The source parser already drops an invalid effort per role (NoteEffortIgnored), so
+	// only a tampered snapshot reaches this error, and it fails the whole apply closed.
+	effort, err := agenttmpl.ValidateEffort(def.Effort)
+	if err != nil {
+		return storedColumns{}, fmt.Errorf("effort: %w", err)
 	}
-	var codexModel pgtype.Text
-	if def.CodexModel != "" {
-		codexModel = pgtype.Text{String: def.CodexModel, Valid: true}
+	codexEffort, err := agenttmpl.ValidateEffort(def.CodexEffort)
+	if err != nil {
+		return storedColumns{}, fmt.Errorf("codex_effort: %w", err)
 	}
-	var tools []byte
+	c := storedColumns{
+		model: text(def.Model), codexModel: text(def.CodexModel),
+		effort: text(effort), codexEffort: text(codexEffort),
+	}
 	if len(def.Tools) > 0 {
 		b, err := json.Marshal(def.Tools)
 		if err != nil {
-			return pgtype.Text{}, pgtype.Text{}, nil, err
+			return storedColumns{}, err
 		}
-		tools = b
+		c.tools = b
 	}
-	return model, codexModel, tools, nil
+	return c, nil
 }

@@ -90,11 +90,13 @@ const listUserCrossCheckPins = `-- name: ListUserCrossCheckPins :many
 SELECT cells.stage, cells.harness, p.model, p.effort,
     u.default_claude_model, u.default_codex_model, u.default_effort, u.default_codex_effort,
     template.model AS template_model,
-    template.codex_model AS template_codex_model
+    template.codex_model AS template_codex_model,
+    template.effort AS template_effort,
+    template.codex_effort AS template_codex_effort
 FROM users u CROSS JOIN (SELECT 'plan'::text AS stage, 'claude'::text AS harness UNION ALL SELECT 'plan', 'codex' UNION ALL SELECT 'code', 'claude' UNION ALL SELECT 'code', 'codex') cells
 LEFT JOIN user_cross_check_pins p ON p.user_id = u.id AND p.stage = cells.stage AND p.harness = cells.harness
 LEFT JOIN LATERAL (
-    SELECT t.model, t.codex_model FROM agent_templates t
+    SELECT t.model, t.codex_model, t.effort, t.codex_effort FROM agent_templates t
     LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = u.id
     LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
     WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = u.id))
@@ -109,16 +111,18 @@ ORDER BY CASE cells.stage WHEN 'plan' THEN 0 ELSE 1 END, cells.harness
 `
 
 type ListUserCrossCheckPinsRow struct {
-	Stage              string      `json:"stage"`
-	Harness            string      `json:"harness"`
-	Model              pgtype.Text `json:"model"`
-	Effort             pgtype.Text `json:"effort"`
-	DefaultClaudeModel pgtype.Text `json:"default_claude_model"`
-	DefaultCodexModel  pgtype.Text `json:"default_codex_model"`
-	DefaultEffort      pgtype.Text `json:"default_effort"`
-	DefaultCodexEffort pgtype.Text `json:"default_codex_effort"`
-	TemplateModel      pgtype.Text `json:"template_model"`
-	TemplateCodexModel pgtype.Text `json:"template_codex_model"`
+	Stage               string      `json:"stage"`
+	Harness             string      `json:"harness"`
+	Model               pgtype.Text `json:"model"`
+	Effort              pgtype.Text `json:"effort"`
+	DefaultClaudeModel  pgtype.Text `json:"default_claude_model"`
+	DefaultCodexModel   pgtype.Text `json:"default_codex_model"`
+	DefaultEffort       pgtype.Text `json:"default_effort"`
+	DefaultCodexEffort  pgtype.Text `json:"default_codex_effort"`
+	TemplateModel       pgtype.Text `json:"template_model"`
+	TemplateCodexModel  pgtype.Text `json:"template_codex_model"`
+	TemplateEffort      pgtype.Text `json:"template_effort"`
+	TemplateCodexEffort pgtype.Text `json:"template_codex_effort"`
 }
 
 // Read all four stage-local cells, pins and worker defaults in one statement snapshot.
@@ -142,6 +146,8 @@ func (q *Queries) ListUserCrossCheckPins(ctx context.Context, userID uuid.UUID) 
 			&i.DefaultCodexEffort,
 			&i.TemplateModel,
 			&i.TemplateCodexModel,
+			&i.TemplateEffort,
+			&i.TemplateCodexEffort,
 		); err != nil {
 			return nil, err
 		}

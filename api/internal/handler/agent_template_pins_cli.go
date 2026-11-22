@@ -29,16 +29,18 @@ const (
 	msgTemplateNotEditable            = "builtin and global templates are edited in the web UI by an admin"
 )
 
-// cliTemplateDTO is the restricted template view of the CLI pin routes: identity, the two pins
-// and two flags. It carries no prompt body, description or tools. Model and CodexModel are null
-// when the template inherits.
+// cliTemplateDTO is the restricted template view of the CLI pin routes: identity, the four pins
+// (model and effort per harness) and two flags. It carries no prompt body, description or tools.
+// Each pin is null when the template inherits.
 type cliTemplateDTO struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	Scope      string  `json:"scope"`
-	Model      *string `json:"model"`
-	CodexModel *string `json:"codex_model"`
-	Customized bool    `json:"customized"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Scope       string  `json:"scope"`
+	Model       *string `json:"model"`
+	CodexModel  *string `json:"codex_model"`
+	Effort      *string `json:"effort"`
+	CodexEffort *string `json:"codex_effort"`
+	Customized  bool    `json:"customized"`
 	// Editable is true only for the caller's own scope='user' rows, the only rows the pin route
 	// writes.
 	Editable bool `json:"editable"`
@@ -57,6 +59,12 @@ func cliTemplateView(t store.AgentTemplate, caller uuid.UUID) cliTemplateDTO {
 	}
 	if t.CodexModel.Valid {
 		dto.CodexModel = &t.CodexModel.String
+	}
+	if t.Effort.Valid {
+		dto.Effort = &t.Effort.String
+	}
+	if t.CodexEffort.Valid {
+		dto.CodexEffort = &t.CodexEffort.String
 	}
 	return dto
 }
@@ -92,7 +100,7 @@ func (h *Handler) ListMyAgentTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 // PutMyAgentTemplateModelPins serves PUT /api/me/agent-templates/{id}/model-pins (PRD #3264 M3):
-// set or clear (null) the Claude and Codex model pins of the caller's OWN user template, in one
+// set or clear (null) the Claude and Codex model and effort pins of the caller's OWN user template, in one
 // transaction under the row lock, touching nothing else.
 //
 // Order: bounded strict body read (its error is revealed only after authorization, so a
@@ -166,17 +174,18 @@ func (h *Handler) PutMyAgentTemplateModelPins(w http.ResponseWriter, r *http.Req
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if k != "model" && k != "codex_model" {
+		if k != "model" && k != "codex_model" && k != "effort" && k != "codex_effort" {
 			writeModelSettingsFieldError(w, k, "unknown field "+k)
 			return
 		}
 	}
 	if len(req) == 0 {
-		httpx.Error(w, http.StatusBadRequest, "at least one of model, codex_model is required")
+		httpx.Error(w, http.StatusBadRequest, "at least one of model, codex_model, effort, codex_effort is required")
 		return
 	}
 
 	model, codexModel := t.Model, t.CodexModel
+	effort, codexEffort := t.Effort, t.CodexEffort
 	lanes := []struct {
 		field, harness string
 		dst            *pgtype.Text
@@ -202,11 +211,38 @@ func (h *Handler) PutMyAgentTemplateModelPins(w http.ResponseWriter, r *http.Req
 		*l.dst = val
 	}
 
+	efforts := []struct {
+		field string
+		dst   *pgtype.Text
+	}{
+		{"effort", &effort},
+		{"codex_effort", &codexEffort},
+	}
+	for _, l := range efforts {
+		raw, present := req[l.field]
+		if !present {
+			continue
+		}
+		var v *string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			writeModelSettingsFieldError(w, l.field, l.field+": must be a string or null")
+			return
+		}
+		val, err := validateTemplateEffort(l.field, v)
+		if err != nil {
+			writeModelSettingsFieldError(w, l.field, err.Error())
+			return
+		}
+		*l.dst = val
+	}
+
 	if _, err := qtx.UpdateAgentTemplateModelPins(ctx, store.UpdateAgentTemplateModelPinsParams{
-		ID:         t.ID,
-		Model:      model,
-		CodexModel: codexModel,
-		UpdatedBy:  pgconv.UUID(user.ID),
+		ID:          t.ID,
+		Model:       model,
+		CodexModel:  codexModel,
+		Effort:      effort,
+		CodexEffort: codexEffort,
+		UpdatedBy:   pgconv.UUID(user.ID),
 	}); err != nil {
 		slog.Error("update template model pins", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

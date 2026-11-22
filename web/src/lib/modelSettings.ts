@@ -17,6 +17,7 @@ export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: strin
   { field: "model", token: "template", label: "lead template" },
   { field: "model", token: "cross_check_pin", label: "checker pin" },
   { field: "model", token: "cross_check_worker_default", label: "worker default" },
+  { field: "effort", token: "template", label: "lead template" },
   { field: "effort", token: "cross_check_pin", label: "checker pin" },
   { field: "effort", token: "cross_check_default", label: "cross-check default" },
   { field: "model", token: "run_override", label: "this run" },
@@ -53,6 +54,7 @@ export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: strin
   { field: "planning_effort", token: "user_planning_default", label: "your choice" },
   { field: "planning_effort", token: "user_default", label: "your choice" },
   { field: "planning_effort", token: "builtin", label: "built-in" },
+  { field: "planning_effort", token: "template", label: "lead template" },
 ];
 
 // codexRuntimeDefaultLabel is the Codex effort select's "Runtime default" option text

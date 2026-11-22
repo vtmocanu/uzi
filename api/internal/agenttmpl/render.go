@@ -26,6 +26,11 @@ type Definition struct {
 	Model string
 	// CodexModel is the Codex pin; Claude Markdown deliberately omits it.
 	CodexModel string
+	// Effort and CodexEffort are the per-harness reasoning-effort pins (PRD #3258): one of
+	// EffortLevels, or "" for no pin. Render emits Effort (Claude Markdown, after model)
+	// and, like CodexModel, deliberately omits CodexEffort.
+	Effort      string
+	CodexEffort string
 	// Tools is the allowlist. Empty means inherit all — the rendered
 	// frontmatter omits the tools line.
 	Tools []string
@@ -37,10 +42,10 @@ type Definition struct {
 
 // Render produces the canonical Claude Code subagent Markdown for a template:
 // YAML frontmatter in fixed field order (name, version, description, tools,
-// model), with tools serialized as an inline comma-separated string (not a YAML
-// sequence), then a blank line, then the prompt body. version, tools and model
-// lines are omitted when empty (version when zero, like tools/model when empty
-// — inherit). The frontmatter is built as ordered strings rather than via
+// model, effort), with tools serialized as an inline comma-separated string (not a YAML
+// sequence), then a blank line, then the prompt body. version, tools, model and
+// effort lines are omitted when empty (version when zero, like tools/model/effort
+// when empty — inherit). The frontmatter is built as ordered strings rather than via
 // yaml.Marshal, which would reorder the map keys and break byte-stability.
 func Render(d Definition) []byte {
 	var b strings.Builder
@@ -55,6 +60,9 @@ func Render(d Definition) []byte {
 	}
 	if d.Model != "" {
 		b.WriteString("model: " + d.Model + "\n")
+	}
+	if d.Effort != "" {
+		b.WriteString("effort: " + d.Effort + "\n")
 	}
 	b.WriteString("---\n\n")
 	b.WriteString(d.PromptBody)

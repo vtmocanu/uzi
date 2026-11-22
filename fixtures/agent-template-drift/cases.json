@@ -1,5 +1,5 @@
 {
-  "note": "Shared drift-predicate contract (issue #223 item 3). Each case's `shipped` and `stored` are the five mutable columns (codex_model is optional; absent means null) of an agent template. `expected.differs` pins the two boolean predicates -- agenttmpl.SameContent (Go) and mockApi.sameContent (TS) -- as `differs == !same`. `expected.columns` pins driftedColumns (TS) exactly, in display order and label spelling (note `prompt body`, a space, not `prompt_body`). The Go half has no column notion, so it reads `differs` only. See README.md before editing -- the cases are load-bearing and must not be tidied. Do not add an -update flag on either side.",
+  "note": "Shared drift-predicate contract (issue #223 item 3). Each case's `shipped` and `stored` are the seven mutable columns (codex_model, effort and codex_effort are optional; absent means null) of an agent template. `expected.differs` pins the two boolean predicates -- agenttmpl.SameContent (Go) and mockApi.sameContent (TS) -- as `differs == !same`. `expected.columns` pins driftedColumns (TS) exactly, in display order and label spelling (note `prompt body`, a space, not `prompt_body`). The Go half has no column notion, so it reads `differs` only. See README.md before editing -- the cases are load-bearing and must not be tidied. Do not add an -update flag on either side.",
   "cases": [
     {
       "name": "identical",
@@ -102,6 +102,30 @@
       "shipped": { "description": "Implements features.", "model": "gpt-6-sol", "codex_model": null, "tools": [], "prompt_body": "You are the coder.\n" },
       "stored": { "description": "Implements features.", "model": null, "codex_model": "gpt-6-sol", "tools": [], "prompt_body": "You are the coder.\n" },
       "expected": { "differs": true, "columns": ["model", "codex model"] }
+    },
+    {
+      "name": "effort-value-change",
+      "shipped": { "description": "Implements features.", "model": "sonnet", "effort": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": "sonnet", "effort": "high", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["effort"] }
+    },
+    {
+      "name": "codex-effort-value-change",
+      "shipped": { "description": "Implements features.", "model": "sonnet", "effort": "high", "codex_effort": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": "sonnet", "effort": "high", "codex_effort": "low", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["codex effort"] }
+    },
+    {
+      "name": "effort-null-equals-null",
+      "shipped": { "description": "Implements features.", "model": null, "effort": null, "codex_effort": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": false, "columns": [] }
+    },
+    {
+      "name": "effort-moved-between-harnesses",
+      "shipped": { "description": "Implements features.", "model": null, "effort": "high", "codex_effort": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": null, "effort": null, "codex_effort": "high", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["effort", "codex effort"] }
     }
   ]
 }

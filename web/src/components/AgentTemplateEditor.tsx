@@ -12,6 +12,7 @@ import { LineDiff } from "./LineDiff";
 import type { AgentTemplateInput, BuiltinDefinition } from "../lib/api";
 import { Alert, Button, Field, Input, Select } from "./ui";
 import { ModelSelect } from "./ModelSelect";
+import { EffortSelect } from "./EffortSelect";
 import { CODEX_ROLE_MODELS } from "../lib/codexModels";
 import {
   frontmatterFieldWarning,
@@ -33,9 +34,13 @@ export interface EditorInitial {
   description: string;
   model: string | null;
   codex_model?: string | null;
+  effort?: string | null;
+  codex_effort?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
+
+const EFFORT_DEFAULT_LABEL = "Default · follows the run's effort";
 
 // AgentTemplateEditorHandle exposes the form's LIVE values to whoever owns the
 // Reset button (issue #201 M4a F14). Reset discards unsaved edits, so its
@@ -100,6 +105,8 @@ export const AgentTemplateEditor = forwardRef<
   const [description, setDescription] = useState(initial.description);
   const [model, setModel] = useState(initial.model ?? "");
   const [codexModel, setCodexModel] = useState(initial.codex_model ?? "");
+  const [effort, setEffort] = useState(initial.effort ?? "");
+  const [codexEffort, setCodexEffort] = useState(initial.codex_effort ?? "");
   const [tools, setTools] = useState<string[]>(initial.tools ?? []);
   const [promptBody, setPromptBody] = useState(initial.prompt_body);
   const [toolDraft, setToolDraft] = useState("");
@@ -122,10 +129,11 @@ export const AgentTemplateEditor = forwardRef<
         name: name || "unnamed",
         description,
         model: model.trim() || null,
+        effort: effort || null,
         tools: tools.length ? tools : null,
         prompt_body: promptBody,
       }),
-    [name, description, model, tools, promptBody],
+    [name, description, model, effort, tools, promptBody],
   );
 
   // currentContent is the form's live values in the shape the comparison reads.
@@ -137,10 +145,12 @@ export const AgentTemplateEditor = forwardRef<
       description,
       model: model.trim() || null,
       codex_model: codexModel.trim() || null,
+      effort: effort || null,
+      codex_effort: codexEffort || null,
       tools: tools.length ? tools : null,
       prompt_body: promptBody,
     }),
-    [description, model, codexModel, tools, promptBody],
+    [description, model, codexModel, effort, codexEffort, tools, promptBody],
   );
 
   useImperativeHandle(ref, () => ({ currentContent: () => currentContent }), [currentContent]);
@@ -174,6 +184,8 @@ export const AgentTemplateEditor = forwardRef<
       description: description.trim(),
       model: model.trim() || null,
       codex_model: codexModel.trim() || null,
+      effort: effort || null,
+      codex_effort: codexEffort || null,
       tools: tools.length ? tools : null,
       prompt_body: promptBody,
     });
@@ -241,6 +253,14 @@ export const AgentTemplateEditor = forwardRef<
               />
             </Field>
             {modelWarning && <Alert message={modelWarning} tone="warning" />}
+            <Field label="Claude effort" htmlFor="template-effort">
+              <EffortSelect
+                id="template-effort"
+                value={effort}
+                onChange={setEffort}
+                defaultLabel={EFFORT_DEFAULT_LABEL}
+              />
+            </Field>
           </div>
           <div className="space-y-2">
             <Field label="Codex model" htmlFor="template-codex-model">
@@ -256,14 +276,28 @@ export const AgentTemplateEditor = forwardRef<
               />
             </Field>
             {codexModelWarning && <Alert message={codexModelWarning} tone="warning" />}
+            <Field label="Codex effort" htmlFor="template-codex-effort">
+              <EffortSelect
+                id="template-codex-effort"
+                value={codexEffort}
+                onChange={setCodexEffort}
+                defaultLabel={EFFORT_DEFAULT_LABEL}
+              />
+            </Field>
           </div>
         </div>
         <p id="template-model-help" className="text-xs text-muted">
-          Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these pins.
+          Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.
         </p>
         {isLeadTemplateName(name) && (
           <p className="text-xs text-muted">
             Each harness's Run defaults model takes precedence over its lead template pin.
+          </p>
+        )}
+        {isLeadTemplateName(name) && (
+          <p className="text-xs text-muted">
+            <span>Used when you have no default effort for this harness</span>. A default effort set in
+            Run defaults takes precedence over the lead template's effort.
           </p>
         )}
       </div>
@@ -445,6 +479,22 @@ function BuiltinDiff({
           <span className="text-ok">{shipped.codex_model || templateModelDefaultLabel(shipped.name, "codex")}</span>
           <span className="text-faint"> → </span>
           <span className="text-danger">{current.codex_model || templateModelDefaultLabel(shipped.name, "codex")}</span>
+        </DiffField>
+      )}
+
+      {changed.includes("effort") && (
+        <DiffField label="Claude effort">
+          <span className="text-ok">{shipped.effort || "Default"}</span>
+          <span className="text-faint"> → </span>
+          <span className="text-danger">{current.effort || "Default"}</span>
+        </DiffField>
+      )}
+
+      {changed.includes("codex effort") && (
+        <DiffField label="Codex effort">
+          <span className="text-ok">{shipped.codex_effort || "Default"}</span>
+          <span className="text-faint"> → </span>
+          <span className="text-danger">{current.codex_effort || "Default"}</span>
         </DiffField>
       )}
 

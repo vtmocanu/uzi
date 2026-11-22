@@ -38,7 +38,7 @@ func TestFireOnNeverEnabledRepoMakesNoForgeCall(t *testing.T) {
 			h.fb.err = errors.New("the forge driver must not be built for a never-enabled repo")
 			sched := tc.sched(h)
 
-			_, err := h.sched.fireOne(context.Background(), sched)
+			_, err := h.sched.fireOne(context.Background(), sched, false)
 			if !errors.Is(err, workersvc.ErrRepoNeverEnabled) {
 				t.Fatalf("fireOne error = %v, want ErrRepoNeverEnabled", err)
 			}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -511,5 +512,215 @@ func TestAgentTemplatePinsConcurrentOmittedPutLiveDB(t *testing.T) {
 				f.checkRow(t, row.ID, def.Model, "gpt-6-luna", true, "admin")
 			}
 		})
+	}
+}
+
+// effortRow reads the stored effort pins and the customization state of a template.
+func (f templatePinsLive) effortRow(t *testing.T, id uuid.UUID) (effort, codex *string, customized bool, origin *string) {
+	t.Helper()
+	if err := f.pool.QueryRow(f.ctx, "SELECT effort,codex_effort,customized,origin FROM agent_templates WHERE id=$1", id).
+		Scan(&effort, &codex, &customized, &origin); err != nil {
+		t.Fatal(err)
+	}
+	return
+}
+
+func templatePinsCheckEfforts(t *testing.T, where string, gotEffort, gotCodex *string, effort, codex string) {
+	t.Helper()
+	same := func(got *string, want string) bool {
+		if want == "" {
+			return got == nil
+		}
+		return got != nil && *got == want
+	}
+	if !same(gotEffort, effort) || !same(gotCodex, codex) {
+		t.Fatalf("%s: effort=%v codex_effort=%v want %q/%q", where, pinStr(gotEffort), pinStr(gotCodex), effort, codex)
+	}
+}
+
+// PRD #3258 N7: cookie CRUD carries tri-state effort and codex_effort. Omitted keeps, null or
+// blank clears, an invalid value (including `runtime`) is a 400 that writes nothing.
+func TestAgentTemplateEffortRoundTripLiveDB(t *testing.T) {
+	f := newTemplatePinsLive(t)
+	body := map[string]any{"name": "effort-" + uuid.NewString(), "description": "effort roundtrip", "prompt_body": "fixture body\n",
+		"model": "opus", "effort": " high ", "codex_effort": "xhigh", "scope": "global"}
+	dto := templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPost, uuid.Nil, body, false), http.StatusCreated)
+	id := uuid.MustParse(dto.ID)
+	if dto.Effort == nil || *dto.Effort != "high" || dto.CodexEffort == nil || *dto.CodexEffort != "xhigh" {
+		t.Fatalf("create DTO: effort=%v codex_effort=%v", dto.Effort, dto.CodexEffort)
+	}
+	e, c, _, _ := f.effortRow(t, id)
+	templatePinsCheckEfforts(t, "after create", e, c, "high", "xhigh")
+
+	// A create that omits the efforts stores NULL.
+	plain := map[string]any{"name": "effort-plain-" + uuid.NewString(), "description": "d", "prompt_body": "b\n", "scope": "global"}
+	pd := templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPost, uuid.Nil, plain, false), http.StatusCreated)
+	if pd.Effort != nil || pd.CodexEffort != nil {
+		t.Fatalf("omitted create efforts must be null: %v %v", pd.Effort, pd.CodexEffort)
+	}
+
+	// Omitted keeps both.
+	delete(body, "effort")
+	delete(body, "codex_effort")
+	body["description"] = "edited"
+	templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, id, body, false), 200)
+	e, c, _, _ = f.effortRow(t, id)
+	templatePinsCheckEfforts(t, "omitted keeps", e, c, "high", "xhigh")
+	// null clears one lane, the other is kept.
+	body["effort"] = nil
+	dto = templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, id, body, false), 200)
+	if dto.Effort != nil || dto.CodexEffort == nil || *dto.CodexEffort != "xhigh" {
+		t.Fatalf("null effort: %v %v", dto.Effort, dto.CodexEffort)
+	}
+	// Blank and whitespace clear, exactly like null.
+	for _, blank := range []string{"", "  \t "} {
+		body["effort"] = "max"
+		body["codex_effort"] = "low"
+		templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, id, body, false), 200)
+		body["effort"] = blank
+		body["codex_effort"] = blank
+		templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, id, body, false), 200)
+		e, c, _, _ = f.effortRow(t, id)
+		templatePinsCheckEfforts(t, fmt.Sprintf("blank %q", blank), e, c, "", "")
+	}
+	delete(body, "effort")
+	delete(body, "codex_effort")
+
+	// Invalid values reject the whole request, even beside a valid change, and write nothing.
+	body["effort"], body["codex_effort"] = "medium", "medium"
+	templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, id, body, false), 200)
+	for _, bad := range []struct{ field, value string }{
+		{"effort", "runtime"}, {"effort", "High"}, {"effort", "extreme"}, {"codex_effort", "runtime"}, {"codex_effort", "none"},
+	} {
+		before, err := f.h.q.GetAgentTemplate(f.ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body["effort"], body["codex_effort"] = "low", "low"
+		body["description"] = "must not persist"
+		body[bad.field] = bad.value
+		out := f.call(f.ctx, &f.admin, http.MethodPut, id, body, false)
+		if out.Code != 400 || !strings.Contains(out.Body.String(), bad.field+":") {
+			t.Fatalf("invalid %s=%q: HTTP %d %s", bad.field, bad.value, out.Code, out.Body.String())
+		}
+		after, err := f.h.q.GetAgentTemplate(f.ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("invalid %s caused a partial write", bad.field)
+		}
+		body["name"] = "effort-invalid-" + uuid.NewString()
+		if out := f.call(f.ctx, &f.admin, http.MethodPost, uuid.Nil, body, false); out.Code != 400 {
+			t.Fatalf("invalid create: HTTP %d %s", out.Code, out.Body.String())
+		}
+		var count int
+		if err := f.pool.QueryRow(f.ctx, "SELECT count(*) FROM agent_templates WHERE name=$1", body["name"]).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("invalid create left %d rows: %v", count, err)
+		}
+	}
+}
+
+// A builtin's effort edit is a customization (SameContent compares effort): origin 'admin', the
+// boot refresh leaves it alone, and Reset restores the shipped NULL with customized=false.
+func TestAgentTemplateEffortBuiltinLifecycleLiveDB(t *testing.T) {
+	f := newTemplatePinsLive(t)
+	if _, err := store.ReconcileBuiltinTemplates(f.ctx, f.h.q); err != nil {
+		t.Fatal(err)
+	}
+	def, body := templatePinsBuiltinBody(t)
+	row, err := f.h.q.GetSharedAgentTemplateByName(f.ctx, def.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, c, custom, origin := f.effortRow(t, row.ID)
+	templatePinsCheckEfforts(t, "seeded", e, c, "", "")
+	if custom || origin == nil || *origin != "embedded" {
+		t.Fatalf("seeded builtin: customized=%v origin=%v", custom, origin)
+	}
+
+	body["effort"] = "high"
+	dto := templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, row.ID, body, false), 200)
+	if !dto.DiffersFromBuiltin || dto.Effort == nil || *dto.Effort != "high" {
+		t.Fatalf("effort edit: differs=%v effort=%v", dto.DiffersFromBuiltin, dto.Effort)
+	}
+	e, c, custom, origin = f.effortRow(t, row.ID)
+	templatePinsCheckEfforts(t, "after edit", e, c, "high", "")
+	if !custom || origin == nil || *origin != "admin" {
+		t.Fatalf("an effort-only edit must customize the builtin: customized=%v origin=%v", custom, origin)
+	}
+	before, err := f.h.q.GetAgentTemplate(f.ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReconcileBuiltinTemplates(f.ctx, f.h.q); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.h.q.GetAgentTemplate(f.ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("reconcile touched an effort-customized builtin")
+	}
+
+	// Saving the shipped values (an explicit null clears the effort) is not a customization.
+	body["effort"] = nil
+	dto = templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, row.ID, body, false), 200)
+	if dto.DiffersFromBuiltin || dto.Effort != nil {
+		t.Fatalf("shipped-values save: differs=%v effort=%v", dto.DiffersFromBuiltin, dto.Effort)
+	}
+	_, _, custom, origin = f.effortRow(t, row.ID)
+	if custom || origin == nil || *origin != "embedded" {
+		t.Fatalf("shipped-values save: customized=%v origin=%v", custom, origin)
+	}
+
+	// Reset after an effort edit restores NULL and customized=false.
+	body["effort"], body["codex_effort"] = "max", "low"
+	templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, row.ID, body, false), 200)
+	dto = templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPost, row.ID, nil, true), 200)
+	if dto.Effort != nil || dto.CodexEffort != nil || dto.DiffersFromBuiltin {
+		t.Fatalf("reset DTO: effort=%v codex=%v differs=%v", dto.Effort, dto.CodexEffort, dto.DiffersFromBuiltin)
+	}
+	e, c, custom, origin = f.effortRow(t, row.ID)
+	templatePinsCheckEfforts(t, "after reset", e, c, "", "")
+	if custom || origin == nil || *origin != "embedded" {
+		t.Fatalf("reset: customized=%v origin=%v", custom, origin)
+	}
+}
+
+// Concurrent PUTs that omit effort must not revert a concurrent PUT that sets it: the merge of
+// omitted pins runs against the row locked FOR UPDATE.
+func TestAgentTemplateEffortConcurrentOmittingPutKeepsLiveDB(t *testing.T) {
+	f := newTemplatePinsLive(t)
+	body := map[string]any{"name": "effort-race-" + uuid.NewString(), "description": "race", "prompt_body": "b\n",
+		"effort": "high", "codex_effort": "high", "scope": "global"}
+	id := uuid.MustParse(templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPost, uuid.Nil, body, false), http.StatusCreated).ID)
+
+	for round := 0; round < 5; round++ {
+		var wg sync.WaitGroup
+		codes := make(chan int, 17)
+		put := func(b map[string]any) {
+			defer wg.Done()
+			codes <- f.call(f.ctx, &f.admin, http.MethodPut, id, b, false).Code
+		}
+		setter := map[string]any{"description": "setter", "prompt_body": "b\n", "effort": "low", "codex_effort": "medium"}
+		wg.Add(1)
+		go put(setter)
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go put(map[string]any{"description": fmt.Sprintf("omitter-%d-%d", round, i), "prompt_body": "b\n"})
+		}
+		wg.Wait()
+		close(codes)
+		for code := range codes {
+			if code != 200 {
+				t.Fatalf("round %d: PUT returned %d", round, code)
+			}
+		}
+		e, c, _, _ := f.effortRow(t, id)
+		templatePinsCheckEfforts(t, fmt.Sprintf("round %d", round), e, c, "low", "medium")
+		// Reset to the starting values for the next round.
+		templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPut, id, map[string]any{"description": "d", "prompt_body": "b\n", "effort": "high", "codex_effort": "high"}, false), 200)
 	}
 }

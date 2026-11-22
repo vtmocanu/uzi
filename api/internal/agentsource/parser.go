@@ -1,7 +1,7 @@
 // Package agentsource parses external agent-role markdown files fetched from an
 // admin-configured source repo (PRD #602 M3). It is the API-side twin of the
 // worker's agent/src/repoagents.ts and reproduces that parsing contract EXACTLY,
-// so a role file parses to the same {name, description, tools, model, prompt_body}
+// so a role file parses to the same {name, description, tools, model, effort, prompt_body}
 // — or the same skip/clamp reason — on both sides. The pairing is pinned by a
 // hand-authored differential golden (parser_test.go + testdata/parity/) that a Go
 // test and a TS test each assert against independently.
@@ -80,6 +80,9 @@ const (
 	NoteToolsFiltered NoteReason = "tools_filtered"
 	// NoteModelIgnored — kept, with an unusable model string dropped (inherits the run default).
 	NoteModelIgnored NoteReason = "model_ignored"
+	// NoteEffortIgnored — kept, with an `effort:` that is not exactly one of the five
+	// levels dropped (the role follows the run's effort). The value is never echoed.
+	NoteEffortIgnored NoteReason = "effort_ignored"
 )
 
 // Note is one skip or clamp, for the caller to surface (M3 part B emits these as
@@ -231,6 +234,19 @@ func ParseFile(raw []byte, slug string) FileResult {
 		}
 	}
 
+	// The effort (PRD #3258 N8/N9) is the role's Claude-family pin when it is EXACTLY one
+	// of the five levels after the shared trim; an empty value inherits silently, like
+	// model; anything else is dropped with a note that never carries the value.
+	if fm.hasEffort {
+		if e := jsTrim(fm.effort); e != "" {
+			if agenttmpl.IsEffortLevel(e) {
+				role.Effort = e
+			} else {
+				notes = append(notes, Note{Name: name, Reason: NoteEffortIgnored})
+			}
+		}
+	}
+
 	return FileResult{OK: true, Role: role, Notes: notes}
 }
 
@@ -327,6 +343,8 @@ type frontmatter struct {
 	hasDesc     bool
 	model       string
 	hasModel    bool
+	effort      string
+	hasEffort   bool
 	tools       []string
 	hasTools    bool
 	body        string
@@ -334,7 +352,7 @@ type frontmatter struct {
 
 // parseFrontmatter is the line parser (NOT a YAML engine) reproducing
 // repoagents.ts's parseFrontmatter: require `---` fences, normalize a leading BOM
-// and CRLF/CR to LF, keep only name/description/model/tools (first occurrence wins,
+// and CRLF/CR to LF, keep only name/description/model/effort/tools (first occurrence wins,
 // unknown keys ignored), drop a block-scalar opener value, and split the body with
 // one leading blank line removed.
 func parseFrontmatter(raw []byte) (frontmatter, bool) {
@@ -388,6 +406,8 @@ func parseFrontmatter(raw []byte) (frontmatter, bool) {
 			fm.description, fm.hasDesc = value, true
 		case key == "model" && !fm.hasModel:
 			fm.model, fm.hasModel = value, true
+		case key == "effort" && !fm.hasEffort:
+			fm.effort, fm.hasEffort = value, true
 		case key == "tools" && !fm.hasTools:
 			fm.hasTools = true
 			if value == "" {

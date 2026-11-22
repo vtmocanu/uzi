@@ -8,6 +8,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // LeadSettingsInput is what the lead resolver reads: the run's harness, the model and effort frozen
@@ -22,6 +23,10 @@ type LeadSettingsInput struct {
 	RunEffortSource pgtype.Text // runs.effort_source: run_override or NULL
 	LaneModel       pgtype.Text // the user's lane for Harness
 	UserEffort      pgtype.Text // the user's per-harness effort column
+	// TemplateEffort is the lead template's effort for Harness's family (issue #3258 N3), read by the
+	// caller via leadTemplateEffort. It applies only when UserEffort is NULL or blank, below the
+	// owner's choice and above the built-in default. Zero means no lead template effort.
+	TemplateEffort pgtype.Text
 	// PlanningModel and PlanningEffort are the owner's Claude planning columns (PRD #3252), read
 	// only for a Claude lead-lane claim; blank (after trim) is unset.
 	PlanningModel  pgtype.Text
@@ -99,7 +104,7 @@ func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
 		out.ModelSource = ""
 	}
 	var unhonorable bool
-	out.Effort, out.EffortSource, unhonorable = leadEffortFor(in.Harness, in.RunEffort, in.RunEffortSource, in.UserEffort)
+	out.Effort, out.EffortSource, unhonorable = leadEffortWithTemplate(in.Harness, in.RunEffort, in.RunEffortSource, in.UserEffort, in.TemplateEffort)
 	if unhonorable {
 		out.Unhonorable = &RunOverrideUnhonorable{Setting: "effort", Value: in.RunEffort.String, Harness: in.Harness}
 		return out
@@ -122,6 +127,42 @@ func leadEffortFor(harness Harness, runEffort, runEffortSource, userEffort pgtyp
 	}
 	effort, source = resolveLeadEffort(harness, userEffort)
 	return effort, source, false
+}
+
+// leadEffortWithTemplate is the LEAD lane's effort precedence (issue #3258 N3): a valid start-time
+// run_override wins (leadEffortFor, unchanged); then the owner's per-harness column, a level or the
+// `runtime` choice; then the lead template's effort for the harness's family with source `template`;
+// then the built-in default. The template tier applies only when the stored column is NULL or blank
+// after trimming, so an explicit `runtime` (nothing sent) beats the template and a corrupt stored
+// value keeps resolveLeadEffort's builtin fallback. A templateEffort outside agenttmpl.EffortLevels
+// is ignored. Only the lead lane calls it; judge, chat, jobs, checkers and the non-lead override
+// path keep leadEffortFor.
+func leadEffortWithTemplate(harness Harness, runEffort, runEffortSource, userEffort, templateEffort pgtype.Text) (effort *string, source leadcfg.EffortSource, unhonorable bool) {
+	runOverride := runEffort.Valid && runEffortSource.Valid && runEffortSource.String == string(leadcfg.EffortSourceRunOverride)
+	userBlank := !userEffort.Valid || strings.TrimSpace(userEffort.String) == ""
+	if !runOverride && userBlank && templateEffort.Valid && slices.Contains(agenttmpl.EffortLevels, templateEffort.String) {
+		level := templateEffort.String
+		return &level, leadcfg.EffortSourceTemplate, false
+	}
+	return leadEffortFor(harness, runEffort, runEffortSource, userEffort)
+}
+
+// leadTemplateEffort is the effort pin of the lead template among the delivered templates for the
+// run's harness (issue #3258 N3), "invalid" when there is none. The lead is picked with
+// agenttmpl.SelectLead, the same first-lead-shaped-name rule as the worker's selectLeadTemplate.
+func leadTemplateEffort(rows []store.AgentTemplate, harness Harness) pgtype.Text {
+	names := make([]string, len(rows))
+	for i, t := range rows {
+		names[i] = t.Name
+	}
+	i, ok := agenttmpl.SelectLead(names)
+	if !ok {
+		return pgtype.Text{}
+	}
+	if e := templateEffortPin(rows[i], string(harness)); e != "" {
+		return pgtype.Text{String: e, Valid: true}
+	}
+	return pgtype.Text{}
 }
 
 // resolveLeadEffort is the single home of the lead effort value and its source. assembleClaim

@@ -69,7 +69,7 @@ func TestCreateRunExplicitAgentSourceRefusals(t *testing.T) {
 func TestNonManualCreatePathsPassNoExplicitSource(t *testing.T) {
 	for name, create := range map[string]func(*Service) error{
 		"schedule": func(s *Service) error {
-			_, err := s.CreateScheduledRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, nil, false, nil, nil, nil)
+			_, err := s.CreateScheduledRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, nil, false, nil, nil, nil, nil)
 			return err
 		},
 		"autopilot": func(s *Service) error {
@@ -77,7 +77,7 @@ func TestNonManualCreatePathsPassNoExplicitSource(t *testing.T) {
 			return err
 		},
 		"scheduled autopilot": func(s *Service) error {
-			_, err := s.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, nil, false, nil, nil)
+			_, err := s.CreateScheduledAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, nil, false, nil, nil, nil)
 			return err
 		},
 	} {
