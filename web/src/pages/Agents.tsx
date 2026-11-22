@@ -272,7 +272,7 @@ export function Agents() {
                       alloc={allocById.get(t.id)}
                       isAdmin={isAdmin}
                       shadowed={isShadowedTemplate(t, sharedNames)}
-                      busy={busy}
+                      busy={busy || allocFor !== user?.id}
                       personalLine={rowLine(t.id)}
                       onToggleMine={setMyOverride}
                       onToggleGlobal={setGlobalDefault}

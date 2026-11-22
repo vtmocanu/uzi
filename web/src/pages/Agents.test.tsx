@@ -483,6 +483,8 @@ describe("Agents page personalized lead line (#3262)", () => {
     await act(async () => {});
     // B's prediction has landed but B's allocations are still pending.
     expect(screen.queryByText(/For your/)).toBeNull();
+    // Toggles are disabled until B's own allocations load, so A's rows can never be written as B's.
+    expect((screen.getByLabelText("Include lead in my runs") as HTMLInputElement).disabled).toBe(true);
 
     await act(async () => {
       allocB.resolve({ templates: allocsB });
@@ -491,6 +493,7 @@ describe("Agents page personalized lead line (#3262)", () => {
     expect(within(orchRow).getByText("For your Claude runs: opus-b · your choice; effort high · your choice")).toBeTruthy();
     const leadRowB = screen.getByRole("link", { name: "lead" }).closest("tr")!;
     expect(within(leadRowB).queryByText(/For your/)).toBeNull();
+    expect((screen.getByLabelText("Include lead in my runs") as HTMLInputElement).disabled).toBe(false);
   });
 
   it("shows no personal line or note when the list fails to load", async () => {
