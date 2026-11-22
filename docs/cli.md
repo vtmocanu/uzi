@@ -3649,7 +3649,7 @@ usable. The CLI shows the `GET` only; it does not call the start-preview.
 `--schedule` adds the schedule preview, below.
 
 `--json` carries every key of the settings read plus an `effective` key holding
-the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes the Claude `planning_model` cell and `efforts` the `planning_effort` cell) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes Claude and Codex `planning_model` cells and `efforts` their `planning_effort` cells) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
 `effective` is `null` when the server does not have the view or the read failed.
 In that case the human output falls back to the previous Model settings rows, a
 line goes to stderr (`Effective settings: not available on this server` for an
@@ -3674,7 +3674,7 @@ the same columns:
 | --- | --- | --- |
 | `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
 | `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
-| `plan phase model`, `plan phase effort` | `claude` | Printed between the worker effort and credential rows, and only on a Claude fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
+| `plan phase model`, `plan phase effort` | `claude`, `codex` | Printed between the worker effort and credential rows, and only on a fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
 | `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
 
 When the harness is chosen at creation, the rows for both harnesses follow

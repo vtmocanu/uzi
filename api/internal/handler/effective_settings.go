@@ -387,8 +387,8 @@ func planningModelCell(lead workersvc.LeadPrediction, stored *string) apitypes.E
 	}
 }
 
-// planningEffortCell is a planning effort cell (PRD #3252), the shared planning effort
-// cell of /me/settings (planningEffortCells) as an effective cell.
+// planningEffortCell builds an effective planning effort cell from the resolved lead, including
+// its template effort tier. The /me/settings planningEffortCells remain preference-only (#3262).
 func planningEffortCell(lead workersvc.LeadPrediction, stored *string) apitypes.EffectiveEffortCellDTO {
 	return apitypes.EffectiveEffortCellDTO{
 		EffortSettingCellDTO: planningEffortCellFromOrdinary(stored, leadEffortSettingCell(string(lead.Harness), lead)),

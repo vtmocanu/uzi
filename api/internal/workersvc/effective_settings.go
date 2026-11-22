@@ -313,7 +313,7 @@ type LeadPrediction struct {
 	// TemplateEffort is the lead template's valid effort for the harness (nil: none), what an unset
 	// preference resolves to.
 	TemplateEffort *string
-	// Plan is the claim's plan_phase pair (PRD #3252), nil unless the owner's Claude planning lane
+	// Plan is the claim's plan_phase pair (PRDs #3252/#3253), nil unless the owner's planning lane for Harness
 	// contributes a value; it is exactly what resolveLeadSettings ships on the claim.
 	Plan *ClaimPhaseSettings
 	// Subagents is nil for a review.

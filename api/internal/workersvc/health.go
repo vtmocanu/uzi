@@ -276,7 +276,7 @@ const (
 	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
 	reasonNoCustomCodexCapableWorker = "no worker supporting custom Codex models is online"
 	// reasonNoPhaseModelsCapableWorker (PRDs #3252/#3253) is emitted for a queued lead-lane run whose
-	// owner has a planning value set and has NO online worker advertising claude_phase_models_v1:
+	// owner has a planning value set and has NO online worker advertising the harness's phase-models capability:
 	// ClaimRun's phase-models clause can never be satisfied until a current worker comes online.
 	reasonNoPhaseModelsCapableWorker     = "no worker supporting separate planning settings is online"
 	reasonNoCodexCompletionCapableWorker = "no online worker implements the Codex completion interlock (codex_completion_interlock_v1); provision a capable worker"

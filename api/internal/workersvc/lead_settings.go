@@ -27,8 +27,8 @@ type LeadSettingsInput struct {
 	// caller via leadTemplateEffort. It applies only when UserEffort is NULL or blank, below the
 	// owner's choice and above the built-in default. Zero means no lead template effort.
 	TemplateEffort pgtype.Text
-	// PlanningModel and PlanningEffort are the owner's Claude planning columns (PRD #3252), read
-	// only for a Claude lead-lane claim; blank (after trim) is unset.
+	// PlanningModel and PlanningEffort are the owner's planning columns for Harness (PRDs #3252/#3253),
+	// read only for a lead-lane claim; blank (after trim) is unset.
 	PlanningModel  pgtype.Text
 	PlanningEffort pgtype.Text
 }
