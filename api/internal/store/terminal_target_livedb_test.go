@@ -1,0 +1,436 @@
+package store_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// Issue #4616: live-DB proofs for the four terminal-MR-target queries
+// (ListActiveMRTargetRuns, StampTerminalTargetStop, StampTerminalTargetCancelInput,
+// CancelRunServerSideForTerminalTarget). A green sqlc generate does not prove these
+// statements prepare or run; each guard is exercised here against a real Postgres.
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (run via
+// e2e/run-store-it.sh).
+
+type terminalTargetEnv struct {
+	ctx    context.Context
+	pool   *pgxpool.Pool
+	q      *store.Queries
+	userID uuid.UUID
+	repoID uuid.UUID
+	worker uuid.UUID
+	target uuid.UUID // completed issue run, the mr_rework target_run_id
+}
+
+func newTerminalTargetEnv(t *testing.T) *terminalTargetEnv {
+	t.Helper()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	e := &terminalTargetEnv{ctx: ctx, pool: pool, q: store.New(pool), userID: uuid.New(), worker: uuid.New(), target: uuid.New()}
+	if _, err := pool.Exec(ctx, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, e.userID, fmt.Sprintf("tt-%s@e2e", e.userID)); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	e.repoID = e.newRepo(t)
+	e.exec(t, `INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'w', $3)`, e.worker, e.userID, e.worker[:])
+	e.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+	           VALUES ($1, $2, $3, 'issue', 1, 't', 'd', 'completed')`, e.target, e.userID, e.repoID)
+	return e
+}
+
+func (e *terminalTargetEnv) exec(t *testing.T, sql string, args ...any) {
+	t.Helper()
+	if _, err := e.pool.Exec(e.ctx, sql, args...); err != nil {
+		t.Fatalf("exec %q: %v", sql, err)
+	}
+}
+
+func (e *terminalTargetEnv) newRepo(t *testing.T) uuid.UUID {
+	t.Helper()
+	connID, repoID := uuid.New(), uuid.New()
+	e.exec(t, `INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'github', $3, 'bot', 1, $4)`, connID, e.userID, "https://forge.e2e/"+connID.String(), []byte{0x1})
+	e.exec(t, `INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/tt', 'main', true)`, repoID, connID, int64(repoID[0])+1, "g/tt-"+repoID.String())
+	return repoID
+}
+
+type ttRun struct {
+	kind       string // ci_fix | mr_rework
+	status     string
+	iid        int64 // target MR iid; 0 = unbound ci_fix
+	generation int64
+	worker     bool
+	released   bool
+	stopKind   string
+	stopReason string
+	failure    bool
+	repo       uuid.UUID
+}
+
+func (e *terminalTargetEnv) seed(t *testing.T, r ttRun) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	repo := r.repo
+	if repo == (uuid.UUID{}) {
+		// A fresh repo per seeded run: uq_runs_one_active_mr_rework allows one active
+		// mr_rework per (repo, mr_iid), and the guard-miss cases reuse the same iid.
+		repo = e.newRepo(t)
+	}
+	var worker any
+	if r.worker {
+		worker = e.worker
+	}
+	var stopKind, stopReason any
+	if r.stopKind != "" {
+		stopKind = r.stopKind
+	}
+	if r.stopReason != "" {
+		stopReason = r.stopReason
+	}
+	var failureReason, failOrigin any
+	if r.failure {
+		failureReason, failOrigin = "boom", "agent_failure"
+	}
+	ref := "agent/issue-" + id.String()
+	switch r.kind {
+	case "ci_fix":
+		var iid any
+		if r.iid != 0 {
+			iid = r.iid
+		}
+		e.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, pipeline_id, pipeline_ref, ci_fix_mr_iid, status, claim_generation, worker_id,
+		                             stop_kind, stop_reason, failure_reason, fail_origin, issue_title, issue_description)
+		           VALUES ($1, $2, $3, 'ci_fix', 99, $4, $5, $6, $7, $8, $9, $10, $11, $12, 't', 'd')`,
+			id, e.userID, repo, ref, iid, r.status, r.generation, worker, stopKind, stopReason, failureReason, failOrigin)
+	case "mr_rework":
+		e.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, pipeline_ref, mr_iid, target_run_id, status, claim_generation, worker_id,
+		                             stop_kind, stop_reason, failure_reason, fail_origin, issue_title, issue_description)
+		           VALUES ($1, $2, $3, 'mr_rework', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 't', 'd')`,
+			id, e.userID, repo, ref, r.iid, e.target, r.status, r.generation, worker, stopKind, stopReason, failureReason, failOrigin)
+	case "task":
+		e.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, branch, status, claim_generation, worker_id, issue_title, issue_description)
+		           VALUES ($1, $2, $3, 'task', $4, $5, $6, $7, 't', 'd')`, id, e.userID, repo, ref, r.status, r.generation, worker)
+	default:
+		t.Fatalf("unsupported kind %q", r.kind)
+	}
+	if r.released {
+		e.exec(t, `UPDATE runs SET claim_released_at = now() WHERE id = $1`, id)
+	}
+	return id
+}
+
+func (e *terminalTargetEnv) run(t *testing.T, id uuid.UUID) store.Run {
+	t.Helper()
+	run, err := e.q.GetRunByID(e.ctx, id)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	return run
+}
+
+func (e *terminalTargetEnv) inputCount(t *testing.T, id uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1`, id).Scan(&n); err != nil {
+		t.Fatalf("count inputs: %v", err)
+	}
+	return n
+}
+
+func ttPgUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }
+
+func TestListActiveMRTargetRunsLiveDB(t *testing.T) {
+	e := newTerminalTargetEnv(t)
+	otherRepo := e.newRepo(t)
+
+	boundCI := e.seed(t, ttRun{repo: e.repoID, kind: "ci_fix", status: "running", iid: 11, worker: true, generation: 1})
+	rework := e.seed(t, ttRun{repo: e.repoID, kind: "mr_rework", status: "queued", iid: 22})
+	e.seed(t, ttRun{repo: e.repoID, kind: "ci_fix", status: "queued"})                // unbound ci_fix
+	e.seed(t, ttRun{repo: e.repoID, kind: "ci_fix", status: "completed", iid: 33})    // terminal
+	e.seed(t, ttRun{repo: e.repoID, kind: "mr_rework", status: "cancelled", iid: 44}) // terminal
+	e.seed(t, ttRun{repo: e.repoID, kind: "task", status: "running", worker: true})   // other kind
+	e.seed(t, ttRun{kind: "mr_rework", status: "queued", iid: 55, repo: otherRepo})   // other repo
+
+	rows, err := e.q.ListActiveMRTargetRuns(e.ctx, store.ListActiveMRTargetRunsParams{RepoID: e.repoID, AfterID: uuid.Nil})
+	if err != nil {
+		t.Fatalf("ListActiveMRTargetRuns: %v", err)
+	}
+	got := map[uuid.UUID]store.ListActiveMRTargetRunsRow{}
+	for _, r := range rows {
+		got[r.ID] = r
+	}
+	if len(rows) != 2 || got[boundCI].ID == uuid.Nil || got[rework].ID == uuid.Nil {
+		t.Fatalf("rows = %+v, want exactly the bound ci_fix %s and the mr_rework %s", rows, boundCI, rework)
+	}
+	if r := got[boundCI]; r.Kind != "ci_fix" || r.Status != "running" || r.TargetMrIid != 11 || !r.WorkerID.Valid || r.WorkerID.Bytes != e.worker || r.ClaimGeneration != 1 || !r.PipelineRef.Valid {
+		t.Errorf("ci_fix row = %+v, want kind ci_fix, running, target 11 (from ci_fix_mr_iid, mr_iid NULL), worker+generation 1", r)
+	}
+	if r := got[rework]; r.Kind != "mr_rework" || r.Status != "queued" || r.TargetMrIid != 22 || r.WorkerID.Valid {
+		t.Errorf("mr_rework row = %+v, want kind mr_rework, queued, target 22 (from mr_iid), no worker", r)
+	}
+}
+
+func TestListActiveMRTargetRunsKeysetLiveDB(t *testing.T) {
+	e := newTerminalTargetEnv(t)
+	var want []string
+	for i := 0; i < 40; i++ {
+		want = append(want, e.seed(t, ttRun{repo: e.repoID, kind: "mr_rework", status: "queued", iid: int64(1000 + i)}).String())
+	}
+	sort.Strings(want)
+
+	first, err := e.q.ListActiveMRTargetRuns(e.ctx, store.ListActiveMRTargetRunsParams{RepoID: e.repoID, AfterID: uuid.Nil})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first) != 33 {
+		t.Fatalf("first page has %d rows, want the LIMIT of 33", len(first))
+	}
+	for i, r := range first {
+		if r.ID.String() != want[i] {
+			t.Fatalf("first page row %d = %s, want %s (ORDER BY id)", i, r.ID, want[i])
+		}
+	}
+	// Keyset: continue after the 32nd row (the caller keeps 32 and drops the probe row).
+	second, err := e.q.ListActiveMRTargetRuns(e.ctx, store.ListActiveMRTargetRunsParams{RepoID: e.repoID, AfterID: first[31].ID})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second) != 8 {
+		t.Fatalf("second page has %d rows, want 8", len(second))
+	}
+	for i, r := range second {
+		if r.ID.String() != want[32+i] {
+			t.Fatalf("second page row %d = %s, want %s", i, r.ID, want[32+i])
+		}
+	}
+}
+
+func TestStampTerminalTargetStopLiveDB(t *testing.T) {
+	e := newTerminalTargetEnv(t)
+	const reason = "target MR merged"
+	call := func(id uuid.UUID, worker uuid.UUID, gen int64) int64 {
+		t.Helper()
+		n, err := e.q.StampTerminalTargetStop(e.ctx, store.StampTerminalTargetStopParams{
+			StopReason: reason, ID: id, WorkerID: ttPgUUID(worker), ClaimGeneration: gen})
+		if err != nil {
+			t.Fatalf("StampTerminalTargetStop: %v", err)
+		}
+		return n
+	}
+
+	for _, status := range []string{"claimed", "running"} {
+		for _, kind := range []string{"ci_fix", "mr_rework"} {
+			id := e.seed(t, ttRun{kind: kind, status: status, iid: 7, worker: true, generation: 3, failure: true})
+			if n := call(id, e.worker, 3); n != 1 {
+				t.Fatalf("%s/%s: rows = %d, want 1", kind, status, n)
+			}
+			run := e.run(t, id)
+			if run.Status != status {
+				t.Errorf("%s/%s: status = %q, the stamp must not change status", kind, status, run.Status)
+			}
+			if !run.StopKind.Valid || run.StopKind.String != "cancelled" || !run.StopReason.Valid || run.StopReason.String != reason {
+				t.Errorf("%s/%s: stop_kind/stop_reason = %+v/%+v, want cancelled/%q", kind, status, run.StopKind, run.StopReason, reason)
+			}
+			if run.FailureReason.Valid || run.FailOrigin.Valid {
+				t.Errorf("%s/%s: failure_reason/fail_origin = %+v/%+v, want both cleared", kind, status, run.FailureReason, run.FailOrigin)
+			}
+			if c := e.inputCount(t, id); c != 0 {
+				t.Errorf("%s/%s: %d run_user_inputs rows written, want none", kind, status, c)
+			}
+		}
+	}
+
+	misses := []struct {
+		name string
+		run  ttRun
+		wkr  uuid.UUID
+		gen  int64
+	}{
+		{"wrong worker", ttRun{kind: "ci_fix", status: "running", iid: 7, worker: true, generation: 3}, uuid.New(), 3},
+		{"wrong generation", ttRun{kind: "ci_fix", status: "running", iid: 7, worker: true, generation: 3}, e.worker, 2},
+		{"released claim", ttRun{kind: "ci_fix", status: "running", iid: 7, worker: true, generation: 3, released: true}, e.worker, 3},
+		{"terminal status", ttRun{kind: "mr_rework", status: "completed", iid: 7, worker: true, generation: 3}, e.worker, 3},
+		{"queued status", ttRun{kind: "mr_rework", status: "queued", iid: 7, worker: true, generation: 3}, e.worker, 3},
+		{"existing stop verdict", ttRun{kind: "ci_fix", status: "running", iid: 7, worker: true, generation: 3, stopKind: "stopped", stopReason: "operator"}, e.worker, 3},
+		{"existing cancel verdict", ttRun{kind: "mr_rework", status: "running", iid: 7, worker: true, generation: 3, stopKind: "cancelled", stopReason: "operator said so"}, e.worker, 3},
+		{"wrong kind", ttRun{kind: "task", status: "running", worker: true, generation: 3}, e.worker, 3},
+	}
+	for _, m := range misses {
+		t.Run(m.name, func(t *testing.T) {
+			id := e.seed(t, m.run)
+			before := e.run(t, id)
+			if n := call(id, m.wkr, m.gen); n != 0 {
+				t.Fatalf("rows = %d, want 0", n)
+			}
+			after := e.run(t, id)
+			if after.StopKind != before.StopKind || after.StopReason != before.StopReason || after.Status != before.Status {
+				t.Errorf("row changed on a guard miss: before %+v/%+v after %+v/%+v", before.StopKind, before.StopReason, after.StopKind, after.StopReason)
+			}
+			if c := e.inputCount(t, id); c != 0 {
+				t.Errorf("%d run_user_inputs rows written, want none", c)
+			}
+		})
+	}
+}
+
+func TestStampTerminalTargetCancelInputLiveDB(t *testing.T) {
+	e := newTerminalTargetEnv(t)
+	const reason = "target MR closed"
+	call := func(id uuid.UUID, worker uuid.UUID, gen int64) (store.RunUserInput, error) {
+		return e.q.StampTerminalTargetCancelInput(e.ctx, store.StampTerminalTargetCancelInputParams{
+			StopReason: reason, ID: id, WorkerID: ttPgUUID(worker), ClaimGeneration: gen})
+	}
+
+	id := e.seed(t, ttRun{kind: "ci_fix", status: "running", iid: 9, worker: true, generation: 4, failure: true})
+	in, err := call(id, e.worker, 4)
+	if err != nil {
+		t.Fatalf("StampTerminalTargetCancelInput: %v", err)
+	}
+	if in.RunID != id || in.Kind != "cancel" || !in.Body.Valid || in.Body.String != reason {
+		t.Fatalf("input = %+v, want a cancel for %s with body %q", in, id, reason)
+	}
+	run := e.run(t, id)
+	if !run.StopKind.Valid || run.StopKind.String != "cancelled" || !run.StopReason.Valid || run.StopReason.String != reason {
+		t.Errorf("stop_kind/stop_reason = %+v/%+v, want cancelled/%q", run.StopKind, run.StopReason, reason)
+	}
+	if run.FailureReason.Valid || run.FailOrigin.Valid {
+		t.Errorf("failure_reason/fail_origin = %+v/%+v, want both cleared", run.FailureReason, run.FailOrigin)
+	}
+	// Second call: stop_kind is now set, so it is a no-op and writes no duplicate input.
+	if _, err := call(id, e.worker, 4); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second call err = %v, want pgx.ErrNoRows", err)
+	}
+	if c := e.inputCount(t, id); c != 1 {
+		t.Fatalf("%d inputs after a second call, want exactly 1", c)
+	}
+	// The input is drained by the live worker's ConsumeRunInputs.
+	consumed, err := e.q.ConsumeRunInputs(e.ctx, id)
+	if err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+	if len(consumed) != 1 || consumed[0].Kind != "cancel" || consumed[0].Body.String != reason {
+		t.Fatalf("consumed = %+v, want the single cancel input", consumed)
+	}
+
+	misses := []struct {
+		name string
+		run  ttRun
+		wkr  uuid.UUID
+		gen  int64
+	}{
+		{"wrong worker", ttRun{kind: "mr_rework", status: "running", iid: 7, worker: true, generation: 4}, uuid.New(), 4},
+		{"wrong generation", ttRun{kind: "mr_rework", status: "running", iid: 7, worker: true, generation: 4}, e.worker, 5},
+		{"released claim", ttRun{kind: "mr_rework", status: "running", iid: 7, worker: true, generation: 4, released: true}, e.worker, 4},
+		{"terminal status", ttRun{kind: "ci_fix", status: "failed", iid: 7, worker: true, generation: 4}, e.worker, 4},
+		{"queued status", ttRun{kind: "ci_fix", status: "queued", iid: 7, worker: true, generation: 4}, e.worker, 4},
+		{"limit_wait status", ttRun{kind: "ci_fix", status: "limit_wait", iid: 7, worker: true, generation: 4}, e.worker, 4},
+		{"pool_wait status", ttRun{kind: "ci_fix", status: "pool_wait", iid: 7, worker: true, generation: 4}, e.worker, 4},
+		{"recovery_wait status", ttRun{kind: "ci_fix", status: "recovery_wait", iid: 7, worker: true, generation: 4}, e.worker, 4},
+		{"paused status", ttRun{kind: "ci_fix", status: "paused", iid: 7, worker: true, generation: 4}, e.worker, 4},
+		{"existing stop verdict", ttRun{kind: "ci_fix", status: "running", iid: 7, worker: true, generation: 4, stopKind: "stopped", stopReason: "operator"}, e.worker, 4},
+		{"wrong kind", ttRun{kind: "task", status: "running", worker: true, generation: 4}, e.worker, 4},
+	}
+	for _, m := range misses {
+		t.Run(m.name, func(t *testing.T) {
+			mid := e.seed(t, m.run)
+			before := e.run(t, mid)
+			if _, err := call(mid, m.wkr, m.gen); !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("err = %v, want pgx.ErrNoRows", err)
+			}
+			after := e.run(t, mid)
+			if after.StopKind != before.StopKind || after.StopReason != before.StopReason {
+				t.Errorf("stamp changed on a guard miss: before %+v/%+v after %+v/%+v", before.StopKind, before.StopReason, after.StopKind, after.StopReason)
+			}
+			if c := e.inputCount(t, mid); c != 0 {
+				t.Errorf("%d run_user_inputs rows written on a guard miss, want none", c)
+			}
+		})
+	}
+}
+
+func TestCancelRunServerSideForTerminalTargetLiveDB(t *testing.T) {
+	e := newTerminalTargetEnv(t)
+	const reason = "target MR merged"
+	call := func(id uuid.UUID, status string, gen, iid int64) int64 {
+		t.Helper()
+		n, err := e.q.CancelRunServerSideForTerminalTarget(e.ctx, store.CancelRunServerSideForTerminalTargetParams{
+			StopReason: reason, ID: id, ObservedStatus: status, ObservedGeneration: gen, MrIid: iid})
+		if err != nil {
+			t.Fatalf("CancelRunServerSideForTerminalTarget: %v", err)
+		}
+		return n
+	}
+
+	for _, kind := range []string{"ci_fix", "mr_rework"} {
+		id := e.seed(t, ttRun{kind: kind, status: "queued", iid: 12, generation: 0, failure: true})
+		if n := call(id, "queued", 0, 12); n != 1 {
+			t.Fatalf("%s: rows = %d, want 1", kind, n)
+		}
+		run := e.run(t, id)
+		if run.Status != "cancelled" || !run.StopKind.Valid || run.StopKind.String != "cancelled" || !run.StopReason.Valid || run.StopReason.String != reason {
+			t.Errorf("%s: status/stop_kind/stop_reason = %q/%+v/%+v, want cancelled/cancelled/%q", kind, run.Status, run.StopKind, run.StopReason, reason)
+		}
+		if run.FailureReason.Valid || run.FailOrigin.Valid {
+			t.Errorf("%s: failure_reason/fail_origin = %+v/%+v, want both NULL", kind, run.FailureReason, run.FailOrigin)
+		}
+		if !run.FinishedAt.Valid {
+			t.Errorf("%s: finished_at is NULL after the cancel", kind)
+		}
+		if n := call(id, "queued", 0, 12); n != 0 {
+			t.Errorf("%s: second call rows = %d, want 0 (terminal)", kind, n)
+		}
+	}
+
+	misses := []struct {
+		name   string
+		run    ttRun
+		status string
+		gen    int64
+		iid    int64
+	}{
+		{"status mismatch", ttRun{kind: "ci_fix", status: "queued", iid: 12}, "running", 0, 12},
+		{"generation mismatch", ttRun{kind: "ci_fix", status: "queued", iid: 12, generation: 2}, "queued", 0, 12},
+		{"existing stop_kind", ttRun{kind: "mr_rework", status: "queued", iid: 12, stopKind: "cancelled", stopReason: "operator"}, "queued", 0, 12},
+		{"wrong ci_fix iid", ttRun{kind: "ci_fix", status: "queued", iid: 12}, "queued", 0, 13},
+		{"wrong mr_rework iid", ttRun{kind: "mr_rework", status: "queued", iid: 12}, "queued", 0, 13},
+		{"unbound ci_fix", ttRun{kind: "ci_fix", status: "queued"}, "queued", 0, 12},
+		{"terminal run", ttRun{kind: "mr_rework", status: "completed", iid: 12}, "completed", 0, 12},
+		{"wrong kind", ttRun{kind: "task", status: "queued"}, "queued", 0, 12},
+	}
+	for _, m := range misses {
+		t.Run(m.name, func(t *testing.T) {
+			id := e.seed(t, m.run)
+			before := e.run(t, id)
+			if n := call(id, m.status, m.gen, m.iid); n != 0 {
+				t.Fatalf("rows = %d, want 0", n)
+			}
+			after := e.run(t, id)
+			if after.Status != before.Status || after.StopKind != before.StopKind || after.StopReason != before.StopReason {
+				t.Errorf("row changed on a guard miss: before %q/%+v/%+v after %q/%+v/%+v",
+					before.Status, before.StopKind, before.StopReason, after.Status, after.StopKind, after.StopReason)
+			}
+		})
+	}
+}
