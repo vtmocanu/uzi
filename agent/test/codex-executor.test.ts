@@ -37376,6 +37376,9 @@ describe("M2 provider executor composition", () => {
         }
       }
       for (const write of writes) assert.match(JSON.stringify(write), /root-output-control/);
+      assert.ok(posted.some(m => m.kind === "text" && m.agent_instance === undefined &&
+        typeof m.payload.text === "string" && m.payload.text.includes("root-output-control")),
+      "posted root agent prose retains root-output-control");
       if (!sensitive) {
         assert.equal(writes.find(w => w.sink === "forge")!.args[2], text);
         assert.deepEqual(JSON.parse(String(rec(writes.find(w => w.sink === "memory")!.args[1]).body)), payload);
