@@ -1144,9 +1144,9 @@ export interface GitCacheOptions {
    *  (milliseconds) so a deadline can be exercised. A value above the production limit is ignored. Production never passes it. */
   compactForeignScanForTest?: { maxBares?: number; maxConfigBytes?: number; maxRecords?: number; deadlineMs?: number; now?: () => number };
   /** issue #4416 — test-only: the clock of the object scan (scanObjectsGrouped, and through it the path pass), and an optional
-   *  hook called as the scan reaches each stage, immediately before that stage's deadline check, so a test can move the
+   *  hook called as the scan reaches each stage (`path_stream`: each chunk the path pass reads), immediately before that stage's deadline check, so a test can move the
    *  clock at an exact point instead of racing the real one. Production never passes it. */
-  objectScanClockForTest?: { now: () => number; atStage?: (stage: "before_path_pass" | "path_pass" | "object_pass") => void };
+  objectScanClockForTest?: { now: () => number; atStage?: (stage: "before_path_pass" | "path_pass" | "path_stream" | "object_pass") => void };
   /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
    *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
    *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
@@ -20460,7 +20460,7 @@ export class GitCache {
     remaining: () => number,
   ): Promise<{ complete: true; hits: Array<{ label: string | undefined; commit: string }> } | { complete: false }> {
     const incomplete = { complete: false } as const;
-    // A deadline already spent on entry is incomplete before any git work (a zero-commit range reads no clock otherwise).
+    // A deadline already spent on entry is incomplete before any git work (a zero-commit range never checks the deadline otherwise).
     if (remaining() <= 0) return incomplete;
     const matchers = active.map((g) => ({ label: g.label, matcher: literalMatcher(g.forms) }));
     const hits: Array<{ label: string | undefined; commit: string }> = [];
@@ -20522,6 +20522,7 @@ export class GitCache {
         let stop = false;
         for await (const raw of spawned.stdout) {
           this.checkCheckpointCooperation();
+          this.objectScanClock?.atStage?.("path_stream");
           if (remaining() <= 0) { stop = true; break; }
           let chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
           while (chunk.length > 0) {

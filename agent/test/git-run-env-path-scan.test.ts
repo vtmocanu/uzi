@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, type GitCacheOptions } from "../src/git.js";
 
 // PRD 4416 M3: a secret containing "/" can be published as a git PATH. A tree object stores one path
 // component, so no single object holds the value; GitCache.scanObjectsForRunEnv therefore also searches the
@@ -206,7 +206,7 @@ describe("scanObjectsForRunEnv: the path pass fails closed", () => {
   it("reaching maxPathBytes is path_scan_incomplete", async () => {
     assert.deepEqual(await scan(prepare(), [NESTED], { caps: { maxPathBytes: 8 } }), incomplete);
   });
-  type Stage = "before_path_pass" | "path_pass" | "object_pass";
+  type Stage = Parameters<NonNullable<NonNullable<GitCacheOptions["objectScanClockForTest"]>["atStage"]>>[0];
   // A scan whose clock jumps a billion milliseconds when it reaches `jumpAt` (never, when undefined).
   const scanWithClock = async (tip: string, jumpAt: Stage | undefined) => {
     let t = 0;
@@ -215,13 +215,19 @@ describe("scanObjectsForRunEnv: the path pass fails closed", () => {
       objectScanClockForTest: { now: () => t, atStage: (s) => { seen.push(s); if (s === jumpAt) t += 10 ** 9; } },
     }));
     const res = await clocked.scanObjectsForRunEnv(bare, { tip, excludes: [base] }, needles(NESTED));
-    return { res, seen };
+    return { res, seen: [...new Set(seen)] }; // path_stream fires once per chunk read: the order of first arrival
+
   };
 
   it("a deadline spent inside the path pass is path_scan_incomplete", async () => {
     const { res, seen } = await scanWithClock(prepare(), "path_pass");
     assert.deepEqual(res, incomplete);
     assert.deepEqual(seen, ["before_path_pass", "path_pass"]);
+  });
+  it("a deadline spent while the path pass reads git's output is path_scan_incomplete", async () => {
+    const { res, seen } = await scanWithClock(prepare(), "path_stream");
+    assert.deepEqual(res, incomplete);
+    assert.deepEqual(seen, ["before_path_pass", "path_pass", "path_stream"]);
   });
   it("a deadline spent before the path pass is deadline", async () => {
     const { res, seen } = await scanWithClock(prepare(), "before_path_pass");
@@ -231,7 +237,7 @@ describe("scanObjectsForRunEnv: the path pass fails closed", () => {
   it("a deadline spent before the object pass is deadline", async () => {
     const { res, seen } = await scanWithClock(prepare(), "object_pass");
     assert.deepEqual(res, { trusted: false, reason: "deadline" });
-    assert.deepEqual(seen, ["before_path_pass", "path_pass", "object_pass"]);
+    assert.deepEqual(seen, ["before_path_pass", "path_pass", "path_stream", "object_pass"]);
   });
   it("a deadline spent inside the path pass of an empty range is path_scan_incomplete", async () => {
     const { res } = await scanWithClock(base, "path_pass");
@@ -240,7 +246,7 @@ describe("scanObjectsForRunEnv: the path pass fails closed", () => {
   it("without a clock jump every stage is reached and the scan is clean", async () => {
     const { res, seen } = await scanWithClock(prepare(), undefined);
     assert.deepEqual(res, { trusted: true, findings: [] });
-    assert.deepEqual(seen, ["before_path_pass", "path_pass", "object_pass"]);
+    assert.deepEqual(seen, ["before_path_pass", "path_pass", "path_stream", "object_pass"]);
   });
   it("the same range under the default caps is clean", async () => {
     assert.deepEqual(await scan(prepare(), [NESTED]), { trusted: true, findings: [] });
