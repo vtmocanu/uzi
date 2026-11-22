@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -73,7 +74,7 @@ func TestRenderListsTotalAndAtMostFiveRuns(t *testing.T) {
 	if strings.Contains(body, "someone else") || strings.Contains(body, other.ID.String()[:8]) {
 		t.Fatalf("another credential's run leaked:\n%s", body)
 	}
-	if !strings.Contains(body, "*subscription*") || !strings.Contains(body, "92% of its 100% weekly limit") ||
+	if !strings.Contains(body, "**subscription**") || !strings.Contains(body, "92% of its 100% weekly limit") ||
 		!strings.Contains(body, "no other token to switch to") || !strings.Contains(body, "`uzi run set-token ") {
 		t.Fatalf("body incomplete:\n%s", body)
 	}
@@ -100,7 +101,8 @@ func TestRenderEscapesOwnerTextAndDropsUnsafeCommands(t *testing.T) {
 	w := renderWarner([]store.Run{safe, unsafe}, blocks, nil)
 	c := &credential{userID: owner, key: key, harness: "claude", fence: func(*notifysvc.SlackRender) {}}
 	n := w.build(context.Background(), c, nearAt(99, 100))
-	body := n.Slack.Body
+	// The notifier renders the body with slacksvc.SlackMrkdwnBlock; assert what Slack would receive.
+	body, _ := slacksvc.SlackMrkdwnBlock(n.Slack.Body)
 	for _, raw := range []string{"<!channel>", "<!here>", "<https://evil.example|click>"} {
 		if strings.Contains(body, raw) {
 			t.Fatalf("unescaped owner text %q in:\n%s", raw, body)
@@ -109,8 +111,11 @@ func TestRenderEscapesOwnerTextAndDropsUnsafeCommands(t *testing.T) {
 	if !strings.Contains(body, "&lt;!channel&gt;") || !strings.Contains(body, "&lt;!here&gt; &amp; y") {
 		t.Fatalf("owner text not escaped:\n%s", body)
 	}
-	if strings.Contains(body, "*bold*") || strings.Contains(body, "`tick`") {
+	if strings.Contains(body, "*bold*") || strings.Contains(body, "`tick`") || strings.Contains(body, "_bold_") {
 		t.Fatalf("label formatting not neutralised:\n%s", body)
+	}
+	if !strings.Contains(body, "&lt;!channel&gt; bold tick &amp; https://evil.example|click") {
+		t.Fatalf("label not rendered as plain escaped text:\n%s", body)
 	}
 	if !strings.Contains(body, "rename the token in Settings to get a copyable command") {
 		t.Fatalf("an unsafe label must say no command is available:\n%s", body)
@@ -155,10 +160,48 @@ func TestRenderSurvivesARunListingFailure(t *testing.T) {
 	w := renderWarner(nil, fakeBlocks{}, errors.New("db down"))
 	c := &credential{userID: uuid.New(), key: "anthropic:x", harness: "claude", label: "tok", fence: func(*notifysvc.SlackRender) {}}
 	n := w.build(context.Background(), c, nearAt(90, 100))
-	if !strings.Contains(n.Slack.Body, "*tok* is at 90% of its 100% weekly limit.") {
+	if !strings.Contains(n.Slack.Body, "**tok** is at 90% of its 100% weekly limit.") {
 		t.Fatalf("body = %q", n.Slack.Body)
 	}
-	if !strings.Contains(n.Slack.Body, "<!date^") || !strings.Contains(n.Slack.Body, at(100).UTC().Format("2006-01-02 15:04 MST")) {
-		t.Fatalf("reset time missing: %q", n.Slack.Body)
+	if len(n.Slack.Facts) != 1 || !strings.Contains(n.Slack.Facts[0], "<!date^") || !strings.Contains(n.Slack.Facts[0], at(100).UTC().Format("2006-01-02 15:04 MST")) {
+		t.Fatalf("reset time missing: %q", n.Slack.Facts)
+	}
+	if strings.Contains(n.Slack.Body, "<!date^") {
+		t.Fatalf("the date token must not be in the markdown-walked body: %q", n.Slack.Body)
+	}
+}
+
+// The reset time is a Fact (trusted markup, never markdown-walked), so the date token reaches Slack
+// intact, while a label with an ampersand is escaped exactly once by the real body renderer.
+func TestRenderThroughSlackBlockKeepsDateTokenAndEscapesOnce(t *testing.T) {
+	d := dm{Label: "R&D", Pct: 92, Limit: 100, ResetsAt: ptrT(at(100)), Total: 1,
+		Runs: []runLine{{ID: uuid.New(), Reason: workersvc.NextClaimNoAlternative, Command: "uzi run set-token x -- 'a&b'"}}}
+	r := renderSlack(d)
+	body, _ := slacksvc.SlackMrkdwnBlock(r.Body)
+	if !strings.HasPrefix(body, "*R&amp;D* is at 92%") || strings.Contains(body, "&amp;amp;") {
+		t.Fatalf("label not escaped exactly once:\n%s", body)
+	}
+	if !strings.Contains(body, "`uzi run set-token x -- 'a&amp;b'`") {
+		t.Fatalf("command not escaped by the block renderer:\n%s", body)
+	}
+	want := fmt.Sprintf("Resets <!date^%d^{date_short_pretty} {time}|%s>", at(100).Unix(), at(100).UTC().Format("2006-01-02 15:04 MST"))
+	if len(r.Facts) != 1 || r.Facts[0] != want {
+		t.Fatalf("facts = %q, want %q", r.Facts, want)
+	}
+	if strings.Contains(body, "<!date") || strings.Contains(body, "&lt;!date") {
+		t.Fatalf("date token leaked into the body:\n%s", body)
+	}
+}
+
+func TestRenderLabelCannotFormLinksOrFakeLines(t *testing.T) {
+	for _, label := range []string{"[click](https://evil.example)", "a\n• `deadbeef` fake line", "x\\", "[[]]", " \t "} {
+		r := renderSlack(dm{Label: label, Pct: 91, Limit: 100})
+		body, _ := slacksvc.SlackMrkdwnBlock(r.Body)
+		if strings.Contains(body, "[") || strings.Contains(body, "](") || strings.Contains(body, "<http") || strings.Contains(body, "\n") {
+			t.Fatalf("label %q rendered as markup:\n%s", label, body)
+		}
+	}
+	if r := renderSlack(dm{Label: "[]", Pct: 91, Limit: 100}); !strings.HasPrefix(r.Body, "A credential is at") {
+		t.Fatalf("an empty stripped label falls back: %q", r.Body)
 	}
 }

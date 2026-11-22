@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/usagereserve"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TxBeginner opens the transactions of the observation and claim. *pgxpool.Pool satisfies it.
@@ -147,7 +148,7 @@ func (w *Warner) anthropicCredential(userID, secretID uuid.UUID, rev int64, pct 
 	win := ClaudeWindow{Reset: wr.ResetsAt, Pct: wr.Pct}
 	fence := notifysvc.CredentialFence{SecretID: secretID, Kind: store.KindAnthropicToken, EnablementRev: rev}
 	c := &credential{
-		userID: userID, key: "anthropic:" + secretID.String(), harness: "claude", obs: obs, trigger: wr,
+		userID: userID, key: workersvc.AnthropicCredentialKey(secretID), harness: "claude", obs: obs, trigger: wr,
 		next: func(r Row) Next { return nextClaude(r, obs, win) },
 		seed: func(ctx context.Context, q *store.Queries) error {
 			return q.SeedWeeklyLimitAlertAnthropic(ctx, store.SeedWeeklyLimitAlertAnthropicParams{UserID: userID, SecretID: secretID})
@@ -185,17 +186,15 @@ func (w *Warner) ObserveCodexWeekly(ctx context.Context, fence notifysvc.CodexAc
 // codexCredential is anthropicCredential's Codex twin.
 func (w *Warner) codexCredential(fence notifysvc.CodexAccountFence, buckets []apitypes.CodexRateLimitBucketDTO, lastSuccessAt time.Time) *credential {
 	obs := lastSuccessAt.UTC().Truncate(time.Microsecond)
-	// Step 0: CodexWeekly directly, so a malformed, NaN, Inf or negative weekly window anywhere in
-	// the reading, a stale reading, no weekly window and a pre-reset best window all reject it.
-	cw := usagereserve.CodexWeekly(usagereserve.CodexReading{Present: true, Buckets: buckets, LastSuccessAt: &obs}, w.codexInterval, w.now())
-	if !cw.OK || !fence.Valid() {
+	cw, ok := codexGate(fence, buckets, obs, w.codexInterval, w.now())
+	if !ok {
 		return nil
 	}
 	view := CodexView{Windows: cw.Windows, Dup: duplicateBuckets(buckets)}
 	trig, _ := view.Trigger()
 	account := fence.AccountID
 	c := &credential{
-		userID: fence.OwnerID, key: "codex:" + account.String(), harness: "codex", obs: obs, trigger: trig,
+		userID: fence.OwnerID, key: workersvc.CodexCredentialKey(account), harness: "codex", obs: obs, trigger: trig,
 		label: "Codex account",
 		next:  func(r Row) Next { return nextCodex(r, obs, view) },
 		seed: func(ctx context.Context, q *store.Queries) error {
@@ -222,6 +221,14 @@ func (w *Warner) codexCredential(fence notifysvc.CodexAccountFence, buckets []ap
 	return c
 }
 
+// codexGate is step 0 for a Codex reading, a pure function of the reading, the fence and the clock:
+// CodexWeekly directly, so a malformed, NaN, Inf or negative weekly window anywhere in the reading, a
+// stale reading, no weekly window and a pre-reset best window all reject it, as does an invalid fence.
+func codexGate(fence notifysvc.CodexAccountFence, buckets []apitypes.CodexRateLimitBucketDTO, obs time.Time, interval time.Duration, now time.Time) (usagereserve.CodexWeeklyReading, bool) {
+	cw := usagereserve.CodexWeekly(usagereserve.CodexReading{Present: true, Buckets: buckets, LastSuccessAt: &obs}, interval, now)
+	return cw, cw.OK && fence.Valid()
+}
+
 // duplicateBuckets is the set of bucket ids carried by more than one bucket of the reading.
 func duplicateBuckets(buckets []apitypes.CodexRateLimitBucketDTO) map[string]bool {
 	seen := map[string]int{}
@@ -241,15 +248,6 @@ func duplicateBuckets(buckets []apitypes.CodexRateLimitBucketDTO) map[string]boo
 func (w *Warner) process(ctx context.Context, c *credential) {
 	next, ok := w.observe(ctx, c)
 	if !ok || next.Warned || !next.PeriodOK {
-		return
-	}
-	// A cheap pre-filter outside any transaction: no lock is taken for a reading that cannot claim.
-	set, err := w.q.GetUserUsageReserve(ctx, c.userID)
-	if err != nil {
-		w.logger.Warn("weeklywarn: read warning settings", "error", err)
-		return
-	}
-	if !Claimable(next, c.obs, usagereserve.EvaluateNear(thresholdOf(set), int(set.WeeklyWarningMarginPts), c.trigger), int(set.WeeklyWarningMarginPts)) {
 		return
 	}
 	w.claim(ctx, c, next)
@@ -342,10 +340,24 @@ func (w *Warner) observe(ctx context.Context, c *credential) (Next, bool) {
 	return next, true
 }
 
-// claim is the claim transaction: under the row lock it re-checks that this reading is still the
+// claim builds the DM and then runs the claim transaction: under the row lock it re-checks that this reading is still the
 // newest observation and the period is still unwarned, then sets warned and inserts the notifications
 // row together. The Slack publish happens only after the commit.
 func (w *Warner) claim(ctx context.Context, c *credential, next Next) {
+	// Outside any transaction and before any lock: the cheap pre-filter, then the DM content (the
+	// owner's run listing and the weekly-limit blocks read the pool). The content is advisory: the claim
+	// transaction re-checks every gate under the row lock, so a stale line can only mis-word a DM that
+	// is still due, and no pool read happens while the advisory or row locks are held.
+	set, err := w.q.GetUserUsageReserve(ctx, c.userID)
+	if err != nil {
+		w.logger.Warn("weeklywarn: read warning settings", "error", err)
+		return
+	}
+	pre := usagereserve.EvaluateNear(thresholdOf(set), int(set.WeeklyWarningMarginPts), c.trigger)
+	if !Claimable(next, c.obs, pre, int(set.WeeklyWarningMarginPts)) {
+		return
+	}
+	n := w.build(ctx, c, pre)
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		w.logger.Warn("weeklywarn: begin claim", "error", err)
@@ -367,7 +379,7 @@ func (w *Warner) claim(ctx context.Context, c *credential, next Next) {
 	if row.Warned || !row.ObservedAt.Valid || !row.ObservedAt.Time.Equal(c.obs) {
 		return // a newer observation won, or the period is already claimed
 	}
-	set, err := q.GetUserUsageReserve(ctx, c.userID)
+	set, err = q.GetUserUsageReserve(ctx, c.userID)
 	if err != nil {
 		w.logger.Warn("weeklywarn: claim settings", "error", err)
 		return
@@ -386,7 +398,6 @@ func (w *Warner) claim(ctx context.Context, c *credential, next Next) {
 	if err != nil || !has {
 		return
 	}
-	n := w.build(ctx, c, near)
 	if _, err := q.ClaimWeeklyLimitWarning(ctx, store.ClaimWeeklyLimitWarningParams{ID: row.ID, ObservedAt: tsz(c.obs)}); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			w.logger.Warn("weeklywarn: claim", "error", err)

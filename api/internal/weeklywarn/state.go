@@ -71,7 +71,8 @@ type ClaudeWindow struct {
 //   - No anchor: anchor on the fresh reset when it is after obs, else stay NULL.
 //   - ClaudeResetObserved arm A (a reset more than the margin later): new period, re-anchor.
 //   - Arm B (unchanged boundary, utilization cleared): rearm, boundary kept.
-//   - A reset within the margin of the anchor: in-window; the anchor follows the reading.
+//   - A reset within the margin of the anchor: in-window; a refill (arm B against the fresh reset)
+//     rearms, otherwise the anchor follows the reading.
 //   - obs after the anchor and the reset absent or outside the margin (arm A not fired): the verified
 //     post-boundary re-anchor, or a NULL anchor when no future reset exists.
 //   - Anything else (a reset before anchor - margin, or no reset before the boundary) is a replay and
@@ -101,6 +102,12 @@ func nextClaude(prev Row, obs time.Time, w ClaudeWindow) Next {
 		return anchorFromFresh() // arm A
 	}
 	if fresh != nil && absInt(epoch(fresh)-epoch(anchor)) <= marginSecs {
+		// Reset jitter within the margin: the boundary is the same one, so a refill is judged against
+		// the prior utilization BEFORE the anchor follows the reading (equal anchors select arm B
+		// only). Overwriting anchor_pct first would hide the 90 to 0 drop and arm B could never fire.
+		if usagereserve.ClaudeResetObserved(*fresh, priorPct, fresh, int(pct)) {
+			return Next{AnchorReset: fresh, AnchorPct: ptrF(pct), PeriodOK: true}
+		}
 		return Next{AnchorReset: fresh, AnchorPct: ptrF(pct), Warned: prev.Warned, PeriodOK: true}
 	}
 	if obs.Unix() > epoch(anchor) {

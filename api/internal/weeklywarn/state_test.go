@@ -592,3 +592,55 @@ func TestMarginIsOneHour(t *testing.T) {
 		t.Fatalf("margin = %d", marginSecs)
 	}
 }
+
+// An observation exactly at the anchored reset is not yet past the boundary (strictly after only).
+func TestObservationAtTheAnchorExactlyIsNotPostBoundary(t *testing.T) {
+	t.Run("claude", func(t *testing.T) {
+		warned := Row{AnchorReset: ptrT(at(100)), AnchorPct: ptrF(90), Warned: true}
+		// No reset in the reading: the post-boundary path would clear the anchor.
+		n := nextClaude(warned, at(100), ClaudeWindow{Pct: 50})
+		if n.AnchorReset == nil || !n.AnchorReset.Equal(at(100)) || !n.Warned || n.PeriodOK {
+			t.Fatalf("obs == anchor must freeze the row: %+v", n)
+		}
+		// One second later the verified post-boundary path applies.
+		n = nextClaude(warned, at(100).Add(time.Second), ClaudeWindow{Pct: 50})
+		if n.AnchorReset != nil || n.Warned {
+			t.Fatalf("obs just past the anchor must clear it: %+v", n)
+		}
+	})
+	t.Run("codex", func(t *testing.T) {
+		warned := Row{AnchorReset: ptrT(at(100)), AnchorPct: ptrF(90), AnchorBucket: strPtr(bkt), Warned: true}
+		v := CodexView{Windows: []usagereserve.CodexWeeklyWindow{cw("gpt", pri, 50, 300)}}
+		n := nextCodex(warned, at(100), v)
+		if n.AnchorBucket == nil || *n.AnchorBucket != bkt || !n.Warned || n.PeriodOK {
+			t.Fatalf("obs == anchor must freeze the row: %+v", n)
+		}
+		n = nextCodex(warned, at(100).Add(time.Second), v)
+		if n.AnchorBucket == nil || *n.AnchorBucket != "gpt" || n.Warned {
+			t.Fatalf("obs just past the anchor must start a new period: %+v", n)
+		}
+	})
+}
+
+// A refill whose reset jitters by a few seconds is still a refill: warned at 90, 0 at T+3s, then 90
+// again gives exactly one new warning.
+func TestClaudeRefillUnderResetJitterRearms(t *testing.T) {
+	s := newSim(t)
+	s.claude(at(1), 90, hp(100))
+	s.wantDMs(1, "warn")
+	s.claude(at(2), 0, hp(100+3.0/3600))
+	if s.row.Warned {
+		t.Fatalf("a jittered refill must rearm: %+v", s.row)
+	}
+	s.claude(at(3), 90, hp(100+3.0/3600))
+	s.wantDMs(2, "exactly one new period")
+	s.claude(at(4), 95, hp(100+3.0/3600))
+	s.wantDMs(2, "once per period")
+	// A small drop that is not a refill leaves the row warned and still follows the anchor.
+	s2 := newSim(t)
+	s2.claude(at(1), 90, hp(100))
+	s2.claude(at(2), 70, hp(100+3.0/3600))
+	if !s2.row.Warned || *s2.row.AnchorPct != 70 {
+		t.Fatalf("a non-refill jitter reading: %+v", s2.row)
+	}
+}

@@ -572,8 +572,8 @@ uzi also sends one Slack DM when a credential reaches the warning, so you hear a
 
 **Known edge cases.**
 
-- A crash between uzi recording a usage reading and recording the warning state can lose the observation of a refill. That period then gets no second DM.
-- Codex can report two weekly windows. If the second one was never present in any accepted reading of the period, uzi cannot tell its later appearance from a genuine early reset, and that period can get one extra DM.
+- A crash, or a failed observation transaction, between uzi recording a usage reading and recording the warning state can lose the observation of a refill. That period then gets no second DM.
+- Codex can report two weekly windows. If the second one was never present in any accepted reading of the period, that is data ambiguity: a window absent from every accepted reading looks the same as a genuine early reset, so its later appearance can get that period one extra DM.
 
 Slack still posts the park messages as before.
 

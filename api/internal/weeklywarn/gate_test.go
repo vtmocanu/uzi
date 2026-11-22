@@ -133,3 +133,37 @@ func TestValidPostBoundaryReadingClearsObsoleteAnchor(t *testing.T) {
 		t.Fatalf("obsolete anchor not cleared: %+v", n)
 	}
 }
+
+// codexGate is the pure step 0: one valid window beside any malformed sibling rejects the whole reading.
+func TestCodexGateTable(t *testing.T) {
+	obs := at(10)
+	future := at(100).Unix()
+	good := apitypes.CodexRateLimitBucketDTO{ID: "codex", Primary: weeklyWindow(fp(90), future)}
+	sibling := func(pct *float64) apitypes.CodexRateLimitBucketDTO {
+		return apitypes.CodexRateLimitBucketDTO{ID: "gpt", Secondary: weeklyWindow(pct, future)}
+	}
+	noPct := apitypes.CodexRateLimitBucketDTO{ID: "gpt", Secondary: &apitypes.CodexRateLimitWindowDTO{LimitWindowSeconds: ip(weekSecs), ResetAt: ip(future)}}
+	invalid := notifysvc.CodexAccountFence{}
+	for _, tc := range []struct {
+		name    string
+		fence   notifysvc.CodexAccountFence
+		buckets []apitypes.CodexRateLimitBucketDTO
+		now     time.Time
+		want    bool
+	}{
+		{"valid", fence(), []apitypes.CodexRateLimitBucketDTO{good}, obs, true},
+		{"valid plus a valid sibling", fence(), []apitypes.CodexRateLimitBucketDTO{good, sibling(fp(10))}, obs, true},
+		{"valid plus a NaN sibling", fence(), []apitypes.CodexRateLimitBucketDTO{good, sibling(fp(math.NaN()))}, obs, false},
+		{"valid plus a negative sibling", fence(), []apitypes.CodexRateLimitBucketDTO{good, sibling(fp(-0.5))}, obs, false},
+		{"valid plus a missing-percent sibling", fence(), []apitypes.CodexRateLimitBucketDTO{good, noPct}, obs, false},
+		{"valid reading, invalid fence", invalid, []apitypes.CodexRateLimitBucketDTO{good}, obs, false},
+		{"stale", fence(), []apitypes.CodexRateLimitBucketDTO{good}, obs.Add(4 * time.Hour), false},
+		{"no buckets", fence(), nil, obs, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := codexGate(tc.fence, tc.buckets, obs, time.Hour, tc.now); ok != tc.want {
+				t.Fatalf("accepted = %v, want %v", ok, tc.want)
+			}
+		})
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // These tests need UZI_TEST_DATABASE_URL (e2e/run-store-it.sh provides a throwaway Postgres and
@@ -80,6 +81,23 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(pool.Close)
 	f := &fixture{t: t, ctx: ctx, pool: pool, q: store.New(pool), user: uuid.New(), now: time.Now().UTC().Truncate(time.Second)}
 	f.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, f.user, fmt.Sprintf("weeklywarn-%s@e2e", f.user))
+	// The shared run-store-it database outlives this test: delete everything the fixture user owns,
+	// children before parents. Registered after pool.Close, so it runs first (cleanups are LIFO).
+	t.Cleanup(func() {
+		for _, stmt := range []string{
+			`DELETE FROM notifications WHERE user_id = $1`,
+			`DELETE FROM weekly_limit_alerts WHERE user_id = $1`,
+			`DELETE FROM runs WHERE user_id = $1`,
+			`DELETE FROM codex_credential_state WHERE user_id = $1`,
+			`DELETE FROM user_secrets WHERE user_id = $1`,
+			`DELETE FROM codex_provider_account WHERE user_id = $1`,
+			`DELETE FROM users WHERE id = $1`,
+		} {
+			if _, err := pool.Exec(context.Background(), stmt, f.user); err != nil {
+				t.Errorf("cleanup %q: %v", stmt, err)
+			}
+		}
+	})
 	f.w = New(Config{
 		Pool: pool, Queries: f.q, Publisher: pubSink{f}, Blocks: fakeBlocks{},
 		Runs:           func(context.Context, uuid.UUID) ([]store.Run, error) { return nil, nil },
@@ -758,4 +776,26 @@ func TestWeeklyWarnCodexCascadeOnAccountDeleteLiveDB(t *testing.T) {
 	if cf.ledger().exists {
 		t.Fatal("deleting the account did not cascade the ledger row")
 	}
+}
+
+// A vault reset deletes every secret and Codex account of the owner (vault.Reset, the real deletion
+// path); the ledger rows go with them and a credential created afterwards warns again in the same week.
+func TestWeeklyWarnVaultResetClearsLedgerAndRewarnsLiveDB(t *testing.T) {
+	f, s, rev := anthropicFx(t)
+	reset := f.resetIn(100)
+	f.claude(s, rev, 92, reset, 1)
+	f.wantDMs(1, "warned before the reset")
+	if !f.ledger(s).warned {
+		t.Fatal("ledger not warned")
+	}
+	if err := vault.NewPostgres(nil, f.pool).Reset(f.ctx, f.user, func(context.Context, vault.BrowserStore) error { return nil }); err != nil {
+		t.Fatalf("vault reset: %v", err)
+	}
+	if f.ledgerRows() != 0 {
+		t.Fatal("the vault reset left a ledger row behind")
+	}
+	s2 := f.secret(store.KindAnthropicToken, "after-reset")
+	f.claudeRun(s2, "running")
+	f.claude(s2, f.rev(s2), 92, reset, 2)
+	f.wantDMs(2, "a new row warns again after the reset")
 }

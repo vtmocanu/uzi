@@ -1,7 +1,7 @@
 # PRD #4123: Weekly limit warning and switch reason
 
 **Issue**: #4123
-**Status**: Draft (refreshed 2026-11-22 against main `aa46586b`)
+**Status**: Implemented M1–M3 on branch `agent/issue-4123` (2026-11-22); owner acceptance pending (live Slack DM and hosted rendering)
 **Priority**: Normal
 
 ## Problem
@@ -216,6 +216,9 @@ Acceptance examples:
 
 ### M1: Parked runs say why they could not switch
 
+**Status**: implemented; unit, handler, CLI, web and Slack render tests plus mutation checks green in-run.
+
+
 Modules 1, 2 (park cases), 4 (run page, `uzi run get`/TUI, Slack park and reserve-pause messages). The selection-kernel extraction lands here, with parity proven first. No migration.
 
 - **Blocked by**: none.
@@ -229,6 +232,9 @@ Modules 1, 2 (park cases), 4 (run page, `uzi run get`/TUI, Slack park and reserv
 
 ### M2: Early warning on web and CLI, with the margin setting
 
+**Status**: implemented; the margin route LiveDB tests (auth, CSRF, default 15, CHECK) passed on a throwaway database.
+
+
 Module 3, the near/at cases of module 2 for running and queued runs, the `RunSummaryItemDTO` projection, the run-page banner, the `limit` decision kind, TUI/CLI rendering, module 6 (migration).
 
 - **Blocked by**: M1.
@@ -240,6 +246,9 @@ Module 3, the near/at cases of module 2 for running and queued runs, the `RunSum
   - the setting round-trips in web and `uzi settings`.
 
 ### M3: Slack warning, once per weekly window
+
+**Status**: implemented; the weeklywarn state-machine tests and 15 LiveDB tests (ordering, rollback, concurrency, fences, cascade, vault reset, relink) passed on a throwaway database. Live Slack delivery is owner acceptance.
+
 
 Module 5 (migration).
 
@@ -276,3 +285,4 @@ Module 5 (migration).
 - **D17. Fix commands are copyable and safe (2026-11-22).** Every label-bearing fix command puts all flags before `--` and then the shell-quoted label (a valid label such as `--default` stays positional); `uzi token pool` always carries `--kind`. Grandfathered labels that are not command-safe get no command.
 - **D18. A run is never listed twice on the Overview (2026-11-22).** The `limit` decision item is skipped for any run already shown on the "Needs your decision" card as a plan, question or owner park, not only an owner park, so the module 4 suppression rule is widened to satisfy M2's "a run is never listed twice". The credential row's run count therefore counts only runs not listed elsewhere; the run page banner still shows for every affected run.
 - **D19. Near-limit blocks on other-window parks (2026-11-22).** A run parked on `five_hour` or a per-model window whose credential's overall weekly reading is near or at the limit gets the M2 near-limit block on web/CLI/TUI (the Slack park message is unchanged). Its wait is `unknown`, because its stored retry/reset stamps belong to the other window. Below the margin such parks render exactly as before.
+- **D20. Implementation choices (2026-11-22).** The `--` command grammar and an always-present `--kind` (D17); a run-scoped `uzi run set-token <id> --auto` alongside worker auto; the warning fence instant is the exact persisted reading time (µs) compared in SQL; the observation and claim are separate transactions so a failed notification-row write never loses rearm evidence (D15); a pure step-0 validity gate runs before any transaction, so a rejected reading takes no lock and writes no row; the DM content is built before the claim transaction, which re-checks every gate.

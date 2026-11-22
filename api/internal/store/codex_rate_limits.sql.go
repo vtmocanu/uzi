@@ -818,8 +818,8 @@ type UpsertCodexAccountRateLimitsParams struct {
 // rejects a reading for an account whose last codex_auth alias was unlinked/deleted between
 // observation and write (there is no longer a subscription to meter). INSERT ... SELECT ...
 // WHERE puts every fence in front of the write: a failed fence selects no row, so nothing
-// is written on EITHER the insert or the conflict path. :execrows — 0 rows means authority
-// moved, and the caller discards the reading rather than writing it stale.
+// is written on EITHER the insert or the conflict path. :one — pgx.ErrNoRows means a refused
+// write (authority moved), and the caller discards the reading rather than writing it stale.
 //
 // 🔴 ENABLEMENT fence (PRD #1732 D6/D13). A Codex reading describes an ACCOUNT, and an
 // account is live only while at least one ENABLED alias is linked to it, so the fence is

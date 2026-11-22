@@ -17,6 +17,13 @@ func ExcludedFromNextClaim(run store.Run) bool { return nextClaimExcluded(run) }
 // EffectiveLimit is the percent at which the owner's weekly reserve holds, or 100 with no threshold.
 func (n *NextClaimSnapshot) EffectiveLimit() float64 { return n.effectiveLimit() }
 
+// AnthropicCredentialKey is the credential key of an Anthropic token secret. It is the one spelling
+// shared by the run weekly-limit block and the weekly-warning ledger.
+func AnthropicCredentialKey(secretID uuid.UUID) string { return "anthropic:" + secretID.String() }
+
+// CodexCredentialKey is the credential key of a Codex provider account (never of an alias).
+func CodexCredentialKey(accountID uuid.UUID) string { return "codex:" + accountID.String() }
+
 // CurrentCredential names the credential the run is spending: its credential key
 // ("anthropic:<secret id>" or "codex:<provider account id>") and display label. ok is false when the
 // run has no resolvable credential in the snapshot (unbound, disabled or unlinked).
@@ -34,7 +41,7 @@ func (n *NextClaimSnapshot) CurrentCredential(run store.Run) (key, label string,
 		if !found {
 			return "", "", false
 		}
-		return "codex:" + acct.id.String(), lbl, true
+		return CodexCredentialKey(acct.id), lbl, true
 	}
 	id := currentAnthropic(run)
 	if id == uuid.Nil && run.LimitDeadSecretID.Valid {
@@ -47,7 +54,7 @@ func (n *NextClaimSnapshot) CurrentCredential(run store.Run) (key, label string,
 	if !found {
 		return "", "", false
 	}
-	return "anthropic:" + id.String(), c.Label, true
+	return AnthropicCredentialKey(id), c.Label, true
 }
 
 // WorkerBinding is the recorded name and Anthropic bind mode of one of the owner's workers; ok is

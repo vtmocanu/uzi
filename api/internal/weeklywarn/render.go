@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/slack-go/slack/slackutilsx"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -124,28 +124,40 @@ func reasonText(r string) string {
 	return "will wait for the reset"
 }
 
-// mrkdwnFormat are the characters that open or close Slack formatting. An owner-authored label is
-// shown without them, so it can never close the bold span it sits in or open another.
-var mrkdwnFormat = strings.NewReplacer("*", "", "_", "", "~", "", "`", "")
+// ownerTextStrip removes what could turn owner-authored text into markup once the body is parsed as
+// CommonMark: emphasis and code delimiters, link brackets and the backslash that escapes a delimiter.
+// The label is shown without them, so it can never close the bold span it sits in, open another, form
+// a link or swallow the closing delimiter.
+var ownerTextStrip = strings.NewReplacer("*", "", "_", "", "~", "", "`", "", "[", "", "]", "", "\\", "")
 
-// esc is slacksvc.EscapeMrkdwn: the three characters Slack itself interprets (&, <, >), applied to
-// every owner-authored string individually, never to the assembled markup.
-func esc(s string) string { return slackutilsx.EscapeMessage(s) }
+// ownerLabel is an owner-authored credential label made safe for the body: terminal and layout
+// control characters folded (termsafe.CellText), then the markup characters stripped. Slack's own
+// &, < and > escaping is not applied here: the body reaches Slack through slacksvc.SlackMrkdwnBlock,
+// which escapes every text node itself, so escaping here would double-escape ("R&D").
+func ownerLabel(s string) string {
+	return strings.TrimSpace(ownerTextStrip.Replace(termsafe.CellText(s)))
+}
 
+// resetFact is the window reset as a Slack date token. It is a Fact because Facts are trusted markup
+// that no markdown walk touches; in the body the walker would escape the token into literal text.
+func resetFact(t time.Time) string {
+	return fmt.Sprintf("Resets <!date^%d^{date_short_pretty} {time}|%s>", t.Unix(), t.UTC().Format("2006-01-02 15:04 MST"))
+}
+
+// renderSlack builds the render. The Body is untrusted CommonMark text (the notifier renders it with
+// slacksvc.SlackMrkdwnBlock): bold is "**", and every owner-authored string is passed through
+// unescaped except for the markup stripping above.
 func renderSlack(d dm) notifysvc.SlackRender {
 	title, verb := "WEEKLY LIMIT NEARLY REACHED", "is at"
 	if d.At {
 		title, verb = "WEEKLY LIMIT REACHED", "has reached"
 	}
 	label := "A credential"
-	if l := strings.TrimSpace(mrkdwnFormat.Replace(d.Label)); l != "" {
-		label = "*" + esc(l) + "*"
+	if l := ownerLabel(d.Label); l != "" {
+		label = "**" + l + "**"
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s %d%% of its %d%% weekly limit.", label, verb, d.Pct, d.Limit)
-	if d.ResetsAt != nil {
-		fmt.Fprintf(&b, " The window resets <!date^%d^{date_short_pretty} {time}|%s>.", d.ResetsAt.Unix(), d.ResetsAt.UTC().Format("2006-01-02 15:04 MST"))
-	}
 	if d.Total > 0 {
 		noun := "runs use"
 		if d.Total == 1 {
@@ -153,11 +165,11 @@ func renderSlack(d dm) notifysvc.SlackRender {
 		}
 		fmt.Fprintf(&b, "\n%d %s this credential:", d.Total, noun)
 		for _, r := range d.Runs {
-			fmt.Fprintf(&b, "\n• `%s` %s", r.ID.String()[:8], esc(reasonText(r.Reason)))
+			fmt.Fprintf(&b, "\n• `%s` %s", r.ID.String()[:8], reasonText(r.Reason))
 			switch {
-			case r.Command != "":
-				fmt.Fprintf(&b, ": `%s`", esc(r.Command))
-			case r.CommandUnavailable:
+			case r.Command != "" && !strings.ContainsAny(r.Command, "`\n\r"):
+				fmt.Fprintf(&b, ": `%s`", r.Command)
+			case r.Command != "" || r.CommandUnavailable:
 				b.WriteString(": rename the token in Settings to get a copyable command")
 			}
 		}
@@ -165,5 +177,9 @@ func renderSlack(d dm) notifysvc.SlackRender {
 			fmt.Fprintf(&b, "\n…and %d more", d.Total-len(d.Runs))
 		}
 	}
-	return notifysvc.SlackRender{Emoji: "⚠️", Title: title, Body: b.String()}
+	r := notifysvc.SlackRender{Emoji: "⚠️", Title: title, Body: b.String()}
+	if d.ResetsAt != nil {
+		r.Facts = []string{resetFact(*d.ResetsAt)}
+	}
+	return r
 }

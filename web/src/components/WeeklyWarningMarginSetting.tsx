@@ -138,7 +138,7 @@ export function WeeklyWarningMarginSetting({
         <p id={helpId} className="mt-1 text-sm text-muted">
           Hear about a credential before its 7-day allowance runs out. Once its weekly usage is
           within this many points of the limit (your weekly reserve when set, otherwise 100%), the
-          run page and the Overview show whether each affected run can move and what to change. A linked Slack account also gets one DM per weekly period. Set 0 to turn early warnings off.
+          run page and the Overview show whether each affected run can move and what to change. A linked Slack account also gets one DM per observed weekly period. Set 0 to turn early warnings off, and the DM with them.
         </p>
       </div>
 
