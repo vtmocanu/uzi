@@ -5324,7 +5324,7 @@ describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
   // PRD #4123: the weekly-limit banner sits in the same header, under the credential chip.
   // Same source-presence ceiling as above; WeeklyLimitBanner.test.tsx proves what it renders.
   it("renders the weekly-limit banner from run.weekly_limit, after the credential chip", () => {
-    const banner = live.indexOf("<WeeklyLimitBanner block={run.weekly_limit} />");
+    const banner = live.indexOf("<WeeklyLimitBanner block={run.weekly_limit} parked={weeklyLimitParked(run)} />");
     expect(banner).toBeGreaterThan(-1);
     expect(banner).toBeGreaterThan(live.indexOf("<RunCredential run={run} />"));
     expect(live).toContain('from "../components/WeeklyLimitBanner"');

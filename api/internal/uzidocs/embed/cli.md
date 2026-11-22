@@ -3744,6 +3744,27 @@ On a run the reserve touches, `uzi run get` shows:
 - a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
   `run pause` above.
 
+### Weekly warning margin
+
+```sh
+uzi settings warning-margin 15
+uzi settings warning-margin off
+```
+
+`uzi settings warning-margin <0..50|off>` sets how many percentage points below its
+effective weekly limit a credential must be before the [early
+warning](./rate-limits.md#early-warning-before-the-weekly-limit) shows. The
+default is 15; `0` (or `off`) turns early warnings off (park explanations stay).
+A value outside 0..50 is a usage error. It posts to `PUT /api/me/weekly-warning-margin`
+(`{"margin_pts": <0..50>}`), which accepts a `uzc_` Bearer token; the response
+is `{"weekly_warning_margin_pts": <n>}`. Human output prints `Weekly warning
+margin: 15 points`, or a `Weekly warning margin: 0 (off ...)` line when off;
+`--json` returns `weekly_warning_margin_pts`. `uzi settings get` prints the same
+`Weekly warning margin:` line and its `--json` carries the field.
+
+For a run that is near its weekly limit but not yet parked, `uzi run get` shows
+the same `WEEKLY_LIMIT` and `FIX` rows as for a park.
+
 ### Codex account mode
 
 ```sh

@@ -263,6 +263,10 @@ type Client interface {
 	// subscription; pauseRunning also pauses running runs. Both are always sent (the
 	// server requires both). RequireUser, so a uzc_ token reaches it. Returns the updated user.
 	SetUsageReserve(ctx context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error)
+	// SetWeeklyWarningMargin sets the caller's weekly-limit early-warning margin (PRD #4123):
+	// PUT /api/me/weekly-warning-margin {"margin_pts": 0..50}, 0 = off. RequireUser, so a
+	// uzc_ token reaches it. Returns the saved value.
+	SetWeeklyWarningMargin(ctx context.Context, marginPts int) (int, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
 	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that

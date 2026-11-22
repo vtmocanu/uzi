@@ -11,6 +11,11 @@
 // owner pastes into a shell; the server already shell-quotes them and withholds any
 // command whose label is not command-safe, flagging command_unavailable "label").
 //
+// The block rides a run parked on its weekly limit (M1) and, from M2, any non-terminal run whose
+// credential is near or at it. `parked` tells the two apart so the wait line is a fact for a
+// parked run ("It waits for the reset") and a conditional for one still working ("If it reaches
+// the limit, it waits"). The headline reads the same either way.
+//
 // The one visual device is the meter under the headline: a thin track filled to the weekly use, with a tick
 // at the effective limit (the reserve when set, else 100). It is aria-hidden; the sentence
 // beside it carries the same numbers.
@@ -68,8 +73,52 @@ function reasonSentence(block: WeeklyLimit): string {
   }
 }
 
-// Only `waits` mentions a resume: `fails` and `unknown` must never read as a promise.
-function waitSentence(block: WeeklyLimit, reset: string | null): string {
+// Whether the run is stopped on its weekly limit right now: a seven_day limit_wait or a
+// weekly-reserve pause (the server's M1 park cases). Anything else carrying the block is near
+// or at the limit while still running, queued or waiting on something else.
+export function weeklyLimitParked(run: { status: string; rate_limit_type?: string | null; hold_reason?: string | null }): boolean {
+  return (
+    (run.status === "limit_wait" && run.rate_limit_type === "seven_day") ||
+    (run.status === "paused" && run.hold_reason === "weekly_reserve")
+  );
+}
+
+// The headline: the credential, its weekly use against the effective limit, and the reset.
+// With a reserve the limit is the owner's threshold, so it is named as theirs.
+function headline(block: WeeklyLimit, reset: string | null): string {
+  const label = quoted(block.credential_label);
+  const when = reset ? `(resets ${reset})` : "(reset time unknown)";
+  if (block.pct === null) return `Weekly usage of ${label} is unknown ${when}.`;
+  const pct = pctText(block.pct);
+  const limit = pctText(block.effective_limit);
+  const reserve = block.effective_limit < 100;
+  if (block.pct >= block.effective_limit) {
+    return reserve
+      ? `${label} is at ${pct} of its weekly allowance, past your ${limit} reserve ${when}.`
+      : `${label} has reached its weekly limit ${when}.`;
+  }
+  return reserve
+    ? `${label} is at ${pct} of its weekly allowance; your reserve holds runs at ${limit} ${when}.`
+    : `${label} is at ${pct} of its weekly limit ${when}.`;
+}
+
+// Only `waits` mentions a resume: `fails` and `unknown` must never read as a promise. A run
+// that is not parked has not hit the limit yet, so its line is conditional.
+function waitSentence(block: WeeklyLimit, reset: string | null, parked: boolean): string {
+  if (!parked) {
+    switch (block.wait) {
+      case "waits":
+        return reset
+          ? `If it reaches the limit, it waits for the reset on ${reset}, then resumes.`
+          : "If it reaches the limit, it waits for the weekly reset, then resumes.";
+      case "fails":
+        return "If it reaches the limit, it fails instead of waiting for the reset.";
+      case "reserve_pause":
+        return "At your reserve it pauses after its current milestone, until a fresh reading shows usage below the reserve or you resume it.";
+      default:
+        return "Whether it waits for the reset at the limit is not known.";
+    }
+  }
   switch (block.wait) {
     case "waits":
       return reset
@@ -177,16 +226,17 @@ function Meter({ pct, limit, warning }: { pct: number | null; limit: number; war
   );
 }
 
-export function WeeklyLimitBanner({ block }: { block: WeeklyLimit | undefined | null }) {
+export function WeeklyLimitBanner({
+  block,
+  parked,
+}: {
+  block: WeeklyLimit | undefined | null;
+  /** The run is stopped on its weekly limit now (weeklyLimitParked). */
+  parked: boolean;
+}) {
   if (!block) return null;
   const warning = block.tier === "warning";
   const reset = resetText(block.resets_at);
-  const label = quoted(block.credential_label);
-  const limit = pctText(block.effective_limit);
-  const usage =
-    block.pct !== null
-      ? `${label} has used ${pctText(block.pct)} of its weekly allowance, against a limit of ${limit}.`
-      : `Weekly usage of ${label} is unknown, against a limit of ${limit}.`;
 
   return (
     <section
@@ -198,11 +248,11 @@ export function WeeklyLimitBanner({ block }: { block: WeeklyLimit | undefined | 
       )}
     >
       <p className={cx("text-sm font-medium", warning ? "text-warn" : "text-fg")}>
-        {usage} {reset ? `Resets ${reset}.` : "Reset time unknown."}
+        {headline(block, reset)}
       </p>
       <Meter pct={block.pct} limit={block.effective_limit} warning={warning} />
       <p className="text-xs text-muted">
-        {reasonSentence(block)} {waitSentence(block, reset)}
+        {reasonSentence(block)} {waitSentence(block, reset, parked)}
       </p>
       {block.fix.length > 0 && (
         <div className="pt-1">

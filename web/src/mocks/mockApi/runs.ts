@@ -42,7 +42,7 @@ import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
-import { appSettings, mockVaultRateFields } from "./settings";
+import { appSettings, mockVaultRateFields, mockWeeklyWarningMarginPts } from "./settings";
 import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
 // Fixed at module load so refreshing usage does not reset the demo's elapsed clock.
@@ -394,6 +394,21 @@ function withCrossCheckActive(item: RunListItem): RunListItem {
   return { ...item, cross_check_active: active };
 }
 
+// PRD #4123 module 6: margin 0 turns the early (near/at) weekly-limit blocks off, the way the
+// server's weeklylimit loader does; a run parked on its weekly limit (a seven_day limit_wait or
+// a weekly-reserve pause) keeps its park explanation whatever the margin.
+function withWeeklyMargin<T extends { status: string; rate_limit_type?: string | null; hold_reason?: string | null; weekly_limit?: unknown }>(
+  item: T,
+): T {
+  if (item.weekly_limit === undefined || mockWeeklyWarningMarginPts() > 0) return item;
+  const parked =
+    (item.status === "limit_wait" && item.rate_limit_type === "seven_day") ||
+    (item.status === "paused" && item.hold_reason === "weekly_reserve");
+  if (parked) return item;
+  const { weekly_limit: _dropped, ...rest } = item;
+  return rest as T;
+}
+
 // Overload order mirrors realApi.listRuns: summary first, legacy LAST.
 function mockListRuns(params: {
   repoId?: string;
@@ -424,7 +439,7 @@ function mockListRuns(params?: {
     .filter((r) => !(r.id in mockOtherRunOwners))
     .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
     .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-    .map((r) => withCrossCheckActive(withPendingQuestion(runListItem(harnessOverlay(r)))));
+    .map((r) => withWeeklyMargin(withCrossCheckActive(withPendingQuestion(runListItem(harnessOverlay(r))))));
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
@@ -910,7 +925,7 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    const decorated = { ...harnessOverlay(credentialOverlay(id in mockOtherRunOwners ? foreignCooldownRun(run) : run)) };
+    const decorated = withWeeklyMargin({ ...harnessOverlay(credentialOverlay(id in mockOtherRunOwners ? foreignCooldownRun(run) : run)) });
     if (id in mockOtherRunOwners) {
       delete decorated.account_cooldown_class;
       delete decorated.account_cooldown_eligible_at;

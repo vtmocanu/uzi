@@ -108,6 +108,8 @@ A run parked on a **7-day** window (`limit_wait` with window `seven_day`), or pa
 
 `fails` and `unknown` never promise a resume.
 
+**Before a park.** The block also appears on a running or queued run whose credential is near or at its weekly limit, before anything parks; the reason and fix rows read the same, and the wait statement is a preview of what would happen at the limit. It is controlled by your warning margin and omitted for stale readings, API keys and custom providers; see [Early warning before the weekly limit](rate-limits.md#early-warning-before-the-weekly-limit).
+
 **Where it shows.** The run page, `uzi run get` (the `WEEKLY_LIMIT` and `FIX` rows, see [CLI](cli.md)), the TUI run detail, and the Slack park message (`⏸️ Paused · usage limit` or the weekly-reserve pause line), which appends the reason and, when there is one, a copyable fix command.
 
 **Fix commands.** Each fix appears only when it would apply to this run. Commands that name a token put every flag before a `--` and the quoted label after it, so a label such as `--auto` is read as a label, not a flag:

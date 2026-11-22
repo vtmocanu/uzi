@@ -620,6 +620,10 @@ export interface UserSettings {
   weekly_reserve_pct?: number | null;
   /** PRD #3522: also pause running runs at the reserve (default true). */
   weekly_reserve_pause_running?: boolean;
+  /** PRD #4123: the weekly-limit early-warning margin in percentage points (0..50, default 15);
+   *  0 turns the early warnings off (park explanations stay). Written only through
+   *  PUT /me/weekly-warning-margin. Absent on a server that predates the setting. */
+  weekly_warning_margin_pts?: number;
   /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
    *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
   codex_account_mode?: CodexAccountMode | string;

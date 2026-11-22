@@ -518,6 +518,37 @@ legacy/unavailable evidence is **not recorded**. Usage meters, forecasts,
 usage-independent run readers and claim/resume admission keep their existing
 behavior; inspecting a run does not recompute its decision from live usage.
 
+## Early warning before the weekly limit
+
+You do not have to wait for a park to learn that a run is heading for its weekly limit. uzi shows the same weekly-limit block that explains a park (see [Why the run did not move to another token](run-limit-wait.md#why-the-run-did-not-move-to-another-token)) **before** the run parks, so you can act while the run is still going.
+
+**When it appears.** On any run that is not finished and already names a vendor subscription credential (an Anthropic token or a linked Codex account), when that credential's 7-day reading is **near or at its effective weekly limit**. Where it shows:
+
+- **Run page:** a banner with the credential, its usage, when the window resets, and what happens if you do nothing.
+- **Overview:** a `limit` item under **Needs your decision** for a run whose block carries a fix you can apply (a warning-tier block), grouped per credential so several runs on one token read as one item. A near-limit run with nothing to fix shows the banner only.
+- **CLI and TUI:** `uzi run get` and the TUI run detail show the same `WEEKLY_LIMIT` and `FIX` rows as for a park (see [CLI](cli.md#weekly-warning-margin)).
+
+**The effective limit.** Your [weekly usage reserve](#weekly-usage-reserve) threshold when one is set, otherwise 100%. A credential is **at** its limit when its 7-day percent (unrounded) is at or above that, and **near** when it is within your margin of it. With a 70% reserve and a 15 point margin, the warning starts at 55%.
+
+**The margin.** `weekly_warning_margin_pts` is a per-user setting in percentage points, a whole number from 0 to 50, **15 by default**. `0` turns the early warnings off; the explanations on parked runs stay.
+
+| Surface | How |
+|---|---|
+| **Settings → Run defaults → Usage limits** | The weekly warning margin field. |
+| **CLI** | `uzi settings warning-margin <0..50>`; `uzi settings get` shows the current value. |
+| **API** | `PUT /api/me/weekly-warning-margin` with `{"margin_pts": <0..50>}`. The field is required and must be an integer; the response is `{"weekly_warning_margin_pts": <n>}`. A `uzc_` Bearer token works. |
+
+**What does not warn.**
+
+- **A stale, missing or partial reading shows no warning.** The early warning needs a fresh, usable 7-day reading (the freshness rule in [How fresh is this?](#how-fresh-is-this)). An unknown reading is never presented as near. This differs from the reserve, which holds new work on an unknown reading.
+- **Runs with no subscription window:** Anthropic console API keys, Codex runs on an OpenAI API key or API-key alias, and runs on a [custom model provider](providers.md).
+- **Runs not yet bound to a credential**, such as a queued run that has not been assigned one.
+- **Finished runs.**
+
+**Nothing switches automatically.** The warning is information plus the fix commands that would apply; it never changes a run's token or account, pauses it, or holds work. Only the [weekly usage reserve](#weekly-usage-reserve) holds or pauses, and only a real provider limit parks a run.
+
+**Not shipped yet:** Slack warning DMs. Slack still posts only the park messages.
+
 ## Weekly usage reserve
 
 If you share one subscription between uzi and your own work, you can keep part

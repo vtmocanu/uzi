@@ -421,6 +421,10 @@ type FakeClient struct {
 	LastReservePct   *int
 	LastReservePause bool
 
+	// SetWeeklyWarningMargin capture (PRD #4123): call count and the margin the command sent.
+	MarginCalls   int
+	LastMarginPts int
+
 	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
 	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
 	// what the command sent.
