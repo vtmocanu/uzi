@@ -64,6 +64,9 @@ Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `NPM_TOKEN`, `GRADLE_OPTS`, `DOCKER_AUTH_CONFIG`, `NO_COLOR`. The full list is
 `fixtures/run-env/name-rules.json`.
 
+A variable whose name became denied after it was saved can still be disabled or
+deleted, but never enabled or edited.
+
 ## Entering a value
 
 The value field is a single line by default; a secret is masked by a password

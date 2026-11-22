@@ -140,6 +140,23 @@ func TestFixtureOverlapDecisions(t *testing.T) {
 	}
 }
 
+func TestValidateNameShape(t *testing.T) {
+	for _, n := range []string{"TMPDIR", "UZI_X", "HTTP_PROXY", "DATABASE_URL"} {
+		if err := ValidateNameShape(n); err != nil {
+			t.Errorf("ValidateNameShape(%q) = %v, want accepted", n, err)
+		}
+	}
+	for _, n := range []string{"SystemDrive", "Temp", "1A", "", strings.Repeat("A", 129)} {
+		err := ValidateNameShape(n)
+		if err == nil || !strings.Contains(err.Error(), "^[A-Z_][A-Z0-9_]{0,127}$") {
+			t.Errorf("ValidateNameShape(%q) = %v, want the grammar error", n, err)
+		}
+	}
+	if err := ValidateName("TMPDIR"); err == nil {
+		t.Error("ValidateName(TMPDIR) accepted a denied name")
+	}
+}
+
 func TestValidateNameTable(t *testing.T) {
 	tests := []struct {
 		name    string
