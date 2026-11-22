@@ -116,6 +116,15 @@ func nearOrAt(run store.Run, snap *workersvc.NextClaimSnapshot) bool {
 	return false
 }
 
+func anyParked(runs []store.Run) bool {
+	for _, r := range runs {
+		if parked(r) {
+			return true
+		}
+	}
+	return false
+}
+
 // ForRuns builds the blocks for one owner's runs. Runs that cannot carry a block are dropped before
 // anything is read; when none remain no snapshot is loaded at all. A load failure yields no blocks
 // (the surfaces then simply omit the block, as for an unparked run). The map holds only runs with a block.
@@ -130,6 +139,11 @@ func (l *Loader) ForRuns(ctx context.Context, ownerID uuid.UUID, runs []store.Ru
 		return nil
 	}
 	snap, err := l.svc.LoadNextClaimSnapshot(ctx, ownerID, l.now())
+	if err == nil && snap.MarginPts <= 0 && !anyParked(eligible) {
+		// Early warnings are off and nothing is parked: no run can carry a block, so skip the
+		// per-run settling reads.
+		return nil
+	}
 	if err == nil {
 		err = l.svc.LoadNextClaimSettling(ctx, snap, eligible)
 	}

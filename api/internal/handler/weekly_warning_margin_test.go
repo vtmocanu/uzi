@@ -141,6 +141,20 @@ func TestSetWeeklyWarningMarginRequiresUser(t *testing.T) {
 	}
 }
 
+type noUserMarginDB struct{ fakeMarginDB }
+
+func (noUserMarginDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
+}
+
+func TestSetWeeklyWarningMarginMissingUserRowIs401(t *testing.T) {
+	h := &Handler{q: store.New(&noUserMarginDB{})}
+	rec := putMargin(h, uuid.New(), `{"margin_pts":15}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing user row: status = %d, want 401", rec.Code)
+	}
+}
+
 // TestGetMySettingsCarriesTheWarningMargin: the margin round-trips through GET /api/me/settings,
 // including 0 (off), which must not be dropped as an empty value.
 func TestGetMySettingsCarriesTheWarningMargin(t *testing.T) {

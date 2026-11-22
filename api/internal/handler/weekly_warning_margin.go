@@ -3,8 +3,11 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -59,6 +62,11 @@ func (h *Handler) SetWeeklyWarningMargin(w http.ResponseWriter, r *http.Request)
 		ID:        user.ID,
 		MarginPts: int16(n),
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The session names a user row that no longer exists.
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 	if err != nil {
 		slog.Error("set user weekly warning margin", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

@@ -301,3 +301,39 @@ func TestWeeklyFixCommandsRoundTripThroughRealCLI(t *testing.T) {
 		}
 	})
 }
+
+// TestWeeklyWaitTextParkedVersusNearLimit: a run that is not parked is never described as paused or
+// waiting, only conditionally; a parked run keeps the unconditional wording.
+func TestWeeklyWaitTextParkedVersusNearLimit(t *testing.T) {
+	seven, reserve := "seven_day", "weekly_reserve"
+	cases := []struct {
+		name    string
+		status  string
+		rl, hr  *string
+		wait    string
+		want    string
+		notWant string
+	}{
+		{"running reserve_pause", "running", nil, nil, "reserve_pause", "if usage reaches the reserve, the run pauses until usage drops below it or you resume it", "stays paused"},
+		{"running waits", "running", nil, nil, "waits", "if it reaches the limit, it waits for the reset", "the run waits for the reset"},
+		{"running fails", "running", nil, nil, "fails", "if it reaches the limit, it fails", "instead of waiting"},
+		{"parked limit_wait waits", "limit_wait", &seven, nil, "waits", "the run waits for the reset", "if it reaches"},
+		{"parked weekly reserve pause", "paused", nil, &reserve, "reserve_pause", "the run stays paused until usage drops below the reserve or you resume it", "if usage"},
+		{"five_hour limit_wait is not parked", "limit_wait", ptrS("five_hour"), nil, "waits", "if it reaches the limit, it waits for the reset", "the run waits for the reset"},
+	}
+	for _, c := range cases {
+		r := weeklyRun()
+		r.Status, r.RateLimitType, r.HoldReason = c.status, c.rl, c.hr
+		w := weeklyBlock()
+		w.Wait = c.wait
+		r.WeeklyLimit = w
+		cell, tui := weeklyLimitCell(r), weeklyLimitTUILine(r)
+		for _, got := range []string{cell, tui} {
+			if !strings.Contains(got, c.want) || (c.notWant != "" && strings.Contains(got, c.notWant)) {
+				t.Errorf("%s: %q want %q, not %q", c.name, got, c.want, c.notWant)
+			}
+		}
+	}
+}
+
+func ptrS(s string) *string { return &s }

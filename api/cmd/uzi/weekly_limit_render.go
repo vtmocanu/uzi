@@ -23,7 +23,8 @@ const weeklyEditReserveText = "raise or turn off the weekly reserve in Settings 
 // effective limit, the reset time, the server-built reason and whether the run waits. Empty for a
 // run without the block (emit-only-when-set). Labels are owner-authored, so they go through cellText
 // and a bound; the reason and wait text are fixed prose.
-func weeklyLimitCell(w *apitypes.WeeklyLimitDTO) string {
+func weeklyLimitCell(r apitypes.RunDTO) string {
+	w := r.WeeklyLimit
 	if w == nil {
 		return ""
 	}
@@ -42,7 +43,7 @@ func weeklyLimitCell(w *apitypes.WeeklyLimitDTO) string {
 	if reason := weeklyReasonText(w); reason != "" {
 		b.WriteString("; " + reason)
 	}
-	if wait := weeklyWaitText(w.Wait); wait != "" {
+	if wait := weeklyWaitText(w.Wait, weeklyLimitParked(r)); wait != "" {
 		b.WriteString("; " + wait)
 	}
 	return b.String()
@@ -57,16 +58,44 @@ func weeklyReasonText(w *apitypes.WeeklyLimitDTO) string {
 	return c.ReasonText()
 }
 
-func weeklyWaitText(wait string) string {
+// weeklyLimitParked mirrors the web's weeklyLimitParked: the run is parked on its weekly limit
+// (limit_wait on the seven_day window) or held by the weekly reserve. Any other run with a block
+// is a live or queued run near its limit, so what happens at the limit is conditional.
+func weeklyLimitParked(r apitypes.RunDTO) bool {
+	switch r.Status {
+	case "limit_wait":
+		return r.RateLimitType != nil && *r.RateLimitType == "seven_day"
+	case "paused":
+		return r.HoldReason != nil && *r.HoldReason == "weekly_reserve"
+	}
+	return false
+}
+
+// weeklyWaitText says what the run does at (parked) or if it reaches (not parked) the limit. A run
+// that is not parked is never described as paused or waiting.
+func weeklyWaitText(wait string, parked bool) string {
+	if parked {
+		switch wait {
+		case "waits":
+			return "the run waits for the reset"
+		case "fails":
+			return "the run fails instead of waiting"
+		case "reserve_pause":
+			return "the run stays paused until usage drops below the reserve or you resume it"
+		case "unknown":
+			return "whether the run waits is not known"
+		}
+		return ""
+	}
 	switch wait {
 	case "waits":
-		return "the run waits for the reset"
+		return "if it reaches the limit, it waits for the reset"
 	case "fails":
-		return "the run fails instead of waiting"
+		return "if it reaches the limit, it fails"
 	case "reserve_pause":
-		return "the run stays paused until usage drops below the reserve or you resume it"
+		return "if usage reaches the reserve, the run pauses until usage drops below it or you resume it"
 	case "unknown":
-		return "whether the run waits is not known"
+		return "whether the run waits at the limit is not known"
 	}
 	return ""
 }
@@ -104,7 +133,7 @@ func weeklyLimitTUILine(r apitypes.RunDTO) string {
 	if w == nil {
 		return ""
 	}
-	line := "weekly limit: " + weeklyLimitCell(w)
+	line := "weekly limit: " + weeklyLimitCell(r)
 	// Only when `uzi run get` would print at least one run-level FIX row (future-run advice does not count).
 	if len(weeklyLimitFixRows(&apitypes.WeeklyLimitDTO{Fix: w.Fix})) > 0 {
 		line += " (fix: uzi run get " + cellText(r.ID) + ")"

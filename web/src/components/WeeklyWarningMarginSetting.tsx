@@ -1,7 +1,7 @@
 // Settings → Run defaults → Usage limits: the weekly-limit warning margin (PRD #4123 module 6).
 // How many percentage points before a credential's effective weekly limit (the reserve when
-// set, else 100%) uzi starts warning: the run-page banner, the Overview decision item and the
-// Slack DM. 0 turns those early warnings off; a run parked on its weekly limit still explains
+// set, else 100%) uzi starts warning: the run-page banner and the Overview decision item.
+// 0 turns those early warnings off; a run parked on its weekly limit still explains
 // why, whatever the margin.
 //
 // One endpoint owns it (PUT /api/me/weekly-warning-margin, the value read back from GET
@@ -33,7 +33,7 @@ function parseMargin(raw: string): number | null {
 // reserve when one is set, so the sentence names the actual percentage warnings start at.
 function effectText(margin: number, reservePct: number | null): string {
   if (margin === 0) {
-    return "Early warnings are off: no banner, no Overview item and no Slack message before a limit. A run parked on its weekly limit still says why and what you can change.";
+    return "Early warnings are off: no banner and no Overview item before a limit. A run parked on its weekly limit still says why and what you can change.";
   }
   const limit = reservePct ?? 100;
   const start = Math.max(0, limit - margin);
@@ -138,8 +138,7 @@ export function WeeklyWarningMarginSetting({
         <p id={helpId} className="mt-1 text-sm text-muted">
           Hear about a credential before its 7-day allowance runs out. Once its weekly usage is
           within this many points of the limit (your weekly reserve when set, otherwise 100%), the
-          run page and the Overview show whether each affected run can move and what to change, and
-          Slack messages you at most once per weekly window. Set 0 to turn early warnings off.
+          run page and the Overview show whether each affected run can move and what to change. Set 0 to turn early warnings off.
         </p>
       </div>
 

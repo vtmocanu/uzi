@@ -67,7 +67,7 @@ describe("WeeklyWarningMarginSetting (PRD #4123)", () => {
     fireEvent.change(input(), { target: { value: "0" } });
     fireEvent.keyDown(input(), { key: "Enter" });
     await waitFor(() => expect(mockApi.setWeeklyWarningMargin).toHaveBeenCalledWith(0));
-    expect(effect()).toMatch(/^Early warnings are off: no banner, no Overview item and no Slack message before a limit\./);
+    expect(effect()).toMatch(/^Early warnings are off: no banner and no Overview item before a limit\./);
     expect(effect()).toMatch(/A run parked on its weekly limit still says why/);
   });
 

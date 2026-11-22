@@ -218,7 +218,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	}
 	// WEEKLY_LIMIT / FIX (PRD #4123): the server-built weekly-limit block, emit-only-when-set. The
 	// labels are owner-authored and bounded; the FIX command is sanitized but never truncated.
-	if cell := weeklyLimitCell(r.WeeklyLimit); cell != "" {
+	if cell := weeklyLimitCell(r); cell != "" {
 		rows = append(rows, []string{"WEEKLY_LIMIT", cell})
 		rows = append(rows, weeklyLimitFixRows(r.WeeklyLimit)...)
 	}

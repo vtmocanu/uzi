@@ -381,3 +381,17 @@ func TestSameLabelOnDifferentAccountsKeepsDistinctKeys(t *testing.T) {
 		t.Fatalf("keys = %v; want three distinct identity keys", keys)
 	}
 }
+
+// A multi-run list with the early warnings off and nothing parked loads exactly one snapshot and
+// yields no block.
+func TestMarginOffListWithNothingParkedLoadsOneSnapshot(t *testing.T) {
+	f := nearStore(96, 0)
+	a, b, c := runningRun(), runningRun(), runningRun()
+	got := blockFor(t, f, a, b, c)
+	if len(got) != 0 {
+		t.Fatalf("blocks = %+v; want none with margin 0", got)
+	}
+	if f.candCnt.Load() != 1 {
+		t.Fatalf("candidate reads = %d; want exactly one snapshot", f.candCnt.Load())
+	}
+}
