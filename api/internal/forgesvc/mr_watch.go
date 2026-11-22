@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // SyncMRStates is the MR-close watcher (PRD #24 M3). The poller calls it once per
@@ -103,10 +104,9 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// Attempt it every tick, ahead of the move. Re-attempts converge: once the
 		// run is terminal (server-side path) GetActiveMRReworkRunForMR returns no
 		// rows → no-op nil; while a live worker's run is still non-terminal a
-		// re-entry re-stamps stop_kind and re-enqueues a cancel verdict, which is
-		// harmless (the worker cancels on the first it consumes) and only occurs in
-		// the narrow window where the move keeps deferring before the worker acks.
-		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64)
+		// re-entry is also a no-op: the fenced cancel writes only when stop_kind IS
+		// NULL, and the first stamp already set it.
+		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64, observed)
 		if cancelErr != nil {
 			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", cancelErr)
 		}
@@ -142,7 +142,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// `locked` was mid-merge. A `locked`->`opened` settle is a non-terminal
 		// transition and must NOT cancel — the rework gate stays open.
 		if observed == forge.MRStateMerged || observed == forge.MRStateClosed {
-			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
+			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64, observed); err != nil {
 				slog.Warn("forgesvc: cancel rework on MR terminal state failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "state", observed, "error", err)
 				return // leave mr_state unadvanced so the next tick retries
 			}
@@ -155,11 +155,11 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 // (issue #853). Returns nil when no canceller is wired or no active rework exists.
 // A non-nil error means the caller must LEAVE mr_state unadvanced (don't consume the
 // edge) so the next poller tick retries — same contract as a forge-side failure.
-func (s *Service) cancelReworkOnClosedMR(ctx context.Context, repoID uuid.UUID, mrIID int64) error {
+func (s *Service) cancelReworkOnClosedMR(ctx context.Context, repoID uuid.UUID, mrIID int64, observed string) error {
 	if s.reworkCanceller == nil {
 		return nil
 	}
-	return s.reworkCanceller.CancelReworkForMR(ctx, repoID, mrIID, "MR merged/closed during rework")
+	return s.reworkCanceller.CancelReworkForMR(ctx, repoID, mrIID, workersvc.TerminalTargetStopReason(observed))
 }
 
 // moveOutcome is the result of a guarded MR-state move, distinguishing the two

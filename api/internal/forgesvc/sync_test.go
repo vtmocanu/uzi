@@ -1,6 +1,7 @@
 package forgesvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -336,6 +337,9 @@ type fakeStore struct {
 
 	boardFreeCandidates    []store.ListBoardFreeMRStateWatchCandidatesRow
 	boardFreeCandidatesErr error
+	activeTargetRuns       []store.ListActiveMRTargetRunsRow
+	activeTargetErr        error
+	activeTargetArgs       []store.ListActiveMRTargetRunsParams
 	issue                  store.Issue
 	issueErr               error
 	columns                []store.BoardColumn
@@ -457,6 +461,25 @@ func (s *fakeStore) ListMRWatchCandidates(context.Context, uuid.UUID) ([]store.L
 }
 func (s *fakeStore) ListBoardFreeMRStateWatchCandidates(context.Context, uuid.UUID) ([]store.ListBoardFreeMRStateWatchCandidatesRow, error) {
 	return s.boardFreeCandidates, s.boardFreeCandidatesErr
+}
+
+// ListActiveMRTargetRuns mimics the store query: runs with id > AfterID in id order, LIMIT 33.
+// activeTargetRuns must be seeded in ascending id order.
+func (s *fakeStore) ListActiveMRTargetRuns(_ context.Context, arg store.ListActiveMRTargetRunsParams) ([]store.ListActiveMRTargetRunsRow, error) {
+	s.activeTargetArgs = append(s.activeTargetArgs, arg)
+	if s.activeTargetErr != nil {
+		return nil, s.activeTargetErr
+	}
+	var out []store.ListActiveMRTargetRunsRow
+	for _, r := range s.activeTargetRuns {
+		if bytes.Compare(r.ID[:], arg.AfterID[:]) > 0 {
+			out = append(out, r)
+		}
+	}
+	if len(out) > 33 {
+		out = out[:33]
+	}
+	return out, nil
 }
 func (s *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
 	return s.issue, s.issueErr

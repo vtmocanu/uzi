@@ -721,6 +721,14 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		slog.Error("poller: sync board-free MR states", "repo", r.PathWithNamespace, "error", err)
 	}
 
+	// Active MR-target cancel (issue #4616): stop active ci_fix / mr_rework runs whose bound
+	// MR has merged or closed, from live forge data keyed on the run's own MR binding (no
+	// board or run-row mr_state needed). Per-run errors are log-and-skipped inside; only an
+	// enumeration failure surfaces here.
+	if err := e.svc.SyncActiveMRTargets(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+		slog.Error("poller: sync active MR targets", "repo", r.PathWithNamespace, "error", err)
+	}
+
 	// PRD-link patch (PRD #72 M5): once a run's MR has merged, rewrite the issue's
 	// own `prds/*.md` link to the path the run moved the file to. Placed HERE — after
 	// SyncMRStates, before the filed→close sync — because it needs a live forge

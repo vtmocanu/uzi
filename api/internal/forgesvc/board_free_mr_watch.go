@@ -85,7 +85,7 @@ func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, 
 		// records `closed` (self-evicting the run from the candidate set) without ever
 		// cancelling. No board move (board-free). On cancel failure leave mr_state
 		// unadvanced so the next tick re-observes the edge and retries.
-		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
+		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64, observed); err != nil {
 			slog.Warn("forgesvc: cancel board-free rework on MR terminal state failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed, "error", err)
 			return
 		}

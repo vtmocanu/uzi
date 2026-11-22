@@ -91,6 +91,15 @@ func terminalTargetStopReason(state string) string {
 // callers (the MR watcher) that pass it to CancelReworkForMR.
 func TerminalTargetStopReason(state string) string { return terminalTargetStopReason(state) }
 
+// IsSafeTerminalTargetBranch and IsFullCommitSHA expose the publication identity rules
+// (safePublicationIdentifier, isSettleSHA) to the forge poller so its merged/closed
+// verification uses the one definition the completed-publication proof uses. They are
+// thin wrappers: forgesvc already imports workersvc, so no shared package is needed.
+func IsSafeTerminalTargetBranch(branch string) bool { return safePublicationIdentifier(branch) }
+
+// IsFullCommitSHA reports whether s is a 40-char lowercase hex commit id.
+func IsFullCommitSHA(s string) bool { return isSettleSHA(s) }
+
 // CancelRunForTerminalTarget stops one active ci_fix / mr_rework run whose verified target MR
 // is merged or closed (issue #4616). A run with a live worker gets a stamped cancel input the
 // worker drains; a queued, limit_wait or pool_wait run is cancelled server-side; paused,
