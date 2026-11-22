@@ -431,7 +431,12 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         assert.ok(JSON.stringify(emitted).includes("private CA complete"), "resumed execution completes");
         const resumedGeneration = (await fs.readFile(store + "/current", "utf8")).trim();
         assert.match(resumedGeneration, /^[a-zA-Z0-9_-]+$/);
+        transcripts = 0;
+        transcriptBytes = 0;
+        runtimeMetadata = false;
         await inspectSubset(store + "/generations/" + resumedGeneration);
+        assert.ok(transcripts > 0 && transcriptBytes > 0, "resumed generation contains nonempty runtime sessions");
+        assert.equal(runtimeMetadata, true, "resumed generation retains original runtime session metadata");
         console.log("fresh-executor-resume-observed", "trusted", "same-runtime-session", "prior-history", "distinct-root-auth-home", "old-root-absent");
 
       } else {
