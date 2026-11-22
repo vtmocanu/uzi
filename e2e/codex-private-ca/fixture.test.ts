@@ -293,6 +293,48 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
       if (row === "trusted") {
         await run;
         console.log("await-returned", id, "executor.run");
+        // Production run finally persists the final epoch before returning. Read only;
+        // never invoke persist or manufacture sessions in this observation.
+        const store = "/data/agent-home/ca-trusted/codex-session-store";
+        const current = (await fs.readFile(store + "/current", "utf8")).trim();
+        assert.ok(/^[a-zA-Z0-9_-]+$/.test(current), "published generation is a safe path component");
+        const generation = store + "/generations/" + current;
+        const pem = await fs.readFile(caFile);
+        let transcripts = 0, transcriptBytes = 0, runtimeMetadata = false;
+        const inspectSubset = async (dir: string, relative = ""): Promise<void> => {
+          for (const name of await fs.readdir(dir)) {
+            const file = dir + "/" + name, rel = relative ? relative + "/" + name : name;
+            const stat = await fs.lstat(file);
+            assert.equal(stat.isSymbolicLink(), false, "copied subset has no symlinks");
+            assert.equal(/auth|config|provider-extra-ca\.crt/i.test(name), false,
+              "copied subset excludes auth/config/staged CA artifacts");
+            if (stat.isDirectory()) {
+              assert.ok(rel === "sessions" || rel.startsWith("sessions/"), "only sessions subtree copied");
+              await inspectSubset(file, rel);
+            } else {
+              assert.ok(stat.isFile() && rel.startsWith("sessions/") && name.endsWith(".jsonl"),
+                "only runtime session JSONL files copied");
+              const bytes = await fs.readFile(file);
+              assert.equal(bytes.includes(pem), false, "copied subset excludes configured public PEM");
+              assert.equal(bytes.includes(Buffer.from(credential)), false, "copied subset excludes runtime key");
+              assert.equal(bytes.includes(Buffer.from("-----BEGIN CERTIFICATE-----")), false,
+                "copied subset excludes PEM certificate blocks");
+              assert.ok(bytes.length > 0, "copied runtime transcript is nonempty");
+              transcripts++;
+              transcriptBytes += bytes.length;
+              for (const line of bytes.toString("utf8").split("\n").filter(Boolean)) {
+                let entry: any;
+                try { entry = JSON.parse(line); } catch { assert.fail("copied transcript contains invalid JSONL"); }
+                if (entry.type === "session_meta" && typeof entry.payload?.id === "string" &&
+                    /^[0-9a-f-]{36}$/i.test(entry.payload.id)) runtimeMetadata = true;
+              }
+            }
+          }
+        };
+        await inspectSubset(generation);
+        assert.ok(transcripts > 0 && transcriptBytes > 0, "production persist captured nonempty runtime sessions");
+        assert.equal(runtimeMetadata, true, "copied transcript contains real runtime session metadata");
+        console.log("persisted-session-subset-observed", "trusted", "nonempty-runtime-jsonl", "exclusions-pass");
         assert.ok(receipts.length >= 2, "tool call then assistant completion reached our listener");
         assert.ok(JSON.stringify(emitted).includes("private CA complete"));
       } else {
