@@ -144,7 +144,8 @@ FROM runs r WHERE r.id = @run_id;
 -- Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
 -- longer queued or no longer admits its recorded worker under claim provenance. A run that left
 -- 'queued' (claimed, cancelled, finished) qualifies, and so does a row whose worker is hibernated
--- or preparing again (the wake can no longer serve the run). An awake worker's row is kept while
+-- or preparing again, or has lost the frozen provider's engine protocol (the wake can no longer
+-- serve the run). An awake worker's row is kept while
 -- the queued run still admits it, so one pending run never wakes a valid worker twice.
 -- A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 SELECT hw.run_id, hw.worker_id
@@ -153,6 +154,13 @@ JOIN runs r ON r.id = hw.run_id
 JOIN workers w ON w.id = hw.worker_id
 WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
    OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
+   OR (r.model_provider_key_mode IS NOT NULL AND NOT CASE r.harness
+       WHEN 'claude' THEN 'claude_provider_v1' = ANY(w.protocol_capabilities)
+       WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities)
+                        AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+                        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+       ELSE false
+   END)
 ORDER BY hw.worker_id, hw.run_id
 LIMIT @max_rows;
 

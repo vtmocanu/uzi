@@ -1,6 +1,9 @@
 package workersvc
 
 import (
+	"context"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -88,6 +91,56 @@ func wantCodexWake(t *testing.T, f *hibFx, run, worker uuid.UUID) {
 	f.wantOrigins(worker, "", WakeOriginDemand)
 }
 
+// Register the actual replacement with its protocol, rather than the generic
+// hibernation fixture's nil capabilities (which replace the advertised protocol).
+func settleCodexWakeReplacement(t *testing.T, f *hibFx, id uuid.UUID) {
+	t.Helper()
+	next := uuid.New()
+	f.env.exec(`UPDATE workers SET registered_pod_uid=$2 WHERE id=$1`, id, next)
+	f.heartbeatNow(id)
+	f.mustApply(id, TransitionReady, next)
+	f.want(id, "waking")
+	if _, _, err := f.svc.RegisterWithCrossCheckSlots(f.env.ctx, f.row(id), "v1", "", nil, nil, nil, codexWakeCaps(), nil, next); err != nil {
+		t.Fatal(err)
+	}
+	f.want(id, "none")
+	if !slices.Equal(f.row(id).ProtocolCapabilities, codexWakeCaps()) {
+		t.Fatal("replacement registration lost Codex wake capabilities")
+	}
+}
+
+// These controls run without a database through claim assembly's shared protocol
+// check. An incomplete binding distinguishes admitted protocols from typed lane
+// refusals without opening a credential or reading provider configuration.
+func TestProviderWakeCapabilityControls(t *testing.T) {
+	for _, tc := range []struct {
+		name, engine string
+		caps         []string
+		admit        bool
+	}{
+		{"claude_legacy", harnessClaude, nil, false},
+		{"claude", harnessClaude, []string{capability.ClaudeProviderV1}, true},
+		{"claude_codex_only", harnessClaude, codexWakeCaps(), false},
+		{"codex", harnessCodex, codexWakeCaps(), true},
+		{"codex_no_provider", harnessCodex, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false},
+		{"codex_no_harness", harnessCodex, []string{capability.CodexProviderV1, capability.CodexRuntimeV2}, false},
+		{"codex_no_runtime", harnessCodex, []string{capability.CodexProviderV1, capability.CodexHarnessV1}, false},
+		{"unknown", "invalid", append(codexWakeCaps(), capability.ClaudeProviderV1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Service{}
+			_, err := s.assembleProviderBinding(context.Background(), store.Worker{ProtocolCapabilities: tc.caps}, store.Run{Harness: tc.engine})
+			if tc.admit {
+				if !errors.Is(err, ErrProviderBindingStale) {
+					t.Fatalf("admitted protocol: got %v, want stale incomplete binding", err)
+				}
+			} else if !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+				t.Fatalf("unsupported protocol: got %v, want typed lane refusal", err)
+			}
+		})
+	}
+}
+
 func TestCodexProviderWakePlacementLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -121,7 +174,7 @@ func TestCodexProviderWakePlacementLiveDB(t *testing.T) {
 				t.Fatal("ineligible worker captured wake row")
 			}
 			// Exercise actual ready + registration settlement without assembling a claim.
-			f.settleOnReplacement(good, false)
+			settleCodexWakeReplacement(t, f, good)
 			if term := f.row(good).LastManualWakeSettledAt; !term.Valid || !term.Time.Equal(lease) {
 				t.Fatalf("demand settlement renewed manual origin lease: %v want %v", term, lease)
 			}
@@ -174,6 +227,60 @@ func TestCodexProviderDemandWakeRejectsIneligibleLiveDB(t *testing.T) {
 	}
 }
 
+func TestCodexProviderWakeCapabilityLossReleaseLiveDB(t *testing.T) {
+	p, f := codexProviderWakeFixture(t)
+	w := f.sleepingWorker()
+	setWakeCaps(f, w, codexWakeCaps())
+	r := frozenCodexWakeRun(t, p)
+	wantCodexWake(t, f, r.ID, w)
+	if released, err := f.svc.ReleaseStaleWake(f.env.ctx, r.ID); err != nil || released {
+		t.Fatalf("compatible wake release=%v, %v", released, err)
+	}
+	// A separate compatible wake must survive the same SQL listing that selects
+	// the capability-loss target. Settle it offline so it cannot suppress demand.
+	control := f.sleepingWorker()
+	setWakeCaps(f, control, codexWakeCaps())
+	controlRun := frozenCodexWakeRun(t, p)
+	wantCodexWake(t, f, controlRun.ID, control)
+	settleCodexWakeReplacement(t, f, control)
+	f.env.exec(`UPDATE workers SET status='offline' WHERE id=$1`, control)
+	setWakeCaps(f, w, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
+	rows, err := f.env.q.ListStaleHibernationWakes(f.env.ctx, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := false
+	for _, row := range rows {
+		if row.RunID == controlRun.ID {
+			t.Fatal("compatible control selected as a stale wake")
+		}
+		if row.RunID == r.ID {
+			if row.WorkerID != w {
+				t.Fatalf("stale wake worker=%s want %s", row.WorkerID, w)
+			}
+			selected = true
+		}
+	}
+	if !selected {
+		t.Fatal("SQL listing omitted capability-loss wake")
+	}
+	if released, err := f.svc.ReleaseStaleWake(f.env.ctx, r.ID); err != nil || !released {
+		t.Fatalf("incompatible wake release=%v, %v", released, err)
+	}
+	if f.wakeRows(r.ID) != 0 {
+		t.Fatal("capability loss left a stale wake row")
+	}
+	if released, err := f.svc.ReleaseStaleWake(f.env.ctx, controlRun.ID); err != nil || released {
+		t.Fatalf("compatible control release=%v, %v", released, err)
+	}
+	replacement := f.sleepingWorker()
+	setWakeCaps(f, replacement, codexWakeCaps())
+	if got := wakeCandidate(t, f, r.ID); got != replacement {
+		t.Fatalf("replacement wake=%s want %s", got, replacement)
+	}
+	wantCodexWake(t, f, r.ID, replacement)
+}
+
 func TestCodexProviderWakeKeepsBusyCustodyFencesLiveDB(t *testing.T) {
 	for _, kind := range []string{"busy", "custody"} {
 		t.Run(kind, func(t *testing.T) {
@@ -216,7 +323,10 @@ func TestCodexProviderSourceKeepsClaudeChatWakeLiveDB(t *testing.T) {
 	// Explicitly Codex-indicating chat remains outside wake admission, even on a
 	// fully capable worker. No claim activation is manufactured.
 	other := f.sleepingWorker()
-	setWakeCaps(f, other, codexWakeCaps())
+	setWakeCaps(f, other, append(codexWakeCaps(), capability.ClaudeProviderV1))
+	if caps := f.row(other).ProtocolCapabilities; !slices.Contains(caps, capability.ClaudeProviderV1) || !slices.Contains(caps, capability.CodexProviderV1) || !slices.Contains(caps, capability.CodexHarnessV1) || !slices.Contains(caps, capability.CodexRuntimeV2) {
+		t.Fatal("chat negative control requires both engine protocols")
+	}
 	codexChat := frozenCodexWakeRun(t, p)
 	f.env.exec(`UPDATE runs SET kind='chat', repo_id=NULL, issue_iid=NULL WHERE id=$1`, codexChat.ID)
 	if got := wakeCandidate(t, f, codexChat.ID); got != uuid.Nil {

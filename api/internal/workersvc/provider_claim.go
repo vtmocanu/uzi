@@ -225,18 +225,7 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 // and the possibly re-keyed payload is never delivered.
 func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimProviderBinding, error) {
 	// Require the complete engine protocol before any binding read or vault open.
-	switch run.Harness {
-	case harnessClaude:
-		if !slices.Contains(wkr.ProtocolCapabilities, capability.ClaudeProviderV1) {
-			return nil, errProviderLaneClaimRefused
-		}
-	case harnessCodex:
-		if !slices.Contains(wkr.ProtocolCapabilities, capability.CodexProviderV1) ||
-			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexHarnessV1) ||
-			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexRuntimeV2) {
-			return nil, errProviderLaneClaimRefused
-		}
-	default:
+	if !workerSupportsProvider(wkr, run.Harness) {
 		return nil, errProviderLaneClaimRefused
 	}
 	keyID, ok := frozenProviderKeyID(run)
@@ -296,6 +285,21 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 		Credential: string(plain),
 		ModelMap:   mm,
 	}, nil
+}
+
+// workerSupportsProvider checks only the advertised protocol for the frozen engine.
+// Wake admission and claim assembly share this conjunction without reading credentials.
+func workerSupportsProvider(w store.Worker, engine string) bool {
+	switch engine {
+	case harnessClaude:
+		return slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderV1)
+	case harnessCodex:
+		return slices.Contains(w.ProtocolCapabilities, capability.CodexProviderV1) &&
+			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&
+			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV2)
+	default:
+		return false
+	}
 }
 
 // promotionRunBinding is the run-shaped view of the frozen provider binding the promoter's locked
