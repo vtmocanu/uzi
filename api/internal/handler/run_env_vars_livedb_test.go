@@ -619,12 +619,15 @@ func TestRunEnvRetiredByteBudgetBoundaryLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	f.withReceipts()
 	f.put("BIG_SECRET", jsonBody(map[string]any{"value": strings.Repeat("s", 1000)}), http.StatusCreated)
-	// Retire history up to (limit - the live value's bytes), 65536 bytes per row at most.
+	// Retire history up to (limit - the live value's bytes), 65536 bytes per row at most. The
+	// padding sits in a second repo: the history budget is per user, while the form budget
+	// counts one repo's secret bytes and the history can exceed it.
+	other := envSecondRepo(t, f.pool, f.repo)
 	remaining := runenv.MaxRetiredValueBytes - 1000
 	for remaining > 0 {
 		n := min(remaining, 65536)
 		if _, err := f.pool.Exec(context.Background(), `INSERT INTO run_env_vars (var_id,user_id,repo_id,name,secret,ciphertext,sealed_with,value_bytes,rev,retired_at)
- VALUES ($1,$2,$3,'PADDING',true,'\x01','master_aad',$4,1,now())`, uuid.New(), f.owner, f.repo, n); err != nil {
+ VALUES ($1,$2,$3,'PADDING',true,'\x01','master_aad',$4,1,now())`, uuid.New(), f.owner, other, n); err != nil {
 			t.Fatal(err)
 		}
 		remaining -= n
@@ -900,7 +903,8 @@ func TestRunEnvRecreateAgainstPendingDeletionLimitsLiveDB(t *testing.T) {
 		f := newEnvFixture(t)
 		f.withReceipts()
 		for i := range 3 {
-			f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", 65536)}), http.StatusCreated)
+			// Plain: the secret form budget (207253 bytes) would stop four secrets before the scope limit.
+			f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", 65536), "secret": false}), http.StatusCreated)
 		}
 		f.put("BIG_3", jsonBody(map[string]any{"value": strings.Repeat("a", 65536-8)}), http.StatusCreated) // 262136 bytes
 		f.must(f.do(http.MethodDelete, "/BIG_3", ""), http.StatusAccepted)                                  // the pending row keeps them
@@ -1142,4 +1146,134 @@ func TestRunEnvDeniedStoredNameCanBeDisabledAndDeletedLiveDB(t *testing.T) {
 		t.Fatalf("rows after delete = %d", n)
 	}
 	f.must(f.do(http.MethodDelete, "/lower_case", ""), http.StatusUnprocessableEntity)
+}
+
+// PRD #4416 form budget: a variable write that would push the repo's secret value bytes
+// past runenv.MaxClaimSecretBytes is refused with env_forms_budget, so a store filled to
+// its limits never makes a claim whose forms pass the worker's cap.
+
+// budgetBase creates three 65536-byte secrets and one 1000-byte secret D (197608 secret
+// bytes), leaving room for D to be rewritten to a larger value.
+func (f *envFixture) budgetBase() int {
+	f.t.Helper()
+	used := 0
+	for i := range 3 {
+		f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", runenv.MaxValueBytes)}), http.StatusCreated)
+		used += runenv.MaxValueBytes
+	}
+	f.put("SMALL", jsonBody(map[string]any{"value": strings.Repeat("s", 1000)}), http.StatusCreated)
+	return used + 1000
+}
+
+func (f *envFixture) putSized(name string, n int, want int) *httptest.ResponseRecorder {
+	f.t.Helper()
+	rec := f.do(http.MethodPut, "/"+name, jsonBody(map[string]any{"value": strings.Repeat("v", n)}))
+	f.must(rec, want)
+	return rec
+}
+
+func (f *envFixture) mustBudgetRefusal(rec *httptest.ResponseRecorder) {
+	f.t.Helper()
+	if envConflictCode(rec) != "env_forms_budget" {
+		f.t.Fatalf("want env_forms_budget, got %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), fmt.Sprint(runenv.MaxClaimSecretBytes)) {
+		f.t.Fatalf("the refusal does not name the limit: %s", rec.Body.String())
+	}
+}
+
+func TestRunEnvFormBudgetCreateBoundaryLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	used := f.budgetBase()
+	room := runenv.MaxClaimSecretBytes - used
+	f.putSized("FILLER", room, http.StatusCreated) // exactly at the budget (room < MaxValueBytes)
+	// One more byte, on a new variable or on a rotation that grows: refused, nothing written.
+	f.mustBudgetRefusal(f.putSized("ONE_OVER", 8, http.StatusConflict))
+	f.mustBudgetRefusal(f.putSized("FILLER", room+1, http.StatusConflict))
+	if f.rowCount("name='ONE_OVER'") != 0 || f.rowCount("name='FILLER' AND retired_at IS NULL") != 1 {
+		t.Fatal("a refused write changed the store")
+	}
+	// A rotation to the same size or smaller is not growth.
+	f.putSized("FILLER", room, http.StatusOK)
+	f.putSized("FILLER", room-1, http.StatusOK)
+	// A plain variable is not a secret byte: it is not counted, even at the budget.
+	f.put("A_PLAIN", jsonBody(map[string]any{"value": strings.Repeat("p", 40000), "secret": false}), http.StatusCreated)
+	// Delete, disable and enable are never refused.
+	f.must(f.do(http.MethodPost, "/SMALL/disable", ""), http.StatusOK)
+	f.must(f.do(http.MethodPost, "/SMALL/enable", ""), http.StatusOK)
+	f.must(f.do(http.MethodDelete, "/SMALL", ""), http.StatusOK)
+	f.putSized("AFTER_DELETE", 1000, http.StatusCreated)
+}
+
+func TestRunEnvFormBudgetCreatePlusOneByteLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	used := f.budgetBase()
+	f.mustBudgetRefusal(f.putSized("FILLER", runenv.MaxClaimSecretBytes-used+1, http.StatusConflict))
+}
+
+func TestRunEnvFormBudgetHeldUpdateLiveDB(t *testing.T) {
+	// A held old version stays sealed, so the new one adds to the total: R = U + new.
+	atBudget := runenv.MaxClaimSecretBytes - (3*runenv.MaxValueBytes + 1000) // the new size of SMALL that lands on the cap
+	f := newEnvFixture(t)
+	f.withReceipts()
+	f.budgetBase()
+	f.putSized("SMALL", atBudget, http.StatusOK)
+	g := newEnvFixture(t)
+	g.withReceipts()
+	g.budgetBase()
+	g.mustBudgetRefusal(g.putSized("SMALL", atBudget+1, http.StatusConflict))
+	if g.rowCount("name='SMALL'") != 1 {
+		t.Fatal("a refused held update retired the old version")
+	}
+}
+
+func TestRunEnvFormBudgetUnheldUpdateLiveDB(t *testing.T) {
+	// An unheld old version is replaced, so R = U - old + new: SMALL may grow by the room
+	// plus its own 1000 bytes, which a held update could not.
+	newSize := runenv.MaxClaimSecretBytes - 3*runenv.MaxValueBytes
+	f := newEnvFixture(t)
+	f.budgetBase()
+	f.putSized("SMALL", newSize, http.StatusOK)
+	g := newEnvFixture(t)
+	g.budgetBase()
+	g.mustBudgetRefusal(g.putSized("SMALL", newSize+1, http.StatusConflict))
+	h := newEnvFixture(t)
+	h.withReceipts()
+	h.budgetBase()
+	h.mustBudgetRefusal(h.putSized("SMALL", newSize, http.StatusConflict))
+}
+
+func TestRunEnvFormBudgetSecretFlagLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	used := f.budgetBase()
+	room := runenv.MaxClaimSecretBytes - used
+	f.put("A_PLAIN", jsonBody(map[string]any{"value": strings.Repeat("p", room+5000), "secret": false}), http.StatusCreated)
+	// Turning the plain value into a secret counts its bytes.
+	f.mustBudgetRefusal(func() *httptest.ResponseRecorder {
+		rec := f.do(http.MethodPut, "/A_PLAIN", jsonBody(map[string]any{"secret": true, "value": strings.Repeat("p", room+1)}))
+		f.must(rec, http.StatusConflict)
+		return rec
+	}())
+	f.put("A_PLAIN", jsonBody(map[string]any{"secret": true, "value": strings.Repeat("p", room)}), http.StatusOK)
+	// A secret turned plain frees its bytes (never refused).
+	f.put("A_PLAIN", jsonBody(map[string]any{"secret": false, "value": strings.Repeat("p", room)}), http.StatusOK)
+}
+
+func TestRunEnvFormBudgetSeededOverBudgetLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.putSized("SHRINK_ME", 1000, http.StatusCreated)
+	// Retired history rows pad the store over the budget (4 x 65536 > MaxClaimSecretBytes).
+	for range 4 {
+		if _, err := f.pool.Exec(context.Background(), `INSERT INTO run_env_vars (var_id,user_id,repo_id,name,secret,ciphertext,sealed_with,value_bytes,rev,retired_at)
+ VALUES ($1,$2,$3,'PADDING',true,'\x01','master_aad',$4,1,now())`, uuid.New(), f.owner, f.repo, runenv.MaxValueBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Over the budget already: a growing write is refused, a new secret too.
+	f.mustBudgetRefusal(f.putSized("SHRINK_ME", 1001, http.StatusConflict))
+	f.mustBudgetRefusal(f.putSized("NEW_ONE", 8, http.StatusConflict))
+	// A shrinking or same-size save is accepted, and so is a plain create.
+	f.putSized("SHRINK_ME", 1000, http.StatusOK)
+	f.putSized("SHRINK_ME", 500, http.StatusOK)
+	f.put("A_PLAIN", jsonBody(map[string]any{"value": "plain", "secret": false}), http.StatusCreated)
 }

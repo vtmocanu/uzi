@@ -45,6 +45,14 @@ SELECT (count(*) FILTER (WHERE pending_delete_at IS NULL))::bigint AS live_count
 FROM run_env_vars
 WHERE user_id = @user_id AND repo_id = @repo_id AND retired_at IS NULL;
 
+-- name: GetRunEnvFormBudgetUsage :one
+-- The secret value bytes a run of this repo can register for masking: every secret row of
+-- the user in this repo's scope or the user scope, whatever its state (live, disabled,
+-- pending deletion or retired), because a claim's redact set can carry any of them.
+SELECT coalesce(sum(value_bytes), 0)::bigint AS secret_bytes
+FROM run_env_vars
+WHERE user_id = @user_id AND secret AND (repo_id = @repo_id OR repo_id IS NULL);
+
 -- name: GetRunEnvRetiredUsage :one
 -- The per-user history budget: retired versions across both scopes.
 SELECT count(*)::bigint AS retired_count,

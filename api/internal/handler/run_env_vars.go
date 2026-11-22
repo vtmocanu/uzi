@@ -40,6 +40,7 @@ const (
 	runEnvCodeLimitReached = "env_limit_reached"
 	runEnvCodeHistoryFull  = "env_history_full"
 	runEnvCodeChanged      = "env_changed"
+	runEnvCodeFormsBudget  = "env_forms_budget"
 )
 
 // runEnvMaxBodyBytes caps a PUT body, the same 1 MiB as httpx.DecodeJSONLimited.
@@ -506,6 +507,26 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		newBytes := int64(len(value))
+		// The form budget: the secret value bytes a run of this repo registers for masking.
+		// Refuse only a write that would end over the cap AND grow the total, so a store
+		// already over it (rows written before the cap) can still shrink.
+		secretBytes, err := q.GetRunEnvFormBudgetUsage(ctx, store.GetRunEnvFormBudgetUsageParams{UserID: userID, RepoID: repo})
+		if err != nil {
+			return err
+		}
+		checkFormBudget := func(retainOld bool) error {
+			var newSecret, oldSecret int64
+			if secret {
+				newSecret = newBytes
+			}
+			if exists && live.Secret && !retainOld {
+				oldSecret = int64(live.ValueBytes)
+			}
+			if after := secretBytes - oldSecret + newSecret; after > runenv.MaxClaimSecretBytes && after > secretBytes {
+				return &runEnvConflictError{runEnvCodeFormsBudget, fmt.Sprintf("this save would give runs of this repo more secret value bytes (%d) than a run can register for masking (%d); delete or shorten a secret, or wait for held versions to expire", after, runenv.MaxClaimSecretBytes)}
+			}
+			return nil
+		}
 		// A description-only save does not bump rev, so one committed between the planning
 		// read and this transaction passes the id/rev check: an omitted description keeps
 		// the locked row's, not the planning read's.
@@ -519,6 +540,9 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			VarID: newVarID, Rev: newRev, AadVersion: runenv.AADVersion2,
 		}
 		if !exists {
+			if err := checkFormBudget(false); err != nil {
+				return err
+			}
 			if usage.LiveCount+usage.PendingCount >= runenv.MaxVarsPerScope {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("this repo already has %d variables (disabled ones and ones pending deletion count); delete one first", runenv.MaxVarsPerScope)}
 			}
@@ -537,6 +561,9 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 				if retain, err = h.receiptHeld(ctx, q, live.VarID, live.Rev); err != nil {
 					return err
 				}
+			}
+			if err := checkFormBudget(retain); err != nil {
+				return err
 			}
 			if retain {
 				// The previous secret version stays sealed for the runs that hold a receipt

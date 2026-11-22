@@ -129,6 +129,27 @@ func (q *Queries) GetLiveRunEnvVarByNameForUpdate(ctx context.Context, arg GetLi
 	return i, err
 }
 
+const getRunEnvFormBudgetUsage = `-- name: GetRunEnvFormBudgetUsage :one
+SELECT coalesce(sum(value_bytes), 0)::bigint AS secret_bytes
+FROM run_env_vars
+WHERE user_id = $1 AND secret AND (repo_id = $2 OR repo_id IS NULL)
+`
+
+type GetRunEnvFormBudgetUsageParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+}
+
+// The secret value bytes a run of this repo can register for masking: every secret row of
+// the user in this repo's scope or the user scope, whatever its state (live, disabled,
+// pending deletion or retired), because a claim's redact set can carry any of them.
+func (q *Queries) GetRunEnvFormBudgetUsage(ctx context.Context, arg GetRunEnvFormBudgetUsageParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getRunEnvFormBudgetUsage, arg.UserID, arg.RepoID)
+	var secret_bytes int64
+	err := row.Scan(&secret_bytes)
+	return secret_bytes, err
+}
+
 const getRunEnvRetiredUsage = `-- name: GetRunEnvRetiredUsage :one
 SELECT count(*)::bigint AS retired_count,
        coalesce(sum(value_bytes), 0)::bigint AS value_bytes
