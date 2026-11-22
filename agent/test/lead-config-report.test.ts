@@ -90,7 +90,8 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
         const ctx = { runId: "r", config: c.config, agents: templates,
           repoAgents: [{ name: "lead", description: "repo", prompt_body: "REPO ROOT MUST NOT WIN", model: "gpt-6-astra" }],
         } as unknown as RunContext;
-        for (const phase of c.config.plan_phase ? [c.phase] : ["plan", "implement"] as const) {
+        for (const phase of ["plan", "implement"] as const) {
+          const expected = resolveLeadRequest({ ...input, phase });
           const selections = phase === "plan" ? [undefined] : [
             { source: "own" as const, exclusions: [] }, { source: "repo" as const, exclusions: [] },
           ];
@@ -98,9 +99,9 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
             const request = (exec as unknown as {
               buildRunRequest(...a: unknown[]): RunTurnRequest;
             }).buildRunRequest(ctx, phase, "p", "continuation", new AbortController().signal, selection);
-            assert.equal(request.model, c.expect.model, `codex sent model ${c.id} ${phase}`);
-            assert.equal(request.effort, c.expect.effort, `codex sent effort ${c.id} ${phase}`);
-            assert.equal(request.modelSource, (c.phase === "plan" && c.config.plan_phase?.model || c.config.default_model) ? "worker_default" : undefined, c.id);
+            assert.equal(request.model, expected.model, `codex sent model ${c.id} ${phase}`);
+            assert.equal(request.effort, expected.effort, `codex sent effort ${c.id} ${phase}`);
+            assert.equal(request.modelSource, (phase === "plan" && c.config.plan_phase?.model || c.config.default_model) ? "worker_default" : undefined, c.id);
             if (selected) assert.ok(request.systemPrompt.includes(selected.prompt_body), c.id);
             assert.ok(!request.systemPrompt.includes("REPO ROOT MUST NOT WIN"), c.id);
             assert.equal(request.resumeSessionId, "continuation", c.id);
@@ -112,11 +113,11 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
               assert.ok("lead" in request.agents, c.id);
             }
             const rendered = renderCodexRun(request);
-            assert.equal(rendered.lead.model, c.expect.model, c.id);
+            assert.equal(rendered.lead.model, expected.model, c.id);
             assert.equal(rendered.diagnostics.some((d) => d.kind === "unknown_model"), false, c.id);
             if (selection?.source !== "repo") {
               for (const t of templates.filter((t) => t.name === "coder")) {
-                const expectedModel = c.config.override_subagent_model || !t.model ? c.expect.model : t.model;
+                const expectedModel = c.config.override_subagent_model || !t.model ? expected.model : t.model;
                 assert.equal(rendered.perRoleModels.get(t.name)?.model, expectedModel, c.id);
                 assert.equal(request.agents[t.name]?.model,
                   c.config.override_subagent_model ? undefined : t.model ?? undefined, c.id);

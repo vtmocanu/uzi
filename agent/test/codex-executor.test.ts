@@ -6948,6 +6948,48 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
   const withDefault = (model: string, levels: string[], def: string | undefined) =>
     ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), ...(def !== undefined ? { defaultReasoningEffort: def } : {}) }] });
 
+  it("approved planning pair probes and reports only the first phase while implementation keeps its own pair", async () => {
+    const entries = { data: [
+      ...withDefault("gpt-6-astra", ["high"], "high").data,
+      ...withDefault("gpt-6.1-sol", ["medium"], "medium").data,
+    ] };
+    const planning = epochResponder("catalog-shared", "catalog-plan", (t, th, tn) => {
+      t.push(toolCall(1, "submit_plan", { plan_md: "bounded catalog plan" }, th, tn, "catalog-submit"))
+        .push(turnCompleted("completed", th, tn));
+    });
+    const implementation = epochResponder("catalog-shared", "catalog-implement", (t, th, tn) => {
+      t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+    });
+    const rig = makeMultiEpochRig([planning, implementation].map(respond =>
+      (c: ResponderCtx) => c.method === "model/list" ? entries : respond(c)));
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const reporterClient = new ReportStub();
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      config: { default_model: "gpt-6.1-sol", default_effort: "max",
+        plan_phase: { model: "gpt-6-astra", effort: "high" } },
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok",
+        selection: { source: "own", exclusions: [] } } }) as never,
+      codexCatalogReport: new CodexCatalogReporter({
+        client: reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+      }),
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "approved catalog phases");
+    await settle();
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(rig.epochs.map(e => e.transport.requests.filter(r => r.method === "model/list").length), [1, 0]);
+    assert.deepEqual(rig.epochs.map(e => {
+      const request = e.transport.requests.find(r => r.method === "turn/start");
+      return [rec(request!.params).model, rec(request!.params).effort];
+    }), [["gpt-6-astra", "high"], ["gpt-6.1-sol", "max"]]);
+    assert.equal(emitted.filter(m => m.payload.event === NOTE_EVENT).length, 0,
+      "the implementation pair is not catalog-probed; its requested effort is sent unchanged");
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.model, "gpt-6-astra");
+    assert.equal(reporterClient.posts[0]!.default_effort, "high");
+  });
+
   it("Runtime default with a reporter: the first turn/start does not wait for model/list, then one report is posted", async () => {
     const reporterClient = new ReportStub();
     let release!: (v: unknown) => void;

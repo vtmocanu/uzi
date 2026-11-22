@@ -103,6 +103,11 @@ oversized or timed-out catalog, or no matching entry, produces no warning. The
 catalog is per-account and can refresh, so the warning is advisory and can be
 wrong either way.
 
+With a separate planning pair, this one probe checks the first actual phase
+(the planning pair on a gated run). Approval does not trigger another catalog
+probe or warning for the implementation pair. Both phases still send their
+requested effort unchanged.
+
 The [judge](./judge.md) uses the preference for its own harness. Task-review
 and internal PR-description passes retain their existing SDK/catalog effort
 behavior; their built-in Codex model remains `gpt-6-sol`.
@@ -191,6 +196,11 @@ use, if it is at most 30 days old. The Codex **Runtime default** option reads:
 | `catalog default: ultra (Codex substitutes another level) (...)` | Known, and the level is `ultra` (see above). |
 | `... · may differ on workers still on another version` | Varies: workers on different Codex runtime versions reported different levels for the current credential. The label shows the highest runtime version's level (ties: the latest report). |
 | `catalog default unknown until a Codex run reports it` | Unknown: no report within 30 days for the current credential, no usable Codex credential, an unlinked subscription, or Codex account mode `auto` with at least one pooled login (the login is chosen only when a run is created, so none can be predicted). With `auto` and an empty pool uzi uses the default credential, so the label can be known. |
+
+A planning-model catalog report is stored under that planning model. Settings
+filter reports by the implementation model as well as the credential, so a
+different planning model cannot supply its label. A gated run that probes only
+the planning model can leave the implementation model’s label unknown or older.
 
 Saving a different Codex model refreshes the label. Because the value is a
 report from an earlier run, it can lag a Codex runtime upgrade, or a catalog

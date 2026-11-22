@@ -116,12 +116,8 @@ $$;
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 
--- PRD #3252: the placement function gains the Claude planning-phase clause, the twin of ClaimRun's
--- NON-BYPASSABLE 'claude_phase_models_v1' clause, so the hibernation wake-demand and capability-gap
--- queries (which evaluate this function) agree with the claim about which workers can take a Claude
--- lead-lane run whose owner has a planning value. Same signature (CREATE OR REPLACE); the clause reads
--- the run row argument plus one users PK lookup, so this touches no table lock. The function stays
--- STABLE and a single SELECT, so it stays inlinable. The Down restores the 00486 body.
+-- Restore the 00499 Up predecessor, including its Claude planning-phase support.
+-- Restoring 00499 Down or the older 00486 body would incorrectly remove that support.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,

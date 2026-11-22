@@ -281,6 +281,16 @@ Tracked literal/identifier sweeps across E2E phases, lib helpers/tests and forge
 
 Dispatch checklist: #4580 merged at `b8ca3f6e1`; the #3244 resolver/reporting seam is locally present at `075c54de2` (#3695), while that issue's external acceptance remains unverified. #3068 applies only to the unselected fresh-conversation alternative. Keep API-before-worker rollout, exact-head full suites, packaged/macOS proof and landing-time migration renumbering as stated above. None is claimed passed here.
 
+## Checker repair verification
+
+The CLI reference now describes both harnesses' planning rows, and the placement rollback comment names the 00499 Up predecessor. The shared Codex request matrix again checks both phases for every case, with phase-specific model, effort and provenance expectations.
+
+The existing catalog contract remains one probe on the first root and at most one catalog-default report per claim. On a gated run it checks the planning pair, not the later implementation pair; implementation effort is sent unchanged without another catalog warning. Reports retain their model key, and settings filter by the implementation model, so a different planning-model observation cannot label it. An approved two-epoch test covers this limit as well as the independent implementation pair; existing Runtime-default non-blocking controls remain intact. Earlier full-file totals above predate this added test; this repair runs the affected matrix/catalog suites and static checks separately.
+
+The resumed-implementation model guard remains fail-closed for supported lead runs, including those without planning settings. Task reviews use ReviewRunner, other excluded kinds use their own dispatch, and Codex egress-bound claims are rejected before this executor. The proposed excluded-lane hold loop has no demonstrated reachable path. Pinned curated-model controls do not prove compatibility of every custom identifier or live provider; this delivery makes no such universal claim and does not weaken exact-model verification.
+
+PR CI, packaged/macOS proof, full E2E phases, CI timing and migration renumbering remain the separately approved landing obligations. Worker completion and archival do not certify those outcomes.
+
 ## Decision Log
 
 - **D1. Mechanism: same conversation at the cold approval epoch (#3246, live evidence 2026-11-20).** User-run native ChatGPT-login probes on Codex 0.167.0: the full matrix and corrected effort-only report are retained in the durable #3246 evidence comment linked below. Implementation provenance is the squash-merge of the Q-spike PR. All twelve original and eight focused turns completed and returned the nonce. Both probes reported unchanged auth-file mtime; credentials were subsequently removed by the operator. The model/effort mechanism is established for this cold shape; the Q-claude guard dependency is now met by PR #4571; #4580 has since merged at `b8ca3f6e1`; its code dependency is satisfied.
