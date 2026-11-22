@@ -1855,7 +1855,6 @@ fixture_hold_deadline() {
     post-discard-late)
       # Real bounded reader on the wall clock: the owner discard is acknowledged only
       # after the deadline, so the verifying re-read is refused rather than unbounded.
-      local fixture_start=$SECONDS
       echo open > "$SEQ_DIR/deadline-state"
       curl() {
         echo "$*" >> "$SEQ_DIR/deadline-budgets"
@@ -1863,7 +1862,9 @@ fixture_hold_deadline() {
       }
       uzi_cli() {
         echo $(( $(cat "$SEQ_DIR/deadline-discards") + 1 )) > "$SEQ_DIR/deadline-discards"
-        while [ "$SECONDS" -lt $((fixture_start + 3)) ]; do command sleep 0.2; done
+        # Called from inside the helper: its own `deadline` local is in (dynamic) scope.
+        # shellcheck disable=SC2154  # deadline is resolve_fixture_source_hold's local
+        while [ "$SECONDS" -lt "$deadline" ]; do command sleep 0.2; done
         echo discarded > "$SEQ_DIR/deadline-state"
         echo '{"discarded":true}'
       } ;;
@@ -1902,7 +1903,12 @@ fixture_hold_deadline() {
     capturing-real)
       [[ "$output" == *'still capturing after 2s'* ]] || fail "capture timeout lost its diagnostic: $output" ;;
     post-discard-late)
-      [[ "$output" == *'re-read failed or exceeded the 2s deadline'* ]] || fail "late post-discard re-read was not refused: $output" ;;
+      [[ "$output" == *'re-read failed or exceeded the 2s deadline'* && "$output" != *'unexpected deadline read'* ]] \
+        || fail "late post-discard re-read was not refused: $output"
+      # Only the pre-discard holds read reached curl, bounded: the re-read was refused
+      # by the bounded reader itself, not by a transport error.
+      [ "$(wc -l < "$SEQ_DIR/deadline-budgets")" = 1 ] && grep -qF -- '--max-time' "$SEQ_DIR/deadline-budgets" \
+        || fail "post-discard re-read was not refused by the bounded reader: $(cat "$SEQ_DIR/deadline-budgets")" ;;
     slow-archives)
       [[ "$output" == *'passed before the owner disposition'* ]] || fail "slow pre-discard read missed the deadline diagnostic: $output" ;;
   esac
