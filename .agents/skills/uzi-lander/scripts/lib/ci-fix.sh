@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 # Shared branch-writer predicate. Inputs are read-only uzi run-list JSON, repo id,
-# and exact pipeline_ref. Callers own lookup failures; malformed data fails closed.
+# exact pipeline_ref, and optional MR number. Callers own lookup failures;
+# malformed data fails closed. Without an MR number only ci_fix is selected.
 
-ci_fix_active_runs() {
+branch_helper_active_runs() {
   [ -n "$2" ] && [ -n "$3" ] || return 1
-  printf '%s' "$1" | jq -ce --arg repo "$2" --arg br "$3" '
+  printf '%s' "$1" | jq -ce --arg repo "$2" --arg br "$3" --argjson pr "${4:-0}" '
+    def matching:
+      .repo_id==$repo and
+      ((.kind=="ci_fix" and .pipeline_ref==$br) or
+       (.kind=="mr_rework" and $pr>0 and .mr_iid==$pr));
+    def terminal: .status | IN("completed", "failed", "cancelled");
     if type != "array" or any(.[]; type != "object") then error("invalid run list") else . end
-    | if any(.[] | select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br);
+    | if any(.[] | select(matching);
         (.id | type != "string") or (.id | test("^[A-Za-z0-9_-]+$") | not) or
         (.status | type != "string") or (.status | test("^[a-z_]+$") | not))
-      then error("invalid ci_fix identity/status") else . end
-    | [.[]|select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and ((.status|test("completed|failed|cancelled"))|not))
-        | {id,status}]'
+      then error("invalid helper identity/status") else . end
+    | [.[] | select(matching and (terminal|not)) | {id,kind,status}] | sort_by(.kind,.id)'
+}
+
+ci_fix_active_runs() {
+  local active
+  active=$(branch_helper_active_runs "$1" "$2" "$3") || return 1
+  printf '%s' "$active" | jq -ce 'map({id,status})'
 }
 
 ci_fix_active_ids() {
@@ -38,7 +49,7 @@ ci_fix_snapshot() {
         (if $t.zone == "Z" then 0 else
           (($t.zone[1:3]|tonumber)*3600 + ($t.zone[4:6]|tonumber)*60) *
           (if $t.zone[0:1] == "+" then 1 else -1 end) end);
-    [.[] | select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and (.status|test("completed|failed|cancelled")))
+    [.[] | select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and (.status|IN("completed", "failed", "cancelled")))
       | . + {finished_epoch: (.finished_at | epoch)}
       | if .finished_epoch > ($now + 300) then error("future ci_fix finish") else . end
       | select(.finished_epoch >= ($now - 86400))] | sort_by(.finished_epoch, .id) | last as $recent
