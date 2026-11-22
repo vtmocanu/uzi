@@ -13,6 +13,32 @@ import { createServer as netServer, type Socket } from "node:net";
 const source = "/run/cdr-private-ca/source.pem";
 
 // These startup controls call baked loadConfig without constructing an executor.
+test("loadConfig accepts exactly 1 MiB valid CA and captures every byte", async () => {
+  assert.equal(process.getuid?.(), 10001);
+  const { loadConfig } = await import("/app/src/config.ts");
+  const { extraCaPem } = await import("/app/src/codex/extra-ca.ts");
+  const file = "/run/cdr-private-ca/exact-limit.pem";
+  const stat = await fs.stat(file);
+  assert.deepEqual([stat.uid, stat.gid, stat.mode & 0o777], [0, 10001, 0o440]);
+  const bytes = await fs.readFile(file);
+  const ca = await fs.readFile("/fixture/ca.pem");
+  const oversized = await fs.readFile("/run/cdr-private-ca/oversized.pem");
+  assert.equal(bytes.length, 1048576);
+  assert.ok(bytes.subarray(0, ca.length).equals(ca), "generated valid CA prefix");
+  assert.ok(bytes.subarray(ca.length).every(byte => byte === 0x20), "ASCII space padding only");
+  assert.equal(oversized.length, 1048577);
+  assert.ok(oversized.subarray(0, -1).equals(bytes), "inputs differ only by final space");
+  assert.equal(oversized.at(-1), 0x20);
+  const cfg = loadConfig({
+    UZI_API_URL: "http://127.0.0.1:1",
+    UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"),
+    UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk", UZI_CODEX_CA_FILE: file,
+  });
+  assert.ok(cfg.codexExtraCa);
+  assert.ok(Buffer.from(cfg.codexExtraCa.pem, "ascii").equals(bytes), "public bundle preserves exact bytes");
+  assert.ok(Buffer.from(extraCaPem(cfg.codexExtraCa), "ascii").equals(bytes), "captured bundle provenance");
+});
+
 for (const kind of ["missing", "unreadable", "malformed", "oversized", "65certs"] as const) {
   test(`loadConfig rejects ${kind} CA with sanitized error`, async () => {
     assert.equal(process.getuid?.(), 10001);

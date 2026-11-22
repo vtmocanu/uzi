@@ -48,7 +48,13 @@ timeout --kill-after=10s 240s docker run --rm --name "$name" --network none \
     cp /fixture/unrelated.pem /run/cdr-private-ca/unrelated.pem
     cp /fixture/ca.pem /run/cdr-private-ca/unreadable.pem
     printf "%s\n" "-----BEGIN CERTIFICATE-----" "invalid" "-----END CERTIFICATE-----" > /run/cdr-private-ca/malformed.pem
-    head -c 1048577 /dev/zero > /run/cdr-private-ca/oversized.pem
+    cp /fixture/ca.pem /run/cdr-private-ca/exact-limit.pem
+    ca_bytes=$(wc -c < /fixture/ca.pem)
+    padding=$((1048576 - ca_bytes))
+    test "$padding" -gt 0
+    dd if=/dev/zero bs=1 count="$padding" 2>/dev/null | tr "\\000" " " >> /run/cdr-private-ca/exact-limit.pem
+    cp /run/cdr-private-ca/exact-limit.pem /run/cdr-private-ca/oversized.pem
+    printf " " >> /run/cdr-private-ca/oversized.pem
     i=0
     while [ "$i" -lt 65 ]; do
       cat /fixture/ca.pem >> /run/cdr-private-ca/65certs.pem
