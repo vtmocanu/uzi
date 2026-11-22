@@ -65,7 +65,15 @@
     "VSCODE_INSPECTOR_OPTIONS",
     "TEMP",
     "TMP",
-    "SYSTEMDRIVE"
+    "SYSTEMDRIVE",
+    "API_FORCE_IDLE_TIMEOUT",
+    "ENABLE_TOOL_SEARCH",
+    "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+    "AUTOMODE_DECISION_LOG",
+    "NODE_USE_SYSTEM_CA",
+    "ENABLE_BETA_TRACING_DETAILED",
+    "ENABLE_ENHANCED_TELEMETRY_BETA",
+    "BETA_TRACING_ENDPOINT"
   ],
   "denied_prefixes": [
     "UZI_",
@@ -209,6 +217,54 @@
       "harness": "claude",
       "decision": "denied",
       "reason": "managed directory: uppercase API spelling of the Windows SystemDrive read, whose environment lookup is case-insensitive; mixed-case SystemDrive stays rejected by the name grammar"
+    },
+    {
+      "name": "API_FORCE_IDLE_TIMEOUT",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: idle (body) watchdog on the Claude CLI's own API connection, a sibling of API_TIMEOUT_MS (owner decision #4611)"
+    },
+    {
+      "name": "ENABLE_TOOL_SEARCH",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: switches the Claude CLI's tool-search mode (owner decision #4611)"
+    },
+    {
+      "name": "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: character budget of the Claude CLI's slash-command tool prompt (owner decision #4611)"
+    },
+    {
+      "name": "AUTOMODE_DECISION_LOG",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: makes the Claude CLI write a decision log file in its config directory (owner decision #4611)"
+    },
+    {
+      "name": "NODE_USE_SYSTEM_CA",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: selects the certificate store the Claude CLI trusts for its own connections (owner decision #4611)"
+    },
+    {
+      "name": "ENABLE_BETA_TRACING_DETAILED",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: with BETA_TRACING_ENDPOINT, turns on the Claude CLI's OpenTelemetry trace and log export without CLAUDE_CODE_ENABLE_TELEMETRY (owner decision #4611)"
+    },
+    {
+      "name": "ENABLE_ENHANCED_TELEMETRY_BETA",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: enables the Claude CLI's enhanced telemetry (trace export) beta, the unprefixed alias of CLAUDE_CODE_ENHANCED_TELEMETRY_BETA (owner decision #4611)"
+    },
+    {
+      "name": "BETA_TRACING_ENDPOINT",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: OTLP endpoint of the Claude CLI's beta trace and log export (owner decision #4611)"
     },
     {
       "name": "TSC_NONPOLLING_WATCHER",
