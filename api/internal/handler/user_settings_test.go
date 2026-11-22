@@ -62,6 +62,10 @@ type fakeSettingsDB struct {
 	// (PRD #3252), written by SetUserPlanningClaude.
 	planningModel  pgtype.Text
 	planningEffort pgtype.Text
+	// taskReview and codexTaskReview are users.task_review_model / codex_task_review_model
+	// (PRD #1570), written by SetUserTaskReviewModel / SetUserCodexTaskReviewModel.
+	taskReview      pgtype.Text
+	codexTaskReview pgtype.Text
 	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
 	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
 	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
@@ -163,6 +167,14 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.judgeRunsOn = j // SetUserJudgeRunsOn: $1 = judge_runs_on (PRD #3257)
 		}
+	case strings.Contains(sql, "UPDATE users SET codex_task_review_model") && len(args) >= 1:
+		if s, ok := args[0].(pgtype.Text); ok {
+			f.codexTaskReview = s // SetUserCodexTaskReviewModel: $1 = codex_task_review_model
+		}
+	case strings.Contains(sql, "UPDATE users SET task_review_model") && len(args) >= 1:
+		if s, ok := args[0].(pgtype.Text); ok {
+			f.taskReview = s // SetUserTaskReviewModel: $1 = task_review_model
+		}
 	case strings.Contains(sql, "UPDATE users SET codex_summary_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
 			f.codexSummary = s // SetUserCodexSummaryModel: $1 = codex_summary_model
@@ -253,6 +265,8 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		codexModel:      f.codexModel,
 		planningModel:   f.planningModel,
 		planningEffort:  f.planningEffort,
+		taskReview:      f.taskReview,
+		codexTaskReview: f.codexTaskReview,
 	}
 }
 
@@ -282,6 +296,8 @@ type fakeSettingsRow struct {
 	codexModel      pgtype.Text
 	planningModel   pgtype.Text
 	planningEffort  pgtype.Text
+	taskReview      pgtype.Text
+	codexTaskReview pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -318,7 +334,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 26: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion and the planning pair (PRD #3252)
+	case 28: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion, the planning pair (PRD #3252) and the task-review models (PRD #1570)
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -407,6 +423,13 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[25].(*pgtype.Text); ok {
 			*p = r.planningEffort
+		}
+		// task_review_model and codex_task_review_model (PRD #1570) are columns 27 and 28.
+		if p, ok := dest[26].(*pgtype.Text); ok {
+			*p = r.taskReview
+		}
+		if p, ok := dest[27].(*pgtype.Text); ok {
+			*p = r.codexTaskReview
 		}
 	}
 	return nil

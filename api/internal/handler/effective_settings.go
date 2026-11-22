@@ -42,7 +42,6 @@ const (
 	sourceBuiltin                 = "builtin"
 
 	noteSDKDefault             = "sdk_default"
-	noteNotConfigurable        = "not_configurable"
 	noteNotSent                = "not_sent"
 	noteNotUsed                = "not_used"
 	noteDefaultHarnessUnusable = "user_default_harness_unusable"
@@ -402,22 +401,17 @@ func claimedModelCell(setting string, c apitypes.ModelSettingCellDTO, notes []st
 	}
 }
 
-// reviewModelCell is the task-review model: a built-in the user cannot configure. The Claude
-// review sends no model, so the SDK decides.
+// reviewModelCell is the task-review model (PRD #1570): the owner's stored review model for the
+// harness (user_default) or, when none is usable, the built-in. An unset Claude model keeps the
+// sdk_default note, since the review then sends no model.
 func reviewModelCell(p workersvc.LeadPrediction) apitypes.EffectiveModelCellDTO {
-	cell := apitypes.EffectiveModelCellDTO{
+	return apitypes.EffectiveModelCellDTO{
 		ModelSettingCellDTO: apitypes.ModelSettingCellDTO{
-			Harness: string(p.Harness), DefaultModel: p.DefaultModel, DefaultSource: p.DefaultModelSource,
+			Harness: string(p.Harness), Model: p.LaneModel, DefaultModel: p.DefaultModel, DefaultSource: p.DefaultModelSource,
 			ResolvedModel: p.Model, Source: p.ModelSource,
 		},
-		Setting: "task_review_model", FixedAt: workersvc.FixedAtClaim,
+		Setting: "task_review_model", FixedAt: workersvc.FixedAtClaim, Notes: modelNotes(p.Model),
 	}
-	if p.Harness == workersvc.HarnessCodex {
-		cell.Notes = []string{noteNotConfigurable}
-	} else {
-		cell.Notes = modelNotes(p.Model)
-	}
-	return cell
 }
 
 // reviewEffortCell is the task-review effort: neither review pass sends one.

@@ -1238,6 +1238,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"claude_provider_id",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
+		// PRD #1570: the per-harness task-review models (null ⇒ built-in) and their read-only cells.
+		"task_review_model", "codex_task_review_model", "task_review_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3252: the Claude planning pair (null ⇒ "Same as the run") and its read-only cells.

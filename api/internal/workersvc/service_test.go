@@ -161,6 +161,11 @@ type fakeStore struct {
 	planningModel  pgtype.Text
 	planningEffort pgtype.Text
 	planningErr    error
+	// taskReviewModel/codexTaskReviewModel feed GetUserTaskReviewSettings (PRD #1570);
+	// taskReviewErr forces the strict review-settings read to fail.
+	taskReviewModel      pgtype.Text
+	codexTaskReviewModel pgtype.Text
+	taskReviewErr        error
 	// attributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// live at standard-claim assembly. The zero value is false; scheduleModelStore sets
 	// it to true so existing fixtures mirror a fresh user's default-on state, and a test
@@ -1089,6 +1094,9 @@ func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool,
 }
 func (f *fakeStore) GetUserJudgeModels(context.Context, uuid.UUID) (store.GetUserJudgeModelsRow, error) {
 	return store.GetUserJudgeModelsRow{JudgeModel: f.judgeModel, CodexJudgeModel: f.codexJudgeModel}, f.judgeModelErr
+}
+func (f *fakeStore) GetUserTaskReviewSettings(context.Context, uuid.UUID) (store.GetUserTaskReviewSettingsRow, error) {
+	return store.GetUserTaskReviewSettingsRow{TaskReviewModel: f.taskReviewModel, CodexTaskReviewModel: f.codexTaskReviewModel}, f.taskReviewErr
 }
 func (f *fakeStore) GetUserSummaryModels(context.Context, uuid.UUID) (store.GetUserSummaryModelsRow, error) {
 	return store.GetUserSummaryModelsRow{SummaryModel: f.summaryModel, CodexSummaryModel: f.codexSummaryModel}, f.summaryModelErr

@@ -347,6 +347,12 @@ type ClaimPayload struct {
 	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
 	// from the judge_model setting at claim assembly. Present only for kind=judge.
 	JudgeModel *string `json:"judge_model,omitempty"`
+	// TaskReviewModel is the owner's resolved task-review model (PRD #1570) for a REVIEW run
+	// (kind=task with review_target_run_id set) on this harness. Present only on a review claim to a
+	// worker advertising capability.TaskReviewSettingsV1, and omitted when the review runs the
+	// built-in "no model, the SDK decides" (Claude with no stored model). It is a separate field from
+	// config.default_model on purpose: that is the worker lane, which a review never uses.
+	TaskReviewModel *string `json:"task_review_model,omitempty"`
 	// SummaryModel is the summary model for this claim's harness (PRD #362 Decision 8,
 	// PRD #3248 D3): the inline run-summary generator's model, resolved user-value-wins
 	// over the instance value and the built-in from the harness's own lane

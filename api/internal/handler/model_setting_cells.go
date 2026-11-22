@@ -68,6 +68,29 @@ func summaryModelCell(harness string, user *string, instance string) apitypes.Mo
 	}
 }
 
+// taskReviewModelCells builds the task-review model setting's cells (PRD #1570), always ordered
+// claude then codex. userClaude/userCodex are the stored user lanes (nil = Default). Each cell
+// resolves through workersvc.ResolveTaskReview, the rule the review claim applies: a valid stored
+// model is user_default, anything else the built-in (Claude: no model, the SDK decides).
+func taskReviewModelCells(userClaude, userCodex *string) []apitypes.ModelSettingCellDTO {
+	return []apitypes.ModelSettingCellDTO{
+		taskReviewModelCell(workersvc.HarnessClaude, userClaude),
+		taskReviewModelCell(workersvc.HarnessCodex, userCodex),
+	}
+}
+
+func taskReviewModelCell(harness workersvc.Harness, user *string) apitypes.ModelSettingCellDTO {
+	r := workersvc.ResolveTaskReview(harness, workersvc.TaskReviewInput{Model: user})
+	return apitypes.ModelSettingCellDTO{
+		Harness:       string(harness),
+		Model:         user,
+		DefaultModel:  r.BuiltinModel,
+		DefaultSource: agenttmpl.WorkerDefaultSourceBuiltin,
+		ResolvedModel: r.Model,
+		Source:        r.ModelSource,
+	}
+}
+
 // effortSettingCells builds the ordinary effort setting's cells (PRD #3247), always
 // ordered claude then codex, from the stored preference tokens of one row read.
 // catalog (issue #3251) is attached to the codex cell only; the claude cell never

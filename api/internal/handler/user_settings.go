@@ -58,6 +58,12 @@ type userSettingsDTO struct {
 	// CodexSummaryModel is the Codex summary lane (PRD #3248): null = inherit the
 	// instance Codex summary model; a value is a Codex role id.
 	CodexSummaryModel *string `json:"codex_summary_model"`
+	// TaskReviewModel and CodexTaskReviewModel are the owner's per-harness model for the handoff
+	// review pass (PRD #1570): null = the built-in review model. TaskReviewModels is the read-only
+	// resolved view of both lanes, ordered claude then codex; never accepted on a PUT.
+	TaskReviewModel      *string                        `json:"task_review_model"`
+	CodexTaskReviewModel *string                        `json:"codex_task_review_model"`
+	TaskReviewModels     []apitypes.ModelSettingCellDTO `json:"task_review_models"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
 	// release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -215,6 +221,8 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 	// The codex cell's catalog default (issue #3251): the lane default_codex_model wins, then
 	// the lead template's Codex pin read with the pin rows above, then the provider default.
 	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
+	taskReviewLane := textPtrValue(s.TaskReviewModel.Valid, s.TaskReviewModel.String)
+	codexTaskReviewLane := textPtrValue(s.CodexTaskReviewModel.Valid, s.CodexTaskReviewModel.String)
 	planningModel := textPtrValue(s.PlanningClaudeModel.Valid, s.PlanningClaudeModel.String)
 	planningEffort := textPtrValue(s.PlanningClaudeEffort.Valid, s.PlanningClaudeEffort.String)
 	return userSettingsDTO{
@@ -229,6 +237,9 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		CodexJudgeModel:        codexJudgeLane,
 		SummaryModel:           summaryLane,
 		CodexSummaryModel:      codexSummaryLane,
+		TaskReviewModel:        taskReviewLane,
+		CodexTaskReviewModel:   codexTaskReviewLane,
+		TaskReviewModels:       taskReviewModelCells(taskReviewLane, codexTaskReviewLane),
 		Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 		MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
 		NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
@@ -330,10 +341,14 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		CodexJudgeModel    json.RawMessage `json:"codex_judge_model"`
 		SummaryModel       json.RawMessage `json:"summary_model"`
 		CodexSummaryModel  json.RawMessage `json:"codex_summary_model"`
-		Theme              json.RawMessage `json:"theme"`
-		MrReworkEnabled    json.RawMessage `json:"mr_rework_enabled"`
-		NowSummaryEnabled  json.RawMessage `json:"now_summary_enabled"`
-		SidebarTokenIds    json.RawMessage `json:"sidebar_token_ids"`
+		// task_review_model / codex_task_review_model (PRD #1570): the handoff review model per
+		// harness, same absent/null/value tri-state. task_review_models is read-only.
+		TaskReviewModel      json.RawMessage `json:"task_review_model"`
+		CodexTaskReviewModel json.RawMessage `json:"codex_task_review_model"`
+		Theme                json.RawMessage `json:"theme"`
+		MrReworkEnabled      json.RawMessage `json:"mr_rework_enabled"`
+		NowSummaryEnabled    json.RawMessage `json:"now_summary_enabled"`
+		SidebarTokenIds      json.RawMessage `json:"sidebar_token_ids"`
 		// The linked Codex accounts on the sidebar rail (PRD #1209 M1): same
 		// absent/present tri-state as sidebar_token_ids — absent leaves the stored set,
 		// present (a JSON array, or null) replaces it. Unlike sidebar_token_ids, a
@@ -476,6 +491,28 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		codexSummaryVal = v
+	}
+
+	var taskReviewVal pgtype.Text
+	taskReviewPresent := req.TaskReviewModel != nil
+	if taskReviewPresent {
+		v, ferr := decodeTaskReviewModelField(req.TaskReviewModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		taskReviewVal = v
+	}
+
+	var codexTaskReviewVal pgtype.Text
+	codexTaskReviewPresent := req.CodexTaskReviewModel != nil
+	if codexTaskReviewPresent {
+		v, ferr := decodeCodexTaskReviewModelField(req.CodexTaskReviewModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		codexTaskReviewVal = v
 	}
 
 	// The legacy theme field (DEPRECATED, PRD #1167) still writes users.theme via
@@ -823,6 +860,28 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			CodexSummaryModel: codexSummaryVal,
 		}); err != nil {
 			slog.Error("set user codex summary model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if taskReviewPresent {
+		if _, err := h.q.SetUserTaskReviewModel(r.Context(), store.SetUserTaskReviewModelParams{
+			ID:              user.ID,
+			TaskReviewModel: taskReviewVal,
+		}); err != nil {
+			slog.Error("set user task review model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexTaskReviewPresent {
+		if _, err := h.q.SetUserCodexTaskReviewModel(r.Context(), store.SetUserCodexTaskReviewModelParams{
+			ID:                   user.ID,
+			CodexTaskReviewModel: codexTaskReviewVal,
+		}); err != nil {
+			slog.Error("set user codex task review model", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

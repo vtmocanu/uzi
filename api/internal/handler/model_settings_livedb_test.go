@@ -26,7 +26,8 @@ import (
 //
 // Write invariant the route's row lock relies on: every column it SETs (default_claude_model,
 // default_codex_model, the legacy default_model mirror, default_effort, default_codex_effort,
-// judge_model, codex_judge_model, judge_runs_on, summary_model, codex_summary_model) is a plain
+// judge_model, codex_judge_model, judge_runs_on, summary_model, codex_summary_model, task_review_model,
+// codex_task_review_model) is a plain
 // non-key column. users.id is never in a SET list, and the only unique or foreign-key-referenced
 // columns of users are id, email, (oidc_issuer, oidc_subject) and the slack resolved id
 // (migrations 00001, 00056, 00044), none of which is written here. That is why FOR NO KEY UPDATE,
@@ -37,7 +38,7 @@ import (
 var modelSettingsColumns = []string{
 	"default_claude_model", "default_codex_model", "default_model", "default_harness",
 	"default_effort", "default_codex_effort", "judge_model", "codex_judge_model", "judge_runs_on",
-	"summary_model", "codex_summary_model",
+	"summary_model", "codex_summary_model", "task_review_model", "codex_task_review_model",
 	"judge_enabled", "autopilot_enabled", "plan_cross_check_enabled", "code_cross_check_enabled",
 }
 
@@ -74,7 +75,8 @@ func (f *effFix) clearModelColumns() {
 	f.t.Helper()
 	f.exec(`UPDATE users SET default_claude_model = NULL, default_codex_model = NULL, default_model = NULL,
 		default_harness = NULL, default_effort = NULL, default_codex_effort = NULL, judge_model = NULL,
-		codex_judge_model = NULL, judge_runs_on = NULL, summary_model = NULL, codex_summary_model = NULL
+		codex_judge_model = NULL, judge_runs_on = NULL, summary_model = NULL, codex_summary_model = NULL,
+		task_review_model = NULL, codex_task_review_model = NULL
 		WHERE id = $1`, f.user)
 }
 
@@ -185,6 +187,20 @@ func TestPutMyModelSettingsParityWithPutMySettingsLiveDB(t *testing.T) {
 		{"codex_summary_model", `"gpt-6-luna"`, true},
 		{"codex_summary_model", `null`, true},
 		{"codex_summary_model", `"nope"`, false},
+		{"task_review_model", `"opus"`, true},
+		{"task_review_model", `"  claude-custom-9  "`, true},
+		{"task_review_model", `null`, true},
+		{"task_review_model", `""`, true},
+		{"task_review_model", `"gpt-6-astra"`, false},
+		{"task_review_model", `"has space"`, false},
+		{"task_review_model", `"bad\u0000id"`, false},
+		{"task_review_model", `7`, false},
+		{"codex_task_review_model", `"gpt-6.1-sol"`, true},
+		{"codex_task_review_model", `"gpt-6-luna"`, true},
+		{"codex_task_review_model", `null`, true},
+		{"codex_task_review_model", `"custom-codex-1"`, false},
+		{"codex_task_review_model", `"opus"`, false},
+		{"codex_task_review_model", `["x"]`, false},
 		{"cross_check_pins", `[{"stage":"plan","harness":"claude","effort":"high"}]`, true},
 		{"cross_check_pins", `[]`, true},
 		{"cross_check_pins", `null`, false},
@@ -292,7 +308,8 @@ func TestPutMyModelSettingsSetAndResetEveryFieldLiveDB(t *testing.T) {
 	f := newEffFix(t, nil)
 	f.clearModelColumns()
 	body := `{"default_claude_model":"opus","default_codex_model":"gpt-6-sol","default_effort":"runtime","default_codex_effort":"xhigh",
-		"judge_model":"haiku","codex_judge_model":"gpt-6-astra","judge_runs_on":"codex","summary_model":"sonnet","codex_summary_model":"gpt-6-luna"}`
+		"judge_model":"haiku","codex_judge_model":"gpt-6-astra","judge_runs_on":"codex","summary_model":"sonnet","codex_summary_model":"gpt-6-luna",
+		"task_review_model":"opus","codex_task_review_model":"gpt-6.1-sol"}`
 	rec := f.putModel(body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("set all = %d %s", rec.Code, rec.Body.String())
@@ -301,6 +318,7 @@ func TestPutMyModelSettingsSetAndResetEveryFieldLiveDB(t *testing.T) {
 		"default_claude_model": "opus", "default_codex_model": "gpt-6-sol", "default_effort": "runtime",
 		"default_codex_effort": "xhigh", "judge_model": "haiku", "codex_judge_model": "gpt-6-astra",
 		"judge_runs_on": "codex", "summary_model": "sonnet", "codex_summary_model": "gpt-6-luna",
+		"task_review_model": "opus", "codex_task_review_model": "gpt-6.1-sol",
 	}
 	row := f.modelRow()
 	for k, v := range want {
@@ -335,7 +353,8 @@ func TestPutMyModelSettingsSetAndResetEveryFieldLiveDB(t *testing.T) {
 
 	// Reset everything with nulls.
 	if rec := f.putModel(`{"default_claude_model":null,"default_codex_model":null,"default_effort":null,"default_codex_effort":null,
-		"judge_model":null,"codex_judge_model":null,"judge_runs_on":null,"summary_model":null,"codex_summary_model":null}`); rec.Code != http.StatusOK {
+		"judge_model":null,"codex_judge_model":null,"judge_runs_on":null,"summary_model":null,"codex_summary_model":null,
+		"task_review_model":null,"codex_task_review_model":null}`); rec.Code != http.StatusOK {
 		t.Fatalf("reset all = %d %s", rec.Code, rec.Body.String())
 	}
 	for k := range want {

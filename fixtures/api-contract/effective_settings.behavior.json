@@ -179,9 +179,7 @@
             "setting": "task_review_model",
             "fixed_at": "claim",
             "ignored": null,
-            "notes": [
-              "not_configurable"
-            ]
+            "notes": []
           }
         ],
         "efforts": [
@@ -1947,9 +1945,7 @@
             "setting": "task_review_model",
             "fixed_at": "claim",
             "ignored": null,
-            "notes": [
-              "not_configurable"
-            ]
+            "notes": []
           }
         ],
         "efforts": [
@@ -2664,9 +2660,7 @@
             "setting": "task_review_model",
             "fixed_at": "claim",
             "ignored": null,
-            "notes": [
-              "not_configurable"
-            ]
+            "notes": []
           }
         ],
         "efforts": [
@@ -3272,9 +3266,7 @@
             "setting": "task_review_model",
             "fixed_at": "claim",
             "ignored": null,
-            "notes": [
-              "not_configurable"
-            ]
+            "notes": []
           }
         ],
         "efforts": [

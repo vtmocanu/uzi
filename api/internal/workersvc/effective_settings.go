@@ -287,7 +287,7 @@ type SubagentPrediction struct {
 }
 
 // LeadPrediction is the lead worker model and effort a run on Harness would use, with where each
-// value comes from. For a task review it is the reviewer's built-in.
+// value comes from. For a task review it is the owner's review model, else the reviewer's built-in.
 type LeadPrediction struct {
 	Harness Harness
 	Review  bool
@@ -330,8 +330,9 @@ type leadPredictStore interface {
 }
 
 // PredictLead predicts the lead model and effort of a run on harness, and its subagents. A
-// task-review run never reaches the lead path, so the review branch is decided first: Codex runs
-// the built-in review model, Claude sends no model, and neither sends an effort. Otherwise the
+// task-review run never reaches the lead path, so the review branch is decided first: it runs the
+// owner's review model for the harness (ResolveTaskReview), else the built-in (Codex: the curated
+// review model, Claude: no model, the SDK decides), and sends no effort yet. Otherwise the
 // claim's own rule (resolveLeadSettings, over the lanes and efforts ListUserCrossCheckPins reads
 // with the lead template's pins) decides, and an empty claim model falls to the worker default
 // (agenttmpl.ResolveWorkerDefaultModel). frozenModel is a schedule's frozen run model.
@@ -370,13 +371,15 @@ func (c leadRunChoice) apply(in *LeadSettingsInput) {
 
 func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Harness, choice leadRunChoice, overrideSubagent bool, review bool) (LeadPrediction, error) {
 	if review {
-		model := agenttmpl.ClaudeTaskReviewModel
-		if harness == HarnessCodex {
-			model = agenttmpl.CodexTaskReviewModel
+		// The review path never reaches the lead resolver: it uses ResolveTaskReview, the rule the
+		// review claim applies (PRD #1570), over the owner's stored review model for the harness.
+		tr, err := s.resolveUserTaskReview(ctx, userID, harness)
+		if err != nil {
+			return LeadPrediction{}, fmt.Errorf("lead predict: %w", err)
 		}
 		return LeadPrediction{
-			Harness: harness, Review: true, Model: model, ModelSource: predictLeadSourceBuiltin,
-			DefaultModel: model, DefaultModelSource: predictLeadSourceBuiltin, EffortSource: predictReviewEffortSource,
+			Harness: harness, Review: true, LaneModel: tr.StoredModel, Model: tr.Model, ModelSource: tr.ModelSource,
+			DefaultModel: tr.BuiltinModel, DefaultModelSource: predictLeadSourceBuiltin, EffortSource: predictReviewEffortSource,
 		}, nil
 	}
 	q, ok := s.q.(leadPredictStore)

@@ -2502,6 +2502,9 @@ var pmBreadth = []pmEntry{
 	{"GetUserSummaryModels", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.GetUserSummaryModels(ctx, f.User)
 	}},
+	{"GetUserTaskReviewSettings", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
+		return q.GetUserTaskReviewSettings(ctx, f.User)
+	}},
 	{"GetUserUsageReserve", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.GetUserUsageReserve(ctx, f.User)
 	}},

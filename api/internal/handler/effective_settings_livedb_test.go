@@ -465,23 +465,50 @@ func TestEffectiveSettingsTaskReviewCellsLiveDB(t *testing.T) {
 	f := newEffFix(t, nil)
 	f.anthropic()
 	f.codexDefault()
-	f.set("default_codex_model", "custom-codex-preview") // whatever the lane holds, the review built-in is fixed
+	f.set("default_codex_model", "custom-codex-preview") // whatever the worker lane holds, the review model is its own setting
 	f.set("default_claude_model", "sonnet")
 	dto, _ := f.get()
 
+	// Unset: the built-ins, no longer marked not configurable.
 	codex := modelCell(t, dto.Models, "task_review_model", "codex")
-	if codex.ResolvedModel != agenttmpl.CodexTaskReviewModel || codex.Source != "builtin" || codex.Model != nil || strings.Join(codex.Notes, ",") != "not_configurable" || codex.FixedAt != "claim" {
+	if codex.ResolvedModel != agenttmpl.CodexTaskReviewModel || codex.Source != "builtin" || codex.Model != nil || len(codex.Notes) != 0 || codex.FixedAt != "claim" {
 		t.Errorf("codex task review model = %+v", codex)
 	}
 	claude := modelCell(t, dto.Models, "task_review_model", "claude")
-	if claude.ResolvedModel != "" || claude.Source != "builtin" || strings.Join(claude.Notes, ",") != "sdk_default" {
-		t.Errorf("claude task review model = %+v (the Claude lane is ignored by the reviewer)", claude)
+	if claude.ResolvedModel != "" || claude.Source != "builtin" || claude.Model != nil || strings.Join(claude.Notes, ",") != "sdk_default" {
+		t.Errorf("claude task review model = %+v (the Claude worker lane is ignored by the reviewer)", claude)
 	}
 	for _, h := range []string{"claude", "codex"} {
 		e := effortCell(t, dto.Efforts, "task_review_effort", h)
 		if e.ResolvedEffort != nil || e.Mode != "runtime_default" || e.Source != "builtin" || strings.Join(e.Notes, ",") != "not_sent" || e.Effort != nil {
 			t.Errorf("%s task review effort = %+v", h, e)
 		}
+	}
+
+	// Configured: the owner's models, source user_default, no note for a Claude model, and the
+	// Codex effort catalog default follows the configured review model.
+	f.set("task_review_model", "opus")
+	f.set("codex_task_review_model", "gpt-6.1-sol")
+	f.catalog.reset()
+	dto, _ = f.get()
+	codex = modelCell(t, dto.Models, "task_review_model", "codex")
+	if codex.ResolvedModel != "gpt-6.1-sol" || codex.Source != "user_default" || codex.Model == nil || *codex.Model != "gpt-6.1-sol" ||
+		codex.DefaultModel != agenttmpl.CodexTaskReviewModel || codex.DefaultSource != "builtin" || len(codex.Notes) != 0 {
+		t.Errorf("configured codex task review model = %+v", codex)
+	}
+	claude = modelCell(t, dto.Models, "task_review_model", "claude")
+	if claude.ResolvedModel != "opus" || claude.Source != "user_default" || claude.Model == nil || *claude.Model != "opus" || len(claude.Notes) != 0 {
+		t.Errorf("configured claude task review model = %+v", claude)
+	}
+	if !f.catalog.saw("gpt-6.1-sol") {
+		t.Errorf("the Codex review effort catalog default read %v, want the configured review model gpt-6.1-sol", f.catalog.models)
+	}
+
+	// A stored Codex model the claim would refuse shows as the built-in.
+	f.set("codex_task_review_model", "gpt-4-retired")
+	dto, _ = f.get()
+	if c := modelCell(t, dto.Models, "task_review_model", "codex"); c.ResolvedModel != agenttmpl.CodexTaskReviewModel || c.Source != "builtin" {
+		t.Errorf("retired codex task review model = %+v", c)
 	}
 }
 

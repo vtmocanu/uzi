@@ -30,6 +30,13 @@ type predictFake struct {
 	// planning is the owner's Claude planning pair (PRD #3252); planningErr fails the strict read.
 	planning    store.GetUserPlanningClaudeRow
 	planningErr error
+	// taskReview is the owner's stored review models (PRD #1570); taskReviewErr fails the read.
+	taskReview    store.GetUserTaskReviewSettingsRow
+	taskReviewErr error
+}
+
+func (f *predictFake) GetUserTaskReviewSettings(context.Context, uuid.UUID) (store.GetUserTaskReviewSettingsRow, error) {
+	return f.taskReview, f.taskReviewErr
 }
 
 func (f *predictFake) GetUserPlanningClaude(context.Context, uuid.UUID) (store.GetUserPlanningClaudeRow, error) {

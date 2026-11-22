@@ -23,6 +23,18 @@
   "codex_judge_model": "x",
   "summary_model": "x",
   "codex_summary_model": "x",
+  "task_review_model": "x",
+  "codex_task_review_model": "x",
+  "task_review_models": [
+    {
+      "harness": "x",
+      "model": "x",
+      "default_model": "x",
+      "default_source": "x",
+      "resolved_model": "x",
+      "source": "x"
+    }
+  ],
   "theme": "x",
   "mr_rework_enabled": true,
   "now_summary_enabled": true,

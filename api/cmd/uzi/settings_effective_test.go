@@ -64,7 +64,7 @@ func effectiveFixture() *apitypes.EffectiveSettingsDTO {
 			modelCell("summary_model", "claude", nil, "haiku", "builtin", "haiku", "builtin"),
 			modelCell("summary_model", "codex", nil, "gpt-6-luna", "builtin", "gpt-6-luna", "builtin"),
 			modelCell("task_review_model", "claude", nil, "", "builtin", "", "builtin", "sdk_default"),
-			modelCell("task_review_model", "codex", nil, "gpt-6-sol", "builtin", "gpt-6-sol", "builtin", "not_configurable"),
+			modelCell("task_review_model", "codex", sptr("gpt-6.1-sol"), "gpt-6-sol", "builtin", "gpt-6.1-sol", "user_default"),
 		},
 		Efforts: []apitypes.EffectiveEffortCellDTO{
 			effortCell("worker_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
@@ -116,7 +116,7 @@ func TestSettingsGetEffectiveRows(t *testing.T) {
 		"judge claude Default haiku haiku instance default",
 		"summary codex Default gpt-6-luna gpt-6-luna built-in",
 		"task review model claude Default SDK/account default SDK/account default built-in · the SDK decides",
-		"task review model codex Default gpt-6-sol gpt-6-sol built-in · not configurable",
+		"task review model codex Pin · gpt-6.1-sol gpt-6-sol gpt-6.1-sol your choice",
 		"task review effort claude Default medium runtime default (value not reported) built-in · not sent",
 		"task review effort codex Default medium runtime default (catalog default unknown) built-in · not sent",
 	} {
