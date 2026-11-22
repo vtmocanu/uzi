@@ -4,7 +4,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { createLogger } from "../src/log.js";
 import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
-import { runEnvRedactionForms, runEnvScanNeedles } from "../src/run-env-forms.js";
+import { RUN_ENV_FORM_CHARS_MAX, runEnvClaimForms, runEnvRedactionForms, runEnvScanNeedles } from "../src/run-env-forms.js";
 import { textHitVariables } from "../src/run-env-scan.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { fakeGitlab, git, installHarness, runnerWith } from "./runner-harness.js";
@@ -203,13 +203,23 @@ describe("the largest claim redacts in bounded time", () => {
   ];
   for (const [label, lineLen, eol, trailing] of cases) {
     it(`${label} values: forms stay under the bound and a 1 MiB text redacts in under 5 s`, () => {
-      const live = Array.from({ length: limits.max_run_env_entries }, (_, i) =>
+      let live = Array.from({ length: limits.max_run_env_entries }, (_, i) =>
         secretVar(`LIVE_${i}`, value(`live-${i}`, Math.floor(limits.max_run_env_total_bytes / limits.max_run_env_entries), i % 5 === 0 ? 0 : lineLen, eol, trailing)));
-      const old = Array.from({ length: limits.max_redact_entries }, (_, i) =>
+      let old = Array.from({ length: limits.max_redact_entries }, (_, i) =>
         retired(`OLD_${i}`, value(`old-${i}`, Math.floor(limits.max_redact_total_bytes / limits.max_redact_entries), i % 5 === 0 ? 0 : lineLen, eol, trailing)));
-      const forms = runEnvRedactionForms(live, old);
+      let claim = runEnvClaimForms(live, old);
+      if (lineLen !== 0) {
+        // Multi-line values at the full store bounds pass the form budget: the claim fails closed, and the
+        // timing below runs on a claim a sixth of that size.
+        assert.ok(claim.overBudget, "the largest multi-line claim is over budget");
+        live = live.slice(0, 8);
+        old = old.slice(0, 50);
+        claim = runEnvClaimForms(live, old);
+      }
+      assert.ok(!claim.overBudget, "the claim measured is within budget");
+      const forms = claim.redaction;
       assert.ok(forms.length < MAX_FORMS, `${forms.length} forms, bound ${MAX_FORMS}`);
-      const needleForms = runEnvScanNeedles(live, old).reduce((n, x) => n + x.forms.length, 0);
+      const needleForms = claim.needles.reduce((n, x) => n + x.forms.length, 0);
       assert.ok(needleForms < MAX_NEEDLE_FORMS, `${needleForms} needle forms, bound ${MAX_NEEDLE_FORMS}`);
 
       const planted = firstLine(old[7]!.value);
@@ -257,5 +267,71 @@ describe("the largest claim redacts in bounded time", () => {
     assert.equal(indexed(text), split(text));
     assert.equal(indexed(`x ${secrets[40]} y`), "x ***REDACTED*** y");
     assert.equal(indexed(`x sec​ret-number-041-value y`), "x ***REDACTED*** y", "split by an invisible character");
+  });
+});
+
+// A multi-line value's public lines (constant JSON members, a legacy PEM header, blank padding) are never
+// registered alone, and a high-entropy line of the same value still is. Armor is joined at runtime.
+describe("public lines of a multi-line value stay readable in redacted output", () => {
+  const ENTROPY = bodyLines("one");
+  const PUBLIC = {
+    jsonType: '  "type": "service_account",',
+    authUri: '"auth_uri": "https://accounts.example.test/o/oauth2/auth",',
+    procType: "Proc-Type: 4,ENCRYPTED",
+    padding: " ".repeat(8),
+    flat: "aaaaaaaabbbbbbbb",
+  };
+  const value = [
+    "{", PUBLIC.jsonType, PUBLIC.authUri, PUBLIC.procType, PUBLIC.padding, PUBLIC.flat,
+    `"client_email": "${ENTROPY[0]}",`, ENTROPY[1]!, ENTROPY[2]!, "}",
+  ].join("\n");
+  const claim = runEnvClaimForms([secretVar("SVC_JSON", value)], []);
+  const redact = makeTextRedactor(claim.redaction);
+
+  for (const [label, line] of Object.entries(PUBLIC)) {
+    it(`${label} is not masked`, () => {
+      const text = `before\n${line}\nafter`;
+      assert.equal(redact(text), text);
+    });
+  }
+
+  it("a high-entropy line of the same value is masked, raw and JSON-escaped", () => {
+    for (const line of [ENTROPY[1]!, ENTROPY[2]!, JSON.stringify(ENTROPY[1]).slice(1, -1)]) {
+      assert.ok(!redact(`x ${line} y`).includes(line.slice(0, 30)), "masked");
+    }
+  });
+
+  it("the per-name line forms hold the entropy lines and no public line", () => {
+    const forms = claim.lineForms.find((n) => n.name === "SVC_JSON")!.forms;
+    assert.ok(forms.includes(ENTROPY[1]!));
+    for (const line of Object.values(PUBLIC)) assert.ok(!forms.includes(line), line);
+  });
+
+  it("a claim with no multi-line value has no line forms", () => {
+    assert.deepEqual(runEnvClaimForms([secretVar("ONE_LINE", "single-line-dummy-value")], []).lineForms, []);
+  });
+});
+
+describe("the form budget", () => {
+  const big = (i: number): string => Array.from({ length: 800 }, (_, n) =>
+    crypto.createHash("sha256").update(`budget-${i}-${n}`).digest("base64")).join("\r\n") + "\r\n";
+
+  it("an over-budget claim reports it, stops building near the cap and registers only raw values", () => {
+    const old = Array.from({ length: 300 }, (_, i) => retired(`OLD_${i % 7}`, big(i)));
+    const claim = runEnvClaimForms([], old);
+    assert.equal(claim.overBudget, true);
+    assert.ok(claim.formChars > RUN_ENV_FORM_CHARS_MAX, "the cap was passed");
+    assert.ok(claim.formChars < RUN_ENV_FORM_CHARS_MAX + 4_000_000, `stopped near the cap: ${claim.formChars}`);
+    assert.deepEqual(claim.needles, []);
+    assert.deepEqual(claim.lineForms, []);
+    assert.ok(claim.redaction.includes(old[0]!.value), "the raw value is registered");
+    assert.ok(claim.redaction.length <= 4 * old.length, "and no encoded form, only each value's variants");
+  });
+
+  it("a claim under the cap is complete", () => {
+    const claim = runEnvClaimForms([secretVar("ONE", big(1))], []);
+    assert.equal(claim.overBudget, false);
+    assert.ok(claim.formChars > 0 && claim.formChars < RUN_ENV_FORM_CHARS_MAX);
+    assert.ok(claim.needles.length === 1 && claim.lineForms.length === 1);
   });
 });

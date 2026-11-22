@@ -2,7 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
-import { runEnvRedactionForms } from "../src/run-env-forms.js";
+import { RUN_ENV_FORMS_OVER_BUDGET, runEnvRedactionForms } from "../src/run-env-forms.js";
+import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, secretRecordingLogger } from "./runner-harness.js";
@@ -180,4 +182,44 @@ describe("run variables are never written to durable worker state", () => {
       for (const needle of [SECRET, OLD_SECRET, PLAIN]) assert.deepEqual(filesContaining(needle), []);
     });
   }
+});
+
+// PRD 4416 M2: a claim whose forms pass the budget fails the run before the clone and the executor, names no value,
+// and still registers the raw values so any text is masked.
+describe("a claim over the form budget", () => {
+  const multiLine = (seed: string, bytes: number): string => {
+    let text = "";
+    for (let i = 0; text.length < bytes; i++) text += crypto.createHash("sha512").update(`${seed}-${i}`).digest("base64").replace(/=+$/, "") + "\r\n";
+    return text;
+  };
+  const OVER_ENTRIES = 40;
+  const overBudget = () => ({
+    forge_pat: "fixture-forge-pat-000000",
+    anthropic_oauth_token: "dummy-oauth-do-not-scan",
+    run_env_redact: Array.from({ length: OVER_ENTRIES }, (_, i) =>
+      ({ var_id: UUID, scope: "repo" as const, rev: i + 1, name: `OLD_${i % 5}`, value: multiLine(`over-${i}`, 65536) })),
+  });
+
+  it("fails with run_env_forms_over_budget, runs no executor and pushes nothing", async () => {
+    const { gitlab } = fakeGitlab();
+    const { logger, added } = secretRecordingLogger();
+    const claim = gitlabClaim(iid++, { secrets: overBudget() as never });
+    let ran = 0;
+    const exec: Executor = { run: async (ctx) => { ran++; return { branch: ctx.branch, reportOnly: true, summary: "ok" }; } };
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+
+    assert.equal(ran, 0, "the executor never ran");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.ok(failed, "the run failed");
+    assert.match(String(failed.failure_reason), new RegExp(RUN_ENV_FORMS_OVER_BUDGET));
+    const first = overBudget().run_env_redact[0]!.value;
+    assert.ok(!JSON.stringify(failed).includes(first.slice(0, 40)), "the report carries no value");
+    assert.ok(added.includes(first), "the raw value is registered so any text is masked");
+    assert.equal(api.states.filter((s) => s.runId === claim.run_id && s.body.status === "completed").length, 0);
+    let pushed = true;
+    try {
+      execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "--quiet", `refs/heads/agent/issue-${claim.issue_iid}`], { stdio: "pipe" });
+    } catch { pushed = false; }
+    assert.equal(pushed, false, "nothing reached origin");
+  });
 });

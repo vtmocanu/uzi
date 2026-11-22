@@ -249,6 +249,15 @@ describe("resolveScanNeedles", () => {
     assert.deepEqual(await resolveScanNeedles({ live: [], fetchProtected: never }), { kind: "needles", needles: [] });
   });
 
+  it("with no flight, versions whose forms pass the budget withhold as forms_over_budget", async () => {
+    const line = (seed: number, n: number): string => `${seed}-${n}-`.padEnd(60, "Qz8vK2mX7pL4wR9t");
+    const big = (seed: number): string => Array.from({ length: 1000 }, (_, n) => line(seed, n)).join("\r\n") + "\r\n";
+    const versions = Array.from({ length: 300 }, (_, i) => retired(`OLD_${i % 9}`, big(i)));
+    assert.deepEqual(
+      await resolveScanNeedles({ live: undefined, fetchProtected: async () => ({ protected: true, versions }) }),
+      { kind: "withhold", reason: "forms_over_budget" });
+  });
+
   it("with no flight, protected:false means nothing to scan for", async () => {
     assert.deepEqual(await resolveScanNeedles({ live: undefined, fetchProtected: async () => ({ protected: false }) }), { kind: "needles", needles: [] });
   });

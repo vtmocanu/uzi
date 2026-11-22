@@ -12,8 +12,7 @@
 // alignments are also kept in the URL-safe alphabet.
 //
 // A multi-line value (a PEM key, a JSON credential file) is also split by line, but only for REDACTION: a
-// line of it can appear alone in output and must be masked there. A line is never a scan needle, because a
-// public line (`"type": "service_account",`) would hit every file that happens to carry it. The scan
+// line of it can appear alone in output and must be masked there. A line is never a scan needle. The scan
 // instead gets the value as it reads inside a unified diff, where every line after the first carries a
 // `+`, `-` or ` ` prefix.
 
@@ -43,17 +42,32 @@ function wholeValueForms(value: string): string[] {
 
 const LINE_BREAK = /\r\n|\r|\n/;
 const PEM_ARMOR = /^-----(BEGIN|END) [^-]+-----$/;
+/** Lines whose text is shared by every value of their kind: a legacy PEM header and the constant members of a
+ *  Google service-account JSON file. */
+const PUBLIC_LINES: readonly RegExp[] = [
+  /^\s*Proc-Type: \d+,[A-Z-]+\s*$/,
+  /^\s*"(type|auth_uri|token_uri|auth_provider_x509_cert_url|universe_domain)"\s*:\s*"[^"]*"\s*,?\s*$/,
+];
+/** The fewest distinct non-space characters a line needs to be registered alone. */
+const MIN_LINE_DISTINCT = 6;
+
+function distinctNonSpace(line: string): number {
+  const seen = new Set<string>();
+  for (const ch of line) if (!/\s/u.test(ch)) seen.add(ch);
+  return seen.size;
+}
 
 function isMultiLine(value: string): boolean {
   return value.includes("\r") || value.includes("\n");
 }
 
-/** The lines of a multi-line value that may be registered alone: long enough, and not PEM armor (the
- *  `-----BEGIN ...-----` lines are public text shared by every key). */
+/** The lines of a multi-line value that may be registered alone: at least {@link MIN_SECRET_LEN} long, with at
+ *  least {@link MIN_LINE_DISTINCT} distinct non-space characters, and neither PEM armor nor a public line. */
 function lineForms(value: string): string[] {
   const out: string[] = [];
   for (const line of value.split(LINE_BREAK)) {
-    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line)) continue;
+    if (line.length < MIN_SECRET_LEN || PEM_ARMOR.test(line) || PUBLIC_LINES.some((re) => re.test(line))) continue;
+    if (distinctNonSpace(line) < MIN_LINE_DISTINCT) continue;
     out.push(line, JSON.stringify(line).slice(1, -1));
   }
   return out;
@@ -71,34 +85,12 @@ function diffShapedForms(value: string): string[] {
   return out;
 }
 
-function usable(forms: readonly string[]): string[] {
-  return [...new Set(forms.filter((f) => f.length >= MIN_SECRET_LEN))];
-}
-
-/** The value as a file may hold it: as given, with its trailing line breaks stripped (a command
- *  substitution drops them, and a token often carries one it was never meant to), and, for a multi-line
+/** The value as a file may hold it: as given, with its trailing line breaks stripped, and, for a multi-line
  *  value, with every line break normalized to LF (a checkout normalizes CRLF), with and without the trailing
  *  line breaks. A variant shorter than {@link MIN_SECRET_LEN} is dropped, so it derives no encoded form. */
 function valueVariants(value: string): string[] {
   const lf = value.replace(/\r\n?/g, "\n");
   return [...new Set([value, value.replace(/[\r\n]+$/, ""), lf, lf.replace(/\n+$/, "")])].filter((v) => v.length >= MIN_SECRET_LEN);
-}
-
-function variantForms(value: string): string[] {
-  return valueVariants(value).flatMap(wholeValueForms);
-}
-
-/** Every form of one secret value to register for redaction: the whole-value forms of each variant of the
- *  value, plus each line of a multi-line value (raw and JSON-escaped). Forms shorter than
- *  {@link MIN_SECRET_LEN} are dropped. */
-function redactionFormsOf(value: string): string[] {
-  return usable([...variantForms(value), ...(isMultiLine(value) ? lineForms(value) : [])]);
-}
-
-/** Every form of one secret value to search for: the whole-value forms of each variant of the value, plus
- *  the diff-shaped forms of a multi-line value. Never a single line of a multi-line value. */
-function scanFormsOf(value: string): string[] {
-  return usable([...variantForms(value), ...(isMultiLine(value) ? diffShapedForms(value) : [])]);
 }
 
 /** One variable's scan needle: its NAME (the only text a finding may show) and every registered form of
@@ -108,33 +100,104 @@ export interface ScanNeedle {
   readonly forms: readonly string[];
 }
 
-/** The exact-value scan needles for a claim's (or the maintenance endpoint's) secret variables, grouped by
- *  name so a hit names the variable. A name with no usable form (every value too short) is dropped. */
+/** The most UTF-16 units of forms one claim may register, every distinct form counted once. Measured: 256 KiB of
+ *  live multi-line values register 6.7M (LF base64 lines) to 25.3M (symbol-dense CRLF lines) units; the full store
+ *  bounds of multi-line values register over 100M. */
+export const RUN_ENV_FORM_CHARS_MAX = 40_000_000;
+
+/** The reason text of a claim whose forms passed {@link RUN_ENV_FORM_CHARS_MAX}. */
+export const RUN_ENV_FORMS_OVER_BUDGET = "run_env_forms_over_budget";
+
+/** The forms of one claim's secret variables, computed once and shared by every consumer. */
+export interface RunEnvClaimForms {
+  /** Every form to register for redaction, longest first. When {@link overBudget}, the raw values (and their
+   *  trimmed and LF-normalized variants) only. */
+  readonly redaction: string[];
+  /** The exact-value scan needles, grouped by variable name. Empty when over budget. */
+  readonly needles: ScanNeedle[];
+  /** Per variable name, the registered line forms of its multi-line values. Empty when over budget. */
+  readonly lineForms: ScanNeedle[];
+  /** The UTF-16 units of distinct forms counted, at most one variant past {@link RUN_ENV_FORM_CHARS_MAX}. */
+  readonly formChars: number;
+  /** Building stopped because {@link RUN_ENV_FORM_CHARS_MAX} was passed; no partial form set is returned. */
+  readonly overBudget: boolean;
+}
+
+const named = (sets: ReadonlyMap<string, ReadonlySet<string>>): ScanNeedle[] =>
+  [...sets].filter(([, forms]) => forms.size > 0).map(([name, forms]) => ({ name, forms: [...forms] }));
+
+/** The forms of a claim's (or the maintenance endpoint's) secret variables: every live secret and every
+ *  run_env_redact entry. Each value's variants and whole-value encodings are built once and feed both the
+ *  redaction list and the scan needles. Building stops as soon as the distinct forms pass the budget. */
+export function runEnvClaimForms(
+  runEnv: readonly ClaimRunEnvVar[] | undefined,
+  runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
+): RunEnvClaimForms {
+  const entries: Array<{ name: string; value: string }> = [];
+  for (const v of runEnv ?? []) if (v.secret) entries.push({ name: v.name, value: v.value });
+  for (const r of runEnvRedact ?? []) entries.push({ name: r.name, value: r.value });
+
+  const redaction = new Set<string>();
+  const needleSets = new Map<string, Set<string>>();
+  const lineSets = new Map<string, Set<string>>();
+  const counted = new Set<string>();
+  let chars = 0;
+  const forName = (sets: Map<string, Set<string>>, name: string): Set<string> => {
+    const set = sets.get(name) ?? new Set<string>();
+    sets.set(name, set);
+    return set;
+  };
+  const register = (forms: readonly string[], targets: readonly Set<string>[]): void => {
+    for (const f of forms) {
+      if (f.length < MIN_SECRET_LEN) continue;
+      for (const t of targets) t.add(f);
+      if (!counted.has(f)) {
+        counted.add(f);
+        chars += f.length;
+      }
+    }
+  };
+
+  for (const { name, value } of entries) {
+    const needle = forName(needleSets, name);
+    const multi = isMultiLine(value);
+    for (const variant of valueVariants(value)) {
+      register(wholeValueForms(variant), [redaction, needle]);
+      if (chars > RUN_ENV_FORM_CHARS_MAX) return overBudgetForms(entries, chars);
+    }
+    if (multi) {
+      register(lineForms(value), [redaction, forName(lineSets, name)]);
+      register(diffShapedForms(value), [needle]);
+      if (chars > RUN_ENV_FORM_CHARS_MAX) return overBudgetForms(entries, chars);
+    }
+  }
+  return {
+    redaction: [...redaction].sort((a, b) => b.length - a.length),
+    needles: named(needleSets),
+    lineForms: named(lineSets),
+    formChars: chars,
+    overBudget: false,
+  };
+}
+
+function overBudgetForms(entries: ReadonlyArray<{ value: string }>, formChars: number): RunEnvClaimForms {
+  const raw = new Set<string>();
+  for (const { value } of entries) for (const v of valueVariants(value)) raw.add(v);
+  return { redaction: [...raw].sort((a, b) => b.length - a.length), needles: [], lineForms: [], formChars, overBudget: true };
+}
+
+/** The exact-value scan needles of {@link runEnvClaimForms}. */
 export function runEnvScanNeedles(
   runEnv: readonly ClaimRunEnvVar[] | undefined,
   runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
 ): ScanNeedle[] {
-  const byName = new Map<string, Set<string>>();
-  const add = (name: string, value: string): void => {
-    const set = byName.get(name) ?? new Set<string>();
-    for (const f of scanFormsOf(value)) set.add(f);
-    byName.set(name, set);
-  };
-  for (const v of runEnv ?? []) if (v.secret) add(v.name, v.value);
-  for (const r of runEnvRedact ?? []) add(r.name, r.value);
-  return [...byName]
-    .filter(([, forms]) => forms.size > 0)
-    .map(([name, forms]) => ({ name, forms: [...forms] }));
+  return runEnvClaimForms(runEnv, runEnvRedact).needles;
 }
 
-/** The deduplicated registration list for a claim's secret variables: every live secret and every
- *  run_env_redact entry. Longest first, so a longer form is replaced before a shorter one inside it. */
+/** The redaction list of {@link runEnvClaimForms}, longest first. */
 export function runEnvRedactionForms(
   runEnv: readonly ClaimRunEnvVar[] | undefined,
   runEnvRedact: readonly ClaimRunEnvRedact[] | undefined,
 ): string[] {
-  const out = new Set<string>();
-  for (const v of runEnv ?? []) if (v.secret) for (const f of redactionFormsOf(v.value)) out.add(f);
-  for (const r of runEnvRedact ?? []) for (const f of redactionFormsOf(r.value)) out.add(f);
-  return [...out].sort((a, b) => b.length - a.length);
+  return runEnvClaimForms(runEnv, runEnvRedact).redaction;
 }

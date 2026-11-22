@@ -26,7 +26,7 @@ import { rmHomeTree } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { MessageBatcher } from "./batcher.js";
 import { makeRedactor, makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
-import { runEnvRedactionForms } from "./run-env-forms.js";
+import { RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms } from "./run-env-forms.js";
 import { CheckActivityRecorder } from "./cross-check-activity.js";
 
 // The verdict route uses reason-class refusals, whereas ordinary state routes use disposition.
@@ -194,7 +194,8 @@ export class CrossCheckRunner {
       // Journaled to the outbox is not proof the original payload arrived (replay may tombstone it): fail closed.
       return usageSeqs.some((s) => (from !== undefined && s >= from) || tombstones.seqs.has(s) || journaled.seqs.has(s));
     };
-    const runEnvForms = runEnvRedactionForms(claim.secrets.run_env, claim.secrets.run_env_redact);
+    const runEnvClaim = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact);
+    const runEnvForms = runEnvClaim.redaction;
     let runEnvRegistered = false;
     // Identity until the secrets are known; every verdict body passes through it before it is reported.
     let redactVerdict: <T>(v: T) => T = (v) => v;
@@ -233,6 +234,8 @@ export class CrossCheckRunner {
       // PRD #4320: the cross-check lane cannot serve a provider until PRD #4322; the server refuses it
       // first, this is the worker's second layer. Reported as an unavailable checker, never run.
       if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);
+      // An over-budget claim registered its raw values above and never runs: reported as an unavailable checker.
+      if (runEnvClaim.overBudget) throw new Error(RUN_ENV_FORMS_OVER_BUDGET);
       const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
         makeRedactor(secrets), makeTextRedactor(secrets), {
           ...(this.opts.outbox ? { outbox: this.opts.outbox } : {}),

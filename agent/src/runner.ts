@@ -1,4 +1,4 @@
-import { runEnvRedactionForms, runEnvScanNeedles, type ScanNeedle } from "./run-env-forms.js";
+import { RUN_ENV_FORM_CHARS_MAX, RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms, type RunEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
 import { hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
 import { runEnvContextField } from "./run-env-lane.js";
 import { markRunEnvSeen, runEnvSeen } from "./run-env-seen.js";
@@ -3190,6 +3190,8 @@ interface RunFlight {
    *  the claim and never persisted. Empty when the claim carried no secret variable; every scanned publish
    *  searches its whole outgoing range for them (requireNoRunEnv). */
   scanNeedles?: readonly ScanNeedle[];
+  /** The registered line forms of this run's multi-line secret variables, per variable name. */
+  scanLineForms?: readonly ScanNeedle[];
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -6430,7 +6432,9 @@ export class RunRunner {
     if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
     // PRD #4416 M2: the forms of every secret run variable (live and older versions), rebuilt from each
     // claim and evicted with the other per-run secrets at terminal. Plain variables are not registered.
-    runScopedSecrets.push(...runEnvRedactionForms(claim.secrets.run_env, claim.secrets.run_env_redact));
+    // An over-budget claim registers its raw values only: it fails below, before the executor starts.
+    const runEnvForms = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact);
+    runScopedSecrets.push(...runEnvForms.redaction);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -6445,6 +6449,7 @@ export class RunRunner {
       initialRunHome,
       gitBasic,
       runScopedSecrets,
+      runEnvForms,
     );
     flight.policyReservation = reservation;
     // PRD 4416 M2: a live flight's claim set is the authority for lanes that publish with no flight in hand
@@ -7527,6 +7532,11 @@ export class RunRunner {
         flight.preserveSession = true;
         flight.keepGuardedInventoryOpen = true;
         throw new Error("transport permanently failed (outbox_unavailable)");
+      }
+      // The variables' forms passed the budget: no complete form set exists, so the run fails before the clone,
+      // the executor or any output.
+      if (runEnvForms.overBudget) {
+        throw new Error(`${RUN_ENV_FORMS_OVER_BUDGET}: the run's secret variables exceed ${RUN_ENV_FORM_CHARS_MAX} characters of registered forms`);
       }
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
@@ -14032,6 +14042,7 @@ export class RunRunner {
     runHome: string | undefined,
     gitBasic: string,
     runScopedSecrets: string[],
+    runEnvForms: RunEnvClaimForms = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact),
   ): RunFlight {
     const runLog = this.log.child({
       run_id: runId,
@@ -14045,7 +14056,7 @@ export class RunRunner {
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
       ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []),
-      ...runEnvRedactionForms(claim.secrets.run_env, claim.secrets.run_env_redact),
+      ...runEnvForms.redaction,
       this.joinToken,
       gitBasic,
     ];
@@ -14571,7 +14582,8 @@ export class RunRunner {
         ? { ciConfigGuardGlobs: [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
         : {}),
       providerKeyForms: claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [],
-      scanNeedles: runEnvScanNeedles(claim.secrets.run_env, claim.secrets.run_env_redact),
+      scanNeedles: runEnvForms.needles,
+      scanLineForms: runEnvForms.lineForms,
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the

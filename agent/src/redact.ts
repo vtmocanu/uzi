@@ -84,12 +84,12 @@ function usableSecrets(secrets: Array<string | undefined | null>): string[] {
 export function makeTextRedactor(secrets: Array<string | undefined | null>): TextRedactor {
   const list = usableSecrets(secrets);
   if (list.length === 0) return (s) => s;
-  const visible = list.map((secret) => secret.replace(INVISIBLE, "")).filter((v) => v.length >= MIN_SECRET_LEN);
+  // With no invisible character in any secret the visible forms are the plain list itself.
+  const stripped = list.some((secret) => INVISIBLE_TEST.test(secret));
+  const visible = stripped ? list.map((secret) => secret.replace(INVISIBLE, "")).filter((v) => v.length >= MIN_SECRET_LEN) : list;
   if (list.length > PER_SECRET_MAX) {
-    // Many secrets (a run's secret variables, with a form per line of every multi-line value): one pass over
-    // the text, not one pass per secret.
     const find = literalSpanFinder(list);
-    const findVisible = visible.length > 0 ? literalSpanFinder(visible) : undefined;
+    const findVisible = !stripped ? find : visible.length > 0 ? literalSpanFinder(visible) : undefined;
     return (s) => {
       let out = replaceSpans(s, find(s));
       if (findVisible && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisible);
@@ -97,9 +97,10 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
     };
   }
   const findEach = spansOfEach(list);
+  const findVisibleEach = !stripped ? findEach : spansOfEach(visible);
   return (s) => {
     let out = replaceSpans(s, findEach(s));
-    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, spansOfEach(visible));
+    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisibleEach);
     return out;
   };
 }
@@ -111,52 +112,81 @@ export const PER_SECRET_MAX = 64;
 export type SpanFinder = (text: string) => Array<[number, number]>;
 
 /**
- * A single-pass finder for many literals. Every literal is at least MIN_SECRET_LEN long, so the first
- * MIN_SECRET_LEN UTF-16 units of a literal key a table: at each text position the table is consulted once
- * and only the literals sharing that key are compared. The longest literal starting at each position is
- * reported, so spans are sorted by start and may overlap; replaceSpans merges them. The cost per position
- * is proportional to the number of literals sharing that 8-unit key, so literals with one shared prefix
- * share one bucket and are compared one after another.
+ * A mutable, reference-counted index of literals for single-pass matching. Every literal is at least
+ * MIN_SECRET_LEN long, so the first MIN_SECRET_LEN UTF-16 units of a literal key a table: at each text position
+ * the table is consulted once and only the literals sharing that key are compared, longest first. Adding a
+ * literal twice and removing it once keeps it; add and remove touch only that literal's key bucket.
  */
-export function literalSpanFinder(literals: readonly string[]): SpanFinder {
-  const scan = literalScanner(literals, true);
-  return (text) => {
-    const spans: Array<[number, number]> = [];
-    scan(text, (literal, at) => spans.push([at, at + literal.length]));
-    return spans;
-  };
-}
+export class LiteralIndex {
+  private readonly counts = new Map<string, number>();
+  private readonly buckets = new Map<string, string[]>();
+  private readonly firstUnit = new Uint32Array(0x10000);
 
-/** One pass over a text that returns every one of `literals` occurring in it (not only the longest at a
- *  position), so a literal that is a prefix of another is still reported. Same cost as literalSpanFinder. */
-export function literalsPresent(literals: readonly string[]): (text: string) => Set<string> {
-  const scan = literalScanner(literals, false);
-  return (text) => {
-    const found = new Set<string>();
-    scan(text, (literal) => found.add(literal));
-    return found;
-  };
-}
-
-function literalScanner(
-  literals: readonly string[], longestOnly: boolean,
-): (text: string, hit: (literal: string, at: number) => void) => void {
-  const key = MIN_SECRET_LEN;
-  const byKey = new Map<string, string[]>();
-  const firstUnit = new Uint8Array(0x10000);
-  for (const literal of new Set(literals)) {
-    if (literal.length < key) continue;
-    const k = literal.slice(0, key);
-    const bucket = byKey.get(k);
-    if (bucket) bucket.push(literal); else byKey.set(k, [literal]);
-    firstUnit[literal.charCodeAt(0)] = 1;
+  /** The distinct literals held. */
+  get size(): number {
+    return this.counts.size;
   }
-  for (const bucket of byKey.values()) bucket.sort((a, b) => b.length - a.length);
-  return (text, hit) => {
-    const last = text.length - key;
+
+  add(literal: string): void {
+    if (literal.length < MIN_SECRET_LEN) return;
+    const held = this.counts.get(literal);
+    this.counts.set(literal, (held ?? 0) + 1);
+    if (held !== undefined) return;
+    const key = literal.slice(0, MIN_SECRET_LEN);
+    const bucket = this.buckets.get(key);
+    if (bucket === undefined) {
+      this.buckets.set(key, [literal]);
+    } else {
+      let lo = 0;
+      let hi = bucket.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (bucket[mid]!.length >= literal.length) lo = mid + 1; else hi = mid;
+      }
+      bucket.splice(lo, 0, literal);
+    }
+    const unit = literal.charCodeAt(0);
+    this.firstUnit[unit] = (this.firstUnit[unit] ?? 0) + 1;
+  }
+
+  remove(literal: string): void {
+    const held = this.counts.get(literal);
+    if (held === undefined) return;
+    if (held > 1) {
+      this.counts.set(literal, held - 1);
+      return;
+    }
+    this.counts.delete(literal);
+    const key = literal.slice(0, MIN_SECRET_LEN);
+    const bucket = this.buckets.get(key);
+    if (bucket !== undefined) {
+      bucket.splice(bucket.indexOf(literal), 1);
+      if (bucket.length === 0) this.buckets.delete(key);
+    }
+    const unit = literal.charCodeAt(0);
+    this.firstUnit[unit] = (this.firstUnit[unit] ?? 1) - 1;
+  }
+
+  /** The [start, end) span of the longest literal at each position where one occurs: sorted by start, and
+   *  possibly overlapping (replaceSpans merges them). */
+  find(text: string): Array<[number, number]> {
+    const spans: Array<[number, number]> = [];
+    this.scan(text, true, (literal, at) => spans.push([at, at + literal.length]));
+    return spans;
+  }
+
+  /** Every literal occurring in the text, not only the longest at a position. */
+  present(text: string): Set<string> {
+    const found = new Set<string>();
+    this.scan(text, false, (literal) => found.add(literal));
+    return found;
+  }
+
+  private scan(text: string, longestOnly: boolean, hit: (literal: string, at: number) => void): void {
+    const last = text.length - MIN_SECRET_LEN;
     for (let i = 0; i <= last; i++) {
-      if (firstUnit[text.charCodeAt(i)] === 0) continue;
-      const bucket = byKey.get(text.slice(i, i + key));
+      if (this.firstUnit[text.charCodeAt(i)] === 0) continue;
+      const bucket = this.buckets.get(text.slice(i, i + MIN_SECRET_LEN));
       if (bucket === undefined) continue;
       for (const literal of bucket) {
         if (text.startsWith(literal, i)) {
@@ -165,7 +195,26 @@ function literalScanner(
         }
       }
     }
-  };
+  }
+}
+
+function indexOf(literals: Iterable<string>): LiteralIndex {
+  const index = new LiteralIndex();
+  for (const literal of literals) index.add(literal);
+  return index;
+}
+
+/** A single-pass finder for many literals: the longest literal at each position (see {@link LiteralIndex}). */
+function literalSpanFinder(literals: readonly string[]): SpanFinder {
+  const index = indexOf(new Set(literals));
+  return (text) => index.find(text);
+}
+
+/** One pass over a text that returns every one of `literals` occurring in it (not only the longest at a
+ *  position), so a literal that is a prefix of another is still reported. */
+export function literalsPresent(literals: readonly string[]): (text: string) => Set<string> {
+  const index = indexOf(new Set(literals));
+  return (text) => index.present(text);
 }
 
 /** `text` with every span (sorted by start, possibly overlapping) replaced by the redaction marker. */
@@ -289,21 +338,24 @@ export function makeRedactor(secrets: Array<string | undefined | null>): Payload
  * makeTextRedactor / makeRedactor apply; `add` is idempotent. A secret is never removed.
  */
 export class SecretSet {
-  private list: string[] = [];
-  private currentText: TextRedactor = (s) => s;
-  private currentPayload: PayloadRedactor = (payload) => payload;
-  readonly text: TextRedactor = (s) => this.currentText(s);
-  readonly payload: PayloadRedactor = (payload) => this.currentPayload(payload);
+  private readonly list: string[] = [];
+  private readonly held = new Set<string>();
+  /** Built when the list first passes PER_SECRET_MAX, then kept current by every add. */
+  private plain: LiteralIndex | undefined;
+  /** The secrets with their invisible characters removed; absent while no secret holds one (the plain list
+   *  and index then serve for the visible match too). */
+  private visible: { list: string[]; index: LiteralIndex | undefined } | undefined;
+  readonly text: TextRedactor = (s) => this.redactText(s);
+  readonly payload: PayloadRedactor = (payload) =>
+    this.list.length === 0 ? payload : redactStrings(payload, this.text);
 
   constructor(initial: Array<string | null | undefined>) {
-    this.list = [...new Set(usableSecrets(initial))];
-    this.rebuild();
+    for (const secret of usableSecrets(initial)) this.append(secret);
   }
 
   add(secret: string): void {
-    if (typeof secret !== "string" || secret.length < MIN_SECRET_LEN || this.list.includes(secret)) return;
-    this.list.push(secret);
-    this.rebuild();
+    if (typeof secret !== "string") return;
+    this.append(secret);
   }
 
   /** The usable secrets added so far (a copy). */
@@ -311,8 +363,43 @@ export class SecretSet {
     return [...this.list];
   }
 
-  private rebuild(): void {
-    this.currentText = makeTextRedactor(this.list);
-    this.currentPayload = makeRedactor(this.list);
+  private append(secret: string): void {
+    if (secret.length < MIN_SECRET_LEN || this.held.has(secret)) return;
+    this.held.add(secret);
+    this.list.push(secret);
+    this.plain?.add(secret);
+    if (this.visible) {
+      this.addVisible(this.visible, secret);
+    } else if (INVISIBLE_TEST.test(secret)) {
+      this.visible = { list: [], index: undefined };
+      for (const s of this.list) this.addVisible(this.visible, s);
+    }
+  }
+
+  private addVisible(visible: { list: string[]; index: LiteralIndex | undefined }, secret: string): void {
+    const v = secret.replace(INVISIBLE, "");
+    if (v.length < MIN_SECRET_LEN) return;
+    visible.list.push(v);
+    visible.index?.add(v);
+  }
+
+  private redactText(s: string): string {
+    const list = this.list;
+    if (list.length === 0) return s;
+    const indexed = list.length > PER_SECRET_MAX;
+    const plain = indexed ? (this.plain ??= indexOf(list)) : undefined;
+    const find: SpanFinder = plain ? (t) => plain.find(t) : spansOfEach(list);
+    let out = replaceSpans(s, find(s));
+    if (!INVISIBLE_TEST.test(out)) return out;
+    const visible = this.visible;
+    if (visible === undefined) return redactAcrossInvisible(out, find);
+    if (visible.list.length === 0) return out;
+    if (indexed) {
+      const index = (visible.index ??= indexOf(visible.list));
+      out = redactAcrossInvisible(out, (t) => index.find(t));
+    } else {
+      out = redactAcrossInvisible(out, spansOfEach(visible.list));
+    }
+    return out;
   }
 }

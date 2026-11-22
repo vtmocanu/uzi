@@ -17,7 +17,7 @@
 import type { GitCache } from "./git.js";
 import { literalsPresent } from "./redact.js";
 import type { RunEnvRedactResponse } from "./protocol.js";
-import { runEnvScanNeedles, type ScanNeedle } from "./run-env-forms.js";
+import { runEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
 
 export type { ScanNeedle } from "./run-env-forms.js";
@@ -145,7 +145,9 @@ export async function resolveScanNeedles(opts: {
     return { kind: "withhold", reason: `protection_http_${status}` };
   }
   if (!body.protected) return { kind: "needles", needles: [] };
-  return { kind: "needles", needles: runEnvScanNeedles(undefined, body.versions) };
+  const forms = runEnvClaimForms(undefined, body.versions);
+  if (forms.overBudget) return { kind: "withhold", reason: "forms_over_budget" };
+  return { kind: "needles", needles: forms.needles };
 }
 
 /** The names of the variables whose forms occur in `text` (a raw patch), in needle order. Used before the
