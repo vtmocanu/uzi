@@ -50,6 +50,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -81,7 +83,7 @@ type Store interface {
 	ListStagedCodexAliasesForUser(ctx context.Context, userID uuid.UUID) ([]store.ListStagedCodexAliasesForUserRow, error)
 	ListLinkedCodexAccountsToPoll(ctx context.Context) ([]store.ListLinkedCodexAccountsToPollRow, error)
 	ListLinkedCodexAccountsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListLinkedCodexAccountsForUserRow, error)
-	UpsertCodexAccountRateLimits(ctx context.Context, arg store.UpsertCodexAccountRateLimitsParams) (int64, error)
+	UpsertCodexAccountRateLimits(ctx context.Context, arg store.UpsertCodexAccountRateLimitsParams) (pgtype.Timestamptz, error)
 	RecordCodexAccountPollFailure(ctx context.Context, arg store.RecordCodexAccountPollFailureParams) (int64, error)
 	GetCodexEarlyResetBaseline(ctx context.Context, arg store.GetCodexEarlyResetBaselineParams) (store.GetCodexEarlyResetBaselineRow, error)
 }
@@ -415,7 +417,7 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 	if readErr == nil && baselineMatches(prior, t) {
 		expected, detected = codexEarlyReset(prior, reading.Buckets, observed)
 	}
-	n, err := e.store.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+	lastSuccess, err := e.store.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
 		UserID:                     t.userID,
 		ProviderAccountID:          t.accountID,
 		Buckets:                    raw,
@@ -424,17 +426,25 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 		AttemptStatus:              attemptStatusOK,
 		EnablementSig:              t.enablementSig,
 	})
+	// The fence refusing the write returns no row: "not written", not an error.
+	written := err == nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		written, err = false, nil
+	}
 	if err != nil {
 		e.logger.Error("codex usage poller: upsert reading", "account", t.accountID.String(), "error", err)
 		return
 	}
-	if n == 0 {
+	// lastSuccess is the exact persisted last_success_at (microsecond precision); a later
+	// consumer compares against it (PRD #4123 M3).
+	_ = lastSuccess
+	if !written {
 		// Fence rejected the write (generation/credential_revision moved, the last linked
 		// alias vanished, no linked alias is enabled any more, or an alias's enablement moved
 		// since the listing) — the reading is discarded, the prior good row untouched.
 		e.logger.Info("codex usage poller: reading discarded (authority moved)", "account", t.accountID.String())
 	}
-	if n > 0 && detected && e.notifier != nil {
+	if written && detected && e.notifier != nil {
 		fence := notifysvc.CodexAccountFence{
 			OwnerID: t.userID, AccountID: t.accountID,
 			Generation: reading.ObservedGeneration, CredentialRevision: reading.ObservedCredentialRevision,

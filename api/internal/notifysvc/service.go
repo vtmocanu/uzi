@@ -213,16 +213,54 @@ type Notification struct {
 // are logged and swallowed. The prune and
 // Slack steps run after the durable write so neither can cost the caller the row.
 func (s *Service) Notify(ctx context.Context, n Notification) (store.Notification, error) {
+	row, durable, err := persist(ctx, s.q, n, s.slack != nil)
+	if err != nil {
+		return store.Notification{}, err
+	}
+	s.publish(ctx, row, n, durable)
+	return row, nil
+}
+
+// NotificationInserter is the one query PersistTx needs, so a caller can bind it to its own
+// transaction (store.Queries.WithTx) without the rest of Store.
+type NotificationInserter interface {
+	InsertNotification(ctx context.Context, arg store.InsertNotificationParams) (store.Notification, error)
+}
+
+// PersistTx marshals n and inserts its notifications row through q, and does nothing else:
+// no retention prune and no Slack publish. A caller binds q to a transaction (the weekly
+// warning claim commits the row together with its ledger flag) and calls PublishPersisted
+// only after that transaction commits, so a rollback emits nothing. It never stores a durable
+// Slack render: it is for fenced, non-redeliverable notifications (Notify handles durable ones).
+func PersistTx(ctx context.Context, q NotificationInserter, n Notification) (store.Notification, error) {
+	row, _, err := persist(ctx, q, n, false)
+	return row, err
+}
+
+// PublishPersisted runs the post-commit half of Notify for a row PersistTx inserted: the
+// best-effort retention prune, then the best-effort Slack enqueue. It never fails the caller,
+// and (like PersistTx) never treats the render as durable.
+func (s *Service) PublishPersisted(ctx context.Context, row store.Notification, n Notification) {
+	s.publish(ctx, row, n, false)
+}
+
+// isDurable reports whether n's Slack render is stored on its row for redelivery. A fenced
+// render is never durable (a stale fenced DM must never be replayed).
+func isDurable(n Notification, hasSlack bool) bool {
+	return n.DurableSlack && n.Slack != nil && n.Slack.Credential == nil && n.Slack.DeliveryTag == "" && n.Slack.CodexAccount == nil && hasSlack
+}
+
+func persist(ctx context.Context, q NotificationInserter, n Notification, hasSlack bool) (store.Notification, bool, error) {
 	payload := []byte("{}")
 	if n.Payload != nil {
 		b, err := json.Marshal(n.Payload)
 		if err != nil {
-			return store.Notification{}, err
+			return store.Notification{}, false, err
 		}
 		payload = b
 	}
 
-	durable := n.DurableSlack && n.Slack != nil && n.Slack.Credential == nil && n.Slack.DeliveryTag == "" && n.Slack.CodexAccount == nil && s.slack != nil
+	durable := isDurable(n, hasSlack)
 	var render []byte
 	if durable {
 		b, err := json.Marshal(durableRender{
@@ -230,12 +268,12 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 			LinkLabel: n.Slack.LinkLabel, Emoji: n.Slack.Emoji, Facts: n.Slack.Facts,
 		})
 		if err != nil {
-			return store.Notification{}, err
+			return store.Notification{}, false, err
 		}
 		render = b
 	}
 
-	row, err := s.q.InsertNotification(ctx, store.InsertNotificationParams{
+	row, err := q.InsertNotification(ctx, store.InsertNotificationParams{
 		UserID:      n.UserID,
 		Kind:        n.Kind,
 		Payload:     payload,
@@ -244,9 +282,12 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 		SlackRender: render,
 	})
 	if err != nil {
-		return store.Notification{}, err
+		return store.Notification{}, false, err
 	}
+	return row, durable, nil
+}
 
+func (s *Service) publish(ctx context.Context, row store.Notification, n Notification, durable bool) {
 	// Retention prune, best-effort and off the durable write. The query no-ops when
 	// the user is under the cap (a bounded index probe). Pending durable rows are
 	// exempt and timestamp ties survive; settlement paths also attempt pruning
@@ -269,9 +310,11 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 		}
 		s.slack.PublishNotification(n.UserID, r)
 	}
-
-	return row, nil
 }
+
+// KindWeeklyLimitWarning is the notifications.kind for the near-weekly-limit warning
+// (PRD #4123 M3). kind is a generic text column with no CHECK, so this needs no migration.
+const KindWeeklyLimitWarning = "weekly_limit_warning"
 
 // KindEarlyLimitReset is the notifications.kind for a LOUD alert that the Anthropic
 // 7-day rate limit reset EARLIER than its expected window (PRD #1020 M3). kind is a

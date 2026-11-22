@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -61,13 +62,21 @@ func (s *fakeStore) ListLinkedCodexAccountsForUser(_ context.Context, u uuid.UUI
 func (s *fakeStore) GetCodexEarlyResetBaseline(context.Context, store.GetCodexEarlyResetBaselineParams) (store.GetCodexEarlyResetBaselineRow, error) {
 	return store.GetCodexEarlyResetBaselineRow{}, pgx.ErrNoRows
 }
-func (s *fakeStore) UpsertCodexAccountRateLimits(_ context.Context, arg store.UpsertCodexAccountRateLimitsParams) (int64, error) {
+func (s *fakeStore) UpsertCodexAccountRateLimits(_ context.Context, arg store.UpsertCodexAccountRateLimitsParams) (pgtype.Timestamptz, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.upserts = append(s.upserts, arg)
 	s.order = append(s.order, "poll:"+arg.ProviderAccountID.String())
-	return s.upsertRows, nil
+	// The real query returns the written last_success_at; a fence refusal returns no row.
+	if s.upsertRows == 0 {
+		return pgtype.Timestamptz{}, pgx.ErrNoRows
+	}
+	return pgtype.Timestamptz{Time: fakeLastSuccess, Valid: true}, nil
 }
+
+// fakeLastSuccess is the last_success_at the fake's accepted write returns.
+var fakeLastSuccess = time.Date(2026, 11, 22, 10, 0, 0, 123456000, time.UTC)
+
 func (s *fakeStore) RecordCodexAccountPollFailure(_ context.Context, arg store.RecordCodexAccountPollFailureParams) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

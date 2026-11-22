@@ -21,6 +21,7 @@ import (
 // *store.Queries satisfies it.
 type NotifierStore interface {
 	IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error)
+	IsCodexWeeklyWarningCurrent(context.Context, store.IsCodexWeeklyWarningCurrentParams) (bool, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
 	GetRunByID(ctx context.Context, runID uuid.UUID) (store.Run, error)

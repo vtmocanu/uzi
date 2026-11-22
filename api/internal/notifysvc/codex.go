@@ -13,6 +13,11 @@ import (
 // DeliveryTagCodexEarlyReset requires an account fence even when its pointer is missing.
 const DeliveryTagCodexEarlyReset = "codex_early_reset"
 
+// DeliveryTagCodexWeeklyWarning marks a Codex weekly-limit warning (PRD #4123 M3). It is
+// fenced by the account authority like the early-reset tag, but through
+// IsCodexWeeklyWarningCurrent, which does not require the early-reset opt-in.
+const DeliveryTagCodexWeeklyWarning = "codex_weekly_warning"
+
 // CodexAccountFence binds one owner's account alert to the observed authority and aliases.
 type CodexAccountFence struct {
 	OwnerID, AccountID             uuid.UUID

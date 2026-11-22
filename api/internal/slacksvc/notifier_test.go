@@ -24,6 +24,7 @@ type fakeNotifStore struct {
 	codexCurrent  bool
 	codexErr      error
 	codexAsked    []store.IsCodexEarlyResetCurrentParams
+	weeklyAsked   []store.IsCodexWeeklyWarningCurrentParams
 	rc            store.GetSlackRunContextRow
 	crossCheckRun store.Run
 	// Gated plan cross-check summary (PRD #3708): nil + nil error models no row.

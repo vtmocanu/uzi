@@ -384,3 +384,64 @@ func TestNotifyEarlyResetRechecksCredential(t *testing.T) {
 		t.Fatalf("current credential not delivered: insert=%v slack=%d", fs.insertCalled, slk.calls)
 	}
 }
+
+// TestPersistTxThenPublishPersisted: the split halves of Notify. PersistTx only inserts (no
+// prune, no Slack), so a caller's transaction can roll back with nothing emitted; the post-
+// commit PublishPersisted then prunes and enqueues the DM.
+func TestPersistTxThenPublishPersisted(t *testing.T) {
+	fs := &fakeStore{}
+	slk := &fakeSlacker{order: &fs.order}
+	svc := New(fs, slk, 0, nil)
+	user := uuid.New()
+	n := Notification{
+		UserID: user, Kind: KindWeeklyLimitWarning, Payload: map[string]any{"pct": 91},
+		Slack: &SlackRender{Title: "Weekly limit", Emoji: "⚠️"},
+	}
+
+	row, err := PersistTx(context.Background(), fs, n)
+	if err != nil {
+		t.Fatalf("PersistTx: %v", err)
+	}
+	if got := fs.order; len(got) != 1 || got[0] != "insert" || slk.calls != 0 || fs.pruneCalled {
+		t.Fatalf("after PersistTx order=%v slack=%d pruned=%v, want only [insert]", got, slk.calls, fs.pruneCalled)
+	}
+	if row.ID != fs.returnedID || fs.inserted.Kind != KindWeeklyLimitWarning || string(fs.inserted.Payload) != `{"pct":91}` {
+		t.Fatalf("row=%+v inserted=%+v", row, fs.inserted)
+	}
+
+	svc.PublishPersisted(context.Background(), row, n)
+	if got := fs.order; len(got) != 3 || got[1] != "prune" || got[2] != "slack" {
+		t.Fatalf("order = %v, want [insert prune slack]", got)
+	}
+	if slk.lastUserID != user || slk.lastRender.Title != "Weekly limit" || slk.lastRender.DeliveryID != uuid.Nil {
+		t.Fatalf("published %v %+v", slk.lastUserID, slk.lastRender)
+	}
+}
+
+// TestPersistTxFailureEmitsNothing: an insert failure is returned and nothing else runs.
+func TestPersistTxFailureEmitsNothing(t *testing.T) {
+	fs := &fakeStore{insertErr: errors.New("insert failed")}
+	if _, err := PersistTx(context.Background(), fs, Notification{UserID: uuid.New(), Kind: KindWeeklyLimitWarning}); err == nil {
+		t.Fatal("want the insert error")
+	}
+	if fs.pruneCalled {
+		t.Fatal("persist failure must not prune")
+	}
+}
+
+// TestWeeklyWarningCodexRenderNotDurable: a Codex weekly warning carries the account fence
+// and its delivery tag, so Notify never stores its render for redelivery even when asked.
+func TestWeeklyWarningCodexRenderNotDurable(t *testing.T) {
+	fs := &fakeStore{}
+	svc := New(fs, &fakeSlacker{order: &fs.order}, 0, nil)
+	fence := codexFence()
+	if _, err := svc.Notify(context.Background(), Notification{
+		UserID: fence.OwnerID, Kind: KindWeeklyLimitWarning, DurableSlack: true,
+		Slack: &SlackRender{Title: "Weekly limit", DeliveryTag: DeliveryTagCodexWeeklyWarning, CodexAccount: &fence},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.inserted.SlackRender) != 0 {
+		t.Fatalf("fenced render stored durably: %s", fs.inserted.SlackRender)
+	}
+}

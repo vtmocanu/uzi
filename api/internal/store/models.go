@@ -2105,6 +2105,20 @@ type VaultBrowserSlot struct {
 	Generation   int64              `json:"generation"`
 }
 
+type WeeklyLimitAlert struct {
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	AnthropicSecretID pgtype.UUID        `json:"anthropic_secret_id"`
+	CodexAccountID    pgtype.UUID        `json:"codex_account_id"`
+	ObservedAt        pgtype.Timestamptz `json:"observed_at"`
+	AnchorReset       pgtype.Timestamptz `json:"anchor_reset"`
+	AnchorPct         pgtype.Float8      `json:"anchor_pct"`
+	AnchorBucket      pgtype.Text        `json:"anchor_bucket"`
+	AnchorMulti       bool               `json:"anchor_multi"`
+	Warned            bool               `json:"warned"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Worker struct {
 	ID                         uuid.UUID          `json:"id"`
 	UserID                     uuid.UUID          `json:"user_id"`
