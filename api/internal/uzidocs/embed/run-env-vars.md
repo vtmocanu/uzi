@@ -181,9 +181,11 @@ denied:
   `CURL_CA_BUNDLE`, `RUBYOPT`.
 - Network and cloud endpoint settings the harness reads, such as
   `AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AWS_ENDPOINT_URL` (the global AWS
-  endpoint override also routes Bedrock traffic), and any `OTEL_EXPORTER_OTLP_*`,
-  `GCE_METADATA_*` or `AWS_ENDPOINT_URL_BEDROCK*` name. The other non-Bedrock
-  per-service names, such as `AWS_ENDPOINT_URL_STS`, stay allowed.
+  endpoint override also routes Bedrock traffic), `AWS_ENDPOINT_URL_STS`,
+  `AWS_ENDPOINT_URL_SSO` and `AWS_ENDPOINT_URL_SSO_OIDC` (they redirect AWS
+  credential acquisition), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
+  `AWS_ENDPOINT_URL_BEDROCK*` name. The other per-service names, such as
+  `AWS_ENDPOINT_URL_S3`, stay allowed.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
 

@@ -908,6 +908,21 @@
       "value": "AWS_ENDPOINT_URL",
       "invariant": "network_wiring",
       "note": "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for"
+    },
+    {
+      "value": "AWS_ENDPOINT_URL_STS",
+      "invariant": "network_wiring",
+      "note": "AWS STS endpoint override; it redirects credential exchange"
+    },
+    {
+      "value": "AWS_ENDPOINT_URL_SSO",
+      "invariant": "network_wiring",
+      "note": "AWS SSO endpoint override; it redirects credential acquisition"
+    },
+    {
+      "value": "AWS_ENDPOINT_URL_SSO_OIDC",
+      "invariant": "network_wiring",
+      "note": "AWS SSO OIDC endpoint override; it redirects credential acquisition"
     }
   ],
   "denied_prefixes": [
@@ -1320,20 +1335,20 @@
     {
       "name": "AWS_ENDPOINT_URL_SSO",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "AWS SSO endpoint override; it redirects credential acquisition; denied as a network_wiring name"
     },
     {
       "name": "AWS_ENDPOINT_URL_SSO_OIDC",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "AWS SSO OIDC endpoint override; it redirects credential acquisition; denied as a network_wiring name"
     },
     {
       "name": "AWS_ENDPOINT_URL_STS",
       "harness": "claude",
-      "decision": "allowed",
-      "reason": "cloud SDK configuration or credential used by builds and tests; it reaches the commands the agent runs, not the Claude CLI process (cloud use by the CLI needs a CLAUDE_CODE_USE_* selector, denied by the CLAUDE_ prefix)"
+      "decision": "denied",
+      "reason": "AWS STS endpoint override; it redirects credential exchange; denied as a network_wiring name"
     },
     {
       "name": "AWS_EXECUTION_ENV",

@@ -81,9 +81,10 @@ caught beyond the PRD list:
   (all `network_wiring`). The `AWS_ENDPOINT_URL_BEDROCK` prefix has no trailing underscore on
   purpose, so it also covers `AWS_ENDPOINT_URL_BEDROCK_AGENT*`. `OTEL_EXPORTER_OTLP_*` and
   `GCE_METADATA_*` are denied as network wiring because the harness reads them.
-- `AWS_ENDPOINT_URL` (`network_wiring`), by exact name: the global AWS endpoint override also
-  routes Bedrock traffic. `AWS_ENDPOINT_URL_STS` and the other non-Bedrock per-service names stay
-  allowed. Names are checked on write only, so a stored variable whose name a later rule denies is
+- `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL_SSO` and
+  `AWS_ENDPOINT_URL_SSO_OIDC` (`network_wiring`), by exact name: the global AWS endpoint override
+  also routes Bedrock traffic, and the STS and SSO overrides redirect credential acquisition. The
+  other per-service names (for example `AWS_ENDPOINT_URL_S3`) stay allowed. Names are checked on write only, so a stored variable whose name a later rule denies is
   dropped at injection by a worker that has the rule, with a run event naming the rule.
 
 Names that a harness also reads but that are application configuration (`AWS_REGION`, cloud

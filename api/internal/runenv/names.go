@@ -202,6 +202,9 @@ var deniedNames = []deniedRule{
 	{"UV_USE_IO_URING", "process_loader", "libuv I/O backend of every Node process, harness included"},
 	{"AWS_EC2_METADATA_SERVICE_ENDPOINT", "network_wiring", "metadata endpoint the harness's AWS SDK reads"},
 	{"AWS_ENDPOINT_URL", "network_wiring", "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for"},
+	{"AWS_ENDPOINT_URL_STS", "network_wiring", "AWS STS endpoint override; it redirects credential exchange"},
+	{"AWS_ENDPOINT_URL_SSO", "network_wiring", "AWS SSO endpoint override; it redirects credential acquisition"},
+	{"AWS_ENDPOINT_URL_SSO_OIDC", "network_wiring", "AWS SSO OIDC endpoint override; it redirects credential acquisition"},
 }
 
 // deniedPrefixes are name prefixes reserved for the worker and the agent harnesses.
