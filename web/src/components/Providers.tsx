@@ -38,7 +38,7 @@ const CTX_MIN = 8192;
 const CTX_MAX = 10_000_000;
 
 const NO_CONTEXT_WARNING =
-  "No context window set. uzi assumes a 200k-token window unless one is configured; set the gateway model's real window.";
+  "No context window set. The smallest window configured on any model applies to all of them, and uzi assumes 200k tokens if none is configured; set the gateway model's real window.";
 
 const CATALOG_CONTEXT_WARNING =
   "The Claude CLI may apply its own window to model names it recognizes as Anthropic models (for example claude-sonnet-4-5), ignoring both a configured window and uzi's 200k default (measured at Claude Code 2.1.325).";
@@ -375,6 +375,12 @@ function ProviderRow({
 
   const canTest = p.has_key && p.key_enabled && !p.retired;
   const mapped = ROLES.filter(({ role }) => p.model_map[role]);
+  // The worker sets one process-wide window: the smallest configured one across all mapped
+  // models, or uzi's 200k fallback when none is configured (agent/src/sdk-env.ts).
+  const configured = mapped.map(({ role }) => p.model_map[role]!.context_window).filter((w): w is number => !!w);
+  const blankLabel = configured.length
+    ? ` (no context window: the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens, applies)`
+    : " (no context window: 200k assumed)";
   const rowBusy = busy || testing;
   const blocked = sourceBlockedReason(p);
 
@@ -408,7 +414,7 @@ function ProviderRow({
               return (
                 <li key={role}>
                   {label}: <code>{sanitizeLabel(e.model)}</code>
-                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : " (no context window: 200k assumed)"}
+                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : blankLabel}
                 </li>
               );
             })}

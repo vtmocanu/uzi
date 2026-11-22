@@ -72,9 +72,12 @@ uzi provider create --name corp-gw \
     enforced for `corp-sonnet`, `claude-corp-custom` and `corp-claude-x`. It was **not
     honoured** for `claude-sonnet-4-5` and `us.anthropic.claude-sonnet-4-5`, with a configured
     window or with uzi's 200k default: no compaction was seen up to 605k reported tokens. The
-    CLI recognizes those ids and applies its own window. We record what was seen, not why, and
-    other names the CLI recognizes as Anthropic models may behave the same. The web form shows a
-    caveat for any model name containing "claude".
+    CLI logged no unrecognized-model warning for those ids, so it appears to recognize them; we
+    record what was seen, not which window it applied, and other names the CLI recognizes as
+    Anthropic models may behave the same. (The Claude Code 2.1.325 changelog says the setting
+    now also applies to unrecognized ids starting with `claude-`, which matches
+    `claude-corp-custom` being enforced there but not at 2.1.319.) The web form and
+    `uzi provider create`/`edit` show a caveat for any model name containing "claude".
 
 ## The key
 
