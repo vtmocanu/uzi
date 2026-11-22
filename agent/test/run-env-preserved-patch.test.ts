@@ -165,6 +165,30 @@ describe("the preserved patch decodes quoted header paths", () => {
     });
   }
 
+  it("decodes an astral character left literal in a quoted header path (core.quotePath=false)", () => {
+    const value = ["x/", "\u{1F511}", "\u0007-", "Kq7Zp2mXw9Lt4s"].join("");
+    const quoted = `x/\u{1F511}\\a-Kq7Zp2mXw9Lt4s`;
+    const full = [
+      `diff --git "a/${quoted}" "b/${quoted}"`, "new file mode 100644", "index 0000000..e69de29",
+      `--- /dev/null`, `+++ "b/${quoted}"`, "",
+    ].join("\n");
+    assert.deepEqual(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], []),
+      { withhold: true, reason: "header_path", variables: ["DB_PASSWORD"] });
+    assert.equal(patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: ["no-such-value-anywhere"] }], []).withhold, false);
+  });
+
+  it("withholds a Binary files header whose quoted paths carry a non-ASCII secret", () => {
+    const value = ["x/", "café-", "Kq7Zp2mXw9Lt4s"].join("");
+    const quoted = `x/caf\\303\\251-Kq7Zp2mXw9Lt4s`;
+    const full = [
+      `diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644",
+      `Binary files "a/${quoted}" and "b/${quoted}" differ`, "",
+    ].join("\n");
+    const verdict = patchScanVerdict(full, [{ name: "DB_PASSWORD", forms: [value] }], []);
+    assert.equal(verdict.withhold, true);
+    assert.equal(verdict.withhold && verdict.reason, "header_path");
+  });
+
   it("withholds a rename header (rename to) whose target is quoted", async () => {
     const value = ["café", "Kq7Zp2mXw9Lt4s"].join("-");
     const full = realDiff([{ name: value, rename: "README.md" }]);

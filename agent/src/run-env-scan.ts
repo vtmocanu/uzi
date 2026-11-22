@@ -270,7 +270,13 @@ function cUnquote(body: string): string {
   const bytes: number[] = [];
   for (let i = 0; i < body.length; i++) {
     const c = body[i]!;
-    if (c !== "\\") { bytes.push(...Buffer.from(c, "utf8")); continue; }
+    if (c !== "\\") {
+      // By code point: an astral character is two UTF-16 units and must not be encoded as two lone surrogates.
+      const cp = body.codePointAt(i)!;
+      bytes.push(...Buffer.from(String.fromCodePoint(cp), "utf8"));
+      if (cp > 0xffff) i += 1;
+      continue;
+    }
     const next = body[i + 1] ?? "";
     const octal = /^[0-3][0-7]{2}/.exec(body.slice(i + 1, i + 4));
     if (octal) { bytes.push(parseInt(octal[0], 8)); i += 3; }

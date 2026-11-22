@@ -20402,7 +20402,8 @@ export class GitCache {
           }
         }
         const path = paths.get(hit.oid) ?? "";
-        const file = hasKeyForm(path) ? "[path withheld]" : path;
+        // Padded as the path pass is: a form with a leading or trailing "/" (rev-list paths never start with one) still withholds.
+        const file = hasKeyForm(`/${path}/`) ? "[path withheld]" : path;
         // One finding per hit object, or per variable it carries when the scan is labelled.
         const labels = hit.labels.filter((l): l is string => l !== undefined);
         if (labels.length === 0) findings.push({ file, startLine: 0, commit, ruleId });
@@ -20424,10 +20425,11 @@ export class GitCache {
    * child per commit: `rev-list --parents` (commit ids; a commit with two or more parents is a merge),
    * then `diff-tree --stdin --root -r -t --no-renames --name-only -z` over the non-merges and
    * `diff-tree --stdin -c -r -t --name-only -z` over the merges, each with `--ignore-submodules=none`
-   * (so a repository's diff.ignoreSubmodules cannot hide a gitlink) and `--no-replace-objects`.
+   * (defence in depth: diff-tree plumbing lists gitlinks regardless of a repository's diff.ignoreSubmodules) and `--no-replace-objects`.
    *
    * Framing of the `-z` output: "<commit id>\0" then "<path>\0" per entry, the next commit's id following
-   * directly; a commit with no diff prints nothing. Paths are raw bytes (-z, so core.quotePath is moot).
+   * directly; a commit with no diff prints nothing in the plain pass, while a merge whose combined diff is
+   * empty prints its id with no paths in the -c pass. Paths are raw bytes (-z, so core.quotePath is moot).
    * A token that is a listed commit id starts that commit's paths; every token, such an id included, is
    * searched as a path, so the attribution can never hide a path. The stream is parsed incrementally and
    * never buffered whole. A path is searched as "/" + path + "/", which contains the path, "/" + path and

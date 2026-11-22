@@ -153,6 +153,19 @@ describe("scanObjectsForRunEnv: a secret published as a path", () => {
     assertWithheld(await scan(introducing, ["/secretdir/"]), "/secretdir/", introducing);
   });
 
+  it("an object finding for a blob under a directory named by a leading-slash form withholds its path", async () => {
+    const dir = ["rv-Ab3k", "Mq7w", "Zx2n"].join("-");
+    const form = `/${dir}`;
+    const introducing = commitPaths(work, { [`${dir}/README`]: `holds ${form} in its content\n` });
+    syncFeature();
+    const res = await scan(introducing, [form]);
+    assert.ok(res.trusted, "the scan is trusted");
+    if (!res.trusted) return;
+    assert.ok(res.findings.length >= 1, "at least one finding");
+    for (const f of res.findings) assert.equal(f.file, PATH_WITHHELD, "every finding withholds the path");
+    assert.ok(!JSON.stringify(res).includes(dir), "no path bytes in the result");
+  });
+
   const hostile: Array<[string, string]> = [
     ["a non-ASCII letter", "caf\u00e9-Kq7/Zp2m"],
     ["an emoji", "\u{1F511}-Kq7/Zp2m"],
