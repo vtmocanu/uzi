@@ -625,12 +625,12 @@ function mockPlanningModel(raw: string | null | undefined, harness: Harness = "c
 }
 
 // The mock has no lead-template pin; each default follows its worker lane or built-in.
-function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude"): ModelSettingCell[] {
+function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude"): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" })[] {
   const valid = (m: string) => harness === "codex" ? !KNOWN_CLAUDE_ALIASES.includes(m) : !CODEX_ROLE_MODELS.includes(m);
   const laneModel = lane?.trim() ?? "";
   const def = laneModel !== "" && valid(laneModel)
-    ? { model: laneModel, source: "user_default" }
-    : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" };
+    ? { model: laneModel, source: "user_default" as const }
+    : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" as const };
   const stored = planning?.trim() ?? "";
   const set = stored !== "" && valid(stored);
   return [{ harness, model: planning ?? null,
@@ -638,14 +638,14 @@ function mockPlanningModelCells(planning: string | null | undefined, lane: strin
     resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source }];
 }
 
-function mockPlanningEffortCells(planning: string | null | undefined, effort: string | null | undefined, harness: Harness = "claude"): EffortSettingCell[] {
+function mockPlanningEffortCells(planning: string | null | undefined, effort: string | null | undefined, harness: Harness = "claude"): (EffortSettingCell & { source: "builtin" | "user_default" | "user_planning_default" })[] {
   const ordinary = mockEffortCell(harness, effort);
   const level = (planning ?? "").trim();
   const set = ["low", "medium", "high", "xhigh", "max"].includes(level);
   return [{ harness, effort: planning ?? null,
     default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source,
     resolved_effort: set ? level : ordinary.resolved_effort,
-    source: set ? "user_planning_default" : ordinary.source,
+    source: set ? "user_planning_default" : ordinary.source === "user_default" ? "user_default" : "builtin",
     mode: set ? "explicit" : ordinary.mode }];
 }
 
