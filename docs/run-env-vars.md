@@ -148,7 +148,7 @@ terminal preservation packs, recovery archives and the preserved patch.
   loses its preserved patch when the diff touches a binary file. Otherwise the
   patch is redacted and scanned as before.
 - Gaps that remain: a secret whose lines hold no qualifying token (tokens of
-  single-case letters alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters,
+  single-case letters (with any `+=_-`) alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters, a secret in a URL's host,
   formatted codes such as `8462-9137`, non-ASCII text, or a secret that is the
   line's leading key) and that is split across files or by elided context between
   hunks, and a value that appears only re-encoded, such as each line indented in a YAML block or in an

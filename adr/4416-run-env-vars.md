@@ -306,7 +306,7 @@ exact-match redaction with an 8-character floor, values reaching the model provi
   rewritten (a new save seals under version 2). Whoever can write the table can also write
   other vault material; this is a defence against a swap, not against a hostile operator.
 - **Redact route without a generation bound**, as above.
-- **Patch gaps.** The patch check misses a secret whose lines hold no qualifying token (single-case letters alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters, formatted codes such as
+- **Patch gaps.** The patch check misses a secret whose lines hold no qualifying token (single-case letters (with any `+=_-`) alone or with one digit, tokens shorter than 8 characters or with fewer than 5 distinct characters, a secret in a URL's host, formatted codes such as
   `8462-9137`, non-ASCII text, a secret that is the line's leading key) and that is split across files or by elided context between hunks, and a value that appears only re-encoded
   (each line indented in a YAML block, or an encoding other than those registered). The blob scan
   still blocks a committed file.
