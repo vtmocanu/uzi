@@ -36,8 +36,16 @@ plan the owner answered.
    Until then the verdict stays unapplied and is replayed to the next claim. On the Claude SDK
    executor (`resumesAtGate = true`, `agent/src/sdk-executor.ts`) a replayed revise re-runs the
    revision with the owner's original feedback and does not re-offer the superseded plan.
+   **Original Codex limitation, superseded by Amendment 2026-11-22 below:**
    Codex has no resume-at-gate: a replayed approve, reject or revise is ignored with a notice
    (superseded ones as in point 6), and a fresh plan is shown (see residuals).
+
+   **Amendment 2026-11-22 (#3253 / PR #4599, owner decision):** Codex now resumes
+   at the gate and replays a still-pending revise against the persisted plan, as
+   Claude does. If no conversation is available, it reconstructs the planning
+   context. The input is APPLIED only after the revised plan persists, not
+   superseded merely because the worker was lost; a later claim does not replay
+   that applied input. Approval/rejection binding and stale-verdict rules remain.
 2. **A claim says when its plan was shown.** A claim carrying an unapproved persisted plan
    carries `resume_plan_at` (`ResumePlanAt` in `api/internal/workersvc/claim.go`, filled in
    `claim_assembly.go` via `LatestPersistedPlanFrameAtForRun`). It is the `created_at` of the
@@ -184,7 +192,9 @@ The approval-only discarded-input endpoint is unchanged.
 Automatic retry allowance, expiry and predecessor tracking remain in the live
 flight's memory. Reclaim does not reconstruct them: Claude retains its existing
 FIFO replay of unapplied inputs on resume; Codex retains fresh-plan and re-send
-notices. An earlier pending input may replay before its former replacement, or that replacement may
+notices. **Historical Codex qualification: superseded by Amendment 2026-11-22
+below; the live-flight retry limits in this amendment are unchanged.**
+An earlier pending input may replay before its former replacement, or that replacement may
 become stale after the gate changes. A stale/ignored receipt records disposal,
 not evidence that the feedback produced a persisted plan. Do not infer successful
 publication from a generic APPLIED receipt.
@@ -196,6 +206,29 @@ ordering guarantee. No new durable allowance, pending-chain reconstruction,
 command, setting, status or migration is introduced. Deploy the API before
 workers; missing negotiation keeps compatibility behavior, without a mixed-version
 repair guarantee. Codex APPLIED suppression and source cleanup authority are unchanged.
+
+## Amendment 2026-11-22: Codex gate replay (#3253 / PR #4599)
+
+The owner confirmed that pending revise feedback survives an interrupted worker
+and is replayed on a subsequent admitted Codex claim, giving Claude parity.
+`CodexExecutor.resumesAtGate` is now true. It reads the replayed backlog before
+presenting a gate; a pending revise acts on the persisted source plan instead of
+requiring the owner to resend it. Without a saved conversation, the revision
+prompt includes the current planning context and the submitted plan.
+
+This also applies after a prior claim's revision retry allowance expired. It does
+not restore the allowance, expiry or predecessor chain. A new claim may receive a
+fresh allowance as before; there is no lifetime retry or exactly-once provider
+execution guarantee. The revise remains pending until a revised plan persists;
+its successful application is not a superseded/discarded receipt, and another
+claim must not replay or apply that input again. Tests cover the expired path and
+a further reclaim after application in `runner-plan-revision-reclaim.test.ts`.
+
+The earlier Codex fresh-plan/re-send description below is retained as history,
+not current behavior. Genuine fresh plans and stale/binding-mismatched verdicts
+still follow the existing presentation/disposal rules. This amendment neither
+authorizes cross-worker takeover nor changes claimant/custody admission
+([ADR-4476](4476-codex-claim-provenance.md)).
 
 ## Consequences and residuals
 
@@ -209,7 +242,8 @@ repair guarantee. Codex APPLIED suppression and source cleanup authority are unc
   impact is a stall (the owner re-approves), not an approval.
 - **Pre-existing, recorded as uzi incidental findings during the #1604 run:** an approve
   freezes milestones and budget at submit time; a stale reject's `stop_kind` handling.
-- **Codex does not resume at the gate** (out of #1604's scope). A resumed Codex claim always
+- **Historical Codex residual, superseded by Amendment 2026-11-22:**
+  **Codex does not resume at the gate** (out of #1604's original scope). A resumed Codex claim always
   gates a fresh plan (the runner puts the run in `gatedRuns`, so its first gate bumps the
   epoch). A carried-over approve, reject or revise is ignored with a notice asking to re-send
   it: on arrival when it predates the shown plan or has no comparable `created_at` ("… sent

@@ -495,3 +495,15 @@ func TestCrossCheckOwnerSteeringProtocolToken(t *testing.T) {
 		t.Fatal("protocol token offered as a repo capability")
 	}
 }
+
+func TestFilterProtocol_KeepsCodexPhaseModelsV1(t *testing.T) {
+	if got := FilterProtocol([]string{CodexPhaseModelsV1}); !reflect.DeepEqual(got, []string{CodexPhaseModelsV1}) {
+		t.Errorf("FilterProtocol(%q) = %v, want it KEPT (missing from the protocol vocabulary?)", CodexPhaseModelsV1, got)
+	}
+	if got := Filter([]string{CodexPhaseModelsV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", CodexPhaseModelsV1, got)
+	}
+	if got := SelfReportable([]string{CodexPhaseModelsV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", CodexPhaseModelsV1, got)
+	}
+}

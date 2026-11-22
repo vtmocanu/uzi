@@ -439,13 +439,20 @@ export function RunDefaults() {
   const [savedCodexEffort, setSavedCodexEffort] = useState("");
   const [codexEffortBusy, setCodexEffortBusy] = useState(false);
 
-  // Claude planning model and effort (PRD #3252): "" = "Same as the run". One shared
+  // Planning model and effort (PRD #3252): "" = "Same as the run". One shared
   // saved/busy pair; the inline errors are keyed by the field the server names.
   const [planningModel, setPlanningModel] = useState("");
   const [savedPlanningModel, setSavedPlanningModel] = useState("");
   const [planningModelCustom, setPlanningModelCustom] = useState(false);
   const [planningEffort, setPlanningEffort] = useState("");
   const [savedPlanningEffort, setSavedPlanningEffort] = useState("");
+  const [planningCodexModel, setPlanningCodexModel] = useState("");
+  const [savedPlanningCodexModel, setSavedPlanningCodexModel] = useState("");
+  const [planningCodexModelError, setPlanningCodexModelError] = useState("");
+  const [planningCodexEffort, setPlanningCodexEffort] = useState("");
+  const [savedPlanningCodexEffort, setSavedPlanningCodexEffort] = useState("");
+  const [planningCodexEffortError, setPlanningCodexEffortError] = useState("");
+  const [planningCodexModelCustom, setPlanningCodexModelCustom] = useState(false);
   const [planningBusy, setPlanningBusy] = useState(false);
   const [planningModelError, setPlanningModelError] = useState("");
   const [planningEffortError, setPlanningEffortError] = useState("");
@@ -488,6 +495,10 @@ export function RunDefaults() {
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
+      setPlanningCodexModel(settings.planning_codex_model ?? "");
+      setSavedPlanningCodexModel(settings.planning_codex_model ?? "");
+      setPlanningCodexEffort(settings.planning_codex_effort ?? "");
+      setSavedPlanningCodexEffort(settings.planning_codex_effort ?? "");
       const pm = settings.planning_claude_model ?? "";
       setPlanningModel(pm);
       setSavedPlanningModel(pm);
@@ -683,7 +694,7 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings }));
+      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings, planning_efforts: settings.planning_efforts }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
@@ -699,7 +710,7 @@ export function RunDefaults() {
     }
   };
 
-  // Claude planning pair (PRD #3252). The default labels describe the SAVED state: the
+  // Planning pairs (PRD #3252). The default labels describe the SAVED state: the
   // server-resolved cells name what "Same as the run" currently means.
   const planningModelCell = committedSettings?.planning_models?.find((c) => c.harness === "claude");
   const planningEffortCell = committedSettings?.planning_efforts?.find((c) => c.harness === "claude");
@@ -726,6 +737,20 @@ export function RunDefaults() {
   const planningModelDirty = planningModelTrimmed !== savedPlanningModel;
   const planningEffortDirty = planningEffort !== savedPlanningEffort;
   const planningCustomEmpty = planningModelCustom && planningModelTrimmed === "";
+  const planningCodexModelCell = committedSettings?.planning_models?.find(c => c.harness === "codex");
+  const planningCodexEffortCell = committedSettings?.planning_efforts?.find(c => c.harness === "codex");
+  const planningCodexModelDefaultLabel = planningCodexModelCell
+    ? `Same as the run · ${planningCodexModelCell.default_model} (${modelSettingSourceLabel("planning_model", planningCodexModelCell.default_source)})`
+    : "Same as the run";
+  const planningCodexEffortDefaultLabel = planningCodexEffortCell
+    ? `Same as the run · ${planningCodexEffortCell.default_effort === "runtime" ? modelSettingSourceLabel("effort", "runtime_default") : planningCodexEffortCell.default_effort} (${modelSettingSourceLabel("planning_effort", planningCodexEffortCell.default_source)})`
+    : "Same as the run";
+  const planningCodexModelWarning = modelFieldWarning(planningCodexModel) ||
+    (["opus", "sonnet", "haiku", "fable"].includes(planningCodexModel.trim()) ? "A Claude model is not valid for the Codex lane." : "");
+  const planningCodexCustomEmpty = planningCodexModelCustom && planningCodexModel.trim() === "";
+  const planningCodexModelDirty = planningCodexModel.trim() !== savedPlanningCodexModel;
+  const planningCodexEffortDirty = planningCodexEffort !== savedPlanningCodexEffort;
+  const planningCodexBlocked = planningCodexModelWarning !== "" || planningCodexCustomEmpty;
   const planningBlocked = planningModelWarning !== "" || planningCustomEmpty;
   // The messages shown under the model select, so assistive tech reads them with it.
   const planningModelDescribedBy =
@@ -738,26 +763,35 @@ export function RunDefaults() {
       .join(" ") || undefined;
 
   // One PUT carrying only the dirty fields (null = Same as the run). A 400 names its field
-  // as a "planning_claude_model:" / "planning_claude_effort:" prefix; an unattributable
-  // message shows under both controls.
+  // as a planning field prefix; an unattributable message shows under all controls.
   const savePlanning = async () => {
     setError("");
     setNotice("");
     setPlanningModelError("");
     setPlanningEffortError("");
+    setPlanningCodexModelError("");
+    setPlanningCodexEffortError("");
     setPlanningBusy(true);
     try {
       const patch: UserSettingsPatch = {};
       if (planningModelDirty) patch.planning_claude_model = planningModelTrimmed || null;
       if (planningEffortDirty) patch.planning_claude_effort = planningEffort || null;
+      if (planningCodexModelDirty) patch.planning_codex_model = planningCodexModel.trim() || null;
+      if (planningCodexEffortDirty) patch.planning_codex_effort = planningCodexEffort || null;
       const { settings } = await api.putMySettings(patch);
       setCommittedSettings(current => current && ({
         ...current,
+        planning_codex_model: settings.planning_codex_model,
+        planning_codex_effort: settings.planning_codex_effort,
         planning_claude_model: settings.planning_claude_model,
         planning_claude_effort: settings.planning_claude_effort,
         planning_models: settings.planning_models,
         planning_efforts: settings.planning_efforts,
       }));
+      setPlanningCodexModel(settings.planning_codex_model ?? "");
+      setSavedPlanningCodexModel(settings.planning_codex_model ?? "");
+      setPlanningCodexEffort(settings.planning_codex_effort ?? "");
+      setSavedPlanningCodexEffort(settings.planning_codex_effort ?? "");
       const pm = settings.planning_claude_model ?? "";
       setPlanningModel(pm);
       setSavedPlanningModel(pm);
@@ -767,10 +801,15 @@ export function RunDefaults() {
       setNotice("Planning defaults saved. They apply the next time a run plans.");
     } catch (err) {
       const message = errorMessage(err, "Failed to save planning defaults");
-      const forModel = message.startsWith("planning_claude_model:");
-      const forEffort = message.startsWith("planning_claude_effort:");
-      if (!forModel) setPlanningEffortError(message);
-      if (!forEffort) setPlanningModelError(message);
+      const fields = [
+        ["planning_claude_model", setPlanningModelError],
+        ["planning_claude_effort", setPlanningEffortError],
+        ["planning_codex_model", setPlanningCodexModelError],
+        ["planning_codex_effort", setPlanningCodexEffortError],
+      ] as const;
+      const field = fields.find(([name]) => message.startsWith(`${name}:`));
+      if (field) field[1](message);
+      else for (const [, setFieldError] of fields) setFieldError(message);
     } finally {
       setPlanningBusy(false);
     }
@@ -1727,7 +1766,7 @@ export function RunDefaults() {
         )}
       </Card>
 
-      {/* Claude planning model and effort (PRD #3252): used while a run plans; the run
+      {/* Planning model and effort (PRD #3252): used while a run plans; the run
           continues on the worker model and effort above once the plan is approved. */}
       <Card className="space-y-5">
         <div>
@@ -1741,49 +1780,70 @@ export function RunDefaults() {
           <Skeleton className="h-9 w-full max-w-sm" />
         ) : (
           <div className="space-y-3">
-            <Field label="Claude planning model" htmlFor="planning-claude-model">
-              <ModelSelect
-                id="planning-claude-model"
-                value={planningModel}
-                onChange={(v) => { setPlanningModel(v); setPlanningModelError(""); }}
-                harness="claude"
-                defaultLabel={planningModelDefaultLabel}
-                customAriaLabel="Custom Claude planning model ID"
-                onCustomModeChange={setPlanningModelCustom}
-                ariaDescribedBy={planningModelDescribedBy}
-              />
-            </Field>
-            {planningModelWarning && (
-              <div id="planning-model-warning">
-                <Alert message={planningModelWarning} tone="warning" />
-              </div>
-            )}
-            {planningCustomEmpty && (
-              <p id="planning-model-empty" className="text-xs text-danger" role="alert">
-                Enter a custom model ID, or choose Same as the run.
-              </p>
-            )}
-            {planningModelError && (
-              <p id="planning-model-error" className="text-xs text-danger" role="alert">
-                {planningModelError}
-              </p>
-            )}
-            <Field label="Claude planning effort" htmlFor="planning-claude-effort">
-              <EffortSelect
-                id="planning-claude-effort"
-                value={planningEffort}
-                onChange={(v) => { setPlanningEffort(v); setPlanningEffortError(""); }}
-                defaultLabel={planningEffortDefaultLabel}
-              />
-            </Field>
-            {planningEffortError && (
-              <p id="planning-effort-error" className="text-xs text-danger" role="alert">
-                {planningEffortError}
-              </p>
-            )}
+            {showClaudeLane && <>
+              <Field label="Claude planning model" htmlFor="planning-claude-model">
+                <ModelSelect
+                  id="planning-claude-model"
+                  value={planningModel}
+                  onChange={(v) => { setPlanningModel(v); setPlanningModelError(""); }}
+                  harness="claude"
+                  defaultLabel={planningModelDefaultLabel}
+                  customAriaLabel="Custom Claude planning model ID"
+                  onCustomModeChange={setPlanningModelCustom}
+                  ariaDescribedBy={planningModelDescribedBy}
+                />
+              </Field>
+              {planningModelWarning && (
+                <div id="planning-model-warning">
+                  <Alert message={planningModelWarning} tone="warning" />
+                </div>
+              )}
+              {planningCustomEmpty && (
+                <p id="planning-model-empty" className="text-xs text-danger" role="alert">
+                  Enter a custom model ID, or choose Same as the run.
+                </p>
+              )}
+              {planningModelError && (
+                <p id="planning-model-error" className="text-xs text-danger" role="alert">
+                  {planningModelError}
+                </p>
+              )}
+              <Field label="Claude planning effort" htmlFor="planning-claude-effort">
+                <EffortSelect
+                  id="planning-claude-effort"
+                  value={planningEffort}
+                  onChange={(v) => { setPlanningEffort(v); setPlanningEffortError(""); }}
+                  defaultLabel={planningEffortDefaultLabel}
+                />
+              </Field>
+              {planningEffortError && (
+                <p id="planning-effort-error" className="text-xs text-danger" role="alert">
+                  {planningEffortError}
+                </p>
+              )}
+            </>}
+            {showCodexLane && <>
+              <Field label="Codex planning model" htmlFor="planning-codex-model">
+                <ModelSelect id="planning-codex-model" harness="codex" allowCustom
+                  value={planningCodexModel} defaultLabel={planningCodexModelDefaultLabel}
+                  onChange={v => { setPlanningCodexModel(v); setPlanningCodexModelError(""); }}
+                  customAriaLabel="Custom Codex planning model ID" onCustomModeChange={setPlanningCodexModelCustom}
+                  ariaDescribedBy={[planningCodexModelWarning && "planning-codex-model-warning", planningCodexCustomEmpty && "planning-codex-model-empty", planningCodexModelError && "planning-codex-model-error"].filter(Boolean).join(" ") || undefined}
+                />
+              </Field>
+              {planningCodexModelWarning && <p id="planning-codex-model-warning" className="text-xs text-danger" role="alert">{planningCodexModelWarning}</p>}
+              {planningCodexCustomEmpty && <p id="planning-codex-model-empty" className="text-xs text-danger" role="alert">Enter a custom model ID, or choose Same as the run.</p>}
+              {planningCodexModelError && <p id="planning-codex-model-error" className="text-xs text-danger" role="alert">{planningCodexModelError}</p>}
+              <Field label="Codex planning effort" htmlFor="planning-codex-effort">
+                <EffortSelect id="planning-codex-effort" value={planningCodexEffort}
+                  defaultLabel={planningCodexEffortDefaultLabel}
+                  onChange={v => { setPlanningCodexEffort(v); setPlanningCodexEffortError(""); }} />
+              </Field>
+              {planningCodexEffortError && <p id="planning-codex-effort-error" className="text-xs text-danger" role="alert">{planningCodexEffortError}</p>}
+            </>}
             <Button
               type="button"
-              disabled={planningBusy || planningBlocked || !(planningModelDirty || planningEffortDirty)}
+              disabled={planningBusy || (showClaudeLane && planningBlocked) || (showCodexLane && planningCodexBlocked) || !(planningModelDirty || planningEffortDirty || planningCodexModelDirty || planningCodexEffortDirty)}
               onClick={savePlanning}
             >
               Save planning defaults

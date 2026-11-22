@@ -209,12 +209,16 @@ func settingsModelRows(s apitypes.UserSettingsDTO) []settingRow {
 	return append(rows, planningSettingRows(s.PlanningModels, s.PlanningEfforts)...)
 }
 
-// planningSettingRows adapts the Claude planning cells (PRD #3252) into settingRows with the
-// planning_model and planning_effort provenance fields. At most one cell of each is read, and an
-// absent cell yields no row.
+// planningSettingRows reads each known harness once per setting, regardless of cell order.
+// An absent cell yields no row.
 func planningSettingRows(models []apitypes.ModelSettingCellDTO, efforts []apitypes.EffortSettingCellDTO) []settingRow {
 	var rows []settingRow
-	for _, c := range models[:min(len(models), 1)] {
+	seenModels := map[string]bool{}
+	for _, c := range models {
+		if (c.Harness != "claude" && c.Harness != "codex") || seenModels[c.Harness] {
+			continue
+		}
+		seenModels[c.Harness] = true
 		// A built-in Claude model is empty: the SDK picks it, so say that rather than print nothing.
 		def, resolved := orSDKDefault(c.DefaultModel), orSDKDefault(c.ResolvedModel)
 		rows = append(rows, settingRow{
@@ -223,7 +227,12 @@ func planningSettingRows(models []apitypes.ModelSettingCellDTO, efforts []apityp
 			Field: "planning_model", Source: c.Source,
 		})
 	}
-	for _, c := range efforts[:min(len(efforts), 1)] {
+	seenEfforts := map[string]bool{}
+	for _, c := range efforts {
+		if (c.Harness != "claude" && c.Harness != "codex") || seenEfforts[c.Harness] {
+			continue
+		}
+		seenEfforts[c.Harness] = true
 		row := effortRow("planning effort", c)
 		row.Field = "planning_effort"
 		rows = append(rows, row)

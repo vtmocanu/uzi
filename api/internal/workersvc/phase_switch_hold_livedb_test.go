@@ -138,11 +138,11 @@ func TestSetRunPhaseSwitchHoldServiceLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a codex run and a non-live phase are refused", func(t *testing.T) {
+	t.Run("a codex run is admitted and a non-live phase is refused", func(t *testing.T) {
 		id := seedPhaseSwitchRun(t, env, o, next(), "running")
 		env.exec(`UPDATE runs SET harness = 'codex' WHERE id = $1`, id)
-		if _, applied, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 3, PhaseSwitchPlan); err != nil || applied {
-			t.Fatalf("codex run = (applied=%v, %v), want (false, nil)", applied, err)
+		if _, applied, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 3, PhaseSwitchPlan); err != nil || !applied {
+			t.Fatalf("codex run = (applied=%v, %v), want (true, nil)", applied, err)
 		}
 		id = seedPhaseSwitchRun(t, env, o, next(), "awaiting_input")
 		if _, applied, err := svc.SetRunPhaseSwitchHold(env.ctx, wkr, id, &head, 3, PhaseSwitchPlan); err != nil || applied {
@@ -338,5 +338,20 @@ func TestPhaseSwitchProcessDeathSweepLiveDB(t *testing.T) {
 	r := mustRun(t, env, spent)
 	if r.Status == "running" || r.Status == "paused" || r.HoldReason.String == HoldReasonPhaseSwitchUnavailable {
 		t.Fatalf("spent run: status %q hold %q, want the existing over-cap route (failed or recovery_wait), not a phase hold", r.Status, r.HoldReason.String)
+	}
+}
+
+func TestCodexPhaseSwitchHoldEachLeadKindLiveDB(t *testing.T) {
+	f := newIsoFix(t)
+	w := store.Worker{ID: f.workerID, UserID: f.userID}
+	for _, kind := range phaseLeadKinds {
+		t.Run(kind, func(t *testing.T) {
+			id := f.insertPhaseRun(t, kind, "awaiting_approval", f.workerID)
+			f.env.exec(`UPDATE runs SET harness='codex', claim_generation=3, auto_approve=true WHERE id=$1`, id)
+			r, applied, err := f.svc.SetRunPhaseSwitchHold(f.env.ctx, w, id, nil, 3, PhaseSwitchImplement)
+			if err != nil || !applied || r.Status != "paused" || r.HoldReason.String != HoldReasonPhaseSwitchUnavailable {
+				t.Fatalf("Codex %s hold=(%s,%v,%v)", kind, r.Status, applied, err)
+			}
+		})
 	}
 }
