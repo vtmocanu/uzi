@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { FakeAnthropicApi } from "./fake-anthropic-api.js";
-import { PhaseClaude } from "./phase-model-claude.js";
+import { CLAUDE_PHASE_SDK, PhaseClaude } from "./phase-model-claude.js";
 
 const nonce = `phase-${randomUUID()}`;
 const wire: Array<Record<string, unknown>> = [];
@@ -106,7 +106,7 @@ test("Claude phase case 9: init precedes requests but is not a prompt or abort a
   assert.equal(barrier.beforePrompt, false);
   assert.deepEqual(barrier.events, ["settings-ready", "gate-release", "prompt", "init", "request"]);
   assert.equal(barrier.requestsAfterAbort, 1);
-  console.log(`PHASE_CLAUDE_EVIDENCE ${JSON.stringify({ sdk: "0.3.319", cli: a.cli,
+  console.log(`PHASE_CLAUDE_EVIDENCE ${JSON.stringify({ sdk: CLAUDE_PHASE_SDK, cli: a.cli,
     models: [a.model, b.model, back.model, omitted.model], efforts: [a.effort, b.effort, back.effort, omitted.effort],
     runtimeDefaultModel: runtimeDefault.model, explicitNondefaultModel: explicitNondefault.model,
     omittedModel: omittedModel.model, switchedUsageModels: Object.keys(b.usage as object),

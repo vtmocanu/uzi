@@ -1,6 +1,6 @@
 {
   "harness_versions": {
-    "claude_agent_sdk": "0.3.319",
+    "claude_agent_sdk": "0.3.325",
     "codex": "0.169.0"
   },
   "denied_names": [
@@ -60,7 +60,12 @@
     "GIT_CONFIG_PARAMETERS",
     "API_TIMEOUT_MS",
     "MAX_THINKING_TOKENS",
-    "MAX_MCP_OUTPUT_TOKENS"
+    "MAX_MCP_OUTPUT_TOKENS",
+    "NODE_INSPECTOR_IPC",
+    "VSCODE_INSPECTOR_OPTIONS",
+    "TEMP",
+    "TMP",
+    "SYSTEMDRIVE"
   ],
   "denied_prefixes": [
     "UZI_",
@@ -155,6 +160,54 @@
       "harness": "claude",
       "decision": "denied",
       "reason": "harness control outside the denied prefixes: tool output bound of the Claude CLI"
+    },
+    {
+      "name": "NODE_INSPECTOR_IPC",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: TypeScript debug-mode selector read by the bundled CLI (not a claim that it starts an inspector)"
+    },
+    {
+      "name": "VSCODE_INSPECTOR_OPTIONS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: TypeScript debug-mode selector read by the bundled CLI (not a claim that it starts an inspector)"
+    },
+    {
+      "name": "TEMP",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "managed directory: Windows sandbox temporary-path selector"
+    },
+    {
+      "name": "TMP",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "managed directory: Windows sandbox temporary-path selector"
+    },
+    {
+      "name": "SYSTEMDRIVE",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "managed directory: uppercase API spelling of the Windows SystemDrive read, whose environment lookup is case-insensitive; mixed-case SystemDrive stays rejected by the name grammar"
+    },
+    {
+      "name": "TSC_NONPOLLING_WATCHER",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration: TypeScript compiler filesystem-watcher preference read by the bundled TypeScript; no effect on how the harness runs"
+    },
+    {
+      "name": "TSC_WATCHDIRECTORY",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration: TypeScript compiler filesystem-watcher preference read by the bundled TypeScript; no effect on how the harness runs"
+    },
+    {
+      "name": "TSC_WATCHFILE",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration: TypeScript compiler filesystem-watcher preference read by the bundled TypeScript; no effect on how the harness runs"
     },
     {
       "name": "DISABLE_TELEMETRY",

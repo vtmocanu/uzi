@@ -57,7 +57,12 @@ denied:
   `PATH`, `HOME`, `TMPDIR`, `SHELL`, `DOCKER_HOST`, `DOCKER_CONFIG`, `GOFLAGS`,
   `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `NETRC`, `CURL_CA_BUNDLE`, `RUBYOPT`.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
-  `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
+  `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`,
+  `NODE_INSPECTOR_IPC`, `VSCODE_INSPECTOR_OPTIONS`.
+- Managed directories the sandbox reads: `TEMP`, `TMP`, `SYSTEMDRIVE`. These
+  are the uppercase spellings of Windows variables (the Windows environment
+  lookup is case-insensitive); API names stay uppercase-only, so the mixed-case
+  `SystemDrive`, `Temp` and `Tmp` are rejected by the name rule.
 
 Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `GOOGLE_APPLICATION_CREDENTIALS`,

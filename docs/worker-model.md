@@ -244,7 +244,7 @@ a table characterized on the pinned CLI. Only a match sends the prompt.
 | `opus` | `claude-opus-5-5` | `medium` |
 | `sonnet` | `claude-sonnet-5-5` | `medium` |
 | `haiku` | `claude-haiku-5-5` | `medium` |
-| `fable` | `claude-fable-5-1` | `high` |
+| `fable` | `claude-fable-5-2` | `medium` |
 
 A full model id, or one mapped by a provider setting, is compared verbatim.
 Anything that cannot be verified holds the run (below); it never implements on

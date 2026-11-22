@@ -133,6 +133,15 @@ const MODEL_ALIAS_ENV = {
   fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
 } as const;
 
+/** The window a provider credential gets when none of its mapped models configures one. Owner
+ *  decision 2026-11-22 (#4611, PRD #4320 Decision Log): CLI 2.1.323+ assumes 1M tokens for a model id
+ *  it does not recognize; uzi keeps a conservative 200K so an unconfigured provider compacts early
+ *  instead of overrunning a gateway's real limit. An explicit window always wins through the
+ *  smallest-window rule in {@link smallestContextWindow}, and a partial map (some slots configured,
+ *  others not) uses the smallest explicit window for the whole process: a documented limitation,
+ *  because CLAUDE_CODE_MAX_CONTEXT_TOKENS cannot differ per model. */
+export const PROVIDER_FALLBACK_CONTEXT_WINDOW = 200_000;
+
 /** The smallest `context_window` among ALL mapped models, or undefined when none is set (PRD #4320
  *  Decision Log: CLAUDE_CODE_MAX_CONTEXT_TOKENS is process-wide, so every mapped slot counts). */
 function smallestContextWindow(modelMap: Extract<SdkCredential, { kind: "provider" }>["modelMap"]): number | undefined {
@@ -160,8 +169,7 @@ function credentialEnv(credential: SdkCredential): Record<string, string | undef
   }
   env.ANTHROPIC_SMALL_FAST_MODEL = credential.modelMap.haiku.model;
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-  const window = smallestContextWindow(credential.modelMap);
-  if (window !== undefined) env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(window);
+  env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(smallestContextWindow(credential.modelMap) ?? PROVIDER_FALLBACK_CONTEXT_WINDOW);
   return env;
 }
 

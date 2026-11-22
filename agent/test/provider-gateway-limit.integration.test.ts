@@ -10,7 +10,7 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { buildSdkEnv } from "../src/sdk-env.js";
 import { isGatewayLimitStatus } from "../src/provider-binding.js";
 
-// PRD #4320 D11/D15 characterization: how the pinned CLI (SDK 0.3.319 / CLI 2.1.319) terminates a turn
+// PRD #4320 D11/D15 characterization: how the CLI (characterized at SDK 0.3.319 / CLI 2.1.319) terminates a turn
 // against a gateway that answers a persistent 429 or 529. Observed 2026-11-18 with the CLI's DEFAULT
 // retry budget: 10 api_retry frames over roughly 180 s (backoff 0.6 s growing to ~36 s), then the
 // terminal frame. This test shortens that with CLAUDE_CODE_MAX_RETRIES=1 (test-only) and asserts the

@@ -6,7 +6,7 @@
 /** Harness versions the lists below were derived from. A bump of either harness must
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
-  claude_agent_sdk: "0.3.319",
+  claude_agent_sdk: "0.3.325",
   codex: "0.169.0",
 } as const;
 
@@ -24,6 +24,7 @@ export const RUN_ENV_DENIED_NAMES: readonly string[] = [
   "UZI_SQLC_DIR", "UZI_RUN_ATTEMPT", "UZI_RUN_CLONE", "UZI_RUN_CLONE_KEY", "UZI_WORKER_SPAWN",
   "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
   "API_TIMEOUT_MS", "MAX_THINKING_TOKENS", "MAX_MCP_OUTPUT_TOKENS",
+  "NODE_INSPECTOR_IPC", "VSCODE_INSPECTOR_OPTIONS", "TEMP", "TMP", "SYSTEMDRIVE",
 ];
 
 export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [

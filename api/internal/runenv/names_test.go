@@ -97,8 +97,13 @@ func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 		if deniedBy(n) == "" {
 			t.Errorf("denied name %q is not denied by the lists", n)
 		}
-		if err := ValidateName(n); err == nil {
-			t.Errorf("ValidateName(%q) accepted a denied name", n)
+		if !NameRegexp.MatchString(n) {
+			// npm_config_cache fails the name grammar, which rejects it before any list is consulted.
+			continue
+		}
+		// An exact denied name must be rejected by the exact-name rule, not by a prefix or the grammar.
+		if err := ValidateName(n); err == nil || !strings.Contains(err.Error(), "(denied name)") {
+			t.Errorf("ValidateName(%q) = %v, want the exact denied-name rule", n, err)
 		}
 	}
 	for _, p := range fx.DeniedPrefixes {
@@ -131,6 +136,10 @@ func TestFixtureOverlapDecisions(t *testing.T) {
 			if err == nil {
 				t.Errorf("overlap %s (%s) is recorded as denied but accepted", o.Name, o.Harness)
 			}
+			// A reserved rule must deny it, not merely the name grammar.
+			if deniedBy(o.Name) == "" {
+				t.Errorf("overlap %s (%s) is recorded as denied but no reserved rule denies it", o.Name, o.Harness)
+			}
 		default:
 			t.Errorf("overlap %s has decision %q", o.Name, o.Decision)
 		}
@@ -154,6 +163,29 @@ func TestValidateNameShape(t *testing.T) {
 	}
 	if err := ValidateName("TMPDIR"); err == nil {
 		t.Error("ValidateName(TMPDIR) accepted a denied name")
+	}
+}
+
+// The Windows spellings the Claude CLI reads (SystemDrive, Temp, Tmp) stay rejected by the
+// grammar; only the uppercase API spellings are reserved names, and the TypeScript
+// watcher preferences are ordinary application configuration.
+func TestWindowsSpellingsAndTscNames(t *testing.T) {
+	for _, n := range []string{"SystemDrive", "Temp", "Tmp"} {
+		err := ValidateName(n)
+		if err == nil || !strings.Contains(err.Error(), "must match") {
+			t.Errorf("ValidateName(%q) = %v, want the grammar error", n, err)
+		}
+	}
+	for _, n := range []string{"TEMP", "TMP", "SYSTEMDRIVE", "NODE_INSPECTOR_IPC", "VSCODE_INSPECTOR_OPTIONS"} {
+		err := ValidateName(n)
+		if err == nil || !strings.Contains(err.Error(), "(denied name)") {
+			t.Errorf("ValidateName(%q) = %v, want the denied-name rule", n, err)
+		}
+	}
+	for _, n := range []string{"TSC_WATCHFILE", "TSC_WATCHDIRECTORY", "TSC_NONPOLLING_WATCHER"} {
+		if err := ValidateName(n); err != nil {
+			t.Errorf("ValidateName(%q) = %v, want accepted", n, err)
+		}
 	}
 }
 
