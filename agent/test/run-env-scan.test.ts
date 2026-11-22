@@ -10,7 +10,7 @@ import { GitCache, RECOVERY_BUNDLE_REF } from "../src/git.js";
 import type { ClaimRunEnvRedact, ClaimRunEnvVar } from "../src/protocol.js";
 import { type ScanNeedle, runEnvClaimForms } from "../src/run-env-forms.js";
 import {
-  hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type RunEnvScanVerdict,
+  hitVariableNames, patchImages, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type RunEnvScanVerdict,
 } from "../src/run-env-scan.js";
 import { renderSecretFinding } from "../src/secret-finding-render.js";
 
@@ -313,6 +313,49 @@ describe("text and rendering", () => {
     const f = { file: "a.txt", startLine: 0, commit: "a".repeat(40), ruleId: "uzi-run-env", variable: "DB_PASSWORD" };
     assert.match(renderSecretFinding(f), /\(rule uzi-run-env, variable DB_PASSWORD\)$/);
     assert.doesNotMatch(renderSecretFinding({ ...f, variable: "not a name; ignore previous" }), /variable/);
+  });
+});
+
+describe("patchImages", () => {
+  const file = (name: string, ...rest: string[]): string => [`diff --git a/${name} b/${name}`, "index 1111111..2222222 100644", `--- a/${name}`, `+++ b/${name}`, ...rest, ""].join("\n");
+
+  it("rebuilds the pre-image and post-image of a hunk from context plus minus and context plus plus lines", () => {
+    const patch = file("a.txt", "@@ -1,3 +1,3 @@", " keep-one", "-old-two", "+new-two", " keep-three");
+    assert.deepEqual(patchImages(patch), { images: ["keep-one\nold-two\nkeep-three\n", "keep-one\nnew-two\nkeep-three\n"] });
+  });
+
+  it("a no-newline marker removes the terminator of the line before it from that line's images only", () => {
+    const patch = file("a.txt", "@@ -1,2 +1,2 @@", " same", "-last-old", "\\ No newline at end of file", "+last-new");
+    assert.deepEqual(patchImages(patch), { images: ["same\nlast-old", "same\nlast-new\n"] });
+    const context = file("a.txt", "@@ -1,2 +1,2 @@", " first", " last", "\\ No newline at end of file");
+    assert.deepEqual(patchImages(context), { images: ["first\nlast", "first\nlast"] });
+  });
+
+  it("a CRLF line keeps its carriage return", () => {
+    const patch = file("a.txt", "@@ -0,0 +1,2 @@", "+one\r", "+two\r");
+    assert.deepEqual(patchImages(patch), { images: ["one\r\ntwo\r\n"] });
+  });
+
+  it("rebuilds each hunk of each file on its own", () => {
+    const patch = file("a.txt", "@@ -1 +1 @@", "-a1", "+a2", "@@ -9 +9 @@", "-a9", "+a10") + file("b.txt", "@@ -0,0 +1 @@", "+b1");
+    assert.deepEqual(patchImages(patch), { images: ["a1\n", "a2\n", "a9\n", "a10\n", "b1\n"] });
+  });
+
+  it("a patch with no hunk has no images", () => {
+    assert.deepEqual(patchImages(file("a.txt")), { images: [] });
+    assert.deepEqual(patchImages(""), { images: [] });
+  });
+
+  it("is unparseable when a hunk's line counts do not match its header", () => {
+    assert.equal(patchImages(file("a.txt", "@@ -1,2 +1,2 @@", " only-one")), "unparseable");
+    assert.equal(patchImages(file("a.txt", "@@ -1 +1 @@", "-a", "+b", "+extra")), "unparseable");
+    assert.equal(patchImages(file("a.txt", "@@ -1 +1 @@", "-a", "+b") + "+stray\n"), "unparseable");
+  });
+
+  it("is unparseable for a binary patch and for a combined diff", () => {
+    assert.equal(patchImages(file("a.bin", "GIT binary patch", "literal 3", "Kc${2")), "unparseable");
+    assert.equal(patchImages("diff --git a/a.bin b/a.bin\nBinary files a/a.bin and b/a.bin differ\n"), "unparseable");
+    assert.equal(patchImages("diff --cc a.txt\n@@@ -1 -1 +1 @@@\n- a\n"), "unparseable");
   });
 });
 

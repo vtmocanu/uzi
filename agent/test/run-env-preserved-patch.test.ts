@@ -37,9 +37,9 @@ function githubRunner(github: GitHubClient): RunRunner {
   );
 }
 
-const claimFor = (iid: number) => gitlabClaim(iid, {
+const claimFor = (iid: number, vars: ClaimRunEnvVar[] = [var1]) => gitlabClaim(iid, {
   repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, default_branch: "main", forge_type: "github" },
-  secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: [var1] },
+  secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan", run_env: vars },
 });
 
 /** What the git layer returns: the whole, uncapped diff. */
@@ -47,12 +47,12 @@ const diffOf = (full: string) => (async () => full) as typeof git.workflowScopeD
 const header = `diff --git a/${WORKFLOW} b/${WORKFLOW}\n`;
 const filler = "+".concat("y".repeat(79), "\n").repeat(8000);
 
-async function failedReport(iid: number, full: string): Promise<{ fail_origin?: string; preserved_patch?: string }> {
+async function failedReport(iid: number, full: string, vars?: ClaimRunEnvVar[]): Promise<{ fail_origin?: string; preserved_patch?: string }> {
   const { github } = fakeGitHub();
   git.pushBranch = (async () => undefined) as typeof git.pushBranch;
   git.branchWorkflowFiles = (async () => [WORKFLOW]) as typeof git.branchWorkflowFiles;
   git.workflowScopeDiff = diffOf(full);
-  const claim = claimFor(iid);
+  const claim = claimFor(iid, vars);
   await githubRunner(github).execute(claim);
   return api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body;
 }
@@ -82,5 +82,42 @@ describe("the preserved patch check sees the whole diff", () => {
     const failed = await failedReport(46202, `${header}${filler}+on: [push]\n`);
     assert.equal(failed.fail_origin, "workflow_scope_missing");
     assert.match(failed.preserved_patch ?? "", /diff truncated at \d+ bytes/);
+  });
+});
+
+// A multi-line value whose lines are each shorter than the minimum registered length: only the whole value (read
+// across the hunk's rebuilt image) can find it. Parts are joined at runtime.
+const SHORT_LINES = ["ab12", "cd34", "ef56"];
+const multiVar = (lines: string[]): ClaimRunEnvVar => ({ ...var1, name: "SVC_BLOB", value: lines.join("\n") });
+const hunkPatch = (...body: string[]): string =>
+  `${header}index 1111111..2222222 100644\n--- a/${WORKFLOW}\n+++ b/${WORKFLOW}\n${body.join("\n")}\n`;
+
+describe("the preserved patch fails closed on what the raw text cannot show", () => {
+  it("withholds a mixed hunk that carries the secret's lines as context and as added lines", async () => {
+    const full = hunkPatch("@@ -1,2 +1,3 @@", ` ${SHORT_LINES[0]}`, `+${SHORT_LINES[1]}`, ` ${SHORT_LINES[2]}`);
+    assert.ok(!full.includes(SHORT_LINES.join("\n")), "no prefix-free run of the value in the raw text");
+    const failed = await failedReport(46210, full, [multiVar(SHORT_LINES)]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing", "the typed failure still lands");
+    assert.equal(failed.preserved_patch, undefined);
+  });
+
+  it("withholds a binary patch", async () => {
+    const full = `${header}index 1111111..2222222 100644\nGIT binary patch\nliteral 3\nKc2\n\nliteral 0\nHcmV?d00001\n`;
+    const failed = await failedReport(46211, full, [multiVar(SHORT_LINES)]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.equal(failed.preserved_patch, undefined);
+  });
+
+  it("withholds a patch carrying one filtered line of a multi-line secret", async () => {
+    const lines = ["Qm9k7Zp3Wd", "ab12", "cd34"];
+    const failed = await failedReport(46212, hunkPatch("@@ -0,0 +1 @@", `+${lines[0]}`), [multiVar(lines)]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.equal(failed.preserved_patch, undefined);
+  });
+
+  it("still attaches a clean patch, hunks and all", async () => {
+    const failed = await failedReport(46213, hunkPatch("@@ -1,2 +1,3 @@", " name: guard", "+on: [push]", " jobs: {}"), [multiVar(SHORT_LINES)]);
+    assert.equal(failed.fail_origin, "workflow_scope_missing");
+    assert.match(failed.preserved_patch ?? "", /\+on: \[push\]/);
   });
 });

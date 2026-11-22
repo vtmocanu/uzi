@@ -244,4 +244,24 @@ describe("a claim over the form budget", () => {
     assert.deepEqual(await resolutions[0], { kind: "withhold", reason: "forms_over_budget" });
     assert.equal(internals.liveScanNeedles.has(claim.run_id), false, "and it is evicted at terminal");
   });
+
+  it("a hand-built over-budget flight is withheld by the upload scan and the checkpoint range scan, never read as clean", async () => {
+    const { gitlab } = fakeGitlab();
+    const runner = runnerWith(() => ({ executor: { run: async () => ({ branch: "b" }) } }), gitlab);
+    const warnings: string[] = [];
+    const flight = {
+      runId: "run-over-budget-direct", scanOverBudget: true, scanNeedles: [] as unknown[], branch: undefined,
+      runLog: { warn: (m: string) => { warnings.push(m); }, info: () => undefined },
+    };
+    const internals = runner as unknown as {
+      requireNoRunEnv(f: unknown, bare: string, tip: string, excludes: string[], what: string): Promise<unknown>;
+      scanCheckpointForPublish(f: unknown, bare: string, branch: string): Promise<{ kind: string; outcome?: string }>;
+    };
+    await assert.rejects(internals.requireNoRunEnv(flight, "/nonexistent-bare", "a".repeat(40), [], "direct"),
+      (e: Error) => e.constructor.name === "SecretRemediationPendingError");
+    assert.ok(warnings.length > 0, "the withhold is logged");
+    git.resolveCheckpointRange = (async () => ({ tipSha: "a".repeat(40), excludeSha: "b".repeat(40) })) as unknown as typeof git.resolveCheckpointRange;
+    const outcome = await internals.scanCheckpointForPublish({ ...flight, publishedRealTips: [], reportedPublishOutcomes: new Set(["secret:untrusted"]) }, "/nonexistent-bare", "agent/issue-1");
+    assert.deepEqual(outcome, { kind: "blocked", outcome: "secret_scan_untrusted" });
+  });
 });

@@ -1,5 +1,4 @@
 import { it } from "node:test";
-import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
@@ -11,6 +10,7 @@ import { createHash } from "node:crypto";
 import { GitCache, OVERLAY_COMMIT_PREFIX, ScratchPublicationError, type GitCacheOptions } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 import { RunRunner } from "../src/runner.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { WorkerClient } from "../src/client.js";
 
 const scratch = path.resolve("../.uzi/scratch");

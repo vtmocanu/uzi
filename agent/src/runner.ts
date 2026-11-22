@@ -1,5 +1,5 @@
 import { RUN_ENV_FORM_CHARS_MAX, RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms, type RunEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
-import { hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, textHitVariables, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
+import { hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, FORMS_OVER_BUDGET, patchScanVerdict, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
 import { runEnvContextField } from "./run-env-lane.js";
 import { markRunEnvSeen, runEnvSeen } from "./run-env-seen.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
@@ -1011,9 +1011,8 @@ class RunEnvBlockedError extends SecretRemediationPendingError {
   }
 }
 
-/** The live-set marker of a run whose claim forms passed the budget: no needle set exists, so no-flight lanes withhold. */
-const FORMS_OVER_BUDGET = "forms_over_budget" as const;
-/** The run's scan needles, `[]` when the claim carried no secret variable (or a hand-built test flight). */
+/** The run's scan needles, `[]` when the claim carried no secret variable, when its forms were over budget (no
+ *  needle set exists then: consumers must check `flight.scanOverBudget` first) or on a hand-built test flight. */
 const needlesOf = (flight: Pick<RunFlight, "scanNeedles">): readonly ScanNeedle[] => flight.scanNeedles ?? [];
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
@@ -8657,7 +8656,8 @@ export class RunRunner {
     if (!await this.provePolicyClaim(claim)) return false;
     await this.resolveRunPendingTerminals(flight.runId, {
       claimGeneration: flight.claimGeneration,
-      continuationMode: flight.effectiveAttemptPaths ? "fresh_from_saved_work" : "same_conversation",
+      // phaseClone has not yet set effectiveAttemptPaths on the pre-clone over-budget call.
+      continuationMode: (flight.effectiveAttemptPaths ?? this.attemptPaths) ? "fresh_from_saved_work" : "same_conversation",
     });
     // A void resolver return is not settlement proof; authenticate through EOF.
     if (await this.outbox!.hasPendingPolicyOutcome(flight.runId) || !await this.provePolicyClaim(claim)) return false;
@@ -8743,7 +8743,7 @@ export class RunRunner {
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
     // Every terminal report is journaled and sent from here: the reason is scrubbed, then capped, before it is
-    // stored, so a caller passes the uncapped reason.
+    // stored.
     body = redactFailureReason(flight.redactText, body);
     const deps = this.terminalDeps();
     const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
@@ -12082,13 +12082,18 @@ export class RunRunner {
     // is not enough on its own: it can be trustworthy AND carry findings.
     const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
       if (rawPatch === null) return undefined;
-      // PRD 4416 M2: the RAW, uncapped patch is searched for the run's secret variable values first (a value
-      // straddling the byte cap must still be seen). Redaction below would scrub a registered form, but a patch
-      // that carries one is withheld whole rather than shipped scrubbed.
-      const variableHits = textHitVariables(rawPatch, needlesOf(flight));
-      if (variableHits.length > 0) {
-        runLog.warn("preserved patch withheld: it carries the value of a run secret variable", {
-          run_id: runId, site, variables: variableHits.slice(0, 10),
+      // PRD 4416 M2: the RAW, uncapped patch is judged before redaction. It is withheld whole (not shipped
+      // scrubbed) when the claim's forms were over budget, when a whole-value form occurs in the patch or in any
+      // hunk's rebuilt pre- or post-image, when a registered line form of a multi-line secret occurs, or when
+      // the patch cannot be rebuilt into hunk images.
+      if (flight.scanOverBudget) {
+        runLog.warn("preserved patch withheld: the run's secret forms were over budget", { run_id: runId, site });
+        return undefined;
+      }
+      const verdict = patchScanVerdict(rawPatch, needlesOf(flight), flight.scanLineForms ?? []);
+      if (verdict.withhold) {
+        runLog.warn("preserved patch withheld: run secret scan", {
+          run_id: runId, site, reason: verdict.reason, variables: verdict.variables.slice(0, 10),
         });
         return undefined;
       }
@@ -16757,7 +16762,7 @@ export class RunRunner {
           // which do not come through here) is byte-unchanged and not scanned.
           // PRD 4416 M2: a run holding secret variables defers every in-permit publish, overlay or not, because the
           // exact-value scan at the pack seam must not run inside a permit either.
-          if (inPermit && (!resolvedOverlay || needlesOf(flight).length > 0)) {
+          if (inPermit && (!resolvedOverlay || needlesOf(flight).length > 0 || flight.scanOverBudget)) {
             // issue #1597 M2 (round 3): NEVER run gitleaks inside a Codex permit. A permit-held child
             // cannot be killed on its own and execScoped's scoped branch ignores `timeout`, while
             // gitleaks' own git-mode `--timeout` yields a silent clean partial scan — so a slow scan
@@ -21739,6 +21744,8 @@ export class RunRunner {
         if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };
         return untrusted("range_unresolved");
       }
+      // No needle set exists for an over-budget claim, so the scan below would read as clean.
+      if (flight.scanOverBudget) return untrusted(FORMS_OVER_BUDGET);
       const scan = await (scanScope ?? ((fn) => fn()))(() =>
         this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }),
       );
@@ -21837,6 +21844,8 @@ export class RunRunner {
     if (options?.unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
+    // No needle set exists for an over-budget claim, so the scan below would read as clean.
+    if (flight.scanOverBudget) return { trusted: false, why: FORMS_OVER_BUDGET };
     const scan = await (options?.scanScope ?? ((fn) => fn()))(() =>
       this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }));
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
@@ -23649,7 +23658,7 @@ export class RunRunner {
       packedTip = packed.tipOid;
       // PRD 4416 M2: the pack's tip must be a candidate the exact-value scan covered; otherwise what would be
       // published is not what was scanned, and nothing is sent.
-      if (needlesOf(flight).length > 0 && !scanCoversCandidate(scannedForVariables, { tip: packed.tipOid })) {
+      if ((needlesOf(flight).length > 0 || flight.scanOverBudget) && !scanCoversCandidate(scannedForVariables, { tip: packed.tipOid })) {
         flight.runLog.warn("run variable scan does not cover the candidate; withholding the upload", { run_id: flight.runId });
         throw new SecretRemediationPendingError();
       }

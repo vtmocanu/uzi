@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -16,6 +15,7 @@ import type { Executor } from "../src/executor.js";
 import type { CompletedPublicationReceipt } from "../src/protocol.js";
 import type { CompletionSource, RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { nullLogger } from "./helpers.js";
 import { client, fakeGitlab, fx, git, gitlabClaim, runnerWith } from "./runner-harness.js";
