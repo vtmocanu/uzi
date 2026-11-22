@@ -2257,6 +2257,7 @@ function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
 }
 
 export class CodexExecutor implements Executor {
+  readonly resumesAtGate = true;
   private readonly lifetime = new ExecutorLifetime();
 
   /** The lifetime's incarnation; a source-use admission binds it (see Executor.executorIncarnation). */
@@ -3950,7 +3951,8 @@ export class CodexExecutor implements Executor {
       // Rebuild from current claim/selection/lifecycle, never a stale planning dispatch.
       const currentImplementationRequest = (): RunTurnRequest | undefined => {
         const intent = shared.phaseTransition.current;
-        const implementation = !!intent || ctx.planApproved === true || this.lastRootRequest?.phase === "implement";
+        const implementation = !!intent || resolvedImplementationSelection !== undefined ||
+          ctx.planApproved === true || this.lastRootRequest?.phase === "implement";
         const sessionId = intent?.pending ? intent.threadId : epoch?.harness.rootThreadId ?? lastSessionId;
         if (!implementation || !sessionId) return undefined;
         return this.buildRunRequest(ctx, "implement", "", sessionId, lifecycleSignal,
@@ -4404,6 +4406,9 @@ export class CodexExecutor implements Executor {
         })();
       }
       const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
+      const resumeAtGate = !preApproved && ctx.resumePhase === "awaiting_approval" &&
+        !!ctx.approvedPlan?.trim() && !!ctx.sessionId;
+      let planningTurnRan = false;
       // #1586: the exact plan version the in-process gate approved (the LAST planMd handed to
       // ctx.gatePlan before an approve verdict). ctx.approvedPlan is only the claim-time
       // plan_md, so without this every implement turn fell back to the queue-time issue text.
@@ -4546,6 +4551,7 @@ export class CodexExecutor implements Executor {
                 for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
               }
             } : undefined;
+            planningTurnRan = true;
             turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", planningPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, onPolicyPlanFirstEvent, undefined, undefined, false, !humanRevision, humanRevision);
           } catch (error) {
             if (silentRevision?.needsRebuild && error instanceof CodexTurnTripError && error.message === REASON_WALL) {
@@ -4649,10 +4655,23 @@ export class CodexExecutor implements Executor {
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
         // during planning. The current flight has not attempted completion yet, but a refusal
         // can report prior server completion attempts and must then route to the completion hold.
-        const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
-        if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
-        if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
-        let planResult = planTurn.result;
+        // Read pending controls before presenting or replanning. Approve stays buffered in
+        // the runner for the actual gate; a revise goes through the existing revision loop.
+        const pending = ctx.planApproved !== true && ctx.approvedPlan?.trim() && ctx.takeResumedGateEvent
+          ? await retryHeldSwitch("gate_resumed", () => ctx.takeResumedGateEvent!(ctx.signal))
+          : undefined;
+        if (pending?.kind === "cancel") throw new Error(REASON_CANCEL);
+        if (pending?.kind === "reject") throw new PlanRejectedError(pending.reason, pending.sourceGateRevision);
+        let planResult: ReducedTurnResult;
+        if (resumeAtGate || pending?.kind === "revise") {
+          planResult = { done: false, plan: ctx.approvedPlan!, sessionId: ctx.sessionId ?? undefined,
+            milestones: ctx.frozenMilestones ?? undefined };
+        } else {
+          const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
+          if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+          if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
+          planResult = planTurn.result;
+        }
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
           throw new TrustedExecutionRefusal("codex plan turn produced no plan");
@@ -4663,7 +4682,7 @@ export class CodexExecutor implements Executor {
         // Issue #1789: from the first gate submission until approval the server row is
         // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await retryHeldSwitch("plan_gate", () => ctx.gatePlan!(planMd!, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission));
+        let verdict = pending?.kind === "revise" ? pending : await retryHeldSwitch("plan_gate", () => ctx.gatePlan!(planMd!, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission));
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -4702,7 +4721,9 @@ export class CodexExecutor implements Executor {
             if (reapedSinceLastPersist && !silentRevision?.needsRebuild) await recreateEpochAfterReap();
             reviseTurn = await drivePlan(verdict.automatic === true
               ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
-              : buildRevisePlanPrompt(feedback), !automatic);
+              : (!ctx.sessionId && !planningTurnRan
+                ? `${this.planPrompt(ctx, environmentFacts)}\n\nSubmitted plan:\n${planMd}\n\n${buildRevisePlanPrompt(feedback)}`
+                : buildRevisePlanPrompt(feedback)), !automatic);
           } catch (error) {
             if (!(error instanceof PlanRevisionReplacedError)) throw error;
             verdict = error.verdict;
@@ -4755,7 +4776,9 @@ export class CodexExecutor implements Executor {
         // propagates out of run() unchanged (startProviderEpoch rethrows it unwrapped and
         // `this.safety` is still the OLD live epoch, since it is swapped only after a
         // successful start), and the runner does the fenced positive running report itself.
-        await this.withCaptureOwnership(async () => {
+        // A restored gate has no live planning root to cut or persist. Reuse its lazy
+        // epoch and let the ordinary implementation preflight verify the saved session.
+        if (planningTurnRan) await this.withCaptureOwnership(async () => {
           const old = epoch!;
           // Ordinary approval keeps plan advice alive during implementation. A
           // changed-milestone capture already saved and drained this HOME.
@@ -5776,7 +5799,8 @@ export class CodexExecutor implements Executor {
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
     // Probe the first actual phase's pair; Runtime default remains absent.
-    const firstPhase = !(ctx.planApproved === true && !!ctx.approvedPlan?.trim()) && ctx.gatePlan
+    const restoredGate = ctx.resumePhase === "awaiting_approval" && !!ctx.sessionId && !!ctx.approvedPlan?.trim();
+    const firstPhase = !(ctx.planApproved === true && !!ctx.approvedPlan?.trim()) && !restoredGate && ctx.gatePlan
       ? "plan" : "implement";
     const level = this.leadRequestFor(ctx, firstPhase).effort;
     // Snapshot the runner contract once for all effect surfaces in this epoch.

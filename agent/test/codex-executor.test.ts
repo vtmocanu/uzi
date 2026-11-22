@@ -27553,9 +27553,13 @@ describe("A capture lifecycle public run", () => {
       if (unclean) {
         // Approval cannot replace an epoch whose helper cleanup is unproved: allowing a
         // successful branch here would publish work across an unverified ownership boundary.
-        await assert.rejects(withTimeout(exec.run(ctx), 5000, "unclean old epoch run"), /prior Codex epoch cleanup unproven/);
+        const refusal = await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")
+          .then(() => undefined, (error: unknown) => error);
+        // Check admission first: bypassing the proof must fail on admitted work,
+        // even if the run later throws a different cleanup error.
         assert.equal(fx.rig.providerLaunches(), 1, "no replacement launch without cleanup proof");
         assert.equal(fx.rig.epochs[1]!.transport.turnStartCount, 0, "no implementation turn admitted");
+        assert.match(String(refusal), /prior Codex epoch cleanup unproven/);
       } else {
         assert.equal((await withTimeout(exec.run(ctx), 5000, "clean old epoch run")).branch, ctx.branch);
         assert.equal(fx.rig.providerLaunches(), 2);
@@ -36797,6 +36801,247 @@ describe("B2 cold approval model handoff", () => {
   };
   const approval = async () => ({ kind: "approve", selection: { status: "ok",
     selection: { source: "own", exclusions: [] } } }) as never;
+
+  const observeClaimAccountants = () => {
+    const owners: CodexUsageAccountant[] = [];
+    const register = CodexUsageAccountant.prototype.registerThread;
+    mock.method(CodexUsageAccountant.prototype, "registerThread", function (
+      this: CodexUsageAccountant, ...args: Parameters<typeof register>
+    ) {
+      if (args[0] === saved && !owners.includes(this)) owners.push(this);
+      return register.apply(this, args);
+    });
+    return owners;
+  };
+
+  const stoppedApprovalClaim = async () => {
+    const rig = makeMultiEpochRig([plan(), implementation()]);
+    const stop = new Error("cold fixture stopped at running report");
+    const { ctx } = makeCtx({ config, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, reportIteration: async () => { throw stop; } });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx),
+      5000, "old approval claim"), error => error === stop);
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    // Persisted claim inputs only; no executor or claim-local accounting escapes.
+    return { sessionId: saved, approvedPlan: "bounded implementation" };
+  };
+
+  for (const restoredGate of [false, true]) {
+    it(`cold persisted ${restoredGate ? "unapproved gate" : "approved resume"} owns fresh accounting`, async () => {
+      const owners = observeClaimAccountants();
+      const accounting = observeUsage();
+      const persisted = await stoppedApprovalClaim();
+      assert.equal(owners.length, 1);
+      const oldUsage = owners[0]!.aggregateByModel();
+      let gates = 0, reports = 0;
+      const respond = implementation("gpt-6.1-sol", 200, 225);
+      const rig = makeRig({ responder: c => {
+        if (c.method === "turn/start") {
+          assert.equal(gates, restoredGate ? 1 : 0, "restored gate must precede provider work");
+          assert.equal(rec(c.params).model, "gpt-6.1-sol", "old planning work must not be resent");
+        }
+        return respond(c);
+      } });
+      const sources: string[] = [];
+      const { ctx, emitted } = makeCtx({ config, ...persisted, planApproved: !restoredGate,
+        resumePhase: restoredGate ? "awaiting_approval" : "implementing",
+        gatePlan: async md => {
+          gates++;
+          assert.equal(md, persisted.approvedPlan);
+          assert.equal(rig.transport.turnStartCount, 0, "saved plan work must not be resent");
+          return approval();
+        },
+        reportPlanAgentSource: async source => { sources.push(source); },
+        reportIteration: async () => { reports++; } });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "cold persisted claim");
+      assert.equal(result.phaseSwitchHeld, undefined);
+      assert.equal(gates, restoredGate ? 1 : 0);
+      assert.equal(reports, 1);
+      assert.deepEqual(sources, [], "persisted plan requires no new planning source");
+      assertImplementationResume(rig.transport);
+      assertImplementationTurn(rig.transport);
+      assert.equal(owners.length, 2, "production creates a new accountant for each claim");
+      assert.notStrictEqual(owners[0], owners[1]);
+      assert.deepEqual(owners[0]!.aggregateByModel(), oldUsage);
+      assert.deepEqual(accounting.cuts, [], "old approval grants no inherited cut");
+      assert.deepEqual(accounting.order, ["live:100", "replay:200", "live:225"]);
+      const usage = lastResultModelUsage(emitted)!;
+      assert.equal(usage["gpt-6-astra"], undefined);
+      assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 25);
+    });
+  }
+
+  for (const control of ["cancel", "reject"] as const) {
+    it(`restored gate consumes pending ${control} before presentation or provider work`, async () => {
+      const rig = makeRig();
+      let reads = 0;
+      const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+        approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+        takeResumedGateEvent: async () => {
+          reads++;
+          assert.equal(rig.transport.requests.length, 0);
+          return control === "cancel" ? { kind: "cancel" } :
+            { kind: "reject", reason: "saved candidate rejected", sourceGateRevision: 7 };
+        },
+        gatePlan: async () => { throw new Error("must not present the gate"); } });
+      await assert.rejects(makeExecutor(rig, bindingOf(API_KEY)).run(ctx),
+        control === "cancel" ? /cancel/ : /saved candidate rejected/);
+      assert.equal(reads, 1);
+      assert.equal(rig.transport.requests.length, 0);
+      assert.equal(rig.sessionOps.persist, 0, "unlaunched HOME cannot overwrite persisted session");
+    });
+  }
+
+  for (const control of ["cancel", "reject"] as const) {
+    it(`restored gate ${control} verdict never launches or persists a provider`, async () => {
+      const rig = makeRig();
+      let gates = 0;
+      const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+        approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+        gatePlan: async md => {
+          gates++;
+          assert.equal(md, "persisted candidate");
+          assert.equal(rig.transport.requests.length, 0);
+          return control === "cancel" ? { kind: "cancel" } :
+            { kind: "reject", reason: "restored gate rejected", sourceGateRevision: 7 };
+        } });
+      await assert.rejects(makeExecutor(rig, bindingOf(API_KEY)).run(ctx),
+        control === "cancel" ? /cancel/ : /restored gate rejected/);
+      assert.equal(gates, 1);
+      assert.equal(rig.transport.requests.length, 0);
+      assert.equal(rig.sessionOps.persist, 0);
+    });
+  }
+
+  it("restored candidate replays milestones without fabricating semantic submission", async () => {
+    const rig = makeRig({ responder: implementation() });
+    const milestones = [{ id: "m1", title: "persisted candidate milestone" }];
+    const stop = new Error("stop after restored approval preflight");
+    let reads = 0, gates = 0;
+    const { ctx } = makeCtx({ config, sessionId: saved, planApproved: false,
+      approvedPlan: "persisted candidate", resumePhase: "awaiting_approval", frozenMilestones: milestones,
+      takeResumedGateEvent: async () => { reads++; return undefined; },
+      gatePlan: async (md, candidate, onPersisted, settles, semantic) => {
+        gates++;
+        assert.equal(reads, 1, "pending controls drained first; queued approve belongs to gate");
+        assert.equal(md, "persisted candidate");
+        assert.deepEqual(candidate, milestones);
+        assert.equal(settles, undefined);
+        assert.equal(semantic, undefined, "persisted replay has no new semantic proposal");
+        assert.equal(typeof onPersisted, "function");
+        assert.equal(rig.transport.requests.length, 0, "approval precedes provider launch");
+        assert.equal(rig.sessionOps.persist, 0);
+        return approval();
+      }, reportIteration: async () => { throw stop; } });
+    await assert.rejects(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), error => error === stop);
+    assert.equal(gates, 1);
+    assertImplementationResume(rig.transport);
+    assert.equal(rig.transport.turnStartCount, 0);
+  });
+
+  for (const hasSession of [true, false]) {
+    it(`pending restored revision ${hasSession ? "resumes" : "reconstructs"} context and cuts only its own approval`, async () => {
+      const accounting = observeUsage();
+      const prompts: string[] = [];
+      const revision = epochResponder(saved, "revised-turn", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "revised candidate" }, th, tn, "revised"))
+          .push(turnCompleted("completed", th, tn));
+      });
+      const rig = makeMultiEpochRig([c => {
+        if (c.method === "turn/start") prompts.push(JSON.stringify(c.params));
+        return revision(c);
+      }, implementation()]);
+      const sources: string[] = [];
+      let gates = 0;
+      const { ctx } = makeCtx({ config, sessionId: hasSession ? saved : undefined,
+        planApproved: false, approvedPlan: "persisted candidate", resumePhase: "awaiting_approval",
+        takeResumedGateEvent: async () => ({ kind: "revise", feedback: "tighten scope", inputId: 42 }),
+        reportPlanAgentSource: async source => { sources.push(source); },
+        gatePlan: async (md, _milestones, _onPersisted, settles) => {
+          gates++;
+          assert.equal(md, "revised candidate", "old candidate is never re-presented");
+          assert.equal(settles, 42, "revision settles at persistence of its replacement");
+          return approval();
+        } });
+      await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "restored revision");
+      assert.equal(gates, 1);
+      assert.equal(prompts.length, 1);
+      assert.match(prompts[0]!, /tighten scope/);
+      if (!hasSession) assert.match(prompts[0]!, /persisted candidate/);
+      assert.deepEqual(sources, ["own"]);
+      assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+      assertImplementationResume(rig.epochs[1]!.transport);
+    });
+  }
+
+  it("an unapproved persisted plan without a session is freshly planned", async () => {
+    const rig = makeMultiEpochRig([plan(), implementation()]);
+    let gates = 0;
+    const { ctx } = makeCtx({ config, planApproved: false, approvedPlan: "old candidate",
+      resumePhase: "awaiting_approval", takeResumedGateEvent: async () => undefined,
+      gatePlan: async md => {
+        gates++;
+        assert.equal(md, "bounded implementation", "lost context must not restore the saved gate");
+        return approval();
+      } });
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "lost-session fresh plan");
+    assert.equal(gates, 1);
+    assert.equal(rig.epochs[0]!.transport.requests.some(r => r.method === "thread/start"), true);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
+
+  it("cold cleared-plan claim replans under A then owns exactly one B cut", async () => {
+    const owners = observeClaimAccountants();
+    const accounting = observeUsage();
+    const persisted = await stoppedApprovalClaim();
+    const oldUsage = owners[0]!.aggregateByModel();
+    const freshPlan: Responder = c => {
+      if (c.method === "thread/resume") {
+        c.transport.push(tokenUsageUpdated(saved, "old-claim", { inputTokens: 200, totalTokens: 200 }));
+        return { thread: { id: saved }, model: "gpt-6-astra" };
+      }
+      if (c.method === "turn/start") {
+        const tn = "cold-new-plan";
+        c.transport.push(turnStarted(saved, tn))
+          .push(tokenUsageUpdated(saved, tn, { inputTokens: 225, totalTokens: 225 },
+            { inputTokens: 25, totalTokens: 25 }))
+          .push(toolCall(1, "submit_plan", { plan_md: "new claim plan" }, saved, tn, "cold-plan"))
+          .push(turnCompleted("completed", saved, tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([freshPlan, implementation("gpt-6.1-sol", 235, 265)]);
+    let gates = 0, reports = 0;
+    const sources: string[] = [];
+    const { ctx, emitted } = makeCtx({ config, sessionId: persisted.sessionId,
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async md => { gates++; assert.equal(md, "new claim plan"); return approval(); },
+      reportPlanAgentSource: async source => { sources.push(source); },
+      reportIteration: async () => { reports++; } });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000, "cold genuine replan");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(gates, 1);
+    assert.equal(reports, 1);
+    assert.deepEqual(sources, ["own"]);
+    const a = rig.epochs[0]!.transport;
+    assert.equal(a.requests.some(r => r.method === "thread/start"), false);
+    const aTurn = a.requests.find(r => r.method === "turn/start")!;
+    assert.equal(rec(aTurn.params).threadId, saved);
+    assert.equal(rec(aTurn.params).model, "gpt-6-astra");
+    assert.equal(rec(aTurn.params).effort, "high");
+    assertImplementationResume(rig.epochs[1]!.transport);
+    assertImplementationTurn(rig.epochs[1]!.transport);
+    assert.equal(owners.length, 2, "new A and B share only the new claim accountant");
+    assert.notStrictEqual(owners[0], owners[1]);
+    assert.deepEqual(owners[0]!.aggregateByModel(), oldUsage);
+    assert.deepEqual(accounting.cuts, [[saved, "gpt-6.1-sol"]]);
+    assert.deepEqual(accounting.order, ["live:100", "replay:200", "live:225", "replay:235", "cut", "live:265"]);
+    const usage = lastResultModelUsage(emitted)!;
+    assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 35, "old history is excluded");
+    assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 30);
+  });
 
   for (const mode of ["match", "mismatch", "missing", "unsafe"] as const) {
     it(`approval ${mode}: verifies before iteration and attributes same-thread usage`, async () => {

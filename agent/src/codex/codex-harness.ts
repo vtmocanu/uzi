@@ -587,6 +587,9 @@ export class CodexHarness implements RunHarness {
   private currentModel?: string;
   private readonly phaseTransition?: CodexPhaseTransitionCell;
   private verifiedTransition?: CodexPhaseTransition;
+  // A strict resume preparation keeps its admission guard through turn dispatch,
+  // including reclaimed implementation claims that have no pending segment cut.
+  private phaseModelVerificationRequired = false;
   private attemptedResumedRoot?: { threadId: string; ordinal: number; transition?: CodexPhaseTransition };
 
   private assertPhaseBoundaryCertain(): void {
@@ -609,6 +612,7 @@ export class CodexHarness implements RunHarness {
   /** Recheck saved thread response after credential coordination, without consuming notes. */
   verifyPreparedPhaseModel(request: RunTurnRequest): void {
     this.assertOpen();
+    this.phaseModelVerificationRequired = true;
     this.assertPhaseBoundaryCertain();
     request.signal.throwIfAborted();
     const rendered = this.render(request);
@@ -1212,7 +1216,8 @@ export class CodexHarness implements RunHarness {
     this.registry.assertWorkAdmission();
     if (this.closed) throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
     request.signal.throwIfAborted();
-    if (options.verifyPhaseModel === true && request.resumeSessionId === undefined)
+    if (options.verifyPhaseModel === true) this.phaseModelVerificationRequired = true;
+    if (this.phaseModelVerificationRequired && request.resumeSessionId === undefined)
       throw new PhaseSwitchUnverifiedError("malformed", {}, {});
     if (request.resumeSessionId === undefined && options.allowFresh !== true)
       throw new PolicyContinuationRejected("session_missing");
@@ -1230,6 +1235,8 @@ export class CodexHarness implements RunHarness {
   private async prepareThread(request: RunTurnRequest, rendered: RenderedCodexRun): Promise<boolean> {
     this.assertOpen();
     this.assertPhaseBoundaryCertain();
+    if (this.phaseModelVerificationRequired && request.resumeSessionId === undefined)
+      throw new PhaseSwitchUnverifiedError("malformed", {}, {});
     this.latchModel(rendered);
     if (request.signal.aborted || this.stopRequested) return false;
     // 1. Ensure the provider root + transport (launched once, reused after).
@@ -1531,7 +1538,8 @@ export class CodexHarness implements RunHarness {
       this.activeTurnId = await this.startTurnRpc(transport, threadId, rendered, request.signal, request.rootDispatch,
         () => {
           this.assertOpen();
-          if (this.phaseTransition?.current?.pending) this.verifyPreparedPhaseModel(request);
+          if (this.phaseModelVerificationRequired || this.phaseTransition?.current?.pending)
+            this.verifyPreparedPhaseModel(request);
           if (this.resumedRoot) this.attemptedResumedRoot = {
             threadId, ordinal, transition: this.verifiedTransition?.pending ? this.verifiedTransition : undefined,
           };
