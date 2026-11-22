@@ -1751,8 +1751,8 @@ Retry the removal once the refs are deleted or settled.
 ### Admin run debug: reading other users' runs
 
 Two kinds of read reach another user's run. From the CLI both need a `uza_` (`admin_ro`) token,
-because a `uzc_` token masks admin-ness (`api/internal/middleware/cli_auth.go`). Browser admin access
-is unchanged.
+because a `uzc_` token masks admin-ness. Browser admin access is unchanged (the flag-gated reads below
+are CLI-only).
 
 **Owner-or-admin reads, regardless of the flag.** A live admin can read these on any run:
 `run get`, `run logs`, `run plan`, `run lead-config` and `review show`.
@@ -1799,7 +1799,8 @@ cross-user read writes one audit log line.
   An older server that ignores `--status` is refused with `this uzi server does not support --status;
   upgrade the server`. When the cap is hit the CLI prints
   `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
-  prints a `{runs, truncated}` envelope of summary rows instead of the table.
+  prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
+  `--status` was given.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
