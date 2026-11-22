@@ -16,11 +16,15 @@ Code anchors are at `add869fc597d6bef732fede7f0576064d1b509db`. The probe
 tests are the `#4609` block in `agent/test/recovery-inventory.test.ts`
 (helper `issue4609Queue`).
 
-Every statement carries one of four labels:
+Statements carry these labels. Section 4 (options) and section 5
+(recommendation) are inference throughout, except where a statement cites
+code.
 
-- **[Code]** is a fact read from the cited source line.
+- **[Code]** is a fact read from the cited source or test line.
 - **[Incident]** is a fact reported for the #4570 incident.
-- **[Measured]** is a count asserted by the controlled probe.
+- **[Measured]** is a count asserted by the committed controlled probe.
+- **[Reported]** is a result an in-run validator reported that the committed
+  tree cannot reproduce on its own.
 - **[Inference]** is a conclusion drawn from the others and is not measured.
 
 ## 1. How the queue works
@@ -89,7 +93,10 @@ opportunity is spent and the context stays queued. A second inactivity gate,
   replaceable, inventory-guarded siblings with a matching canonical context
   (`agent/src/recovery.ts:4370-4378`).
 - **[Code]** The hint reads the journal once for each distinct run in the
-  whole queue, on every live pass (`agent/src/recovery.ts:4380-4390`).
+  whole queue, on every materializing live pass
+  (`agent/src/recovery.ts:4380-4390`). Passes that are credential-blocked,
+  lack discovery or the inventory feature (`agent/src/recovery.ts:6129`), or
+  run with a cap below 2 skip it.
 - **[Inference]** A newly owed context has no frozen record, so it can never
   be priority. The #3614 reservation covers only invalidated-inventory
   replacement, never first reconstruction.
@@ -170,7 +177,7 @@ Reads are counted per phase of the pass:
 
 Retained contexts are fixture runs whose hold listing returns no hold.
 
-**[Measured]** Under the stub clock every operation takes zero time. The
+**[Code]** Under the stub clock every operation takes zero time. The
 probe therefore measures counts, not durations. Any time figure in this
 report is an inference.
 
@@ -199,13 +206,18 @@ Setup:
 - **[Measured]** The target is first selected on pass 5, which is the 4th
   pass after its arrival, and it produces a real capture and upload.
 - **[Measured]** On pass 5, 11 of the 14 hold RPCs and all 10 ownership calls
-  are the target's own. They come from capture and upload re-checks, not from
-  queue selection.
+  are the target's own.
+- **[Code]** One of the target's hold RPCs is its selection-time check
+  (`agent/src/recovery.ts:4424`). The other 10, and all 10 ownership calls,
+  follow its selection, in the capture and upload path. The probe asserts the
+  counts, not where each call comes from.
 - **[Inference]** This matches the hypothesis. A target that arrives behind L
   queued contexts is first selected `ceil((L+1)/cap)` passes after arrival,
   here `ceil(13/4) = 4`.
-- **[Inference]** At about 30 to 45 s per pass, the wait is roughly 2 to 3
-  minutes before the target's own capture work begins. In general, every 4
+- **[Inference]** The target arrives at some point between two passes, so
+  the wait is three full intervals plus a partial one. Under the conditional
+  30 to 45 s cadence, that is roughly 1.5 to 3 minutes, plus pass durations,
+  before the target's own capture work begins. In general, every 4
   retained no-hold contexts ahead of a target add one pass of wait.
 
 ### Scenario 2: invalidated-replacement control (#3614)
@@ -224,9 +236,9 @@ Setup: 12 retained no-hold contexts plus one invalidated, replaceable target P.
   runs.
 - **[Measured]** This fixture's target produces no fresh capture
   (`cloneHeads = [H2]`). It reports `invalidated_snapshot_reused` and stays
-  priority, so the reserved slot is spent every pass. This is the
-  "permanent refusal may keep the reserved turn" case the ADR-1296 amendment
-  names.
+  priority, so the reserved slot is spent every pass.
+- **[Inference]** This corresponds to the "permanent refusal may keep the
+  reserved turn" case the ADR-1296 amendment names.
 
 ### Scenario 3: ordinary FIFO progress
 
@@ -249,7 +261,13 @@ at first.
   capture.
 - **[Measured]** L stays queued after every pass.
 - **[Inference]** The current policy has no negative cache, so a context
-  whose hold appears later is discovered again without any extra state.
+  whose hold appears later is re-selected by ordinary rotation without any
+  extra state.
+- **[Inference]** Closed or discarded holds never reopen
+  (`agent/src/recovery.ts:4426`). In production, a hold "appears later" only
+  when it opens after the context was discovered, or when custody moves to
+  this worker so the hold enters this worker's own listing. The probe models
+  the transition only as the fake listing starting to return the hold.
 
 ### Scenario 5: an executing target becomes inactive
 
@@ -267,9 +285,11 @@ Setup: 8 retained contexts, with the target first in discovery order.
 
 ### What the probe proves
 
-- **[Measured]** In scenarios 1, 4 and 5, the proof is a produced capture and
-  upload (`f.state.produced` and `f.state.uploads` each rise by 1 on the
-  selection pass). It is not the capture fallback.
+- **[Measured]** In scenarios 1 and 4 and in the executing variants of
+  scenario 5, the proof is a produced capture and upload (`f.state.produced`
+  and `f.state.uploads` each rise by 1 on the selection pass). The
+  `inventory_not_inactive` variant asserts only the produced capture. None of
+  them uses the capture fallback.
 - **[Inference]** This proves selection, progress past the hold check and a
   produced capture. It does not prove a FINAL acknowledgement or custody
   settlement.
@@ -288,8 +308,8 @@ Setup: 8 retained contexts, with the target first in discovery order.
 
 ### Mutation proof
 
-**[Measured]** Five mutants of `agent/src/recovery.ts` were run in a scratch
-export, one at a time. The unmutated export passed. Each mutant failed its
+**[Reported]** The in-run tester ran five mutants of `agent/src/recovery.ts`
+in a scratch export, one at a time. The unmutated export passed. Each mutant failed its
 intended scenario:
 
 | Mutant | Killed by |
@@ -314,11 +334,11 @@ wall-clock guarantee.
 | A | Keep the current policy. | Unchanged: `ceil((L+1)/cap)` passes after arrival. | None. | Both proven by scenarios 4 and 5. | None. ADR-1296 already accepts this trade-off. |
 | B | Per-pass memo of hold listings by `runId`. | Unchanged. | Memory is one listing per distinct run in a pass, with staleness of at most one pass. Saves hold RPCs only when one run has several queued contexts in the same batch, which the probe never shows. | Unchanged, because the memo dies with the pass. | Needs a decision that a one-pass stale listing is acceptable, since the capture path re-checks its hold. Small, but it saves nothing in the measured case. |
 | F | Put the hold RPC before the journal read for each entry. | Unchanged. | Saves at most one journal read per no-hold selection, `cap` per pass at most. The hint's queue-wide reads are untouched. | Unchanged. | Inverts the provenance-first order (`agent/src/recovery.ts:4421-4424`). A context that is settled but has no hold would then cost an RPC instead of a local read. The saving is small, and the order change needs review. |
-| G | Use the exact-generation hold read (`?generation=`). | Unchanged. | Response size drops to one generation. RPC count is unchanged. | Unchanged. | Gated by capability negotiation (`RecoveryHeldPublicationV2` / `RecoveryBindinglessClosedV1`, `api/internal/handler/recovery.go:211-231`) and the bindingless observation header. It is a different read contract from the ordinary listing, so it needs rollout review. |
-| C | Bounded skip-ahead: a `hold_unavailable` visit does not consume a capped opportunity. Selection keeps scanning up to K extra entries per pass, and every visited entry rotates. | About `ceil((L+1)/(cap+K))` passes when the entries ahead have no hold. | Up to K extra journal reads and K extra hold RPCs per pass. No new memory and no staleness, because every visit is fresh. | Unchanged: no cache, and membership is kept. | Changes the #3614 opportunity contract ("rotates raw contexts … before execution/hold checks"). In effect it raises the per-pass RPC cap, which is close to the cap increase the issue rules out of scope. Owner decision plus an ADR-1296 amendment. |
-| D | First-arrival reservation: one slot per pass for a context never visited since it entered the queue, analogous to #3614. | A new arrival progresses within the number of new arrivals ahead of it, usually pass 1. | Memory is one visited-key set, bounded by the queue. No staleness. | A context removed and re-added is a new arrival again (as #3614 already treats it), so discovery churn can earn repeat priority. | New fairness contract. Ordinary survivors slow to `ceil(N/(cap-2))` when both reservations are active. Owner decision plus an ADR-1296 amendment. |
+| G | Use the exact-generation hold read (`?generation=`). | Unchanged on its own. | RPC count is unchanged. The read returns one generation's hold, including a verified closed observation (`released` or `discarded`) for this worker (`api/internal/recovery/exact_observation.go:20`, `:57`). | Unchanged. | Gated by capability negotiation (`RecoveryHeldPublicationV2` / `RecoveryBindinglessClosedV1`, `api/internal/handler/recovery.go:211-231`) and, for closed observations, the `Uzi-Recovery-Observation` header that guards mixed-version rollouts. It is a different read contract from the ordinary listing, so it needs rollout review. Its closed observation is the input option E would need. |
+| C | Bounded skip-ahead: a `hold_unavailable` visit does not consume a capped opportunity. Selection keeps scanning up to K extra entries per pass, and every visited entry rotates. | About `ceil((L+1)/(cap+K))` passes when the entries ahead have no hold. | Up to K extra selection-time journal reads and K extra hold RPCs per pass, on top of the unchanged hint reads and capture-path re-checks. The extra calls lengthen the pass, and the next pass is scheduled from its end. No new memory and no staleness, because every visit is fresh. | Unchanged: no cache, and membership is kept. | Changes the #3614 opportunity contract ("rotates raw contexts … before execution/hold checks"). It also raises the per-pass selection budget, so it falls within the issue's out-of-scope "timer/cap increases". It needs an explicit owner scope decision, not only a policy choice. |
+| D | First-arrival reservation: one slot per pass for a context never visited since it entered the queue, analogous to #3614. | With A first arrivals ahead of it, a new arrival progresses within A+1 passes, usually on the next pass. | No added per-pass reads or RPCs. Memory is one visited-key set, bounded by the queue. No staleness. | A context removed and re-added is a new arrival again (as #3614 already treats it), so discovery churn can earn repeat priority. | New fairness contract. With cap ≥ 3, ordinary survivors slow to `ceil(N/(cap-2))` when both reservations are active. Owner decision plus an ADR-1296 amendment. |
 | H | Demote instead of keeping position: a context that just reported `hold_unavailable` rotates behind fresh arrivals, not behind its siblings. | New arrivals overtake no-hold contexts. | Memory is one flag per queued entry. No staleness. | Membership is kept, so a context whose hold appears later still progresses. | Fairness change. Under continuous arrivals, demoted contexts can starve, so it needs its own bound. Owner decision plus an ADR-1296 amendment. |
-| E | Negative cache or backoff for closed holds. | Faster while the cache holds. | Needs a staleness bound and invalidation. | Scenario 4 shows the hazard: the cross-pass negative-cache mutant hides a context whose hold appears later. | Needs a closed-hold cache decision and borders #2823's pruning authority. Named as a dependency, not proposed. |
+| E | Skip or back off a context in scheduling. Variant E1 caches the absence of a listed hold. Variant E2 (with G) caches only a positively observed closure. | Faster while the cache holds. | Memory is one entry per cached context. E1 needs a staleness bound and invalidation. E2 caches a terminal state, because closed holds never reopen (`agent/src/recovery.ts:4426`). | E1 is unsafe: the tester's cross-pass absence-cache mutant hid a scenario 4 context whose hold appeared later. E2 is not refuted by scenario 4, but it must still never hide a context that a later generation or a custody move makes eligible. | Needs a closed-hold cache decision. Closed custody alone grants no FINAL or cleanup authority (`api/internal/apitypes/recovery.go:327`). A closed context with pins left is #2823's pruning input, so E2 borders that boundary. Named as a dependency, not proposed. |
 
 ## 5. Recommendation
 
@@ -332,29 +352,44 @@ accepts it.
 
 - Options B, F and G are cost refinements only. B and F save nothing, or one
   read per selection, in the measured shape. G changes a read contract. None
-  of them shortens the wait.
+  of them shortens the wait, and none is warranted without production
+  evidence that journal or RPC cost matters.
 - Options C, D and H shorten the wait, but each changes the #3614
-  fairness or opportunity contract.
+  fairness or opportunity contract. C also raises the per-pass selection
+  budget, which the issue rules out of scope.
 - Option E needs a closed-hold cache decision and touches #2823's boundary.
+  Its absence-cache variant (E1) is unsafe.
 
 The recommendation is to **keep the current policy (A)**.
 
 ### If the owner wants lower latency
 
 If the owner decides that first-reconstruction latency matters, the
-recommended candidate is **C, with K = cap**. It keeps:
+recommended candidate is **D, a first-arrival reservation**. It keeps:
 
-- FIFO order and membership;
+- the existing per-pass cap and selection budget, so it adds no reads or
+  RPCs per pass and stays inside the issue's scope;
 - fresh checks on every visit, with no cache and therefore no staleness;
-- the behaviour proven for later-eligible and executing→inactive contexts.
+- queue membership, so the behaviour proven for later-eligible and
+  executing→inactive contexts is unchanged.
 
-Its cost is bounded: at most `2 × cap` hold RPCs and journal reads per pass.
-A first reconstruction behind L no-hold contexts would then wait about
-`ceil((L+1)/(2 × cap))` passes.
+Its costs are fairness costs:
 
-It needs an owner decision on the opportunity contract and an ADR-1296
-amendment. The implementation must ship its own red-then-green regression;
-scenario 1's pinned pass number is the natural regression seam.
+- Ordinary survivors slow from `ceil(N/(cap-1))` to `ceil(N/(cap-2))` passes
+  while both reservations are in use. This needs cap ≥ 3.
+- A context that discovery drops and re-adds earns the reservation again.
+
+D needs an owner decision on the fairness contract and an ADR-1296
+amendment.
+
+C, with K = cap, would cut the wait to about `ceil((L+1)/(2 × cap))` passes
+without a new fairness rule. But it adds up to K selection-time reads and
+RPCs per pass on top of the hint reads and capture re-checks. It also raises
+the per-pass selection budget, which the issue rules out of scope. It is
+therefore only available with an explicit scope decision.
+
+Either implementation must ship its own red-then-green regression. Scenario
+1's pinned pass number is the natural regression seam.
 
 ### Limitations
 
