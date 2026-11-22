@@ -236,6 +236,7 @@ func automaticHarnessEligible(res resolvedHarness, explicit *Harness, origin har
 // CountEnabledCodexSecrets); the any-credential variants are read only to classify an explicit
 // refusal as disabled-not-absent (errHarnessCredentialDisabled).
 type harnessResolverStore interface {
+	providerLaneSourceReader
 	engineProviderSourceReader
 	// PRD #4320 M4: the owner's Claude provider source, read before the vendor token rule.
 	GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID) (store.GetUserClaudeProviderSourceRow, error)
@@ -478,13 +479,17 @@ func (s *Service) BothHarnessesUsable(ctx context.Context, userID uuid.UUID) (bo
 	if !ok {
 		return false, errHarnessStoreUnavailable
 	}
-	claude, src, err := s.claudeAvailability(ctx, q, userID, false)
+	if err := s.refuseProviderLane(ctx, q, userID, HarnessCodex); err != nil {
+		if errors.Is(err, ErrProviderLaneUnsupported) {
+			return false, nil
+		}
+		return false, err
+	}
+	claude, _, err := s.claudeAvailability(ctx, q, userID, true)
 	if err != nil {
 		return false, err
 	}
-	// Plan cross-check needs both engines, and cross-check does not support a provider-sourced
-	// owner (provider_lane_unsupported until PRD #4322): a set source is never "both usable".
-	if !claude || src.Set() {
+	if !claude {
 		return false, nil
 	}
 	_, codex, err := s.resolveUsableCodexCredential(ctx, userID, q)
@@ -773,12 +778,15 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			// A provider binding's re-check and insert need one transaction: fail closed.
 			return store.Run{}, resolvedHarness{}, errProviderCreateRequiresTx
 		}
+		if origin.RefuseProviderOwner && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
+			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+		}
 		rq, ok := s.harnessStore()
 		if !ok {
 			return store.Run{}, resolvedHarness{}, errHarnessStoreUnavailable
 		}
 		if origin.RefuseProviderOwner {
-			if err := s.refuseProviderLane(ctx, rq, userID); err != nil {
+			if err := s.refuseProviderLane(ctx, rq, userID, *explicit); err != nil {
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
@@ -842,7 +850,10 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 
 	if origin.RefuseProviderOwner {
-		if err := s.refuseProviderLane(ctx, qtx, userID); err != nil {
+		if explicit == nil {
+			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+		}
+		if err := s.refuseProviderLane(ctx, qtx, userID, *explicit); err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
 	}
@@ -863,7 +874,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
 	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
-	// A refused lane (judge, job, cross-check) does the same: the guard above already found no source,
+	// A guarded lane (judge, job, cross-check) does the same: the guard above allowed its source snapshot,
 	// and a lane insert stamps no binding, so a second source read here could only see a source
 	// selected in between and then fail the binding assertion as an internal mismatch. The lane
 	// instead orders just before that selection (the source read above holds no secret lock).
@@ -1090,15 +1101,22 @@ func (s *Service) verifyRunBinding(ctx context.Context, q *store.Queries, run st
 	return s.checkProviderModels(ctx, q, run, *res.ProviderSource)
 }
 
-// refuseProviderLane is the lane guard for judge, job, cross-check and isolated runs: an owner who
-// selected a Claude provider source (usable or not) cannot create one until PRD #4322, whatever
-// harness the lane resolves to, so a lane never borrows a vendor credential around the source.
-func (s *Service) refuseProviderLane(ctx context.Context, q providerSourceReader, userID uuid.UUID) error {
-	src, err := s.claudeProviderSource(ctx, q, userID)
+// providerLaneSourceReader reads both source selections in one owner snapshot.
+type providerLaneSourceReader interface {
+	GetUserProviderLaneSources(context.Context, uuid.UUID) (store.GetUserProviderLaneSourcesRow, error)
+}
+
+// refuseProviderLane uses selection presence only, before any credential work.
+// A Claude source blocks both lanes; a Codex source additionally blocks the Codex lane.
+func (s *Service) refuseProviderLane(ctx context.Context, q providerLaneSourceReader, userID uuid.UUID, lane Harness) error {
+	if lane != HarnessClaude && lane != HarnessCodex {
+		return ErrProviderLaneUnsupported
+	}
+	sources, err := q.GetUserProviderLaneSources(ctx, userID)
 	if err != nil {
 		return err
 	}
-	if src.Set() {
+	if sources.ClaudeProviderID.Valid || (lane == HarnessCodex && sources.CodexProviderID.Valid) {
 		return ErrProviderLaneUnsupported
 	}
 	return nil

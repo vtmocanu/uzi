@@ -35,7 +35,8 @@ type harnessCreationOrigin struct {
 	// resolved WITHOUT the owner's provider source. Nil for a fresh creation.
 	InheritFrom *store.Run
 	// RefuseProviderOwner refuses the creation (ErrProviderLaneUnsupported) when the owner selected
-	// a Claude provider source: judge, job and cross-check lanes (PRD #4322 enables them later).
+	// a Claude source (both lanes), or a Codex source (Codex lane only). Guarded origins
+	// require an explicit recognized harness, and resolve vendor credentials only.
 	RefuseProviderOwner bool
 	// ConsumerGateRepo, when valid, makes createRunAtomic take that repository's shared terminal
 	// consumer gate as the first lock of the create transaction (issue #4488, ADR-4007 T3). The zero

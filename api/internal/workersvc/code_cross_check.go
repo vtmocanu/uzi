@@ -69,7 +69,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 	}
 	retryQ := store.New(tx)
 	owned, e := retryQ.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
-	if e != nil || owned.UserID != worker.UserID || owned.ClaimGeneration != generation || owned.ClaimReleasedAt.Valid ||
+	if e != nil || owned.UserID != worker.UserID || owned.ClaimGeneration != generation || owned.ClaimReleasedAt.Valid || owned.Harness != lead.Harness ||
 		!codeCrossCheckCustodyStatus(owned) || !owned.CodeCrossCheckRequired {
 		_ = tx.Rollback(ctx)
 		return result, ErrCrossCheckRefused
@@ -89,6 +89,21 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 	if e = tx.Commit(ctx); e != nil {
 		return result, e
 	}
+	// The retry transaction is settled before recording failure, which takes the
+	// lead lock itself. A frozen provider lead must not reach vendor resolution.
+	if providerBoundRun(owned) {
+		return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
+	}
+	rq, ok := s.q.(providerLaneSourceReader)
+	if !ok {
+		return result, errHarnessStoreUnavailable
+	}
+	if err := s.refuseProviderLane(ctx, rq, lead.UserID, harness); err != nil {
+		if errors.Is(err, ErrProviderLaneUnsupported) {
+			return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
+		}
+		return result, err
+	}
 	_, err = s.createRunResolved(ctx, lead.UserID, &harness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		txq, ok := q.(*store.Queries)
 		if !ok {
@@ -101,7 +116,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, ErrCrossCheckRefused
 		}
 		if providerBoundRun(locked) {
-			// A provider-bound lead has no checker lane yet (PRD #4320, PRD #4322).
+			// A provider-bound lead has no checker lane in this slice.
 			return store.Run{}, ErrProviderLaneUnsupported
 		}
 		prior, e := txq.GetCodeCrossCheck(ctx, leadID)
@@ -146,7 +161,7 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, GuidanceText: frozen.GuidanceText.String, RepoInstructionsCommit: frozen.RepoInstructionsCommit, RepoInstructionsEnabled: frozen.RepoInstructionsEnabled, RepoInstructionsText: frozen.RepoInstructionsText.String, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
 		return child, e
-	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: cross-check refuses a provider-sourced owner (PRD #4322)
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // Enforce the engine-aware unsupported-lane selection policy.
 	if errors.Is(err, retry) {
 		return result, nil
 	}

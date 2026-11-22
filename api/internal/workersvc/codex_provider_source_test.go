@@ -278,3 +278,8 @@ func TestCodexProviderVisibleModelPin(t *testing.T) {
 		t.Fatalf("internal model did not use default: %v", err)
 	}
 }
+
+func (f *sourceMatrixStore) GetUserProviderLaneSources(context.Context, uuid.UUID) (store.GetUserProviderLaneSourcesRow, error) {
+	f.sourceReads++
+	return store.GetUserProviderLaneSourcesRow{ClaudeProviderID: f.claude.ProviderID, CodexProviderID: f.source.ProviderID}, nil
+}
