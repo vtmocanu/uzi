@@ -1590,7 +1590,9 @@ export function makeProductionCodexAdviceHarnessFactory(
   client: WorkerClient,
   baseLog: Logger,
   homeRoot: string,
-  deps: { launchRoot?: LaunchAdviceRootSeam; codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa } = {},
+  deps: { launchRoot?: LaunchAdviceRootSeam; codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
+    /** Test-only; forwarded to {@link makeProductionLaunchAdviceRoot}. main.ts never passes it. */
+    adviceRootTestSeams?: ProductionAdviceRootTestSeams } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const { runId, binding, signal, refresh, onRefreshDenied } = params;
@@ -1606,7 +1608,7 @@ export function makeProductionCodexAdviceHarnessFactory(
     if (signal?.aborted) close();
     try {
       const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
-      const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
+      const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership, deps.adviceRootTestSeams);
       return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
         binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
         scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined,

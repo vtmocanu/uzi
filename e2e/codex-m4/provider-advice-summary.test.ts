@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 const { parse } = createRequire(path.resolve(__dirname, "../../agent/package.json"))("smol-toml") as {
   parse(text: string): Record<string, unknown>;
 };
-import { makeProductionCodexAdviceHarnessFactory, makeProductionLaunchAdviceRoot } from "../../agent/src/codex/codex-executor.js";
+import { makeProductionCodexAdviceHarnessFactory } from "../../agent/src/codex/codex-executor.js";
 import { launchCodexRoot } from "../../agent/src/codex/launcher.js";
 import { selectCodexExecutionAuthority } from "../../agent/src/codex/select.js";
 import { runReadOnlyModelPass } from "../../agent/src/model-pass.js";
@@ -161,12 +161,12 @@ test(PROVIDER_ADVICE_SUMMARY_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const home = path.join(parent, "home");
   await fs.mkdir(home);
   const { logger: log, lines } = recordingLogger();
-  const launchRoot = makeProductionLaunchAdviceRoot(home, "provider", log, undefined, {
-    launchCodexRootForTest,
-    sharedDirOwner: { uid: process.getuid!(), gid: process.getgid!() },
+  // The factory both production runners are given (main.ts). Only the root launcher's OS-bound seams are
+  // swapped (adviceRootTestSeams); no launchRoot is passed, so the factory builds its own root and derives
+  // the auth mode from the binding. main.ts also passes codexExtraCa; this row omits it.
+  const factory = makeProductionCodexAdviceHarnessFactory(client, log, home, {
+    adviceRootTestSeams: { launchCodexRootForTest, sharedDirOwner: { uid: process.getuid!(), gid: process.getgid!() } },
   });
-  // The factory both production runners are given (main.ts), with only the root launcher's seams swapped.
-  const factory = makeProductionCodexAdviceHarnessFactory(client, log, home, { launchRoot });
   const refuseClaude = (): never => { throw new Error("the Claude query path must not run on a Codex provider pass"); };
 
   // (a) The advice pass: the exact option shape review-runner and judge-runner hand runReadOnlyModelPass.
@@ -220,7 +220,9 @@ test(PROVIDER_ADVICE_SUMMARY_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
     ["gateway/sol-model", 32768], ["gateway/sol-model", 32768],
     ["gateway/luna-model", 16384], ["gateway/luna-model", 16384],
   ]);
+  assert.equal(specs.length, 4);
   for (const spec of specs) {
+    // The auth mode here is the factory's own derivation from the binding (binding.authMode).
     assert.equal(spec.authMode, "provider", "advice roots launch under the provider auth mode, never a vendor one");
     assert.deepEqual(spec.providerBinding, (binding as { providerBinding: unknown }).providerBinding);
   }

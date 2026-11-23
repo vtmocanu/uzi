@@ -18,8 +18,8 @@ import type { SdkCredential } from "./sdk-env.js";
 export const CLAUDE_PROVIDER_CAPABILITY = "claude_provider_v1";
 
 /** The protocol capability a worker must advertise (at register) to accept a Codex provider-bound
- *  claim. Advertised only together with the Codex harness, runtime v2 and custom-model capabilities
- *  (worker.ts), and the api admits a Codex provider claim only to a worker that advertises all of them. */
+ *  claim. Advertised only together with the Codex harness and runtime v2 capabilities (worker.ts),
+ *  and the api admits a Codex provider claim only on provider, harness and runtime v2. */
 export const CODEX_PROVIDER_CAPABILITY = "codex_provider_v1";
 
 /** The reason a claim whose lane cannot serve a provider reports (the server refuses these lanes

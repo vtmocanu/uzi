@@ -2106,6 +2106,8 @@ export class WorkerClient {
     this.inputObservationEpoch++;
     this.registeredWorkerId = undefined;
     this.hasExactHoldCapability = false;
+    this.hasClaudeProviderCapability = false;
+    this.hasCodexProviderCapability = false;
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.latestHibernationCachePruneValue = undefined;
@@ -2838,7 +2840,8 @@ export class WorkerClient {
 
   /** A provider claim requires the capability this registration advertised: Claude needs
    *  claude_provider_v1; Codex needs codex_provider_v1 together with the Codex harness and runtime
-   *  v2 (the same trio the api admits a Codex provider claim on), else the lane refuses. */
+   *  v2 (the api's claim SQL clause checks codex_provider_v1; its Go admission checks the trio of
+ *  provider, harness and runtime v2), else the lane refuses. */
   private requireProviderCapability(engine: "claude" | "codex"): void {
     if (engine === "codex") {
       if (!this.hasCodexProviderCapability) throw new ProviderLaneUnsupportedError();
