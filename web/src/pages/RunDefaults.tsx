@@ -26,6 +26,14 @@ import { SettingsShell } from "../components/SettingsShell";
 import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
 import { bothHarnessesUsable } from "../lib/harnessSelection";
 
+// The read-only judge summary's routing line. An explicit Claude or Codex choice shares
+// Models' copy; "Same as the run" drops Models' "Pick Claude or Codex" prompt, since
+// nothing is pickable here, and points at Models instead.
+function judgeSummaryHelp(choice: string): string {
+  if (choice === "claude" || choice === "codex") return judgeRunsOnHelp(choice);
+  return "Claude runs use the Claude judge model, Codex runs the Codex model. To judge every run on one harness, change it in Models.";
+}
+
 // The judge picker's "Auto-select from the pool" sentinel — the SAME value
 // WorkersSettings.tsx uses for its worker picker, deliberately a string no
 // user-authored token label can collide with. Module scope, not inside the
@@ -625,7 +633,7 @@ export function RunDefaults() {
                 <dt className="text-muted">Runs on</dt>
                 <dd className="mb-2 text-fg sm:mb-0">
                   {judgeOn ?? "Same as the run"}
-                  <span className="mt-0.5 block text-xs text-faint">{judgeRunsOnHelp(judgeRunsOn)}</span>
+                  <span className="mt-0.5 block text-xs text-faint">{judgeSummaryHelp(judgeRunsOn)}</span>
                 </dd>
               </div>
               {/* One wrapper per dt/dd pair: a <dl> may group only a name and its values. */}
@@ -896,12 +904,21 @@ export function RunDefaults() {
                   ? "harness-overflow-scope harness-overflow-automatic"
                   : overflowUnavailable
                     ? "harness-overflow-scope harness-overflow-unavailable"
-                    : "harness-overflow-scope"
+                    : !loaded
+                      ? "harness-overflow-scope harness-overflow-loading"
+                      : "harness-overflow-scope"
               }
             />
             Overflow to the other harness when my default is near its limits
           </label>
-          {!loaded && !loadError && <Skeleton className="h-3.5 w-full max-w-md" />}
+          {!loaded && !loadError && (
+            <div aria-busy="true">
+              {/* Named by the toggle's aria-describedby: it is disabled until the load
+                  settles, and this says why (as the judge summary's loading row does). */}
+              <span id="harness-overflow-loading" className="sr-only">Loading your saved default harness</span>
+              <Skeleton className="h-3.5 w-full max-w-md" />
+            </div>
+          )}
           {overflowUnavailable && (
             <p id="harness-overflow-unavailable" className="text-xs text-faint">
               Unavailable until your settings load. Reload the page to try again.

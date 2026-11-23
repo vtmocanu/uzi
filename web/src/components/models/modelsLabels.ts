@@ -5,7 +5,7 @@
 // Run defaults model editors used (judgeRunsOnHelp, the helper and task-review Default labels) and
 // the retired CrossCheckDefaults grid's checker labels; the worker and planning Default labels are
 // read from the server cell's default_model / default_source. Run defaults' read-only judge
-// summary reuses harnessName and judgeRunsOnHelp, so the routing copy has one home.
+// summary reuses harnessName, and judgeRunsOnHelp for an explicit Claude or Codex choice.
 
 import type {
   CrossCheckPinDTO,

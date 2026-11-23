@@ -1444,7 +1444,7 @@ describe("Run defaults — judge summary (PRD #3263 M3)", () => {
     renderPage();
     await waitFor(() => expect(pairs()).toHaveLength(5));
     expect(pairs()).toEqual([
-      ["Runs on", "Same as the run" + "Claude runs use the Claude judge model, Codex runs the Codex model. Pick Claude or Codex to judge every run on one harness."],
+      ["Runs on", "Same as the run" + "Claude runs use the Claude judge model, Codex runs the Codex model. To judge every run on one harness, change it in Models."],
       ["Claude judge model", "sonnet · instance default"],
       ["Claude judge credential", "Your default token (personal)"],
       ["Codex judge model", "gpt-6-sol · your choice"],
@@ -1538,6 +1538,13 @@ describe("Run defaults — judge summary (PRD #3263 M3)", () => {
     expect(summary().querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
     expectNoFalseClaims();
     expect(summary().textContent).not.toContain("Unavailable");
+    // The disabled toggle names why: its describedby includes the loading note, not the
+    // Unavailable one (that is only for a failed load).
+    const loading = document.getElementById("harness-overflow-loading");
+    expect(loading?.textContent).toBe("Loading your saved default harness");
+    expect(loading?.className).toContain("sr-only");
+    const describedBy = overflowSwitch().getAttribute("aria-describedby")?.split(" ");
+    expect(describedBy).toEqual(["harness-overflow-scope", "harness-overflow-loading"]);
     fireEvent.click(overflowSwitch());
     expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
   });
@@ -1553,6 +1560,7 @@ describe("Run defaults — judge summary (PRD #3263 M3)", () => {
     const note = document.getElementById("harness-overflow-unavailable");
     expect(note?.textContent).toContain("Unavailable until your settings load");
     expect(overflowSwitch().getAttribute("aria-describedby")?.split(" ")).toContain("harness-overflow-unavailable");
+    expect(document.getElementById("harness-overflow-loading")).toBeNull();
     fireEvent.click(overflowSwitch());
     expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
   });
