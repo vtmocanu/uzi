@@ -13296,6 +13296,15 @@ WHERE id = @id AND user_id = @user_id
 UPDATE runs SET mr_rework_enabled = @mr_rework_enabled, updated_at = now()
 WHERE id = @id AND user_id = @user_id;
 
+-- name: SetRunCiAutofixEnabled :execrows
+-- Flip ONE run's CI-autofix override after the fact (issue #4617). Owner-scoped exactly
+-- like SetRunMrReworkEnabled: a foreign run returns 0 rows (the handler maps it to 404).
+-- @ci_autofix_enabled is a NULLABLE bool: NULL clears the override back to inherit the
+-- owner default, false/true set an explicit override. No status guard: the override
+-- matters after the run completes, while its MR pipeline can still fail.
+UPDATE runs SET ci_autofix_enabled = sqlc.narg('ci_autofix_enabled'), updated_at = now()
+WHERE id = @id AND user_id = @user_id;
+
 -- name: SetRunPriority :execrows
 -- Expedite/undo one queued run's manual priority override (PRD #320 D6/D7). Owner-
 -- scoped: a foreign run returns 0 rows -> handler 404 (never 403). QUEUED-ONLY:
