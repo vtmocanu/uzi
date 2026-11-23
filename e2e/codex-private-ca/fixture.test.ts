@@ -1,4 +1,6 @@
-// Only /app/src from the baked image is used. No executor/OS dependency injection.
+// Only /app/src from the baked image is used. No executor/OS dependency injection, except the
+// internal provider first-response allowance (FIRST_RESPONSE_MS below), shortened so the
+// typed timeout fires before the 20 s wall / 10 s idle bounds; no env or claim override exists.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs/promises";
@@ -6,6 +8,9 @@ import { execFileSync } from "node:child_process";
 import { createServer as httpsServer } from "node:https";
 import { createServer as httpServer, type ServerResponse } from "node:http";
 import { createServer as netServer, type Socket } from "node:net";
+
+/** Production is 120 s; the negative rows need the typed timeout well inside the 10 s idle bound. */
+const FIRST_RESPONSE_MS = 4000;
 
 // The fixture is mounted outside /app; load baked source by absolute URL.
 
@@ -352,6 +357,7 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         sdkHomeRoot: "/data/agent-home", executorKind: cfg.executor, stubPlanGate: cfg.stubPlanGate,
         dockerWiring: cfg.dockerWiring, codexExtraCa: cfg.codexExtraCa,
         codexCommandSandbox: cfg.codexCommandSandbox, codexSandboxDegraded: cfg.codexHarness.degraded,
+        codexProviderFirstResponseMs: FIRST_RESPONSE_MS,
       };
       const address = { provider: { provider_id: "cdr-private-ca", revision: 1, engine: "codex",
         protocol: "openai_responses", base_url: `https://127.0.0.1:${((row === "stalled" ? stalled : server).address() as any).port}/v1`,

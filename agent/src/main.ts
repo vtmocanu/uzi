@@ -305,6 +305,9 @@ export interface BuildRunExecutorDeps {
   /** Issue #3675: per-run command-cache rotation threshold in bytes (0 disables;
    *  absent leaves the executor's rotation off). */
   codexCommandCacheRunBytes?: number;
+  /** Provider first-response allowance override for the baked private-CA fixture only;
+   *  `main()` never sets it, so production keeps the 120 s default. */
+  codexProviderFirstResponseMs?: number;
 }
 
 /**
@@ -435,6 +438,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // once the last sink settles — so run()'s finally must leave the registry ALIVE.
         deferRegistryTeardown: true,
         ...(deps.codexCommandCacheRunBytes === undefined ? {} : { commandCacheRunBytes: deps.codexCommandCacheRunBytes }),
+        ...(deps.codexProviderFirstResponseMs === undefined ? {} : { providerFirstResponseMs: deps.codexProviderFirstResponseMs }),
       },
     );
     return { executor, homeDir: runHome };

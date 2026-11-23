@@ -20,8 +20,14 @@ import { RunResidueBlockedError, assertResidueQuarantineOpen } from "../residue-
 /** Outer bridge budget: above WorkerClient's 8s cap, below app-server's hard 10s cap. */
 export const CODEX_REFRESH_BRIDGE_BUDGET_MS = 9_000;
 
-/** Internal per-root setup and initial-response allowance; no provider configuration can extend it.
- * The transport owns timer cleanup. Abort signals retain any earlier run bound. */
+/** Provider-only first-model-response allowance, started once turn/start is acknowledged. Queued
+ * gateways and slow reasoning models may stay silent well past local setup. Earlier run, idle,
+ * advice and cancellation bounds keep their own outcomes through the caller's abort signal. */
+export const CODEX_PROVIDER_FIRST_RESPONSE_MS = 120_000;
+
+/** Internal per-root local app-server setup allowance (launch through the turn/start
+ * acknowledgment); no provider configuration can extend it. The transport owns timer cleanup.
+ * Abort signals retain any earlier run bound. */
 export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined): (() => number) | undefined {
   if (mode !== "provider") return undefined;
   const end = performance.now() + 10_000;
@@ -35,18 +41,16 @@ export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined):
 }
 
 /**
- * Initial response only, sharing the per-root setup budget through the first model
- * response. Later turns (and HTTP reconnects inside them) are not bounded here.
+ * Initial model response only, on its own provider allowance started at the turn/start
+ * acknowledgment (`timeoutMs`, undefined = unbounded), separate from the local setup budget.
+ * Later turns (and HTTP reconnects inside them) are not bounded here.
  * The timer only wakes the consumer: transport/root cleanup remains with its owner.
  */
-export function codexInitialResponseWait(budget: (() => number) | undefined, threadId: string, turnId: string) {
-  // Expiry must throw to the caller, not create a rejected wake promise that
-  // could sit unobserved while the consumer yields or prepares its next read.
-  const remaining = budget?.();
+export function codexInitialResponseWait(timeoutMs: number | undefined, threadId: string, turnId: string) {
   let expired = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const ready = new Promise<void>(resolve => {
-    if (remaining !== undefined) timer = setTimeout(() => { expired = true; resolve(); }, remaining);
+    if (timeoutMs !== undefined) timer = setTimeout(() => { expired = true; resolve(); }, timeoutMs);
   });
   const clear = (): void => {
     if (timer !== undefined) clearTimeout(timer);

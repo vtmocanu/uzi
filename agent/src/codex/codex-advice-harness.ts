@@ -70,7 +70,7 @@ import type {
   HarnessThrownFailure,
 } from "../harness.js";
 import type { CodexProviderConfig } from "./codex-harness.js";
-import { codexInitialResponseWait, codexConnectionBudget, type CodexAppServerAuthSession } from "./appserver-auth.js";
+import { CODEX_PROVIDER_FIRST_RESPONSE_MS, codexInitialResponseWait, codexConnectionBudget, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexAdvice } from "./render.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -159,6 +159,9 @@ export interface CodexAdviceHarnessOptions {
   /** PRD #2603: the credential mode the price table projects usage cost under. Absent ⇒ the
    *  usage snapshot carries tokens with an `unreported` cost. */
   readonly authMode?: "subscription" | "api_key" | "provider";
+  /** Provider first-response allowance (default {@link CODEX_PROVIDER_FIRST_RESPONSE_MS}).
+   *  Internal test seam only: no env, claim or provider configuration reaches it. */
+  readonly providerFirstResponseMs?: number;
   /** Injected clock for the price table's promotional boundary. Defaults to the wall clock. */
   readonly now?: () => Date;
   readonly log: Logger;
@@ -245,6 +248,7 @@ export class CodexAdviceHarness implements AdviceHarness {
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
   private readonly authMode?: "subscription" | "api_key" | "provider";
+  private readonly providerFirstResponseMs: number;
   private readonly now: () => Date;
   private readonly log: Logger;
 
@@ -254,6 +258,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     this.operationScope = opts.operationScope;
     this.admissionReporter = opts.admissionReporter;
     this.authMode = opts.authMode;
+    this.providerFirstResponseMs = opts.providerFirstResponseMs ?? CODEX_PROVIDER_FIRST_RESPONSE_MS;
     this.now = opts.now ?? (() => new Date());
     this.launchRoot = opts.launchRoot;
     this.providerBinding = opts.providerBinding;
@@ -453,7 +458,10 @@ export class CodexAdviceHarness implements AdviceHarness {
 
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
-    const responseWait = codexInitialResponseWait(connectionBudget, threadId, turnId);
+    // Local setup ended at the turn/start acknowledgment; the first model response gets its own
+    // provider allowance. The request's own timeout and owner abort keep their outcomes.
+    const responseWait = codexInitialResponseWait(
+      connectionBudget === undefined ? undefined : this.providerFirstResponseMs, threadId, turnId);
     let text = "";
     // Running byte sum of the accumulated advice text, so the total is bounded against an
     // unbounded/looping stream (see MAX_ADVICE_TEXT_BYTES). Kept O(n) total: each appended

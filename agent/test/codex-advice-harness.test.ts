@@ -27,6 +27,7 @@ import { CodexAdviceCredentialBridge, CODEX_PRODUCTION_PROVIDER, makeCodexAdvice
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import {
+  CODEX_PROVIDER_FIRST_RESPONSE_MS,
   createCodexAppServerAuth,
   type CodexAppServerAuthSession,
 } from "../src/codex/appserver-auth.js";
@@ -315,16 +316,18 @@ function makeHarness(
 }
 
 describe("CodexAdviceHarness: initial provider response deadline", () => {
-  for (const control of ["timeout", "native", "cancel", "response", "terminal"] as const) {
+  for (const control of ["timeout", "native", "cancel", "response", "late", "terminal", "outer"] as const) {
     it(`handles ${control} after ACK`, async t => {
       t.mock.timers.enable({ apis: ["setTimeout"] });
       const bits = makeHarness({ authMode: control === "native" ? "api_key" : "provider" });
       const controller = new AbortController();
       let failure: unknown;
       let settled = false;
-      const pending = bits.harness.run(makeAdviceRequest({ signal: controller.signal, timeoutMs: 60_000 }), noThrowPolicy)
+      // "outer": the advice request's own timeout is earlier than the provider allowance.
+      const timeoutMs = control === "outer" ? 60_000 : 10 * CODEX_PROVIDER_FIRST_RESPONSE_MS;
+      const pending = bits.harness.run(makeAdviceRequest({ signal: controller.signal, timeoutMs }), noThrowPolicy)
         .catch(error => { failure = error; }).finally(() => { settled = true; });
-      const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+      const flush = async (): Promise<void> => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
       try {
         await flush();
         assert.ok(bits.transport.requests.some(r => r.method === "turn/start"));
@@ -333,18 +336,30 @@ describe("CodexAdviceHarness: initial provider response deadline", () => {
           params: { threadId: "th-1", turnId: "tn-1", delta: "hello" } });
         if (control === "terminal") bits.transport.push(turnCompleted());
         await flush();
-        t.mock.timers.tick(10_001);
+        // Past the 10 s local setup budget: a silent provider is still within its own allowance.
+        t.mock.timers.tick(11_000);
+        await flush();
+        if (control === "late") bits.transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "th-1", turnId: "tn-1", delta: "late" } });
+        await flush();
+        if (control === "timeout" || control === "outer") assert.equal(settled, false, "setup budget does not bound the first response");
+        t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS);
         await flush();
         if (control === "timeout") {
           assert.equal(settled, true);
           assert.ok(failure instanceof CodexTransportError);
           assert.equal(failure.failure.category, "timeout");
+          assert.equal(failure.failure.message, "codex provider initial response deadline exceeded");
           assert.equal(bits.transport.closes > 0, true);
           assert.equal(bits.disposeCalls(), 1);
+        } else if (control === "outer") {
+          assert.equal(settled, true);
+          assert.ok(!(failure instanceof CodexTransportError), "the earlier advice timeout keeps its own outcome");
+          assert.match(String((failure as Error)?.message), /model call exceeded 60000ms/);
         } else if (control !== "cancel") {
           assert.equal(failure, undefined);
           assert.equal(settled, control === "terminal");
-          if (!settled) { bits.transport.push(turnCompleted()); await pending; }
+          if (!settled) { bits.transport.push(turnCompleted()); await pending; assert.equal(failure, undefined); }
         } else {
           assert.equal(settled, true);
           assert.ok(!(failure instanceof CodexTransportError));

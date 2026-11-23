@@ -40,6 +40,7 @@ import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type Har
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
+  CODEX_PROVIDER_FIRST_RESPONSE_MS,
   createCodexAppServerAuth,
   type CodexAppServerAuthMode,
   type CodexAppServerAuthSession,
@@ -1375,6 +1376,7 @@ function makeHarness(
     appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
     authMode?: CodexAppServerAuthMode;
+    providerFirstResponseMs?: number;
     accountant?: CodexUsageAccountant;
     phaseTransition?: CodexPhaseTransitionCell;
     onTokenUsageIncomplete?: (text: string) => void | Promise<void>;
@@ -1402,6 +1404,7 @@ function makeHarness(
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
     authMode: opts.authMode,
+    providerFirstResponseMs: opts.providerFirstResponseMs,
     accountant: opts.accountant,
     phaseTransition: opts.phaseTransition,
     onTokenUsageIncomplete: opts.onTokenUsageIncomplete,
@@ -7667,7 +7670,7 @@ describe("CodexHarness: initial provider response deadline", () => {
           params: { threadId: "th-1", item: { type: "agentMessage", text: "hello" } } });
         if (control === "terminal") transport.push(turnCompleted());
         await tick();
-        t.mock.timers.tick(10_001);
+        t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS + 1);
         await tick();
         assert.equal(failure, undefined);
         assert.equal(settled, control === "cancel" || control === "terminal");
@@ -7701,10 +7704,55 @@ describe("CodexHarness: initial provider response deadline", () => {
         await tick();
         t.mock.timers.tick(10_001);
         await tick();
+        assert.equal(settled, false, "the spent local setup budget does not bound the first model response");
+        t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS);
+        await tick();
         assert.equal(settled, true, "ACK, logs, retry and foreign output must not disable response deadline");
         assert.ok(failure instanceof CodexTransportError);
         assert.equal(failure.failure.category, "timeout");
+        assert.equal(failure.failure.message, "codex provider initial response deadline exceeded");
       } finally { controller.abort(); await pending; await harness.close(); }
     });
   }
+});
+
+describe("CodexHarness: provider first-response allowance is separate from local setup", () => {
+  const deadlineMessage = "codex provider initial response deadline exceeded";
+
+  it("valid model output arriving after the 10 s setup budget still completes the turn", async (t) => {
+    let now = 1_000;
+    t.mock.method(performance, "now", () => now);
+    const transport = new FakeTransport(method => {
+      // The gateway queues the request: local setup is long spent before the model answers.
+      if (method === "turn/start") now += 11_000;
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport, authMode: "provider" });
+    transport.push(threadStarted()).push(agentMessage("slow but valid")).push(turnCompleted("completed")).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") return;
+    assert.equal(last.terminal.outcome, "success", "a slow first response is not a setup failure");
+  });
+
+  it("the internal allowance seam bounds a first response that never arrives", async () => {
+    const { harness, transport } = makeHarness({ authMode: "provider", providerFirstResponseMs: 30 });
+    transport.push(threadStarted());
+    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (error: unknown) =>
+      error instanceof CodexTransportError && error.failure.category === "timeout" && error.failure.message === deadlineMessage);
+  });
+
+  it("an earlier owner abort keeps its own outcome instead of the provider timeout", async () => {
+    const { harness, transport } = makeHarness({ authMode: "provider" });
+    transport.push(threadStarted());
+    const controller = new AbortController();
+    const turn = collect(harness.startTurn(makeRequest({ signal: controller.signal })).events);
+    setTimeout(() => controller.abort(), 20);
+    const outcome = await turn.then(events => ({ events }), (error: unknown) => ({ error }));
+    if ("error" in outcome) {
+      assert.ok(!(outcome.error instanceof CodexTransportError && outcome.error.failure.message === deadlineMessage),
+        "the abort, not the 120 s provider allowance, ends the turn");
+    }
+  });
 });

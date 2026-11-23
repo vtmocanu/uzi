@@ -2100,6 +2100,9 @@ export interface CodexExecutorDeps {
    *  (production: UZI_CODEX_COMMAND_CACHE_RUN_BYTES). Absent or 0 disables measurement and
    *  rotation; no command is ever refused for cache size. */
   readonly commandCacheRunBytes?: number;
+  /** Provider first-response allowance per owned root (default 120 s). Internal test seam:
+   *  no env, claim or provider configuration reaches it. */
+  readonly providerFirstResponseMs?: number;
   /** Issue #3675: measure one run's cache (production: {@link measureCommandCache}). */
   readonly measureCommandCache?: (token: string, signal: AbortSignal) => Promise<CacheMeasureResult>;
   /** Issue #3675: the minimum spacing between two measurements of one cache (default 30 s). */
@@ -6225,6 +6228,7 @@ export class CodexExecutor implements Executor {
         // Preserve the run's immutable credential mode. Both modes enable API-equivalent
         // estimates in the token accountant when usage evidence fully reconciles.
         authMode: binding.authMode,
+        ...(this.deps.providerFirstResponseMs === undefined ? {} : { providerFirstResponseMs: this.deps.providerFirstResponseMs }),
         // Share usage across internal provider epochs, but emit the server lineage marker only for
         // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
         // a fresh lineage even when thread/resume emits no thread/started notification.

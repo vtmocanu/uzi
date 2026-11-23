@@ -124,7 +124,7 @@ import {
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import { codexInitialResponseWait, codexConnectionBudget, type CodexAuthSuspensionLease, type CodexAppServerAuthMode, type CodexAppServerAuthSession } from "./appserver-auth.js";
+import { CODEX_PROVIDER_FIRST_RESPONSE_MS, codexInitialResponseWait, codexConnectionBudget, type CodexAuthSuspensionLease, type CodexAppServerAuthMode, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -270,6 +270,10 @@ export interface CodexHarnessOptions {
    *  API-equivalent estimates from the pinned Standard price table when usage fully reconciles.
    *  When absent, entries and run cost stay unreported while token totals are retained. */
   readonly authMode?: CodexAppServerAuthMode;
+  /** Provider first-response allowance per owned root (default
+   *  {@link CODEX_PROVIDER_FIRST_RESPONSE_MS}). Internal test seam only: no env, claim or provider
+   *  configuration reaches it. */
+  readonly providerFirstResponseMs?: number;
   /** PRD #1332 C4a / CodeRabbit 4004800880: the executor-claim-leg token accountant, INJECTED so it
    *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
    *  builds a FRESH {@link CodexHarness}, but the accountant keeps the claim leg's cumulative
@@ -575,6 +579,7 @@ export class CodexHarness implements RunHarness {
   // PRD #1332 C4b / D5: the run's immutable auth mode, used ONLY to project the terminal cost
   // semantics from the accountant. Undefined leaves the terminal price-free (unreported).
   private readonly authMode?: CodexAppServerAuthMode;
+  private readonly providerFirstResponseMs: number;
 
   // Run-level provider root state (launched once, reused across turns; a reused
   // notifications() iterator is single-consumer so it is obtained exactly once).
@@ -860,6 +865,7 @@ export class CodexHarness implements RunHarness {
     this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
     this.authMode = opts.authMode;
+    this.providerFirstResponseMs = opts.providerFirstResponseMs ?? CODEX_PROVIDER_FIRST_RESPONSE_MS;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
     this.phaseTransition = opts.phaseTransition;
     this.onTokenUsageIncomplete = opts.onTokenUsageIncomplete;
@@ -1555,8 +1561,10 @@ export class CodexHarness implements RunHarness {
             threadId, ordinal, transition: this.verifiedTransition?.pending ? this.verifiedTransition : undefined,
           };
         });
-      responseWait = codexInitialResponseWait(this.connectionBudget, threadId, this.activeTurnId);
-      // Setup and initial response share one allowance, consumed once per owned root.
+      // Local setup ends at the turn/start acknowledgment. The first model response gets its own
+      // provider allowance, once per owned root (a present setup budget marks a fresh provider root).
+      responseWait = codexInitialResponseWait(
+        this.connectionBudget === undefined ? undefined : this.providerFirstResponseMs, threadId, this.activeTurnId);
       this.connectionBudget = undefined;
       // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
       // that was cancelled or refused before dispatch.

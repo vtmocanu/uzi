@@ -4,6 +4,7 @@ import { createCodexTransport, CodexTransportError } from "../src/codex/transpor
 import assert from "node:assert/strict";
 
 import {
+  CODEX_PROVIDER_FIRST_RESPONSE_MS,
   CODEX_REFRESH_BRIDGE_BUDGET_MS,
   codexConnectionBudget,
   codexInitialResponseWait,
@@ -22,11 +23,35 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-it("expired initial response budget throws synchronously with a typed timeout", () => {
-  assert.throws(() => codexInitialResponseWait(() => {
-    throw new CodexTransportError({ category: "timeout", message: "expired setup budget" });
-  }, "thread-1", "turn-1"), error =>
-    error instanceof CodexTransportError && error.failure.category === "timeout");
+it("provider first response has its own allowance, not the spent setup budget", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  assert.equal(CODEX_PROVIDER_FIRST_RESPONSE_MS, 120_000);
+  const wait = codexInitialResponseWait(CODEX_PROVIDER_FIRST_RESPONSE_MS, "thread-1", "turn-1");
+  t.mock.timers.tick(11_000);
+  wait.assertOpen();
+  wait.observe({ kind: "activity", method: "item/agentMessage/delta",
+    params: { threadId: "thread-1", turnId: "turn-1", delta: "late" } } as CodexNotification);
+  t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS);
+  wait.assertOpen();
+});
+
+it("a provider first response that never arrives raises the typed initial-response timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const wait = codexInitialResponseWait(CODEX_PROVIDER_FIRST_RESPONSE_MS, "thread-1", "turn-1");
+  t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS - 1);
+  wait.assertOpen();
+  t.mock.timers.tick(1);
+  await wait.ready;
+  assert.throws(() => wait.assertOpen(), error =>
+    error instanceof CodexTransportError && error.failure.category === "timeout" &&
+    error.failure.message === "codex provider initial response deadline exceeded");
+});
+
+it("non-provider and later turns carry no first-response bound", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const wait = codexInitialResponseWait(undefined, "thread-1", "turn-1");
+  t.mock.timers.tick(10 * CODEX_PROVIDER_FIRST_RESPONSE_MS);
+  wait.assertOpen();
 });
 
 it("expired provider setup budget refuses before any RPC or credential send", async (t) => {
