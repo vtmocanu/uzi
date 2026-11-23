@@ -2242,3 +2242,21 @@ not decided here: #4494 Direction 1 and #4628.
 
 **Accounting.** As in #3644, the park holds the current generation's custody hold; an owner Resume adds a
 claim and a hold, each counting toward `custody_hold_limit`.
+
+## Amendment 2026-11-23, #4645: a permanent message failure after a confirmed hold or wall park
+
+Decision record (AI-synced 2026-11-23). Like #4627 and #4644 above, this keeps a permanent refusal of the
+run's messages (the batcher breaker) from replacing a nonterminal disposition with a `failed` report.
+
+- **Guard.** `handlePermanentFailure` in `agent/src/runner.ts` returns, logging a warning, once
+  `holdOrWallParkConfirmed` is set: the server answered `paused` to a completion hold (including the
+  interlocked completion hold), a preflight hold, a phase-switch hold or a wall park on this flight. No
+  terminal is journaled, nothing is aborted and no terminal provider reap runs, so on Codex no boundary,
+  refresh or release follows the confirmation. The park's own shutdown and cleanup are unchanged.
+- **Precedence.** The guard sits after the worker-memory branch, which keeps its custody retention,
+  `RetainedRecoveryStop` abort and reconciliation ownership, and after the #4644 restore-window branch.
+- **Scope.** Only a trip after positive confirmation is covered. A trip while a hold request is
+  unresolved or refused, during the phase-switch flush before its request, during the wall pre-park flush
+  or the park report, or in a callback that entered before the flag was set keeps today's handling. Those
+  windows, a shared nonterminal-disposition lifecycle and the server-side replay check after Resume are
+  tracked in #4646.

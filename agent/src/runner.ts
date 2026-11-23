@@ -8960,10 +8960,10 @@ export class RunRunner {
       return;
     }
     // issue #4645: the server already accepted a completion/preflight/phase-switch hold or a wall park (paused) on this flight, so a
-    // permanent message failure during the final drain must not turn that accepted disposition into a `failed` report, an abort or a
-    // terminal reap. workerMemory.hold keeps precedence (above). Not covered here (tracked in #4646): trips during an unresolved or
-    // refused hold request, the phase-switch pre-request flush, the wall pre-park flush and the reportWallPark window, and a callback
-    // already entered before the flag was set.
+    // permanent message failure after that confirmation (in practice the final drain) must not turn that accepted disposition into a
+    // `failed` report, an abort or a terminal reap. workerMemory.hold keeps precedence (above). Not covered here (tracked in #4646):
+    // trips during an unresolved or refused hold request, the phase-switch pre-request flush, the wall pre-park flush and the
+    // reportWallPark window, and a callback already entered before the flag was set.
     if (flight.holdOrWallParkConfirmed) {
       flight.runLog.warn(CONFIRMED_DISPOSITION_TRIP_LOG, { run_id: flight.runId, reason });
       return;
