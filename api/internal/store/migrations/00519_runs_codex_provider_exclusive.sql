@@ -14,7 +14,7 @@ LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM runs WHERE model_provider_id IS NOT NULL AND harness = 'codex') THEN
-        RAISE EXCEPTION 'refusing to roll back 00516: Codex provider runs still exist';
+        RAISE EXCEPTION 'refusing to roll back 00519: Codex provider runs still exist';
     END IF;
 END
 $$;

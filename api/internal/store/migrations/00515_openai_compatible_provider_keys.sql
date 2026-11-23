@@ -18,7 +18,7 @@ LOCK TABLE user_secrets IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM user_secrets WHERE kind = 'openai_compatible_key') THEN
-        RAISE EXCEPTION 'refusing to roll back 00512: Responses provider keys still exist';
+        RAISE EXCEPTION 'refusing to roll back 00515: Responses provider keys still exist';
     END IF;
 END
 $$;

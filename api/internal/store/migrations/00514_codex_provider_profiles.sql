@@ -19,7 +19,7 @@ LOCK TABLE model_providers IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM model_providers WHERE engine = 'codex') THEN
-        RAISE EXCEPTION 'refusing to roll back 00511: Codex providers still exist';
+        RAISE EXCEPTION 'refusing to roll back 00514: Codex providers still exist';
     END IF;
 END
 $$;

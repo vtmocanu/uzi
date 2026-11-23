@@ -178,7 +178,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 				break
 			}
 		}
-		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00516: Codex provider runs still exist") {
+		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00519: Codex provider runs still exist") {
 			t.Fatalf("Down refusal: %v", err)
 		}
 	})

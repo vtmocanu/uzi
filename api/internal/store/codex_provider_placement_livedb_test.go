@@ -172,7 +172,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 			break
 		}
 	}
-	if refusal == nil || !strings.Contains(refusal.Error(), "refusing to roll back 00518") {
+	if refusal == nil || !strings.Contains(refusal.Error(), "refusing to roll back 00521") {
 		t.Fatalf("Down refusal=%v", refusal)
 	}
 	if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT guarded_down"); err != nil {

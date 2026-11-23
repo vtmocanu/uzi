@@ -76,7 +76,7 @@ func TestCodexProviderVendorReadersExcludeProviderKeyLiveDB(t *testing.T) {
 		t.Fatalf("fixture key kind = %q", k)
 	}
 
-	// The schema refuses to make a provider key a default or auto-eligible (00512, 00389): the kind
+	// The schema refuses to make a provider key a default or auto-eligible (00515, 00389): the kind
 	// filters below are the second line, so the first is asserted directly.
 	for _, col := range []string{"is_default", "auto_eligible"} {
 		_, err := env.pool.Exec(env.ctx, `UPDATE user_secrets SET `+col+` = true WHERE id = $1`, providerKey)
