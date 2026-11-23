@@ -48,6 +48,7 @@ type fakeSettingsDB struct {
 	nowSummary      pgtype.Bool
 	weeklyPct       pgtype.Int2
 	weeklyPause     bool
+	weeklyMargin    int16
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -281,6 +282,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		nowSummary:            f.nowSummary,
 		weeklyPct:             f.weeklyPct,
 		weeklyPause:           f.weeklyPause,
+		weeklyMargin:          f.weeklyMargin,
 		sidebarIDs:            f.sidebarIDs,
 		sidebarCodexIDs:       f.sidebarCodexIDs,
 		apprMode:              f.apprMode,
@@ -316,6 +318,7 @@ type fakeSettingsRow struct {
 	nowSummary            pgtype.Bool
 	weeklyPct             pgtype.Int2
 	weeklyPause           bool
+	weeklyMargin          int16
 	sidebarIDs            []uuid.UUID
 	sidebarCodexIDs       []uuid.UUID
 	apprMode              pgtype.Text
@@ -370,7 +373,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 32: // GetUserSettings: both planning pairs and per-harness task-review models/efforts.
+	case 33: // GetUserSettings: both planning pairs, per-harness task-review models/efforts, and weekly_warning_margin_pts (PRD #4123).
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -475,6 +478,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[31].(*pgtype.Text); ok {
 			*p = r.codexTaskReviewEffort
+		}
+		// weekly_warning_margin_pts (PRD #4123) is the 33rd column, after the task-review columns.
+		if p, ok := dest[32].(*int16); ok {
+			*p = r.weeklyMargin
 		}
 	}
 	return nil

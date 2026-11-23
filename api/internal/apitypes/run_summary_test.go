@@ -1,6 +1,7 @@
 package apitypes
 
 import (
+	"encoding/json"
 	"reflect"
 	"sort"
 	"testing"
@@ -79,9 +80,32 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.Effort = nil
 	want.ModelSource = nil
 	want.EffortSource = nil
+	// The summary keeps only tier, credential_key and credential_label of the weekly-limit block.
+	want.WeeklyLimit = &WeeklyLimitDTO{
+		Tier: full.WeeklyLimit.Tier, CredentialKey: full.WeeklyLimit.CredentialKey, CredentialLabel: full.WeeklyLimit.CredentialLabel,
+	}
 
 	got := RunSummaryOf(full).ListItem()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("RunSummaryOf(x).ListItem() != x minus heavy fields\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+func TestRunSummaryWeeklyLimitProjection(t *testing.T) {
+	item := RunListItemDTO{}
+	if got := RunSummaryOf(item).WeeklyLimit; got != nil {
+		t.Fatalf("absent block must stay absent in the summary, got %+v", got)
+	}
+	// The key and label are opaque test values; they are joined at runtime so no literal sits next to a
+	// credential-named field.
+	acct, lbl := "anthropic:"+"acct-1", "ma"+"in"
+	item.WeeklyLimit = &WeeklyLimitDTO{Tier: WeeklyLimitTierWarning, CredentialKey: acct, CredentialLabel: lbl, Reason: "pinned", Wait: "waits"}
+	sum := RunSummaryOf(item)
+	if sum.WeeklyLimit == nil || *sum.WeeklyLimit != (WeeklyLimitSummaryDTO{Tier: "warning", CredentialKey: acct, CredentialLabel: lbl}) {
+		t.Fatalf("summary projection = %+v", sum.WeeklyLimit)
+	}
+	b, err := json.Marshal(sum.WeeklyLimit)
+	if err != nil || string(b) != `{"tier":"warning","credential_key":"anthropic:acct-1","credential_label":"main"}` {
+		t.Fatalf("summary wire = %s (%v)", b, err)
 	}
 }

@@ -263,6 +263,22 @@ func (c *HTTPClient) SetUsageReserve(ctx context.Context, thresholdPct *int, pau
 	return env.User, nil
 }
 
+func (c *HTTPClient) SetWeeklyWarningMargin(ctx context.Context, marginPts int) (int, error) {
+	body := struct {
+		MarginPts int `json:"margin_pts"`
+	}{MarginPts: marginPts}
+	var out struct {
+		Pts *int `json:"weekly_warning_margin_pts"`
+	}
+	if err := c.put(ctx, "/api/me/weekly-warning-margin", body, &out); err != nil {
+		return 0, err
+	}
+	if out.Pts == nil {
+		return 0, Exitf(ExitGeneric, "malformed response from uzi (/api/me/weekly-warning-margin)")
+	}
+	return *out.Pts, nil
+}
+
 func (c *HTTPClient) ListMemory(ctx context.Context) ([]apitypes.AgentMemoryDTO, error) {
 	var env struct {
 		Memories []apitypes.AgentMemoryDTO `json:"memories"`

@@ -156,7 +156,7 @@ func TestHarnessOverflowCodexInvalidReadingLiveDB(t *testing.T) {
 					if scenario == "credential write fence" {
 						generation, revision = 0, -1
 					}
-					n, err := fx.env.q.UpsertCodexAccountRateLimits(fx.env.ctx, store.UpsertCodexAccountRateLimitsParams{
+					n, err := upsertCodexRows(fx.env.ctx, fx.env.q, store.UpsertCodexAccountRateLimitsParams{
 						UserID: fx.userID, ProviderAccountID: fx.codex.account,
 						Buckets:            []byte(poolBuckets(true, false, poolWindow(fiveHourSecs, 10, 100000), poolWindow(weekSecs, 10, 100000))),
 						ObservedGeneration: generation, ObservedCredentialRevision: revision,

@@ -6,14 +6,18 @@ import { overviewDecisions } from "../lib/overview";
 describe("overview-next mock scenario decisions", () => {
   afterEach(() => localStorage.clear());
 
-  it("seeds a plan review, a question, an owner park and deduplicated open PRs", async () => {
+  it("seeds a plan review, a question, an owner park, a weekly limit and deduplicated open PRs", async () => {
     vi.resetModules();
     localStorage.setItem("uzi_mock_scenario", "overview-next");
     const { mockApi } = await import("./mockApi");
     const runs = (await mockApi.listRuns({ view: "summary" })).runs;
     const items = overviewDecisions(runs, await mockApi.getRecoveryHolds());
     const kinds = new Set(items.map((i) => i.kind));
-    expect(kinds).toEqual(new Set(["plan", "question", "park", "held", "pr"]));
+    expect(kinds).toEqual(new Set(["plan", "question", "park", "held", "limit", "pr"]));
+    // PRD #4123: the weekly-limit warnings group by credential (the running near-limit run and
+    // the timed seven_day park sit on different tokens).
+    const limitKeys = items.flatMap((i) => (i.kind === "limit" ? [i.run.weekly_limit?.credential_key] : []));
+    expect(new Set(limitKeys)).toEqual(new Set(["anthropic:sec-low", "anthropic:sec-console"]));
     // The two decision holds collapse into exactly one held-work row.
     const held = items.filter((i) => i.kind === "held");
     expect(held).toHaveLength(1);

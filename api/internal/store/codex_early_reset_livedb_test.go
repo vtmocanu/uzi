@@ -37,7 +37,7 @@ func newCodexEarlyResetFixture(t *testing.T) *codexEarlyResetFixture {
 
 func (f *codexEarlyResetFixture) success(t *testing.T, gen, rev int64) {
 	t.Helper()
-	n, err := f.q.UpsertCodexAccountRateLimits(f.ctx, store.UpsertCodexAccountRateLimitsParams{
+	n, err := upsertCodexRows(f.ctx, f.q, store.UpsertCodexAccountRateLimitsParams{
 		UserID: f.user, ProviderAccountID: f.account, EnablementSig: f.sig,
 		ObservedGeneration: gen, ObservedCredentialRevision: rev,
 		Buckets: []byte(`{"weekly":{"used_percent":40}}`), AttemptStatus: "ok",

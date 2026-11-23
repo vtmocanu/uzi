@@ -1054,6 +1054,12 @@ func (m tuiModel) renderDetail() string {
 	if line := fitVaultParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
+	// The weekly-limit line (PRD #4123): one row after the vault park line, same wait ink.
+	// Owner-authored labels reach it only through renderer.Plain; clampVisual keeps it one physical
+	// row, which transcriptBudgetWithoutDiskGuidance charges (the #379 invariant).
+	if line := weeklyLimitTUILine(d.run); line != "" {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
 	// The disk park line (PRD #1809 M5), same slot, ink and shedding as the vault park line: a
 	// data_volume_full park is another recovery_wait cause, so the two never both draw.
 	for _, line := range forgeRunLines(d.run) {

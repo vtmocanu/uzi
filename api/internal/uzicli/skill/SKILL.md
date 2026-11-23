@@ -187,6 +187,7 @@ uzi whoami
 uzi settings
 uzi settings get
 uzi settings reserve
+uzi settings warning-margin <0..50|off>
 uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
 uzi settings set <setting> [--harness claude|codex] <value>
@@ -404,6 +405,12 @@ uzi version
   Prints the resulting reserve; `--json` returns `weekly_reserve_pct` and
   `weekly_reserve_pause_running`. Usage exit 2 on an out-of-range threshold. A uzc_ token
   can run it.
+- `uzi settings warning-margin <0..50|off>` — set the weekly-limit warning margin: how many
+  percentage points before a credential's effective weekly limit (your reserve when set,
+  else 100%) uzi starts warning on runs. An integer from 0 to 50; `0` or `off` turns early
+  warnings off (a run parked by a weekly limit still explains why). `--json` returns
+  `weekly_warning_margin_pts`; `uzi settings get` shows it as `Weekly warning margin:`. Usage
+  exit 2 on an out-of-range value. A uzc_ token can run it.
 - `uzi settings set <setting> [--harness claude|codex] <value>` and
   `uzi settings reset <setting> [--harness claude|codex]` — write or clear one model or
   effort default for new runs (`PUT /api/me/model-settings`). Settings: `worker-model`,

@@ -210,7 +210,7 @@ func TestCodexBackgroundRefreshInProgressCompletesAcrossDisableLiveDB(t *testing
 	if blob := env.accountBlob(t, fx.userID, fx.accountID); blob.AccessToken != rotatedAccess || blob.RefreshToken != rotatedRefresh {
 		t.Fatal("the refreshed login was not persisted")
 	}
-	n, werr := env.q.UpsertCodexAccountRateLimits(env.ctx, store.UpsertCodexAccountRateLimitsParams{
+	n, werr := upsertCodexRows(env.ctx, env.q, store.UpsertCodexAccountRateLimitsParams{
 		UserID: fx.userID, ProviderAccountID: fx.accountID, Buckets: []byte(`[]`),
 		ObservedGeneration: 1, ObservedCredentialRevision: acct.CredentialRevision, AttemptStatus: "ok",
 		EnablementSig: started,

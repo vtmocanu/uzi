@@ -186,7 +186,7 @@ func TestCodexReadingEnablementFenceLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	upsert := func(acc uuid.UUID, sig string) int64 {
 		t.Helper()
-		n, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+		n, err := upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 			UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"r":1}`), AttemptStatus: "ok",
 			EnablementSig: sig,
 		})
@@ -273,7 +273,7 @@ func TestCodexReadingFenceSerializesWithTransitionLiveDB(t *testing.T) {
 
 	done := make(chan int64, 1)
 	go func() {
-		n, uerr := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+		n, uerr := upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 			UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"r":1}`), AttemptStatus: "ok",
 			EnablementSig: started,
 		})
@@ -369,7 +369,7 @@ func TestCodexTickAndPokeSignaturesAgreeLiveDB(t *testing.T) {
 	if pokeSig := codexEnablementSig(ctx, t, q, user, acc); tickSig != pokeSig {
 		t.Fatalf("tick enablement list %q != poke enablement list %q", tickSig, pokeSig)
 	}
-	n, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+	n, err := upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 		UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"r":1}`), AttemptStatus: "ok",
 		EnablementSig: tickSig,
 	})
@@ -396,7 +396,7 @@ func TestCodexFencedWriteTakesSecretMutationLockLiveDB(t *testing.T) {
 		fn   write
 	}{
 		{"reading", func(ctx context.Context, q *store.Queries, user, acc uuid.UUID, sig string) (int64, error) {
-			return q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+			return upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 				UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"r":1}`), AttemptStatus: "ok",
 				EnablementSig: sig,
 			})
