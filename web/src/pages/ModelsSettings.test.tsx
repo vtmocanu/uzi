@@ -341,6 +341,41 @@ describe("Models page", () => {
     expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1);
   });
 
+  it("Discard after an unconfirmed save keeps the uncertainty and Reload, without claiming the stored values", async () => {
+    mockApi.putMyModelSettings.mockRejectedValueOnce(
+      new ApiError(500, "the save may or may not have been applied", { reason: "settings_commit_unknown" }),
+    );
+    mount();
+    await screen.findByLabelText("Worker model — Codex");
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText(/could not confirm whether this save was applied/);
+    fireEvent.click(discardButton());
+    expect(control("Worker model — Codex").value).toBe("inherit");
+    expect(within(bar()).getByText(/could not confirm whether this save was applied/)).toBeTruthy();
+    expect(within(bar()).getByRole("button", { name: "Reload saved settings" })).toBeTruthy();
+  });
+
+  it("takes the worker effort Default from the template-aware effective cell, not the preference-only settings cell", async () => {
+    const effective = makeEffective();
+    effective.efforts = effective.efforts.map((c) =>
+      c.setting === "worker_effort" && c.harness === "claude"
+        ? { ...c, default_effort: "high", default_source: "template", resolved_effort: "high", source: "template" }
+        : c,
+    );
+    mockApi.getEffectiveSettings.mockResolvedValue(effective);
+    const preferenceOnly = (harness: "claude" | "codex") => ({
+      harness, effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit",
+    });
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({
+      effort_settings: [preferenceOnly("claude"), preferenceOnly("codex")] as UserSettings["effort_settings"],
+    }) });
+    mount();
+    await screen.findByLabelText("Worker effort — Claude");
+    // /me/settings' preference cell says built-in medium; the effective cell knows the lead template.
+    expect(control("Worker effort — Claude").options[0].text).toBe("Default · high (lead template)");
+  });
+
   it("says a saved-but-unreadable save was saved, and a plain 500 that nothing changed", async () => {
     mockApi.putMyModelSettings.mockRejectedValueOnce(
       new ApiError(500, "settings saved; reading them back failed", { reason: "settings_saved_readback_failed" }),

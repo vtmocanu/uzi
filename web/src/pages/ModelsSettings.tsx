@@ -251,11 +251,13 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     setOutcome((o) => (o?.kind === "saved" || o?.kind === "reloaded" ? null : o));
   };
 
+  // Discard drops the local draft only. After an uncertain save it does not reconcile what the
+  // server stored, so the uncertainty and its alert (with Reload saved settings) stay until a
+  // successful save or reload.
   const discard = useCallback(() => {
     setDraft(baseline);
     setFieldErrors({});
-    setOutcome(null);
-    setUncertainty(null);
+    setOutcome((o) => (o?.kind === "unknown" || o?.kind === "saved_unreadable" ? o : null));
     setPickerGeneration((g) => g + 1);
   }, [baseline]);
 
@@ -353,8 +355,11 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const { settings, effective } = loaded;
   const workerModelCell = (h: "claude" | "codex") =>
     effective?.models?.find((c) => c.setting === "worker_model" && c.harness === h);
+  // Default metadata comes from the effective worker-effort cell, which includes the lead
+  // template's effort tier; the /me/settings preference cell always describes the built-in
+  // default. Without predictions the label stays generic rather than claiming built-in medium.
+  // (The Codex Runtime default label still reads catalog metadata from the settings cell.)
   const effortCell = (h: "claude" | "codex") =>
-    settings.effort_settings?.find((c) => c.harness === h) ??
     effective?.efforts?.find((c) => c.setting === "worker_effort" && c.harness === h);
 
   // The judge's routing as DRAFTED: dimming follows the select before it is saved.
