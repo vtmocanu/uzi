@@ -116,6 +116,10 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const [reloading, setReloading] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [outcome, setOutcome] = useState<SaveOutcome | null>(null);
+  // An earlier save may have committed without confirmation. Kept apart from `outcome`, which a
+  // later failed reload or failed retry replaces: only a successful save, a successful reload or
+  // Discard reconciles it, so the guard never offers "Discard changes" while a commit is unconfirmed.
+  const [uncertainty, setUncertainty] = useState<"unknown" | "saved_unreadable" | null>(null);
   const [customMode, setCustomMode] = useState<Record<string, boolean>>({});
   // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
   // (whose value never changed, so it would not re-derive) returns to its stored option.
@@ -182,6 +186,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     setDraft(baseline);
     setFieldErrors({});
     setOutcome(null);
+    setUncertainty(null);
     setPickerGeneration((g) => g + 1);
   }, [baseline]);
 
@@ -201,6 +206,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       setLoaded({ settings: res.settings, effective: res.effective ?? null });
       setBaseline(values);
       setDraft(values);
+      setUncertainty(null);
       setOutcome(res.effective ? { kind: "saved", count } : { kind: "saved_no_prediction" });
     } catch (err) {
       if (!isCurrent(seq)) return;
@@ -211,8 +217,10 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         setOutcome({ kind: "invalid", count: Object.keys(byKey).length + unmatched.length, unmatched });
       } else if (modelSettingsFailureReason(err) === "settings_commit_unknown") {
         setOutcome({ kind: "unknown" });
+        setUncertainty("unknown");
       } else if (modelSettingsFailureReason(err) === "settings_saved_readback_failed") {
         setOutcome({ kind: "saved_unreadable" });
+        setUncertainty((u) => u ?? "saved_unreadable");
       } else if (err instanceof ApiError && err.status <= 500) {
         // The handler answers a plain 500 only for a failure before commit (rolled back),
         // and other 4xx before writing anything.
@@ -220,6 +228,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       } else {
         // A network failure or a gateway error: the request may have reached the server.
         setOutcome({ kind: "unknown" });
+        setUncertainty("unknown");
       }
     } finally {
       // Cleared whenever still mounted, even if a newer request token was issued meanwhile
@@ -241,6 +250,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       setLoaded(next);
       setBaseline(values);
       setFieldErrors({});
+      setUncertainty(null);
       setOutcome({ kind: "reloaded", stillDirty: dirtyFields(values, draft).length });
     } catch (err) {
       if (isCurrent(seq)) setOutcome({ kind: "reload_failed", message: errorMessage(err, "request failed") });
@@ -346,7 +356,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         saving={saving}
         // The PUT may have committed: leaving must not read as a discard (PRD: explain the
         // uncertainty, never claim a rollback). A reload replaces this outcome.
-        saveUncertainty={outcome?.kind === "unknown" || outcome?.kind === "saved_unreadable" ? outcome.kind : null}
+        saveUncertainty={uncertainty}
         viewerId={viewerId}
         onDiscard={discard}
       />

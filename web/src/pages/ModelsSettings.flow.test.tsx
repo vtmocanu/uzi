@@ -359,6 +359,26 @@ describe("unsaved-changes guard", () => {
     expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: null });
   }, 30000);
 
+  it("a failed Reload after an unknown commit keeps the uncertain dialog (no Discard claim)", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    failNextMockModelSettingsWrite("commit_unknown");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/could not confirm whether this save was applied/, {}, { timeout: 5000 });
+    const spy = vi.spyOn(mockApi, "getMySettings").mockRejectedValueOnce(new Error("offline"));
+    try {
+      fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
+      await waitFor(() => expect(spy).toHaveBeenCalled());
+      await waitFor(() => expect(within(bar()).queryByText(/Reloading/)).toBeNull(), { timeout: 5000 });
+    } finally {
+      spy.mockRestore();
+    }
+    await act(() => router.navigate("/settings/appearance"));
+    const open = await screen.findByRole("dialog", { name: UNCONFIRMED });
+    expectUncertainCopy(open);
+    expect(within(open).queryByRole("button", { name: "Discard changes" })).toBeNull();
+  }, 30000);
+
   it("logout while dirty reaches /login without the dialog", async () => {
     const router = await openModels();
     select("Worker model — Codex", "gpt-6-sol");
