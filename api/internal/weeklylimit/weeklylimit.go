@@ -244,8 +244,10 @@ func fixes(run store.Run, res *workersvc.NextClaimResult, snap *workersvc.NextCl
 	if res.ManualSwitch && anthropic && (res.Reason == workersvc.NextClaimPinned || res.Reason == workersvc.NextClaimNotAuto) {
 		runFix = append(runFix, apitypes.WeeklyLimitFixDTO{Kind: FixAutoSelect, TargetID: runID, Command: "uzi run set-token " + runID + " --auto"})
 	}
+	// A chat spends the owner's default token whatever the worker binding (PRD #104 D1), so
+	// re-binding the worker would not help it and would change the worker's other work.
 	if res.Reason == workersvc.NextClaimNotAuto && anthropic && run.WorkerID.Valid &&
-		run.Kind != runkind.Judge && run.Kind != runkind.SelfImprove {
+		run.Kind != runkind.Judge && run.Kind != runkind.SelfImprove && run.Kind != runkind.Chat {
 		wid := uuid.UUID(run.WorkerID.Bytes)
 		if name, mode, ok := snap.WorkerBinding(wid); ok && mode != workersvc.BindModeAuto {
 			fix := apitypes.WeeklyLimitFixDTO{
@@ -275,7 +277,7 @@ func fixes(run store.Run, res *workersvc.NextClaimResult, snap *workersvc.NextCl
 			// An Anthropic run in an auto lane re-selects at its next claim, so pooling the
 			// alternative helps this run; a Codex run keeps its frozen account, so it only helps
 			// runs created afterwards.
-			if anthropic && res.Reason == workersvc.NextClaimHeadroomOutside {
+			if anthropic && res.Reason == workersvc.NextClaimHeadroomOutside && run.Kind != runkind.Chat {
 				runFix = append(runFix, fix)
 			} else {
 				future = append(future, fix)

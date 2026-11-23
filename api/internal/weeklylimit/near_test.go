@@ -395,3 +395,39 @@ func TestMarginOffListWithNothingParkedLoadsOneSnapshot(t *testing.T) {
 		t.Fatalf("candidate reads = %d; want exactly one snapshot", f.candCnt.Load())
 	}
 }
+
+// Chat is not bindable (PRD #104 D1): its claim always opens the owner's default token, so the
+// worker's auto binding and the pool never move it. Its block must say not_auto and offer no run
+// fix that pools a token or re-binds the worker (those cannot help the chat and change other
+// work), with the worker on auto and on a fixed binding alike.
+func TestChatRunNeverGetsPoolOrWorkerAdvice(t *testing.T) {
+	for _, mode := range []string{"auto", "default"} {
+		t.Run("worker_"+mode, func(t *testing.T) {
+			f := nearStore(86, 15)
+			f.workers[0].AnthropicBindMode = mode
+			run := runningRun()
+			run.Kind = "chat"
+			got := blockFor(t, f, run)[run.ID]
+			if got == nil {
+				t.Fatal("no block for a chat on a near-limit default token")
+			}
+			if got.Reason != workersvc.NextClaimNotAuto {
+				t.Fatalf("reason = %q; want not_auto (chat spends the owner's default token)", got.Reason)
+			}
+			kinds := fixKinds(got.Fix)
+			if _, ok := kinds[FixPoolOn]; ok {
+				t.Fatalf("chat got a pool_on run fix: %+v", got.Fix)
+			}
+			for _, fx := range got.Fix {
+				if fx.Kind == FixAutoSelect && fx.TargetID == wkr.String() {
+					t.Fatalf("chat got a worker re-bind run fix: %+v", got.Fix)
+				}
+			}
+			for _, fx := range got.FutureRuns {
+				if fx.Kind == FixAutoSelect && fx.TargetID == wkr.String() {
+					t.Fatalf("chat got a worker re-bind future fix: %+v", got.FutureRuns)
+				}
+			}
+		})
+	}
+}

@@ -434,6 +434,11 @@ type claimModeResult struct {
 // judge and self_improve, then the per-run override, then the recorded worker's bind mode; a missing
 // worker is unknown (effectiveNextClaimMode).
 func (n *NextClaimSnapshot) claimMode(run store.Run, worker store.Worker) claimModeResult {
+	// Chat is deliberately not bindable (PRD #104 D1): assembleChatClaim always opens the owner's
+	// default token, whatever the worker's binding or a pool says, so its lane is never auto.
+	if run.Kind == runkind.Chat {
+		return claimModeResult{kind: claimKindNotAuto}
+	}
 	if run.Kind == runkind.SelfImprove || run.Kind == runkind.Judge {
 		if n.reserve != nil && n.reserve.judgeMode == BindModeAuto {
 			return claimModeResult{kind: claimKindAuto, judge: true}
