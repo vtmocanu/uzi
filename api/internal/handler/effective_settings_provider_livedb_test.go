@@ -37,10 +37,14 @@ func (f *effFix) selectProvider() uuid.UUID {
 	}); err != nil {
 		f.t.Fatalf("insert key: %v", err)
 	}
-	f.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, f.user, p.ID)
+	f.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, f.user, p.ID)
 	// Registered after the fixture's user delete, so it runs first: a selected provider cannot be
 	// deleted (RESTRICT).
-	f.t.Cleanup(func() { _, _ = f.pool.Exec(f.ctx, `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, f.user) })
+	f.t.Cleanup(func() {
+		if _, err := f.pool.Exec(f.ctx, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, f.user); err != nil {
+			f.t.Errorf("clear the Claude source in cleanup: %v", err)
+		}
+	})
 	return p.ID
 }
 

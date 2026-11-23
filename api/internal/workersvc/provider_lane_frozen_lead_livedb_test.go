@@ -74,7 +74,7 @@ func frozenLeadFixture(t *testing.T, stage string, engine Harness) (*provFix, st
 	}
 	// No Claim or provider capability advertisement: this is an unclaimed legal
 	// frozen profile, put into the same storage custody used by the existing tests.
-	fx.env.exec(`UPDATE users SET claude_provider_id=NULL,codex_provider_id=NULL WHERE id=$1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id=NULL,claude_provider_scope_id=NULL,codex_provider_id=NULL WHERE id=$1`, fx.userID)
 	sources, err := fx.env.q.GetUserProviderLaneSources(fx.env.ctx, fx.userID)
 	if err != nil || sources.ClaudeProviderID.Valid || sources.CodexProviderID.Valid {
 		t.Fatalf("both current provider sources must be NULL: %+v err=%v", sources, err)

@@ -736,12 +736,25 @@ type MemoryParkRelease struct {
 
 type ModelProvider struct {
 	ID              uuid.UUID          `json:"id"`
-	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
 	Name            string             `json:"name"`
 	Engine          string             `json:"engine"`
 	CurrentRevision int32              `json:"current_revision"`
 	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	CredentialMode  pgtype.Text        `json:"credential_mode"`
+	ScopeOwnerID    uuid.UUID          `json:"scope_owner_id"`
+}
+
+type ModelProviderKeyTestResult struct {
+	ProviderID       uuid.UUID          `json:"provider_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Revision         int32              `json:"revision"`
+	KeySecretID      uuid.UUID          `json:"key_secret_id"`
+	KeyEnablementRev int64              `json:"key_enablement_rev"`
+	AuthResult       string             `json:"auth_result"`
+	ToolResult       pgtype.Text        `json:"tool_result"`
+	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
 }
 
 type ModelProviderProbeResult struct {
@@ -2079,6 +2092,7 @@ type User struct {
 	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
 	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
 	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
+	ClaudeProviderScopeID     pgtype.UUID        `json:"claude_provider_scope_id"`
 }
 
 type UserCrossCheckPin struct {
@@ -2105,6 +2119,7 @@ type UserSecret struct {
 	AnthropicRejectedAt        pgtype.Timestamptz `json:"anthropic_rejected_at"`
 	AnthropicSuccessGeneration int64              `json:"anthropic_success_generation"`
 	ProviderID                 pgtype.UUID        `json:"provider_id"`
+	ProviderScopeID            pgtype.UUID        `json:"provider_scope_id"`
 }
 
 type UserVault struct {

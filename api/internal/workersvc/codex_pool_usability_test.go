@@ -33,10 +33,6 @@ type poolFakeStore struct {
 	poolReadCalls int
 }
 
-// GetUserClaudeProviderSource: the scripted facts have no provider source (the null path).
-func (f *poolFakeStore) GetUserClaudeProviderSource(context.Context, uuid.UUID) (store.GetUserClaudeProviderSourceRow, error) {
-	return store.GetUserClaudeProviderSourceRow{}, nil
-}
 func (f *poolFakeStore) UserHasAnthropicToken(context.Context, uuid.UUID) (bool, error) {
 	return f.hasAnthropic, nil
 }
