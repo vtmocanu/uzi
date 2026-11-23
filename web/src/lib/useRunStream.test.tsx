@@ -1056,6 +1056,29 @@ describe("quiet account cooldown metadata", () => {
     expect(result.current.error).toBe("");
   });
 
+  it("re-reads a quiet waiting run every 60s so a weekly-limit warning appears (PRD #4123)", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: { ...fakeRun(), status: "queued" } });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    const afterMount = get.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(get).toHaveBeenCalledTimes(afterMount);
+    get.mockResolvedValue({ run: { ...fakeRun(), status: "queued",
+      weekly_limit: { tier: "warning", credential_key: "anthropic:a", credential_label: "work" } } as unknown as Run });
+    await act(async () => { await vi.advanceTimersByTimeAsync(50_000); });
+    expect(get).toHaveBeenCalledTimes(afterMount + 1);
+    expect((result.current.run as unknown as { weekly_limit?: { tier: string } })?.weekly_limit?.tier).toBe("warning");
+  });
+
+  it("never re-reads a terminal run on the quiet cadence", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: { ...fakeRun(), status: "completed" } });
+    renderHook(() => useRunStream("run-1"));
+    await flush();
+    const afterMount = get.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(130_000); });
+    expect(get).toHaveBeenCalledTimes(afterMount);
+  });
+
   it("refreshes quiet extension/class changes and lease expiry with no activity or new operations", async () => {
     const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: held() });
     const { result, unmount } = renderHook(() => useRunStream("run-1"));
