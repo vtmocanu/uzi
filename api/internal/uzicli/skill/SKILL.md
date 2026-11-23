@@ -334,6 +334,8 @@ uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <l
 uzi admin review stats
 uzi admin egress-profile list
 uzi admin egress-profile show <name>
+uzi admin provider list   # read-only: admin-shared provider definitions with selected-user and key counts
+uzi admin provider get <id|name>
 uzi skill status [--target claude|codex|all]
 uzi skill install [--force] [--target claude|codex|all]
 uzi skill install-hook [--target claude|codex|all]
@@ -1993,7 +1995,9 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
 - `uzi provider list|create|edit|test|retire|use` — your model providers: named
   Anthropic-compatible gateways Claude can be pointed at (docs: `uzi docs show providers`).
   `list` shows NAME, URL, AUTH, MODELS, KEY (`yes`/`no`/`disabled`), TEST (`<auth>/<tool>` or `-`)
-  and RETIRED; under `--json` it is `{enabled, providers, allowed_base_urls}`, and `enabled:false`
+  RETIRED and MANAGED BY (`admin` for a definition your admin shares, whose key is your own;
+  `edit` and `retire` refuse those, and a name shared by an owned and a shared definition needs
+  the id for `use`/`test`); under `--json` it is `{enabled, providers, allowed_base_urls}`, and `enabled:false`
   means the operator has not configured an allowlist. `create` needs `--name`, `--base-url`
   (exactly an allowlisted URL) and `--model haiku=<model>[:<window>]` (repeatable for sonnet,
   opus, fable). `edit` renames and/or replaces the whole model map. `test` prints the auth and

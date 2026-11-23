@@ -432,6 +432,11 @@ type FakeClient struct {
 	MarginCalls   int
 	LastMarginPts int
 
+	// SharedProviders drives AdminListSharedProviders and AdminGetSharedProvider (PRD #4324); an id
+	// not in the list is an ExitNotFound error, like the server's 404. SharedProviderGets counts gets.
+	SharedProviders    []apitypes.AdminSharedProviderDTO
+	SharedProviderGets int
+
 	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
 	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
 	// what the command sent.

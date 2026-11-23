@@ -385,6 +385,11 @@ type Client interface {
 	// unknown name is a 404 (exit 4).
 	AdminListEgressProfiles(ctx context.Context) ([]apitypes.EgressProfileDTO, error)
 	AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error)
+	// AdminListSharedProviders / AdminGetSharedProvider read the admin-shared provider definitions
+	// (PRD #4324): GET /api/admin/providers[/{id}], in the admin READ group (a uza_ token reads
+	// them). READ-ONLY: admin writes are cookie-only. A personal provider id is a 404 (exit 4).
+	AdminListSharedProviders(ctx context.Context) ([]apitypes.AdminSharedProviderDTO, error)
+	AdminGetSharedProvider(ctx context.Context, id string) (apitypes.AdminSharedProviderDTO, error)
 	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
 	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
 	// (category, target), attribution hidden — the reply is an unenveloped

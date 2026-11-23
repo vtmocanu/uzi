@@ -365,6 +365,29 @@ func (c *HTTPClient) AdminGetEgressProfile(ctx context.Context, name string) (ap
 	return env.EgressProfile, nil
 }
 
+// AdminListSharedProviders reads every admin-shared provider definition with its selected-user and
+// attached-key counts (PRD #4324): GET /api/admin/providers, envelope {"providers": [...]}.
+func (c *HTTPClient) AdminListSharedProviders(ctx context.Context) ([]apitypes.AdminSharedProviderDTO, error) {
+	var out apitypes.AdminSharedProviderListDTO
+	if err := c.get(ctx, "/api/admin/providers", &out); err != nil {
+		return nil, err
+	}
+	return out.Providers, nil
+}
+
+// AdminGetSharedProvider reads one shared definition by id (PRD #4324): GET
+// /api/admin/providers/{id}, envelope {"provider": {...}}. A personal provider id is the
+// server's 404 (exit 4).
+func (c *HTTPClient) AdminGetSharedProvider(ctx context.Context, id string) (apitypes.AdminSharedProviderDTO, error) {
+	var env struct {
+		Provider apitypes.AdminSharedProviderDTO `json:"provider"`
+	}
+	if err := c.get(ctx, "/api/admin/providers/"+url.PathEscape(id), &env); err != nil {
+		return apitypes.AdminSharedProviderDTO{}, err
+	}
+	return env.Provider, nil
+}
+
 func (c *HTTPClient) AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error) {
 	var out apitypes.AdminUsageDTO
 	if err := c.get(ctx, "/api/admin/usage", &out); err != nil {
