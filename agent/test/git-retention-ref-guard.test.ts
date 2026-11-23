@@ -279,6 +279,36 @@ describe("issue4627 owedTipRetained", { timeout: 300_000 }, () => {
     assert.equal(everything(), before);
   });
 
+  it("an exact pin and candidate record with the owed context file deleted is not retained, writing nothing", async () => {
+    await trackedHead();
+    for (const n of fs.readdirSync(owedDir()).filter((x) => x.startsWith("context-"))) fs.unlinkSync(path.join(owedDir(), n));
+    const before = everything();
+    const spy = recordEvents();
+    let result;
+    try { result = await cache.owedTipRetained(bare, opts); } finally { spy.restore(); }
+    // Ownership itself needs the context file, so this is refused before the retention comparison.
+    assert.deepEqual(result, { kind: "not_updated", reason: "ownership_unknown" });
+    assert.deepEqual(spy.events, []);
+    assert.equal(everything(), before);
+  });
+
+  it("an exact pin and candidate record with the owed context file differing from the canonical record is unretained, writing nothing", async () => {
+    await trackedHead();
+    const names = fs.readdirSync(owedDir()).filter((x) => x.startsWith("context-"));
+    assert.ok(names.length > 0);
+    for (const n of names) {
+      const file = path.join(owedDir(), n);
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      // Same fields and values, other key order: still parses and still names the same context, but is not the stored form.
+      fs.writeFileSync(file, JSON.stringify(Object.fromEntries(Object.entries(record).reverse())) + "\n", { mode: 0o600 });
+    }
+    const before = everything();
+    const spy = recordEvents();
+    try { assert.deepEqual(await cache.owedTipRetained(bare, opts), { kind: "unretained" }); } finally { spy.restore(); }
+    assert.deepEqual(spy.events, []);
+    assert.equal(everything(), before);
+  });
+
   it("a tip reachable only through an episode ref is unretained, writing nothing", async () => {
     const h = await trackedHead();
     gitIn(bare, ["update-ref", "-d", owedRef(h)]);

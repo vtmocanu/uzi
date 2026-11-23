@@ -468,21 +468,25 @@ test("an episode-only or pending owner reservation change keeps the generic erro
   }
 });
 
-test("a blocked journal keeps the generic error under a typed mismatch, whatever the blocker", async () => {
-  for (const blocker of ["adoption_failed", "budget_exhausted"] as const) {
+test("a blocked journal never surfaces the typed error: renewable blockers get the generic error, others today's blocked error", async () => {
+  for (const blocker of ["adoption_failed", "budget_exhausted", "clock_invalid", "capture_failed"] as const) {
     const f = ownerFixture();
     await f.reserve();
     if (blocker === "adoption_failed") await f.block();
-    else {
+    else if (blocker === "budget_exhausted") {
       await f.reserve(); await f.reserve();
       await assert.rejects(f.reserve(), /budget/);
+    } else {
+      const j = f.read();
+      await f.recreate().blockRecoveryEpisode(f.bare, f.branch, f.key, j, blocker, j.recovery);
     }
     assert.equal(f.read().recovery!.blocker, blocker);
     setBare(f, JSON.stringify([f.bare, "9", "2"]));
     const before = JSON.stringify([...f.values]);
+    const renewable = blocker === "adoption_failed" || blocker === "budget_exhausted";
     await assert.rejects(f.reserve(2, 1, 8), (error: unknown) => {
       assert.ok(!(error instanceof RecoveryOwnerBareIdentityError), blocker);
-      assert.match((error as Error).message, GENERIC);
+      assert.match((error as Error).message, renewable ? GENERIC : /^recovery episode is blocked$/);
       return true;
     });
     assert.equal(JSON.stringify([...f.values]), before);

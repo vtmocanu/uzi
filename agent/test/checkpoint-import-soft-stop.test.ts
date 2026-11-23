@@ -546,6 +546,29 @@ it("m3 D/F owned ancestor preservation finishes archive and promotion before a l
   } finally { f.fx.cleanup(); }
 });
 
+it("m3 D/F owned ancestor with its setup-created pin present completes and issues no update-ref for that pin", async () => {
+  const f = await fixture();
+  try {
+    const ancestor = f.commit("owned ancestor"); await f.fetch();
+    const childBranch = branch + "/new";
+    git(f.clone, "update-ref", "-d", "refs/heads/" + branch);
+    git(f.clone, "branch", childBranch, f.base);
+    const pinRef = "refs/uzi-owed/" + run + "/" + ancestor;
+    assert.equal(git(f.bare, "rev-parse", pinRef), ancestor, "the setup fetch created the pin");
+    const options = { context: { ...f.options.context, generation: 2, branch: childBranch } };
+    let pinWrites = 0, promoted = false;
+    const spawner = realSpawner(args => {
+      if (args.includes("update-ref") && args.includes(pinRef)) pinWrites++;
+      if (args.includes("update-ref") && args.includes("refs/uzi-runner/" + childBranch)) promoted = true;
+    });
+    await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+      () => f.cache.fetchAgentBranch(f.bare, f.clone, childBranch, run, options));
+    assert.equal(pinWrites, 0, "the existing same-SHA pin is reused with no write");
+    assert.equal(promoted, true);
+    assert.equal(git(f.bare, "rev-parse", pinRef), ancestor);
+  } finally { f.fx.cleanup(); }
+});
+
 it("m3 unknown owner incoming pin settles after soft stop without adopting existing tracking", async () => {
   const f = await fixture();
   try {

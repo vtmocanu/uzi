@@ -12560,8 +12560,12 @@ export class GitCache {
         if (probedOld?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < probedOld.claimGeneration)) {
           throw new Error("stale recovery claim fence");
         }
-        // Step 3: every blocked journal keeps today's disposition (the generic binding error).
-        if (probedOld?.stage === "blocked") throw new Error("recovery owner binding changed");
+        // Step 3: a blocked journal keeps today's disposition: the blocked error before the owner read for
+        // a non-renewable blocker, the generic binding error for the two renewable ones.
+        if (probedOld?.stage === "blocked") {
+          if (probedOld.blocker !== "budget_exhausted" && probedOld.blocker !== "adoption_failed") throw new Error("recovery episode is blocked");
+          throw new Error("recovery owner binding changed");
+        }
         // Step 4: only the exact committed reservation may surface the typed error.
         if (probedOld === undefined || typedChange.record.state !== "committed" ||
             !ownerJournalMatches(typedChange.record, probed)) throw new Error("recovery owner binding changed");
