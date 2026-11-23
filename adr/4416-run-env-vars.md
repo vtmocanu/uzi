@@ -429,7 +429,11 @@ The split-across-files and elided-context patch gaps are closed by the `multi_li
      writer is known only from deployment records.
   4. Keep every affected or unknown journal retained until an explicit owner resolution is
      recorded for it, without copying the report's contents. Manual journal deletion is not a
-     retirement mechanism.
+     retirement mechanism. A running worker replays a pending journal on its own and retires it
+     once the api accepts it (`resolvePendingTerminal`, `agent/src/terminal-resolve.ts`), so take
+     the inventory before an upgraded worker starts on a source that may hold one. A journal that
+     was replayed before the inventory is resolved from the api-side record of the delivered
+     report, not treated as unaffected.
 
   The maintainers run this check through a private authenticated inventory with exact correlation
   against delivered history, and record metadata-only results with owner dispositions.
