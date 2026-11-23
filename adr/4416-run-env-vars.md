@@ -562,7 +562,9 @@ recovery described under R3.
 - **R1, a live runner-uid writer: fixed under the uid split.** A live runner-uid process can no
   longer rewrite the config or swap it between the worker's check and the CLI's read, because the
   directory and its file are worker-owned and the runner cannot write or move them (e2e above). A
-  live process can still plant files elsewhere under HOME, which the CLI does not read. With one
+  live process can still plant files elsewhere under HOME: configuration files there were not
+  applied in the probes, but the CLI does read the runner-writable `HOME/.claude/projects`
+  (transcripts, per-project memory) and `HOME/.claude/tasks` through the links, as before. With one
   uid the limit above applies.
 - **R2, a write during a running CLI: probed, `-p` mode only.** In the probe the config was not
   re-read during a running process (fake API returning 500, CLI retrying, no completed turn; SDK
@@ -586,8 +588,9 @@ recovery described under R3.
 
   Residual (accepted as documented): exit 1 is not proof of a planted entry. mkdir also exits 1 on
   ENOSPC, EDQUOT or EIO, and `setpriv` exits 1 when it cannot resolve the runner user (for example
-  under descriptor or memory exhaustion). Such a failure moves `.claude` aside once and refuses the
-  start; nothing is deleted, and that session's resume history stays in the aside copy.
+  under descriptor or memory exhaustion). Such a failure moves `.claude` aside once. The start is
+  then refused if the retry fails too, and otherwise proceeds with a fresh `.claude`; nothing is
+  deleted, and earlier sessions' resume history stays in the aside copy.
 
   Asides (`.claude.stale-*`, `.uzi-claude-config.stale-*`) are not
   reclaimed automatically in a HOME that is never torn down, such as the shared chat root; each

@@ -90,11 +90,15 @@
 // the start. That keeps a runner-planted target from refusing every later start of a HOME, the
 // shared chat HOME included. Residual: exit 1 is not proof of a planted entry. mkdir also exits 1
 // on ENOSPC/EDQUOT/EIO, and setpriv exits 1 when it cannot resolve the runner user (for example
-// under descriptor or memory exhaustion); such a failure moves `.claude` aside once (nothing is
-// deleted; that session's resume history stays in the aside copy) and the start is refused.
+// under descriptor or memory exhaustion); such a failure moves `.claude` aside once. The start is
+// then refused if the retry fails too, and otherwise proceeds with a fresh `.claude`; nothing is
+// deleted, and earlier sessions' resume history stays in the aside copy.
 //
-// Not reset any more: `<HOME>/.claude.json` and `<HOME>/.claude/*` are not read by the CLI, so
-// they are no longer replaced or removed.
+// Not reset any more: `<HOME>/.claude.json` and the configuration files under `<HOME>/.claude`
+// (`.config.json`, `settings.json`, `remote-settings.json`) were not applied in the probes once
+// CLAUDE_CONFIG_DIR is set, so they are no longer replaced or removed. The CLI does read the linked
+// `<HOME>/.claude/projects` (transcripts, per-project memory) and `<HOME>/.claude/tasks`, which stay
+// runner-writable data, as before this change.
 //
 // No HOME in the env: no-op (the probe-style spawns that carry no HOME do not start a CLI). A spawn
 // that carries a provider credential but no HOME is refused by spawnDetached (sdk-spawn.ts) before
@@ -227,8 +231,9 @@ function defaultMkdirAsRunner(args: readonly string[]): number {
   });
   // A spawn error, a signal or a timeout is transient: it refuses this start only, so a burst of
   // load never moves the shared chat root's transcripts aside. Only mkdir's own failure status 1
-  // (a planted file, an unsearchable directory) is returned as such; setpriv's own failures (126,
-  // 127 on a failed credential change or execve, e.g. RLIMIT_NPROC EAGAIN) are transient too.
+  // (a planted file, an unsearchable directory) is returned as such; setpriv's other failures (126,
+  // 127 on a failed credential change or execve, e.g. RLIMIT_NPROC EAGAIN) are transient too. Its
+  // user-lookup failure also exits 1 and is read as planted (see the header's Residual).
   if (r.error || r.signal || r.status === null) throw refuse("the runner mkdir of the .claude targets did not complete");
   if (r.status !== 0 && r.status !== MKDIR_PLANTED_STATUS) {
     throw refuse("the runner mkdir of the .claude targets did not complete");
@@ -281,7 +286,8 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => number,
         // (or an unsearchable .claude) shows up only as mkdir's own failure status 1. Only that moves
         // the HOME entry aside, once, and rebuilds; a second such exit refuses the start. Any other
         // status (setpriv's 126/127 on a failed credential change or execve under load, a seam's
-        // other value) is transient: it refuses this start and keeps .claude in place.
+        // other value) is transient: it refuses this start and keeps .claude in place. A setpriv
+        // user-lookup failure exits 1 and lands above (the header's Residual).
         if (status !== MKDIR_PLANTED_STATUS) throw refuse("the runner mkdir of the .claude targets did not complete");
         if (retriedAfterMkdirFailure) throw refuse("the runner could not create the .claude targets");
         retriedAfterMkdirFailure = true;
