@@ -386,7 +386,7 @@ type ReserveOverrideGrant struct {
 // pause records, from the owner's CURRENT reading of the credential the run spent. It returns nil when
 // the reserve is off (the threshold was cleared), where there is nothing to override.
 func ComputeReserveOverride(ctx context.Context, q *store.Queries, run store.Run, iv ReserveIntervals, now time.Time) (*ReserveOverrideGrant, error) {
-	snap, err := buildReserveSnapshot(ctx, q, run.UserID, now, reserveIntervals{claude: iv.Claude, codex: iv.Codex})
+	snap, err := buildReserveSnapshot(ctx, q, run.UserID, now, reserveIntervals{claude: iv.Claude, codex: iv.Codex}, false)
 	if err != nil {
 		return nil, err
 	}

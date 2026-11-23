@@ -150,12 +150,23 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		holdAnnounced := announced && existing.ParkKind.String == announcedKind &&
 			existing.LimitPausedAt.Valid && announcedAt.Valid &&
 			existing.LimitPausedAt.Time.Equal(announcedAt.Time)
-		tblocks, tfallback, tok := renderThreadBlocks(rc, base)
-		if pp != nil {
-			tblocks, tfallback, tok = publicationThreadBlocks(rc, *pp, base)
-		} else if tok && rc.Status == "completed" {
-			// Issue #3813: disclose a failed advisory Code cross-check on this same message.
-			tblocks, tfallback = withCodeCrossCheckAdvisory(tblocks, tfallback, n.codeCrossCheckAdvisory(ctx, rc))
+		// The thread line is composed only when it can be posted: an already-announced hold
+		// posts nothing, so it loads no weekly-limit snapshot either.
+		var (
+			tblocks   []slack.Block
+			tfallback string
+			tok       bool
+		)
+		if !holdAnnounced {
+			if pp != nil {
+				tblocks, tfallback, tok = publicationThreadBlocks(rc, *pp, base)
+			} else {
+				tblocks, tfallback, tok = renderThreadBlocks(rc, base, n.weeklyLimitFor(ctx, rc))
+				if tok && rc.Status == "completed" {
+					// Issue #3813: disclose a failed advisory Code cross-check on this same message.
+					tblocks, tfallback = withCodeCrossCheckAdvisory(tblocks, tfallback, n.codeCrossCheckAdvisory(ctx, rc))
+				}
+			}
 		}
 		if tok && !holdAnnounced {
 			if _, perr := n.poster.PostBlocks(ctx, existing.ChannelID, existing.RootTs, tfallback, tblocks); perr != nil {
@@ -937,7 +948,7 @@ func inProgressTitle(rc store.GetSlackRunContextRow) string {
 // (boundReason) before it becomes its own section. The MR link and deep link keep their
 // raw <url|label> markup (server/forge-derived, https-guarded), ScrubSecrets'd as a
 // no-op-on-clean last line of defense.
-func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Block, fallback string, ok bool) {
+func renderThreadBlocks(rc store.GetSlackRunContextRow, base string, wl *apitypes.WeeklyLimitDTO) (blocks []slack.Block, fallback string, ok bool) {
 	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
 	linkElem := func() (slack.MixedElement, bool) {
 		if u := runLink(base, rc.ID); u != "" {
@@ -1023,7 +1034,7 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		}
 		blocks = []slack.Block{threadSectionBlock(head)}
 		var ctxElems []slack.MixedElement
-		if detail := limitWaitDetail(rc); detail != "" {
+		if detail := limitWaitDetail(rc, wl); detail != "" {
 			ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
 		}
 		if el, has := linkElem(); has {
@@ -1032,7 +1043,7 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		if len(ctxElems) > 0 {
 			blocks = append(blocks, slack.NewContextBlock("slack_thread_limit_ctx", ctxElems...))
 		}
-		return blocks, fmt.Sprintf("%s · %s#%d", parkLabel, repo, iid(rc.IssueIid)), true
+		return blocks, fmt.Sprintf("%s · %s#%d", parkLabel, repo, iid(rc.IssueIid)) + ScrubSecrets(weeklyLimitSuffix(wl, "")), true
 
 	case "paused":
 		if iterationHold(rc) {
@@ -1057,13 +1068,17 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 			if n := len(decodeMilestoneIDs(rc.MilestonesCompleted)); n > 0 {
 				fmt.Fprintf(&detail, "after milestone %d · ", n)
 			}
-			detail.WriteString("usage reached your weekly reserve threshold · resumes when usage drops below it, or override with `uzi run resume " + rc.ID.String() + "`")
+			resume := "uzi run resume " + rc.ID.String()
+			detail.WriteString("usage reached your weekly reserve threshold · resumes when usage drops below it, or override with `" + resume + "`")
+			// The resume command is already in the sentence above, so the block adds its reason and
+			// any other fix, never the same command twice.
+			detail.WriteString(weeklyLimitSuffix(wl, resume))
 			ctxElems := []slack.MixedElement{threadMrkdwnElem(ScrubSecrets(detail.String()))}
 			if el, has := linkElem(); has {
 				ctxElems = append(ctxElems, el)
 			}
 			blocks = append(blocks, slack.NewContextBlock("slack_thread_reserve_ctx", ctxElems...))
-			return blocks, fmt.Sprintf("Paused · weekly usage reserve · %s#%d", repo, iid(rc.IssueIid)), true
+			return blocks, fmt.Sprintf("Paused · weekly usage reserve · %s#%d", repo, iid(rc.IssueIid)) + ScrubSecrets(weeklyLimitSuffix(wl, resume)), true
 		}
 		// PRD #1190 M1: an ordinary pause. The notifier has no pause-origin evidence, so
 		// the header stays neutral about who paused the run. The last checkpoint-published
@@ -1141,7 +1156,7 @@ func providerGatewayDetail(rc store.GetSlackRunContextRow) string {
 // own failure-reason composition does — the line never claims a fact uzi does not
 // have. A park with neither a window nor a stamp yields "", so the context block is
 // just the deep link (or omitted when no base URL resolves).
-func limitWaitDetail(rc store.GetSlackRunContextRow) string {
+func limitWaitDetail(rc store.GetSlackRunContextRow, wl *apitypes.WeeklyLimitDTO) string {
 	if providerGatewayPark(rc) {
 		return providerGatewayDetail(rc)
 	}
@@ -1173,7 +1188,55 @@ func limitWaitDetail(rc store.GetSlackRunContextRow) string {
 		}
 		fmt.Fprintf(&b, "(pause %d)", rc.LimitWaitCount)
 	}
+	if suffix := weeklyLimitSuffix(wl, ""); suffix != "" {
+		if b.Len() == 0 {
+			suffix = strings.TrimPrefix(suffix, " · ")
+		}
+		b.WriteString(suffix)
+	}
 	return b.String()
+}
+
+// weeklyLimitSuffix is the park line's weekly-limit addition: " · <reason> · `<command>`", each part
+// escaped for mrkdwn (the reason and the command carry owner-authored labels) and the command set in
+// a code span so a label's own markers stay literal. It is empty for a nil
+// block, so a park without one renders byte-identically to before. omitCommand names a command the
+// line already shows; it is skipped in favour of the next fix with one. A fix whose label is not
+// command-safe has no command: when no fix supplies one to show and some fix was withheld for that
+// reason, the line says to rename the token in Settings to get a copyable command.
+func weeklyLimitSuffix(wl *apitypes.WeeklyLimitDTO, omitCommand string) string {
+	if wl == nil {
+		return ""
+	}
+	out := " · " + EscapeMrkdwn(wl.ReasonText())
+	withheld := false
+	for _, f := range wl.Fix {
+		if f.Command != "" && f.Command != omitCommand {
+			// A Slack code span: the label inside the command may carry mrkdwn markers (a
+			// label like _prod_ would otherwise render italic, and a copied command would then
+			// name a different credential). Inside backticks the text is literal.
+			return out + " · `" + EscapeMrkdwn(f.Command) + "`"
+		}
+		if f.Command == "" && f.CommandUnavailable != "" {
+			withheld = true
+		}
+	}
+	if withheld {
+		out += " · " + EscapeMrkdwn("rename the token in Settings to get a copyable command")
+	}
+	return out
+}
+
+// weeklyLimitFor asks the wired weekly-limit source for the block of a seven_day limit_wait park or
+// a weekly-reserve pause; every other state, and an unwired notifier, gets nil (no suffix).
+func (n *Notifier) weeklyLimitFor(ctx context.Context, rc store.GetSlackRunContextRow) *apitypes.WeeklyLimitDTO {
+	if n.weeklyLimit == nil {
+		return nil
+	}
+	if !weeklyReserveHold(rc) && (rc.Status != "limit_wait" || !rc.RateLimitType.Valid || rc.RateLimitType.String != "seven_day") {
+		return nil
+	}
+	return n.weeklyLimit(ctx, rc.ID)
 }
 
 // slackLandingState derives the run's landing_state bucket (issue #1418) from the Slack

@@ -192,8 +192,7 @@ For `unknown`/exit 9 caused by `uzi run list` reporting "cannot reach", "no such
 `takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
 repo/branch. Recent is the newest terminal run finished within 24 hours, including failed
 and cancelled runs; `unknown` blocks branch work.
-The lookup uses the owner's latest 200 runs; older active runs and other owners' runs
-are outside its visibility, so `none` is not a global exclusion guarantee.
+`VISIBILITY=owner_only` means `none` is not factory-wide: references/merge-mechanics.md.
 
 Before any local fix, push, rebase or merge, refresh the snapshot. With an active ci_fix, decide
 with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`

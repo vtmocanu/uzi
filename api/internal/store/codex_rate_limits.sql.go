@@ -232,6 +232,53 @@ func (q *Queries) IsCodexEarlyResetCurrent(ctx context.Context, arg IsCodexEarly
 	return is_current, err
 }
 
+const isCodexWeeklyWarningCurrent = `-- name: IsCodexWeeklyWarningCurrent :one
+SELECT true::boolean AS is_current
+FROM codex_provider_account a
+WHERE a.user_id = $1 AND a.id = $2
+    AND a.generation = $3::bigint
+    AND a.credential_revision = $4::bigint
+    AND a.coord_state IN ('idle', 'committed')
+    AND NOT a.reauth_required AND a.recovery_sealed IS NULL
+    AND EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    AND $5::text <> ''
+    AND (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text = $5::text
+`
+
+type IsCodexWeeklyWarningCurrentParams struct {
+	UserID                     uuid.UUID `json:"user_id"`
+	ProviderAccountID          uuid.UUID `json:"provider_account_id"`
+	ObservedGeneration         int64     `json:"observed_generation"`
+	ObservedCredentialRevision int64     `json:"observed_credential_revision"`
+	EnablementSig              string    `json:"enablement_sig"`
+}
+
+// PRD #4123 M3: the weekly-warning twin of IsCodexEarlyResetCurrent, WITHOUT the owner's
+// notify_early_limit_reset opt-in (the warning is governed by the margin setting, not that
+// flag). Same authority fence; no row refuses delivery.
+func (q *Queries) IsCodexWeeklyWarningCurrent(ctx context.Context, arg IsCodexWeeklyWarningCurrentParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isCodexWeeklyWarningCurrent,
+		arg.UserID,
+		arg.ProviderAccountID,
+		arg.ObservedGeneration,
+		arg.ObservedCredentialRevision,
+		arg.EnablementSig,
+	)
+	var is_current bool
+	err := row.Scan(&is_current)
+	return is_current, err
+}
+
 const listCodexAccountRateLimits = `-- name: ListCodexAccountRateLimits :many
 SELECT
     u.id                         AS user_id,
@@ -699,7 +746,7 @@ func (q *Queries) RecordCodexAccountPollFailure(ctx context.Context, arg RecordC
 	return result.RowsAffected(), nil
 }
 
-const upsertCodexAccountRateLimits = `-- name: UpsertCodexAccountRateLimits :execrows
+const upsertCodexAccountRateLimits = `-- name: UpsertCodexAccountRateLimits :one
 
 WITH secret_mutation_lock AS MATERIALIZED (
     SELECT pg_advisory_xact_lock_shared(
@@ -745,6 +792,7 @@ ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
     attempt_error                = NULL,
     enablement_sig               = EXCLUDED.enablement_sig,
     updated_at                   = now()
+RETURNING last_success_at
 `
 
 type UpsertCodexAccountRateLimitsParams struct {
@@ -770,8 +818,8 @@ type UpsertCodexAccountRateLimitsParams struct {
 // rejects a reading for an account whose last codex_auth alias was unlinked/deleted between
 // observation and write (there is no longer a subscription to meter). INSERT ... SELECT ...
 // WHERE puts every fence in front of the write: a failed fence selects no row, so nothing
-// is written on EITHER the insert or the conflict path. :execrows — 0 rows means authority
-// moved, and the caller discards the reading rather than writing it stale.
+// is written on EITHER the insert or the conflict path. :one — pgx.ErrNoRows means a refused
+// write (authority moved), and the caller discards the reading rather than writing it stale.
 //
 // 🔴 ENABLEMENT fence (PRD #1732 D6/D13). A Codex reading describes an ACCOUNT, and an
 // account is live only while at least one ENABLED alias is linked to it, so the fence is
@@ -814,8 +862,8 @@ type UpsertCodexAccountRateLimitsParams struct {
 // revision, so a pre-disable reading is not shown after a re-enable. The same rule hides
 // the reading after a newly linked alias or a sibling's re-enable until the next successful
 // poll re-stamps it: conservative, since the account reading itself has not changed.
-func (q *Queries) UpsertCodexAccountRateLimits(ctx context.Context, arg UpsertCodexAccountRateLimitsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, upsertCodexAccountRateLimits,
+func (q *Queries) UpsertCodexAccountRateLimits(ctx context.Context, arg UpsertCodexAccountRateLimitsParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, upsertCodexAccountRateLimits,
 		arg.UserID,
 		arg.ProviderAccountID,
 		arg.Buckets,
@@ -824,8 +872,7 @@ func (q *Queries) UpsertCodexAccountRateLimits(ctx context.Context, arg UpsertCo
 		arg.AttemptStatus,
 		arg.EnablementSig,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var last_success_at pgtype.Timestamptz
+	err := row.Scan(&last_success_at)
+	return last_success_at, err
 }

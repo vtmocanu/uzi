@@ -118,7 +118,7 @@ func TestUpsertCodexAccountRateLimitsLiveDB(t *testing.T) {
 
 	upsert := func(acc uuid.UUID, gen, rev int64, buckets []byte, status string) int64 {
 		t.Helper()
-		n, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+		n, err := upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 			UserID: user, ProviderAccountID: acc, Buckets: buckets,
 			ObservedGeneration: gen, ObservedCredentialRevision: rev, AttemptStatus: status,
 			EnablementSig: codexEnablementSig(ctx, t, q, user, acc),
@@ -193,7 +193,7 @@ func TestRecordCodexAccountPollFailureLiveDB(t *testing.T) {
 
 	// --- failure AFTER a success preserves buckets + last_success_at ---
 	acc, _ := mkLinkedCodexAccount(ctx, t, pool, q, user, "aftersuccess", false)
-	if _, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+	if _, err := upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 		UserID: user, ProviderAccountID: acc, Buckets: []byte(`{"good":1}`),
 		ObservedGeneration: 0, ObservedCredentialRevision: 0, AttemptStatus: "ok",
 		EnablementSig: codexEnablementSig(ctx, t, q, user, acc),

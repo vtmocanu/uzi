@@ -317,8 +317,18 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 	if err != nil {
 		return publicationUnknown("forge_unknown")
 	}
-	if summary.IID != answer.Binding.MRIID || summary.State != forge.MRStateOpened ||
-		!safePublicationIdentifier(summary.SourceBranch) || summary.SourceBranch != req.Branch || !isSettleSHA(summary.HeadSHA) {
+	// Identity first: a summary that is not this run's bound MR on this branch never authorizes
+	// anything, whatever its state.
+	if summary.IID != answer.Binding.MRIID || !safePublicationIdentifier(summary.SourceBranch) ||
+		summary.SourceBranch != req.Branch || !isSettleSHA(summary.HeadSHA) {
+		return publicationUnknown("forge_mismatch")
+	}
+	terminal := false
+	switch summary.State {
+	case forge.MRStateOpened:
+	case forge.MRStateMerged, forge.MRStateClosed:
+		terminal = true
+	default:
 		return publicationUnknown("forge_mismatch")
 	}
 	txCtx, txCancel := context.WithTimeout(ctx, completedPublicationDeadline)
@@ -341,6 +351,9 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 	after, err := readPublicationSnapshot(txCtx, qt, params, "recheck")
 	if err != nil || !bytes.Equal(before, after) {
 		return publicationUnknown("authority_changed")
+	}
+	if terminal {
+		return s.stopTerminalPublication(ctx, txCtx, tx, qt, w, id, req, params, before, terminalTargetStopReason(summary.State))
 	}
 	if fallback {
 		slog.Info("publication context: unstamped completed source resolved non-closing", "event", "publication_context_unstamped_fallback",

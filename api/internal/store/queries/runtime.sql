@@ -14135,3 +14135,110 @@ UPDATE runs SET codex_switch_target_secret_id = sqlc.narg('secret_id')::uuid,
     codex_switch_target_account_revision = sqlc.narg('account_revision')::bigint
 WHERE id = @id AND user_id = @user_id AND credential_switch_requested_at IS NOT NULL
   AND credential_switch_generation = sqlc.narg('generation')::bigint AND harness = 'codex';
+
+-- name: StampTerminalTargetStop :execrows
+-- Issue #4616 publication-context backstop: a server-owned stop stamp for an active
+-- ci_fix / mr_rework run whose target MR is terminal. It inserts NO cancel input; the
+-- run's own publication path reads stop_kind and ends the run as cancelled. stop_kind IS
+-- NULL preserves any operator or earlier verdict (stop, cancel, auto_stopped) untouched.
+-- The worker/generation fence and the unreleased-claim check bind it to the live claim.
+UPDATE runs SET stop_kind = 'cancelled', stop_reason = @stop_reason::text,
+    failure_reason = NULL, fail_origin = NULL, updated_at = now()
+WHERE id = @id
+  AND worker_id = @worker_id
+  AND claim_generation = @claim_generation
+  AND claim_released_at IS NULL
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status IN ('claimed', 'running')
+  AND stop_kind IS NULL;
+
+-- name: StampTerminalTargetCancelInput :one
+-- Issue #4616 live-worker early cancel: stamp stop_kind AND enqueue the kind='cancel'
+-- steering input in ONE statement (the CreateStopVerdictInput atomicity pattern), so the
+-- stamp and the input the live worker drains can never diverge. A guard miss stamps
+-- nothing and inserts nothing, which surfaces as pgx.ErrNoRows: the caller treats that as
+-- a no-op. Parked/queued statuses are excluded (no live poller to drain the input);
+-- stop_kind IS NULL means a second call is a no-op, so no duplicate input is written.
+-- The input body reuses @stop_reason (same value as the stamped reason).
+WITH stamped AS (
+    UPDATE runs SET stop_kind = 'cancelled', stop_reason = @stop_reason::text,
+        failure_reason = NULL, fail_origin = NULL, updated_at = now()
+    WHERE runs.id = @id
+      AND runs.worker_id = @worker_id
+      AND runs.claim_generation = @claim_generation
+      AND runs.claim_released_at IS NULL
+      AND runs.kind IN ('ci_fix', 'mr_rework')
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled', 'queued', 'limit_wait',
+                              'pool_wait', 'recovery_wait', 'paused')
+      AND runs.stop_kind IS NULL
+    RETURNING runs.id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT stamped.id, 'cancel', @stop_reason::text FROM stamped
+RETURNING *;
+
+-- name: CancelRunServerSideForTerminalTarget :execrows
+-- Issue #4616 fenced non-live cancel: server-side cancel of an active ci_fix / mr_rework
+-- run (no live poller) whose verified target MR is terminal. Same lock-ordered CTE shape
+-- and terminal-run cleanup as CancelRunServerSide, but server-owned (no user_id) and
+-- fenced on the observed status and claim_generation (equality admits 0 for a
+-- never-claimed queued run) plus the target MR iid, so a run that moved since it was
+-- listed is left alone. stop_kind IS NULL: an existing stop_kind (operator cancel
+-- included) is never overwritten. failure_reason / fail_origin are cleared: a cancel is
+-- not a failure.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id
+      AND runs.status = @observed_status::text
+      AND runs.claim_generation = @observed_generation
+      AND runs.stop_kind IS NULL
+      AND runs.kind IN ('ci_fix', 'mr_rework')
+      AND ((runs.kind = 'ci_fix' AND runs.ci_fix_mr_iid = @mr_iid::bigint)
+           OR (runs.kind = 'mr_rework' AND runs.mr_iid = @mr_iid::bigint))
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    stop_reason = @stop_reason::text,
+    failure_reason = NULL, fail_origin = NULL,
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
+    updated_at = now()
+WHERE runs.id = @id
+  AND runs.status = @observed_status::text
+  AND runs.claim_generation = @observed_generation
+  AND runs.stop_kind IS NULL
+  AND runs.kind IN ('ci_fix', 'mr_rework')
+  AND ((runs.kind = 'ci_fix' AND runs.ci_fix_mr_iid = @mr_iid::bigint)
+       OR (runs.kind = 'mr_rework' AND runs.mr_iid = @mr_iid::bigint))
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);

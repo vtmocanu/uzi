@@ -16,6 +16,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api } from "../lib/api";
 import { UsageReserveSetting } from "../components/UsageReserveSetting";
+import { WeeklyWarningMarginSetting } from "../components/WeeklyWarningMarginSetting";
 import type { UserSettings, BindMode, Harness, ModelSettingCell, SecretMeta } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -545,6 +546,18 @@ export function RunDefaults() {
             about your 7-day window; its own component and endpoint, so its busy/error
             state never touches the two toggles above. */}
         <UsageReserveSetting />
+
+        {/* PRD #4123: the early-warning margin, counted back from the reserve above (or
+            100%). Its own endpoint and state; hidden until the settings read says what is
+            stored, and on a server that predates the setting. */}
+        {committedSettings?.weekly_warning_margin_pts !== undefined && (
+          <WeeklyWarningMarginSetting
+            saved={committedSettings.weekly_warning_margin_pts}
+            onSaved={(marginPts) =>
+              setCommittedSettings((current) => current && { ...current, weekly_warning_margin_pts: marginPts })
+            }
+          />
+        )}
       </Card>
 
       <Card className="space-y-4">

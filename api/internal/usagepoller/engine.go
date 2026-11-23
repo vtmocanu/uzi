@@ -89,6 +89,15 @@ type EarlyResetNotifier interface {
 	NotifyEarlyReset(ctx context.Context, userID, secretID uuid.UUID, enablementRev int64, expected, observed time.Time) (store.Notification, error)
 }
 
+// WeeklyWarner receives every accepted (fenced-written) Anthropic reading for the weekly-limit
+// warning (PRD #4123 M3). *weeklywarn.Warner satisfies it. pct and resetsAt are the reading's
+// 7-day window, syncedAt the exact instant the write persisted (microsecond precision), rev the
+// enablement revision it landed at. Optional and nil-safe; the call is best effort and never fails
+// the poll.
+type WeeklyWarner interface {
+	ObserveAnthropicWeekly(ctx context.Context, userID, secretID uuid.UUID, rev int64, pct *int16, resetsAt *time.Time, syncedAt time.Time)
+}
+
 // TokenOpener opens a user's Anthropic token via the vault path (PRD #53 D1/D3).
 // *secretopen.Opener satisfies it in production; tests inject a fake. Both the
 // tick and the poke open the row they already fetched. It returns
@@ -128,7 +137,14 @@ type Engine struct {
 	// notifier delivers the early-reset alert (PRD #1020 M3). Optional and nil-safe:
 	// nil (the default) means detection runs and logs but does not deliver.
 	notifier EarlyResetNotifier
+
+	// warner receives each written reading for the weekly-limit warning (PRD #4123 M3); nil by default.
+	warner WeeklyWarner
 }
+
+// SetWeeklyWarner wires the weekly-limit warning collaborator. Call once at startup, before the
+// engine runs.
+func (e *Engine) SetWeeklyWarner(w WeeklyWarner) { e.warner = w }
 
 // SetNotifier wires the early-reset alert collaborator (PRD #1020 M3). Call once at
 // startup, before the engine runs. A nil notifier
@@ -475,9 +491,11 @@ const earlyResetThreshold = 8 * time.Hour
 // while the poll was in flight) notifies nothing.
 func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev int64, notifyEarly bool, next anthropic.Reading) {
 	if !notifyEarly {
-		// Opt-out (or the default): upsert as today, no read, no fire. The write
-		// result is irrelevant here (nothing downstream depends on it), so ignore it.
-		_, _ = e.upsert(ctx, userID, secretID, rev, next)
+		// Opt-out (or the default): upsert as today, no read, no early-reset fire. Only the
+		// weekly-limit warning depends on the write result.
+		if written, syncedAt, err := e.upsert(ctx, userID, secretID, rev, next); err == nil && written {
+			e.observeWeekly(ctx, userID, secretID, rev, next, syncedAt)
+		}
 		return
 	}
 
@@ -502,9 +520,11 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev in
 	// (0 rows) is silent for the stronger reason: the credential was disabled, or
 	// moved to a new revision, after this poll started, so the reading is not its
 	// owner's current state and must alert nothing.
-	if written, err := e.upsert(ctx, userID, secretID, rev, next); err != nil || !written {
+	written, syncedAt, err := e.upsert(ctx, userID, secretID, rev, next)
+	if err != nil || !written {
 		return
 	}
+	e.observeWeekly(ctx, userID, secretID, rev, next, syncedAt)
 
 	if !fire {
 		return
@@ -527,6 +547,16 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev in
 		}
 		e.logger.Error("usage poller: notify early reset", "user", userID.String(), "error", nerr)
 	}
+}
+
+// observeWeekly hands a written reading to the weekly-limit warning, after the fenced write and only
+// then (PRD #4123 M3). It is independent of the early-reset opt-in.
+func (e *Engine) observeWeekly(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading, syncedAt time.Time) {
+	if e.warner == nil {
+		return
+	}
+	pct := int16(r.SevenDay.Pct) //nolint:gosec // G115: a rate-limit percentage (0-100), the same conversion as pgInt2
+	e.warner.ObserveAnthropicWeekly(ctx, userID, secretID, rev, &pct, r.SevenDay.ResetsAt, syncedAt)
 }
 
 // earlyResetFires is the D8 predicate. With T = prev.SevenDayResetsAt, it fires iff
@@ -570,8 +600,10 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 // upsert overwrites ONE TOKEN's gauge row (PRD #53 D4, repointed by #104 M5).
 // synced_at is stamped now. It reports whether the row was written: false with a
 // nil error means the D13 fence refused it (PRD #1732), because the token is
-// disabled or its enablement revision is no longer rev.
-func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, error) {
+// disabled or its enablement revision is no longer rev. It also returns the exact instant it
+// wrote as synced_at, truncated to microseconds (the column's precision), so a downstream
+// consumer (PRD #4123 M3) compares against the persisted value; zero when not written.
+func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, time.Time, error) {
 	// An account without a 5-hour window (r.FiveHour nil) stores NULL pct + reset,
 	// never a fabricated 0%.
 	var fhPct pgtype.Int2
@@ -580,6 +612,7 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int
 		fhPct = pgInt2(r.FiveHour.Pct)
 		fhReset = r.FiveHour.ResetsAt
 	}
+	syncedAt := e.now().UTC().Truncate(time.Microsecond)
 	n, err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     secretID,
 		UserID:           userID,
@@ -588,15 +621,18 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int
 		SevenDayPct:      pgInt2(r.SevenDay.Pct),
 		SevenDayResetsAt: pgconv.TimePtr(r.SevenDay.ResetsAt),
 		Source:           pgconv.Text(r.Source),
-		SyncedAt:         pgconv.Time(e.now().UTC()),
+		SyncedAt:         pgconv.Time(syncedAt),
 		EnablementRev:    rev,
 	})
 	if err != nil {
 		// The token id is safe to log — it is a row identifier, never the credential.
 		e.logger.Error("usage poller: upsert", "user", userID.String(), "secret", secretID.String(), "error", err)
-		return false, err
+		return false, time.Time{}, err
 	}
-	return n > 0, nil
+	if n == 0 {
+		return false, time.Time{}, nil
+	}
+	return true, syncedAt, nil
 }
 
 // The backoff map is keyed by SECRET id since M5 (it was user id under PRD #53's

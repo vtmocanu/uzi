@@ -723,6 +723,12 @@ const realApi = {
       threshold_pct: thresholdPct,
       pause_running: pauseRunning,
     }),
+  // Set the current user's weekly-limit warning margin (PRD #4123), an integer 0..50 with
+  // 0 = off. Session identity only. Returns the stored value; GET /me/settings reads it back.
+  setWeeklyWarningMargin: (marginPts: number) =>
+    request<{ weekly_warning_margin_pts: number }>("PUT", "/me/weekly-warning-margin", {
+      margin_pts: marginPts,
+    }),
   // Flip the current user's early-limit-reset Slack alert opt-in (PRD #1020 M4/M5).
   // Session identity only — the body carries no user id. Returns the updated user.
   setNotifyEarlyReset: (enabled: boolean) =>

@@ -2075,6 +2075,7 @@ type User struct {
 	CodexTaskReviewModel      pgtype.Text        `json:"codex_task_review_model"`
 	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
 	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
+	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
 }
 
 type UserCrossCheckPin struct {
@@ -2122,6 +2123,20 @@ type VaultBrowserSlot struct {
 	TokenVersion int32              `json:"token_version"`
 	VaultEpoch   int64              `json:"vault_epoch"`
 	Generation   int64              `json:"generation"`
+}
+
+type WeeklyLimitAlert struct {
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	AnthropicSecretID pgtype.UUID        `json:"anthropic_secret_id"`
+	CodexAccountID    pgtype.UUID        `json:"codex_account_id"`
+	ObservedAt        pgtype.Timestamptz `json:"observed_at"`
+	AnchorReset       pgtype.Timestamptz `json:"anchor_reset"`
+	AnchorPct         pgtype.Float8      `json:"anchor_pct"`
+	AnchorBucket      pgtype.Text        `json:"anchor_bucket"`
+	AnchorMulti       bool               `json:"anchor_multi"`
+	Warned            bool               `json:"warned"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Worker struct {

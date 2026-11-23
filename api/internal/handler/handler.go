@@ -161,6 +161,7 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
+	weeklyLimit          weeklyLimitSource // owner-only weekly-limit block (PRD #4123); nil = no block
 	heldSvc              heldPublisher     // test seam for WorkerRunHeldPublication; nil = wsvc
 	terminalSvc          terminalPublisher // test seam for WorkerRunTerminalPreservation; nil = wsvc
 	// catalogDefaults is the test seam for the settings cell's Codex catalog default read

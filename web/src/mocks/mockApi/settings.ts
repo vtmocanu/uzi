@@ -24,7 +24,7 @@ import {
   THEME_POLARITY,
   type Theme,
 } from "../../lib/theme";
-import { daysAgo, mockBuildInfo } from "../data";
+import { daysAgo, mockBuildInfo, MOCK_WEEKLY_WARNING_MARGIN_PTS } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
@@ -136,6 +136,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
   // "default". Tolerantly validated like default_harness, so no storage-key bump.
   codex_account_mode: "auto",
+  // PRD #4123: the weekly-limit warning margin, at the server's column default.
+  weekly_warning_margin_pts: MOCK_WEEKLY_WARNING_MARGIN_PTS,
 };
 // Persisted pins override these fresh-demo seeds on reload.
 if (mockScenario() === "cross-check-mixed") {
@@ -562,6 +564,12 @@ function releaseCheckStatus(): ReleaseCheckStatus {
 }
 
 let userSettings: UserSettings = loadedSettings.userSettings;
+
+// PRD #4123: the stored weekly-limit warning margin; the run mocks read it so margin 0 hides
+// the near-limit blocks exactly as the server does (park explanations stay).
+export function mockWeeklyWarningMarginPts(): number {
+  return userSettings.weekly_warning_margin_pts ?? MOCK_WEEKLY_WARNING_MARGIN_PTS;
+}
 
 // PRD #1551 D3: the effective-harness lane the deprecated default_model projects to and
 // bridges through. A codex pin resolves to Codex, a claude pin to Claude; with no pin it
@@ -1985,6 +1993,23 @@ export const settingsApi = {
     u.weekly_reserve_pct = thresholdPct;
     u.weekly_reserve_pause_running = pauseRunning;
     return delay({ user: { ...u } }, 200);
+  },
+
+  // ── Weekly-limit warning margin (PRD #4123 module 6) ─────────────────────────
+  // Mirrors PUT /api/me/weekly-warning-margin (handler/weekly_warning_margin.go): margin_pts
+  // is required and must be an integer 0..50 (0 = off); a rejected value writes nothing. The
+  // response is the stored value alone. 400 messages match the server.
+  setWeeklyWarningMargin: async (marginPts: number) => {
+    requireSession();
+    if (marginPts === undefined) {
+      throw new ApiError(400, "margin_pts is required (an integer 0..50)");
+    }
+    if (typeof marginPts !== "number" || !Number.isInteger(marginPts) || marginPts < 0 || marginPts > 50) {
+      throw new ApiError(400, "margin_pts must be an integer from 0 to 50");
+    }
+    userSettings = { ...userSettings, weekly_warning_margin_pts: marginPts };
+    persistSettings();
+    return delay({ weekly_warning_margin_pts: marginPts }, 200);
   },
 
   // ── Early-limit-reset Slack alert opt-in (PRD #1020 M4/M5) ────────────────────

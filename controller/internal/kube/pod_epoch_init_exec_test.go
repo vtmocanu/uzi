@@ -110,9 +110,25 @@ func newEpochInitHost(t *testing.T) *epochInitHost {
 	h := &epochInitHost{t: t, node: node, data: filepath.Join(root, "data"), nix: filepath.Join(root, "nix"),
 		src: seedSource(t), marker: markerFileWith(t, "toolchain"), layout: filepath.Join(root, "layout"),
 		helper: filepath.Join(root, "helper.py"), python: python}
+	// A setgid temp parent (e.g. GOTMPDIR) makes new dirs inherit S_ISGID and its
+	// group, which Mkdir's mode cannot clear; pin the unsafe 0o700 baseline explicitly.
 	for _, p := range []string{h.data, h.nix} {
 		if err := os.Mkdir(p, 0o700); err != nil {
 			t.Fatal(err)
+		}
+		if err := os.Chown(p, -1, os.Getgid()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o700); err != nil { //nolint:gosec // G302: private test directory; clears inherited setgid, keeps owner search permission.
+			t.Fatal(err)
+		}
+		st, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok || st.Mode() != os.ModeDir|0o700 || int(sys.Gid) != os.Getgid() {
+			t.Fatalf("fixture temp dir not normalised: %s mode=%v (%v)", p, st.Mode(), st.Sys())
 		}
 	}
 	h.write(h.helper, epochFixture)

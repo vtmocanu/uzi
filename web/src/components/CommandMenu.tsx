@@ -144,6 +144,7 @@ const RUN_DECISION_VIEW = {
   plan: { hint: "Plan review", icon: <KindIcon kind="plan" /> },
   question: { hint: "Question", icon: <KindIcon kind="question" /> },
   park: { hint: "Parked", icon: <KindIcon kind="park" /> },
+  limit: { hint: "Weekly limit", icon: <KindIcon kind="limit" /> },
   pr: { hint: "Pull request", icon: <KindIcon kind="pr" /> },
 } as const;
 

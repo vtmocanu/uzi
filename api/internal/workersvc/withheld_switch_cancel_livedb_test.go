@@ -401,6 +401,7 @@ func TestWithheldSwitchCancelContractLiveDB(t *testing.T) {
 			pipeline_ref,mr_iid,target_run_id,claim_generation,credential_switch_requested_at,credential_switch_generation)
 			VALUES ($1,$2,$3,'mr_rework','t','d','running',now(),$4,'agent/issue-3974-rework',4242,$5,1,now(),1)`,
 			rework, w.userID, uuid.UUID(lead.RepoID.Bytes), w.leadWorker.ID, w.lead)
+		w.svc.SetTxBeginner(w.env.pool) // the fenced terminal-target cancel runs in one transaction
 		if err := w.svc.CancelReworkForMR(w.env.ctx, uuid.UUID(lead.RepoID.Bytes), 4242, "mr closed"); err != nil {
 			t.Fatal(err)
 		}

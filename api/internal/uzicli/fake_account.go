@@ -288,6 +288,15 @@ func (f *FakeClient) SetUsageReserve(_ context.Context, thresholdPct *int, pause
 	return apitypes.UserDTO{WeeklyReservePct: thresholdPct, WeeklyReservePauseRunning: pauseRunning}, nil
 }
 
+func (f *FakeClient) SetWeeklyWarningMargin(_ context.Context, marginPts int) (int, error) {
+	f.MarginCalls++
+	f.LastMarginPts = marginPts
+	if f.Err != nil {
+		return 0, f.Err
+	}
+	return marginPts, nil
+}
+
 func (f *FakeClient) ListMemory(context.Context) ([]apitypes.AgentMemoryDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err

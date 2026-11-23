@@ -2,15 +2,18 @@ package handler
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,13 +62,44 @@ type publishTransport struct {
 	proto  int
 	// entered is when the latest request reached the router (UnixNano), after its headers were
 	// read and so no earlier than the server began reading it: a lower bound for the handler's start.
-	entered atomic.Int64
+	entered       atomic.Int64
+	handshakeDone atomic.Bool
+}
+
+// slowFirstWriteListener delays the first server TLS write on each test connection.
+type slowFirstWriteListener struct {
+	net.Listener
+	delay time.Duration
+}
+
+func (l slowFirstWriteListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &slowFirstWriteConn{Conn: c, delay: l.delay}, nil
+}
+
+type slowFirstWriteConn struct {
+	net.Conn
+	once  sync.Once
+	delay time.Duration
+}
+
+func (c *slowFirstWriteConn) Write(p []byte) (int, error) {
+	c.once.Do(func() { time.Sleep(c.delay) })
+	return c.Conn.Write(p)
 }
 
 // publishTransportServer serves WorkerRunPublish on a chi router (worker injected like the real
 // middleware) next to a sibling route that does not extend its deadlines. http2 selects TLS with
 // HTTP/2 and the server's own client; otherwise plain HTTP/1.1 without keep-alives.
 func publishTransportServer(t *testing.T, http2 bool, base time.Duration, stub *publishStub) *publishTransport {
+	t.Helper()
+	return publishTransportServerWithTLSDelay(t, http2, base, stub, 0)
+}
+
+func publishTransportServerWithTLSDelay(t *testing.T, http2 bool, base time.Duration, stub *publishStub, delay time.Duration) *publishTransport {
 	t.Helper()
 	box := newBox(t)
 	sealed, err := box.Seal([]byte("pat"))
@@ -93,6 +127,9 @@ func publishTransportServer(t *testing.T, http2 bool, base time.Duration, stub *
 	srv.Config.ReadTimeout, srv.Config.WriteTimeout = base, base
 	pt.srv = srv
 	if http2 {
+		if delay > 0 {
+			srv.Listener = slowFirstWriteListener{srv.Listener, delay}
+		}
 		srv.EnableHTTP2 = true
 		srv.StartTLS()
 		pt.client = srv.Client()
@@ -114,7 +151,10 @@ func (pt *publishTransport) post(t *testing.T, path string, body io.Reader) (*ht
 		t.Fatal(err)
 	}
 	req.Header.Set("X-Uzi-Checkpoint-Tip", validTip)
-	return pt.client.Do(req)
+	trace := &httptrace.ClientTrace{TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+		pt.handshakeDone.Store(err == nil)
+	}}
+	return pt.client.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 }
 
 // eachProto runs fn as an HTTP/1.1 and an HTTP/2 subtest.
@@ -143,20 +183,27 @@ func wantPublished(t *testing.T, resp *http.Response, after time.Duration) {
 // 1: a service call that outlives the base WriteTimeout still delivers its answer.
 func TestWorkerRunPublishSlowServiceOutlivesBaseTimeout(t *testing.T) {
 	eachProto(t, func(t *testing.T, http2 bool) {
-		base := scalePublishBudgets(t, 100) // base 150 ms; upload 0.6 s, context 2.1 s, grace 0.15 s
+		// Keep the cold TLS setup budget above the injected delay. The
+		// previous 100 ms handshake limit could expire before router entry.
+		base := scalePublishBudgets(t, 25) // base 600 ms; TLS handshake 400 ms
 		stub := &publishStub{}
 		stub.fn = func(ctx context.Context, _ pushbroker.Options) (pushbroker.Result, error) {
-			time.Sleep(base * 4) // 600 ms: past the base timeout, inside the context budget
+			entered := time.Now()
+			time.Sleep(2 * base) // past the base write timeout, inside the context budget
+			if elapsed := time.Since(entered); elapsed <= base {
+				t.Errorf("publisher ran for %v, want longer than the base write timeout %v", elapsed, base)
+			}
 			if ctx.Err() != nil {
 				t.Errorf("service context ended early: %v", ctx.Err())
 			}
 			return pushbroker.Result{Ref: "refs/uzi-checkpoints/agent/issue-42"}, nil
 		}
-		pt := publishTransportServer(t, http2, base, stub)
+		pt := publishTransportServerWithTLSDelay(t, http2, base, stub, 200*time.Millisecond)
 		start := time.Now()
 		resp, err := pt.post(t, "/publish", strings.NewReader("pack"))
 		if err != nil {
-			t.Fatalf("the answer did not arrive: %v", err)
+			t.Fatalf("the answer did not arrive after %v (TLS ready=%t, router entered=%t, broker calls=%d): %v",
+				time.Since(start), pt.handshakeDone.Load(), pt.entered.Load() != 0, stub.calls.Load(), err)
 		}
 		defer func() { _ = resp.Body.Close() }()
 		wantProto(t, resp, pt)

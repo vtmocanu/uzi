@@ -5,6 +5,11 @@ import { daysAgo, minsAgo } from "./time";
 
 // ── Users ────────────────────────────────────────────────────────────────────
 
+// PRD #4123: the server's default weekly-limit warning margin (users.weekly_warning_margin_pts,
+// DEFAULT 15). It lives on the settings read (GET /me/settings), not on User, so the mock seeds
+// its settings blob from this.
+export const MOCK_WEEKLY_WARNING_MARGIN_PTS = 15;
+
 export const mockAdmin: User = {
   id: "u-admin",
   email: "vlad@uzi.local",

@@ -150,7 +150,7 @@ else
 fi
 
 # Issue #2665: a ready server exposes the public Docker/Go seams without waiting
-# for real LiveDB tests. Each scenario is bounded to ten package calls plus the
+# for real LiveDB tests. Each scenario is bounded to eleven package calls plus the
 # optional handler call; a failed scenario is recorded without blocking siblings.
 READYBIN="$TMP/ready-bin"
 mkdir -p "$READYBIN"
@@ -265,7 +265,7 @@ assert_case() {
 }
 
 # Explicit expected order, independent of the runner's PKGS array.
-expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller hostedsvc issuetrackersvc runlifecycle)
+expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller hostedsvc issuetrackersvc runlifecycle weeklywarn)
 for scenario in success optional retained-missing-run retained-missing-closure-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
   case_dir="$TMP/$scenario"
   mkdir -p "$case_dir"
@@ -310,8 +310,8 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
   case "$scenario" in
     success|optional)
       assert_case "successful sweep exits zero" test "$rc" -eq 0
-      assert_case "aggregate log contains all ten passes" \
-        grep -qF 'LiveDB: 10 passed, 0 skipped' "$case_dir/output"
+      assert_case "aggregate log contains all eleven passes" \
+        grep -qF 'LiveDB: 11 passed, 0 skipped' "$case_dir/output"
       assert_case "success banner appears" grep -qF 'Store integration tests passed.' "$case_dir/output"
       assert_case "successful log files removed" \
         test -z "$(find "$case_dir" -name '*-log.*' -print)"
@@ -342,7 +342,7 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
           ;;
         top-skip|sub-skip)
           assert_case "aggregate guard retains and rejects an early skip at any depth" \
-            grep -qF 'LiveDB: 10 passed, 1 skipped' "$case_dir/output"
+            grep -qF 'LiveDB: 11 passed, 1 skipped' "$case_dir/output"
           ;;
       esac
       ;;
@@ -433,20 +433,20 @@ for scenario in checkpoint-success checkpoint-disabled checkpoint-go-fail checkp
     fi
     calls="$(wc -l < "$case_dir/go.log")"
     if [ "$enabled" = 1 ]; then
-      assert_case "normal ten packages plus checkpoint leg" test "$calls" -eq 11
+      assert_case "normal eleven packages plus checkpoint leg" test "$calls" -eq 12
       assert_case "checkpoint command bounded, uncached, serialized, race-enabled" \
         grep -Fq "$(printf '\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t15m\t-run\t^TestTaskCheckpointCrossWorkerRecoveryE2E$\t./internal/workersvc/...')" "$case_dir/go.log"
       proof_log="$(awk '/^Task checkpoint recovery proof log: / {print $NF}' "$case_dir/output")"
       assert_case "checkpoint log retained" test -f "$proof_log"
       case "$proof_log" in "$ROOT/.uzi/scratch/"*) rm -f "$proof_log" ;; esac
     else
-      assert_case "non-1 value leaves ten-package sweep unchanged" test "$calls" -eq 10
+      assert_case "non-1 value leaves eleven-package sweep unchanged" test "$calls" -eq 11
     fi
   done
 done
 
 # Issue #4232: UZI_STORE_IT_GROUP splits the sweep across CI's two LiveDB jobs.
-# Unset (above, and the explicit `unset` case here) runs all ten packages; the two
+# Unset (above, and the explicit `unset` case here) runs all eleven packages; the two
 # named groups partition them; the empty string, any other value, and an opt-in proof
 # with the workersvc group refuse with exit 2 before Docker starts a database.
 group_line() { # $1 dsn, $2 package, $3 timeout
@@ -483,9 +483,9 @@ for scenario in group-unset group-workersvc group-rest group-rest-proof group-em
   dsn="$(cut -f1 "$case_dir/go.log" | head -n 1)"
   : > "$case_dir/expected"
   case "$scenario" in
-    group-unset) want=(store:30m handler:20m forgesvc:10m schedsvc:10m workersvc:45m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m) ;;
+    group-unset) want=(store:30m handler:20m forgesvc:10m schedsvc:10m workersvc:45m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m weeklywarn:10m) ;;
     group-workersvc) want=(workersvc:45m) ;;
-    group-rest|group-rest-proof) want=(store:30m handler:20m forgesvc:10m schedsvc:10m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m) ;;
+    group-rest|group-rest-proof) want=(store:30m handler:20m forgesvc:10m schedsvc:10m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m weeklywarn:10m) ;;
   esac
   for entry in "${want[@]}"; do group_line "$dsn" "${entry%%:*}" "${entry#*:}" >> "$case_dir/expected"; done
   if [ "$scenario" = group-rest-proof ]; then

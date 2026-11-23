@@ -141,6 +141,19 @@ export function useRunStream(runId: string) {
     });
   }, 10_000, `${runId}:${run?.status ?? ""}`);
 
+  // PRD #4123: a quiet non-terminal run (queued, awaiting_input, a park...) gets no socket frame
+  // when a usage poll moves its credential into or out of the weekly warning margin, so re-read
+  // its metadata on a slower visible cadence. Same single outstanding quiet read as above.
+  usePollWhileVisible(() => {
+    if (run?.id !== runId || isTerminalRun(run.status) || ["claimed", "running", "awaiting_approval"].includes(run.status)) return;
+    if (quietReadRef.current) return quietReadRef.current;
+    const pending = readRun(true);
+    quietReadRef.current = pending;
+    return pending.finally(() => {
+      if (quietReadRef.current === pending) quietReadRef.current = null;
+    });
+  }, 60_000, `${runId}:${run?.status ?? ""}:quiet`);
+
   // refreshOnKinds is set only by the debounced catch-up: the mount and onopen paths
   // already re-read the run themselves, so they skip it rather than fetch it twice.
   const replay = useCallback(async (refreshOnKinds = false, passive = false) => {

@@ -76,6 +76,8 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			p.Println(settingsNowSummaryLine(settings))
 			// PRD #3522: the weekly usage reserve, off when no threshold is set.
 			p.Println(settingsReserveLine(settings))
+			// PRD #4123: the weekly-limit early-warning margin.
+			p.Println(warningMarginLine(settings.WeeklyWarningMarginPts))
 			// Issue #3719: how new Codex runs choose a login.
 			p.Println(settingsCodexModeLine(settings))
 			p.Println(settingsDefaultHarnessLine(settings.DefaultHarness))
@@ -87,6 +89,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	get.Flags().StringVar(&scheduleID, "schedule", "", "preview what firing this saved schedule now would use (schedule id)")
 	cmd.AddCommand(get)
 	cmd.AddCommand(newSettingsReserveCmd(env, gf))
+	cmd.AddCommand(newSettingsWarningMarginCmd(env, gf))
 	cmd.AddCommand(newSettingsCodexModeCmd(env, gf))
 	cmd.AddCommand(newSettingsHarnessOverflowCmd(env, gf))
 	cmd.AddCommand(newSettingsSetCmd(env, gf))

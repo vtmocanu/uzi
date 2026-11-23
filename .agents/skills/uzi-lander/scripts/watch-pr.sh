@@ -289,11 +289,16 @@ while [ "$i" -lt "$MAX" ]; do
     unk uzi_repo_list
   elif [ -z "$repo_id" ]; then
     CI_FIX_ACTIVE=none; CI_FIX_RECENT=none
-  elif rl2=$(uzi run list --json 2>/dev/null) && is_array "$rl2"; then
-    mrw_active=$(printf '%s' "$rl2" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-      '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr
-                   and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || unk mr_rework
-    if ! ci_fix_snapshot "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" 2>/dev/null; then unk ci_fix; fi
+  elif branch_writers_read "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" "$PR" \
+       && writers_summarize; then
+    print_writers_visibility
+    # CI_FIX_RECENT stays owner-scoped: reuse the fallback's run list, else read it separately.
+    rl2=$WRITERS_RUNS
+    [ -n "$rl2" ] || rl2=$(uzi run list --json 2>/dev/null || echo 'x')
+    if ci_fix_snapshot "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" 2>/dev/null \
+       && writers_include_owner_active "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" "$PR" 2>/dev/null; then
+      mrw_active=$WRITERS_MRW_COUNT
+    else unk ci_fix; fi
   else
     unk mr_rework
     unk ci_fix

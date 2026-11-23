@@ -6,6 +6,7 @@ import {
   GROUP_BUTTON,
   GROUP_PREVIEW,
   groupTitle,
+  limitCredentialNoun,
   mergeOverviewRows,
   planDetail,
   openPrs,
@@ -543,12 +544,14 @@ describe("groupTitle and GROUP_BUTTON", () => {
     expect(groupTitle("question", 2)).toBe("2 runs need your input");
     expect(groupTitle("park", 1)).toBe("1 run waits on you");
     expect(groupTitle("park", 4)).toBe("4 runs wait on you");
+    expect(groupTitle("limit", 1)).toBe("1 run on it has a fix you can apply");
+    expect(groupTitle("limit", 2)).toBe("2 runs on it have a fix you can apply");
     expect(groupTitle("pr", 1)).toBe("1 pull request is open for your review");
     expect(groupTitle("pr", 5)).toBe("5 pull requests are open for your review");
   });
 
   it("names the group buttons and the preview size", () => {
-    expect(GROUP_BUTTON).toEqual({ plan: "Review plans", question: "Open runs", park: "Resume runs", pr: "Review PRs" });
+    expect(GROUP_BUTTON).toEqual({ plan: "Review plans", question: "Open runs", park: "Resume runs", limit: "Show runs", pr: "Review PRs" });
     expect(GROUP_PREVIEW).toBe(3);
   });
 });
@@ -589,5 +592,107 @@ describe("decisionCount", () => {
     );
     expect(decisionCount(items)).toBe(4);
     expect(decisionCount([])).toBe(0);
+  });
+});
+
+// PRD #4123: the `limit` decision kind, from the summary row's compact weekly_limit.
+describe("overviewDecisions limit kind (PRD #4123)", () => {
+  const at = (m: number) => `2026-07-05T12:${String(m).padStart(2, "0")}:00Z`;
+  const wl = (key: string, label: string, tier: "warning" | "notice" = "warning") => ({
+    tier,
+    credential_key: key,
+    credential_label: label,
+  });
+  const limits = (runs: RunSummaryItem[]) =>
+    overviewDecisions(runs).flatMap((d) => (d.kind === "limit" ? [d.run.id] : []));
+
+  it("lists warning-tier runs with the Review fix verb, oldest first, before open PRs", () => {
+    const got = overviewDecisions([
+      run({ id: "pr", status: "completed", kind: "issue", mr_iid: 1, mr_state: "opened", created_at: at(1), finished_at: at(2) }),
+      run({ id: "late", status: "running", status_since: at(9), weekly_limit: wl("anthropic:a", "A") }),
+      run({ id: "early", status: "running", status_since: at(3), weekly_limit: wl("anthropic:a", "A") }),
+    ]);
+    expect(got.map((d) => (d.kind === "held" ? "held" : [d.run.id, d.kind, d.verb]))).toEqual([
+      ["early", "limit", "Review fix"],
+      ["late", "limit", "Review fix"],
+      ["pr", "pr", "Review PR"],
+    ]);
+  });
+
+  it("gives notice-tier runs and runs without a block no row", () => {
+    expect(
+      limits([
+        run({ id: "notice", status: "running", weekly_limit: wl("anthropic:a", "A", "notice") }),
+        run({ id: "none", status: "running" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("gives a timed limit_wait and a weekly-reserve pause (both automatic) their limit row", () => {
+    expect(
+      limits([
+        run({ id: "timed", status: "limit_wait", rate_limit_type: "seven_day", weekly_limit: wl("anthropic:a", "A") }),
+        run({ id: "reserve", status: "paused", hold_reason: "weekly_reserve", weekly_limit: wl("codex:c1", "C1") }),
+      ]),
+    ).toEqual(["timed", "reserve"]);
+  });
+
+  it("never lists a run twice: an owner park, plan or question keeps its own row", () => {
+    const got = overviewDecisions([
+      run({ id: "owner-park", status: "paused", weekly_limit: wl("anthropic:a", "A") }),
+      run({ id: "plan", status: "awaiting_approval", weekly_limit: wl("anthropic:a", "A") }),
+      run({ id: "ask", status: "awaiting_input", weekly_limit: wl("anthropic:a", "A") }),
+      run({ id: "running", status: "running", weekly_limit: wl("anthropic:a", "A") }),
+    ]);
+    const ids = got.flatMap((d) => (d.kind === "held" ? [] : [d.run.id]));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(got.find((d) => d.kind !== "held" && d.run.id === "owner-park")?.kind).toBe("park");
+    expect(got.filter((d) => d.kind === "limit").map((d) => (d.kind === "held" ? "" : d.run.id))).toEqual(["running"]);
+  });
+
+  it("ignores a block on a terminal run", () => {
+    expect(limits([run({ id: "done", status: "failed", weekly_limit: wl("anthropic:a", "A") })])).toEqual([]);
+  });
+
+  it("counts each limit run as a decision", () => {
+    expect(
+      decisionCount(
+        overviewDecisions([
+          run({ id: "a", status: "running", weekly_limit: wl("anthropic:a", "A") }),
+          run({ id: "b", status: "running", weekly_limit: wl("anthropic:a", "A") }),
+        ]),
+      ),
+    ).toBe(2);
+  });
+});
+
+describe("decisionRows limit grouping (PRD #4123)", () => {
+  const wl = (key: string, label: string) => ({ tier: "warning" as const, credential_key: key, credential_label: label });
+  const rowsOf = (runs: RunSummaryItem[]) => decisionRows(overviewDecisions(runs));
+
+  it("groups by credential_key, one row even for a single run", () => {
+    const rows = rowsOf([
+      run({ id: "r1", status: "running", status_since: "2026-07-05T12:01:00Z", weekly_limit: wl("anthropic:a", "A") }),
+      run({ id: "r2", status: "running", status_since: "2026-07-05T12:02:00Z", weekly_limit: wl("codex:c1", "C1") }),
+      run({ id: "r3", status: "running", status_since: "2026-07-05T12:03:00Z", weekly_limit: wl("anthropic:a", "A") }),
+    ]);
+    expect(rows.map((r) => (r.type === "limit" ? [r.credentialKey, r.credentialLabel, r.items.map((i) => i.run.id)] : r.type))).toEqual([
+      ["anthropic:a", "A", ["r1", "r3"]],
+      ["codex:c1", "C1", ["r2"]],
+    ]);
+  });
+
+  it("keeps two credentials that share a label as separate rows", () => {
+    const rows = rowsOf([
+      run({ id: "r1", status: "running", weekly_limit: wl("anthropic:a", "work") }),
+      run({ id: "r2", status: "running", weekly_limit: wl("anthropic:b", "work") }),
+    ]);
+    expect(rows.map((r) => (r.type === "limit" ? r.credentialKey : r.type))).toEqual(["anthropic:a", "anthropic:b"]);
+  });
+
+  it("names the credential's vendor from the key prefix only", () => {
+    expect(limitCredentialNoun("anthropic:sec-1")).toBe("Token");
+    expect(limitCredentialNoun("codex:acct-1")).toBe("Codex account");
+    expect(limitCredentialNoun("future:x")).toBe("Credential");
   });
 });
