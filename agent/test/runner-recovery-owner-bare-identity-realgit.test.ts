@@ -13,7 +13,10 @@ import { RequestError } from "../src/client.js";
 import * as gitModule from "../src/git.js";
 import type { MemoryParkRecord } from "../src/git.js";
 import type { ClaimResponse } from "../src/protocol.js";
+import { reapRunProcesses } from "../src/run-procs.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
+import { treeDigest } from "./restore-route-rig.js";
+import { createHash } from "node:crypto";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -25,6 +28,21 @@ const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYS
 
 function command(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: "pipe", env: GIT_ENV }).trim();
+}
+/** Names and bytes of every work-tree file outside `.git` (git's own bookkeeping legitimately moves under a read). */
+function workTree(dir: string): string {
+  const h = createHash("sha256");
+  const walk = (d: string): void => {
+    for (const name of fs.readdirSync(d).sort()) {
+      if (d === dir && name === ".git") continue;
+      const p = path.join(d, name);
+      const st = fs.lstatSync(p);
+      h.update(`${path.relative(dir, p)}\0${st.mode}\0`);
+      if (st.isDirectory()) walk(p); else if (st.isFile()) h.update(fs.readFileSync(p));
+    }
+  };
+  walk(dir);
+  return h.digest("hex");
 }
 /** The whole bare: its local config and its refs, as bytes. */
 const dumps = (bare: string) => ({ config: command(bare, "config", "--local", "--list"), refs: command(bare, "for-each-ref") });
@@ -49,7 +67,11 @@ interface Rig {
   sequence: string[];
   /** How many guidance lines the feed already held when the first park was requested. */
   guidanceAtPark?: number;
-  counts: { models: number; captures: number; ledger: number; blocks: number; reserves: number; rejections: unknown[]; holds: number; freeCaptures: number };
+  counts: { models: number; captures: number; ledger: number; blocks: number; reserves: number; rejections: unknown[]; holds: number; freeCaptures: number;
+    /** Teardown seams a claim exit can reach: clone retire/remove (git), process kill and reap, cache drop (executor). */
+    retires: number; removes: number; kills: number; reaps: number; reclaims: number };
+  /** The run's own HOME dir, seeded with a marker file before the claim. */
+  home: string;
   flights: Flight[];
   ackHook?: AckHook;
   mismatch: { on: boolean; which: Which };
@@ -114,7 +136,9 @@ async function build(t: TestContext, o: RigOptions = {}): Promise<Rig> {
   const rig: Rig = {
     claim, bare, clonePath: clone.path, branch: clone.branch, key, journalKey, ownerKey, registry: new ActiveRunRegistry(), logs,
     parks: [], sequence: [],
-    counts: { models: 0, captures: 0, ledger: 0, blocks: 0, reserves: 0, rejections: [], holds: 0, freeCaptures: 0 },
+    counts: { models: 0, captures: 0, ledger: 0, blocks: 0, reserves: 0, rejections: [], holds: 0, freeCaptures: 0,
+      retires: 0, removes: 0, kills: 0, reaps: 0, reclaims: 0 },
+    home: path.join(homeDir, claim.run_id),
     flights: [], mismatch: { on: false, which: "dev" },
     journal: () => JSON.parse(command(bare, "config", journalKey)) as Journal,
     setJournal: mutate => {
@@ -160,10 +184,21 @@ async function build(t: TestContext, o: RigOptions = {}): Promise<Rig> {
     if (isPark) return { status: body.status, recoveryCause: body.recovery_cause } as never;
     return report(runId, body, signal);
   });
+  // Counted, never replaced: the clone teardown a claim exit performs.
+  for (const [name, field] of [["retireRunnerClone", "retires"], ["removeRunnerClone", "removes"]] as const) {
+    const original = (seam[name] as (...a: unknown[]) => Promise<unknown>).bind(git);
+    t.mock.method(seam, name, async (...args: unknown[]) => { rig.counts[field]++; return original(...args); });
+  }
   rig.execute = async () => {
     api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
-    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId),
-      executor: { run: async () => { rig.counts.models++; throw new Error("must not model"); } } }),
+    // Executor-side teardown seams are observed through counting stubs, so a claim exit that kills, reaps or drops caches shows.
+    const executor = {
+      run: async () => { rig.counts.models++; throw new Error("must not model"); },
+      killAgentTree: () => { rig.counts.kills++; },
+      reapAttributedProcesses: async (opts: Parameters<typeof reapRunProcesses>[3]) => { rig.counts.reaps++; return reapRunProcesses(rig.home, undefined, [], opts); },
+      reclaimCachesInPlace: async () => { rig.counts.reclaims++; return { dropped: [], absent: [], failed: [], skipped: [] }; },
+    };
+    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId), executor: executor as never }),
       fakeGitlab().gitlab, undefined, logs.logger, { recoveryRetryMs: 1, activeRuns: rig.registry, ...o.runnerExtra });
     const priv = runner as unknown as Record<string, (...a: unknown[]) => unknown>;
     // The hold exists only with the fix; a runner without it is observed through the other counters.
@@ -518,7 +553,26 @@ describe("a base-class bare-identity error from any other owner read inside the 
     void r;
     return state;
   };
-  const assertTodaysDisposition = (r: Rig, ownerBefore: string): void => {
+  /** The predecessor's state before the claim: the run HOME (seeded here), the bare's refs, and the clone's HEAD and work tree. */
+  const predecessor = (r: Rig) => {
+    fs.mkdirSync(path.join(r.home, "sub"), { recursive: true });
+    fs.writeFileSync(path.join(r.home, "sub", "transcript.jsonl"), "session bytes\n");
+    return { homeDigest: treeDigest(r.home), refs: command(r.bare, "for-each-ref"), head: command(r.clonePath, "rev-parse", "HEAD"),
+      status: command(r.clonePath, "status", "--porcelain"), cloneDigest: workTree(r.clonePath) };
+  };
+  const assertTodaysDisposition = (r: Rig, before: ReturnType<typeof predecessor>): void => {
+    // No teardown: nothing retired or removed the clone, killed or reaped a process, or dropped a cache; HOME and the clone are as before.
+    assert.equal(r.counts.retires, 0, "no clone retire");
+    assert.equal(r.counts.removes, 0, "no clone removal");
+    assert.equal(r.counts.kills, 0, "no process kill");
+    assert.equal(r.counts.reaps, 0, "no attributed-process reap");
+    assert.equal(r.counts.reclaims, 0, "no cache drop");
+    assert.equal(fs.existsSync(r.home), true, "the run HOME still exists");
+    assert.equal(treeDigest(r.home), before.homeDigest, "the run HOME is unchanged");
+    assert.equal(command(r.bare, "for-each-ref"), before.refs, "the bare's refs are byte-identical");
+    assert.equal(command(r.clonePath, "rev-parse", "HEAD"), before.head, "the clone's HEAD is unchanged");
+    assert.equal(command(r.clonePath, "status", "--porcelain"), before.status, "the clone's work tree status is unchanged");
+    assert.equal(workTree(r.clonePath), before.cloneDigest, "the clone's work tree is unchanged");
     // Behaviour first, so a baseline that holds fails on the hold and not on the missing class.
     assert.equal(r.counts.holds, 0, "not held");
     assert.equal(guidance(r).length, 0, "no storage-identity guidance line");
@@ -536,12 +590,12 @@ describe("a base-class bare-identity error from any other owner read inside the 
     assert.equal(r.counts.freeCaptures, 0, "no quiescence capture");
     assert.equal(fs.existsSync(r.clonePath), true, "custody kept");
     assert.equal(fs.readFileSync(path.join(r.clonePath, "retained.txt"), "utf8"), "local retained work\n");
-    void ownerBefore;
   };
 
   it("the identity changes between the probe and the ordinary owner read: today's preservation_failed, nothing held", async t => {
     const r = await build(t);
     const ownerBefore = r.rawOwner();
+    const pre = predecessor(r);
     const state = scope(t, r);
     const seam = git as any;
     const real = seam.checkedRecovery.bind(git);
@@ -553,7 +607,7 @@ describe("a base-class bare-identity error from any other owner read inside the 
     });
     await r.execute();
     assert.equal(first, false, "the flip happened inside the reservation");
-    assertTodaysDisposition(r, ownerBefore);
+    assertTodaysDisposition(r, pre);
     assert.equal(r.rawOwner(), ownerBefore, "the owner record is untouched: the ordinary read refused before any write");
     FAIL_SHAPE(r);
   });
@@ -562,6 +616,7 @@ describe("a base-class bare-identity error from any other owner read inside the 
     it(`the identity changes right after the ${name} write: the readback's base error takes today's preservation_failed route`, async t => {
       const r = await build(t);
       const ownerBefore = r.rawOwner();
+      const pre = predecessor(r);
       const state = scope(t, r);
       const seam = git as unknown as { runGit(bare: string, args: string[], ...rest: unknown[]): Promise<string> };
       const real = seam.runGit.bind(git);
@@ -576,7 +631,7 @@ describe("a base-class bare-identity error from any other owner read inside the 
       });
       await r.execute();
       assert.equal(flipped, true, "the flip followed the owner-record write");
-      assertTodaysDisposition(r, ownerBefore);
+      assertTodaysDisposition(r, pre);
       OWNER_SHAPE(r, name, ownerBefore);
       FAIL_SHAPE(r);
     });
