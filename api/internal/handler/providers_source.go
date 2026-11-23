@@ -168,7 +168,8 @@ func (h *Handler) setMyProviderSource(w http.ResponseWriter, r *http.Request, en
 			httpx.ErrorReason(w, http.StatusConflict,
 				providerSourceUnusableMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
 		case isPGForeignKeyViolation(err, "users_claude_provider_fkey"), isPGForeignKeyViolation(err, "users_codex_provider_fkey"):
-			// The provider was deleted after the lock, or is not usable by the caller.
+			// Defensive backstop: the share lock blocks a delete, and a delete that committed first
+			// yields no row (404 above), so this only fires if the provider is unusable by the caller.
 			writeProviderError(w, errProviderNotFound)
 		case writeProviderError(w, err):
 		default:

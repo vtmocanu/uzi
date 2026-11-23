@@ -75,23 +75,6 @@ type AdminSharedProviderListDTO struct {
 	Providers []AdminSharedProviderDTO `json:"providers"`
 }
 
-// AdminSharedProviderCreateRequest is the POST /api/admin/providers body. The engine is Claude
-// only; base_url and auth_style are fixed at creation.
-type AdminSharedProviderCreateRequest struct {
-	Name      string      `json:"name"`
-	Engine    string      `json:"engine,omitempty"`
-	Protocol  string      `json:"protocol,omitempty"`
-	BaseURL   string      `json:"base_url"`
-	AuthStyle string      `json:"auth_style"`
-	ModelMap  ModelMapDTO `json:"model_map"`
-}
-
-// AdminSharedProviderPatchRequest is the PATCH /api/admin/providers/{id} body: name and/or model map.
-type AdminSharedProviderPatchRequest struct {
-	Name     *string      `json:"name,omitempty"`
-	ModelMap *ModelMapDTO `json:"model_map,omitempty"`
-}
-
 // ProviderCreateRequest is the POST /api/me/providers body. It never carries a key: the key is
 // added from the web Settings only.
 type ProviderCreateRequest struct {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
@@ -660,9 +661,10 @@ func awaitDone(t *testing.T, done chan *httptest.ResponseRecorder, what string) 
 	}
 }
 
-// A select that holds the definition's share lock blocks an admin retire or model-map edit until it
-// commits, so a run is never frozen on a revision edited away under it.
-func TestSharedProviderSelectHoldsAdminEditLiveDB(t *testing.T) {
+// SQL lock-conflict pin only: a test transaction takes the share lock itself (it does not drive the
+// select route) and shows an admin retire or edit waits for it. The route-level fences are
+// TestSharedProviderSelectWaitsForAdminHoldLiveDB and TestSharedProviderAdminWaitsForSelectLiveDB.
+func TestSharedProviderShareLockConflictsWithAdminEditSQLPinLiveDB(t *testing.T) {
 	for _, op := range []struct {
 		name, method, suffix, body string
 	}{
@@ -691,6 +693,159 @@ func TestSharedProviderSelectHoldsAdminEditLiveDB(t *testing.T) {
 				t.Fatalf("admin %s = %d %s", op.name, rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// A select whose admin op holds the definition first waits for it (the real select route). The held op
+// is a retire (the select then reads "retired", 409, and leaves no selection) or a rename, which takes
+// FOR NO KEY UPDATE and so does NOT conflict with the users FK's KEY SHARE: only the route's own
+// LockModelProviderForShare can make the select wait for it.
+func TestSharedProviderSelectWaitsForAdminHoldLiveDB(t *testing.T) {
+	for _, held := range []string{"retire", "rename"} {
+		t.Run(held, func(t *testing.T) {
+			s := newSharedFx(t, true)
+			ctx := context.Background()
+			s.b.putKeyFor(t, s.shared.ID, testProviderKey)
+			tx, err := s.f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			q := store.New(tx)
+			pid := uuid.MustParse(s.shared.ID)
+			if _, err := q.LockSharedModelProviderForEdit(ctx, pid); err != nil {
+				t.Fatal(err)
+			}
+			if held == "retire" {
+				_, err = q.RetireSharedModelProvider(ctx, pid)
+			} else {
+				_, err = q.RenameSharedModelProvider(ctx, store.RenameSharedModelProviderParams{ID: pid, Name: "held-rename-" + uuid.NewString()[:8]})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := blockedRequest(cookieReqPrepared(t, s.b.router, http.MethodPut, "/api/me/providers/claude-source", s.b.jwt, `{"provider_id":"`+s.shared.ID+`"}`))
+			assertBlocked(t, done, "select")
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			rec := awaitDone(t, done, "select")
+			if held == "retire" {
+				if rec.Code != http.StatusConflict || providerReason(t, rec) != "provider_source_unusable" || !strings.Contains(rec.Body.String(), "retired") {
+					t.Fatalf("select after a committed retire = %d %s, want 409 retired", rec.Code, rec.Body.String())
+				}
+				if got := s.b.sourceInSettings(t); got != nil {
+					t.Fatalf("a refused select left source %s", *got)
+				}
+				var n int
+				if err := s.f.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE id = $1 AND claude_provider_id IS NULL`, s.b.user).Scan(&n); err != nil || n != 1 {
+					t.Fatalf("users.claude_provider_id not NULL: n=%d err=%v", n, err)
+				}
+				return
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("select after a committed rename = %d %s, want 200", rec.Code, rec.Body.String())
+			}
+			if got := s.b.sourceInSettings(t); got == nil || *got != s.shared.ID {
+				t.Fatalf("source = %v, want the shared definition", got)
+			}
+		})
+	}
+}
+
+// afterShareLockTx wraps a real transaction and, right after the select route's
+// LockModelProviderForShare statement ran, parks until released.
+type afterShareLockTx struct {
+	pgx.Tx
+	held    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (x *afterShareLockTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	row := x.Tx.QueryRow(ctx, sql, args...)
+	if strings.Contains(sql, "-- name: LockModelProviderForShare ") {
+		x.once.Do(func() {
+			close(x.held)
+			<-x.release
+		})
+	}
+	return row
+}
+
+// A real select that already holds the share lock makes a real admin retire wait; the selection then
+// commits and the source reads as retired.
+func TestSharedProviderAdminWaitsForSelectLiveDB(t *testing.T) {
+	s := newSharedFx(t, true)
+	s.b.putKeyFor(t, s.shared.ID, testProviderKey)
+	hook := &afterShareLockTx{held: make(chan struct{}), release: make(chan struct{})}
+	s.f.h.secretBeginTx = func(c context.Context) (pgx.Tx, error) {
+		tx, err := s.f.pool.BeginTx(c, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			return nil, err
+		}
+		if hook.Tx == nil {
+			hook.Tx = tx
+			return hook, nil
+		}
+		return tx, nil
+	}
+	defer func() { s.f.h.secretBeginTx = nil }()
+	var once sync.Once
+	releaseSelect := func() { once.Do(func() { close(hook.release) }) }
+	defer releaseSelect()
+
+	sel := blockedRequest(cookieReqPrepared(t, s.b.router, http.MethodPut, "/api/me/providers/claude-source", s.b.jwt, `{"provider_id":"`+s.shared.ID+`"}`))
+	select {
+	case <-hook.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the select never reached its share lock")
+	}
+	retire := blockedRequest(cookieReqPrepared(t, s.f.router, http.MethodPost, adminProvidersPath+"/"+s.shared.ID+"/retire", s.admin.jwt, ""))
+	assertBlocked(t, retire, "admin retire")
+	releaseSelect()
+	if rec := awaitDone(t, sel, "select"); rec.Code != http.StatusOK {
+		t.Fatalf("select = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	if rec := awaitDone(t, retire, "admin retire"); rec.Code != http.StatusOK {
+		t.Fatalf("admin retire = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	if got := s.b.sourceInSettings(t); got == nil || *got != s.shared.ID {
+		t.Fatalf("the selection did not persist: %v", got)
+	}
+	if got := s.b.getProvider(t, s.shared.ID); !got.Retired {
+		t.Errorf("provider after retire = %+v, want retired", got)
+	}
+}
+
+// Admin create, edit and retire each write one provider_audit line (actor and provider) and none carries
+// key material.
+func TestSharedProviderAdminAuditLiveDB(t *testing.T) {
+	s := newSharedFx(t, false)
+	logs := captureProviderAudit(t)
+	s.shared = s.createShared(t, "audit-"+uuid.NewString()[:8], "bearer")
+	s.b.putKeyFor(t, s.shared.ID, testProviderKey)
+	path := adminProvidersPath + "/" + s.shared.ID
+	if rec := cookieReq(t, s.f.router, http.MethodPatch, path, s.admin.jwt, `{"model_map":{"haiku":{"model":"h7"}}}`); rec.Code != http.StatusOK {
+		t.Fatalf("edit = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, s.f.router, http.MethodPost, path+"/retire", s.admin.jwt, ""); rec.Code != http.StatusOK {
+		t.Fatalf("retire = %d %s", rec.Code, rec.Body.String())
+	}
+	for _, action := range []string{"admin_create", "admin_edit", "admin_retire"} {
+		want := fmt.Sprintf("action=%s actor_id=%s provider_id=%s", action, s.admin.user, s.shared.ID)
+		found := false
+		for _, l := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(l, "provider_audit") && strings.Contains(l, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no provider_audit line %q in:\n%s", want, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), testProviderKey) {
+		t.Errorf("the log carries key material")
 	}
 }
 

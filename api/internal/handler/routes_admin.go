@@ -310,7 +310,8 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// Admin-shared provider writes (PRD #4324): create, name/model-map edit, retire, guarded
 			// delete. Cookie-only admin writes, so a uza_ Bearer 401s before the handler and the CLI
 			// stays read-only. Base URL and auth style are fixed at creation. No limiter, no
-			// per-user lock: a local write that takes the definition row lock only.
+			// per-user lock: a local write (create takes the advisory catalogue lock; edit, retire and
+			// delete take the definition row lock first).
 			r.Post("/providers", h.AdminCreateSharedProvider)
 			r.Patch("/providers/{id}", h.AdminPatchSharedProvider)
 			r.Post("/providers/{id}/retire", h.AdminRetireSharedProvider)

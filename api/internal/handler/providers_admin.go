@@ -20,10 +20,10 @@ import (
 // user attaches their own key through the ordinary key routes. Reads are a RequireAdminRO surface (a
 // uza_ token may list and show); every write is cookie-only (RequireAuth + RequireAdmin).
 //
-// Locking: every admin transaction here takes the definition row lock FIRST and nothing else. None of
-// them takes the per-user secret-mutation lock (withSecretLock): a recipient's select takes that lock,
-// then the definition FOR SHARE, so an admin path that held the definition and then asked for a per-user
-// lock would cycle with it.
+// Locking: create takes the advisory catalogue lock; edit, retire and delete take the definition row
+// lock first. None of them takes the per-user secret-mutation lock (withSecretLock): a recipient's
+// select takes that lock, then the definition FOR SHARE, so an admin path that held the definition and
+// then asked for a per-user lock would cycle with it.
 
 const (
 	// maxSharedProviders is the cap on shared definitions across all admins, retired ones included.
