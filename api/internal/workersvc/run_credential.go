@@ -183,6 +183,11 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		harness = harnessClaude
 	}
 
+	// Frozen provider authority applies before either harness switch path.
+	if providerBoundRun(run) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
+	}
+
 	if harness == harnessCodex {
 		return s.requestCodexCredentialSwitch(ctx, run, mode, secretID)
 	}
@@ -194,9 +199,6 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// frozen provider key), whatever the mode, and no switch of a vendor run to `default` while the
 	// owner's Claude source is a provider. Checked before the status dispatch, so nothing is written.
 	// This covers `uzi run set-token` and `uzi approve --token`, which is a client-side SetRunCredential.
-	if providerBoundRun(run) {
-		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
-	}
 	resolved, err := s.validateRunSwitchOverride(ctx, userID, run.Kind, harness, mode, secretID)
 	if err != nil {
 		return SetRunCredentialResult{}, err
@@ -603,6 +605,9 @@ var ErrCodexSwitchIneligible = errors.New("codex credentials can be switched onl
 // requestCodexCredentialSwitch writes only a pending target. The live binding
 // remains authoritative until a separately negotiated apply commits.
 func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed store.Run, mode string, secretID *uuid.UUID) (SetRunCredentialResult, error) {
+	if providerBoundRun(observed) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
+	}
 	if observed.Status == "claimed" {
 		return SetRunCredentialResult{}, ErrCredentialSwitchClaimAssembling
 	}
@@ -637,6 +642,9 @@ func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed sto
 	if w.UserID != observed.UserID || run.UserID != observed.UserID || run.ClaimGeneration != observed.ClaimGeneration ||
 		run.ClaimReleasedAt.Valid || !applyLiveStatus(run.Status) || run.Kind == "job" || run.Kind == "cross_check" {
 		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	if providerBoundRun(run) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
 	}
 	if !codexSwitchLaneEligible(run) {
 		return SetRunCredentialResult{}, ErrCredentialOverrideLaneNotSwitchable
