@@ -360,7 +360,7 @@ Recorded so the PRD's plan is not read as the shipped mechanism.
 ## Global CLI config input
 
 The M2 audit classifies one more file input to the Claude CLI: its global config,
-`<HOME>/.claude.json`. The pinned CLI (2.1.319, SDK 0.3.319) applies an `env` block from it
+`<HOME>/.claude.json`. The pinned CLI (2.1.325, SDK 0.3.325; first measured at 2.1.319) applies an `env` block from it
 (for example `OTEL_LOG_RAW_API_BODIES`, `NODE_OPTIONS`, `ANTHROPIC_BASE_URL`) regardless of
 `settingSources: []`, with the provider credential already in its environment.
 
@@ -373,8 +373,12 @@ The M2 audit classifies one more file input to the Claude CLI: its global config
   package-manager hooks).
 - `HOME/.claude.json` is written by the CLI as the runner, and by anything the agent runs. It is
   read at every CLI start, and the CLI also watches it during a process.
-- The CLI's resolver prefers a non-empty `HOME/.claude/.config.json` over `.claude.json`, so that
-  file is an equivalent input.
+- The CLI's resolver can prefer `HOME/.claude/.config.json` over `.claude.json`, so that file is
+  an equivalent input. At 2.1.319 a non-empty regular file there wins. At 2.1.325 (resolver
+  re-read in the bundled binary on 2026-11-23) the same two files are the whole set, but the
+  condition is wider: a regular file that is non-empty, or empty with any write bit set, can win,
+  depending on the state of `.claude.json`. The reset removes the file whatever its size or mode,
+  so the wider condition needs no code change; a test pins the empty, writable case.
 
 **The `OTEL_LOG_` rule does not cover this path.** The `OTEL_LOG_` prefix in "Name rules, with
 evidence" filters run variables only. A run-written env block in this file reaches the CLI

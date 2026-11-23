@@ -15,9 +15,11 @@
 // HOME that is not sticky a live runner-uid process can still swap the temp entry before the
 // rename and so publish a file of its own; that is part of the live-writer residual below.
 //
-// Alternate file. The pinned CLI (2.1.319) resolves its global config from
-// `<CLAUDE_CONFIG_DIR or HOME/.claude>/.config.json` first: a non-empty regular file there wins
-// over `<HOME>/.claude.json`, so an agent can plant an env block there with no process alive.
+// Alternate file. The pinned CLI (2.1.325; same file set as 2.1.319) resolves its global config
+// from `<CLAUDE_CONFIG_DIR or HOME/.claude>/.config.json` first: a regular file there that is
+// non-empty, or (from 2.1.325) empty with a write bit set, can win over `<HOME>/.claude.json`, so
+// an agent can plant an env block there with no process alive. The removal below is
+// unconditional, so it covers every size and mode.
 // Before the replace, that file is removed so the resolver returns `<HOME>/.claude.json`. Under
 // the uid split the `.claude` directory is normally created by the CLI as the runner uid, which
 // the worker cannot unlink inside, so the removal runs as the runner uid (`rm -f`); without the

@@ -201,6 +201,24 @@ describe("SdkExecutor + spawnDetached: the CLI global config is reset at every s
     assert.ok(!fs.existsSync(alt));
   });
 
+  it("(g2) an empty, writable .claude/.config.json (which CLI 2.1.325 can prefer) is removed too", async () => {
+    const claudeDir = path.join(homeDir, ".claude");
+    const alt = path.join(claudeDir, ".config.json");
+    const exec = makeExecutor(
+      twoLegs((leg) => {
+        if (leg === 1) {
+          fs.mkdirSync(claudeDir, { recursive: true });
+          fs.writeFileSync(alt, "");
+          fs.chmodSync(alt, 0o666);
+        }
+      }),
+    );
+    await exec.run(makeCtx());
+    assert.strictEqual(fs.readFileSync(dumpPath(2) + ".alt", "utf8"), "ABSENT", "leg 2's CLI sees no .config.json");
+    assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES);
+    assert.ok(!fs.existsSync(alt));
+  });
+
   it("(h) a directory at .claude/.config.json refuses the start, with no spawn", async () => {
     fs.mkdirSync(path.join(homeDir, ".claude", ".config.json"), { recursive: true });
     await assert.rejects(makeExecutor(twoLegs()).run(makeCtx()), (err: unknown) => {
