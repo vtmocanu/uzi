@@ -160,7 +160,7 @@ func TestPutMyModelSettingsPinErrorsCarryCellIdentity(t *testing.T) {
 	}
 }
 
-// decodeCrossCheckPins (PutMySettings, and the metadata tests) keeps returning the FIRST defect
+// decodeCrossCheckPins (PutMySettings) keeps returning the FIRST defect
 // with the text it has always had, even though the collector now sees every defect.
 func TestDecodeCrossCheckPinsFirstErrorTextUnchanged(t *testing.T) {
 	user := uuid.New()

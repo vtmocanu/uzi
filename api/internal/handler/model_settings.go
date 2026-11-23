@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -31,6 +32,25 @@ const (
 	// saved and read back but whose effective-settings prediction could not be computed.
 	reasonSettingsEffectiveReadbackFailed = "settings_effective_readback_failed"
 )
+
+const (
+	// maxUnknownFieldErrors caps the unknown-key entries in the 400 "errors" array.
+	maxUnknownFieldErrors = 5
+	// maxEchoBytes bounds every caller-supplied string echoed into that array.
+	maxEchoBytes = 64
+)
+
+// clipEcho returns s cut to at most maxEchoBytes bytes on a rune boundary.
+func clipEcho(s string) string {
+	if len(s) <= maxEchoBytes {
+		return s
+	}
+	n := maxEchoBytes
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
 
 // modelSettingsAllowlist is the closed set of keys PUT /api/me/model-settings accepts. Anything
 // else, including the legacy default_model, appearance and every consent switch, is a 400
@@ -74,7 +94,7 @@ type modelSettingsWrite struct {
 	harness                                 modelSettingsField
 	planningClaudeModel, planningClaudeEffort,
 	planningCodexModel, planningCodexEffort modelSettingsField
-	// crossCheckPins are the decoded cross_check_pins patches (decodeCrossCheckPins); empty when
+	// crossCheckPins are the decoded cross_check_pins patches (collectCrossCheckPins); empty when
 	// the key is absent or an empty list.
 	crossCheckPins []store.PatchUserCrossCheckPinParams
 }
@@ -231,7 +251,14 @@ func decodeModelSettingsRequest(req map[string]json.RawMessage, userID uuid.UUID
 	var errs []modelSettingsError
 	for _, k := range keys {
 		if _, allowed := modelSettingsAllowlist[k]; !allowed {
-			errs = append(errs, modelSettingsError{Field: k, Message: "unknown field " + k})
+			// The response must stay small whatever the caller sends: at most
+			// maxUnknownFieldErrors entries (the first ones in sorted order, no marker entry), and
+			// each key is echoed clipped (clipEcho).
+			if len(errs) == maxUnknownFieldErrors {
+				break
+			}
+			ck := clipEcho(k)
+			errs = append(errs, modelSettingsError{Field: ck, Message: "unknown field " + ck})
 		}
 	}
 	if len(errs) > 0 {

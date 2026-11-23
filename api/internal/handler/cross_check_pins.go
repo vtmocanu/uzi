@@ -37,9 +37,10 @@ func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchU
 }
 
 // collectCrossCheckPins decodes like decodeCrossCheckPins but reports every defect: a list-shape
-// defect ends the walk (there are no cells to attribute), otherwise every cell is checked and
-// one defect per stage, harness or duplicate problem plus one per bad model or effort member is
-// returned, in request order. The patches are only meaningful when no error is returned.
+// defect ends the walk (there are no cells to attribute), otherwise every cell is checked. A cell
+// reports only the first of its stage, harness or duplicate defect and is then skipped (its
+// members are not validated); a cell that passes those reports one defect per bad model or effort
+// member. Defects come in request order. The patches are only meaningful when no error is returned.
 func collectCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchUserCrossCheckPinParams, []crossCheckPinError) {
 	if raw == nil {
 		return nil, nil
@@ -62,9 +63,13 @@ func collectCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.Patch
 	seen := map[string]bool{}
 	patches := make([]store.PatchUserCrossCheckPinParams, 0, len(cells))
 	for _, c := range cells {
-		key := c.Stage + "/" + c.Harness
+		// Stage and harness are caller text: every echo of them is clipped (clipEcho). A valid
+		// stage or harness is short, so the clip changes only the text of oversized unknown ones
+		// (and the dedupe key, which is only consulted for valid cells).
+		stage, harness := clipEcho(c.Stage), clipEcho(c.Harness)
+		key := stage + "/" + harness
 		cellErr := func(member string, err error) {
-			errs = append(errs, crossCheckPinError{Stage: c.Stage, Harness: c.Harness, Member: member, Err: err})
+			errs = append(errs, crossCheckPinError{Stage: stage, Harness: harness, Member: member, Err: err})
 		}
 		if c.Stage != "plan" && c.Stage != "code" {
 			cellErr("", fmt.Errorf("cross_check_pins %s stage: unknown stage", key))
