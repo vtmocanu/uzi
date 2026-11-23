@@ -13,8 +13,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// These tests prove wake admission only. Actual claim/reclaim coverage lives in
-// codex_provider_actual_claim_livedb_test.go; advertisement awaits completed M1-M4 delivery.
+// These tests cover wake admission and wake-to-claim composition. Reclaim coverage
+// lives in codex_provider_actual_claim_livedb_test.go; advertisement awaits completed M1-M4 delivery.
 func codexProviderWakeFixture(t *testing.T) (*provFix, *hibFx) {
 	t.Helper()
 	p := newProvFix(t)
@@ -186,6 +186,103 @@ func TestCodexProviderWakePlacementLiveDB(t *testing.T) {
 				t.Fatal("wake readiness unexpectedly claimed the run")
 			}
 			wantCodexBinding(t, p, mustRun(t, f.env, r.ID), 1, p.keyRev())
+		})
+	}
+}
+
+// TestCodexProviderWakeReadinessActualClaimLiveDB composes the real wake,
+// replacement registration and claim paths. It proves API delivery, not execution
+// by a model runtime or support for advertising the protocol from workers.
+func TestCodexProviderWakeReadinessActualClaimLiveDB(t *testing.T) {
+	for _, change := range []string{"source_B", "source_cleared", "key_disabled"} {
+		t.Run(change, func(t *testing.T) {
+			p, f := codexProviderWakeFixture(t)
+			const plain = "inert-wake-provider-A-key"
+			sealed, err := p.env.box.Seal([]byte(plain))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.env.exec(`UPDATE user_secrets SET ciphertext=$2 WHERE id=$1`, p.key, sealed)
+			p.env.sealBotPAT(t, p.userID)
+			// Usable vendor credentials must not become a fallback or gain authority.
+			p.anthropic()
+			vendor := p.env.seedStaticAPIKey(t, p.userID, "wake-native-"+uuid.NewString(), "inert-wake-native-key")
+			p.env.exec(`UPDATE user_secrets SET is_default=true WHERE id=$1`, vendor)
+			w := f.sleepingWorker()
+			setWakeCaps(f, w, codexWakeCaps())
+			r := frozenCodexWakeRun(t, p)
+			if !r.RepoAgentSourceRequired {
+				t.Fatal("creation lost repository-source fence")
+			}
+			if got := wakeCandidate(t, f, r.ID); got != w {
+				t.Fatalf("wake candidate=%s want %s", got, w)
+			}
+			lease := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Microsecond)
+			f.env.exec(`UPDATE workers SET last_manual_wake_settled_at=$2 WHERE id=$1`, w, lease)
+			wantCodexWake(t, f, r.ID, w)
+			// Select a distinct valid B after A has been frozen and its wake recorded.
+			b := &provFix{effFix: p.effFix}
+			seedCodexSource(t, b)
+			sealedB, err := p.env.box.Seal([]byte("inert-wake-provider-B-key"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.env.exec(`UPDATE user_secrets SET ciphertext=$2 WHERE id=$1`, b.key, sealedB)
+			if change != "source_B" {
+				p.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, p.userID)
+			}
+			settleCodexWakeReplacement(t, f, w)
+			if term := f.row(w).LastManualWakeSettledAt; !term.Valid || !term.Time.Equal(lease) {
+				t.Fatal("demand readiness renewed the manual lease")
+			}
+			if got := mustRun(t, f.env, r.ID); got.Status != "queued" || got.WorkerID.Valid {
+				t.Fatal("readiness claimed the run before Service.Claim")
+			}
+			if change == "key_disabled" {
+				p.env.exec(`UPDATE user_secrets SET disabled_at=now(), enablement_rev=enablement_rev+1 WHERE id=$1`, p.key)
+				if _, err := f.svc.assembleProviderBinding(f.env.ctx, f.row(w), r); !errors.Is(err, ErrProviderBindingStale) {
+					t.Fatalf("disabled key assembly=%v, want typed stale binding", err)
+				}
+			}
+			payload, err := f.svc.Claim(f.env.ctx, f.row(w), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := mustRun(t, f.env, r.ID)
+			if change == "key_disabled" {
+				if payload != nil || got.Status != "paused" || got.HoldReason.String != holdProviderBindingStale {
+					t.Fatal("disabled frozen key did not produce the stale-binding refusal")
+				}
+			} else {
+				if payload == nil || payload.RunID != r.ID.String() || payload.Secrets.Provider == nil ||
+					payload.Secrets.Codex != nil || payload.Secrets.AnthropicOAuthToken != "" {
+					t.Fatal("Claim did not deliver the exclusive provider run")
+				}
+				a := payload.Secrets.Provider
+				if a.ProviderID != p.provider.String() || a.Engine != harnessCodex || a.Protocol != "openai_responses" ||
+					a.Revision != 1 || a.BaseURL != pvBase || a.AuthStyle != "bearer" ||
+					a.ModelMap["default"].Model != "gateway" || a.Credential != plain {
+					t.Fatal("Claim did not deliver frozen provider A")
+				}
+				if got.Status != "claimed" || !got.WorkerID.Valid || uuid.UUID(got.WorkerID.Bytes) != w {
+					t.Fatal("replacement worker did not own the actual claim")
+				}
+			}
+			if bindingOfRun(got) != bindingOfRun(r) || !got.RepoAgentSourceRequired {
+				t.Fatal("claim or refusal changed the frozen binding or repository fence")
+			}
+			if got.AnthropicSecretID.Valid || got.CodexSecretID.Valid || got.CodexAuthMode.Valid ||
+				got.CodexMaterialRevision.Valid || len(got.CodexCapHash) != 0 || got.CredentialOverrideSecretID.Valid {
+				t.Fatal("provider claim or refusal acquired vendor authority")
+			}
+			// CodexClaimEpoch is a generic revocation counter, not vendor authority.
+			var journal int
+			if err := p.env.pool.QueryRow(p.env.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id=$1`, r.ID).Scan(&journal); err != nil {
+				t.Fatal(err)
+			}
+			if journal != 0 {
+				t.Fatal("provider claim journaled vendor credentials")
+			}
 		})
 	}
 }
