@@ -3788,7 +3788,8 @@ WHERE w.user_id = $1
     OR ($2::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
-        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))
+        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities))
   )
 `
 

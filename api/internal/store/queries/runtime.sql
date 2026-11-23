@@ -12373,7 +12373,8 @@ WHERE w.user_id = @user_id
     OR (@engine::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
-        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))
+        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities))
   );
 
 -- name: CountOnlineWorkersSatisfyingCodexRuntime :one

@@ -744,6 +744,7 @@ WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
        WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+                        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
        ELSE false
    END)
 ORDER BY hw.worker_id, hw.run_id
