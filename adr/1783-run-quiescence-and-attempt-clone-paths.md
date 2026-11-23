@@ -5,6 +5,66 @@
 **Date**: 2026-09-27
 **Related**: GitHub issue vtmocanu/uzi#1783
 
+## Amendment 2026-11-23 — #4632: inventory source proof serialized against same-key seeds
+
+The retained-recovery inventory proof runs unmarked runner-uid git in a failed
+predecessor's clone. A same-key attempt seed sweeps every non-live path of the
+clone key and read that git as unattributed residue, failing the successor.
+
+- **Bare-lock section.** Each clone's proof (before-scan, runner git, after-scan)
+  runs as one section under the repository's bare lock `B`
+  (`GitCache.withInventorySourceLock`). Lock wait is 30 s; the section budget is
+  12 s; the after-scan has 3 s and the status read 3 s. A nested call, a boundary
+  scope that releases `B` itself, an expired lock wait or an active reclaim
+  admission refuses `source_lock_unavailable`. A queued seed waits for the
+  flight-boundary `A` wait of 30 s (`codexBoundaryDeadlineMs`); each section ahead
+  of it adds at most 15 s (12 s plus the seed probe), `B` is FIFO, and there is no
+  end-to-end bound.
+- **Stage latch.** Work runs as tracked stages. At the deadline, an abort or the
+  section's end a latch closes: no new stage or git call starts (the content
+  proof polls it before each git call), a late callback never changes the verdict,
+  and abandoned work stays tracked until it settles. A section that cannot show
+  its work settled refuses `source_settlement_unproven`.
+- **Forced-helper scans.** The section's scans always run through the helper
+  (`forceHelper`), because the in-process scan exempts the scanner's own
+  descendants and would not see the proof's git.
+- **In-memory exclusion.** Before spawning, the section installs an entry keyed by
+  (bare, clone key); a leftover entry is first cleared lazily (2 s). An entry
+  clears only when the body ran to its end, git started, everything settled, the
+  after-scan was quiescent and at least 1 s remains, and a fresh observe-only
+  probe reads clear. The probe never signals a process. Verdict
+  (`inventoryClearVerdict`): unmarked in-scope residue blocks; processes marked
+  to another live, protected or terminal attempt, and results that are
+  unverified only through unreadable-unattributed processes, do not. This
+  mirrors the attempt seed's own relaxation. An undefined result, an unverified
+  result with no processes or an unknown reason is not clear.
+- **Scope-classed clears.** A full clear sweeps the same scope as a seed
+  (`nonLiveKeyPaths`) and removes the settled entries. A restore clear uses the
+  narrower restore seed scope and only admits that seed; the entry stays. A full
+  clear is deferred (`full_probe_deferred_restore`) while a restore entry holds
+  the branch.
+- **Refusals.** Same-key canonical and attempt seeds, restore seeds and orphan
+  reclaims refuse nonterminally while the key is excluded
+  (`InventorySourceExclusionRefusal`, not an authority refusal). The runner waits
+  once (30 s), retries once, then stops the claim for retry with custody kept. A
+  restore seed refused twice is refused `inventory_source_exclusion`. Reclaims
+  take a per-target-key admission under `B`, held for the whole proof, which
+  makes a section refuse `source_lock_unavailable` meanwhile.
+- **Restart boundary.** The registry is process memory. A worker restart is
+  safe only where the PID namespace ends with the worker (tini as PID 1, or
+  docker-init over tini); other postures are logged once as not namespace-scoped
+  and fall back to the unchanged seed sweep after a restart.
+- **Timing changes.** The inventory status read has a 3 s timeout instead of the
+  10 min git default. The predecessor content proof is bounded by the section and
+  fails closed on large trees; that path is disabled in production
+  (`predecessorFinalForTests`).
+- **Accepted boundaries.** Operator discards do not consult the registry. The
+  `PendingRecoveryCaptureError` recovery capture is ungated (pre-existing).
+  Containers are not covered by the probe. A descendant that forges a marker
+  escapes the clear. A canonical reseed is over-excluded.
+- **Rollout.** The checks `source_lock_unavailable` and
+  `source_settlement_unproven` are new; older workers do not emit or retry them.
+
 ## Amendment 2026-11-15 — #4365: definitive declined source end
 
 A retired source-owner sink whose admission barrier has joined can record a
