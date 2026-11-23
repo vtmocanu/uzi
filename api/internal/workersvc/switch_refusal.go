@@ -169,6 +169,10 @@ func anthropicSwitchRefusal(run store.Run, worker store.Worker, facts switchFact
 // in-transaction call (re-read row and locked worker) or, by default, the whole sequence for a preview.
 func codexSwitchRefusal(run store.Run, worker store.Worker, facts switchFacts) error {
 	if facts.Stage != switchStageLocked {
+		// PRD #4320 D8: a provider-bound run's credential is its frozen provider key.
+		if providerBoundRun(run) {
+			return ErrCredentialOverrideProviderSource
+		}
 		if run.Status == "claimed" {
 			return ErrCredentialSwitchClaimAssembling
 		}
@@ -192,6 +196,9 @@ func codexSwitchRefusal(run store.Run, worker store.Worker, facts switchFacts) e
 	if worker.UserID != obs.UserID || run.UserID != obs.UserID || run.ClaimGeneration != obs.ClaimGeneration ||
 		run.ClaimReleasedAt.Valid || !applyLiveStatus(run.Status) || run.Kind == "job" || run.Kind == "cross_check" {
 		return ErrCredentialSwitchRaced
+	}
+	if providerBoundRun(run) {
+		return ErrCredentialOverrideProviderSource
 	}
 	if !codexSwitchLaneEligible(run) {
 		return ErrCredentialOverrideLaneNotSwitchable

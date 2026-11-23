@@ -171,6 +171,84 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     });
   }
 
+  // A provider-bound Codex claim carries secrets.provider (engine codex) and NO secrets.codex. Its
+  // lost-session replan must gate exactly like the vendor Codex claim above: the buffered approve
+  // belongs to the old gate and must not approve the fresh candidate.
+  it("provider-bound Codex replaces the persisted gate identity when its session is lost", { skip: LINUX_ONLY }, async () => {
+    newApi();
+    const { gitlab } = fakeGitlab();
+    const homeRoot = path.join(fx.dataDir, "gate-preflight-provider");
+    const presentationId = "0f5c2d4e-1111-4a2b-8c3d-000000000002";
+    const plan = "persisted candidate";
+    const claim = gitlabClaim(706, {
+      claim_generation: 2, session_id: SID, plan_approved: false, plan_md: plan,
+      plan_source: "agent", resume_phase: "awaiting_approval",
+      resume_plan_at: "2000-01-01T00:00:00.000000Z",
+      resume_gate_revision: 3, resume_gate_presentation_id: presentationId,
+      secrets: { forge_pat: "fixture-forge", forge_username: "bot", provider: {
+        provider_id: "codex-gate-proof", revision: 1, engine: "codex", protocol: "openai_responses",
+        base_url: "https://gateway.example.test/v1", auth_style: "bearer",
+        credential: ["pk", "-gate-proof-", "0123456789abcdef"].join(""),
+        model_map: { default: { model: "corp-codex" } },
+      } },
+    });
+    api.setInputClaimGeneration(claim.run_id, 2);
+    api.seedGate(claim.run_id, { revision: 3, presentationId, historical: [], payload: { plan_md: plan } });
+    send(claim.run_id, row("approve_plan", null, { gate_binding: "bound", gate_revision: 3 }));
+    api.onState(claim.run_id, body => {
+      if (body.status === "awaiting_approval") send(claim.run_id, row("reject_plan", "fresh gate"));
+    });
+    let verdict: string | undefined;
+    await runnerWith(runId => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        resumesAtGate: true,
+        run: async ctx => {
+          assert.equal(ctx.sessionId, undefined);
+          assert.equal(await ctx.takeResumedGateEvent?.(), undefined, "queued approve stays buffered");
+          verdict = (await ctx.gatePlan!(plan)).kind;
+          throw new Error("gate identity observed");
+        },
+      },
+    }), gitlab).execute(claim);
+    const [gate] = gates(claim.run_id);
+    assert.ok(gate, "the candidate was presented");
+    assert.notEqual(gate.presentation_id, presentationId, "a lost-session gate is a fresh presentation");
+    assert.equal(api.gateOf(claim.run_id).revision, 4);
+    assert.equal(verdict, "reject");
+  });
+
+  // The same preflight for a provider-bound Codex claim (secrets.provider, no secrets.codex): a persisted
+  // Codex thread is checked against the Codex session store, never the Claude transcript, so it resumes.
+  it("provider-bound Codex resumes when the claimed thread is persisted on this worker", { skip: LINUX_ONLY }, async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-codex-provider-resume-"));
+    const codexHome = path.join(homeRoot, "source");
+    try {
+      const { gitlab } = fakeGitlab();
+      const seen: RunContext[] = [];
+      const claim = gitlabClaim(707, { session_id: SID, secrets: {
+        forge_pat: "fixture-forge", forge_username: "bot", provider: {
+          provider_id: "codex-resume-proof", revision: 1, engine: "codex", protocol: "openai_responses",
+          base_url: "https://gateway.example.test/v1", auth_style: "bearer",
+          credential: ["pk", "-resume-proof-", "0123456789abcdef"].join(""),
+          model_map: { default: { model: "corp-codex" } },
+        },
+      } });
+      const store = path.join(homeRoot, claim.run_id, "codex-session-store");
+      fs.mkdirSync(path.dirname(store), { recursive: true });
+      fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+      fs.writeFileSync(path.join(codexHome, "sessions", `rollout-2026-09-25-${SID}.jsonl`), "{}\n");
+      await CodexSessionStore.persist(codexHome, store);
+      await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+      assert.equal(seen[0]?.sessionId, SID, "a present persisted Codex thread keeps the session id");
+      const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
+      assert.ok(events.includes(RESUME_CONTINUED_EVENT), `expected ${RESUME_CONTINUED_EVENT}, got ${JSON.stringify(events)}`);
+      assert.ok(!events.includes(RESUME_LINEAGE_BREAK_EVENT), "a present thread records no lineage break");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("drops the resume and says so when the transcript is not on this worker", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-"));
@@ -437,7 +515,64 @@ describe("RunRunner — resume preflight (issue #105)", () => {
   });
 });
 
-it("a retained Codex runner turn adopts the session artifact but starts a fresh thread", { skip: LINUX_ONLY }, async () => {
+// Retained work proves a predecessor existed; with no conversation id the successor must say it starts
+// without earlier context. The notice keys on the Codex engine, so vendor and provider claims alike.
+for (const kind of ["vendor", "provider"] as const) {
+  it(`a retained ${kind} Codex episode without a session id emits the lineage-break notice`, { skip: LINUX_ONLY }, async () => {
+    const { gitlab } = fakeGitlab();
+    const secrets = kind === "vendor"
+      ? { forge_pat: "fixture-forge", forge_username: "bot", codex: {
+        auth_mode: "api_key" as const, access_token: "fixture-key", capability: "fixture-capability",
+      } }
+      : { forge_pat: "fixture-forge", forge_username: "bot", provider: {
+        provider_id: "codex-retained-proof", revision: 1, engine: "codex" as const, protocol: "openai_responses" as const,
+        base_url: "https://gateway.example.test/v1", auth_style: "bearer" as const,
+        credential: ["pk", "-retained-proof-", "0123456789abcdef"].join(""),
+        model_map: { default: { model: "corp-codex" } },
+      } };
+    const iid = kind === "vendor" ? 4323 : 4324;
+    const firstClaim = gitlabClaim(iid, { plan_approved: true, plan_source: "agent", plan_md: "Approved plan", secrets });
+    const claim = { ...firstClaim, claim_generation: 2 };
+    const original = git.normalizeRetainedSourceObjects;
+    const stub = (): { safety: ReturnType<typeof codexRig>["safety"]; sandboxesCommands: true } & Record<string, unknown> => {
+      const rig = codexRig();
+      return { safety: rig.safety, sandboxesCommands: true, withCredentialFreeCapture: rig.capture, settleForCredentialFreeCapture: rig.settle };
+    };
+    try {
+      api.setCompletionHoldResponse("paused", 200);
+      await runnerWith(() => ({
+        executor: {
+          ...stub(),
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            if (!await ctx.enterCompletionHold!("test completion hold reason")) throw new Error("completion hold was refused");
+            return { branch: ctx.branch, completionHeld: { reason: "test completion hold reason" } };
+          },
+        },
+      }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(firstClaim);
+      assert.equal(api.completionHoldRequests.length, 1, "the seed run entered a real completion hold");
+      git.normalizeRetainedSourceObjects = async () => undefined;
+      fs.writeFileSync(path.join(worktreeDirFor(iid), "retained.txt"), "held local work\n");
+      api.setOwnershipStatus(claim.run_id, "running", 2);
+      (claim as { last_seq?: number }).last_seq = api.messages(claim.run_id).at(-1)?.seq ?? 0;
+      let seen: RunContext | undefined;
+      await runnerWith(() => ({
+        executor: {
+          ...stub(),
+          run: async (ctx: RunContext): Promise<ExecutorResult> => { seen = ctx; return { branch: ctx.branch }; },
+        },
+      }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+      assert.ok(seen, "the successor reached its executor: " + JSON.stringify([api.states.filter(x => x.runId === claim.run_id).map(x => [x.body.status, (x.body as {failure_reason?: string}).failure_reason]), api.messages(claim.run_id).filter(m => m.kind === "status").map(m => m.payload.text)]));
+      assert.equal(seen.sessionId, undefined);
+      const lineage = api.messages(claim.run_id).filter((m) => m.kind === "status" &&
+        m.payload.event === RESUME_LINEAGE_BREAK_EVENT);
+      assert.deepEqual(lineage.map((m) => m.payload.reason), ["session_id_unavailable"]);
+    } finally {
+      git.normalizeRetainedSourceObjects = original;
+    }
+  });
+}
+
+it("a retained Codex runner turn adopts the session artifact but starts a fresh thread",{ skip: LINUX_ONLY }, async () => {
   const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
   const freshSid = "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee";
   const turnId = "retained-fresh-turn";

@@ -554,6 +554,26 @@ capability. Design record, route split, inheritance rules and rollback hazards:
 [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md); user docs:
 [docs/providers.md](docs/providers.md).
 
+**Codex engine (PRD #4323).** The same core serves a second engine arm: a provider with engine
+`codex` and protocol `openai_responses` (Bearer only), keyed by `openai_compatible_key` and selected
+per engine in `users.codex_provider_id` (`uzi provider use`; clearing names `--engine`). Resolution,
+freezing and the claim checks are engine-parameterized, not copied. A Codex provider claim is
+**provider-only**: the key travels only in `claim.secrets.provider`, there is no `secrets.codex`
+block (the decoder refuses both), no vendor release or refresh is called, and
+`/codex/release` and `/codex/refresh` refuse the run. The worker advertises `codex_provider_v1`
+with the Codex harness capabilities; the api admits the claim only to a worker with
+`codex_provider_v1` + `codex_harness_v1` + `codex_runtime_v2`, so the api rolls before the workers.
+The issue/task/prompt/self_improve lane, its in-run advice, summary and task-review passes, and
+retries, resume and cold resume use the frozen binding (provider, revision, key `enablement_rev`);
+`mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
+Interim refusals (`provider_lane_unsupported`, follow-up #4574): the Codex judge is skipped for an
+owner with a provider source, plan and code cross-check refuse when either side is Codex-provider
+bound (a Claude lead with plan cross-check owned by someone with a Codex source gets a human plan
+gate), and jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
+model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);
+[ADR-4320, Codex engine](adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)
+records the claim ordering and recovery model.
+
 ## Claude rate-limit visibility (PRD #53)
 
 A background engine (`api/internal/usagepoller`, the same `Boot()` immediate

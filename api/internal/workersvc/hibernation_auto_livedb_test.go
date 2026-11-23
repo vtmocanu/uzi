@@ -208,6 +208,26 @@ func wantNotBlocked(t *testing.T, w store.Worker) {
 // its new worker; a run that finished just now is activity.
 func TestHibernationAutoIdlenessLiveDB(t *testing.T) {
 	a := newAutoFx(t)
+	// Keep threshold jumps local to this fixture instead of aging shared worker history.
+	a.clock = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	a.advertiseNow()
+	t.Run("recent foreign worker history does not displace the idle target", func(t *testing.T) {
+		foreign := newHibFx(t)
+		foreignAnchor := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+		// Fill a candidate batch with older anchors if the fixture uses wall time.
+		for i := 0; i < HibernationAutoAdmissionsPerPass; i++ {
+			id, _ := foreign.worker()
+			foreign.env.exec(`UPDATE workers SET created_at = $2, manual_cordoned_at = $2,
+				manual_cordoned_by = $3, manual_cordoned_by_label = 'fixture' WHERE id = $1`,
+				id, foreignAnchor, foreign.user)
+		}
+		id, _ := a.idle(400 * 24 * time.Hour)
+		run := a.runOf(runkind.Issue, "running", &id)
+		a.finish(run, "completed", a.clock)
+		a.advance(autoIdleAfter)
+		a.mustPass(1)
+		a.want(id, "preparing")
+	})
 	t.Run("every run kind keeps the worker busy", func(t *testing.T) {
 		id, _ := a.idle(400 * 24 * time.Hour)
 		for _, kind := range runkind.All() {

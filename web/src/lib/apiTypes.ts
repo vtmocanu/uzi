@@ -143,17 +143,15 @@ export interface SecretDependents {
 }
 
 // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
-export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable" | "default" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna";
 
 export interface ProviderModelEntry {
   model: string;
   context_window?: number;
 }
 
-// haiku is required by the server; the other roles are optional.
-export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
-  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
->;
+// The engine requires haiku (Claude) or default (Codex); remaining entries are optional.
+export type ProviderModelMap = Partial<Record<ProviderModelRole, ProviderModelEntry>>;
 
 export type ProviderAuthStyle = "bearer" | "x_api_key";
 
@@ -166,10 +164,10 @@ export interface ProviderProbe {
 export interface ProviderDTO {
   id: string;
   name: string;
-  engine: "claude";
+  engine: "claude" | "codex";
   retired: boolean;
   current_revision: number;
-  protocol: "anthropic_messages";
+  protocol: "anthropic_messages" | "openai_responses";
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
@@ -185,6 +183,8 @@ export interface ProvidersList {
 }
 
 export interface CreateProviderInput {
+  engine?: ProviderDTO["engine"];
+  protocol?: ProviderDTO["protocol"];
   name: string;
   base_url: string;
   auth_style: ProviderAuthStyle;
@@ -655,6 +655,7 @@ export interface UserSettings {
    *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
    *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
   claude_provider_id?: string | null;
+  codex_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present

@@ -439,14 +439,14 @@ func TestProviderUseSelectsByNameAndID(t *testing.T) {
 
 func TestProviderUseNoneClears(t *testing.T) {
 	fc := &uzicli.FakeClient{}
-	out, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", "--none")
+	out, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", "--none", "--engine", "claude")
 	if code != uzicli.ExitOK || !fc.ProviderSourceSet || fc.LastProviderSource != nil || fc.ProviderSourceCalls != 1 {
 		t.Fatalf("code %d set=%v sent=%v stderr %q", code, fc.ProviderSourceSet, fc.LastProviderSource, errOut)
 	}
 	if !strings.Contains(out, "Anthropic directly") {
 		t.Errorf("output = %q", out)
 	}
-	out, _, code = runCLI(t, fakeEnv(fc), "--json", "provider", "use", "--none")
+	out, _, code = runCLI(t, fakeEnv(fc), "--json", "provider", "use", "--none", "--engine", "claude")
 	if code != uzicli.ExitOK || !strings.Contains(out, `"claude_provider_id": null`) && !strings.Contains(out, `"claude_provider_id":null`) {
 		t.Errorf("json: code %d out %q", code, out)
 	}

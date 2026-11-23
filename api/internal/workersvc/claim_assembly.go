@@ -218,12 +218,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
 		return nil, errIsolatedClaimRefused
 	}
-	// PRD #4320 module 5: a provider-bound run exists only on the Claude issue/chat lanes (module 4's
-	// creation refusals). Judge, job, cross-check and isolated claims have no provider support until
-	// PRD #4322, so such a row (data that creation cannot produce; defence in depth) is refused
-	// terminally before anything is opened: a provider run never reaches a vendor credential ladder.
+	// Provider claims support ordinary engine-aware lanes only; refuse unsupported
+	// shapes before context or credential reads, without entering a vendor ladder.
 	if providerBoundRun(run) && (run.Kind == runkind.Judge || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
-		isolated || run.Harness != harnessClaude) {
+		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
+		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
+		return nil, errProviderLaneClaimRefused
+	}
+	if providerBoundRun(run) && !workerSupportsProvider(wkr, run.Harness) {
 		return nil, errProviderLaneClaimRefused
 	}
 	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A
@@ -516,10 +518,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// review run left defaultModel nil above and is exempt; judge/chat never reach here. A custom
 	// id is exactly one harnessModelCompatible rejects for the Codex harness (non-empty,
 	// non-curated), so the same closed vocabulary decides the claim gate and this re-check.
-	if harness == HarnessCodex && !isReviewRun &&
-		defaultModel.Valid && !harnessModelCompatible(HarnessCodex, defaultModel.String) &&
-		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
-		return nil, errCustomModelCapabilityMissing
+	if harness == HarnessCodex && !isReviewRun && defaultModel.Valid {
+		if err := requireCodexCustomModelCapability(run, defaultModel.String, wkr.ProtocolCapabilities); err != nil {
+			return nil, err
+		}
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). Ordinary lanes resolve NULL
@@ -572,10 +574,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 		// Resolve the final plan before checking custom passthrough: effort-only planning inherits
 		// the effective root model, and a planning model may differ from the implementation root.
-		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil &&
-			!harnessModelCompatible(HarnessCodex, *leadSettings.Plan.Model) &&
-			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
-			return nil, errCustomModelCapabilityMissing
+		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil {
+			if err := requireCodexCustomModelCapability(run, *leadSettings.Plan.Model, wkr.ProtocolCapabilities); err != nil {
+				return nil, err
+			}
 		}
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
@@ -1117,7 +1119,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// indicated by either M1 sentinel fails closed the same way. An ordinary Claude run
 	// (harness='claude', no codex fields) skips this entirely and its claim JSON stays
 	// byte-identical to today's (ClaimSecrets.Codex stays nil ⇒ no `codex` key).
-	if run.Harness == harnessCodex {
+	// A validated provider binding supplies exclusive authority; vendor runs, including
+	// deleted aliases with a null FK, still enter the harness-authoritative path.
+	if run.Harness == harnessCodex && providerBinding == nil {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
 			// finishRunClaim (claim_recovery.go) settles every outcome in one exact-claim
@@ -1604,4 +1608,18 @@ func phaseModelsCapability(h Harness) string {
 		return capability.CodexPhaseModelsV1
 	}
 	return capability.ClaudePhaseModelsV1
+}
+
+// requireCodexCustomModelCapability returns errCustomModelCapabilityMissing when a Codex run's
+// effective model is not in the curated vocabulary and the worker lacks codex_custom_model_v1. A
+// provider-bound run is exempt: its model names are slots in the frozen provider map, resolved by
+// the worker, never vendor models. Phase-model capability is checked separately.
+func requireCodexCustomModelCapability(run store.Run, model string, caps []string) error {
+	if providerBoundRun(run) {
+		return nil
+	}
+	if !harnessModelCompatible(HarnessCodex, model) && !slices.Contains(caps, capability.CodexCustomModelV1) {
+		return errCustomModelCapabilityMissing
+	}
+	return nil
 }

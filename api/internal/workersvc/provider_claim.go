@@ -151,8 +151,14 @@ func (s *Service) providerBindingRefusal(run store.Run, rev *store.GetModelProvi
 		return holdProviderBindingStale
 	}
 	pid := uuid.UUID(run.ModelProviderID.Bytes)
-	if key.Kind != store.KindAnthropicCompatibleKey || !key.ProviderID.Valid || uuid.UUID(key.ProviderID.Bytes) != pid ||
+	if key.Kind != providerKeyKind(run.Harness) || !key.ProviderID.Valid || uuid.UUID(key.ProviderID.Bytes) != pid ||
 		key.Disabled || key.EnablementRev != run.ModelProviderKeyRev.Int64 {
+		return holdProviderBindingStale
+	}
+	var models providers.ModelMap
+	if rev.Engine != run.Harness || rev.Revision != run.ModelProviderRevision.Int32 ||
+		uuid.UUID(rev.ProviderID) != pid || json.Unmarshal(rev.ModelMap, &models) != nil ||
+		providers.ValidateProfile(run.Harness, rev.Protocol, rev.AuthStyle, models) != nil {
 		return holdProviderBindingStale
 	}
 	if _, ok := s.providerAllow(rev.BaseUrl); !ok {
@@ -212,17 +218,14 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 // openWithAutoRetry, recordRunCredential or SetRunAnthropicSecret, so runs.anthropic_secret_id and
 // anthropic_rejected_at stay untouched, and the claiming worker's anthropic_bind_mode is ignored.
 //
-// The claiming worker must advertise capability.ClaudeProviderV1 (checked before anything is read).
+// The claiming worker must advertise its engine provider capability (checked before any read).
 //
 // The finisher re-checks the same binding under locks (lockedProviderRefusal) after this open: a
 // rotation between the open and the delivery bumps enablement_rev, so the locked re-check refuses it
 // and the possibly re-keyed payload is never delivered.
 func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimProviderBinding, error) {
-	// Go-side backstop to the SQL claim clauses (PRD #4320 Decision Log, "M2 finding: the pinned Claude
-	// CLI follows gateway redirects"): a worker that did not report claude_provider_v1 never receives a
-	// provider key, so nothing below (no read, no vault open) runs for it. Refused terminally, like
-	// every other provider-lane refusal, never delivered.
-	if !slices.Contains(wkr.ProtocolCapabilities, capability.ClaudeProviderV1) {
+	// Require the complete engine protocol before any binding read or vault open.
+	if !workerSupportsProvider(wkr, run.Harness) {
 		return nil, errProviderLaneClaimRefused
 	}
 	keyID, ok := frozenProviderKeyID(run)
@@ -257,10 +260,10 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 	}
 	entry, _ := s.providerAllow(rev.BaseUrl) // allowlisted: providerBindingRefusal just proved it
 	var mm providers.ModelMap
-	if err := json.Unmarshal(rev.ModelMap, &mm); err != nil || providers.ValidateModelMap(mm) != nil {
+	if err := json.Unmarshal(rev.ModelMap, &mm); err != nil || providers.ValidateModelMapForEngine(run.Harness, mm) != nil {
 		return nil, fmt.Errorf("%w: the bound provider revision has an invalid model map", errCredentialUnavailable)
 	}
-	plain, err := secretopen.OpenByIDOfKind(ctx, s.q, s.vlt, s.box, run.UserID, keyID, store.KindAnthropicCompatibleKey)
+	plain, err := secretopen.OpenByIDOfKind(ctx, s.q, s.vlt, s.box, run.UserID, keyID, providerKeyKind(run.Harness))
 	switch {
 	case err == nil:
 	case errors.Is(err, secretopen.ErrVaultLocked):
@@ -275,7 +278,7 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 	return &ClaimProviderBinding{
 		ProviderID: pid.String(),
 		Revision:   rev.Revision,
-		Engine:     providers.EngineClaude,
+		Engine:     run.Harness,
 		Protocol:   rev.Protocol,
 		BaseURL:    entry,
 		AuthStyle:  rev.AuthStyle,
@@ -284,12 +287,27 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 	}, nil
 }
 
+// workerSupportsProvider checks only the advertised protocol for the frozen engine.
+// Wake admission and claim assembly share this conjunction without reading credentials.
+func workerSupportsProvider(w store.Worker, engine string) bool {
+	switch engine {
+	case harnessClaude:
+		return slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderV1)
+	case harnessCodex:
+		return slices.Contains(w.ProtocolCapabilities, capability.CodexProviderV1) &&
+			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&
+			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV2)
+	default:
+		return false
+	}
+}
+
 // promotionRunBinding is the run-shaped view of the frozen provider binding the promoter's locked
 // read (LockCredentialDisabledRunForPromotion) carries, so the provider arms need no second read of
 // the run row. Only the binding columns (plus identity) are set.
 func promotionRunBinding(r store.LockCredentialDisabledRunForPromotionRow) store.Run {
 	return store.Run{
-		ID: r.ID, UserID: r.UserID,
+		ID: r.ID, UserID: r.UserID, Harness: r.Harness,
 		ModelProviderID: r.ModelProviderID, ModelProviderRevision: r.ModelProviderRevision,
 		ModelProviderKeyMode: r.ModelProviderKeyMode, ModelProviderKeySecretID: r.ModelProviderKeySecretID,
 		ModelProviderKeyRev: r.ModelProviderKeyRev,

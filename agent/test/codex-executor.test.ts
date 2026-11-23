@@ -89,8 +89,8 @@ import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
-import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
-import { CodexHarness, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
+import { createCodexProviderExecutionAuthority, selectCodexBinding, CodexSelectionError, type CodexBinding, type CodexExecutionAuthority } from "../src/codex/select.js";
+import { CodexHarness, type CodexLaunchRootSpec, type CodexLaunchRootResult, type CodexProviderConfig } from "../src/codex/codex-harness.js";
 import { CodexUsageAccountant } from "../src/codex/token-accounting.js";
 import { PhaseSwitchUnverifiedError } from "../src/phase-switch-unverified.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
@@ -101,7 +101,7 @@ import type {
   LaunchAdviceRootSeam,
 } from "../src/codex/codex-advice-harness.js";
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
-import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { JudgeEvidenceReducer, type JudgeEvidence } from "../src/judge-evidence.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
@@ -787,7 +787,7 @@ function answerEnvProbe(
 
 function makeExecutor(
   rig: { client: FakeClient; deps: CodexExecutorDeps; probeCalls?: ProbeCall[] },
-  binding: CodexBinding,
+  binding: CodexExecutionAuthority,
   log: Logger = noopLog,
   dockerWiring?: DockerWiring,
   providerConfig: CodexProviderConfig = provider,
@@ -32973,11 +32973,11 @@ describe("M2 actualRunner credential replacement", () => {
         };
         const planSummaryFactory = (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
           const plan = planPass.getStore() === true;
-          summaryBuilds.push({ capability: params.binding.capability, authMode: params.binding.authMode, plan });
+          summaryBuilds.push({ capability: (params.binding as CodexBinding).capability, authMode: params.binding.authMode, plan });
           summaryOwners.push(summaryOwnership.get(params)!);
           // Intent and any other pass settles at once: no mutant can hang on a summary timeout.
           if (!plan) throw new Error("plan-summary fixture serves only the plan pass");
-          if (params.binding.capability === oldClaim.capability) {
+          if ((params.binding as CodexBinding).capability === oldClaim.capability) {
             planWorkStarted = true;
             planWorkEntered.resolve();
             await awaitPlanAbortThenRelease(params.signal);
@@ -32985,14 +32985,14 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: JSON.stringify({ summary: `Plan summary built with ${params.binding.capability}`, deltas: [] }),
+            return { text: JSON.stringify({ summary: `Plan summary built with ${(params.binding as CodexBinding).capability}`, deltas: [] }),
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
         const intentSummaryFactory = (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
-          summaryBuilds.push({ capability: params.binding.capability, authMode: params.binding.authMode, plan: false });
+          summaryBuilds.push({ capability: (params.binding as CodexBinding).capability, authMode: params.binding.authMode, plan: false });
           summaryOwners.push(summaryOwnership.get(params)!);
-          if (params.binding.capability === oldClaim.capability) {
+          if ((params.binding as CodexBinding).capability === oldClaim.capability) {
             // The designated A intent build retains its ownership record and never launches through it.
             const executorState = executor as unknown as { ownedSummaryRegistries: WeakSet<object>; unverifiedEpochRegistries: Set<object> };
             ownedUnverifiedAtABuild = [...executorState.unverifiedEpochRegistries].filter(registry => executorState.ownedSummaryRegistries.has(registry)).length;
@@ -33009,7 +33009,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: `Intent summary built with ${params.binding.capability}`,
+            return { text: `Intent summary built with ${(params.binding as CodexBinding).capability}`,
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
@@ -34193,9 +34193,11 @@ describe("M2 actualRunner credential replacement", () => {
             nowSummary: { homeRoot: dir, queryFn: (() => { throw new Error("Codex Now reached Claude"); }) as never,
               codexAdviceHarnessFactory: (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
                 nowBuilds.push(params);
+                const vendorBinding = params.binding;
+                assert.ok(vendorBinding.authMode !== "provider");
                 const owner = summaryOwnership.get(params)!;
                 owners.push(owner);
-                const isA = params.binding.capability === oldClaim.capability;
+                const isA = vendorBinding.capability === oldClaim.capability;
                 if (isA && phase === "factory") {
                   params.signal!.addEventListener("abort", () => nowAborted.resolve(), { once: true });
                   nowEntered.resolve();
@@ -34222,7 +34224,7 @@ describe("M2 actualRunner credential replacement", () => {
                   owner.guard(); liveBAdmitted = true;
                 }
                 return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
-                  nowRuns.push(params.binding.capability);
+                  nowRuns.push(vendorBinding.capability);
                   const tracked = trackedRoot();
                   summaryRoots.push(tracked);
                   const root: CodexRootHandle = {
@@ -36032,9 +36034,9 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.ok(releases.length > 0, "real recovery auth bridge consumed reminted capability");
                 assert.ok(executedRecoveryExecutor && executedRecoveryRig);
                 const authority = (executedRecoveryExecutor as unknown as {
-                  currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+                  currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority<CodexBinding>>;
                 }).currentCodexAuthority;
-                assert.equal(authority.binding.capability, recovered.secrets.codex!.capability);
+                assert.equal((authority.binding as CodexBinding).capability, recovered.secrets.codex!.capability);
                 assert.equal(authority.ordinal, 0, "new flight starts its server-owned usage baseline");
                 assert.equal(authority.capabilityEpoch, undefined, "never inherits predecessor switch metadata");
                 const requests = executedRecoveryRig.transport.requests;
@@ -36332,7 +36334,7 @@ describe("M2 actualRunner credential replacement", () => {
           const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
           assert.equal(authority.ordinal, 1);
           assert.equal(authority.capabilityEpoch, 42, "capability counter is distinct from the usage ordinal");
-          assert.equal(authority.binding.capability, next.capability);
+          assert.equal((authority.binding as CodexBinding).capability, next.capability);
           const usage = feed.filter(m => m.payload.event === "codex_response_usage");
           assert.equal(usage.length, 1, "only B emitted provider usage");
           assert.deepEqual({ output: bMessage.credential_epoch_ordinal, usage: usage[0]!.credential_epoch_ordinal },
@@ -37445,7 +37447,7 @@ describe("Codex repeated actualRunner switching", () => {
         "first result really releases the held B publication");
       assert.equal(results[0]!.epoch, 42);
       const bAuthority = (executor as unknown as {
-        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority<CodexBinding>>;
       }).currentCodexAuthority;
       assert.equal(bAuthority.ordinal, 1);
       assert.equal(bAuthority.capabilityEpoch, 42);
@@ -37519,11 +37521,11 @@ describe("Codex repeated actualRunner switching", () => {
       }
       assert.equal(feed.some(m => m.payload.event === "resume_lineage_break"), false);
       const authority = (executor as unknown as {
-        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority<CodexBinding>>;
       }).currentCodexAuthority;
       assert.equal(authority.ordinal, 2);
       assert.equal(authority.capabilityEpoch, 43);
-      assert.equal(authority.binding.capability, cClaim.capability);
+      assert.equal((authority.binding as CodexBinding).capability, cClaim.capability);
       assert.ok(authority !== bAuthority, "C has a distinct immutable authority");
       assert.throws(() => bAuthority.assertCurrent(), /retired/);
       await assert.rejects(bScope.prepare("root", new AbortController().signal, () => {}), /closed/,
@@ -37546,6 +37548,1373 @@ describe("Codex repeated actualRunner switching", () => {
       }
     }
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
+  });
+});
+
+describe("M2 provider executor composition", () => {
+  m2Runner.installHarness();
+  function barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  for (const phase of ["factory", "advice"] as const) {
+    it(`M2 provider epoch retirement fences pending ${phase} through owned lifecycle`, async () => {
+      const rig = makeRig();
+      const binding = createCodexProviderExecutionAuthority(providerClaim());
+      const executor = makeExecutor(rig, binding);
+      const entered = barrier(), release = barrier();
+      let owner: NonNullable<ReturnType<typeof summaryOwnership.get>> | undefined;
+      let launches = 0, turns = 0, publications = 0;
+      const factory = executor.bindCodexSummaryFactory(async params => {
+        owner = summaryOwnership.get(params)!;
+        if (phase === "factory") { entered.resolve(); await release.promise; }
+        return { kind: "codex", run: async () => {
+          turns++;
+          entered.resolve(); await release.promise;
+          return { text: "obsolete", end: { kind: "terminal", terminal: { outcome: "success" } } };
+        } } as never;
+      });
+      const params = { runId: "run-1", binding };
+      summaryCallDeadlines.set(params, Date.now() + 10_000);
+      const call = (async () => {
+        const harness = await factory(params);
+        await harness.run({} as never, {} as never);
+        publications++;
+      })();
+      const rejected = assert.rejects(call, /credential authority retired/);
+      try {
+        await entered.promise;
+        const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
+        assert.deepEqual(authority.binding, binding);
+        authority.retire();
+        assert.equal(authority.isCurrent(), false);
+        assert.throws(() => owner!.guard(), /credential authority retired/);
+        await assert.rejects(owner!.launch(async () => { launches++; return trackedRoot().root as never; }),
+          /credential authority retired/);
+        release.resolve();
+        await rejected;
+        assert.equal(launches, 0);
+        assert.equal(turns, phase === "advice" ? 1 : 0);
+        assert.equal(publications, 0);
+        assert.equal(rig.client.releaseCalls.length, 0);
+        assert.equal(rig.client.refreshCalls.length, 0);
+        assert.equal((await executor.withCredentialFreeCapture(1000, async () => {})).kind, "observed_empty",
+          "retired pending call settles its owned reservation before capture");
+      } finally { release.resolve(); await rejected; }
+    });
+  }
+
+
+  for (const clean of [true, false]) it(`M2 provider launched pending advice disposal clean=${clean}`, async () => {
+    const rig = makeRig();
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    const entered = barrier(), disposalEntered = barrier(), releaseDisposal = barrier();
+    const events: string[] = [];
+    const transport = new FakeTransport(c => {
+      if (c.method === "turn/start") { events.push("turn"); entered.resolve(); }
+      return defaultResponder(c);
+    });
+    let disposals = 0, publications = 0;
+    const raw = makeProductionCodexAdviceHarnessFactory(new Proxy({}, {
+      get: (_target, name) => { throw new Error("vendor operation " + String(name)); },
+    }) as never, noopLog, "/unused", {
+      launchRoot: async spec => {
+        const owner = summaryOwnership.get(params)!;
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        const handle = await owner.launch(async () => ({
+          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+            nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null },
+          failed: undefined, whenFailed: new Promise<Error>(() => {}),
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+          waitChild: async () => ({ event: "child_exit", code: 0 }),
+          dispose: async () => {
+            disposals++; events.push("dispose"); disposalEntered.resolve();
+            await releaseDisposal.promise;
+            return clean
+              ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
+              : { clean: false, reason: "survivor" };
+          },
+        }));
+        return { cwd: "/isolated", transport, dispose: async () => {
+          await transport.close();
+          if (!(await handle.dispose()).clean) throw new Error("unclean summary");
+        } };
+      },
+    });
+    const factory = executor.bindCodexSummaryFactory(raw);
+    const params = { runId: "run-1", binding };
+    summaryCallDeadlines.set(params, Date.now() + 10_000);
+    const harness = await factory(params);
+    const pending = harness.run({ label: "summary", model: "gpt-6-sol", prompt: "Summarize", systemPrompt: "Read only",
+      output: { kind: "text" }, signal: new AbortController().signal, timeoutMs: 5000 },
+      { onTerminal: () => {} }).then(result => { publications++; return result; });
+    const rejected = assert.rejects(pending, clean ? /credential authority retired/ : /summary auth, transport or root cleanup failed/);
+    try {
+      await entered.promise;
+      const authority = executor["currentCodexAuthority"]!;
+      authority.retire();
+      events.push("retire");
+      transport.push(agentMessage("stale provider output")).push(turnCompleted("completed")).end();
+      await disposalEntered.promise;
+      let settled = false;
+      pending.finally(() => { settled = true; }).catch(() => {});
+      await Promise.resolve();
+      assert.equal(settled, false, "pending advice retains disposal join");
+      assert.equal(publications, 0);
+      releaseDisposal.resolve();
+      await rejected;
+      assert.equal(transport["closedFlag"], true);
+      assert.equal(disposals, 1, "registered root and harness share disposal");
+      assert.deepEqual(events, ["turn", "retire", "dispose"]);
+      const capture = await executor.withCredentialFreeCapture(1000, async () => {});
+      assert.equal(capture.kind, clean ? "observed_empty" : "incomplete",
+        "unconfirmed disposal must retain custody");
+      assert.equal(publications, 0);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    } finally { releaseDisposal.resolve(); await rejected; }
+  });
+
+  // main.ts:849,921 supplies the raw production factory to delivery SummaryRunner;
+  // runner.ts:17074-17077 binds executor ownership for Now only. Post-run owned
+  // delivery is a safety control: closed admission must remain closed.
+  for (const ownedEditor of [false, true]) it(`M2 provider actual runner ${ownedEditor ? "refuses post-run owned editor with lead-only fallback" : "publishes editor output and redacted lead claims"}`, async () => {
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) =>
+      transport.push(toolCall(98, "signal_done", { pr_summary: {
+        what: "Lead delivery " + providerClaim().credential,
+        verification: [{ command: "verify " + providerClaim().credential, result: "pass" }],
+      } }, th, tn, "done")).push(turnCompleted("completed", th, tn))) });
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    const transport = new FakeTransport(defaultResponder);
+    transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(agentMessage(JSON.stringify({ summary: "Editor delivery " + binding.providerBinding.credential,
+        changes: ["Visible change"], scope_notes: [], review_pointers: [] })))
+      .push(turnCompleted("completed")).end();
+    let launches = 0, disposals = 0;
+    const raw = makeProductionCodexAdviceHarnessFactory(new Proxy({}, {
+      get: (_target, name) => { throw new Error("vendor operation " + String(name)); },
+    }) as never, noopLog, "/unused", {
+      launchRoot: async spec => {
+        launches++;
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        assert.equal(spec.providerSlot, "default");
+        return { transport, cwd: "/isolated", dispose: async () => { disposals++; } };
+      },
+    });
+    let factoryFailure: unknown;
+    const owned = executor.bindCodexSummaryFactory(raw);
+    const observedFactory: typeof owned = async params => {
+      try { return await owned(params); } catch (error) { factoryFailure = error; throw error; }
+    };
+    ownedSummaryFactories.add(observedFactory);
+    const publicationLog = recordingLogger();
+    const summary = new SummaryRunner(publicationLog.logger, {
+      homeRoot: path.resolve("../.uzi/scratch"),
+      queryFn: (() => assert.fail("Claude called")) as never,
+      codexAdviceHarnessFactory: ownedEditor ? observedFactory : raw,
+    });
+    const usage: import("../src/harness.js").AdviceUsageSnapshot[] = [];
+    const generate = summary.generateDeliverySummary.bind(summary);
+    summary.generateDeliverySummary = input => generate({ ...input, onUsage: snapshot => {
+      usage.push(snapshot); input.onUsage?.(snapshot);
+    } });
+    const prApi = new FakePrDescApi();
+    m2Runner.api.prDescription = prApi;
+    const forge = m2Runner.fakeGitlab();
+    m2FollowPush(m2Runner.git, forge.pr, true);
+    const delivery: Executor = { run: async ctx => {
+      commitInTree(ctx.worktreePath, "provider-proof.txt", "delivered work\n");
+      return executor.run(ctx);
+    } };
+    const claim = m2Runner.gitlabClaim(45091, {
+      plan_approved: true, plan_md: "Approved provider delivery", plan_source: "seeded",
+      secrets: { forge_pat: "fixture-forge-pat-000000", provider: binding.providerBinding },
+    });
+    await m2Runner.runner(delivery, forge.gitlab, undefined, { summaryRunner: summary }).execute(claim);
+    assert.ok(m2Runner.api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"),
+      JSON.stringify(m2Runner.api.states));
+    if (ownedEditor) {
+      assert.ok(factoryFailure instanceof Error);
+      assert.match(factoryFailure.message, /summary admission closed/);
+      assert.ok(publicationLog.lines.some(line =>
+        JSON.stringify(line).includes('"msg":"delivery summary skipped"')
+        && JSON.stringify(line).includes('"error_class":"TrustedExecutionRefusal"')));
+      assert.equal(launches, 0, "completed lead refuses owned factory before root launch");
+      assert.equal(disposals, 0);
+      assert.equal(transport.requests.length, 0);
+      assert.deepEqual(usage, []);
+      assert.doesNotMatch(forge.pr.description, /Editor delivery/);
+      assert.match(forge.pr.description, /Lead delivery/);
+      assert.match(forge.pr.description, /verify/);
+      assert.ok(prApi.calls.some(c => c.op === "stage" && c.body.source === "lead_only"));
+      assert.ok(!prApi.calls.some(c => c.op === "stage" && c.body.source === "generated"));
+    } else {
+      assert.equal(factoryFailure, undefined);
+      assert.equal(launches, 1);
+      assert.equal(disposals, 1);
+      assert.equal(usage.length, 1);
+      assert.equal(usage[0]!["corp-code"]!.inputTokens, 100);
+      assert.equal(usage[0]!["corp-code"]!.outputTokens, 20);
+      assert.equal(usage[0]!["corp-code"]!.costStatus, "unreported");
+      assert.equal(usage[0]!["corp-code"]!.costUSD, undefined);
+      assert.match(forge.pr.description, /Editor delivery/);
+      assert.match(forge.pr.description, /verify/);
+      assert.ok(prApi.calls.some(c => c.op === "stage" && c.body.source === "generated"));
+      assert.ok(!JSON.stringify({ body: forge.pr.description, staged: prApi.calls }).includes(binding.providerBinding.credential));
+      assert.equal((transport.requests.find(r => r.method === "turn/start")!.params as { model: string }).model, "corp-code");
+    }
+    assert.ok(!JSON.stringify({ body: forge.pr.description, staged: prApi.calls }).includes(binding.providerBinding.credential));
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("M2 provider delivery owned SummaryRunner preserves tuple and default-map sol", async () => {
+    const { buildDeliveryContext } = await import("../src/pr-description-context.js");
+    const rig = makeRig();
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    const output = { summary: "Delivered ***REDACTED*** work.", changes: ["Added proof."], scope_notes: [], review_pointers: [] };
+    const transport = new FakeTransport(defaultResponder);
+    transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(agentMessage(JSON.stringify({ ...output, summary: "Delivered " + binding.providerBinding.credential + " work." }))).push(turnCompleted("completed")).end();
+    let disposed = 0, builds = 0;
+    const noVendor = new Proxy({}, { get: (_target, name) => { throw new Error("unexpected vendor operation " + String(name)); } });
+    const raw = makeProductionCodexAdviceHarnessFactory(noVendor as never, noopLog, "/unused", {
+      launchRoot: async spec => {
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        assert.equal(spec.providerSlot, "default");
+        return { transport, cwd: "/isolated", dispose: async () => { disposed++; } };
+      },
+    });
+    const factory = executor.bindCodexSummaryFactory(async params => {
+      builds++;
+      assert.deepEqual(params.binding, binding);
+      assert.ok(Object.isFrozen(params.binding));
+
+      const harness = await raw(params);
+      const run = harness.run.bind(harness);
+      harness.run = (request, policy) => {
+        assert.equal(request.model, "gpt-6-sol");
+        return run(request, policy);
+      };
+      return harness;
+    });
+    const diagnostics = recordingLogger();
+    const runner = new SummaryRunner(diagnostics.logger, {
+      homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 1000,
+      queryFn: (() => { assert.fail("provider delivery must never use Claude"); }) as never,
+      codexAdviceHarnessFactory: factory,
+    });
+    const context = await buildDeliveryContext({
+      git: {} as never, barePath: "/unused", targetBranch: "main",
+      headSha: "invalid", deadlineMs: Date.now() + 10_000, redact: s => s,
+      issueTitle: "Provider work", issueBody: "Add proof.",
+    });
+    const snapshots: import("../src/harness.js").AdviceUsageSnapshot[] = [];
+    const input = { claim: { run_id: "run-1", secrets: { provider: binding.providerBinding } },
+      context, deadlineMs: Date.now() + 10_000, onUsage: (u: import("../src/harness.js").AdviceUsageSnapshot) => { snapshots.push(u); } };
+    assert.deepEqual(await runner.generateDeliverySummary(input), output, JSON.stringify(diagnostics.lines));
+    assert.equal(builds, 1);
+    assert.equal(disposed, 1);
+    const start = transport.requests.find(c => c.method === "turn/start");
+    assert.ok(start, "delivery dispatches a provider turn");
+    assert.equal((start.params as { model?: string }).model, "corp-code");
+    assert.equal(snapshots[0]!["corp-code"]!.inputTokens, 100);
+    assert.equal(snapshots[0]!["corp-code"]!.outputTokens, 20);
+    assert.equal(snapshots[0]!["corp-code"]!.costStatus, "unreported");
+    assert.equal(snapshots[0]!["corp-code"]!.costUSD, undefined);
+    assert.equal(await runner.generateDeliverySummary({ ...input, claim: { ...input.claim,
+      secrets: { provider: { ...binding.providerBinding, revision: 2 } } } }), null);
+    assert.equal(builds, 1, "mismatched delivery authority refuses before construction");
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+  it("provider Now actual model pass preserves tokens without inventing vendor cost", async () => {
+    const { runReadOnlyModelPass } = await import("../src/model-pass.js");
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const transport = new FakeTransport(defaultResponder);
+    transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(agentMessage("Working on the provider milestone"))
+      .push(turnCompleted("completed")).end();
+    let disposed = 0;
+    const client = new Proxy({}, { get: (_target, name) => { throw new Error("unexpected vendor operation " + String(name)); } });
+    const factory = makeProductionCodexAdviceHarnessFactory(client as never, noopLog, "/unused", {
+      launchRoot: async () => ({ transport, cwd: "/isolated", dispose: async () => { disposed++; } }),
+    });
+    const snapshots: import("../src/harness.js").AdviceUsageSnapshot[] = [];
+    const text = await runReadOnlyModelPass({
+      provider: binding.providerBinding, codex: { runId: "provider-now", binding, buildHarness: factory },
+      homeRoot: path.resolve("../.uzi/scratch"), label: "now", model: "gpt-6-luna",
+      prompt: "Describe progress", systemPrompt: "Summarize", timeoutMs: 1000,
+      homePrefix: "uzi-now-test-", denyReason: "read only",
+      queryFn: (() => { assert.fail("provider Now must never use Claude"); }) as never,
+      log: noopLog, onUsage: u => { snapshots.push(u); },
+    });
+    assert.equal(text, "Working on the provider milestone");
+    assert.equal(disposed, 1);
+    assert.equal(snapshots.length, 1);
+    const observed = snapshots[0]!["corp-code"]!;
+    assert.equal(observed.inputTokens, 100);
+    assert.equal(observed.outputTokens, 20);
+    assert.equal(observed.costStatus, "unreported");
+    assert.equal(observed.costUSD, undefined);
+  });
+
+  const providerClaim = () => ({
+    provider_id: "fixture-code", revision: 1, engine: "codex" as const,
+    protocol: "openai_responses" as const, auth_style: "bearer" as const,
+    base_url: "https://gateway.example.test/v1",
+    credential: ["fixture", "provider", "key"].join("-"),
+    model_map: { default: { model: "corp-code", context_window: 32768 } },
+  });
+
+  for (const mode of ["provider", "subscription"] as const) {
+    it(`M2 refresh isolation actual executor clean fence: ${mode}`, async () => {
+      const input = providerClaim();
+      const binding = mode === "provider"
+        ? createCodexProviderExecutionAuthority(input) : bindingOf(SUBSCRIPTION);
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      const entered = installerBarrier(), released = installerBarrier();
+      const events: string[] = [];
+      const release = rig.client.releaseCodex.bind(rig.client);
+      const refresh = rig.client.refreshCodex.bind(rig.client);
+      rig.client.releaseCodex = async (...args) => {
+        events.push("release");
+        return release(...args);
+      };
+      rig.client.refreshCodex = async (...args) => {
+        assert.equal(rig.reaped(), 0, "boundary reconciles before provider-root reap");
+        events.push("refresh-enter");
+        entered.resolve();
+        await released.promise;
+        const result = await refresh(...args);
+        events.push("refresh-settled");
+        return result;
+      };
+      let getters = 0;
+      Object.assign(rig.client, { codexAdmissionReporter: () => { getters++; return undefined; } });
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+      const exec = makeExecutor(rig, binding);
+      input.credential = "changed-after-authority";
+      let boundary: Promise<unknown> | undefined;
+      let sinks = 0;
+      try {
+        await withTimeout(exec.run(makeCtx().ctx), 3000, "refresh isolation run");
+        assert.equal(rig.reaped(), 0, "deferred run leaves settlement to the boundary");
+        assert.equal(rig.client.refreshCalls.length, 0);
+        boundary = exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {
+          assert.ok(rig.reaped() > 0);
+          assert.ok(rig.effectDisposes() > 0);
+          events.push("sink");
+          sinks++;
+        });
+        if (mode === "subscription") {
+          await withTimeout(entered.promise, 3000, "real boundary refresh entered");
+          assert.equal(sinks, 0, "sink cannot overtake the in-flight vendor refresh");
+          released.resolve();
+        }
+        await withTimeout(boundary, 3000, "refresh isolation boundary");
+        assert.equal(sinks, 1);
+        assert.equal(rig.client.releaseCalls.length, mode === "provider" ? 0 : 1);
+        assert.equal(rig.client.refreshCalls.length, mode === "provider" ? 0 : 1);
+        assert.equal(getters, mode === "provider" ? 0 : 1);
+        assert.deepEqual(events, mode === "provider" ? ["sink"]
+          : ["release", "refresh-enter", "refresh-settled", "sink"]);
+        const login = rig.transport.requests.find(r => r.method === "account/login/start");
+        if (mode === "provider") {
+          assert.deepEqual(login?.params, { type: "apiKey", apiKey: providerClaim().credential });
+        } else {
+          assert.equal(rec(login?.params).type, "chatgptAuthTokens");
+          assert.equal(rig.client.refreshCalls[0]!.observed_generation, 3);
+        }
+        assert.equal(rig.transport.requests.filter(r => r.method === "account/rateLimits/read").length, 0,
+          "runtime receives notifications; neither authority issues polling requests");
+      } finally {
+        released.resolve();
+        if (boundary) await boundary;
+        await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      }
+    });
+  }
+
+  for (const mode of ["provider", "subscription", "api_key"] as const) {
+    it(`M2 meter isolation actual executor: ${mode}`, async () => {
+      const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+      const key = ["meter-fixture", '"', "/", "<>&", "tail"].join("");
+      const forms = [key, 'meter-fixture\\"/<>&tail', 'meter-fixture\\"\\/<>&tail',
+        "meter-fixture%22%2F%3C%3E%26tail", 'meter-fixture\\"/\\u003c\\u003e\\u0026tail'];
+      const model = "gpt-6.1-sol";
+      const binding = mode === "provider"
+        ? createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+          model_map: { default: { model, context_window: 32768 } } })
+        : bindingOf(mode === "subscription" ? SUBSCRIPTION : API_KEY);
+      const rig = makeRig({ responder: c => c.method === "model/list"
+        ? { data: [{ id: model, model, supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+          defaultReasoningEffort: "high" }] } : defaultResponder(c) });
+      const signals: unknown[] = [], operations: unknown[] = [], reports: CodexCatalogDefaultBody[] = [];
+      let getters = 0;
+      const reporter = new CodexAdmissionReporter(7, () => true, async body => { signals.push(body); return 204; });
+      Object.assign(rig.client, {
+        codexAdmissionReporter: () => { getters++; return reporter; },
+        hasFeature: (name: string) => name === "codex_account_operation_admission_v1",
+        codexOperationNegotiation: 1,
+        checkCodexOperationAdmission: async (_run: string, request: { operation_id: string; claim_generation: number }) => {
+          operations.push(request);
+          return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+        },
+      });
+      const { logger, lines } = recordingLogger();
+      const { ctx, emitted } = makeCtx({ claimGeneration: 7, config: { default_effort: "high", default_model: model },
+        codexCatalogReport: new CodexCatalogReporter({
+          client: { recordCodexCatalogDefault: async (_run, body) => { reports.push(body); return { kind: "ok" }; } },
+          runId: "run-1", claimGeneration: 7, catalogContext: "a".repeat(64), logger,
+        }),
+      });
+      rig.transport.push(threadStarted())
+        .push({ kind: "rate_limits_updated", method: "account/rateLimits/updated", params: {},
+          rateLimits: { limitId: "codex", primary: { usedPercent: 100, windowDurationMins: 300,
+            resetsAt: 2000000000 }, rateLimitReachedType: "rate_limit_reached", limitName: forms[1], planType: forms[2],
+            credits: { balance: forms[3] },
+            ...Object.fromEntries(forms.map((form, i) => [`extra${i}`, form])) } })
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 1000, cachedInputTokens: 600,
+          cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 }))
+        .push(signalDone()).push(turnCompleted()).end();
+      try {
+        await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "meter isolation");
+        await new Promise(r => setImmediate(r));
+        const usage = rec(lastResultModelUsage(emitted)![model]);
+        assert.equal(usage.inputTokens, 300);
+        assert.equal(usage.outputTokens, 200);
+        assert.equal(usage.costStatus, mode === "provider" ? "unreported" : "metered");
+        if (mode === "provider") assert.equal(usage.costUSD, undefined);
+        else assert.equal(Math.round((usage.costUSD as number) * 1e6), 2910);
+        assert.equal(getters, mode === "provider" ? 0 : 1);
+        assert.equal(operations.length, mode === "subscription" ? 1 : 0);
+        assert.equal(rig.client.releaseCalls.length, mode === "provider" ? 0 : 1);
+        assert.equal(rig.client.refreshCalls.length, 0);
+        assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, mode === "provider" ? 0 : 1);
+        assert.equal(reports.length, mode === "provider" ? 0 : 1);
+        assert.equal(rig.transport.requests.filter(r => r.method === "account/rateLimits/read").length, 0);
+        assert.deepEqual(signals, []);
+        assert.equal(emitted.some(m => /limit.*wait|wait.*limit/.test(String(m.payload.event))), false);
+        for (const form of forms) assert.ok(!JSON.stringify({ emitted, lines, reports, signals }).includes(JSON.stringify(form).slice(1, -1)));
+      } finally { reporter.seal(true); }
+    });
+  }
+
+  for (const mode of ["provider", "subscription", "api_key"] as const) {
+    it(`M2 meter classification on failed actual turn: ${mode}`, async () => {
+      const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+      const { LimitReachedError } = await import("../src/limit.js");
+      const key = ["limit", "fixture", "secret"].join("-");
+      const rig = makeRig();
+      const binding = mode === "provider"
+        ? createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key })
+        : bindingOf(mode === "subscription" ? SUBSCRIPTION : API_KEY);
+      const signals: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+      let getters = 0;
+      const reporter = new CodexAdmissionReporter(7, () => true, async body => { signals.push(body); return 204; });
+      Object.assign(rig.client, { codexAdmissionReporter: () => { getters++; return reporter; } });
+      const { logger, lines } = recordingLogger();
+      const { ctx, emitted } = makeCtx({ claimGeneration: 7 });
+      rig.transport.push(threadStarted())
+        .push({ kind: "rate_limits_updated", method: "account/rateLimits/updated", params: {},
+          rateLimits: { limitId: "codex", primary: { usedPercent: 100, windowDurationMins: 300,
+            resetsAt: 2000000000 }, rateLimitReachedType: "rate_limit_reached", extra: key } })
+        .push({ kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: true,
+          params: { threadId: "th-1", turnId: "tn-1", willRetry: true,
+            error: { codexErrorInfo: "rateLimitExceeded", message: key } } })
+        .push({ ...turnCompleted("failed"), params: { threadId: "th-1", turn: { id: "tn-1", status: "failed",
+          error: { codexErrorInfo: "usageLimitExceeded", message: key } } } }).end();
+      try {
+        let failure: unknown;
+        try { await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "limit classification"); }
+        catch (error) { failure = error; }
+        assert.ok(failure instanceof Error);
+        assert.equal(failure instanceof LimitReachedError, mode === "subscription",
+          "only native subscription exhaustion becomes a vendor limit wait");
+        assert.equal(getters, mode === "provider" ? 0 : 1);
+        await new Promise(r => setImmediate(r));
+        assert.equal(signals.length, mode === "provider" ? 0 : 1);
+        if (mode !== "provider") assert.equal(signals[0]!.class, "rate_limit");
+        assert.ok(!JSON.stringify({ emitted, lines, signals, error: String(failure) }).includes(key));
+        assert.equal(rig.transport.requests.filter(r => r.method === "account/rateLimits/read").length, 0);
+      } finally { reporter.seal(true); }
+    });
+  }
+
+  for (const mode of ["provider", "api_key"] as const) for (const sensitive of [false, true]) for (const blocking of [false, true]) {
+    it(`M2 catalog default model key overlap ${mode} sensitive=${sensitive} blocking=${blocking}`, async () => {
+      // Prefixless credential is also a syntactically valid model ID.
+      const key = ["catalog", "overlap", "fixture"].join("-");
+      const model = sensitive ? key : "catalog-clean-control";
+      const reports: CodexCatalogDefaultBody[] = [];
+      let catalogSettled!: () => void;
+      const catalogDone = new Promise<void>(resolve => { catalogSettled = resolve; });
+      const rig = makeRig({ token: key, responder: async c => {
+        if (c.method === "model/list") return {
+          data: [{ id: model, model, supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+            defaultReasoningEffort: "high" }],
+        };
+        // Keep the report-only probe alive until its actual onEntry/report callback returns.
+        if (c.method === "turn/start" && mode !== "provider") {
+          await withTimeout(catalogDone, 3000, "actual catalog callback settled");
+        }
+        return defaultResponder(c);
+      } });
+      const { logger, lines } = recordingLogger();
+      const reporter = new CodexCatalogReporter({
+          client: { recordCodexCatalogDefault: async (_run, body) => { reports.push(body); return { kind: "ok" }; } },
+          runId: "run-1", claimGeneration: 7, catalogContext: "b".repeat(64), logger,
+      });
+      const report = reporter.report.bind(reporter);
+      reporter.report = (entry, reportedModel) => {
+        try { report(entry, reportedModel); }
+        finally { catalogSettled(); }
+      };
+      const claimSecret = "separate-claim-secret";
+      const { ctx } = makeCtx({
+        config: { default_model: mode === "provider" ? "default" : model,
+          ...(blocking ? { default_effort: "high" as const } : {}) },
+        // Native key is known ONLY through the runtime release, never claim redaction.
+        redactText: makeTextRedactor(mode === "provider" ? [key, claimSecret] : [claimSecret]),
+        codexCatalogReport: reporter,
+      });
+      const posted: OutgoingMessage[] = [];
+      const batcher = new MessageBatcher({ postMessages: async (_run: string, messages: OutgoingMessage[]) => {
+        posted.push(...messages);
+      } } as unknown as WorkerClient, "run-1", 0, 5, logger, makeRedactor([key]), makeTextRedactor([key]));
+      const capture = ctx.emit;
+      ctx.emit = message => { capture(message); batcher.emit(message); };
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+      const binding = mode === "provider" ? createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+        model_map: { default: { model, context_window: 32768 } } }) : bindingOf(API_KEY);
+      try { await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "catalog key overlap"); }
+      finally { await batcher.close(); }
+      if (mode !== "provider") await withTimeout(catalogDone, 3000, "catalog callback");
+      const turns = rig.transport.requests.filter(r => r.method === "turn/start");
+      assert.equal(turns.length, 1);
+      assert.equal(rec(turns[0]!.params).model, model, "catalog redaction leaves requested model unchanged");
+      assert.equal(rec(turns[0]!.params).effort, blocking ? "high" : undefined);
+      assert.equal(rig.transport.requests.filter(r => r.method === "model/list").length, mode === "provider" ? 0 : 1);
+      if (mode === "provider") assert.deepEqual(reports, []);
+      if (!sensitive && mode !== "provider") {
+        assert.equal(reports.length, 1);
+        assert.equal(reports[0]!.model, model);
+        assert.equal(reports[0]!.default_effort, "high");
+      }
+      assert.ok(!JSON.stringify(reports).includes(key), "released key must not escape catalog default report.model");
+      assert.ok(!JSON.stringify({ posted, lines }).includes(key), "released key must not escape public output");
+    });
+  }
+
+  it("refuses changed provider summary authority before factory construction", async () => {
+    const rig = makeRig();
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    const executor = makeExecutor(rig, binding);
+    let builds = 0;
+    const factory = executor.bindCodexSummaryFactory(async () => {
+      builds++;
+      return { run: async () => ({}) } as never;
+    });
+    const variants = [
+      { provider_id: "other" }, { revision: 2 }, { credential: "changed-fixture-key" },
+      { base_url: "https://other.example/v1" },
+      { model_map: { default: { model: "other-model" } } },
+    ];
+    for (const change of variants) {
+      const params = { runId: "run-1", binding: createCodexProviderExecutionAuthority({ ...providerClaim(), ...change }) };
+      summaryCallDeadlines.set(params, Date.now() + 10000);
+      await assert.rejects(factory(params), /authority mismatch/);
+    }
+    const params = { runId: "run-1", binding: bindingOf(API_KEY) };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    await assert.rejects(factory(params), /authority mismatch/);
+    assert.equal(builds, 0);
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  for (const sensitive of [false, true]) {
+    it(`M2 bounded provider failed root diagnostic sensitive=${sensitive}`, async () => {
+      const key = ["failure-fixture", '"', "/", "<>&", "tail"].join("");
+      const inputs = sensitive ? [key, 'failure-fixture\\"/<>&tail',
+        'failure-fixture\\"\\/<>&tail', "failure-fixture%22%2F%3C%3E%26tail",
+        'failure-fixture\\"/\\u003c\\u003e\\u0026tail'] : ["clean-alpha", "clean-beta"];
+      const payload = { control: "failure-control",
+        ...Object.fromEntries(inputs.map((value, ordinal) => [value, { value, ordinal }])) };
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+      const forms = providerKeyForms(key);
+      if (sensitive) for (const input of inputs) assert.ok(forms.includes(input));
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) => {
+        transport.push({
+          kind: "turn_completed", method: "turn/completed", threadId: th, turnId: tn, status: "failed",
+          params: { threadId: th, turn: { id: tn, status: "failed",
+            error: { codexErrorInfo: "badRequest", message: JSON.stringify(payload), additionalDetails: payload } } },
+        });
+      }) });
+      const { logger, lines } = recordingLogger();
+      const posted: OutgoingMessage[] = [];
+      const batcher = new MessageBatcher({ postMessages: async (_id: string, messages: OutgoingMessage[]) => {
+        posted.push(...messages);
+      } } as unknown as WorkerClient, "run-1", 0, 5, logger, makeRedactor(forms), makeTextRedactor(forms));
+      const { ctx, emitted } = makeCtx({ redactText: makeTextRedactor(forms) });
+      const capture = ctx.emit;
+      ctx.emit = message => { capture(message); batcher.emit(message); };
+      let failure: unknown;
+      try { await makeExecutor(rig, binding, logger).run(ctx); }
+      catch (error) { failure = error; }
+      finally { rig.transport.end(); await batcher.close(); }
+      assert.ok(failure instanceof Error);
+      assert.equal(failure.message, "codex turn failed: failed (badRequest)");
+      assert.equal(rig.transport.turnStartCount, 1, "the admitted failed turn settles without retries");
+      const results = emitted.filter(m => m.kind === "error" && m.payload.event === "result");
+      assert.equal(results.length, 1, "one classified failed terminal");
+      assert.ok(posted.some(m => m.kind === "error" && m.payload.event === "result"), "failure reaches batcher posts");
+      assert.match(JSON.stringify(results), /badRequest/);
+      assert.doesNotMatch(JSON.stringify({ posted, lines }), /failure-control|clean-alpha|clean-beta/,
+        "even clean provider diagnostics are withheld from the failure projection");
+      for (const [sink, value] of Object.entries({ posted, lines, error: failure.message })) {
+        const visible = JSON.stringify(value);
+        for (const form of forms) {
+          assert.ok(!visible.includes(form), `provider key escaped ${sink}`);
+          assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), `escaped provider key escaped ${sink}`);
+        }
+      }
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
+
+  it("M2 bounded provider actual runner posts classified failure_reason", async () => {
+    const key = ["runner-failure", '"', "/", "<>&", "tail"].join("");
+    const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+    const forms = providerKeyForms(key);
+    const diagnostic = { control: "runner-failure-control",
+      ...Object.fromEntries(forms.map(value => [value, { value }])) };
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) => {
+      transport.push({
+        kind: "turn_completed", method: "turn/completed", threadId: th, turnId: tn, status: "failed",
+        params: { threadId: th, turn: { id: tn, status: "failed",
+          error: { codexErrorInfo: "badRequest", message: JSON.stringify(diagnostic), additionalDetails: diagnostic } } },
+      });
+    }) });
+    const { logger, lines } = recordingLogger();
+    const executor = makeExecutor(rig, binding, logger);
+    const claim = m2Runner.gitlabClaim(45092, {
+      plan_approved: true, plan_md: "Approved failure proof", plan_source: "seeded",
+      secrets: { forge_pat: "fixture-forge-pat-000000", provider: binding.providerBinding },
+    });
+    const forge = m2Runner.fakeGitlab();
+    await m2Runner.runnerWith(() => ({ executor }), forge.gitlab, undefined, logger).execute(claim);
+    const states = m2Runner.api.states.filter(s => s.runId === claim.run_id);
+    const failed = states.filter(s => s.body.status === "failed");
+    assert.equal(failed.length, 1, JSON.stringify(states));
+    assert.equal(failed[0]!.body.failure_reason, "codex turn failed: failed (badRequest)");
+    assert.ok(!states.some(s => s.body.status === "completed"));
+    assert.equal(rig.transport.turnStartCount, 1);
+    const messages = m2Runner.api.messages(claim.run_id);
+    assert.ok(messages.some(m => m.kind === "error" && m.payload.event === "result"),
+      "real runner batcher posts the failed result");
+    assert.ok(lines.some(line => JSON.stringify(line).includes("run failed")), "runner diagnostic was captured");
+    const visible = JSON.stringify({ states, messages, lines });
+    assert.doesNotMatch(visible, /runner-failure-control/);
+    for (const form of forms) {
+      assert.ok(!visible.includes(form), "provider key escaped actual runner sinks");
+      assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), "encoded provider key escaped actual runner sinks");
+    }
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("M2 bounded provider default root drains stderr without publishing it", async () => {
+    const rig = makeRig();
+    const { launchProviderRoot: unused, ...rest } = rig.deps;
+    void unused;
+    const key = ["stderr-fixture", '"', "/", "<>&", "tail"].join("");
+    const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+    const forms = providerKeyForms(key);
+    const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+    let requests = "", initialized = false, disposed = false;
+    stdin.on("data", chunk => {
+      requests += chunk.toString();
+      let newline: number;
+      while ((newline = requests.indexOf("\n")) >= 0) {
+        const line = JSON.parse(requests.slice(0, newline)); requests = requests.slice(newline + 1);
+        if (line.method === "initialize") {
+          initialized = true;
+          // End only our injected streams. No real provider process is launched.
+          stderr.end(JSON.stringify({ control: "stderr-private-control",
+            ...Object.fromEntries(forms.map(value => [value, value])) }).repeat(256));
+          stdout.write(JSON.stringify({ id: line.id, error: { code: -32000, message: "fixture initialization refused" } }) + "\n");
+        }
+      }
+    });
+    const { logger, lines } = recordingLogger();
+    rig.deps = { ...rest, launchCodexRootForTest: async () => ({
+      started: { event: "started", supervisorPid: 1234, childPid: 1235, subreaper: true,
+        nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 1234, transport: { stdin, stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+      dispose: async () => {
+        disposed = true; stdin.end(); stdout.end(); stderr.end();
+        return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+      },
+    }) };
+    const { ctx, emitted } = makeCtx({ redactText: makeTextRedactor(forms) });
+    try { await assert.rejects(makeExecutor(rig, binding, logger).run(ctx)); }
+    finally { stdin.end(); stdout.end(); stderr.end(); }
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(initialized, true, "production transport attempted initialization");
+    assert.equal(disposed, true, "failed initialization disposed our root");
+    assert.equal(stderr.readableEnded, true, "production default adapter drained the injected stderr");
+    assert.equal(stderr.readableLength, 0);
+    const visible = JSON.stringify({ emitted, lines });
+    assert.doesNotMatch(visible, /stderr-private-control/);
+    for (const form of forms) {
+      assert.ok(!visible.includes(form));
+      assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)));
+    }
+  });
+
+  for (const sensitive of [false, true]) {
+    it(`M2 owned production intent and plan publication sensitive=${sensitive}`, async () => {
+      // Supported injected transports: production composition, not real runtime proof.
+      const key = ["summary-echo", '"', "/", "<>&", "tail"].join("");
+      // Independent encoded fixtures, deliberately not derived from providerKeyForms.
+      const echoes = [key, 'summary-echo\\"/<>&tail', 'summary-echo\\"\\/<>&tail',
+        "summary-echo%22%2F%3C%3E%26tail", 'summary-echo\\"/\\u003c\\u003e\\u0026tail'];
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key });
+      const intentPosted = installerBarrier();
+      const done = epochResponder("th-1", "tn-1", (t, th, tn) =>
+        t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Provider plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([plan, done]);
+      let vendorCalls = 0;
+      const forbidden = () => { vendorCalls++; throw new Error("unexpected vendor operation"); };
+      const posted: Record<string, unknown> = {};
+      Object.assign(rig.client, {
+        releaseCodex: forbidden, refreshCodex: forbidden, checkCodexOperationAdmission: forbidden,
+        postIntentSummary: async (id: string, summary: string) => {
+          assert.equal(id, "run-1"); posted.intent = summary; intentPosted.resolve();
+        },
+        postPlanSummary: async (id: string, body: unknown) => {
+          assert.equal(id, "run-1"); posted.plan = body;
+        },
+      });
+      const { logger, lines } = recordingLogger();
+      const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/m2-summary-"));
+      const transports: FakeTransport[] = [];
+      let disposals = 0;
+      const factory = makeProductionCodexAdviceHarnessFactory(rig.client as never, logger, root, {
+        launchRoot: async spec => {
+          assert.deepEqual(spec.providerBinding, binding.providerBinding);
+          assert.equal(spec.providerSlot, "default");
+          const ordinal = transports.length;
+          assert.ok(ordinal < 2, "one advice root per pass");
+          const control = ordinal === 0 ? "Intent control" : "Plan control";
+          const summary = sensitive ? control + " " + echoes.join(" | ") : control;
+          const text = ordinal === 0 ? summary : JSON.stringify({ summary, deltas: [{ kind: "added", text: "Visible delta" }] });
+          const transport = new FakeTransport(defaultResponder);
+          transport.push(threadStarted())
+            .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100 + ordinal, outputTokens: 20, totalTokens: 120 + ordinal }))
+            .push(agentMessage(text)).push(turnCompleted("completed")).end();
+          transports.push(transport);
+          return { transport, cwd: "/isolated", dispose: async () => { disposals++; } };
+        },
+      });
+      const { ctx, emitted } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        gatePlan: async (md, _milestones, awaiting) => {
+          await withTimeout(intentPosted.promise, 3000, "intent publication");
+          await awaiting?.(md);
+          return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
+        },
+      });
+      const executor = new CodexExecutor(logger, root,
+        { binding, client: rig.client as never, provider, codexAdviceHarnessFactory: factory },
+        { installDeps: async () => ({ results: [], truncated: false }), ...rig.deps,
+          spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+      try {
+        await executor.run(ctx);
+        assert.equal(transports.length, 2);
+        assert.equal(disposals, 2, "both owned advice roots disposed before return");
+        assert.ok(rig.epochs.every(e => e.reaped() > 0), "executor roots reaped");
+        const suffix = sensitive ? " " + echoes.map(() => "***REDACTED***").join(" | ") : "";
+        assert.equal(posted.intent, "Intent control" + suffix);
+        assert.deepEqual(posted.plan, { summary: "Plan control" + suffix, deltas: [{ kind: "added", text: "Visible delta" }], plan_md: "Provider plan" });
+        const usage = emitted.filter(m => m.kind === "summary_usage");
+        assert.deepEqual(usage.map(m => m.payload.pass).sort(), ["intent", "plan"]);
+        for (const [ordinal, pass] of ["intent", "plan"].entries()) {
+          const event = usage.find(m => m.payload.pass === pass)!;
+          const observed = (event.payload.model_usage as import("../src/harness.js").AdviceUsageSnapshot)["corp-code"]!;
+          assert.equal(observed.inputTokens, 100 + ordinal);
+          assert.equal(observed.outputTokens, 20);
+          assert.equal(observed.costStatus, "unreported");
+          assert.equal(observed.costUSD, undefined);
+          const turns = transports[ordinal]!.requests.filter(r => r.method === "turn/start");
+          assert.equal(turns.length, 1);
+          assert.equal(rec(turns[0]!.params).model, "corp-code");
+        }
+        const visible = JSON.stringify({ posted, emitted, lines });
+        for (const echo of echoes) {
+          assert.ok(!visible.includes(echo), "key echo escaped publication");
+          assert.ok(!visible.includes(JSON.stringify(echo).slice(1, -1)), "encoded key echo escaped publication");
+        }
+        assert.equal(vendorCalls, 0, "provider never enters vendor operations");
+      } finally {
+        await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("derives provider-only intent and plan claims from the frozen epoch", async () => {
+    const done = epochResponder("th-1", "tn-1", (t, th, tn) =>
+      t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
+    const approve: Awaited<ReturnType<NonNullable<RunContext["gatePlan"]>>> = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
+    const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: "Provider plan" }, th, tn, "plan"))
+        .push(turnCompleted("completed", th, tn)));
+    const rig = makeMultiEpochRig([plan, done]);
+    const inputs: IntentSummaryInput[] = [];
+    const summaryRunner = {
+      generateIntentSummary: async (input: IntentSummaryInput) => { inputs.push(input); return "Intent."; },
+      generatePlanSummary: async (input: PlanSummaryInput) => { inputs.push(input); return { summary: "Plan.", deltas: [] }; },
+    };
+    const delivered: unknown[] = [];
+    Object.assign(rig.client, {
+      postIntentSummary: async (_id: string, summary: string) => { delivered.push(summary); },
+      postPlanSummary: async (_id: string, body: unknown) => { delivered.push(body); },
+    });
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async (md, _milestones, awaiting) => { await awaiting?.(md); return approve; },
+    });
+    const binding = createCodexProviderExecutionAuthority(providerClaim());
+    await makeExecutor(rig, binding, noopLog, undefined, provider, { summaryRunner }).run(ctx);
+    assert.equal(inputs.length, 2);
+    assert.equal(delivered[0], "Intent.");
+    assert.equal((delivered[1] as { summary: string }).summary, "Plan.");
+    for (const input of inputs) {
+      assert.equal(Object.hasOwn(input.claim!.secrets, "codex"), false);
+      assert.deepEqual(input.claim!.secrets.provider, binding.providerBinding);
+      assert.ok(Object.isFrozen(input.claim!.secrets.provider));
+    }
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("delivers frozen managed login on fresh roots with no vendor operations", async () => {
+    const rig = makeRig();
+    const input = providerClaim();
+    const binding = createCodexProviderExecutionAuthority(input);
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const specs: CodexLaunchRootSpec[] = [];
+    const launch = rig.deps.launchProviderRoot!;
+    const deps: CodexExecutorDeps = { ...rig.deps, launchProviderRoot: async (spec, mode) => {
+      assert.equal(mode, "provider");
+      specs.push(spec);
+      return launch(spec, mode);
+    } };
+    const executor = makeExecutor({ ...rig, deps }, binding);
+    input.credential = "changed-provider-credential";
+    input.model_map.default.model = "changed-model";
+    const { ctx } = makeCtx();
+    await executor.run(ctx);
+    assert.ok(specs.length >= 1);
+    assert.equal(specs[0]!.providerBinding?.credential, binding.providerBinding.credential);
+    assert.equal(specs[0]!.providerBinding?.model_map.default.model, "corp-code");
+    assert.equal(specs[0]!.model, "default");
+    const login = rig.transport.requests.find(r => r.method === "account/login/start");
+    assert.deepEqual(login?.params, { type: "apiKey", apiKey: binding.providerBinding.credential });
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  it("restarts at the frozen binding after a plan boundary", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("resumed-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const input = providerClaim();
+    const binding = createCodexProviderExecutionAuthority(input);
+    const specs: CodexLaunchRootSpec[] = [];
+    const launch = rig.deps.launchProviderRoot!;
+    rig.deps = { ...rig.deps, launchProviderRoot: async (spec, mode) => {
+      specs.push(spec);
+      assert.equal(mode, "provider");
+      return launch(spec, mode);
+    } };
+    const executor = makeExecutor(rig, binding);
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => {
+        input.base_url = "https://replacement.example.test";
+        input.credential = "replacement-fixture-key";
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      } });
+    await executor.run(ctx);
+    assert.equal(specs.length, 2);
+    assert.ok(rig.epochs[0]!.disposed() >= 1);
+    for (const spec of specs) {
+      assert.deepEqual(spec.providerBinding, binding.providerBinding);
+      assert.equal(spec.model, "default");
+    }
+    for (const epoch of rig.epochs) {
+      const login = epoch.transport.requests.find(r => r.method === "account/login/start");
+      assert.deepEqual(login?.params, { type: "apiKey", apiKey: binding.providerBinding.credential });
+    }
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
+  });
+
+  for (const slot of ["default", "gpt-6-astra"] as const) {
+    it(`passes exclusive provider authority and ${slot} context through the actual default launcher`, async () => {
+      const rig = makeRig();
+      const { launchProviderRoot: unused, ...rest } = rig.deps;
+      void unused;
+      const binding = createCodexProviderExecutionAuthority({
+        ...providerClaim(),
+        model_map: {
+          default: { model: "corp-code", context_window: 32768 },
+          ...(slot === "gpt-6-astra" ? { "gpt-6-astra": { model: "corp-code", context_window: 131072 } } : {}),
+        },
+      });
+      let reached = false;
+      rig.deps = { ...rest, launchCodexRootForTest: async spec => {
+        reached = true;
+        assert.deepEqual(spec.providerBinding, binding.providerBinding);
+        assert.equal(spec.provider, undefined);
+        assert.equal(spec.authMode, "provider");
+        assert.equal(spec.useAppServerAuth, true);
+        assert.equal(spec.model, slot);
+        assert.equal(spec.providerBinding?.model_map[spec.model!]?.context_window,
+          slot === "gpt-6-astra" ? 131072 : 32768);
+        assert.equal(spec.codeModeHost, true);
+        assert.equal(Object.hasOwn(spec, "credentialValue"), false);
+        throw new Error("provider launcher sentinel");
+      } };
+      const { ctx } = makeCtx(slot === "gpt-6-astra"
+        ? { config: { default_model: "gpt-6-astra", default_model_source: "run_override" } }
+        : {});
+      await assert.rejects(makeExecutor(rig, binding).run(ctx), /provider launcher sentinel/);
+      assert.equal(reached, true);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
+
+  it("provider auth-state canary reaches production staging via branch instrumentation", async (t) => {
+    const root = await fs.mkdtemp(path.join(process.env.TMPDIR!, "provider-executor-canary-"));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const home = path.join(root, "run");
+    await fs.mkdir(path.join(home, "codex-data"), { recursive: true });
+    const source = path.join(root, "source");
+    await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+    const transcript = JSON.stringify({ type: "session_meta", payload: { id: "controlled-session" } }) + "\n";
+    await fs.writeFile(path.join(source, "sessions/rollout-safe.jsonl"), transcript);
+    for (const name of ["auth.json", "config.toml", "cache.json"]) {
+      await fs.writeFile(path.join(source, name), ["private", name, "canary"].join("-"));
+    }
+    await CodexSessionStore.persist(source, path.join(home, "codex-session-store"));
+    const rig = makeRig();
+    const { launchProviderRoot: unused, ...rest } = rig.deps;
+    void unused;
+    let staged = "";
+    let reached = false;
+    const sentinel = new Error("canary default launcher captured");
+    rig.deps = { ...rest, sessionStore: {
+      ...CodexSessionStore,
+      adopt: async (store, destination, opts) => {
+        assert.equal(opts?.destination, "runner-seed");
+        staged = destination;
+        return CodexSessionStore.adopt(store, destination, opts);
+      },
+    }, launchCodexRootForTest: async spec => {
+      reached = true;
+      assert.equal(spec.authMode, "provider");
+      assert.equal(spec.seedSession, true);
+      assert.equal(staged, spec.ownedDataRoot + ".session-seed");
+      assert.deepEqual(await fs.readdir(staged), ["sessions"]);
+      assert.deepEqual(await fs.readdir(path.join(staged, "sessions")), ["rollout-safe.jsonl"]);
+      assert.equal(await fs.readFile(path.join(staged, "sessions/rollout-safe.jsonl"), "utf8"), transcript);
+      throw sentinel;
+    } };
+    const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()), noopLog, undefined, provider, home);
+    // Host is command uid. Model parent preparation only; enable the actual
+    // production staging branch after its two parent checks. The launcher hook
+    // itself would otherwise bypass staging, so merely capturing spec is insufficient.
+    let parentChecks = 0;
+    Object.defineProperty(executor, "providerLaunchInjected", { value: () => ++parentChecks <= 2 });
+    await assert.rejects(executor.run(makeCtx().ctx), error => error === sentinel);
+    assert.equal(parentChecks, 3, "two parent checks followed by actual staging admission");
+    assert.equal(reached, true);
+    await assert.rejects(fs.stat(staged), { code: "ENOENT" });
+    // No claim about final-root provisioning/disposal: the hook stops before it.
+  });
+
+  for (const mapped of [false, true]) {
+    it(`provider delegated child uses ${mapped ? "role slot" : "default fallback"} for RPCs, context and accounting`, async () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport
+            .push(toolCall(11, "uzi_bash", { command: "echo mapped-child" }, "th-child", "tn-child", "child-shell"))
+            .push(tokenUsageUpdated("th-child", "tn-child", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+            .push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      } });
+      const binding = createCodexProviderExecutionAuthority({
+        ...providerClaim(),
+        model_map: {
+          default: { model: "corp-default", context_window: 32768 },
+          ...(mapped ? { "gpt-6.1-sol": { model: "corp-child", context_window: 65536 } } : {}),
+        },
+      });
+      const { ctx, emitted } = makeCtx({ agents: [
+        { name: "lead", description: "lead", prompt_body: "lead body" },
+        { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-6.1-sol" },
+      ] });
+      rig.transport.push(threadStarted())
+        .push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "root-child"));
+      const running = makeExecutor(rig, binding).run(ctx);
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "mapped child settled");
+      rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+      await withTimeout(running, 3000, "mapped child run");
+      const model = mapped ? "corp-child" : "corp-default";
+      const start = rec(rig.transport.requests.filter(r => r.method === "thread/start")[1]!.params);
+      const turn = rec(rig.transport.requests.filter(r => r.method === "turn/start")[1]!.params);
+      assert.equal(start.model, model);
+      assert.equal(turn.model, model);
+      assert.equal(rec(start.config).model_context_window, mapped ? 65536 : 32768);
+      assert.deepEqual(start.environments, []);
+      assert.deepEqual(turn.environments, []);
+      assertNoNativeServers(start.config);
+      assert.ok(rig.spawnCommandCalls.some(s => JSON.stringify(s.argv).includes("echo mapped-child")));
+      const usage = lastResultModelUsage(emitted)!;
+      assert.deepEqual(Object.keys(usage), [model]);
+      assert.equal(rec(usage[model]).inputTokens, 200);
+      assert.equal(rec(usage[model]).outputTokens, 100);
+      assert.equal(rec(usage[model]).costUSD, undefined);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+    });
+  }
+
+  for (const sensitive of [false, true]) {
+    it(`provider child output boundary preserves ${sensitive ? "encoded-key secrecy and unpriced usage" : "clean output and distinct usage"}`, async () => {
+      // Inputs are constructed independently of the production expected-form helper.
+      const key = ["child-fixture", '"', "/", "<>&", "tail"].join("");
+      const json = 'child-fixture\\"/<>&tail';
+      const slash = 'child-fixture\\"\\/<>&tail';
+      const unicode = 'child-fixture\\"/\\u003c\\u003e\\u0026tail';
+      const percent = 'child-fixture%22%2F%3C%3E%26tail';
+      const inputs = sensitive ? [key, json, slash, percent, unicode] : ["clean-alpha", "clean-beta"];
+      const payload = { control: "child-output-control", ...Object.fromEntries(inputs.map((value, i) => [value, { value, ordinal: i }])) };
+      const text = JSON.stringify(payload);
+      const rootModel = "corp-root";
+      const childModel = "corp-child";
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport
+            .push(agentMessage(text, "th-child"))
+            .push(toolCall(11, "uzi_bash", { command: "echo child-output-control" }, "th-child", "tn-child", "child-shell"))
+            .push(tokenUsageUpdated("th-child", "tn-child", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+            .push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      } });
+      // Only the effect seam is fake; the tool broker, projection and delegation are real.
+      rig.deps = { ...rig.deps, spawnCommand: async () => ({ code: 0, stdout: text, stderr: "child-stderr-control" }) };
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+        model_map: { default: { model: rootModel, context_window: 32768 },
+          "gpt-6.1-sol": { model: childModel, context_window: 65536 } } });
+      const forms = providerKeyForms(key);
+      if (sensitive) for (const input of inputs) assert.ok(forms.includes(input), "independent input is a recognized key form");
+      const { logger, lines } = recordingLogger();
+      const { ctx, emitted } = makeCtx({ redactText: makeTextRedactor(forms), agents: [
+        { name: "lead", description: "lead", prompt_body: "lead body" },
+        { name: "coder", description: "coder", prompt_body: "coder body", model: "gpt-6.1-sol" },
+      ] });
+      rig.transport.push(threadStarted())
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 10, outputTokens: 5, totalTokens: 15 }))
+        .push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "root-child"));
+      const running = makeExecutor(rig, binding, logger).run(ctx);
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "output child settled");
+      rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+      await withTimeout(running, 3000, "output child run");
+      const reply = rig.transport.responses.find(r => r.requestId === 1)!;
+      assert.match(JSON.stringify(reply), /child-output-control/, "child text reaches the parent response");
+      assert.ok(emitted.some(m => m.agent === "coder" && JSON.stringify(m).includes("child-output-control")), "child feed was emitted");
+      assert.ok(rig.transport.responses.some(r => r.requestId === 11), "actual tool broker settled child command");
+      const usage = lastResultModelUsage(emitted)!;
+      assert.ok(usage, "final accounting was emitted");
+      assert.deepEqual(Object.keys(usage).sort(), [childModel, rootModel]);
+      assert.equal(rec(usage[rootModel]).inputTokens, 10);
+      assert.equal(rec(usage[childModel]).inputTokens, 200);
+      const rows = Object.values(usage).map(rec);
+      assert.equal(rows.reduce((sum, row) => sum + Number(row.inputTokens), 0), 210);
+      assert.equal(rows.reduce((sum, row) => sum + Number(row.outputTokens), 0), 105);
+      assert.equal(rows.length, 2, "root and child retain distinct model accounting");
+      for (const row of rows) assert.equal(row.costUSD, undefined, "provider tokens remain unpriced");
+      assert.equal(rig.transport.requests.filter(r => r.method === "thread/start").length, 2);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+      const visible = JSON.stringify({ emitted, responses: rig.transport.responses, logs: lines });
+      if (sensitive) {
+        for (const form of forms) {
+          for (const [channel, value] of Object.entries({ emitted, responses: rig.transport.responses, logs: lines })) {
+            assert.ok(!JSON.stringify(value).includes(form), `provider form escaped ${channel} (response IDs: ${rig.transport.responses.filter(r => JSON.stringify(r).includes(form)).map(r => r.requestId).join(",")}): ${form}`);
+          }
+          assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), "JSON-escaped provider form escaped output boundary");
+        }
+      } else {
+        const shellReply = rec(rec(rig.transport.responses.find(r => r.requestId === 11)?.response).result);
+        assert.equal(shellReply.success, true, "child shell callback succeeds");
+        const shellOutput = rec(JSON.parse(String(rec((shellReply.contentItems as unknown[])[0]).text)));
+        assert.equal(typeof shellOutput.stdout, "string");
+        assert.ok(shellOutput.stdout, "child shell stdout is nonempty");
+        assert.deepEqual(JSON.parse(String(shellOutput.stdout)), {
+          control: "child-output-control",
+          "clean-alpha": { value: "clean-alpha", ordinal: 0 },
+          "clean-beta": { value: "clean-beta", ordinal: 1 },
+        }, "clean shell JSON member names and values survive");
+      }
+    });
+  }
+
+
+  for (const sensitive of [false, true]) {
+    it(`provider root RPC composition sensitive=${sensitive} preserves write boundaries and unpriced tokens`, async () => {
+      const key = ["root-fixture", '"', "/", "<>&", "tail"].join("");
+      // Independent challenge strings: do not generate the input using providerKeyForms.
+      const inputs = sensitive ? [key, 'root-fixture\\"/<>&tail', 'root-fixture\\"\\/<>&tail',
+        "root-fixture%22%2F%3C%3E%26tail", 'root-fixture\\"/\\u003c\\u003e\\u0026tail'] : ["clean-alpha", "clean-beta"];
+      const payload = { control: "root-output-control",
+        ...Object.fromEntries(inputs.map((value, ordinal) => [value, { value, ordinal }])) };
+      const text = JSON.stringify(payload);
+      const model = "gpt-6.1-sol"; // Gateway collision with a priced vendor model.
+      const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: key,
+        model_map: { default: { model, context_window: 32768 } } });
+      assert.ok(Object.isFrozen(binding.providerBinding));
+      const forms = providerKeyForms(key);
+      if (sensitive) for (const input of inputs) assert.ok(forms.includes(input));
+      const rig = makeRig();
+      const writes: { sink: string; args: unknown[] }[] = [];
+      const forbidden: string[] = [];
+      const deny = (name: string) => async () => { forbidden.push(name); assert.fail(name); };
+      Object.assign(rig.client, {
+        releaseCodex: deny("releaseCodex"), refreshCodex: deny("refreshCodex"),
+        checkCodexOperationAdmission: deny("checkCodexOperationAdmission"),
+        reportFinding: async (...args: unknown[]) => { writes.push({ sink: "finding", args }); return "finding-root"; },
+        saveMemory: async (...args: unknown[]) => {
+          writes.push({ sink: "memory", args });
+          return { id: "memory-root", title: rec(args[1]).title };
+        },
+        replyMRThread: async (...args: unknown[]) => { writes.push({ sink: "forge", args }); return { replied: true }; },
+      });
+      const { logger, lines } = recordingLogger();
+      // runner.buildFlight owns root-feed redaction at the production batcher boundary.
+      const posted: OutgoingMessage[] = [];
+      const batchClient = { postMessages: async (_id: string, messages: OutgoingMessage[]) => {
+        posted.push(...messages);
+      } } as unknown as WorkerClient;
+      const batcher = new MessageBatcher(batchClient, "run-1", 0, 5, logger,
+        makeRedactor(forms), makeTextRedactor(forms));
+      const { ctx, emitted } = makeCtx({
+        redactText: makeTextRedactor(forms),
+        reportProgress: async progress => { writes.push({ sink: "progress", args: [progress] }); },
+      });
+      const capture = ctx.emit;
+      ctx.emit = message => { capture(message); batcher.emit(message); };
+      rig.transport.push(threadStarted())
+        .push({ kind: "rate_limits_updated", method: "account/rateLimits/updated",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {} })
+        .push(agentMessage(text))
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 137, outputTokens: 29, totalTokens: 166 }))
+        .push(toolCall(81, "report_progress", { completed: [text], in_progress: ["root-control"] }, "th-1", "tn-1", "root-progress"))
+        .push(toolCall(82, reportIncidentalIssueToolName(), {
+          title: "root finding", description: text, location: text, labels: ["root-control"], confidence: "high" }, "th-1", "tn-1", "root-finding"))
+        .push(toolCall(83, memoryToolNames()[0]!, {
+          title: "root memory", body: text, basis: "observed", evidence: "root-output-control " + inputs.join(" | ") }, "th-1", "tn-1", "root-memory"))
+        .push(toolCall(84, "mcp__forge__reply_mr_thread", { reply_id: "root-reply", body: text }, "th-1", "tn-1", "root-forge"));
+      const running = makeExecutor(rig, binding, logger).run(ctx);
+      try {
+        await waitFor(() => [81, 82, 83, 84].every(id => rig.transport.responses.some(r => r.requestId === id)),
+          "root RPC callbacks settled");
+        rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+        await withTimeout(running, 3000, "root composition completion");
+      } finally {
+        rig.transport.end();
+        await running;
+        await batcher.close();
+      }
+      assert.deepEqual(forbidden, []);
+      assert.deepEqual(writes.map(w => w.sink).sort(), ["finding", "forge", "memory", "progress"], JSON.stringify(rig.transport.responses));
+      for (const id of [81, 82, 83, 84]) {
+        const reply = rig.transport.responses.find(r => r.requestId === id)!;
+        assert.equal(rec(rec(reply.response).result).success, true, `root callback ${id} succeeds`);
+      }
+      const usage = lastResultModelUsage(emitted)!;
+      assert.deepEqual(Object.keys(usage), [model]);
+      assert.equal(rec(usage[model]).inputTokens, 137);
+      assert.equal(rec(usage[model]).outputTokens, 29);
+      assert.equal(rec(usage[model]).costUSD, undefined);
+      assert.equal(rec(usage[model]).costStatus, "unreported");
+      for (const [channel, value] of Object.entries({ writes, posted, responses: rig.transport.responses, logs: lines })) {
+        const visible = JSON.stringify(value);
+        for (const form of forms) {
+          assert.ok(!visible.includes(form), `key escaped ${channel}`);
+          assert.ok(!visible.includes(JSON.stringify(form).slice(1, -1)), `escaped key escaped ${channel}`);
+        }
+      }
+      for (const write of writes) assert.match(JSON.stringify(write), /root-output-control/);
+      assert.ok(posted.some(m => m.kind === "text" && m.agent_instance === undefined &&
+        typeof m.payload.text === "string" && m.payload.text.includes("root-output-control")),
+      "posted root agent prose retains root-output-control");
+      if (!sensitive) {
+        assert.equal(writes.find(w => w.sink === "forge")!.args[2], text);
+        assert.deepEqual(JSON.parse(String(rec(writes.find(w => w.sink === "memory")!.args[1]).body)), payload);
+        assert.ok(posted.some(m => JSON.stringify(m).includes("clean-alpha")));
+      }
+    });
+  }
+
+
+  // Explicit claim-redactor fixture: proves executor/harness posting, not runner registration.
+  const runtimeKey = ["runtime-fixture", '"', "/", "<>&", "tail"].join("");
+  const runtimeForms = [runtimeKey, 'runtime-fixture\\"/<>&tail',
+    'runtime-fixture\\"\\/<>&tail', "runtime-fixture%22%2F%3C%3E%26tail",
+    'runtime-fixture\\"/\\u003c\\u003e\\u0026tail'];
+
+  for (const route of ["thread/start", "thread/resume"] as const) {
+    for (const [index, model] of ["corp-observed-clean", ...runtimeForms].entries()) {
+      it(`bounded provider runtime report ${route} form=${index} redacts at client boundary`, async () => {
+        const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: runtimeKey });
+        assert.ok(Object.isFrozen(binding.providerBinding));
+        const posts: LeadConfigReportBody[] = [];
+        const { logger, lines } = recordingLogger();
+        const config = { default_effort_source: "builtin" as const };
+        const reporter = new LeadConfigReporter({
+          client: { async recordLeadConfig(_id, body) {
+            posts.push(structuredClone(body)); return { kind: "ok" };
+          } },
+          runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger,
+        });
+        const rig = makeRig({ responder: c => {
+          const answer = c.method === "thread/resume" ? { thread: { id: "th-1" } } : defaultResponder(c);
+          return c.method === route ? { ...rec(answer), model, reasoningEffort: "medium",
+            // Unknown names are not admitted observation fields.
+            [runtimeKey]: runtimeKey } : answer;
+        } });
+        rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+        const { ctx } = makeCtx({ config, leadConfig: reporter,
+          ...(route === "thread/resume" ? { sessionId: "th-1" } : {}),
+          redactText: makeTextRedactor(providerKeyForms(runtimeKey)) });
+        const result = await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "bounded runtime report");
+        assert.equal(rig.transport.requests.filter(r => r.method === route).length, 1);
+        if (route === "thread/resume") {
+          // An implementation resume verifies the observed thread model against the mapped wire
+          // model, with no provider exemption: every observation other than "corp-code" holds the run
+          // before any turn, and the hold evidence carries scrubbed text only.
+          assert.equal(result.phaseSwitchHeld?.phase, "implement");
+          assert.equal(result.phaseSwitchHeld?.cause, "model_mismatch");
+          assert.equal(rig.transport.turnStartCount, 0, "a model mismatch holds before turn/start");
+          assert.equal(result.phaseSwitchHeld?.requested.model, "corp-code");
+          assert.ok(posts.every(p => p.observed_model === null), "no observation follows a held resume");
+          for (const p of posts) assert.equal(p.requested_model, "corp-code", "a requested row reports the mapped wire model");
+          if (index === 0) assert.equal(result.phaseSwitchHeld?.observed.model, "corp-observed-clean");
+          for (const [sink, value] of Object.entries({ posts, logs: lines, held: result.phaseSwitchHeld })) {
+            const serialized = JSON.stringify(value);
+            for (const form of runtimeForms) {
+              assert.ok(!serialized.includes(form), `provider credential escaped ${sink}; held form=${index}`);
+              assert.ok(!serialized.includes(JSON.stringify(form).slice(1, -1)), `escaped provider credential escaped ${sink}; held form=${index}`);
+            }
+          }
+          return;
+        }
+        assert.equal(rig.transport.turnStartCount, 1, "observation follows accepted turn/start");
+        assert.equal(posts.length, 2, "requested and observed rows reached report client");
+        assert.equal(posts[0]!.requested_model, "corp-code", "requested row reports the mapped wire model, never the vendor default");
+        assert.equal(rec(rig.transport.requests.find(r => r.method === "turn/start")!.params).model, "corp-code", "wire uses mapped provider default");
+        assert.equal(posts[0]!.requested_model_source, "builtin");
+        assert.equal(posts[1]!.observed_effort, "medium");
+        assert.equal(posts[1]!.observed_effort_evidence, "codex_runtime_default");
+        if (index === 0) {
+          assert.equal(posts[1]!.observed_model, "corp-observed-clean");
+          assert.equal(posts[1]!.observed_model_evidence, "codex_thread_response");
+        }
+        for (const [sink, value] of Object.entries({ posts, logs: lines })) {
+          const serialized = JSON.stringify(value);
+          for (const form of runtimeForms) assert.ok(!serialized.includes(JSON.stringify(form).slice(1, -1)),
+            `provider credential escaped ${sink}; observation form=${index}`);
+        }
+      });
+    }
+  }
+
+  it("a resumed implementation whose thread answers with the wire model proceeds to its turn", async () => {
+    const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: runtimeKey });
+    const posts: LeadConfigReportBody[] = [];
+    const { logger } = recordingLogger();
+    const config = { default_effort_source: "builtin" as const };
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_id, body) { posts.push(structuredClone(body)); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger,
+    });
+    const rig = makeRig({ responder: c => {
+      const answer = c.method === "thread/resume" ? { thread: { id: "th-1" } } : defaultResponder(c);
+      return c.method === "thread/resume" ? { ...rec(answer), model: "corp-code", reasoningEffort: "medium" } : answer;
+    } });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter, sessionId: "th-1",
+      redactText: makeTextRedactor(providerKeyForms(runtimeKey)) });
+    const result = await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "wire-model resume");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(rig.transport.turnStartCount, 1, "the verified resume dispatches its turn");
+    assert.equal(rec(rig.transport.requests.find(r => r.method === "turn/start")!.params).model, "corp-code");
+    assert.equal(posts[0]!.requested_model, "corp-code");
+    assert.equal(posts[1]!.observed_model, "corp-code");
+  });
+
+  it("refuses unmapped explicit models before login or vendor release", async () => {
+    const rig = makeRig();
+    const executor = makeExecutor(rig, createCodexProviderExecutionAuthority(providerClaim()));
+    let admissions = 0;
+    const { ctx } = makeCtx({ config: { default_model: "gpt-6-astra", default_model_source: "run_override" } });
+    ctx.prepareCodexRootDispatch = async () => { admissions++; return () => {}; };
+    await assert.rejects(executor.run(ctx), /provider_model_unmapped/);
+    assert.equal(admissions, 0);
+    assert.equal(rig.transport.threadStartCount, 0);
+    assert.equal(rig.transport.turnStartCount, 0);
+    assert.equal(rig.providerLaunches(), 0);
+    assert.equal(rig.client.releaseCalls.length, 0);
+    assert.equal(rig.client.refreshCalls.length, 0);
   });
 });
 
@@ -38305,4 +39674,117 @@ describe("B2 cold approval model handoff", () => {
       assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "one implementation segment after replacement");
     });
   }
+});
+
+// Issue #4323: provider-bound plan -> implement phase models. Only a model whose source is run_override
+// or schedule_pin is an explicit owner choice (its own map key or provider_model_unmapped); every
+// uzi-selected model (the owner's planning default, user default, template) uses its own key when the
+// map has one and the `default` slot otherwise. Effort passes through unchanged; the lead-config row
+// reports the mapped wire model; a provider run's per-model segments carry token counts but no cost.
+describe("provider phase models (issue #4323)", () => {
+  afterEach(() => { mock.restoreAll(); });
+  const saved = "p4323-thread";
+  const planTurn = "p4323-plan-turn";
+  const planResponder = (): Responder => epochResponder(saved, planTurn, (t, th, tn) => {
+    t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+      .push(toolCall(1, "submit_plan", { plan_md: "bounded implementation" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn));
+  });
+  const implementResponder = (observe?: (model: unknown) => string): Responder => c => {
+    if (c.method === "thread/resume") {
+      c.transport.push(tokenUsageUpdated(saved, planTurn, { inputTokens: 100, totalTokens: 100 }));
+      const wire = rec(c.params).model;
+      return { thread: { id: rec(c.params).threadId }, model: observe ? observe(wire) : wire };
+    }
+    if (c.method === "turn/start") {
+      const tn = "p4323-implement";
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId: saved, turnId: tn,
+        params: { threadId: saved, turn: { id: tn } } })
+        .push(tokenUsageUpdated(saved, tn, { inputTokens: 160, totalTokens: 160 }, { inputTokens: 60, totalTokens: 60 }))
+        .push(signalDone(saved, tn)).push(turnCompleted("completed", saved, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const approval = async () => ({ kind: "approve", selection: { status: "ok",
+    selection: { source: "own", exclusions: [] } } }) as never;
+  const claimWith = (model_map: Record<string, { model: string }>) => ({
+    provider_id: "phase-gateway", revision: 1, engine: "codex" as const, protocol: "openai_responses" as const,
+    auth_style: "bearer" as const, base_url: "https://gateway.example.test/v1",
+    credential: ["phase", "gateway", "key", "0123456789"].join("-"), model_map,
+  }) as import("../src/protocol.js").ClaimCodexProviderBinding;
+  const planPin = (source: "user_planning_default" | "run_override" | "schedule_pin"): ClaimConfig => ({
+    default_model: "gpt-6.1-sol", default_model_source: "user_default",
+    default_effort: "medium", default_effort_source: "user_default",
+    plan_phase: { model: "gpt-6-astra", model_source: source, effort: "high", effort_source: "user_planning_default" },
+  });
+  const drive = async (config: ClaimConfig, map: Record<string, { model: string }>) => {
+    const posts: LeadConfigReportBody[] = [];
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_id, body) { posts.push(structuredClone(body)); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger: noopLog,
+    });
+    const rig = makeMultiEpochRig([planResponder(), implementResponder()]);
+    const { ctx, emitted } = makeCtx({ config, leadConfig: reporter, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, reportIteration: async () => {} });
+    const exec = makeExecutor(rig, createCodexProviderExecutionAuthority(claimWith(map)));
+    return { rig, posts, emitted, run: () => withTimeout(exec.run(ctx), 5000, "provider phase models") };
+  };
+  const turnOf = (transport: FakeTransport) => rec(transport.requests.find(r => r.method === "turn/start")!.params);
+
+  it("the owner's planning default and the implement model resolve through their own keys, else default", async () => {
+    const { rig, posts, run } = await drive(planPin("user_planning_default"),
+      { default: { model: "corp-default" }, "gpt-6.1-sol": { model: "corp-sol" } });
+    const result = await run();
+    assert.equal(result.phaseSwitchHeld, undefined);
+    // gpt-6-astra has no key: uzi-selected, so the default slot. gpt-6.1-sol has its own key.
+    assert.equal(turnOf(rig.epochs[0]!.transport).model, "corp-default");
+    assert.equal(turnOf(rig.epochs[0]!.transport).effort, "high");
+    assert.equal(rec(rig.epochs[1]!.transport.requests.find(r => r.method === "thread/resume")!.params).model, "corp-sol");
+    assert.equal(turnOf(rig.epochs[1]!.transport).model, "corp-sol");
+    assert.equal(turnOf(rig.epochs[1]!.transport).effort, "medium");
+    assert.deepEqual(posts.filter(p => p.observed_model === null).map(p => [p.phase, p.requested_model, p.requested_effort]),
+      [["plan", "corp-default", "high"], ["implement", "corp-sol", "medium"]],
+      "the lead-config rows report the mapped wire models, never the vendor ids");
+  });
+
+  it("an owner implement pin (run_override) next to an unmapped model refuses at implement, not at planning", async () => {
+    const config: ClaimConfig = { ...planPin("user_planning_default"), default_model_source: "run_override" };
+    const { rig, run } = await drive(config, { default: { model: "corp-default" } });
+    await assert.rejects(run(), /provider_model_unmapped/);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the uzi-selected planning model ran on the default slot");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+  });
+
+  for (const source of ["run_override", "schedule_pin"] as const) {
+    it(`an explicit planning model (${source}) must have its own key`, async () => {
+      const { rig, run } = await drive(planPin(source), { default: { model: "corp-default" }, "gpt-6.1-sol": { model: "corp-sol" } });
+      await assert.rejects(run(), /provider_model_unmapped/);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 0, "refused before any provider turn");
+    });
+
+    it(`an explicit planning model (${source}) with its own key resolves through it`, async () => {
+      const { rig, run } = await drive(planPin(source),
+        { default: { model: "corp-default" }, "gpt-6-astra": { model: "corp-astra" }, "gpt-6.1-sol": { model: "corp-sol" } });
+      assert.equal((await run()).phaseSwitchHeld, undefined);
+      assert.equal(turnOf(rig.epochs[0]!.transport).model, "corp-astra");
+      assert.equal(turnOf(rig.epochs[1]!.transport).model, "corp-sol");
+    });
+  }
+
+  it("crossing a planning to implementation segment cut leaves both vendor-named mapped models unpriced", async () => {
+    // The mapped names equal vendor ids that codex-pricing.json prices; a provider run must never use them.
+    const { emitted, run } = await drive(planPin("user_planning_default"),
+      { default: { model: "gpt-6-astra" }, "gpt-6.1-sol": { model: "gpt-6.1-sol" } });
+    const result = await run();
+    assert.equal(result.phaseSwitchHeld, undefined);
+    const usage = lastResultModelUsage(emitted)!;
+    assert.deepEqual(Object.keys(usage).sort(), ["gpt-6-astra", "gpt-6.1-sol"]);
+    assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100, "planning segment");
+    assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "implementation segment");
+    for (const model of ["gpt-6-astra", "gpt-6.1-sol"]) {
+      assert.equal(rec(usage[model]).costStatus, "unreported", model);
+      assert.equal(rec(usage[model]).costUSD, undefined, model);
+    }
+  });
 });

@@ -88,3 +88,12 @@ func TestCheckStoredCredentialOverrideEnabled(t *testing.T) {
 		})
 	}
 }
+
+func (s *storedOverrideMetaStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}
+
+// GetUserProviderLaneSources preserves the fixture's unselected-source policy.
+func (f *storedOverrideMetaStore) GetUserProviderLaneSources(context.Context, uuid.UUID) (store.GetUserProviderLaneSourcesRow, error) {
+	return store.GetUserProviderLaneSourcesRow{}, nil
+}

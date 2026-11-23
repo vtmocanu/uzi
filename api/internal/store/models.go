@@ -760,6 +760,7 @@ type ModelProviderRevision struct {
 	AuthStyle  string             `json:"auth_style"`
 	ModelMap   []byte             `json:"model_map"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	Engine     string             `json:"engine"`
 }
 
 type MrReviewAuthorQueue struct {
@@ -2076,6 +2077,7 @@ type User struct {
 	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
 	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
 	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
+	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
 }
 
 type UserCrossCheckPin struct {

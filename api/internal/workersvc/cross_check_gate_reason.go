@@ -102,24 +102,22 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		if !ok {
 			return ErrInvalidState
 		}
-		// PRD #4320: a provider-bound lead, or an owner whose Claude source is a provider, has no
+		// PRD #4320: a provider-bound lead or a refused owner selection has no
 		// checker lane (provider_lane_unsupported until PRD #4322). That is the server's own fact,
 		// attested here, so the plan lands on the human gate (a non-pass never auto-approves).
 		if providerBoundRun(lead) {
 			return nil
 		}
-		if lerr := s.refuseProviderLane(ctx, resolver, lead.UserID); errors.Is(lerr, ErrProviderLaneUnsupported) {
-			return nil
-		} else if lerr != nil {
-			return lerr
-		}
-		// The checker is the lead's OPPOSITE family, so an unusable credential of that
-		// family (never the lead's own) is what attests the checker unavailable.
 		harness, known := oppositeHarness(lead.Harness)
 		if !known {
 			return ErrInvalidState
 		}
-		_, err := s.resolveRunHarnessQ(ctx, lead.UserID, &harness, resolver)
+		if lerr := s.refuseProviderLane(ctx, resolver, lead.UserID, harness); errors.Is(lerr, ErrProviderLaneUnsupported) {
+			return nil
+		} else if lerr != nil {
+			return lerr
+		}
+		_, err := s.resolveRunHarnessMode(ctx, lead.UserID, &harness, resolver, true)
 		if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) {
 			return nil
 		}

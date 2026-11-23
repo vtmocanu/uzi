@@ -255,12 +255,13 @@ const (
 	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
 	// reasonNoProviderCapableWorker (PRD #4320 module 5) is emitted for a PROVIDER-BOUND queued run
 	// (runs.model_provider_key_mode set) whose owner has NO online worker advertising the
-	// 'claude_provider_v1' protocol capability. Like reasonNoCodexCapableWorker it names a
+	// provider protocol for the frozen engine (plus the Codex harness/runtime on that same worker).
+	// Like reasonNoCodexCapableWorker it names a
 	// NON-BYPASSABLE block: ClaimRun's dedicated provider clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so the run waits until a worker that
-	// supports provider claims comes online. Provider execution is activated (#4505): current worker
-	// images advertise the capability, so this names only a fleet of older images (the hosted fleet
-	// is pinned separately from the app tier). Maps to the SAME healthWaitingWorker enum
+	// supports that engine's provider claims comes online. Claude provider execution is activated
+	// (#4505); Codex advertisement remains gated on completed delivery. The hosted worker fleet
+	// is pinned separately from the app tier. Maps to the SAME healthWaitingWorker enum
 	// (runs.health_reason is free text).
 	reasonNoProviderCapableWorker = "no worker that supports model providers is online"
 	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
@@ -1723,15 +1724,13 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			return reasonNoCurrentCodexRuntime
 		}
 	}
-	// PRD #4320 module 5: a PROVIDER-BOUND run whose owner has NO online worker advertising
-	// claude_provider_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable provider clause can never be
-	// satisfied). Placed right after the Codex rungs for the same reason they sit ahead of the
-	// priority-class re-label. r.ModelProviderKeyMode is the claim clause's own discriminator, so the
-	// pill and the claim can never disagree. Read errors fall through.
+	// Provider-bound runs need one worker satisfying their frozen engine's full
+	// provider protocol intersection. Keep this ahead of the priority re-label.
+	// Read errors fall through, as with the other capability rungs.
 	if r.ModelProviderKeyMode.Valid {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
+		c, cerr := s.q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: r.UserID, Engine: r.Harness})
 		if cerr != nil {
-			slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
+			slog.Error("health: count online workers satisfying provider", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoProviderCapableWorker
 		}

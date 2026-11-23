@@ -1,5 +1,5 @@
-// Settings → Custom providers (PRD #4320 M3). A provider is an Anthropic-Messages
-// compatible gateway the user can point Claude runs at: a base URL chosen from the
+// Settings → Custom providers. A provider is an engine-compatible gateway
+// the user can point runs at: a base URL chosen from the
 // operator's allowlist, an auth style, a model map and a write-only API key.
 //
 // Every string here (names, URLs, model names) is untrusted and rendered as React
@@ -27,6 +27,16 @@ const ROLES: { role: ProviderModelRole; label: string; required: boolean }[] = [
   { role: "fable", label: "Fable", required: false },
 ];
 
+const CODEX_ROLES: typeof ROLES = [
+  { role: "default", label: "Default", required: true },
+  ...(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] as const).map(role => ({ role, label: role, required: false })),
+];
+const rolesFor = (engine: ProviderDTO["engine"]) => engine === "codex" ? CODEX_ROLES : ROLES;
+const engineLabel = (engine: ProviderDTO["engine"]) => engine === "codex" ? "Codex" : "Claude";
+async function setSource(engine: ProviderDTO["engine"], id: string | null) {
+  return engine === "codex" ? (await api.setCodexProviderSource(id)).codex_provider_id : (await api.setClaudeProviderSource(id)).claude_provider_id;
+}
+
 const AUTH_LABELS: Record<ProviderAuthStyle, string> = {
   bearer: "Authorization: Bearer",
   x_api_key: "x-api-key",
@@ -49,16 +59,11 @@ interface ModelRow {
 }
 type ModelRows = Record<ProviderModelRole, ModelRow>;
 
-const emptyRows = (): ModelRows => ({
-  haiku: { model: "", ctx: "" },
-  sonnet: { model: "", ctx: "" },
-  opus: { model: "", ctx: "" },
-  fable: { model: "", ctx: "" },
-});
+const emptyRows = (): ModelRows => Object.fromEntries([...ROLES, ...CODEX_ROLES].map(({ role }) => [role, { model: "", ctx: "" }])) as ModelRows;
 
 function rowsFromMap(map: ProviderModelMap): ModelRows {
   const rows = emptyRows();
-  for (const { role } of ROLES) {
+  for (const { role } of [...ROLES, ...CODEX_ROLES]) {
     const e = map[role];
     if (e) rows[role] = { model: e.model, ctx: e.context_window ? String(e.context_window) : "" };
   }
@@ -67,9 +72,9 @@ function rowsFromMap(map: ProviderModelMap): ModelRows {
 
 // buildModelMap validates the rows the way the server does (the server stays
 // authoritative) and returns either the map or the first problem found.
-function buildModelMap(rows: ModelRows): { map: ProviderModelMap } | { error: string } {
+function buildModelMap(rows: ModelRows, engine: ProviderDTO["engine"]): { map: ProviderModelMap } | { error: string } {
   const out: Partial<Record<ProviderModelRole, { model: string; context_window?: number }>> = {};
-  for (const { role, label, required } of ROLES) {
+  for (const { role, label, required } of rolesFor(engine)) {
     const model = rows[role].model.trim();
     const ctx = rows[role].ctx.trim();
     if (model === "") {
@@ -94,7 +99,7 @@ function buildModelMap(rows: ModelRows): { map: ProviderModelMap } | { error: st
 }
 
 function sameModelMap(a: ProviderModelMap, b: ProviderModelMap): boolean {
-  return ROLES.every(({ role }) => {
+  return [...ROLES, ...CODEX_ROLES].every(({ role }) => {
     const x = a[role];
     const y = b[role];
     if (!x || !y) return !x && !y;
@@ -116,14 +121,14 @@ const REASON_MESSAGES: Record<string, string> = {
   provider_retired: "This provider is retired and can no longer be changed.",
   provider_name_taken: "You already have a provider with that name.",
   provider_probe_rate_limited: "Tests are rate limited. Wait a moment, then test again.",
-  provider_source_unusable: "This provider cannot be your Claude source right now. Check that it is not retired and has an enabled key.",
+  provider_source_unusable: "This provider cannot be your model source right now. Check that it is not retired and has an enabled key.",
 };
 
-// Why a provider cannot be selected as the Claude source, or null when it can. Mirrors the
+// Why a provider cannot be selected as its engine source, or null when it can. Mirrors the
 // server's usability rules (the server stays authoritative and answers 409
 // provider_source_unusable); the feature-off case never reaches a row.
 function sourceBlockedReason(p: ProviderDTO): string | null {
-  if (p.retired) return "A retired provider cannot be your Claude source.";
+  if (p.retired) return "A retired provider cannot be your model source.";
   if (!p.has_key) return "Set a key before using this provider.";
   if (!p.key_enabled) return "Enable the key before using this provider.";
   return null;
@@ -167,17 +172,19 @@ function ModelMapFields({
   rows,
   onChange,
   idPrefix,
+  engine,
 }: {
   rows: ModelRows;
   onChange: (rows: ModelRows) => void;
   idPrefix: string;
+  engine: ProviderDTO["engine"];
 }) {
   const set = (role: ProviderModelRole, part: Partial<ModelRow>) =>
     onChange({ ...rows, [role]: { ...rows[role], ...part } });
   return (
     <fieldset className="space-y-3">
       <legend className="text-sm font-medium text-muted">Model map</legend>
-      {ROLES.map(({ role, label, required }) => {
+      {rolesFor(engine).map(({ role, label, required }) => {
         const row = rows[role];
         return (
           <div key={role} className="space-y-1">
@@ -202,10 +209,10 @@ function ModelMapFields({
             </div>
             {row.model.trim() !== "" && row.ctx.trim() === "" && (
               <p className="text-xs text-warn" data-testid={`ctx-warning-${role}`}>
-                {label}: {NO_CONTEXT_WARNING}
+                {label}: {engine === "codex" ? "No context window set. Codex uses its runtime fallback context window, which may differ from the gateway limit." : NO_CONTEXT_WARNING}
               </p>
             )}
-            {row.model.toLowerCase().includes("claude") && (
+            {engine === "claude" && row.model.toLowerCase().includes("claude") && (
               <p className="text-xs text-warn" data-testid={`ctx-unenforced-${role}`}>
                 {label}: {CATALOG_CONTEXT_WARNING}
               </p>
@@ -247,7 +254,9 @@ function BaseUrlSelect({
 function AuthStyleSelect({
   value,
   onChange,
+  engine,
 }: {
+  engine: ProviderDTO["engine"];
   value: ProviderAuthStyle;
   onChange: (v: ProviderAuthStyle) => void;
 }) {
@@ -259,7 +268,7 @@ function AuthStyleSelect({
         onChange={(e) => onChange(e.target.value as ProviderAuthStyle)}
       >
         <option value="bearer">{AUTH_LABELS.bearer}</option>
-        <option value="x_api_key">{AUTH_LABELS.x_api_key}</option>
+        {engine === "claude" && <option value="x_api_key">{AUTH_LABELS.x_api_key}</option>}
       </Select>
     </Field>
   );
@@ -267,7 +276,7 @@ function AuthStyleSelect({
 
 type RunFn = (fn: () => Promise<unknown>, notice: string, fallback: string, refresh?: boolean) => Promise<boolean>;
 
-const DELETE_SOURCE_REASON = "This is your Claude source. Stop using it before you delete it.";
+const DELETE_SOURCE_REASON = "This is your model source. Stop using it before you delete it.";
 
 type Panel = "edit" | "endpoint" | "key" | null;
 
@@ -318,7 +327,7 @@ function ProviderRow({
   const saveEdit = async (e: FormEvent) => {
     e.preventDefault();
     const nameErr = validName(name);
-    const built = buildModelMap(rows);
+    const built = buildModelMap(rows, p.engine);
     const err = nameErr ?? ("error" in built ? built.error : null);
     if (err) return setFormError(err);
     setFormError("");
@@ -374,13 +383,16 @@ function ProviderRow({
   };
 
   const canTest = p.has_key && p.key_enabled && !p.retired;
-  const mapped = ROLES.filter(({ role }) => p.model_map[role]);
-  // The worker sets one process-wide window: the smallest configured one across all mapped
-  // models, or uzi's 200k fallback when none is configured (agent/src/sdk-env.ts).
-  const configured = mapped.map(({ role }) => p.model_map[role]!.context_window).filter((w): w is number => !!w);
-  const blankLabel = configured.length
-    ? ` (no context window: uzi requests the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens)`
-    : " (no context window: 200k assumed)";
+  const mapped = rolesFor(p.engine).filter(({ role }) => p.model_map[role]);
+  // Claude only: the worker sets one process-wide window, the smallest configured one across all
+  // mapped models, or uzi's 200k fallback when none is configured (agent/src/sdk-env.ts).
+  const configured = p.engine === "claude" ? mapped.map(({ role }) => p.model_map[role]!.context_window).filter((w): w is number => !!w) : [];
+  // Codex omits model_context_window, so its runtime fallback applies (agent/src/codex/config.ts).
+  const blankLabel = p.engine === "codex"
+    ? " (no context window: Codex runtime fallback)"
+    : configured.length
+      ? ` (no context window: uzi requests the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens)`
+      : " (no context window: 200k assumed)";
   const rowBusy = busy || testing;
   const blocked = sourceBlockedReason(p);
 
@@ -388,7 +400,8 @@ function ProviderRow({
     <li className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4" data-testid={`provider-${p.id}`}>
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-semibold text-fg">{sanitizeLabel(p.name)}</h3>
-        {isSource && <Badge tone="info">Claude source</Badge>}
+        <Badge tone="neutral">{engineLabel(p.engine)}</Badge>
+        {isSource && <Badge tone="info">{engineLabel(p.engine)} source</Badge>}
         {p.retired && <Badge tone="neutral">Retired</Badge>}
         {!p.has_key ? (
           <Badge tone="warning">No key</Badge>
@@ -400,6 +413,8 @@ function ProviderRow({
       </div>
 
       <dl className="grid gap-x-4 gap-y-1 text-sm sm:grid-cols-[8rem_1fr]">
+        <dt className="text-muted">Protocol</dt>
+        <dd>{p.protocol === "openai_responses" ? "OpenAI Responses" : "Anthropic Messages"}</dd>
         <dt className="text-muted">Base URL</dt>
         <dd className="break-all">
           <code>{sanitizeLabel(p.base_url)}</code>
@@ -430,11 +445,12 @@ function ProviderRow({
         {isSource ? (
           <Button
             size="sm"
+            aria-label={`Stop using ${engineLabel(p.engine)} source`}
             disabled={rowBusy}
             onClick={() =>
               void run(
-                async () => onSource((await api.setClaudeProviderSource(null)).claude_provider_id),
-                "Claude runs use Anthropic again.",
+                async () => onSource(await setSource(p.engine, null)),
+                `${engineLabel(p.engine)} runs use the native source again.`,
                 "Failed to stop using the provider",
               )
             }
@@ -448,13 +464,13 @@ function ProviderRow({
             title={blocked ?? undefined}
             onClick={() =>
               void run(
-                async () => onSource((await api.setClaudeProviderSource(p.id)).claude_provider_id),
-                "This provider is now your Claude source.",
+                async () => onSource(await setSource(p.engine, p.id)),
+                `This provider is now your ${engineLabel(p.engine)} source.`,
                 "Failed to use the provider",
               )
             }
           >
-            Use as Claude source
+            Use as {engineLabel(p.engine)} source
           </Button>
         )}
         {!p.retired && (
@@ -578,7 +594,7 @@ function ProviderRow({
           <Field label="Name">
             <Input aria-label="Provider name" value={name} onChange={(e) => setName(e.target.value)} />
           </Field>
-          <ModelMapFields rows={rows} onChange={setRows} idPrefix={`${uid}-edit`} />
+          <ModelMapFields engine={p.engine} rows={rows} onChange={setRows} idPrefix={`${uid}-edit`} />
           {formError && <Alert message={formError} />}
           <Button type="submit" disabled={rowBusy}>Save changes</Button>
         </form>
@@ -586,7 +602,7 @@ function ProviderRow({
       {panel === "endpoint" && (
         <form onSubmit={saveEndpoint} className="space-y-3 border-t border-edge pt-3">
           <BaseUrlSelect value={baseUrl} onChange={setBaseUrl} allowed={allowed} />
-          <AuthStyleSelect value={auth} onChange={setAuth} />
+          <AuthStyleSelect engine={p.engine} value={auth} onChange={setAuth} />
           {formError && <Alert message={formError} />}
           <Button type="submit" disabled={rowBusy}>Save endpoint</Button>
         </form>
@@ -622,6 +638,7 @@ function CreateForm({
   run: RunFn;
 }) {
   const uid = useId();
+  const [engine, setEngine] = useState<ProviderDTO["engine"]>("claude");
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [auth, setAuth] = useState<ProviderAuthStyle>("bearer");
@@ -630,7 +647,7 @@ function CreateForm({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const built = buildModelMap(rows);
+    const built = buildModelMap(rows, engine);
     const err =
       validName(name) ?? (baseUrl === "" ? "Pick a base URL." : null) ?? ("error" in built ? built.error : null);
     if (err) return setError(err);
@@ -638,6 +655,8 @@ function CreateForm({
     const ok = await run(
       () =>
         api.createProvider({
+          engine,
+          protocol: engine === "codex" ? "openai_responses" : "anthropic_messages",
           name: name.trim(),
           base_url: baseUrl,
           auth_style: auth,
@@ -657,6 +676,10 @@ function CreateForm({
   return (
     <form onSubmit={submit} className="space-y-3 border-t border-edge pt-5" aria-label="Add a provider">
       <h3 className="text-sm font-semibold text-fg">Add a provider</h3>
+      <Field label="Engine"><Select aria-label="Engine" value={engine} onChange={e => { setEngine(e.target.value as ProviderDTO["engine"]); setRows(emptyRows()); setAuth("bearer"); setError(""); }}>
+        <option value="claude">Claude</option><option value="codex">Codex</option>
+      </Select></Field>
+      <p className="text-xs text-muted">Protocol: {engine === "codex" ? "OpenAI Responses" : "Anthropic Messages"}</p>
       {allowed.length === 0 && (
         <p className="text-sm text-warn">The operator has not allowed any base URLs, so a provider cannot be added yet.</p>
       )}
@@ -664,8 +687,8 @@ function CreateForm({
         <Input aria-label="Provider name" placeholder="team-gateway" value={name} onChange={(e) => setName(e.target.value)} />
       </Field>
       <BaseUrlSelect value={baseUrl} onChange={setBaseUrl} allowed={allowed} />
-      <AuthStyleSelect value={auth} onChange={setAuth} />
-      <ModelMapFields rows={rows} onChange={setRows} idPrefix={`${uid}-new`} />
+      <AuthStyleSelect engine={engine} value={auth} onChange={setAuth} />
+      <ModelMapFields engine={engine} rows={rows} onChange={setRows} idPrefix={`${uid}-new`} />
       {error && <Alert message={error} />}
       <Button type="submit" disabled={busy || allowed.length === 0}>Add provider</Button>
     </form>
@@ -678,8 +701,9 @@ export function Providers() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  // UserSettings.claude_provider_id: null = Anthropic; undefined = not read yet / unreadable.
-  const [sourceId, setSourceId] = useState<string | null | undefined>(undefined);
+  // Each engine selection: null = native; undefined = not read yet / unreadable.
+  const [sources, setSources] = useState<Partial<Record<ProviderDTO["engine"], string | null>>>({});
+  const updateSource = (engine: ProviderDTO["engine"], id: string | null) => setSources(old => ({ ...old, [engine]: id }));
 
   const reload = useCallback(async () => {
     try {
@@ -687,14 +711,15 @@ export function Providers() {
         api.listProviders(),
         (async () => {
           try {
-            return (await api.getMySettings(true)).settings.claude_provider_id ?? null;
+            const settings = (await api.getMySettings(true)).settings;
+            return { claude: settings.claude_provider_id ?? null, codex: settings.codex_provider_id ?? null };
           } catch {
             return undefined; // the selection is advisory here; the list still renders
           }
         })(),
       ]);
       setData(list);
-      if (source !== undefined) setSourceId(source);
+      if (source !== undefined) setSources(source);
       setLoadError("");
     } catch (err) {
       setLoadError(errorMessage(err, "Failed to load providers"));
@@ -732,8 +757,7 @@ export function Providers() {
       <div>
         <SectionTitle>Custom providers</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          Point Claude runs at an Anthropic Messages compatible gateway instead of Anthropic. Pick a base URL the
-          operator allows, map the Claude model names to the gateway's models, then save a key and test it.
+          Point Claude or Codex runs at a compatible gateway. Pick an allowed base URL, map models, then save a key and test it.
         </p>
       </div>
 
@@ -749,42 +773,21 @@ export function Providers() {
             Custom providers are off. Your operator has not enabled them by setting{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_PROVIDER_ALLOWED_BASE_URLS</code>.
           </p>
-          {sourceId !== undefined && sourceId !== null && (
-            <div className="space-y-2">
-              <p className="text-sm text-muted">A custom provider is still selected as your Claude source.</p>
-              <Button
-                size="sm"
-                disabled={busy}
-                onClick={() =>
-                  void run(
-                    async () => setSourceId((await api.setClaudeProviderSource(null)).claude_provider_id),
-                    "Claude runs use Anthropic again.",
-                    "Failed to stop using the provider",
-                  )
-                }
-              >
-                Stop using
-              </Button>
+          {(["claude", "codex"] as const).map(engine => sources[engine] != null && (
+            <div key={engine}>
+              <p>A custom provider is still selected as your {engineLabel(engine)} source.</p>
+              <Button disabled={busy} aria-label={`Stop using ${engineLabel(engine)} source`} onClick={() => void run(async () => updateSource(engine, await setSource(engine, null)), `${engineLabel(engine)} runs use the native source again.`, "Failed to stop using the provider")}>Stop using</Button>
             </div>
-          )}
+          ))}
         </>
       ) : data ? (
         <>
-          <div className="space-y-1 text-sm" data-testid="claude-source">
-            <p>
-              <span className="text-muted">Current Claude source: </span>
-              <span className="font-medium text-fg">
-                {sourceId === undefined
-                  ? "unknown"
-                  : sourceId === null
-                    ? "Anthropic"
-                    : data.providers.find((p) => p.id === sourceId)
-                      ? sanitizeLabel(data.providers.find((p) => p.id === sourceId)!.name)
-                      : "a provider that no longer exists"}
-              </span>
-            </p>
-            <p className="text-xs text-faint">Use only a gateway you trust not to redirect: a redirect can resend your prompts and code to another host, and your key to another path on the same host (or, with x-api-key auth, to another host). Bearer auth limits this. See the Model providers docs.</p>
-          </div>
+          {(["claude", "codex"] as const).map(engine => (
+            <div key={engine} data-testid={`${engine}-source`}>
+              Current {engineLabel(engine)} source: {sources[engine] === undefined ? "unknown" : sources[engine] === null ? (engine === "claude" ? "Anthropic" : "OpenAI") : sanitizeLabel(data.providers.find(p => p.id === sources[engine])?.name ?? "a provider that no longer exists")}
+              <p className="text-xs text-faint">{engine === "claude" ? "Use only a gateway you trust not to redirect: a redirect can resend your prompts and code to another host, and your key to another path on the same host (or, with x-api-key auth, to another host). Bearer auth limits this. See the Model providers docs." : "Use only a gateway you trust: Codex runtime redirects may forward request bodies and authentication headers. Allowlist admission is not confinement to that host. See the Model providers docs."}</p>
+            </div>
+          ))}
           {data.providers.length === 0 ? (
             <p className="text-sm text-muted">No providers yet.</p>
           ) : (
@@ -797,8 +800,8 @@ export function Providers() {
                   busy={busy}
                   run={run}
                   onProbe={onProbe}
-                  isSource={sourceId === p.id}
-                  onSource={setSourceId}
+                  isSource={sources[p.engine] === p.id}
+                  onSource={id => updateSource(p.engine, id)}
                 />
               ))}
             </ul>

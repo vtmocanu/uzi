@@ -8,13 +8,19 @@ type ModelEntryDTO struct {
 	ContextWindow *int   `json:"context_window,omitempty"`
 }
 
-// ModelMapDTO maps the Claude aliases to gateway models. Haiku is required (the SDK's background
-// calls use the small/fast slot); the others are optional.
+// ModelMapDTO carries the engine-specific model map. Claude requires haiku; Codex requires
+// default. Optional entries retain their exact uzi-visible model IDs.
 type ModelMapDTO struct {
-	Opus   *ModelEntryDTO `json:"opus,omitempty"`
-	Sonnet *ModelEntryDTO `json:"sonnet,omitempty"`
-	Haiku  ModelEntryDTO  `json:"haiku"`
-	Fable  *ModelEntryDTO `json:"fable,omitempty"`
+	Default   *ModelEntryDTO `json:"default,omitempty"`
+	GPT6Astra *ModelEntryDTO `json:"gpt-6-astra,omitempty"`
+	GPT56Sol  *ModelEntryDTO `json:"gpt-5.6-sol,omitempty"`
+	GPT6Sol   *ModelEntryDTO `json:"gpt-6-sol,omitempty"`
+	GPT61Sol  *ModelEntryDTO `json:"gpt-6.1-sol,omitempty"`
+	GPT6Luna  *ModelEntryDTO `json:"gpt-6-luna,omitempty"`
+	Opus      *ModelEntryDTO `json:"opus,omitempty"`
+	Sonnet    *ModelEntryDTO `json:"sonnet,omitempty"`
+	Haiku     ModelEntryDTO  `json:"haiku,omitzero"`
+	Fable     *ModelEntryDTO `json:"fable,omitempty"`
 }
 
 // ProviderProbeDTO is the latest stored probe result of a provider's current revision. The two

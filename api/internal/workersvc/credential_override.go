@@ -76,11 +76,11 @@ var (
 	ErrCredentialOverrideHarnessUnsupported = errors.New("credential override unsupported on codex harness")
 	ErrCredentialOverridePinnedNeedsSecret  = errors.New("credential override pinned mode requires a token")
 	ErrCredentialOverrideInvalidMode        = errors.New("invalid credential override mode")
-	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the owner's Claude source is a model
+	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the run's source is a model
 	// provider, whose run uses the provider key, so a vendor credential override is refused. It
 	// wraps ErrCredentialOverrideHarnessUnsupported, so every consumer that already refuses that
 	// keeps refusing; the handler adds the provider wording.
-	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the Claude source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
+	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
 )
 
 // refuseOverrideForProviderOwner refuses a vendor credential override when the owner selected a
@@ -88,11 +88,11 @@ var (
 // a vendor run carrying an override. q is asserted for the source read; a surface that cannot read
 // the source fails closed (an error, never nil), so an override never rides an unchecked owner.
 func refuseOverrideForProviderOwner(ctx context.Context, q any, userID uuid.UUID) error {
-	r, ok := q.(providerSourceReader)
+	r, ok := q.(engineProviderSourceReader)
 	if !ok {
 		return errors.New("credential override: the query surface cannot read the provider source")
 	}
-	row, err := r.GetUserClaudeProviderSource(ctx, userID)
+	row, err := r.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: userID, Engine: "claude"})
 	if err != nil {
 		return fmt.Errorf("credential override: provider source: %w", err)
 	}

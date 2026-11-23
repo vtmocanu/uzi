@@ -1189,7 +1189,17 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// There is no get on Secrets, so "create if absent" is not available to us — and
 		// does not need to be. Issue the create and treat AlreadyExists as success. That
 		// is the WHOLE of Secret idempotence, and it needs no read.
-		_, err := m.client.CoreV1().Secrets(ns).Create(ctx, RenderSecret(m.cfg, w, *w.JoinToken), metav1.CreateOptions{})
+		secret := RenderSecret(m.cfg, w, *w.JoinToken)
+		// Kubernetes limits the sum of Data values, including duplicate CA copies.
+		// Budget the rendered object and actual token, without exposing either.
+		remaining := corev1.MaxSecretSize
+		for _, value := range secret.Data {
+			if len(value) > remaining {
+				return fmt.Errorf("worker secret data exceeds Kubernetes %d-byte limit", corev1.MaxSecretSize)
+			}
+			remaining -= len(value)
+		}
+		_, err := m.client.CoreV1().Secrets(ns).Create(ctx, secret, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			// The error is from the apiserver about an object it rejected; it does not carry
 			// the Secret's data. Still, nothing here interpolates the token.

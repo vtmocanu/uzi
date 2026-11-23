@@ -111,6 +111,9 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 	refuse := func(reason string) (CodexSwitchPreflightResult, error) {
 		return CodexSwitchPreflightResult{Outcome: ApplyOutcomeNotApplied, Reason: reason}, nil
 	}
+	if providerBoundRun(run) {
+		return refuse(applyReasonProviderBound)
+	}
 	prior, err := q.GetRunCredentialSwitchEpochByOp(ctx, store.GetRunCredentialSwitchEpochByOpParams{RunID: runID, OpID: op})
 	if err == nil {
 		if prior.ClaimGeneration != gen || !prior.WorkerID.Valid || uuid.UUID(prior.WorkerID.Bytes) != w.ID {

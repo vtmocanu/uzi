@@ -74,7 +74,7 @@ func (q *Queries) DeleteModelProvider(ctx context.Context, arg DeleteModelProvid
 
 const deleteProviderKeySecret = `-- name: DeleteProviderKeySecret :execrows
 DELETE FROM user_secrets
-WHERE user_id = $1 AND provider_id = $2 AND kind = 'anthropic_compatible_key'
+WHERE user_id = $1 AND provider_id = $2 AND kind IN ('anthropic_compatible_key', 'openai_compatible_key')
 `
 
 type DeleteProviderKeySecretParams struct {
@@ -161,9 +161,19 @@ type GetModelProviderRevisionParams struct {
 	Revision   int32     `json:"revision"`
 }
 
-func (q *Queries) GetModelProviderRevision(ctx context.Context, arg GetModelProviderRevisionParams) (ModelProviderRevision, error) {
+type GetModelProviderRevisionRow struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	Protocol   string             `json:"protocol"`
+	BaseUrl    string             `json:"base_url"`
+	AuthStyle  string             `json:"auth_style"`
+	ModelMap   []byte             `json:"model_map"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) GetModelProviderRevision(ctx context.Context, arg GetModelProviderRevisionParams) (GetModelProviderRevisionRow, error) {
 	row := q.db.QueryRow(ctx, getModelProviderRevision, arg.ProviderID, arg.Revision)
-	var i ModelProviderRevision
+	var i GetModelProviderRevisionRow
 	err := row.Scan(
 		&i.ProviderID,
 		&i.Revision,
@@ -177,7 +187,7 @@ func (q *Queries) GetModelProviderRevision(ctx context.Context, arg GetModelProv
 }
 
 const getModelProviderRevisionForOwner = `-- name: GetModelProviderRevisionForOwner :one
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -197,6 +207,7 @@ type GetModelProviderRevisionForOwnerRow struct {
 	BaseUrl    string    `json:"base_url"`
 	AuthStyle  string    `json:"auth_style"`
 	ModelMap   []byte    `json:"model_map"`
+	Engine     string    `json:"engine"`
 }
 
 // A frozen revision of an owner's provider (inherited creation re-checks the URL against the
@@ -215,6 +226,7 @@ func (q *Queries) GetModelProviderRevisionForOwner(ctx context.Context, arg GetM
 		&i.BaseUrl,
 		&i.AuthStyle,
 		&i.ModelMap,
+		&i.Engine,
 	)
 	return i, err
 }
@@ -252,9 +264,11 @@ func (q *Queries) GetProviderBindingKeyByID(ctx context.Context, arg GetProvider
 }
 
 const getProviderKeyForUpdate = `-- name: GetProviderKeyForUpdate :one
-SELECT id, disabled_at, enablement_rev FROM user_secrets
-WHERE user_id = $1 AND provider_id = $2 AND kind = 'anthropic_compatible_key'
-FOR UPDATE
+SELECT k.id, k.disabled_at, k.enablement_rev FROM user_secrets k
+JOIN model_providers p ON p.id = k.provider_id AND p.owner_user_id = k.user_id
+WHERE k.user_id = $1 AND k.provider_id = $2
+  AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+FOR UPDATE OF k
 `
 
 type GetProviderKeyForUpdateParams struct {
@@ -329,6 +343,89 @@ func (q *Queries) GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID)
 	return i, err
 }
 
+const getUserProviderLaneSources = `-- name: GetUserProviderLaneSources :one
+SELECT claude_provider_id, codex_provider_id FROM users WHERE id = $1
+`
+
+type GetUserProviderLaneSourcesRow struct {
+	ClaudeProviderID pgtype.UUID `json:"claude_provider_id"`
+	CodexProviderID  pgtype.UUID `json:"codex_provider_id"`
+}
+
+// One owner snapshot, without opening keys or resolving either source.
+func (q *Queries) GetUserProviderLaneSources(ctx context.Context, id uuid.UUID) (GetUserProviderLaneSourcesRow, error) {
+	row := q.db.QueryRow(ctx, getUserProviderLaneSources, id)
+	var i GetUserProviderLaneSourcesRow
+	err := row.Scan(&i.ClaudeProviderID, &i.CodexProviderID)
+	return i, err
+}
+
+const getUserProviderSource = `-- name: GetUserProviderSource :one
+SELECT u.claude_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id AND p.owner_user_id = u.id AND p.engine = $1
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = $2 AND $1::text = 'claude'
+UNION ALL
+SELECT u.codex_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.codex_provider_id AND p.owner_user_id = u.id AND p.engine = $1
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = $2 AND $1::text = 'codex'
+`
+
+type GetUserProviderSourceParams struct {
+	Engine string    `json:"engine"`
+	ID     uuid.UUID `json:"id"`
+}
+
+type GetUserProviderSourceRow struct {
+	ProviderID       pgtype.UUID        `json:"provider_id"`
+	Engine           pgtype.Text        `json:"engine"`
+	Protocol         pgtype.Text        `json:"protocol"`
+	CurrentRevision  pgtype.Int4        `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	BaseUrl          pgtype.Text        `json:"base_url"`
+	AuthStyle        pgtype.Text        `json:"auth_style"`
+	ModelMap         []byte             `json:"model_map"`
+	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
+	KeyKind          pgtype.Text        `json:"key_kind"`
+	KeyProviderID    pgtype.UUID        `json:"key_provider_id"`
+	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
+	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+}
+
+func (q *Queries) GetUserProviderSource(ctx context.Context, arg GetUserProviderSourceParams) (GetUserProviderSourceRow, error) {
+	row := q.db.QueryRow(ctx, getUserProviderSource, arg.Engine, arg.ID)
+	var i GetUserProviderSourceRow
+	err := row.Scan(
+		&i.ProviderID,
+		&i.Engine,
+		&i.Protocol,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.BaseUrl,
+		&i.AuthStyle,
+		&i.ModelMap,
+		&i.KeySecretID,
+		&i.KeyKind,
+		&i.KeyProviderID,
+		&i.KeyDisabledAt,
+		&i.KeyEnablementRev,
+	)
+	return i, err
+}
+
 const insertModelProvider = `-- name: InsertModelProvider :one
 INSERT INTO model_providers (owner_user_id, name, engine, current_revision)
 VALUES ($1, $2, $3, 1)
@@ -357,17 +454,18 @@ func (q *Queries) InsertModelProvider(ctx context.Context, arg InsertModelProvid
 }
 
 const insertModelProviderRevision = `-- name: InsertModelProviderRevision :exec
-INSERT INTO model_provider_revisions (provider_id, revision, protocol, base_url, auth_style, model_map)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO model_provider_revisions (provider_id, revision, protocol, base_url, auth_style, model_map, engine)
+SELECT p.id, $1, $2, $3, $4, $5, p.engine
+FROM model_providers p WHERE p.id = $6
 `
 
 type InsertModelProviderRevisionParams struct {
-	ProviderID uuid.UUID `json:"provider_id"`
 	Revision   int32     `json:"revision"`
 	Protocol   string    `json:"protocol"`
 	BaseUrl    string    `json:"base_url"`
 	AuthStyle  string    `json:"auth_style"`
 	ModelMap   []byte    `json:"model_map"`
+	ProviderID uuid.UUID `json:"provider_id"`
 }
 
 // A revision is immutable: this is the ONLY statement that writes model_provider_revisions rows
@@ -375,19 +473,22 @@ type InsertModelProviderRevisionParams struct {
 // query file). An edit inserts the next revision.
 func (q *Queries) InsertModelProviderRevision(ctx context.Context, arg InsertModelProviderRevisionParams) error {
 	_, err := q.db.Exec(ctx, insertModelProviderRevision,
-		arg.ProviderID,
 		arg.Revision,
 		arg.Protocol,
 		arg.BaseUrl,
 		arg.AuthStyle,
 		arg.ModelMap,
+		arg.ProviderID,
 	)
 	return err
 }
 
 const insertProviderKeySecret = `-- name: InsertProviderKeySecret :one
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id)
-VALUES ($1, 'anthropic_compatible_key', $2, false, false, $3, $4, $5)
+SELECT $1, CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END,
+       $2, false, false, $3, $4, $5
+FROM model_providers p
+WHERE p.id = $5 AND p.owner_user_id = $1
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
 `
 
@@ -409,7 +510,7 @@ type InsertProviderKeySecretRow struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Stores a provider's gateway key (kind anthropic_compatible_key), the ONLY writer of that kind.
+// Stores a provider's gateway key; derives its kind from the owned provider engine.
 // Deliberately NOT InsertUserSecret: that statement forces the first secret of a kind to be the
 // default and the first anthropic_token into the auto-select pool, and a provider key must be
 // neither (is_default=false, auto_eligible=false), so it never enters a default slot, the poller,
@@ -630,7 +731,7 @@ func (q *Queries) LockProviderBindingKeyForShareNowait(ctx context.Context, arg 
 }
 
 const lockProviderBindingRevisionForKeyShareNowait = `-- name: LockProviderBindingRevisionForKeyShareNowait :one
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -650,6 +751,7 @@ type LockProviderBindingRevisionForKeyShareNowaitRow struct {
 	BaseUrl    string    `json:"base_url"`
 	AuthStyle  string    `json:"auth_style"`
 	ModelMap   []byte    `json:"model_map"`
+	Engine     string    `json:"engine"`
 }
 
 // The claim finisher's revision read (PRD #4320 module 5, D9): the same SELECT as
@@ -669,6 +771,7 @@ func (q *Queries) LockProviderBindingRevisionForKeyShareNowait(ctx context.Conte
 		&i.BaseUrl,
 		&i.AuthStyle,
 		&i.ModelMap,
+		&i.Engine,
 	)
 	return i, err
 }
@@ -760,6 +863,36 @@ func (q *Queries) SetUserClaudeProviderSource(ctx context.Context, arg SetUserCl
 	var claude_provider_id pgtype.UUID
 	err := row.Scan(&claude_provider_id)
 	return claude_provider_id, err
+}
+
+const setUserProviderSource = `-- name: SetUserProviderSource :one
+UPDATE users u
+SET claude_provider_id = CASE WHEN $1::text = 'claude' THEN $2::uuid ELSE claude_provider_id END,
+    codex_provider_id = CASE WHEN $1::text = 'codex' THEN $2::uuid ELSE codex_provider_id END
+WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
+  AND ($2::uuid IS NULL OR EXISTS (
+      SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
+        AND p.owner_user_id = u.id AND p.engine = $1::text))
+RETURNING claude_provider_id, codex_provider_id
+`
+
+type SetUserProviderSourceParams struct {
+	Engine     string      `json:"engine"`
+	ProviderID pgtype.UUID `json:"provider_id"`
+	ID         uuid.UUID   `json:"id"`
+}
+
+type SetUserProviderSourceRow struct {
+	ClaudeProviderID pgtype.UUID `json:"claude_provider_id"`
+	CodexProviderID  pgtype.UUID `json:"codex_provider_id"`
+}
+
+// Owner and engine must match for a non-null selection; clearing is explicit.
+func (q *Queries) SetUserProviderSource(ctx context.Context, arg SetUserProviderSourceParams) (SetUserProviderSourceRow, error) {
+	row := q.db.QueryRow(ctx, setUserProviderSource, arg.Engine, arg.ProviderID, arg.ID)
+	var i SetUserProviderSourceRow
+	err := row.Scan(&i.ClaudeProviderID, &i.CodexProviderID)
+	return i, err
 }
 
 const upsertModelProviderProbeResult = `-- name: UpsertModelProviderProbeResult :execrows

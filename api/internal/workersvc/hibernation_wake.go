@@ -146,6 +146,10 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 		return DemandWakeNone, nil
 	}
 
+	if providerBoundRun(run) && !workerSupportsProvider(w, run.Harness) {
+		return DemandWakeNone, nil
+	}
+
 	now := s.now()
 	if _, ierr := q.InsertHibernationWake(ctx, store.InsertHibernationWakeParams{
 		RunID: runID, WorkerID: workerID, FirstWokenAt: pgconv.Time(now),
@@ -172,7 +176,8 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 }
 
 // ReleaseStaleWake deletes run runID's wake row when the run is no longer queued (or no longer
-// exists), when its recorded worker no longer passes claim provenance, or when the row's worker
+// exists), when its recorded worker no longer passes claim provenance or the frozen provider's
+// engine protocol, or when the row's worker
 // is hibernated or preparing again (the wake can no longer serve the run). A row whose worker
 // settled awake is kept while the run is queued and still admits that worker: it already woke once.
 // The worker is locked first and the staleness is re-checked under the lock, so a wake being
@@ -225,6 +230,13 @@ func (s *Service) ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, 
 			return false, aerr
 		}
 		stale = !admitted
+	}
+	if !stale {
+		run, rerr := q.GetRunByID(ctx, runID)
+		if rerr != nil {
+			return false, rerr
+		}
+		stale = providerBoundRun(run) && !workerSupportsProvider(w, run.Harness)
 	}
 	if !stale {
 		return false, nil

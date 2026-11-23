@@ -505,7 +505,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		}
 		originCreatedAt, err = qq.CreateJobOrigin(ctx, origin)
 		return run, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: jobs refuse a provider-sourced owner (PRD #4322 enables them)
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // Jobs retain the fixed Claude lane and its legacy Claude-source refusal.
 	if err != nil {
 		return JobView{}, err
 	}

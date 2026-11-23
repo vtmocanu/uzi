@@ -1543,3 +1543,13 @@ nested patch absence. P-layer protocol evidence uses injected OS seams: it is
 neither packaged OS isolation nor exhaustive proof about native OS effects.
 The [archived #4321 evidence](../prds/done/4321-codex-provider-spike.md)
 is background; this record states the current adoption boundary.
+
+## Note (2026-11-23, PRD #4323): user-chosen provider destinations
+
+The execution policy above is unchanged when the destination is a user-chosen,
+operator-allowlisted Responses provider ([ADR-4320](4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)).
+Native tools and extensions stay suppressed, no MCP servers are configured, and
+the config is worker-generated from validated fields, never user or repository
+TOML. Provider response data cannot select a callback's run, role, phase or
+credential authority. Adding any native MCP server would need a fresh authority
+review.

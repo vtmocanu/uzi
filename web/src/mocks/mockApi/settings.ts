@@ -28,7 +28,7 @@ import { daysAgo, mockBuildInfo, MOCK_WEEKLY_WARNING_MARGIN_PTS } from "../data"
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
-import { mockClaudeProviderId } from "./providers";
+import { mockClaudeProviderId, mockCodexProviderId } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -759,8 +759,9 @@ function mySettingsResponse(): { settings: UserSettings } {
   // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
+  const codex_provider_id = mockCodexProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts,
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, codex_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts,
     planning_claude_model: userSettings.planning_claude_model ?? null,
     planning_claude_effort: userSettings.planning_claude_effort ?? null,
     planning_codex_model: userSettings.planning_codex_model ?? null,

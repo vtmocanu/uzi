@@ -450,58 +450,67 @@ func TestProviderRouteAuthMatrixLiveDB(t *testing.T) {
 // TestProviderKeyIsInvisibleToGenericSecretRoutesLiveDB pins that the generic /me/secrets surface
 // neither lists, tests nor mutates a provider key, so nothing can reseal or default it.
 func TestProviderKeyIsInvisibleToGenericSecretRoutesLiveDB(t *testing.T) {
-	f := newProviderFixture(t, testGatewayURL)
-	p := f.create(t, validCreateBody)
-	if rec := cookieReq(t, f.router, http.MethodPut, "/api/me/providers/"+p.ID+"/key", f.jwt, `{"key":"`+testProviderKey+`"}`); rec.Code != http.StatusOK {
-		t.Fatalf("seed key = %d", rec.Code)
-	}
-	var keyID uuid.UUID
-	if err := f.pool.QueryRow(context.Background(), `SELECT id FROM user_secrets WHERE provider_id = $1`, p.ID).Scan(&keyID); err != nil {
-		t.Fatal(err)
-	}
-	var before []byte
-	_ = f.pool.QueryRow(context.Background(), `SELECT ciphertext FROM user_secrets WHERE id = $1`, keyID).Scan(&before)
-
-	// Not listed.
-	rec := bearerReqBody(f.router, http.MethodGet, "/api/me/secrets", f.uzc, "")
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), keyID.String()) || strings.Contains(rec.Body.String(), "anthropic_compatible_key") {
-		t.Errorf("GET /me/secrets = %d %s; the provider key must not be listed", rec.Code, rec.Body.String())
-	}
-	// The generic connection test 404s for the kind, as a Bearer and with a session.
-	testPath := "/api/me/secrets/anthropic_compatible_key/" + keyID.String() + "/test"
-	if rec := bearerReqBody(f.router, http.MethodPost, testPath, f.uzc, ""); rec.Code != http.StatusNotFound {
-		t.Errorf("generic test of a provider key = %d %s, want 404", rec.Code, rec.Body.String())
-	}
-	// Generic mutations addressed at the key's id are 404s that leave the sealed value untouched.
-	for _, c := range []struct{ method, path, body string }{
-		{http.MethodPatch, "/api/me/secrets/anthropic_token/" + keyID.String(), `{"token":"dummy-anthropic-token-1234"}`},
-		{http.MethodPatch, "/api/me/secrets/anthropic_token/" + keyID.String(), `{"default":true}`},
-		{http.MethodDelete, "/api/me/secrets/anthropic_token/" + keyID.String(), ""},
-		{http.MethodPatch, "/api/me/secrets/anthropic_token/" + keyID.String() + "/auto-eligible", `{"auto_eligible":true}`},
-		{http.MethodPatch, "/api/me/secrets/anthropic_compatible_key/" + keyID.String() + "/enabled", `{"enabled":false}`},
-		{http.MethodGet, "/api/me/secrets/anthropic_compatible_key/" + keyID.String() + "/dependents", ""},
+	for _, c := range []struct{ engine, kind, body string }{
+		{"claude", "anthropic_compatible_key", validCreateBody},
+		{"codex", "openai_compatible_key", `{"name":"codex-gateway","engine":"codex","protocol":"openai_responses","base_url":"` + testGatewayURL + `","auth_style":"bearer","model_map":{"default":{"model":"gateway-default"}}}`},
 	} {
-		var rec *httptest.ResponseRecorder
-		if strings.HasSuffix(c.path, "/auto-eligible") {
-			rec = bearerReqBody(f.router, c.method, c.path, f.uzc, c.body)
-		} else {
-			rec = cookieReq(t, f.router, c.method, c.path, f.jwt, c.body)
-		}
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s %s = %d %s, want 404", c.method, c.path, rec.Code, rec.Body.String())
-		}
-	}
-	var after []byte
-	var isDefault, auto bool
-	if err := f.pool.QueryRow(context.Background(), `SELECT ciphertext, is_default, auto_eligible FROM user_secrets WHERE id = $1`, keyID).Scan(&after, &isDefault, &auto); err != nil {
-		t.Fatalf("provider key gone after generic mutations: %v", err)
-	}
-	if string(after) != string(before) || isDefault || auto {
-		t.Error("a generic secret route changed the provider key")
-	}
-	// The generic create route does not exist for the kind.
-	if rec := cookieReq(t, f.router, http.MethodPost, "/api/me/secrets/anthropic_compatible_key", f.jwt, `{"token":"dummy-anthropic-token-1234","label":"x"}`); rec.Code < 400 {
-		t.Errorf("POST /me/secrets/anthropic_compatible_key = %d, want a refusal", rec.Code)
+		t.Run(c.engine, func(t *testing.T) {
+			f := newProviderFixture(t, testGatewayURL)
+			p := f.create(t, c.body)
+			if rec := cookieReq(t, f.router, http.MethodPut, "/api/me/providers/"+p.ID+"/key", f.jwt, `{"key":"`+testProviderKey+`"}`); rec.Code != http.StatusOK {
+				t.Fatalf("seed key = %d", rec.Code)
+			}
+			var keyID uuid.UUID
+			if err := f.pool.QueryRow(context.Background(), `SELECT id FROM user_secrets WHERE provider_id = $1`, p.ID).Scan(&keyID); err != nil {
+				t.Fatal(err)
+			}
+			var before []byte
+			_ = f.pool.QueryRow(context.Background(), `SELECT ciphertext FROM user_secrets WHERE id = $1`, keyID).Scan(&before)
+			nativeToken := seedTestConnection(t, f.h, f.pool, f.user, "anthropic_token", "fixture-native-token")
+			nativeKey := seedTestConnection(t, f.h, f.pool, f.user, "openai_api_key", "fixture-native-key")
+
+			// Provider keys are hidden while native credentials remain visible.
+			rec := bearerReqBody(f.router, http.MethodGet, "/api/me/secrets", f.uzc, "")
+			if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), keyID.String()) || strings.Contains(rec.Body.String(), c.kind) || !strings.Contains(rec.Body.String(), nativeToken.String()) || !strings.Contains(rec.Body.String(), nativeKey.String()) {
+				t.Errorf("GET /me/secrets = %d %s; the provider key must not be listed", rec.Code, rec.Body.String())
+			}
+			// The generic connection test 404s for the kind, as a Bearer and with a session.
+			testPath := "/api/me/secrets/" + c.kind + "/" + keyID.String() + "/test"
+			if rec := bearerReqBody(f.router, http.MethodPost, testPath, f.uzc, ""); rec.Code != http.StatusNotFound {
+				t.Errorf("generic test of a provider key = %d %s, want 404", rec.Code, rec.Body.String())
+			}
+			// Generic mutations addressed at the key's id are 404s that leave the sealed value untouched.
+			for _, c := range []struct{ method, path, body string }{
+				{http.MethodPatch, "/api/me/secrets/anthropic_token/" + keyID.String(), `{"token":"dummy-anthropic-token-1234"}`},
+				{http.MethodPatch, "/api/me/secrets/anthropic_token/" + keyID.String(), `{"default":true}`},
+				{http.MethodDelete, "/api/me/secrets/anthropic_token/" + keyID.String(), ""},
+				{http.MethodPatch, "/api/me/secrets/anthropic_token/" + keyID.String() + "/auto-eligible", `{"auto_eligible":true}`},
+				{http.MethodPatch, "/api/me/secrets/" + c.kind + "/" + keyID.String() + "/enabled", `{"enabled":false}`},
+				{http.MethodGet, "/api/me/secrets/" + c.kind + "/" + keyID.String() + "/dependents", ""},
+			} {
+				var rec *httptest.ResponseRecorder
+				if strings.HasSuffix(c.path, "/auto-eligible") {
+					rec = bearerReqBody(f.router, c.method, c.path, f.uzc, c.body)
+				} else {
+					rec = cookieReq(t, f.router, c.method, c.path, f.jwt, c.body)
+				}
+				if rec.Code != http.StatusNotFound {
+					t.Errorf("%s %s = %d %s, want 404", c.method, c.path, rec.Code, rec.Body.String())
+				}
+			}
+			var after []byte
+			var isDefault, auto bool
+			if err := f.pool.QueryRow(context.Background(), `SELECT ciphertext, is_default, auto_eligible FROM user_secrets WHERE id = $1`, keyID).Scan(&after, &isDefault, &auto); err != nil {
+				t.Fatalf("provider key gone after generic mutations: %v", err)
+			}
+			if string(after) != string(before) || isDefault || auto {
+				t.Error("a generic secret route changed the provider key")
+			}
+			// The generic create route does not exist for the kind.
+			if rec := cookieReq(t, f.router, http.MethodPost, "/api/me/secrets/"+c.kind, f.jwt, `{"token":"dummy-anthropic-token-1234","label":"x"}`); rec.Code < 400 {
+				t.Errorf("POST /me/secrets/%s = %d, want a refusal", c.kind, rec.Code)
+			}
+		})
 	}
 }
 

@@ -35,7 +35,7 @@ describe("codex U broker policy (real broker / screener / fileop)", () => {
 
     // These representative native execution names are not recognized worker capabilities and
     // deny unknown_tool before effects. Bare native apply_patch is a separate runtime surface;
-    // apply_patch_freeform=false is ignored at pin 0.167.0, not a runtime suppression control.
+    // apply_patch_freeform=false is ignored at 0.167.0 (pin 0.169.0, not re-measured), not a runtime suppression control.
     // Worker patch authority uses the recognized callback/broker path. See native-patch-inert.test.ts.
     const nativeNames = ["shell", "shell_command", "exec_command", "unified_exec", "write_stdin", "local_shell", "container.exec", "exec", "code_interpreter"];
     for (const name of nativeNames) {

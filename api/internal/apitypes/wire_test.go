@@ -1236,6 +1236,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"codex_judge_model", "judge_models", "judge_runs_on",
 		// PRD #4320: the provider the Claude lane runs on (null ⇒ vendor ladder).
 		"claude_provider_id",
+		// Issue #4323: the Codex provider source (null ⇒ vendor ladder).
+		"codex_provider_id",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
 		// PRD #1570: the per-harness task-review models (null ⇒ built-in) and their read-only cells.

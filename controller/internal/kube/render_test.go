@@ -1052,6 +1052,86 @@ func TestSecretAppendsTheExtraCAAfterTheAPICA(t *testing.T) {
 	}
 }
 
+func TestCodexExtraCASecretAndStartupEnv(t *testing.T) {
+	const api = "api-ca-without-trailing-newline"
+	const extra = "\nextra-ca\n\n"
+	for _, ca := range []struct {
+		name, api, extra, combined string
+	}{
+		{"none", "", "", ""},
+		{"api-only", api, "", api},
+		{"extra-only", "", extra, extra},
+		{"api-and-extra", api, extra, api + "\n" + extra},
+	} {
+		for _, split := range []bool{false, true} {
+			for _, isolated := range []bool{false, true} {
+				for _, mount := range []string{"/run/secrets", "/run/uzi-secrets"} {
+					t.Run(fmt.Sprintf("%s/split=%t/isolated=%t/mount=%s", ca.name, split, isolated, mount), func(t *testing.T) {
+						cfg := laneTestConfig()
+						cfg.APICAPEM, cfg.ExtraCAPEM = []byte(ca.api), []byte(ca.extra)
+						cfg.UIDSplit, cfg.SecretMountPath = split, mount
+						w := desired("abc")
+						if isolated {
+							w = desiredIsolated("abc")
+						}
+						secret := RenderSecret(cfg, w, "uzw_test-token")
+						wantCodex := ca.extra != "" && !isolated
+						got, present := secret.Data["codex-extra-ca.crt"]
+						if present != wantCodex || (wantCodex && string(got) != ca.extra) {
+							t.Errorf("Codex CA = %q, present=%t; want exact extra=%q, present=%t", got, present, ca.extra, wantCodex)
+						}
+						if got, present := secret.Data["ca.crt"]; string(got) != ca.combined || present != (ca.combined != "") {
+							t.Errorf("combined CA = %q, present=%t; want %q", got, present, ca.combined)
+						}
+						if string(secret.Data["worker_token"]) != "uzw_test-token" {
+							t.Error("join token changed")
+						}
+						pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+						env := envMap(pod.Containers[0])
+						wantPath := ""
+						if wantCodex {
+							wantPath = mount + "/codex-extra-ca.crt"
+						}
+						if got, present := env["UZI_CODEX_CA_FILE"]; got != wantPath || present != wantCodex {
+							t.Errorf("Codex env = %q, present=%t; want %q, present=%t", got, present, wantPath, wantCodex)
+						}
+						wantNode, wantCLI := "", ""
+						if ca.combined != "" {
+							wantNode = mount + "/ca.crt"
+						}
+						if ca.extra != "" && (!split || isolated) {
+							wantCLI = mount + "/ca.crt"
+						}
+						if env["NODE_EXTRA_CA_CERTS"] != wantNode || env["UZI_CLI_CA_FILE"] != wantCLI || env["UZI_WORKER_TOKEN_FILE"] != mount+"/worker_token" {
+							t.Errorf("existing CA/token env changed: %v", env)
+						}
+						foundVolume, foundMount := false, false
+						for _, volume := range pod.Volumes {
+							if volume.Name == "token" {
+								foundVolume = true
+								if volume.Secret == nil || volume.Secret.DefaultMode == nil || *volume.Secret.DefaultMode != 0o440 || len(volume.Secret.Items) != 0 {
+									t.Errorf("Secret projection permissions changed: %+v", volume.Secret)
+								}
+							}
+						}
+						for _, vm := range pod.Containers[0].VolumeMounts {
+							if vm.Name == "token" {
+								foundMount = true
+								if !vm.ReadOnly || vm.MountPath != mount {
+									t.Errorf("Secret mount changed: %+v", vm)
+								}
+							}
+						}
+						if !foundVolume || !foundMount {
+							t.Error("missing token Secret volume or mount")
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 // The Claude CLI gets the bundle (UZI_CLI_CA_FILE) only when an extra CA exists and the uid
 // split is off: the CLI never dials the api, and under the split it runs as a uid that
 // cannot read the Secret file.

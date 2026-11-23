@@ -1,8 +1,13 @@
 import { describe, it } from "node:test";
+import { PassThrough } from "node:stream";
+import { createCodexTransport, CodexTransportError } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 
 import {
+  CODEX_PROVIDER_FIRST_RESPONSE_MS,
   CODEX_REFRESH_BRIDGE_BUDGET_MS,
+  codexConnectionBudget,
+  codexInitialResponseWait,
   CodexAppServerAuthError,
   createCodexAppServerAuth,
   type CodexSubscriptionRefreshBridge,
@@ -17,6 +22,74 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 }
+
+it("provider first response has its own allowance, not the spent setup budget", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  assert.equal(CODEX_PROVIDER_FIRST_RESPONSE_MS, 120_000);
+  const wait = codexInitialResponseWait(CODEX_PROVIDER_FIRST_RESPONSE_MS, "thread-1", "turn-1");
+  t.mock.timers.tick(11_000);
+  wait.assertOpen();
+  wait.observe({ kind: "activity", method: "item/agentMessage/delta",
+    params: { threadId: "thread-1", turnId: "turn-1", delta: "late" } } as CodexNotification);
+  t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS);
+  wait.assertOpen();
+});
+
+it("a provider first response that never arrives raises the typed initial-response timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const wait = codexInitialResponseWait(CODEX_PROVIDER_FIRST_RESPONSE_MS, "thread-1", "turn-1");
+  t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS - 1);
+  wait.assertOpen();
+  t.mock.timers.tick(1);
+  await wait.ready;
+  assert.throws(() => wait.assertOpen(), error =>
+    error instanceof CodexTransportError && error.failure.category === "timeout" &&
+    error.failure.message === "codex provider initial response deadline exceeded");
+});
+
+it("non-provider and later turns carry no first-response bound", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const wait = codexInitialResponseWait(undefined, "thread-1", "turn-1");
+  t.mock.timers.tick(10 * CODEX_PROVIDER_FIRST_RESPONSE_MS);
+  wait.assertOpen();
+});
+
+it("expired provider setup budget refuses before any RPC or credential send", async (t) => {
+  let now = 1_000;
+  t.mock.method(performance, "now", () => now);
+  const budget = codexConnectionBudget("provider");
+  assert.ok(budget);
+  now += 10_000;
+  const transport = new FakeTransport();
+  const auth = createCodexAppServerAuth({ mode: "provider", apiKey: "fixture-key" });
+  await assert.rejects(auth.authenticate(transport, undefined, budget), error =>
+    error instanceof CodexTransportError && error.failure.category === "timeout");
+  assert.deepEqual(transport.calls, []);
+  for (const mode of [undefined, "api_key", "subscription"] as const) {
+    assert.equal(codexConnectionBudget(mode), undefined);
+  }
+});
+
+it("provider pending initialize keeps the typed connection deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const inbound = new PassThrough();
+  const outbound = new PassThrough();
+  const transport = createCodexTransport({ inbound, outbound });
+  const auth = createCodexAppServerAuth({ mode: "provider", apiKey: "fixture-key" });
+  const pending = auth.authenticate(transport, undefined, () => 10);
+  let failure: unknown;
+  const settled = pending.catch(error => { failure = error; });
+  t.mock.timers.tick(10);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    assert.ok(failure instanceof CodexTransportError);
+    assert.equal(failure.failure.category, "timeout");
+    assert.equal(failure.message, "codex transport request deadline exceeded");
+  } finally {
+    await transport.close();
+    await settled;
+  }
+});
 
 const INITIAL = { accessToken: "initial-access-token", accountId: "server-account-1" };
 const REFRESHED = { accessToken: "refreshed-access-token", accountId: "server-account-1" };
@@ -784,4 +857,43 @@ describe("Codex app-server auth: intercepted request ownership", () => {
       return true;
     });
   });
+});
+
+describe("immutable provider managed authentication", () => {
+  it("snapshots provider apiKey login and refuses refresh without vendor calls", async () => {
+    const config = { mode: "provider" as const, apiKey: "provider-fixture-credential" };
+    const auth = createCodexAppServerAuth(config);
+    config.apiKey = "changed-after-construction";
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    assert.equal(auth.mode, "provider");
+    assert.deepEqual(transport.calls.find(call => call.method === "account/login/start")?.params,
+      { type: "apiKey", apiKey: "provider-fixture-credential" });
+    await assert.rejects(auth.handleServerRequest(transport, refreshRequest(900)), CodexAppServerAuthError);
+    assert.equal(transport.calls.filter(call => call.kind === "request").length, 2);
+    assert.equal(responses(transport).length, 1);
+  });
+
+  it("refuses provider subscription, endpoint and environment authority", () => {
+    for (const extra of [
+      { initial: INITIAL }, { bridge: { refresh: () => { throw new Error("must not call vendor"); } } },
+      { baseUrl: "https://evil.example" }, { env: { OPENAI_API_KEY: "evil" } },
+      { headers: {} }, { accountId: "other" },
+    ]) {
+      assert.throws(() => createCodexAppServerAuth({
+        mode: "provider", apiKey: "provider-fixture-credential", ...extra,
+      }), CodexAppServerAuthError);
+    }
+    assert.throws(() => createCodexAppServerAuth({ mode: "provider", apiKey: "" }), CodexAppServerAuthError);
+  });
+});
+
+it("provider interceptor refuses refresh and never invokes vendor authority", async () => {
+  const auth = createCodexAppServerAuth({ mode: "provider", apiKey: "provider-fixture-credential" });
+  const transport = new FakeTransport();
+  await auth.authenticate(transport);
+  assert.equal(transport.emitServerRequest(refreshRequest(901)), true);
+  await assert.rejects(auth.drainInterceptedRequests(), CodexAppServerAuthError);
+  assert.equal(responses(transport).length, 1);
+  assert.equal(transport.calls.filter(call => call.kind === "request").length, 2);
 });

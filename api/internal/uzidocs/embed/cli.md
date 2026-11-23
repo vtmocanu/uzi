@@ -2988,29 +2988,41 @@ on the `status`/`bucket` enums.
 
 ## Model providers: `uzi provider`
 
-A [model provider](./providers.md) is a named Anthropic-compatible gateway with its own key
-and model map. The CLI manages the parts that never handle a credential:
+A [model provider](./providers.md) is a named gateway with its own key and model map: an
+Anthropic-compatible one for the Claude engine, or a Responses-compatible one for the Codex
+engine. The CLI manages the parts that never handle a credential:
 
 ```sh
-uzi provider list                              # NAME, URL, AUTH, MODELS, KEY, TEST, RETIRED
+uzi provider list                              # NAME, ENGINE, URL, AUTH, MODELS, KEY, TEST, RETIRED
 uzi provider create --name corp-gw --base-url https://gw.example.com/anthropic \
   --model haiku=corp-haiku:200000 --model sonnet=corp-sonnet:200000
+uzi provider create --engine codex --name code-gw --base-url https://gw.example.com/openai \
+  --model default=gw-model-a:200000 --model gpt-6-sol=gw-model-b:200000
 uzi provider edit corp-gw --name corp --model haiku=corp-haiku:200000
 uzi provider test corp                         # auth and tool-call results, separately
 uzi provider retire corp
-uzi provider use corp                          # select as your Claude source; --none clears it
+uzi provider use corp                          # select as the source of the provider's own engine
+uzi provider use --none --engine claude        # clear one engine's source (or --engine codex)
 ```
 
 `<name|id>` matches an id exactly or a name without regard to case. `create` needs `--name`,
 `--base-url` (exactly one of the URLs your operator allowed; `uzi provider list --json` shows
-them as `allowed_base_urls`) and `--model haiku=...`. `--auth-style` is `bearer` (default) or
-`x_api_key`. `--model` is `alias=model[:context_window]` and repeatable; `edit --model` replaces
-the whole map. A trailing `:0` stays part of the model id; any other all-digit suffix after the
-last colon is read as the context window.
+them as `allowed_base_urls`) and a model map with its required key. `--engine` is `claude`
+(default) or `codex`. `--auth-style` is `bearer` (default) or `x_api_key`; a Codex provider
+accepts `bearer` only. `--model` is `alias=model[:context_window]` and repeatable; `edit --model`
+replaces the whole map. A trailing `:0` stays part of the model id; any other all-digit suffix
+after the last colon is read as the context window.
+
+The `--model` vocabulary is per engine. Claude: `haiku` (required), `sonnet`, `opus`, `fable`.
+Codex: `default` (required) plus the optional Codex model ids `gpt-6-astra`, `gpt-5.6-sol`,
+`gpt-6-sol`, `gpt-6.1-sol` and `gpt-6-luna`. A Codex model the map does not name resolves through
+`default` when uzi picks it, but an explicit `--model` on a run or a schedule pin needs its own key
+(`provider_model_unmapped` otherwise); see [Use a provider as your Codex
+source](./providers.md#use-a-provider-as-your-codex-source).
 
 `test` prints an `auth:` line (`ok`, `rejected`, `inconclusive`) and a `tools:` line (`passed`,
 `not_supported`, `inconclusive`, `not_run`), then "Neither result certifies full compatibility
-with Claude." `--json` carries the same fields. Tests are limited to one at a time and 30 per hour
+with its engine." `--json` carries the same fields. Tests are limited to one at a time and 30 per hour
 per user.
 
 Web-only, deliberately: the **API key** (add, replace, remove, enable), a **base URL or auth
@@ -3019,15 +3031,25 @@ cannot mint or redirect a credential. `create` ends by pointing you at Settings 
 A server without `UZI_PROVIDER_ALLOWED_BASE_URLS` has the feature off: `list` says so
 (`--json` gives `enabled: false`); `create` is refused with `provider_base_url_not_allowed` (exit 2), and `edit`, `test` and `retire` exit 5. A refusal prints the server's
 `reason` (for example `provider_base_url_not_allowed`) after the message. Selecting a provider
-as your Claude source is `uzi provider use <name|id>`; `uzi provider use --none` clears it so Claude
-runs use your Anthropic token again (see
-[Use a provider as your Claude source](./providers.md#use-a-provider-as-your-claude-source)). It
-applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 2 for usage errors
-(pass a name or id, or `--none`, not both), 4 when the provider is not found, 5 when it is retired,
-has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
-(`use --none` only clears the selection, so it succeeds even with the feature off).
-`--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
-"unknown (custom provider)". Runs start on workers that advertise `claude_provider_v1`; an older worker leaves them queued ("no worker that supports model providers is online"). See [Model providers](./providers.md).
+as a source is `uzi provider use <name|id>`: it sets the source of the provider's own engine
+(`users.claude_provider_id` for a Claude provider, `users.codex_provider_id` for a Codex one), and
+an optional `--engine` must match the provider. Each engine has its own selection, so clearing
+names the engine: `uzi provider use --none --engine claude|codex` (`--none` alone is a usage
+error). Clearing Claude means Claude runs use your Anthropic token again; clearing Codex means
+Codex runs use your Codex login or OpenAI key again (see
+[Use a provider as your Claude source](./providers.md#use-a-provider-as-your-claude-source) and
+[Use a provider as your Codex source](./providers.md#use-a-provider-as-your-codex-source)). It
+applies to runs you start afterwards, and one engine's selection never affects the other's runs.
+Exit codes: 2 for usage errors (pass a name or id, or `--none --engine ...`, not both; an
+`--engine` that does not match the provider), 4 when the provider is not found, 5 when it is
+retired, has no key or a disabled key, the feature is off, or the server answers
+`provider_source_unusable` (`use --none` only clears the selection, so it succeeds even with the
+feature off). `--json` prints `{"<engine>_provider_id", "name"}`, for example
+`{"codex_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as "unknown (custom
+provider)". Claude provider runs start on workers that advertise `claude_provider_v1` and Codex
+ones on workers that advertise `codex_provider_v1` together with the Codex harness capabilities; an
+older worker leaves them queued ("no worker that supports model providers is online"). See [Model
+providers](./providers.md).
 
 ## Anthropic tokens
 
