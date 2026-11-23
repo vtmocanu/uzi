@@ -268,6 +268,18 @@ provider run, which queues ("no worker that supports model providers is online")
 image overrides and Compose or separately run workers yourself, since only the chart's worker image
 pin is bumped by the release helper.
 
+**Codex providers (PRD #4323).** The same allowlist also admits Responses-compatible gateways for
+the Codex engine (engine `codex`, Bearer auth only); put the exact base URL in the list like any
+other. Workers advertise `codex_provider_v1` together with the Codex harness capabilities, and the
+api admits a Codex provider claim only to a worker advertising `codex_provider_v1`,
+`codex_harness_v1` and `codex_runtime_v2`, so **deploy the api before the workers**; until a
+capable worker is online such a run queues with the same "no worker that supports model providers
+is online" reason. The pinned Codex runtime follows redirects and can forward request bodies and the
+Bearer header beyond the approved URL, and it does not limit model-response size, so the allowlist
+is admission control, not confinement (see [Model providers](./providers.md) and
+[ADR-4320](../adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)). The worker's
+`workers.extraCA` bundle is also delivered to the Codex runtime with TLS verification on.
+
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
 fails the render). The chart checks every entry's shape (https only; no userinfo, query, fragment,
@@ -281,8 +293,8 @@ private-CA gateway always tests as inconclusive while runs may still reach it.
 
 ### The Test probe
 
-**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` with the
-provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
+**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` (a Codex
+provider: `<base_url>/responses`) with the provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
 protocol) and, only if that succeeds, a forced single-tool request (does the gateway return a
 `tool_use` block). Neither certifies full compatibility. The api must therefore be able to reach the
 gateway on the network, which is separate from any worker egress rule.
@@ -500,7 +512,7 @@ Predicts a manual issue start with a given harness and token choice, validated b
 
 `harness` is `claude` or `codex`; omit it (or send null) for the default. `credential_override.mode` is `inherit`, `auto`, `default` or `pinned`; `secret_id` names the pinned token. A bad enum or uuid is a 400. Any override other than `inherit` makes the creation-time policies ineligible, as at creation.
 
-The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
+The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude or Codex source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
 
 When the harness is chosen at creation, `harness.value` and `credential` are null and `alternatives` lists Claude then Codex, neither marked as the likely choice. Each alternative is computed as if that harness were chosen and carries its own `credential`, or its own `refusal` and `refusal_detail`. The top-level `refusal` is set only when the request fails before a harness is decided, or when **every** alternative is refused for the **same** reason. When the reasons differ, the top-level `refusal` and `refusal_detail` stay null and each alternative keeps its own reason; one branch's reason is never promoted to stand for both. If one alternative is valid, nothing is promoted either.
 

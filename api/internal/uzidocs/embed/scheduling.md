@@ -858,9 +858,9 @@ exceed `max_issues` once backfill walks past a skip), which ones
 - `provider_source_unusable`, `provider_lane_unsupported`,
   `provider_model_unmapped`, `provider_binding_stale`,
   `provider_destination_not_allowed` and `credential_override_provider_source`
-  — your Claude source is a model provider and the fire was refused at run
+  — your Claude or Codex source is a model provider and the fire was refused at run
   creation. The fire starts nothing and never falls back to a vendor credential
-  or to Codex. A recurring schedule advances and re-fires next cadence. A
+  or to the other engine. A recurring schedule advances and re-fires next cadence. A
   one-time schedule is **held** on `provider_source_unusable` (due, un-advanced,
   with the skip recorded as its last fire) until you repair the provider, like a
   disabled pin; on the other five reasons a one-time schedule is consumed like
@@ -869,7 +869,8 @@ exceed `max_issues` once backfill walks past a skip), which ones
   operator allowlist, or its key is missing or disabled.
   `provider_lane_unsupported`: judge, job, cross-check and isolated runs do not
   support a provider yet. `provider_model_unmapped`: a model the run would use
-  is not in the provider's model map. `provider_binding_stale`: an inherited
+  is not in the provider's model map (for a Codex provider, a model pinned on the
+  schedule needs its own key; models uzi picks fall back to `default`). `provider_binding_stale`: an inherited
   provider key was rotated, disabled or deleted since the source run.
   `provider_destination_not_allowed`: an inherited provider URL is no longer
   allowlisted. `credential_override_provider_source`: a stored credential
