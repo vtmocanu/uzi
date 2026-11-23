@@ -145,6 +145,7 @@
   ],
   "weekly_reserve_pct": 1,
   "weekly_reserve_pause_running": true,
+  "weekly_warning_margin_pts": 1,
   "codex_account_mode": "x",
   "harness_overflow_enabled": true
 }

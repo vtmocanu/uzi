@@ -329,7 +329,7 @@ func TestCodeCrossCheckAdvisoryOnlyOnCompleted(t *testing.T) {
 
 // The advisory is its own context block, with a block_id distinct from the completed one.
 func TestWithCodeCrossCheckAdvisoryBlockShape(t *testing.T) {
-	blocks, fallback, _ := renderThreadBlocks(codeCCParent(), "https://uzi.example")
+	blocks, fallback, _ := renderThreadBlocks(codeCCParent(), "https://uzi.example", nil)
 	same, sameFallback := withCodeCrossCheckAdvisory(blocks, fallback, "")
 	if len(same) != len(blocks) || sameFallback != fallback {
 		t.Fatalf("empty advisory must not change the message")

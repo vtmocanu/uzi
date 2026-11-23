@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/shellquote"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -135,8 +136,8 @@ func TestShellQuote(t *testing.T) {
 		"=foo":                "'=foo'",
 		"a=b":                 "a=b",
 	} {
-		if got := shellQuote(in); got != want {
-			t.Errorf("shellQuote(%q) = %s; want %s", in, got, want)
+		if got := shellquote.Quote(in); got != want {
+			t.Errorf("shellquote.Quote(%q) = %s; want %s", in, got, want)
 		}
 	}
 }

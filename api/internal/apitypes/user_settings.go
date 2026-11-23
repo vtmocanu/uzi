@@ -124,6 +124,10 @@ type UserSettingsDTO struct {
 	// written through PUT /api/me/settings; PUT /api/me/usage-reserve owns the write.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
+	// WeeklyWarningMarginPts is the weekly-limit early-warning margin in percentage points (PRD
+	// #4123), 0..50 with 0 = off, default 15. Not written through PUT /api/me/settings;
+	// PUT /api/me/weekly-warning-margin owns the write.
+	WeeklyWarningMarginPts int `json:"weekly_warning_margin_pts"`
 	// CodexAccountMode is the user's Codex account mode (issue #3719): "default" binds the
 	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
 	// PUT /api/me/codex-account-mode owns the write.

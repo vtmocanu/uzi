@@ -39,10 +39,10 @@ func (s *earlyResetBehaviorStore) GetCodexEarlyResetBaseline(_ context.Context, 
 	return b, nil
 }
 
-func (s *earlyResetBehaviorStore) UpsertCodexAccountRateLimits(ctx context.Context, p store.UpsertCodexAccountRateLimitsParams) (int64, error) {
-	n, err := s.fakeStore.UpsertCodexAccountRateLimits(ctx, p)
-	if err != nil || n != 1 {
-		return n, err
+func (s *earlyResetBehaviorStore) UpsertCodexAccountRateLimits(ctx context.Context, p store.UpsertCodexAccountRateLimitsParams) (pgtype.Timestamptz, error) {
+	ts, err := s.fakeStore.UpsertCodexAccountRateLimits(ctx, p)
+	if err != nil {
+		return ts, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -53,7 +53,7 @@ func (s *earlyResetBehaviorStore) UpsertCodexAccountRateLimits(ctx context.Conte
 		EnablementSig:         pgtype.Text{String: p.EnablementSig, Valid: true},
 		NotifyEarlyLimitReset: true,
 	}
-	return n, nil
+	return ts, nil
 }
 
 type earlyResetBehaviorEvent struct {

@@ -241,8 +241,8 @@ a plain `go test ./...` when `UZI_TEST_DATABASE_URL` is unset. The full PRD #24 
 is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
 The script has since grown past that one query: it sweeps **every `*LiveDB` test in
-the ten packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
-`workersvc`, `recovery`, `poller`, `hostedsvc`, `issuetrackersvc` and `runlifecycle`, serially (`-p 1`, one shared database). CI splits that one sweep across two jobs with
+the eleven packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
+`workersvc`, `recovery`, `poller`, `hostedsvc`, `issuetrackersvc`, `runlifecycle` and `weeklywarn`, serially (`-p 1`, one shared database). CI splits that one sweep across two jobs with
 `UZI_STORE_IT_GROUP`: `test-livedb-workersvc` (`workersvc`) and
 `test-codex-refresh-lostreply-e2e` (`rest`, every other package, then the combined
 proofs). `test-api-store-it` is a thin context that requires both to have succeeded.

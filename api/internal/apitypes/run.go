@@ -278,6 +278,9 @@ type RunDTO struct {
 	// InjectedEnv lists the run environment variables the current claim generation delivered:
 	// names, scope and the secret flag. Detail read, run owner only; never on the worker DTO.
 	InjectedEnv []InjectedEnvVarDTO `json:"injected_env,omitempty"`
+	// WeeklyLimit is the owner-only weekly-limit block (PRD #4123); absent unless the run's vendor
+	// credential is in a weekly-limit park.
+	WeeklyLimit *WeeklyLimitDTO `json:"weekly_limit,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1286,6 +1289,8 @@ type RunSummaryItemDTO struct {
 	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
+	// WeeklyLimit is the compact owner-only weekly-limit projection (PRD #4123).
+	WeeklyLimit *WeeklyLimitSummaryDTO `json:"weekly_limit,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -2179,6 +2184,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		PolicyHold:                    item.PolicyHold,
 		WorkerRecovery:                item.WorkerRecovery,
 		MemoryHold:                    item.MemoryHold,
+		WeeklyLimit:                   item.WeeklyLimit.Summary(),
 		ID:                            item.ID,
 		RepoID:                        item.RepoID,
 		ForgeType:                     item.ForgeType,
@@ -2375,6 +2381,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			PolicyHold:                    s.PolicyHold,
 			WorkerRecovery:                s.WorkerRecovery,
 			MemoryHold:                    s.MemoryHold,
+			WeeklyLimit:                   weeklyLimitFromSummary(s.WeeklyLimit),
 			ID:                            s.ID,
 			RepoID:                        s.RepoID,
 			ForgeType:                     s.ForgeType,

@@ -140,6 +140,26 @@ func decide(threshold int16, used float64, resetsAt *time.Time) Verdict {
 	return Verdict{State: OK, Pct: pct, Threshold: int(threshold), ResetsAt: resetsAt, Fresh: true}
 }
 
+// WeeklyReading is a credential's usable 7-day reading, or the fact that it has none. OK is
+// true only for a fresh, post-reset reading carrying a utilization; every other case (missing,
+// stale, pre-reset, utilization-less) is the fail-closed not-OK reading, never a zero percent.
+type WeeklyReading struct {
+	OK       bool
+	Pct      float64
+	ResetsAt *time.Time
+}
+
+// ClaudeWeekly applies the reserve's reading policy to a Claude token's 7-day reading, with no
+// threshold: a missing, stale, pre-reset or utilization-less reading is not OK. EvaluateClaude
+// is built on it, so the reserve and the warning surfaces cannot disagree about usability.
+func ClaudeWeekly(r ClaudeReading, interval time.Duration, now time.Time) WeeklyReading {
+	if !r.Present || r.SevenDayPct == nil || r.SyncedAt == nil ||
+		Stale(*r.SyncedAt, true, interval, now) || PreReset(r.SevenDayResetsAt, *r.SyncedAt, now) {
+		return WeeklyReading{}
+	}
+	return WeeklyReading{OK: true, Pct: float64(*r.SevenDayPct), ResetsAt: r.SevenDayResetsAt}
+}
+
 // EvaluateClaude evaluates a Claude token's 7-day reading against the user's threshold. A nil
 // threshold is always OK. A missing, stale, pre-reset or utilization-less reading is Unknown.
 // A reading equal to the threshold is Held.
@@ -147,11 +167,11 @@ func EvaluateClaude(threshold *int16, r ClaudeReading, interval time.Duration, n
 	if threshold == nil {
 		return Verdict{State: OK}
 	}
-	if !r.Present || r.SevenDayPct == nil || r.SyncedAt == nil ||
-		Stale(*r.SyncedAt, true, interval, now) || PreReset(r.SevenDayResetsAt, *r.SyncedAt, now) {
+	w := ClaudeWeekly(r, interval, now)
+	if !w.OK {
 		return unknown()
 	}
-	return decide(*threshold, float64(*r.SevenDayPct), r.SevenDayResetsAt)
+	return decide(*threshold, w.Pct, w.ResetsAt)
 }
 
 // CodexReading is the stored per-account reading. LastSuccessAt is the account's last
@@ -162,12 +182,148 @@ type CodexReading struct {
 	LastSuccessAt *time.Time
 }
 
-// EvaluateCodex evaluates a Codex account against the user's threshold. The 7-day windows are
-// the primary or secondary windows whose reported duration is exactly WeeklyWindowSeconds,
-// never chosen by position. A weekly window whose used percent is missing, non-finite or
-// negative makes the whole reading Unknown (fail closed); over 100 is clamped to 100. Buckets carry no model field, so
-// the PRD's fallback applies: the highest used percent across every bucket's weekly windows
-// decides, and its reset is that window's. No weekly window is Unknown.
+// CodexWeeklyWindow is one weekly window of a Codex reading with its place in the reading:
+// the bucket it belongs to, whether it was the bucket's "primary" or "secondary" slot, its
+// reset (nil when the reading carried none) and its clamped used percent.
+type CodexWeeklyWindow struct {
+	BucketID string
+	Slot     string
+	ResetsAt *time.Time
+	Pct      float64
+}
+
+// CodexWeeklyReading is a Codex account's usable 7-day reading. OK is false for a missing,
+// stale, invalid-window, window-less or pre-reset reading. When OK, Pct and ResetsAt are the
+// highest-utilization weekly window's and Windows lists every weekly window of the reading.
+type CodexWeeklyReading struct {
+	OK       bool
+	Pct      float64
+	ResetsAt *time.Time
+	Windows  []CodexWeeklyWindow
+}
+
+// CodexWeekly applies the reserve's reading policy to a Codex account, with no threshold. The
+// 7-day windows are the primary or secondary windows whose reported duration is exactly
+// WeeklyWindowSeconds, never chosen by position. A weekly window whose used percent is missing,
+// non-finite or negative makes the whole reading not OK (fail closed); over 100 is clamped to
+// 100. Buckets carry no model field, so the PRD's fallback applies: the highest used percent
+// across every bucket's weekly windows decides, and its reset is that window's. No weekly
+// window is not OK.
+func CodexWeekly(r CodexReading, interval time.Duration, now time.Time) CodexWeeklyReading {
+	if !r.Present || r.LastSuccessAt == nil || Stale(*r.LastSuccessAt, true, interval, now) {
+		return CodexWeeklyReading{}
+	}
+	var best *apitypes.CodexRateLimitWindowDTO
+	var windows []CodexWeeklyWindow
+	for i := range r.Buckets {
+		slots := [...]struct {
+			name string
+			w    *apitypes.CodexRateLimitWindowDTO
+		}{{"primary", r.Buckets[i].Primary}, {"secondary", r.Buckets[i].Secondary}}
+		for _, sl := range slots {
+			w := sl.w
+			if w == nil || w.LimitWindowSeconds == nil || *w.LimitWindowSeconds != WeeklyWindowSeconds {
+				continue
+			}
+			// Fail closed (PRD D6): a weekly window whose utilization is missing or not finite
+			// makes the whole reading unusable rather than letting a sibling window decide. Over
+			// 100% is the most-held state there is, so it is clamped to 100, never skipped.
+			if w.UsedPercent == nil || math.IsNaN(*w.UsedPercent) || math.IsInf(*w.UsedPercent, 0) || *w.UsedPercent < 0 {
+				return CodexWeeklyReading{}
+			}
+			windows = append(windows, CodexWeeklyWindow{BucketID: r.Buckets[i].ID, Slot: sl.name,
+				ResetsAt: CodexWindowReset(w, *r.LastSuccessAt), Pct: clampPercent(*w.UsedPercent)})
+			if best == nil || clampPercent(*w.UsedPercent) > clampPercent(*best.UsedPercent) {
+				best = w
+			}
+		}
+	}
+	if best == nil {
+		return CodexWeeklyReading{}
+	}
+	resetsAt := CodexWindowReset(best, *r.LastSuccessAt)
+	if PreReset(resetsAt, *r.LastSuccessAt, now) {
+		return CodexWeeklyReading{}
+	}
+	return CodexWeeklyReading{OK: true, Pct: clampPercent(*best.UsedPercent), ResetsAt: resetsAt, Windows: windows}
+}
+
+// Weekly is the reading's headline weekly window as a WeeklyReading: OK only for a usable reading, with
+// the highest-utilization window's percent and reset (PRD #4123 module 3). It is the Codex input of
+// EvaluateNear.
+func (c CodexWeeklyReading) Weekly() WeeklyReading {
+	return WeeklyReading{OK: c.OK, Pct: c.Pct, ResetsAt: c.ResetsAt}
+}
+
+// NearState is the outcome of EvaluateNear.
+type NearState int
+
+const (
+	// NearUnknown: the reading is not usable (missing, stale, pre-reset, invalid or utilization-less).
+	NearUnknown NearState = iota
+	// NearBelow: the reading is below limit - margin.
+	NearBelow
+	// NearNear: the reading is within the margin below the limit.
+	NearNear
+	// NearAt: the reading is at or above the limit.
+	NearAt
+)
+
+func (s NearState) String() string {
+	switch s {
+	case NearUnknown:
+		return "unknown"
+	case NearBelow:
+		return "below"
+	case NearNear:
+		return "near"
+	case NearAt:
+		return "at"
+	}
+	return "invalid"
+}
+
+// NearVerdict is EvaluateNear's result. EffectiveLimit is the reserve threshold, or 100 with none, and
+// is set for every state. Pct (the used percent rounded down, never above 100) and ResetsAt are set
+// when the reading is usable.
+type NearVerdict struct {
+	State          NearState
+	EffectiveLimit int
+	Pct            int
+	ResetsAt       *time.Time
+}
+
+// EvaluateNear places a credential's weekly reading relative to its effective limit: the threshold
+// when set, else 100 (a nil threshold is a limit of 100, not "no reading"). The comparisons use the
+// unrounded percent, like the reserve's own Held rule: at is pct >= limit, near is pct >= limit -
+// margin, and a not-OK reading is Unknown. A margin of 0 (or less) leaves only below and at.
+func EvaluateNear(threshold *int16, marginPts int, w WeeklyReading) NearVerdict {
+	limit := 100
+	if threshold != nil {
+		limit = int(*threshold)
+	}
+	v := NearVerdict{State: NearUnknown, EffectiveLimit: limit}
+	if !w.OK || math.IsNaN(w.Pct) || w.Pct < 0 {
+		return v
+	}
+	if marginPts < 0 {
+		marginPts = 0
+	}
+	pct := clampPercent(w.Pct)
+	v.Pct, v.ResetsAt = int(math.Floor(pct)), w.ResetsAt
+	switch {
+	case pct >= float64(limit):
+		v.State = NearAt
+	case pct >= float64(limit-marginPts):
+		v.State = NearNear
+	default:
+		v.State = NearBelow
+	}
+	return v
+}
+
+// EvaluateCodex evaluates a Codex account against the user's threshold using CodexWeekly's
+// reading policy: a not-OK reading is Unknown.
 //
 // Rounding: the verdict is Held iff used >= threshold on the unrounded percent (so 69.9 does
 // not hold a 70 threshold); the reported Pct is the used percent rounded down.
@@ -175,36 +331,15 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 	if threshold == nil {
 		return Verdict{State: OK}
 	}
-	if !r.Present || r.LastSuccessAt == nil || Stale(*r.LastSuccessAt, true, interval, now) {
+	cw := CodexWeekly(r, interval, now)
+	if !cw.OK {
 		return unknown()
 	}
-	var best *apitypes.CodexRateLimitWindowDTO
-	var weekly []WeeklyWindow
-	for i := range r.Buckets {
-		for _, w := range []*apitypes.CodexRateLimitWindowDTO{r.Buckets[i].Primary, r.Buckets[i].Secondary} {
-			if w == nil || w.LimitWindowSeconds == nil || *w.LimitWindowSeconds != WeeklyWindowSeconds {
-				continue
-			}
-			// Fail closed (PRD D6): a weekly window whose utilization is missing or not finite
-			// makes the whole reading Unknown rather than letting a sibling window decide. Over
-			// 100% is the most-held state there is, so it is clamped to 100, never skipped.
-			if w.UsedPercent == nil || math.IsNaN(*w.UsedPercent) || math.IsInf(*w.UsedPercent, 0) || *w.UsedPercent < 0 {
-				return unknown()
-			}
-			weekly = append(weekly, WeeklyWindow{ResetsAt: CodexWindowReset(w, *r.LastSuccessAt), Pct: clampPercent(*w.UsedPercent)})
-			if best == nil || clampPercent(*w.UsedPercent) > clampPercent(*best.UsedPercent) {
-				best = w
-			}
-		}
+	weekly := make([]WeeklyWindow, 0, len(cw.Windows))
+	for _, w := range cw.Windows {
+		weekly = append(weekly, WeeklyWindow{ResetsAt: w.ResetsAt, Pct: w.Pct})
 	}
-	if best == nil {
-		return unknown()
-	}
-	resetsAt := CodexWindowReset(best, *r.LastSuccessAt)
-	if PreReset(resetsAt, *r.LastSuccessAt, now) {
-		return unknown()
-	}
-	v := decide(*threshold, clampPercent(*best.UsedPercent), resetsAt)
+	v := decide(*threshold, cw.Pct, cw.ResetsAt)
 	v.Weekly = weekly
 	return v
 }

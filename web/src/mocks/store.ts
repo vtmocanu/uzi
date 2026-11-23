@@ -225,9 +225,9 @@ function seed(): MockState {
   }
   // ?mock=overview-calm (PRD #3878): the viewer has active runs but nothing needs a decision,
   // so the default Overview's decision card stays hidden. Drop every own run that could list
-  // as one: a plan/question wait, a parked run, or a finished run with a pull request. (The
-  // mock graph cannot import lib/overview, so mockApi.overviewCalm.test.ts checks the result
-  // against overviewDecisions.)
+  // as one: a plan/question wait, a parked run, a finished run with a pull request, or a run
+  // whose weekly-limit block is warning tier. (The mock graph cannot import lib/overview, so
+  // mockApi.overviewCalm.test.ts checks the result against overviewDecisions.)
   if (mockScenario() === "overview-calm") {
     const decisionStatus = new Set<string>([
       "awaiting_approval", "awaiting_input", "awaiting_followup",
@@ -235,7 +235,8 @@ function seed(): MockState {
     ]);
     for (const r of runs.values()) {
       if (r.id in mockOtherRunOwners) continue;
-      if (decisionStatus.has(r.status) || r.mr_iid != null) runs.delete(r.id);
+      // PRD #4123: a warning-tier weekly-limit block lists as a `limit` decision too.
+      if (decisionStatus.has(r.status) || r.mr_iid != null || r.weekly_limit?.tier === "warning") runs.delete(r.id);
     }
   }
   const proposals = new Map<string, IssueProposal>();

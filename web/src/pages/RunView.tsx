@@ -77,6 +77,7 @@ import { latestActivity } from "../lib/runActivity";
 import { stageForMessages } from "../lib/runStage";
 import { PlainMarkdownExcerpt } from "../components/PlainMarkdownExcerpt";
 import { RunProgressCard, runProgressCardVisible } from "../components/RunProgressCard";
+import { WeeklyLimitBanner, weeklyLimitParked } from "../components/WeeklyLimitBanner";
 import { forgeNounLower, forgeNounSentence, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { pauseOrigin, type PauseOrigin } from "../lib/pauseOrigin";
 import { useRunStream } from "../lib/useRunStream";
@@ -3124,6 +3125,10 @@ export function RunView() {
                 </Badge>
               )}
             </div>
+            {/* PRD #4123: the weekly-limit block sits directly under the chip row that
+                carries <RunCredential>, since it is about that credential. Server-computed;
+                absent unless the credential is parked on or near its weekly limit. */}
+            <WeeklyLimitBanner block={run.weekly_limit} parked={weeklyLimitParked(run)} />
           </div>
         }
       />

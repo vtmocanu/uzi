@@ -18,7 +18,7 @@ func TestWeeklyReservePauseNotice(t *testing.T) {
 		t.Fatalf("root = %q / %q, want the reserve cause named", rootSection, fallback)
 	}
 
-	thread, tfallback, ok := renderThreadBlocks(rc, "")
+	thread, tfallback, ok := renderThreadBlocks(rc, "", nil)
 	if !ok {
 		t.Fatal("a reserve park must render a thread event")
 	}
@@ -36,7 +36,7 @@ func TestWeeklyReservePauseNotice(t *testing.T) {
 	// Control: an ordinary pause (no hold) keeps the neutral wording.
 	rc.HoldReason = txt("")
 	rc.HoldReason.Valid = false
-	ordinary, _, _ := renderThreadBlocks(rc, "")
+	ordinary, _, _ := renderThreadBlocks(rc, "", nil)
 	_, section := blockSummary(ordinary)
 	if !strings.Contains(section, "‖ *Paused*") || strings.Contains(section, "weekly usage reserve") {
 		t.Errorf("ordinary pause section = %q, want the neutral header", section)

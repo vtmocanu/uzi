@@ -306,6 +306,10 @@ with a `credential_switch_uncertain` feed message. Neither old nor new
 credential executes until the uncertainty is resolved. No release/reclaim
 fallback is added.
 
+### When a Codex run hits its weekly limit
+
+Codex runs are **account-bound** for automatic selection: a run keeps the account it was created with, and a parked run does not move to another pooled account. A run parked on the 7-day window (or paused by the weekly reserve) therefore shows the reason `account_bound`, plus a fix list. Pooling another account (`uzi token pool --on --kind codex -- <label>`) or `uzi settings codex-mode auto` affects **future** runs only. For a live run, `uzi run set-token <run> -- <label>` applies only where the switch above does; queued and parked runs refuse it, so those fixes are not offered for a parked run. See [Why the run did not move to another token](run-limit-wait.md#why-the-run-did-not-move-to-another-token).
+
 ### Recovery and acceptance limits
 
 Normal recovery after actual worker loss can create a new claim and checkout.

@@ -138,7 +138,7 @@ func TestCodexReauthSurvivesRestartThenReplacementClearsLiveDB(t *testing.T) {
 	if len(reading.Buckets) != 1 || reading.Buckets[0].ID != "codex" {
 		t.Fatalf("post-recovery buckets = %+v", reading.Buckets)
 	}
-	n, err := freshQ.UpsertCodexAccountRateLimits(env.ctx, store.UpsertCodexAccountRateLimitsParams{
+	n, err := upsertCodexRows(env.ctx, freshQ, store.UpsertCodexAccountRateLimitsParams{
 		UserID:                     fx.userID,
 		ProviderAccountID:          fx.accountID,
 		Buckets:                    []byte(`[{"id":"codex","allowed":null,"limit_reached":null,"primary":null,"secondary":null}]`),

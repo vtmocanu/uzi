@@ -2026,6 +2026,15 @@ PRD at `prds/done/3264-cli-model-settings.md` (milestones M1 to M3 shipped).
 - Animated sidebar icons default on for new users and users whose `sidebar_motion` is NULL. Explicit true and false remain personal choices; clearing the choice follows the on default. No backfill is needed. (AI-synced 2026-11-21)
 - The server, web fallback, mocks and uncached pre-paint behavior agree on that default. The Appearance control shows the default; `prefers-reduced-motion` still suppresses animations. (AI-synced 2026-11-21)
 
+## Feature #4123 — Weekly limit warning and switch reason
+
+PRD at `prds/4123-weekly-limit-warning.md`.
+
+- A vendor-subscription run parked on the overall 7-day window, or paused by the weekly usage reserve, says why its next claim will or will not move to another credential (pinned, not auto, can switch, selection unchanged, headroom outside the pool, pool exhausted, no alternative, switch pending, Codex account-bound, unknown), what happens next without promising a resume that will not happen, and the existing owner action that would change it. Shown to the owner only on the run page, `uzi run get`, the TUI and the Slack park message; one server computation feeds every surface. Nothing switches automatically; 5-hour and per-model parks, API keys and custom providers are unchanged. (AI-synced 2026-11-22)
+- An early warning appears for any non-terminal vendor-subscription run whose credential is within the per-user margin (`weekly_warning_margin_pts`, default 15, 0..50; 0 disables early warnings but not park explanations) of its effective weekly limit (the weekly reserve when set, else 100%), on the run page, the Overview "Needs your decision" card (grouped per credential; a run is never listed twice), `uzi run get` and the TUI. Set via Run defaults, `uzi settings warning-margin` or `PUT /api/me/weekly-warning-margin`. (AI-synced 2026-11-22)
+- With a linked Slack account, the owner gets at most one best-effort DM per credential per observed anchored weekly period when a credential with non-terminal runs is near or at its effective weekly limit (margin > 0, a usable reset); it lists the affected runs with reason and fix. Never durable or replayed; a lost DM is accepted because the banner is the guaranteed surface (D11, D15, D16). (AI-synced 2026-11-22)
+- Fix commands put every flag before `--` and then the shell-quoted label, always name `--kind` for `uzi token pool`, and are omitted (with a rename hint) for grandfathered labels that are not command-safe. (AI-synced 2026-11-22)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

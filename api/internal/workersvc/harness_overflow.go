@@ -158,7 +158,7 @@ func codexOverflowEvidence(c codexselect.Candidate, reason codexselect.Reason, d
 // defaults. The query joins gauges on enablement_rev; rejected rows do not count.
 // Reserve loading is independent of gauge loading, including when reserve is off.
 func (s *Service) claudeOverflowEvidence(ctx context.Context, q *store.Queries, userID uuid.UUID, now time.Time, destination bool) (overflowEvidence, error) {
-	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals())
+	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals(), false)
 	if err != nil {
 		return overflowEvidence{}, err
 	}
