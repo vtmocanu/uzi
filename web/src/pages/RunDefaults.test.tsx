@@ -977,7 +977,7 @@ it("usage-limit provider regression #2360: shared default has neutral copy", () 
 describe("cross-check model and effort live in Models", () => {
   it("shows the enables and a Models link, and no checker controls or separate save", async () => {
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByText("Run judge");
+    await waitFor(() => expect(screen.getByText("Runs on")).toBeTruthy());
     expect(screen.getByText(/Plan cross-check · Required before implementation/)).toBeTruthy();
     expect(screen.getByText(/Code cross-check · Advisory before publication/)).toBeTruthy();
     const pointer = screen.getByText(/Model and effort for each cross-check stage are set in/);
@@ -1322,7 +1322,7 @@ describe("harness overflow autosave", () => {
     mockApi.setHarnessOverflow.mockReturnValueOnce(new Promise(resolve => { finishOverflow = resolve; }));
     mockApi.putMySettings.mockReturnValueOnce(new Promise(resolve => { finishSettings = resolve; }));
     renderPage();
-    await screen.findByRole("switch", { name: label });
+    await waitFor(() => expect(control().getAttribute("aria-disabled")).not.toBe("true"));
     control().focus();
     fireEvent.click(control());
     expect(control().getAttribute("aria-disabled")).toBe("true");
@@ -1454,6 +1454,37 @@ describe("Run defaults — judge summary (PRD #3263 M3)", () => {
     const link = within(summary()).getByRole("link", { name: "Change in Models" });
     expect(link.getAttribute("href")).toBe("/settings/models");
     expect(summary().textContent ?? "").not.toContain("Not used:");
+  });
+
+  it("shows the Claude provider restriction ahead of Codex credential readiness", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex", { claude_provider_id: "gateway" }));
+    renderPage();
+    await waitFor(() => expect(pairs()).toContainEqual(["Codex judge credential", "Judge runs are skipped while a custom Claude provider is selected"]));
+    expect(pairs()).toContainEqual(["Codex judge model", "gpt-6-sol · your choice"]);
+  });
+
+  it("does not claim a linked Codex alias makes a judge usable", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("codex_auth", { codex_status: "linked", auto_eligible: true })] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex", { codex_account_mode: "auto" }));
+    renderPage();
+    await waitFor(() => expect(pairs()).toContainEqual(["Codex judge credential", "Codex credential availability is checked when the judge is queued"]));
+  });
+
+  it("drops a previous viewer's credential while loading the next viewer", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token", { label: "previous viewer token" })] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    const page = () => <MemoryRouter><RunDefaults /></MemoryRouter>;
+    const { rerender } = render(page());
+    await screen.findByText("Your default token (previous viewer token)");
+    let release!: (value: Awaited<ReturnType<typeof api.listSecrets>>) => void;
+    mockApi.listSecrets.mockReturnValue(new Promise(resolve => { release = resolve; }));
+    mockAuth({ ...baseUser, id: "u2" });
+    rerender(page());
+    expect(screen.queryByText(/previous viewer token/)).toBeNull();
+    release({ secrets: [key("anthropic_token", { label: "next viewer token" })] });
+    await screen.findByText("Your default token (next viewer token)");
+    expect(screen.queryByText(/previous viewer token/)).toBeNull();
   });
 
   it("marks the lane the saved routing leaves unused in full contrast, and keeps the token picker operable", async () => {

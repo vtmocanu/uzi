@@ -85,9 +85,28 @@ describe("mock putMyModelSettings", () => {
     expect(body.errors.map((e) => e.field)).toEqual(["default_model", "theme"]);
   });
 
+  it("rejects a Codex model containing spaces without applying other fields", async () => {
+    const { api } = await reload();
+    const before = (await api.getMySettings()).settings;
+    const err = await rejection(api.putMyModelSettings({ default_codex_model: "two words", planning_codex_effort: "high" }));
+    expect(err.body).toMatchObject({ field: "default_codex_model" });
+    expect((await api.getMySettings()).settings).toEqual(before);
+  });
+
+  it("returns the saved worker model and effort in effective predictions", async () => {
+    const { api } = await reload();
+    const { effective } = await api.putMyModelSettings({ default_codex_model: "custom-codex", default_codex_effort: "runtime" });
+    expect(effective?.models.find(c => c.setting === "worker_model" && c.harness === "codex"))
+      .toMatchObject({ resolved_model: "custom-codex", source: "user_default" });
+    expect(effective?.efforts.find(c => c.setting === "worker_effort" && c.harness === "codex"))
+      .toMatchObject({ resolved_effort: null, mode: "runtime_default", source: "user_default" });
+  });
+
   it("accepts Runtime default on worker effort but not on planning effort", async () => {
     const { api } = await reload();
-    await expect(api.putMyModelSettings({ default_codex_effort: "runtime" })).resolves.toBeTruthy();
+    const result = await api.putMyModelSettings({ default_codex_effort: "runtime" });
+    expect(result.settings.default_codex_effort).toBe("runtime");
+    expect((await api.getMySettings()).settings.default_codex_effort).toBe("runtime");
     const err = await rejection(api.putMyModelSettings({ planning_codex_effort: "runtime" }));
     expect((err.body as { field: string }).field).toBe("planning_codex_effort");
   });

@@ -102,7 +102,7 @@ const rowName = (row: string) => document.querySelector(`[data-row="${row}"] h4`
 
 // A select truncates an option when an auto-width clone holding only that option is wider than
 // the select itself. The Codex worker effort's Runtime default option is the shared #3251 catalog
-// sentence (lib/modelSettings codexRuntimeDefaultLabel, also on Run defaults), so it is exempt here.
+// sentence (lib/modelSettings codexRuntimeDefaultLabel), so it is exempt here.
 const LONG_SHARED_OPTION = /^Runtime default · catalog default/;
 function truncatedOptions(): string[] {
   const out: string[] = [];

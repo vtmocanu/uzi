@@ -77,6 +77,11 @@ function claudeJudgeCredential(
 }
 
 export function RunDefaults() {
+  const { user } = useAuth();
+  return <RunDefaultsEditor key={user?.id} />;
+}
+
+function RunDefaultsEditor() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
   // The loaded settings: the judge summary reads the saved routing and judge model cells, and
   // harness overflow the saved default harness. The toggles below keep their own state, so
@@ -332,7 +337,13 @@ export function RunDefaults() {
       setNowSummaryEnabled(settings.now_summary_enabled ?? null);
       setClaudeUsable(hasAnthropicToken(rows));
       setCodexUsable(isCodexUsable(rows, settings.codex_account_mode));
-      return { secrets: rows.filter((s) => s.kind === "anthropic_token") };
+      const aliases = rows.filter((s) => s.kind === "codex_auth");
+      const pooled = settings.codex_account_mode === "auto" ? aliases.filter((s) => s.auto_eligible) : [];
+      const judgeAliases = pooled.length > 0 ? pooled : aliases.filter((s) => s.is_default);
+      return {
+        secrets: rows.filter((s) => s.kind === "anthropic_token"),
+        hasLinkedJudgeAlias: judgeAliases.some((s) => s.enabled !== false && s.codex_status === "linked"),
+      };
     },
     [],
     { fallback: "Failed to load settings" },
@@ -362,8 +373,12 @@ export function RunDefaults() {
   const judgeOn = judgeRunsOn === "" ? null : harnessName(judgeRunsOn);
   const claudeJudgeNotUsed = judgeRunsOn === "codex";
   const codexJudgeNotUsed = judgeRunsOn === "claude";
-  const judgeHarnessUnusable =
-    (judgeRunsOn === "claude" && !claudeUsable) || (judgeRunsOn === "codex" && !codexUsable);
+  const judgeProviderRestricted = Boolean(committedSettings?.claude_provider_id);
+  const providerRestriction = "Judge runs are skipped while a custom Claude provider is selected";
+  // Alias metadata does not expose the account state the queue-time resolver checks.
+  const hasCodexAlias = data?.hasLinkedJudgeAlias ?? false;
+  const judgeHarnessUnusable = !judgeProviderRestricted &&
+    ((judgeRunsOn === "claude" && !claudeUsable) || (judgeRunsOn === "codex" && !codexUsable && !hasCodexAlias));
   const notUsedCopy = judgeOn ? `Not used: the judge runs on ${judgeOn}` : "";
 
   // The enforced banner's model clause: the one model in play when the judge runs on a fixed
@@ -393,7 +408,7 @@ export function RunDefaults() {
     judgeLanes.push({
       harness: "claude",
       model: judgeModelSummary(claudeJudgeCell, effectiveJudgeModel),
-      credential: claudeJudgeCredential(user, secrets, pooledCount, claudeUsable),
+      credential: judgeProviderRestricted ? providerRestriction : claudeJudgeCredential(user, secrets, pooledCount, claudeUsable),
       notUsed: claudeJudgeNotUsed,
     });
   }
@@ -403,7 +418,11 @@ export function RunDefaults() {
       model: judgeModelSummary(codexJudgeCell, undefined),
       // Docs/judge.md: a Codex judge re-resolves your usable Codex credential when it is
       // queued (subscription default first); there is no separate judge-lane pick.
-      credential: codexUsable
+      credential: judgeProviderRestricted
+        ? providerRestriction
+        : hasCodexAlias
+        ? "Codex credential availability is checked when the judge is queued"
+        : codexUsable
         ? "Your usable Codex credential when the judge is queued"
         : "No usable Codex credential, so Codex judges are skipped",
       notUsed: codexJudgeNotUsed,

@@ -98,9 +98,9 @@ button saves changed fields for both harnesses.
 The empty option names the lead template tier when that supplies the run's
 effort, for example **Same as the run · high (lead template)**, matching what
 a run actually plans at.
-There is no Runtime default choice for planning effort, and
-the setting is written through `PUT /api/me/settings` (cookie-only) or that
-card; no CLI command sets it. Phases, scope and the planning model are in
+Planning effort has no Runtime default choice. Save from Models or use
+`PUT /api/me/model-settings`, which accepts `uzc_` and `uza_` tokens.
+The existing `PUT /api/me/settings` route remains cookie-only. Phases, scope and the planning model are in
 [Worker model](./worker-model.md#planning-model-and-effort).
 
 - **Any combination is allowed.** A planning effort can be set while your

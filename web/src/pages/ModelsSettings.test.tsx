@@ -341,6 +341,34 @@ describe("Models page", () => {
     expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1);
   });
 
+  it("sends an explicitly re-chosen baseline value after an unconfirmed save", async () => {
+    mockApi.putMyModelSettings.mockRejectedValueOnce(new TypeError("connection lost"));
+    mount();
+    await screen.findByLabelText("Worker model — Codex");
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText(/could not confirm whether this save was applied/);
+    select("Worker model — Codex", "inherit");
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenLastCalledWith({ default_codex_model: null }));
+  });
+
+  it("reload keeps the pending edit and adopts unrelated stored changes", async () => {
+    mockApi.putMyModelSettings.mockRejectedValueOnce(new TypeError("connection lost"));
+    mount();
+    await screen.findByLabelText("Worker model — Codex");
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText(/could not confirm whether this save was applied/);
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_effort: "low" }) });
+    fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
+    await waitFor(() => expect(control("Worker effort — Claude").value).toBe("low"));
+    await within(bar()).findByText(/previous request may still finish/);
+    expect(status()).toBe("1 unsaved change: Worker model — Codex");
+    expect(within(bar()).getByRole("button", { name: "Reload saved settings" })).toBeTruthy();
+  });
+
   it("Discard after an unconfirmed save keeps the uncertainty and Reload, without claiming the stored values", async () => {
     mockApi.putMyModelSettings.mockRejectedValueOnce(
       new ApiError(500, "the save may or may not have been applied", { reason: "settings_commit_unknown" }),

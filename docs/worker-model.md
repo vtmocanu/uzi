@@ -181,11 +181,12 @@ and the run uses one model and effort throughout, as before.
   button saves the changed Claude and Codex fields together with the rest of
   the page. The empty option reads like
   `Same as the run · <model> (<where it comes from>)`.
-- **Or through the API.** `PUT /api/me/settings` takes a planning model and a
+- **Or through the API.** `PUT /api/me/model-settings` takes a planning model and a
   planning effort per harness: `planning_claude_model`,
   `planning_claude_effort`, `planning_codex_model` and `planning_codex_effort`
   (absent leaves it unchanged, `null` clears it, a value sets it). That
-  endpoint is cookie-only; there is no CLI setter for planning settings yet. `uzi settings get` shows them (see [the CLI
+  endpoint accepts `uzc_` and `uza_` tokens. The existing `PUT /api/me/settings`
+  route is cookie-only. `uzi settings get` shows both planning lanes (see [the CLI
   reference](./cli.md#effective-settings)).
 - **Planning effort** takes `low`, `medium`, `high`, `xhigh` or `max`, with no
   runtime option; see [Reasoning effort](./worker-effort.md#planning-effort).

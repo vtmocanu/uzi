@@ -1133,6 +1133,9 @@ function stageSettingsPatch(base: UserSettings, patch: UserSettingsPatch): UserS
     if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
       throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
     }
+    if (val !== null && /\s/u.test(val)) {
+      throw new ApiError(400, "default_codex_model: model must be a single token with no spaces");
+    }
     next = { ...next, default_codex_model: val };
   }
   if (patch.default_effort !== undefined) {
@@ -2131,6 +2134,18 @@ export const settingsApi = {
       withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on),
       mockLeadTemplateEfforts(),
       { claude: userSettings.default_effort, codex: userSettings.default_codex_effort });
+    view.models = view.models.map(c => {
+      if (c.setting !== "worker_model") return c;
+      const model = c.harness === "claude" ? userSettings.default_claude_model : userSettings.default_codex_model;
+      return model ? { ...c, model, resolved_model: model, source: "user_default" } : c;
+    });
+    view.efforts = view.efforts.map(c => {
+      if (c.setting !== "worker_effort") return c;
+      const pref = c.harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+      if (!pref) return c;
+      const { effort, resolved_effort, source, mode } = mockEffortCell(c.harness, pref);
+      return { ...c, effort, resolved_effort, source: source === "user_default" ? "user_default" : "builtin", mode };
+    });
     return delay(withPlanning(view), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {

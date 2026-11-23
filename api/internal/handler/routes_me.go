@@ -306,7 +306,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// planning_codex_effort) are a deliberate new Bearer authority of the same kind as the
 	// judge lanes: no per-run planning override exists, so they are not covered by the
 	// non-additive argument. They are owner-only (the caller's own settings), and PRD #3263
-	// (modules A and D) intends them to be writable from the CLI token.
+	// (module A) makes them reachable over the CLI token through this shared route.
 	//
 	// A uza_ admin token reaches handlers with IsAdmin=true; that is irrelevant here, the
 	// handler has no admin branch and the identity is the authenticated user, never the body.

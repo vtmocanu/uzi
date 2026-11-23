@@ -177,11 +177,14 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [outcome, setOutcome] = useState<SaveOutcome | null>(null);
   // An earlier save may have committed without confirmation. Kept apart from `outcome`, which a
-  // later failed reload or failed retry replaces: only a successful save or a successful reload
+  // later failed reload or failed retry replaces: a confirmed save or a read after a completed response
   // reconciles it, so a dialog shown while a commit is unconfirmed never offers "Discard changes".
   // Discard drops the local draft but keeps this (with Reload) because it cannot know what the
   // server stored; a clean draft is not guarded by the leave dialog.
   const [uncertainty, setUncertainty] = useState<"unknown" | "saved_unreadable" | null>(null);
+  const [unconfirmedKeys, setUnconfirmedKeys] = useState<ReadonlySet<string>>(new Set());
+  const [reaffirmed, setReaffirmed] = useState<ReadonlySet<string>>(new Set());
+  const [requestMayStillFinish, setRequestMayStillFinish] = useState(false);
   const [customMode, setCustomMode] = useState<Record<string, boolean>>({});
   // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
   // (whose value never changed, so it would not re-derive) returns to its stored option.
@@ -227,21 +230,22 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     };
   }, [load]);
 
-  const dirty = useMemo(() => dirtyFields(baseline, draft), [baseline, draft]);
+  const dirty = useMemo(() => dirtyFields(baseline, draft, MODELS_FIELDS, reaffirmed), [baseline, draft, reaffirmed]);
   const dirtyKeys = useMemo(() => new Set(dirty.map((f) => f.key)), [dirty]);
   // "Other (custom model ID)" with an empty box would otherwise save as Default while the
   // picker still shows Other, so any cell in that state, dirty or not, blocks Save with its own error.
   const customEmpty = useMemo(() => new Set(emptyCustomFields(draft, customMode).map((f) => f.key)), [customMode, draft]);
   // A dirty value its own validator refuses (a Codex id in a Claude helper lane, the other
   // family's model in a checker) blocks Save on its cell, dimmed or not.
-  const localWarnings = useMemo(() => localFieldWarnings(baseline, draft), [baseline, draft]);
+  const localWarnings = useMemo(() => localFieldWarnings(baseline, draft, MODELS_FIELDS, reaffirmed), [baseline, draft, reaffirmed]);
   const blocked = useMemo(() => new Set([...customEmpty, ...Object.keys(localWarnings)]), [customEmpty, localWarnings]);
   // An UNCHANGED stored value the same validator refuses (a legacy Codex id in a Claude lane) is
   // shown on its cell as information; it never blocks Save.
-  const storedWarnings = useMemo(() => storedFieldWarnings(baseline, draft), [baseline, draft]);
+  const storedWarnings = useMemo(() => storedFieldWarnings(baseline, draft, MODELS_FIELDS, reaffirmed), [baseline, draft, reaffirmed]);
 
   const setValue = (key: string, value: string) => {
     setDraft((d) => ({ ...d, [key]: value }));
+    if (unconfirmedKeys.has(key)) setReaffirmed((keys) => new Set([...keys, key]));
     setFieldErrors((errs) => {
       if (!(key in errs)) return errs;
       const next = { ...errs };
@@ -253,9 +257,10 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
   // Discard drops the local draft only. After an uncertain save it does not reconcile what the
   // server stored, so the uncertainty and its alert (with Reload saved settings) stay until a
-  // successful save or reload.
+  // confirmed save or a reload that is safe to reconcile.
   const discard = useCallback(() => {
     setDraft(baseline);
+    setReaffirmed(new Set());
     setFieldErrors({});
     setOutcome(uncertainty ? { kind: "discarded_unconfirmed" } : null);
     setPickerGeneration((g) => g + 1);
@@ -269,8 +274,9 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     setSaving(true);
     setOutcome(null);
     setFieldErrors({});
+    const rememberUnconfirmed = () => setUnconfirmedKeys((keys) => new Set([...keys, ...dirtyKeys]));
     try {
-      const res = await api.putMyModelSettings(buildModelsPatch(baseline, draft));
+      const res = await api.putMyModelSettings(buildModelsPatch(baseline, draft, MODELS_FIELDS, reaffirmed));
       if (!isCurrent(seq)) return;
       // The canonical post-commit settings become the clean baseline AND the draft.
       const values = baselineFromSettings(res.settings);
@@ -278,6 +284,9 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       setBaseline(values);
       setDraft(values);
       setUncertainty(null);
+      setUnconfirmedKeys(new Set());
+      setReaffirmed(new Set());
+      setRequestMayStillFinish(false);
       setOutcome(res.effective ? { kind: "saved", count } : { kind: "saved_no_prediction" });
     } catch (err) {
       if (!isCurrent(seq)) return;
@@ -289,17 +298,21 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       } else if (modelSettingsFailureReason(err) === "settings_commit_unknown") {
         setOutcome({ kind: "unknown" });
         setUncertainty("unknown");
+        rememberUnconfirmed();
       } else if (modelSettingsFailureReason(err) === "settings_saved_readback_failed") {
         setOutcome({ kind: "saved_unreadable" });
         setUncertainty((u) => u ?? "saved_unreadable");
+        rememberUnconfirmed();
       } else if (err instanceof ApiError && err.status <= 500) {
         // The handler answers a plain 500 only for a failure before commit (rolled back),
         // and other 4xx before writing anything.
         setOutcome({ kind: "not_saved", message: err.message });
       } else {
-        // A network failure or a gateway error: the request may have reached the server.
+        // A network failure or a gateway error can arrive before the server finishes.
         setOutcome({ kind: "unknown" });
         setUncertainty("unknown");
+        setRequestMayStillFinish(true);
+        rememberUnconfirmed();
       }
     } finally {
       // Cleared whenever still mounted, even if a newer request token was issued meanwhile
@@ -318,18 +331,26 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       const next = await fetchSaved();
       if (!isCurrent(seq)) return;
       const values = baselineFromSettings(next.settings);
-      // A clean draft (nothing edited, or edits discarded) adopts the stored values too, so a
-      // committed save never reappears as a pending "revert" edit.
-      const clean = dirtyFields(baseline, draft).length === 0;
+      // Keep only edits the viewer made against the previous baseline. Every
+      // other field follows the fresh server value.
+      const nextDraft = { ...values };
+      for (const { key } of dirty) nextDraft[key] = draft[key];
       setLoaded(next);
       setBaseline(values);
-      if (clean) {
-        setDraft(values);
-        setPickerGeneration((g) => g + 1);
-      }
+      setDraft(nextDraft);
+      if (dirty.length === 0) setPickerGeneration((g) => g + 1);
       setFieldErrors({});
-      setUncertainty(null);
-      setOutcome(clean ? { kind: "reloaded", stillDirty: 0, adopted: true } : { kind: "reloaded", stillDirty: dirtyFields(values, draft).length });
+      if (!requestMayStillFinish) {
+        setUncertainty(null);
+        setUnconfirmedKeys(new Set());
+        setReaffirmed(new Set());
+      }
+      setOutcome({
+        kind: "reloaded",
+        adopted: dirty.length === 0,
+        stillDirty: dirtyFields(values, nextDraft, MODELS_FIELDS, requestMayStillFinish ? reaffirmed : undefined).length,
+        requestMayStillFinish,
+      });
     } catch (err) {
       if (isCurrent(seq)) setOutcome({ kind: "reload_failed", message: errorMessage(err, "request failed") });
     } finally {
@@ -535,8 +556,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         dirtyCount={dirty.length}
         saving={saving}
         // The PUT may have committed: leaving must not read as a discard (PRD: explain the
-        // uncertainty, never claim a rollback). Cleared only by a successful save or a successful
-        // reload.
+        // uncertainty, never claim a rollback). A reload after a lost response may still
+        // predate the earlier write.
         saveUncertainty={uncertainty}
         viewerId={viewerId}
         onDiscard={discard}

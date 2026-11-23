@@ -12,7 +12,7 @@ export type SaveOutcome =
   | { kind: "not_saved"; message: string }
   | { kind: "unknown" }
   | { kind: "saved_unreadable" }
-  | { kind: "reloaded"; stillDirty: number; adopted?: boolean }
+  | { kind: "reloaded"; stillDirty: number; adopted?: boolean; requestMayStillFinish?: boolean }
   | { kind: "reload_failed"; message: string }
   | { kind: "discarded_unconfirmed" };
 
@@ -20,15 +20,16 @@ function plural(n: number, one: string, many: string): string {
   return n === 1 ? `1 ${one}` : `${n} ${many}`;
 }
 
-function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
+function OutcomeAlert({ outcome, onReload, busy, reloading, uncertain }: {
   outcome: SaveOutcome;
   onReload: () => void;
+  busy: boolean;
   reloading: boolean;
   /** An earlier save is still unconfirmed: keep Reload reachable even after a failed retry. */
   uncertain: boolean;
 }) {
   const reload = (
-    <Button type="button" variant="secondary" size="sm" disabled={reloading} onClick={onReload}>
+    <Button type="button" variant="secondary" size="sm" disabled={busy} onClick={onReload}>
       {reloading ? "Reloading…" : "Reload saved settings"}
     </Button>
   );
@@ -84,6 +85,9 @@ function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
         />,
       );
     case "reloaded":
+      if (outcome.requestMayStillFinish) {
+        return withReload(<Alert tone="warning" message="Reloaded the saved settings. The previous request may still finish, so these values are a snapshot." />);
+      }
       return (
         <Alert
           tone="info"
@@ -145,7 +149,7 @@ export function ModelsSaveBar({
         count > 0 ? "border-brand/50" : "border-edge",
       )}
     >
-      {outcome && <OutcomeAlert outcome={outcome} onReload={onReload} reloading={reloading} uncertain={uncertain} />}
+      {outcome && <OutcomeAlert outcome={outcome} onReload={onReload} busy={busy} reloading={reloading} uncertain={uncertain} />}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
         <p role="status" aria-live="polite" data-testid="models-save-status" className="min-w-0 text-sm sm:flex-1">
           {saving ? (

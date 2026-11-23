@@ -288,3 +288,8 @@ describe("emptyCustomFields", () => {
     expect(emptyCustomFields(draft, {})).toEqual([]);
   });
 });
+
+it("flags a raw format character that JavaScript trim would drop", () => {
+  expect(localFieldWarnings({ default_codex_model: "" }, { default_codex_model: "\uFEFF" }))
+    .toHaveProperty("default_codex_model", expect.stringContaining("format character"));
+});

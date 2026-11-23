@@ -153,6 +153,7 @@ export const MODELS_FIELDS: readonly ModelsField[] = [
  *  Pass the field to use its own normalization (a checker pin's Unicode trim). */
 export function normalizeValue(value: string | null | undefined, field?: ModelsField): string {
   const v = value ?? "";
+  if (field?.kind === "model" && "scalar" in field.target && /\p{Cf}/u.test(v)) return v;
   return field?.normalize ? field.normalize(v) : v.trim();
 }
 
@@ -170,18 +171,20 @@ export function baselineFromSettings(settings: UserSettings, fields: readonly Mo
 }
 
 /** dirtyFields lists, in field order, every field whose draft differs semantically from the baseline. */
-export function dirtyFields(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): ModelsField[] {
-  return fields.filter((f) => normalizeValue(draft[f.key], f) !== normalizeValue(baseline[f.key], f));
+export function dirtyFields(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS, reaffirmed?: ReadonlySet<string>): ModelsField[] {
+  return fields.filter((f) => reaffirmed?.has(f.key) || normalizeValue(draft[f.key], f) !== normalizeValue(baseline[f.key], f));
 }
 
 /** localFieldWarnings maps each DIRTY field whose value its own validator refuses to that
  *  warning. A stored value is never blocked here (storedFieldWarnings reports it). Dimmed cells are
  *  validated like any other. */
-export function localFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): Record<string, string> {
+export function localFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS, reaffirmed?: ReadonlySet<string>): Record<string, string> {
   const warnings: Record<string, string> = {};
-  for (const f of dirtyFields(baseline, draft, fields)) {
+  for (const f of dirtyFields(baseline, draft, fields, reaffirmed)) {
     const value = normalizeValue(draft[f.key], f);
-    const warning = value === "" || !f.validate ? "" : f.validate(draft[f.key] ?? "");
+    const warning = f.kind === "model" && "scalar" in f.target && /\p{Cf}/u.test(value)
+      ? "Model contains a format character; remove it before saving."
+      : value === "" || !f.validate ? "" : f.validate(draft[f.key] ?? "");
     if (warning) warnings[f.key] = warning;
   }
   return warnings;
@@ -191,8 +194,8 @@ export function localFieldWarnings(baseline: ModelsValues, draft: ModelsValues, 
  *  (a legacy Codex id in a Claude helper lane, the other family's model in a checker pin) to
  *  that warning, prefixed so it reads as a fact about what is saved. It is informational: it
  *  never blocks Save, since the user did not make that value and may be saving something else. */
-export function storedFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): Record<string, string> {
-  const dirty = new Set(dirtyFields(baseline, draft, fields).map((f) => f.key));
+export function storedFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS, reaffirmed?: ReadonlySet<string>): Record<string, string> {
+  const dirty = new Set(dirtyFields(baseline, draft, fields, reaffirmed).map((f) => f.key));
   const warnings: Record<string, string> = {};
   for (const f of fields) {
     if (dirty.has(f.key) || !f.validate) continue;
@@ -212,10 +215,10 @@ export function emptyCustomFields(draft: ModelsValues, customMode: Readonly<Reco
 
 /** buildModelsPatch is the one save body: only dirty fields, trimmed, Default as null. Pin
  *  members of one stage/harness cell share one cross_check_pins entry, in field order. */
-export function buildModelsPatch(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): ModelSettingsPatch {
+export function buildModelsPatch(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS, reaffirmed?: ReadonlySet<string>): ModelSettingsPatch {
   const patch: ModelSettingsPatch = {};
   const pins: ModelSettingsPinPatch[] = [];
-  for (const f of dirtyFields(baseline, draft, fields)) {
+  for (const f of dirtyFields(baseline, draft, fields, reaffirmed)) {
     const value = normalizeValue(draft[f.key], f) || null;
     if ("scalar" in f.target) {
       patch[f.target.scalar] = value;

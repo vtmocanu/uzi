@@ -25,8 +25,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   };
 });
 
-import App from "../App";
-import { AuthProvider } from "../auth/AuthContext";
+import { appRoutes } from "../appRoutes";
 import { mockApi } from "../mocks/mockApi";
 import { failNextMockModelSettingsWrite } from "../mocks/mockApi/settings";
 
@@ -47,7 +46,7 @@ let observer: MutationObserver | null = null;
 
 function mountApp(path = "/settings/models") {
   const router = createMemoryRouter(
-    [{ path: "*", element: <AuthProvider><App /></AuthProvider> }],
+    appRoutes,
     { initialEntries: ["/schedules", path], initialIndex: 1 },
   );
   render(<RouterProvider router={router} />);
@@ -507,4 +506,15 @@ describe("unsaved-changes guard", () => {
     expect(screen.queryByLabelText("Worker model — Codex")).toBeNull();
     expect(dialogSeen).toBe(false);
   }, 30000);
+});
+
+it("renders the production root error element for an unexpected route error", async () => {
+  const router = createMemoryRouter(
+    [{ ...appRoutes[0], loader: () => { throw new Error("route fixture failed"); } }],
+    { initialEntries: ["/settings/models"] },
+  );
+  render(<RouterProvider router={router} />);
+  expect(await screen.findByRole("heading", { name: "Something went wrong" })).toBeTruthy();
+  expect(screen.getByRole("alert").textContent).toContain("route fixture failed");
+  expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
 });
