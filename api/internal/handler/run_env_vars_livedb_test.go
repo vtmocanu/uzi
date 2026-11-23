@@ -407,9 +407,10 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 // deleted, but never enabled or edited (PRD #4416).
 func TestRunEnvDeniedNameDisableDeleteLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
-	f.put("LEGACY_TMP", jsonBody(map[string]any{"value": "https://legacy.example.test", "secret": false}), http.StatusCreated)
-	// Rename the stored row to an already-denied name, bypassing PUT validation.
-	cliMustExec(t, f.pool, `UPDATE run_env_vars SET name='TMPDIR' WHERE repo_id=$1 AND name='LEGACY_TMP'`, f.repo)
+	// Store a row under an already-denied name, bypassing PUT validation. A direct insert, not a
+	// rename: a variable's identity (owner, repo, scope, name) cannot change on this branch.
+	cliMustExec(t, f.pool, `INSERT INTO run_env_vars (var_id,user_id,repo_id,name,secret,ciphertext,sealed_with,value_bytes,rev)
+ VALUES ($1,$2,$3,'TMPDIR',false,'\x01','master_aad',1,1)`, uuid.New(), f.owner, f.repo)
 
 	f.must(f.do(http.MethodPost, "/TMPDIR/disable", ""), http.StatusOK)
 	if n := f.rowCount("name='TMPDIR' AND disabled_at IS NOT NULL AND retired_at IS NULL"); n != 1 {

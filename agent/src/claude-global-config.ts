@@ -28,7 +28,7 @@
 // stat of the file then fails and its resolver falls back to `.claude.json`. Under the split the
 // image's busybox `rm -f` exits non-zero on ENOTDIR, so that state refuses the start (fail closed).
 // The `.claude<oauth suffix>.json` variants are chosen only with CLAUDE_CODE_CUSTOM_OAUTH_URL,
-// and the run-env `CLAUDE_` prefix is denied (run-env-names.ts), so they are out of scope.
+// and the repo-variable name rules deny the `CLAUDE_` prefix, so they are out of scope.
 //
 // Mode. 0660 with the group the HOME hands down (runner for run and chat HOMEs; job HOMEs
 // differ; there is no setgid on single-uid). The CLI saves its config in place (open O_WRONLY,

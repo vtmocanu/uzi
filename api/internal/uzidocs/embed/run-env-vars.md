@@ -296,13 +296,14 @@ denied:
   provider selector whose leading underscore escapes the `CLAUDE_` prefix).
 - Telemetry switches the Claude CLI reads outside the denied prefixes:
   `ENABLE_BETA_TRACING_DETAILED`, `ENABLE_ENHANCED_TELEMETRY_BETA`,
-  `BETA_TRACING_ENDPOINT`. Other `OTEL_*` names are allowed for your own
-  application for now: the CLI starts no third-party OpenTelemetry exporter
-  unless `CLAUDE_CODE_ENABLE_TELEMETRY` (denied by the `CLAUDE_` prefix) or the
-  beta tracing pair above is set, and the worker never sets them. One exception:
-  `OTEL_LOG_RAW_API_BODIES=file:<dir>` makes the CLI write raw API request and
-  response bodies to that directory, so the `OTEL_LOG_` and `OTEL_EXPORTER_OTLP_`
-  prefixes are denied (above).
+  `BETA_TRACING_ENDPOINT`. `OTEL_*` names outside the denied `OTEL_LOG_` and
+  `OTEL_EXPORTER_OTLP_` prefixes are allowed for your own application: the CLI
+  starts no third-party OpenTelemetry exporter unless
+  `CLAUDE_CODE_ENABLE_TELEMETRY` (denied by the `CLAUDE_` prefix) or the beta
+  tracing pair above is set, and the worker never sets them. `OTEL_LOG_` is
+  denied because `OTEL_LOG_RAW_API_BODIES=file:<dir>` makes the CLI write raw
+  API request and response bodies to that directory; `OTEL_EXPORTER_OTLP_` is
+  denied as exporter endpoint and header wiring.
 - Managed directories the sandbox reads: `TEMP`, `TMP`, `SYSTEMDRIVE`. These
   are the uppercase spellings of Windows variables (the Windows environment
   lookup is case-insensitive); API names stay uppercase-only, so the mixed-case

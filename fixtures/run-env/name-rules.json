@@ -2514,7 +2514,7 @@
       "name": "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
       "harness": "claude",
       "decision": "denied",
-      "reason": "provider selector outside the denied prefixes (its leading underscore escapes CLAUDE_): makes the Claude CLI treat the worker-set ANTHROPIC_BASE_URL gateway as the first-party Anthropic API; denied under the provider-selection invariant (#4611)"
+      "reason": "provider selector whose leading underscore escapes CLAUDE_ (it is also covered by the _CLAUDE_ prefix): makes the Claude CLI treat the worker-set ANTHROPIC_BASE_URL gateway as the first-party Anthropic API; denied under the provider-selection invariant (#4611)"
     },
     {
       "name": "TSC_NONPOLLING_WATCHER",
