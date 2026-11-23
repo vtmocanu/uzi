@@ -286,7 +286,22 @@ func TestListRunsWeeklyLimitSummaryOwnerOnly(t *testing.T) {
 		{Run: parked, PriorityClass: "normal"}, {Run: fiveHour, PriorityClass: "normal"},
 	}}
 	h := wlRunsHandler(t, rs)
-	h.SetWeeklyLimit(wlLoader(t, newWLStore("spare", owner.ID)))
+	// The default margin (15): with margin 0 the summary drops to notice
+	// (TestWeeklyLimitMarginZeroDropsParkedOverviewDecision). Token A reads 50%, below
+	// the warning line, so only the seven_day park carries a block: a five_hour park on a
+	// near-limit token may carry an independent weekly warning, not a park explanation.
+	s := nearStoreFor(owner.ID, 15)
+	for i := range s.cands {
+		if s.cands[i].UserSecretID == wlTokA {
+			s.cands[i].SevenDayPct.Int16 = 50
+		}
+	}
+	for i := range s.tokens {
+		if s.tokens[i].UserSecretID == wlTokA {
+			s.tokens[i].SevenDayPct.Int16 = 50
+		}
+	}
+	h.SetWeeklyLimit(wlLoader(t, s))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/runs?view=summary", nil)
 	req = req.WithContext(mw.ContextWithUser(req.Context(), owner))
