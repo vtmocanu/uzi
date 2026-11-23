@@ -449,6 +449,24 @@ describe("Models page", () => {
       expectStanding();
     });
 
+    it("a successful retry keeps the lost request's keys: re-choosing the saved value is sent again", async () => {
+      await loseResponse();
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      fireEvent.click(saveButton());
+      await within(bar()).findByText("Saved 1 change.");
+      expect(status()).toBe("No unsaved changes");
+      // The lost request may still overwrite this key, so an explicit re-choice of the value
+      // the retry stored counts as a change and is sent again.
+      select("Worker model — Codex", "inherit");
+      select("Worker model — Codex", "gpt-6-sol");
+      expect(status()).toBe("1 unsaved change: Worker model — Codex");
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenLastCalledWith({ default_codex_model: "gpt-6-sol" }));
+      await within(bar()).findByText("Saved 1 change.");
+      expectStanding();
+    });
+
     it("a failed Reload", async () => {
       await loseResponse();
       mockApi.getMySettings.mockRejectedValueOnce(new Error("offline"));
