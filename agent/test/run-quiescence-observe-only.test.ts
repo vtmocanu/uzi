@@ -234,6 +234,127 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
     }
   });
 
+  describe("inventory signalling scans through quiesceRunAttempt (helperDeadline + deadlineAt)", () => {
+    const PID = 84;
+    const START = 5151;
+    const other = (roots: () => Array<{ pid: number; startTime: number }>) =>
+      newRunAttempt("run-18", 1, "/data/runner/github.com+o+r/issue-18", roots);
+    const plantUnreadable = (): void =>
+      plantFakeProc(root, PID, { uid: ME, comm: "ssh-agent", env: "unreadable", cwd: "/", startTime: START });
+    const killSpy = (killed: number[]) => (pid: number): void => {
+      killed.push(pid);
+      fs.rmSync(path.join(root, String(pid)), { recursive: true, force: true });
+    };
+    async function withUidSplit<T>(fn: () => Promise<T>): Promise<T> {
+      const previous = process.env.UZI_UID_SPLIT;
+      process.env.UZI_UID_SPLIT = "1";
+      try { return await fn(); } finally {
+        if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+        else process.env.UZI_UID_SPLIT = previous;
+      }
+    }
+
+    it("A: an unattributed unreadable pid is killed as unreadable_no_other_claim (in-process lane, uid split, no other claim)", async () => {
+      plantUnreadable();
+      const killed: number[] = [];
+      const out = await withUidSplit(() => quiesceRunAttempt({
+        mode: "own", attempt: undefined, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry: new LiveAttemptRegistry(), otherClaimInFlight: false,
+        helperDeadline: true, deadlineAt: Date.now() + 30_000,
+      }, { targetUid: ME, reap: { viaHelper: false, kill: killSpy(killed), intervalMs: 10 } }));
+      assert.deepEqual(killed, [PID]);
+      assert.equal(fs.existsSync(path.join(root, String(PID))), false, "the unreadable pid was signalled");
+      assert.equal(out.process?.state, "quiescent", JSON.stringify(out.process));
+      assert.deepEqual(out.process?.killed, [PID]);
+    });
+
+    it("A control: the same scan observeOnly (no helperDeadline) kills nothing and stays unverified / not_clear", async () => {
+      plantUnreadable();
+      const killed: number[] = [];
+      const out = await withUidSplit(() => quiesceRunAttempt({
+        mode: "own", attempt: undefined, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry: new LiveAttemptRegistry(), otherClaimInFlight: false,
+        observeOnly: true, deadlineAt: Date.now() + 30_000,
+      }, { targetUid: ME, reap: { viaHelper: false, kill: killSpy(killed), intervalMs: 10 } }));
+      assert.deepEqual(killed, []);
+      assert.equal(fs.existsSync(path.join(root, String(PID))), true);
+      assert.equal(out.process?.state, "unverified", JSON.stringify(out.process));
+      assert.equal(out.process?.processes.some((p) => p.reason === "unreadable_unattributed"), true, JSON.stringify(out.process?.processes));
+      assert.equal(inventoryClearVerdict(out.process), "not_clear");
+    });
+
+    it("B (in-process): a late recorded root of another live attempt is re-proved and attributes the unreadable pid; nothing is killed", async () => {
+      plantUnreadable();
+      const killed: number[] = [];
+      let calls = 0;
+      const peer = other(() => (++calls >= 2 ? [{ pid: PID, startTime: START }] : []));
+      const registry = new LiveAttemptRegistry();
+      registry.add(own);
+      registry.add(peer);
+      const out = await quiesceRunAttempt({
+        mode: "own", attempt: own, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry, otherClaimInFlight: false,
+        helperDeadline: true, deadlineAt: Date.now() + 30_000,
+      }, { targetUid: ME, reap: { viaHelper: false, kill: killSpy(killed), intervalMs: 10 } });
+      assert.ok(calls >= 2, `recordedRootPids re-read for the re-proof (${calls} calls)`);
+      assert.deepEqual(killed, []);
+      assert.equal(fs.existsSync(path.join(root, String(PID))), true);
+      assert.equal(out.process?.state, "quiescent", JSON.stringify(out.process));
+      assert.equal(out.process?.rootReproof, "quiescent");
+      assert.equal(inventoryClearVerdict(out.process), "clear");
+    });
+
+    it("B control (in-process): without a late root the same pid stays unverified, unreadable_unattributed, never killed", async () => {
+      plantUnreadable();
+      const killed: number[] = [];
+      let calls = 0;
+      const peer = other(() => { calls += 1; return []; });
+      const registry = new LiveAttemptRegistry();
+      registry.add(own);
+      registry.add(peer);
+      const out = await quiesceRunAttempt({
+        mode: "own", attempt: own, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry, otherClaimInFlight: false,
+        helperDeadline: true, deadlineAt: Date.now() + 30_000,
+      }, { targetUid: ME, reap: { viaHelper: false, kill: killSpy(killed), intervalMs: 10, deadlineMs: 300 } });
+      assert.deepEqual(killed, []);
+      assert.equal(out.process?.state, "unverified", JSON.stringify(out.process));
+      assert.equal(out.process?.processes.some((p) => p.pid === PID && p.reason === "unreadable_unattributed"), true, JSON.stringify(out.process?.processes));
+      assert.equal(inventoryClearVerdict(out.process), "not_clear");
+      assert.ok(calls >= 1);
+    });
+
+    it("B (helper lane): the late-root retry is a second helper request whose deadline never exceeds the original", async () => {
+      plantUnreadable();
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-obs-"));
+      try {
+        const record = path.join(tmp, "request.json");
+        let calls = 0;
+        const peer = other(() => (++calls >= 2 ? [{ pid: PID, startTime: START }] : []));
+        const registry = new LiveAttemptRegistry();
+        registry.add(own);
+        registry.add(peer);
+        const deadlineAt = Date.now() + 30_000;
+        const out = await quiesceRunAttempt({
+          mode: "own", attempt: own, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+          dockerHost: undefined, registry, forceHelper: true, helperDeadline: true, deadlineAt,
+        }, { reap: { spawnHelper: rewrapSpawn({}, record) } });
+        assert.ok(calls >= 2, `recordedRootPids re-read after the first helper proof (${calls} calls)`);
+        assert.equal(out.process?.state, "quiescent", JSON.stringify(out.process));
+        assert.equal(out.process?.rootReproof, "quiescent");
+        assert.deepEqual(out.process?.killed ?? [], []);
+        // The record file holds the LAST request (the retry): it carries the unattributed-kill refusal and a bounded deadline.
+        const sent = JSON.parse(fs.readFileSync(record, "utf8")) as ScanRequest;
+        assert.equal(sent.mayKillUnreadableUnattributed, false);
+        assert.equal(sent.liveRoots.some((r) => r.pid === PID && r.startTime === START), true, JSON.stringify(sent.liveRoots));
+        assert.equal(typeof sent.deadlineAt, "number");
+        assert.ok((sent.deadlineAt as number) <= deadlineAt, "the retry deadline never exceeds the original");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("an opted-in (helperDeadline, the inventory shape) non-observe scan serializes the deadline but not observeOnly", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-obs-"));
     try {
