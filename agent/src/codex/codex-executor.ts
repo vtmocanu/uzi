@@ -146,7 +146,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor, redactStrings } from "../redact.js";
-import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexProviderBinding, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -7407,7 +7407,7 @@ export class CodexExecutor implements Executor {
    *  must have its own map key; every uzi-selected model (the owner's planning default, user default,
    *  template, built-in) uses its own key when the map has one and the `default` slot otherwise. The source
    *  is the one the phase's request carries, so a planning model is judged by its own source. */
-  private providerSlotFor(ctx: RunContext, phase: "plan" | "implement", request = this.leadRequestFor(ctx, phase)): keyof import("../protocol.js").ClaimCodexProviderBinding["model_map"] | undefined {
+  private providerSlotFor(ctx: RunContext, phase: "plan" | "implement", request = this.leadRequestFor(ctx, phase)): keyof ClaimCodexProviderBinding["model_map"] | undefined {
     const binding = this.opts.binding;
     if (binding.authMode !== "provider") return undefined;
     return resolveCodexProviderModelSlot(request.model, binding.providerBinding.model_map,

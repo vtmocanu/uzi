@@ -208,7 +208,7 @@ const HOLDS: Record<string, string[]> = {
     'provider: codex.binding.authMode === "provider" ? codex.binding.providerBinding : undefined,'],
   "runner.ts": ['codexBound = selectCodexExecutionAuthority(claim.secrets).kind === "codex";'],
   "claude-advice-harness.ts": ['const tracker = new AdviceUsageTracker(credential.kind === "provider");'],
-  "sdk-env.ts": ['ANTHROPIC_BASE_URL: credential.baseUrl,', 'ANTHROPIC_API_KEY: credential.authStyle === "x_api_key" ? credential.key : undefined,', 'ANTHROPIC_AUTH_TOKEN: credential.authStyle === "bearer" ? credential.key : undefined,'], 
+  "sdk-env.ts": ['ANTHROPIC_BASE_URL: credential.baseUrl,', 'ANTHROPIC_API_KEY: credential.authStyle === "x_api_key" ? credential.key : undefined,', 'ANTHROPIC_AUTH_TOKEN: credential.authStyle === "bearer" ? credential.key : undefined,'],
 };
 
 function offenders(sources: Map<string, string>): string[] {
