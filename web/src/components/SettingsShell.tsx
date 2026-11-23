@@ -1,5 +1,5 @@
 // SettingsShell: one header + tab bar shared by the user-scoped settings
-// surfaces (Account & tokens, Run defaults, Forge, Access, Memory). Kills the old
+// surfaces (Account & tokens, Appearance, Models, Run defaults, Forge, Access, Memory). Kills the old
 // discoverability problem where the /settings/* pages were URL siblings wired
 // together only by hand-placed corner links — the drift a unified layout
 // header exists to prevent.
@@ -17,6 +17,7 @@ import { PinnedBlock, TabRow, tabClass } from "./TabRow";
 export const TABS = [
   { to: "/settings", label: "Account & tokens", end: true },
   { to: "/settings/appearance", label: "Appearance", end: false },
+  { to: "/settings/models", label: "Models", end: false },
   { to: "/settings/run-defaults", label: "Run defaults", end: false },
   { to: "/settings/forge", label: "Forge", end: false },
   { to: "/settings/access", label: "Access", end: false },

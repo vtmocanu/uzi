@@ -62,6 +62,16 @@ describe("SettingsShell tabs", () => {
     expect(current("Account & tokens")).toBeNull();
   });
 
+  // PRD #3263: Models sits between Appearance and Run defaults and lights on its own route.
+  it("puts Models between Appearance and Run defaults and lights it on /settings/models", () => {
+    renderAt("/settings/models");
+    const labels = screen.getAllByRole("link").map((a) => a.textContent);
+    expect(labels.slice(1, 4)).toEqual(["Appearance", "Models", "Run defaults"]);
+    expect(current("Models")).toBe("page");
+    expect(current("Run defaults")).toBeNull();
+    expect(current("Account & tokens")).toBeNull();
+  });
+
   // Issue #204: at 390px a five-tab strip overflows (measured scrollWidth 401 vs
   // clientWidth 390 on the original five) and used to scroll the whole page body
   // sideways. jsdom has no layout engine, so this asserts the class contract that
@@ -75,7 +85,7 @@ describe("SettingsShell tabs", () => {
     // The underline still spans the row, drawn as an inset line (#4419) so the row box
     // never overflows by a pixel and grows a vertical scrollbar.
     expect(row.className).toContain("shadow-[inset_0_-1px_0_rgb(var(--edge))]");
-    for (const name of ["Account & tokens", "Appearance", "Run defaults", "Forge", "Access", "Memory"]) {
+    for (const name of ["Account & tokens", "Appearance", "Models", "Run defaults", "Forge", "Access", "Memory"]) {
       const tab = screen.getByRole("link", { name });
       expect(tab.className).toMatch(/\bshrink-0\b/);
       expect(tab.className).toContain("whitespace-nowrap");

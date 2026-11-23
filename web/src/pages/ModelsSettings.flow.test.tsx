@@ -1,0 +1,269 @@
+// @vitest-environment jsdom
+//
+// PRD #3263 M1, end to end in jsdom: the REAL App (AppShell, sidebar, command menu, route
+// guards, AuthProvider) in a memory DATA router, as main.tsx mounts it, against the stateful
+// mockApi. Covers the settings flow (save, navigate away and back, invalid cell, injected write
+// failure) and the unsaved-changes guard (tab, sidebar, command menu, back/forward, logout, a
+// 401) plus the beforeunload listener lifecycle. Waits are event-driven only.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { createMemoryRouter, RouterProvider } from "react-router-dom";
+
+// The unauthorized handler AuthProvider registers, captured so a test can deliver a 401.
+const captured = vi.hoisted(() => ({ onUnauthorized: null as null | (() => void) }));
+
+vi.mock("../lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    MOCK_MODE: true,
+    api: (await import("../mocks/mockApi")).mockApi,
+    setUnauthorizedHandler: (handler: (() => void) | null) => {
+      captured.onUnauthorized = handler;
+      actual.setUnauthorizedHandler(handler);
+    },
+  };
+});
+
+import App from "../App";
+import { AuthProvider } from "../auth/AuthContext";
+import { mockApi } from "../mocks/mockApi";
+import { failNextMockModelSettingsWrite } from "../mocks/mockApi/settings";
+
+const DIALOG = "You have unsaved model changes";
+const RESET = {
+  default_harness: null, default_claude_model: null, default_codex_model: null, default_effort: null,
+  default_codex_effort: null, planning_claude_model: null, planning_claude_effort: null,
+  planning_codex_model: null, planning_codex_effort: null,
+};
+
+// Records whether the guard dialog EVER appeared, so "no dialog" also means "no flash".
+let dialogSeen = false;
+let observer: MutationObserver | null = null;
+
+function mountApp(path = "/settings/models") {
+  const router = createMemoryRouter(
+    [{ path: "*", element: <AuthProvider><App /></AuthProvider> }],
+    { initialEntries: ["/schedules", path], initialIndex: 1 },
+  );
+  render(<RouterProvider router={router} />);
+  return router;
+}
+
+const control = (name: string) => screen.getByLabelText(name) as HTMLSelectElement;
+const select = (name: string, value: string) => fireEvent.change(control(name), { target: { value } });
+const bar = () => screen.getByTestId("models-save-bar");
+const status = () => screen.getByTestId("models-save-status").textContent ?? "";
+const path = (router: ReturnType<typeof mountApp>) => router.state.location.pathname;
+const dialog = () => screen.queryByRole("dialog", { name: DIALOG });
+
+async function openModels(path?: string) {
+  const router = mountApp(path);
+  await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+  return router;
+}
+
+beforeEach(async () => {
+  localStorage.clear();
+  await mockApi.login("vlad@uzi.local", "x");
+  await mockApi.putMyModelSettings(RESET);
+  dialogSeen = false;
+  observer = new MutationObserver(() => {
+    if (document.querySelector(`[aria-label="${DIALOG}"]`)) dialogSeen = true;
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+});
+afterEach(() => {
+  observer?.disconnect();
+  cleanup();
+  failNextMockModelSettingsWrite(null);
+  vi.restoreAllMocks();
+});
+
+describe("Models settings flow (stateful mock)", () => {
+  it("saves several cells, clears dirty to the returned values, and reloads the same values after leaving", async () => {
+    const router = await openModels();
+    select("Default harness", "codex");
+    select("Worker model — Codex", "gpt-6-sol");
+    select("Planning effort — Claude", "high");
+    select("Worker effort — Claude", "runtime");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText("Saved 4 changes. Your next runs use them.", {}, { timeout: 5000 });
+    expect(status()).toBe("No unsaved changes");
+    expect((await mockApi.getMySettings()).settings).toMatchObject({
+      default_harness: "codex", default_codex_model: "gpt-6-sol", planning_claude_effort: "high", default_effort: "runtime",
+    });
+
+    // Clean, so leaving does not prompt; coming back loads the stored values.
+    await act(() => router.navigate("/settings/appearance"));
+    expect(path(router)).toBe("/settings/appearance");
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+    expect(control("Default harness").value).toBe("codex");
+    expect(control("Worker model — Codex").value).toBe("gpt-6-sol");
+    expect(control("Planning effort — Claude").value).toBe("high");
+    expect(control("Worker effort — Claude").value).toBe("runtime");
+    expect(dialogSeen).toBe(false);
+  }, 30000);
+
+  it("an invalid cell saves nothing: the error is on its row and every field reloads at its saved value", async () => {
+    await mockApi.putMyModelSettings({ default_codex_effort: "low" });
+    const router = await openModels();
+    select("Worker effort — Codex", "max");
+    select("Worker model — Claude", "custom");
+    fireEvent.change(screen.getByLabelText("Worker model — Claude, custom model ID"), { target: { value: "gpt-6-sol" } });
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByRole("alert", {}, { timeout: 5000 });
+    const claude = control("Worker model — Claude");
+    const errorId = (claude.getAttribute("aria-describedby") ?? "").split(" ").find((id) => id.endsWith("-error"))!;
+    expect(document.getElementById(errorId)?.textContent).toContain("default_claude_model");
+    expect(control("Worker effort — Codex").getAttribute("aria-describedby")).not.toContain("-error");
+    expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_effort: "low", default_claude_model: null });
+
+    // Leave (discarding the draft) and come back: everything is at the previous saved values.
+    await act(() => router.navigate("/settings/appearance"));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+    expect(control("Worker effort — Codex").value).toBe("low");
+    expect(control("Worker model — Claude").value).toBe("inherit");
+  }, 30000);
+
+  it("an injected write failure leaves every field at its saved value and keeps the draft", async () => {
+    const router = await openModels();
+    select("Default harness", "claude");
+    select("Planning model — Codex", "gpt-6-astra");
+    failNextMockModelSettingsWrite("write_failed");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/The save failed and nothing was changed/, {}, { timeout: 5000 });
+    expect(control("Planning model — Codex").value).toBe("gpt-6-astra");
+    expect((await mockApi.getMySettings()).settings).toMatchObject({ default_harness: null, planning_codex_model: null });
+    await act(() => router.navigate("/settings/appearance"));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+    expect(control("Default harness").value).toBe("inherit");
+    expect(control("Planning model — Codex").value).toBe("inherit");
+  }, 30000);
+});
+
+describe("unsaved-changes guard", () => {
+  it("tab click: Stay keeps the draft, Discard changes navigates", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(screen.getByRole("link", { name: "Run defaults" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stay" }));
+    await waitFor(() => expect(dialog()).toBeNull());
+    expect(path(router)).toBe("/settings/models");
+    expect(control("Worker model — Codex").value).toBe("gpt-6-sol");
+    fireEvent.click(screen.getByRole("link", { name: "Run defaults" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/run-defaults"));
+  }, 30000);
+
+  it("sidebar link: blocked until discarded", async () => {
+    const router = await openModels();
+    select("Worker effort — Claude", "high");
+    fireEvent.click(screen.getAllByRole("link", { name: /^Schedules/ })[0]);
+    expect(await screen.findByRole("dialog", { name: DIALOG })).toBeTruthy();
+    expect(path(router)).toBe("/settings/models");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/schedules"));
+  }, 30000);
+
+  it("command-menu navigation: Stay keeps the page", async () => {
+    const router = await openModels();
+    select("Planning effort — Codex", "low");
+    fireEvent.keyDown(document.body, { key: "k", code: "KeyK", ctrlKey: true });
+    const menu = await screen.findByRole("dialog", { name: "Command menu" });
+    fireEvent.change(within(menu).getByRole("combobox"), { target: { value: "appearance" } });
+    const option = await within(menu).findByRole("option", { name: /Settings › Appearance/ });
+    fireEvent.click(option);
+    fireEvent.click(await screen.findByRole("button", { name: "Stay" }));
+    await waitFor(() => expect(dialog()).toBeNull());
+    expect(path(router)).toBe("/settings/models");
+    expect(control("Planning effort — Codex").value).toBe("low");
+  }, 30000);
+
+  it("browser back and forward are blocked until discarded", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    await act(() => router.navigate(-1));
+    fireEvent.click(await screen.findByRole("button", { name: "Stay" }));
+    await waitFor(() => expect(dialog()).toBeNull());
+    expect(path(router)).toBe("/settings/models");
+    await act(() => router.navigate(-1));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/schedules"));
+    // Forward again: the discarded page loads clean and does not prompt on leaving.
+    await act(() => router.navigate(1));
+    await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+    expect(status()).toBe("No unsaved changes");
+  }, 30000);
+
+  it("does not prompt on a clean page, after a save, or after Discard", async () => {
+    const router = await openModels();
+    fireEvent.click(screen.getByRole("link", { name: "Appearance" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/Saved 1 change/, {}, { timeout: 5000 });
+    fireEvent.click(screen.getByRole("link", { name: "Appearance" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Worker model — Codex", {}, { timeout: 5000 });
+    select("Worker model — Codex", "gpt-6-astra");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Discard" }));
+    fireEvent.click(screen.getByRole("link", { name: "Appearance" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+    expect(dialogSeen).toBe(false);
+  }, 30000);
+
+  it("adds the beforeunload listener only while dirty and removes it on discard and save", async () => {
+    const add = vi.spyOn(window, "addEventListener");
+    const remove = vi.spyOn(window, "removeEventListener");
+    const unloads = (spy: typeof add) => spy.mock.calls.filter(([type]) => type === "beforeunload").map(([, fn]) => fn);
+    await openModels();
+    expect(unloads(add)).toHaveLength(0);
+    select("Worker model — Codex", "gpt-6-sol");
+    expect(unloads(add)).toHaveLength(1);
+    const listener = unloads(add)[0] as (e: Event) => void;
+    const event = new Event("beforeunload", { cancelable: true });
+    listener(event);
+    expect(event.defaultPrevented).toBe(true);
+    fireEvent.click(within(bar()).getByRole("button", { name: "Discard" }));
+    expect(unloads(remove)).toContain(listener);
+
+    select("Worker model — Codex", "gpt-6-astra");
+    expect(unloads(add)).toHaveLength(2);
+    const second = unloads(add)[1];
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/Saved 1 change/, {}, { timeout: 5000 });
+    expect(unloads(remove)).toContain(second);
+    expect(unloads(add)).toHaveLength(2);
+  }, 30000);
+
+  it("logout while dirty reaches /login without the dialog", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(screen.getAllByRole("button", { name: "Log out" })[0]);
+    await waitFor(() => expect(path(router)).toBe("/login"), { timeout: 5000 });
+    expect(dialogSeen).toBe(false);
+  }, 30000);
+
+  it("a 401 while dirty does not trap the user in the old viewer's form", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    expect(captured.onUnauthorized).not.toBeNull();
+    await mockApi.logout();
+    act(() => captured.onUnauthorized!());
+    await waitFor(() => expect(path(router)).toBe("/login"), { timeout: 5000 });
+    expect(screen.queryByLabelText("Worker model — Codex")).toBeNull();
+    expect(dialogSeen).toBe(false);
+  }, 30000);
+});
