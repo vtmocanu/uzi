@@ -241,11 +241,16 @@ The agent can read every variable, secret or not. Store read-only, narrowly
 scoped credentials. uzi does not log in or configure tools for you; the agent
 or your repo scripts do.
 
-Before each Claude CLI start the worker resets the CLI's global config under the
-run's home (`.claude.json`, and removes `.claude/.config.json`), so an `env` block
-the agent left there is not applied at the next start. A process the agent leaves
-running can still race that reset; ADR-4416 lists the open limits. If a directory is planted at either path, the worker
-cannot reset it and the run fails instead of starting the CLI.
+Every Claude CLI start runs with its global config taken from a directory the
+worker prepares under the run's home (`.uzi-claude-config`) and the agent cannot
+write when the worker and the agent run as separate users. An `env` block the
+agent writes to the usual config files in the home is not read, so it does not
+apply at the next start. With a single user (some small installs) there is no
+such protection, because the agent has the worker's own permissions. If something
+unexpected sits at that path, the worker moves it aside (`.uzi-claude-config.stale-*`,
+`.claude.stale-*`) and rebuilds; it fails the run instead of starting the CLI only
+when it cannot do that, for example on a read-only data volume. ADR-4416 has the
+details and the limits.
 
 ## Name and value rules
 

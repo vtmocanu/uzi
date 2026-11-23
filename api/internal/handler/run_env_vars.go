@@ -232,8 +232,8 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 // runEnvDTOAt is runEnvDTO with an optional vault epoch: when epoch is non-nil the plain value is
 // opened at that epoch (the users.vault_epoch read in the same statement as the row), and a stale
 // seal withholds the value and reports locked, the list's existing locked answer; the next read
-// is coherent. A nil epoch is the write response, whose row has no epoch and which asks the vault
-// for its lock state after the commit (runEnvWriteDTO).
+// is coherent. A nil epoch is only the description save that writes nothing (it reads no epoch)
+// and asks the vault for its lock state instead; every other write passes the epoch it locked.
 func (h *Handler) runEnvDTOAt(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow, vaultLocked bool, epoch *int64) (dto apitypes.RunEnvVarDTO, locked bool) {
 	dto = apitypes.RunEnvVarDTO{
 		VarID:       row.VarID,
