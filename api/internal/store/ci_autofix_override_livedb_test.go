@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -257,8 +258,10 @@ func TestCIAutofixSelectedRunTieBreakLiveDB(t *testing.T) {
 	const branch = "agent/issue-51"
 	lowOwner := e.newUser(t, nil, true)
 	highOwner := e.newUser(t, nil, true)
-	lowID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
-	highID := uuid.MustParse("ffffffff-ffff-4fff-8fff-ffffffffffff")
+	lowID, highID := uuid.New(), uuid.New()
+	if bytes.Compare(lowID[:], highID[:]) > 0 {
+		lowID, highID = highID, lowID
+	}
 	insert := func(id, owner uuid.UUID, mr int64, iss int64) {
 		mustExec(e.ctx, t, e.pool,
 			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, branch, mr_iid, created_at)
@@ -334,6 +337,33 @@ func TestSetRunCiAutofixEnabledLiveDB(t *testing.T) {
 	}
 	if v := read(); v.Valid {
 		t.Fatalf("after clear want NULL, got %+v", v)
+	}
+}
+
+func TestSetRunCiAutofixEnabledPreservesQueuedUpdatedAtLiveDB(t *testing.T) {
+	e := newAutofixOverrideEnv(t, 16)
+	runID := e.insertRun(t, e.ownerA, "issue", "queued", "agent/issue-32", nil, nil, "1 hour")
+	const affinityTime = "2026-01-02 03:04:05+00"
+	mustExec(e.ctx, t, e.pool, `UPDATE runs SET updated_at = $2::timestamptz WHERE id = $1`, runID, affinityTime)
+
+	n, err := e.q.SetRunCiAutofixEnabled(e.ctx, store.SetRunCiAutofixEnabledParams{
+		ID: runID, UserID: e.ownerA, CiAutofixEnabled: pgtype.Bool{Bool: false, Valid: true},
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("set queued override: rows = %d, err = %v", n, err)
+	}
+
+	var override pgtype.Bool
+	var unchanged bool
+	if err := e.pool.QueryRow(e.ctx, `SELECT ci_autofix_enabled, updated_at = $2::timestamptz FROM runs WHERE id = $1`,
+		runID, affinityTime).Scan(&override, &unchanged); err != nil {
+		t.Fatalf("read queued run: %v", err)
+	}
+	if !override.Valid || override.Bool {
+		t.Fatalf("queued override = %+v, want false", override)
+	}
+	if !unchanged {
+		t.Fatal("changing the CI-autofix override reset the queued run's affinity timestamp")
 	}
 }
 

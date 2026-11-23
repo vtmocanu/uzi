@@ -13301,8 +13301,9 @@ WHERE id = @id AND user_id = @user_id;
 -- like SetRunMrReworkEnabled: a foreign run returns 0 rows (the handler maps it to 404).
 -- @ci_autofix_enabled is a NULLABLE bool: NULL clears the override back to inherit the
 -- owner default, false/true set an explicit override. No status guard: the override
--- matters after the run completes, while its MR pipeline can still fail.
-UPDATE runs SET ci_autofix_enabled = sqlc.narg('ci_autofix_enabled'), updated_at = now()
+-- matters after the run completes, while its MR pipeline can still fail. Preserve updated_at:
+-- touching it would restart queued-run claim affinity and spread timers.
+UPDATE runs SET ci_autofix_enabled = sqlc.narg('ci_autofix_enabled')
 WHERE id = @id AND user_id = @user_id;
 
 -- name: SetRunPriority :execrows

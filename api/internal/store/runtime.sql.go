@@ -27568,7 +27568,7 @@ func (q *Queries) SetRunCheckpointTip(ctx context.Context, arg SetRunCheckpointT
 }
 
 const setRunCiAutofixEnabled = `-- name: SetRunCiAutofixEnabled :execrows
-UPDATE runs SET ci_autofix_enabled = $1, updated_at = now()
+UPDATE runs SET ci_autofix_enabled = $1
 WHERE id = $2 AND user_id = $3
 `
 
@@ -27582,7 +27582,8 @@ type SetRunCiAutofixEnabledParams struct {
 // like SetRunMrReworkEnabled: a foreign run returns 0 rows (the handler maps it to 404).
 // @ci_autofix_enabled is a NULLABLE bool: NULL clears the override back to inherit the
 // owner default, false/true set an explicit override. No status guard: the override
-// matters after the run completes, while its MR pipeline can still fail.
+// matters after the run completes, while its MR pipeline can still fail. Preserve updated_at:
+// touching it would restart queued-run claim affinity and spread timers.
 func (q *Queries) SetRunCiAutofixEnabled(ctx context.Context, arg SetRunCiAutofixEnabledParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCiAutofixEnabled, arg.CiAutofixEnabled, arg.ID, arg.UserID)
 	if err != nil {
