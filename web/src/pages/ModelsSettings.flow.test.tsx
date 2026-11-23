@@ -67,6 +67,7 @@ async function openModels(path?: string) {
   return router;
 }
 
+let routerErrors: string[] = [];
 beforeEach(async () => {
   localStorage.clear();
   await mockApi.login("vlad@uzi.local", "x");
@@ -76,12 +77,24 @@ beforeEach(async () => {
     if (document.querySelector(`[aria-label="${DIALOG}"]`)) dialogSeen = true;
   });
   observer.observe(document.body, { childList: true, subtree: true });
+  routerErrors = [];
+  const original = console.error;
+  vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    const text = args.map((a) => (a instanceof Error ? a.message : String(a))).join(" ");
+    if (text.includes("Invalid blocker state transition")) routerErrors.push(text);
+    original(...args);
+  });
 });
 afterEach(() => {
+  // A second blocker.proceed() lands in the router's error boundary (the page is replaced by
+  // an error screen in the app), so any such error fails the test that caused it.
+  const errors = routerErrors;
+  routerErrors = [];
   observer?.disconnect();
   cleanup();
   failNextMockModelSettingsWrite(null);
   vi.restoreAllMocks();
+  expect(errors).toEqual([]);
 });
 
 describe("Models settings flow (stateful mock)", () => {

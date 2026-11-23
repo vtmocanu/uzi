@@ -73,17 +73,28 @@ export function UnsavedModelsGuard({
   // Nothing left unsaved while the dialog is open (a pending save finished, or the draft was
   // edited back): the user asked to leave and there is nothing to lose, so let them go rather
   // than ask about "0 changes".
+  // proceed() may run at most once per blocked navigation: Discard proceeds and clears the
+  // draft in one handler, so the effect below would otherwise see the still-"blocked" blocker
+  // with a clean draft and proceed a second time, which the router rejects
+  // ("Invalid blocker state transition: unblocked -> proceeding").
+  const proceeded = useRef(false);
+  if (blocker.state === "unblocked") proceeded.current = false;
+  const proceedOnce = useCallback(() => {
+    if (proceeded.current || blocker.state !== "blocked") return;
+    proceeded.current = true;
+    blocker.proceed();
+  }, [blocker]);
   const blockedClean = blocker.state === "blocked" && !dirty;
   useEffect(() => {
-    if (blockedClean) blocker.proceed?.();
-  }, [blockedClean, blocker]);
+    if (blockedClean) proceedOnce();
+  }, [blockedClean, proceedOnce]);
 
   if (blocker.state !== "blocked" || !dirty) return null;
   const stay = () => blocker.reset();
   const discard = () => {
     if (saving) return;
     onDiscard();
-    blocker.proceed();
+    proceedOnce();
   };
   const changes = dirtyCount === 1 ? "1 change" : `${dirtyCount} changes`;
   // An uncertain save is never "not saved": the PUT may have committed, and leaving cannot
