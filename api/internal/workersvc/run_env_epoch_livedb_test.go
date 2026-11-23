@@ -27,10 +27,15 @@ type epochRaceQueries struct {
 	once    sync.Once
 	after   func()
 	reads   int
+	byName  map[string]int
 }
 
 func (q *epochRaceQueries) fire(name string) {
 	q.reads++
+	if q.byName == nil {
+		q.byName = map[string]int{}
+	}
+	q.byName[name]++
 	if name == q.trigger {
 		q.once.Do(q.after)
 	}
@@ -124,7 +129,76 @@ func TestRunEnvClaimStaleEpochDeliversNothingLiveDB(t *testing.T) {
 			if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.HoldReason.Valid || r.FailOrigin.Valid {
 				t.Fatalf("status=%s hold=%v fail=%v, want queued with nothing parked or failed", r.Status, r.HoldReason, r.FailOrigin)
 			}
+			if q.byName[trigger] != 2 { // the stale seal was re-read once
+				t.Fatalf("%s list reads = %d, want 2 (the read and one re-read)", trigger, q.byName[trigger])
+			}
 		})
+	}
+}
+
+// A stale seal whose refetch opens: the owner enables protection (and stays unlocked) between the
+// read and the open. The re-read row is sealed at the new epoch and opens, so the value is
+// delivered and the claim finishes against the new epoch.
+func TestRunEnvClaimStaleEpochRefetchOpensLiveDB(t *testing.T) {
+	fx := newREFix(t, true)
+	armProtection(t, fx.env, fx.userID)
+	runID := fx.queuedRun(t, "issue")
+	secret := envSecretValue("refetch")
+	fx.put(t, "API_KEY", true, secret)
+	q := &epochRaceQueries{Queries: fx.env.q, trigger: "effective", after: func() {
+		if err := fx.env.vlt.Enable(fx.env.ctx, fx.userID, codexRacePassword); err != nil {
+			t.Errorf("enable protection: %v", err)
+		}
+	}}
+	fx.svc.q = q
+	p, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if p == nil || runEnvByName(p)["API_KEY"].Value != secret {
+		t.Fatalf("claim = %+v, want the refetched row opened and delivered", p)
+	}
+	if q.byName["effective"] != 2 {
+		t.Fatalf("effective list reads = %d, want 2", q.byName["effective"])
+	}
+	if r := mustRun(t, fx.env, runID); r.Status != "claimed" {
+		t.Fatalf("status = %s, want claimed", r.Status)
+	}
+}
+
+// The window after the open: the values opened at epoch E, then the owner enables protection
+// (epoch E+1, every key unchanged) and locks before the claim commits. The finish compares the
+// epoch it reads under the users-row lock with the one the values were opened at: nothing is
+// delivered and the run goes back to queued.
+func TestRunEnvClaimEpochChangeAfterOpenDeliversNothingLiveDB(t *testing.T) {
+	fx := newREFix(t, true)
+	armProtection(t, fx.env, fx.userID)
+	runID := fx.queuedRun(t, "issue")
+	secret := envSecretValue("window")
+	fx.put(t, "API_KEY", true, secret)
+	var assembled *ClaimPayload
+	fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
+		if err != nil || p == nil || runEnvByName(p)["API_KEY"].Value != secret {
+			t.Errorf("assembly did not open the value: payload=%v err=%v", p != nil, err)
+		}
+		assembled = p
+		fx.enableAndLock(t)()
+	}}
+	p, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if assembled == nil {
+		t.Fatal("assembly hook never ran")
+	}
+	if p != nil {
+		t.Fatalf("claim = %+v, want an idle (requeued) claim", p.Secrets)
+	}
+	if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.HoldReason.Valid || r.FailOrigin.Valid {
+		t.Fatalf("status=%s hold=%v fail=%v, want queued with nothing parked or failed", r.Status, r.HoldReason, r.FailOrigin)
+	}
+	if got := fx.receipts(t, runID); len(got) != 0 {
+		t.Fatalf("receipts = %+v, want none", got)
 	}
 }
 
@@ -148,6 +222,23 @@ func TestRunEnvCrossCheckStaleEpochDeliversNothingLiveDB(t *testing.T) {
 	if p != nil {
 		t.Fatalf("checker claimed with redact=%+v run_env=%+v after the owner protected and locked", p.Secrets.RunEnvRedact, p.Secrets.RunEnv)
 	}
+	// The receipts were re-read once, and the check is still open: the child is queued with no
+	// failure origin (a requeue), not decided checker_unavailable.
+	if q.byName["receipts"] != 2 {
+		t.Fatalf("receipt reads = %d, want 2 (the read and one re-read)", q.byName["receipts"])
+	}
+	child := mustRun(t, f.env, f.runID)
+	if child.Status != "queued" || child.FailOrigin.Valid || child.HoldReason.Valid {
+		t.Fatalf("child status=%s fail=%v hold=%v, want queued with no failure origin", child.Status, child.FailOrigin, child.HoldReason)
+	}
+	var verdict, outcome, reason string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT COALESCE(verdict,''), COALESCE(outcome,''), COALESCE(reason_class,'')
+	    FROM cross_checks WHERE checker_run_id=$1`, f.runID).Scan(&verdict, &outcome, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if verdict == "failed" || outcome == "failed" || reason == "checker_unavailable" {
+		t.Fatalf("check decided: verdict %q outcome %q reason %q, want it still open", verdict, outcome, reason)
+	}
 }
 
 // Redact route: the receipted versions are read unprotected; the owner protects and locks before
@@ -168,7 +259,7 @@ func TestRunEnvRedactRouteStaleEpochIsVaultLockedLiveDB(t *testing.T) {
 		t.Fatalf("RunEnvRedact = %+v, %v; want ErrRunEnvVaultLocked and no version", res, err)
 	}
 	// The retry re-read the list once: two reads in all.
-	if q.reads != 2 {
+	if q.reads != 2 || q.byName["receipts"] != 2 {
 		t.Fatalf("receipt reads = %d, want 2 (the read and one re-read)", q.reads)
 	}
 }

@@ -549,13 +549,14 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// into finishRunClaim's bounded retry: the claim never waits, parks or fails on the lock.
 	runEnvPark := runEnvHistory || errors.Is(decision, errRunEnvHistoryUnavailable)
 	if decision == nil && runEnvLocked {
-		if _, err := q.LockUserVaultStateForKeyShareNowait(ctx, locked.UserID); err != nil {
+		vaultState, err := q.LockUserVaultStateForKeyShareNowait(ctx, locked.UserID)
+		if err != nil {
 			return nil, "", err
 		}
 		if h := s.claimHooks; h != nil && h.afterRunEnvLock != nil {
 			h.afterRunEnvLock(ctx, run)
 		}
-		envDecision, err := checkRunEnv(ctx, q, locked, payload.runEnv)
+		envDecision, err := checkRunEnv(ctx, q, locked, payload.runEnv, vaultState.VaultEpoch)
 		if err != nil {
 			return nil, "", err
 		}

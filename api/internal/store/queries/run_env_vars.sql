@@ -4,12 +4,15 @@
 -- name: ListRunEnvVarsForRepo :many
 -- Live (enabled and disabled) and pending-deletion rows of one repo scope, name order.
 -- Retired versions are history and never listed. The ciphertext is returned so the
--- handler can open plain values; secret values are never opened for a response.
-SELECT id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-       disabled_at, pending_delete_at, created_at, updated_at, aad_version
-FROM run_env_vars
-WHERE user_id = @user_id AND repo_id = @repo_id AND retired_at IS NULL
-ORDER BY name, (pending_delete_at IS NOT NULL), rev DESC;
+-- handler can open plain values; secret values are never opened for a response. vault_epoch is
+-- the owner's users.vault_epoch read in the same statement as the ciphertext, so the handler
+-- opens each value at the epoch its material was read at (secretopen.OpenSealedAtEpoch).
+SELECT r.id, r.var_id, r.name, r.secret, r.description, r.ciphertext, r.sealed_with, r.value_bytes, r.rev,
+       r.disabled_at, r.pending_delete_at, r.created_at, r.updated_at, r.aad_version, u.vault_epoch
+FROM run_env_vars r
+JOIN users u ON u.id = r.user_id
+WHERE r.user_id = @user_id AND r.repo_id = @repo_id AND r.retired_at IS NULL
+ORDER BY r.name, (r.pending_delete_at IS NOT NULL), r.rev DESC;
 
 -- name: GetLiveRunEnvVarByName :one
 -- The live row of a repo-scope name. A plain read: the handler's planning read runs

@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // RunEnvDelivered reports whether a run of this shape may receive run environment variables
@@ -51,6 +52,21 @@ type runEnvSnapshot struct {
 	effective []runEnvEntry
 	redact    []runEnvEntry
 	capable   bool
+	// epoch is the owner's vault epoch every value of the successful open pass was opened at
+	// (valid only when hasEpoch). finishRunClaimTx compares it with the epoch it reads under the
+	// users-row lock, so a protection change between the open and the commit delivers nothing.
+	epoch    int64
+	hasEpoch bool
+}
+
+// noteEpoch records the epoch one opened value was read at. Values read in different
+// statements at different epochs mean the vault changed mid-pass: a stale seal, re-read once.
+func (s *runEnvSnapshot) noteEpoch(epoch int64) error {
+	if s.hasEpoch && s.epoch != epoch {
+		return store.ErrVaultSealStale
+	}
+	s.epoch, s.hasEpoch = epoch, true
+	return nil
 }
 
 // attachRunEnv fills payload.Secrets.RunEnv and RunEnvRedact for a run that receives run
@@ -68,8 +84,8 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 		return s.attachCrossCheckRedact(ctx, run, governing, capable, payload)
 	}
 	// A ciphertext read here is opened at the vault epoch read in the same statement. A stale
-	// seal (the owner enabled protection, rewrapped or locked between the read and the open) is
-	// re-read once; a second one withholds the claim as a locked vault. No value is delivered
+	// seal (the owner enabled protection or rewrapped between the read and the open, which bumps
+	// the epoch) is re-read once; a second one requeues the claim. No value is delivered
 	// from a failed or retried pass: the payload fields are assigned only after every open.
 	var snap *runEnvSnapshot
 	err := retryOnSealStale(func() error {
@@ -85,7 +101,8 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 }
 
 // retryOnSealStale runs read (the query plus the opens of its rows) and, on a stale vault seal,
-// runs it once more against a fresh read. A second stale seal is errVaultLocked (a requeue).
+// runs it once more against a fresh read. A second stale seal is errVaultLocked: a requeue on
+// the claim and a 409 vault_locked on the redact route.
 func retryOnSealStale(read func() error) error {
 	err := read()
 	if !errors.Is(err, store.ErrVaultSealStale) {
@@ -143,6 +160,9 @@ func (s *Service) openLeadRunEnv(ctx context.Context, run store.Run, capable boo
 		if oerr != nil {
 			return nil, mapRunEnvOpenError(oerr)
 		}
+		if err := snap.noteEpoch(row.VaultEpoch); err != nil {
+			return nil, err
+		}
 		snap.effective = append(snap.effective, runEnvEntry{VarID: row.VarID, Rev: row.Rev, Scope: scope, Name: row.Name, Secret: row.Secret})
 		runEnv = append(runEnv, ClaimRunEnvVar{
 			VarID: row.VarID.String(), Scope: scope, Rev: row.Rev, Name: row.Name,
@@ -162,6 +182,9 @@ func (s *Service) openLeadRunEnv(ctx context.Context, run store.Run, capable boo
 			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName, VaultEpoch: row.VaultEpoch,
 		})
 		if err != nil {
+			return nil, err
+		}
+		if err := snap.noteEpoch(row.VaultEpoch); err != nil {
 			return nil, err
 		}
 		snap.redact = append(snap.redact, runEnvEntry{VarID: row.VarID, Rev: row.Rev, Scope: row.Scope, Name: row.Name, Secret: true})
@@ -213,7 +236,8 @@ func (s *Service) attachCrossCheckRedact(ctx context.Context, run store.Run, tar
 	}
 	versions, err := s.openReceiptVersions(ctx, run.UserID, target, rows)
 	switch {
-	case errors.Is(err, errVaultLocked):
+	case errors.Is(err, errVaultLocked), errors.Is(err, secretopen.ErrReaderFailure):
+		// Transient: the check stays queued and a later claim retries it.
 		return err
 	case err != nil:
 		return errCheckerRunEnvUnavailable
@@ -232,7 +256,7 @@ func (s *Service) openReceiptVersions(ctx context.Context, owner, governing uuid
 		if !first {
 			var err error
 			if rows, err = s.q.ListRunEnvSecretReceiptVersionsForRun(ctx, governing); err != nil {
-				return fmt.Errorf("run env redact receipts: %w", err)
+				return fmt.Errorf("%w: run env redact receipts: %w", secretopen.ErrReaderFailure, err)
 			}
 		}
 		first = false
@@ -375,6 +399,8 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	switch {
 	case errors.Is(err, errVaultLocked):
 		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
+	case errors.Is(err, secretopen.ErrReaderFailure):
+		return RunEnvRedactResponse{}, err // transient: the handler answers 500, not a history verdict
 	case err != nil:
 		return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
 	}
@@ -383,14 +409,20 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 
 // mapRunEnvOpenError maps a secretopen failure to the claim lane's domain errors: a locked
 // vault requeues, a stale vault seal passes through for the caller's single re-read
-// (retryOnSealStale), and anything else (including a missing or failing vault) cannot be
-// opened and parks the run: never a fallback to an epoch-less open.
+// (retryOnSealStale), an infrastructure failure (a vault state read that failed) passes through
+// as a plain transient error that neither parks nor decides a check, and anything else
+// (including an unconfigured vault, which a retry cannot fix) cannot be opened and parks the
+// run: never a fallback to an epoch-less open.
 func mapRunEnvOpenError(err error) error {
 	if errors.Is(err, store.ErrVaultSealStale) {
 		return store.ErrVaultSealStale
 	}
 	if errors.Is(err, secretopen.ErrVaultLocked) {
 		return errVaultLocked
+	}
+	if errors.Is(err, secretopen.ErrReaderFailure) &&
+		!errors.Is(err, vault.ErrNotConfigured) && !errors.Is(err, vault.ErrInvalidState) {
+		return err
 	}
 	return fmt.Errorf("%w: a value could not be opened", errRunEnvHistoryUnavailable)
 }
@@ -407,7 +439,10 @@ type runEnvFinishQueries interface {
 // database failure (the transaction rolls back); a non-nil decision is a classification
 // (errRunEnvStale, errRunEnvCapabilityMissing, errRunEnvHistoryUnavailable) and nothing is
 // delivered.
-func checkRunEnv(ctx context.Context, q runEnvFinishQueries, locked store.Run, snap *runEnvSnapshot) (decision error, err error) {
+func checkRunEnv(ctx context.Context, q runEnvFinishQueries, locked store.Run, snap *runEnvSnapshot, lockedEpoch int64) (decision error, err error) {
+	if snap.hasEpoch && snap.epoch != lockedEpoch {
+		return errRunEnvStale, nil
+	}
 	eff, err := q.ListRunEnvEffectiveKeysForRun(ctx, locked.ID)
 	if err != nil {
 		return nil, fmt.Errorf("run env effective keys: %w", err)

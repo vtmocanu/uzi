@@ -318,11 +318,12 @@ func (q *Queries) ListRunEnvVarCountsForUser(ctx context.Context, userID uuid.UU
 
 const listRunEnvVarsForRepo = `-- name: ListRunEnvVarsForRepo :many
 
-SELECT id, var_id, name, secret, description, ciphertext, sealed_with, value_bytes, rev,
-       disabled_at, pending_delete_at, created_at, updated_at, aad_version
-FROM run_env_vars
-WHERE user_id = $1 AND repo_id = $2 AND retired_at IS NULL
-ORDER BY name, (pending_delete_at IS NOT NULL), rev DESC
+SELECT r.id, r.var_id, r.name, r.secret, r.description, r.ciphertext, r.sealed_with, r.value_bytes, r.rev,
+       r.disabled_at, r.pending_delete_at, r.created_at, r.updated_at, r.aad_version, u.vault_epoch
+FROM run_env_vars r
+JOIN users u ON u.id = r.user_id
+WHERE r.user_id = $1 AND r.repo_id = $2 AND r.retired_at IS NULL
+ORDER BY r.name, (r.pending_delete_at IS NOT NULL), r.rev DESC
 `
 
 type ListRunEnvVarsForRepoParams struct {
@@ -345,13 +346,16 @@ type ListRunEnvVarsForRepoRow struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	AadVersion      int16              `json:"aad_version"`
+	VaultEpoch      int64              `json:"vault_epoch"`
 }
 
 // PRD #4416 M1: run environment variables. Every write runs inside a transaction that
 // holds LockSecretMutation and then FenceVaultWrite, like the other secret writers.
 // Live (enabled and disabled) and pending-deletion rows of one repo scope, name order.
 // Retired versions are history and never listed. The ciphertext is returned so the
-// handler can open plain values; secret values are never opened for a response.
+// handler can open plain values; secret values are never opened for a response. vault_epoch is
+// the owner's users.vault_epoch read in the same statement as the ciphertext, so the handler
+// opens each value at the epoch its material was read at (secretopen.OpenSealedAtEpoch).
 func (q *Queries) ListRunEnvVarsForRepo(ctx context.Context, arg ListRunEnvVarsForRepoParams) ([]ListRunEnvVarsForRepoRow, error) {
 	rows, err := q.db.Query(ctx, listRunEnvVarsForRepo, arg.UserID, arg.RepoID)
 	if err != nil {
@@ -376,6 +380,7 @@ func (q *Queries) ListRunEnvVarsForRepo(ctx context.Context, arg ListRunEnvVarsF
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.AadVersion,
+			&i.VaultEpoch,
 		); err != nil {
 			return nil, err
 		}

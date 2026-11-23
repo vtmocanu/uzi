@@ -989,6 +989,54 @@ func TestRunEnvPutRefusesInvalidUTF8LiveDB(t *testing.T) {
 	f.put("UTF_TEST", "{\"value\":\"abcdéefgh12345\",\"secret\":false}", http.StatusCreated)
 }
 
+// A plain value is opened at the vault epoch its row was read at. The owner reads the row while
+// unprotected (master_aad material the server key opens), then enables protection and locks: the
+// row held in memory is stale, so the epoch-fenced open withholds it and reports the vault locked
+// instead of serving the plaintext the master key would still open.
+func TestRunEnvListPlainValueOpensAtRowEpochLiveDB(t *testing.T) {
+	h, router, pool := cliVaultLiveDB(t)
+	vaultFixturePolicy(t, pool, "optional")
+	owner := cliSeedUser(t, pool, false)
+	const password = "a-vault-epoch-password" //nolint:gosec // G101: test-only vault password.
+	setVaultFixturePassword(t, pool, owner, password)
+	repo := cliSeedOwnedRepo(t, pool, owner)
+	f := &envFixture{t: t, h: h, router: router, pool: pool, owner: owner, repo: repo, jwt: cliMintJWT(t, pool, owner)}
+	f.put("PLAIN_ONE", jsonBody(map[string]any{"value": "https://sandbox.example.test", "secret": false}), http.StatusCreated)
+
+	ctx := context.Background()
+	rows, err := h.q.ListRunEnvVarsForRepo(ctx, store.ListRunEnvVarsForRepoParams{UserID: owner, RepoID: repoPG(repo)})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("list rows = %d, %v", len(rows), err)
+	}
+	row := rows[0]
+	asRow := func(r store.ListRunEnvVarsForRepoRow) runEnvRow {
+		return runEnvRow{
+			ID: r.ID, VarID: r.VarID, Name: r.Name, Secret: r.Secret, Description: r.Description, Ciphertext: r.Ciphertext,
+			SealedWith: r.SealedWith, ValueBytes: r.ValueBytes, Rev: r.Rev, DisabledAt: r.DisabledAt,
+			PendingDeleteAt: r.PendingDeleteAt, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, AadVersion: r.AadVersion,
+		}
+	}
+	epoch := row.VaultEpoch
+	// Control: at the epoch the row was read at, the value opens.
+	dto, locked := h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)
+	if locked || dto.Value == nil || *dto.Value != "https://sandbox.example.test" {
+		t.Fatalf("control open = %+v locked=%v", dto, locked)
+	}
+
+	if err := h.vault.Enable(ctx, owner, password); err != nil {
+		t.Fatal(err)
+	}
+	h.vault.Lock(owner)
+	dto, locked = h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)
+	if !locked || dto.Value != nil || !dto.ValueWithheld {
+		t.Fatalf("a row read before the owner protected and locked opened: %+v locked=%v", dto, locked)
+	}
+	// A list read after the change carries the new epoch and withholds because the vault is locked.
+	if l := f.list(); !l.VaultLocked {
+		t.Fatalf("list after protect+lock = %+v; want vault_locked", l)
+	}
+}
+
 // vault_locked comes from the vault, so a list of secrets only (which never opens a
 // value) still tells a locked protected vault from an unlocked or unprotected one.
 func TestRunEnvListReportsLockedVaultForSecretOnlyLiveDB(t *testing.T) {

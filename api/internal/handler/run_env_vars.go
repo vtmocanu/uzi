@@ -31,6 +31,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/runenv"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
@@ -97,7 +98,7 @@ func runEnvHeadroomConflict(code string, err error) error {
 
 // runEnvRow is the shape every run_env_vars read returns, whichever generated query
 // produced it.
-type runEnvRow = store.ListRunEnvVarsForRepoRow
+type runEnvRow = store.InsertRunEnvVarRow
 
 // runEnvOwner resolves the caller and the repo they own, answering 401/400/404 itself
 // (the same preflight as GetRepoToolProfile: a foreign or unknown repo is a 404).
@@ -213,6 +214,15 @@ func runEnvState(r runEnvRow) string {
 // withholds every plain value without opening it: a row read before the vault was
 // protected and locked may still carry master_aad material the master key opens.
 func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked bool) (dto apitypes.RunEnvVarDTO, locked bool) {
+	return h.runEnvDTOAt(context.Background(), userID, repoID, row, vaultLocked, nil)
+}
+
+// runEnvDTOAt is runEnvDTO with an optional vault epoch: when epoch is non-nil the plain value is
+// opened at that epoch (the users.vault_epoch read in the same statement as the row), and a stale
+// seal withholds the value and reports locked, the list's existing locked answer; the next read
+// is coherent. A nil epoch is the write response, whose row has no epoch and which asks the vault
+// for its lock state after the commit (runEnvWriteDTO).
+func (h *Handler) runEnvDTOAt(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow, vaultLocked bool, epoch *int64) (dto apitypes.RunEnvVarDTO, locked bool) {
 	dto = apitypes.RunEnvVarDTO{
 		VarID:       row.VarID,
 		Name:        row.Name,
@@ -249,10 +259,15 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 		dto.ValueWithheld = true
 		return dto, false
 	}
-	plain, err := h.vault.Open(userID, kind, row.SealedWith, row.Ciphertext)
+	var plain []byte
+	if epoch != nil {
+		plain, err = secretopen.OpenSealedAtEpoch(ctx, h.vault, h.box, userID, kind, row.SealedWith, row.Ciphertext, *epoch)
+	} else {
+		plain, err = h.vault.Open(userID, kind, row.SealedWith, row.Ciphertext)
+	}
 	if err != nil {
 		dto.ValueWithheld = true
-		if errors.Is(err, vault.ErrLocked) {
+		if errors.Is(err, vault.ErrLocked) || errors.Is(err, secretopen.ErrVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 			return dto, true
 		}
 		slog.Error("open plain run env value", "error", err)
@@ -306,7 +321,13 @@ func (h *Handler) ListRepoEnvVars(w http.ResponseWriter, r *http.Request) {
 	}
 	vaultLocked := out.VaultLocked
 	for _, row := range rows {
-		dto, locked := h.runEnvDTO(userID, repoID, row, vaultLocked)
+		epoch := row.VaultEpoch
+		dto, locked := h.runEnvDTOAt(r.Context(), userID, repoID, runEnvRow{
+			ID: row.ID, VarID: row.VarID, Name: row.Name, Secret: row.Secret, Description: row.Description,
+			Ciphertext: row.Ciphertext, SealedWith: row.SealedWith, ValueBytes: row.ValueBytes, Rev: row.Rev,
+			DisabledAt: row.DisabledAt, PendingDeleteAt: row.PendingDeleteAt, CreatedAt: row.CreatedAt,
+			UpdatedAt: row.UpdatedAt, AadVersion: row.AadVersion,
+		}, vaultLocked, &epoch)
 		out.VaultLocked = out.VaultLocked || locked
 		out.Variables = append(out.Variables, dto)
 		out.Counts.Total++
