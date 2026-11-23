@@ -1543,3 +1543,225 @@ nested patch absence. P-layer protocol evidence uses injected OS seams: it is
 neither packaged OS isolation nor exhaustive proof about native OS effects.
 The [archived #4321 evidence](../prds/done/4321-codex-provider-spike.md)
 is background; this record states the current adoption boundary.
+
+
+## Amendment: M1 source, compatibility and environment audit (#4626, 2026-11-23)
+
+This source audit precedes coordinated 0.169.0 → 0.171.0 adoption;
+it does not itself attest to an installed binary. Runtime pins and harness
+version assertions are updated only after the audit. Four actual source archives under
+.uzi/scratch/research4626/ were used: codex-rust-v0.169.0,
+codex-rust-v0.169.1, codex-rust-v0.170.0 and codex-rust-v0.171.0.
+The baseline source commit is d32063f96c2dff1dc96af839b3952abb6acfeda4;
+the successive commits are c376cf7396eff83ce4c6ac61b9553df142e7a0be,
+29eb79e9866b3262a777fdf8195c1b9e63684c91 and
+ccf9be8cc458bd6b8336fe84d68d8893f2691a5e. Source was obtained through
+official HTTPS. The tags are unsigned: archive content equality establishes
+content correspondence, not cryptographic authentication by a tag signature.
+
+### Upstream compatibility review
+
+- **0.169.1:** the actual delta contains 42 added/modified paths.
+  Protocol/app-server implementation is unchanged, but shared runtime and
+  catalog changes matter: completed response items pass through provider
+  normalization at [core/src/client.rs:2806](https://github.com/openai/codex/blob/c376cf7396eff83ce4c6ac61b9553df142e7a0be/codex-rs/core/src/client.rs#L2806), and
+  incremental_tools_legacy defaults true at
+  [features/src/lib.rs:1825](https://github.com/openai/codex/blob/c376cf7396eff83ce4c6ac61b9553df142e7a0be/codex-rs/features/src/lib.rs#L1825). Unchanged protocol files do not
+  establish unchanged runtime tool behavior.
+- **0.170.0:** the OTLP headers helper is opt-in for explicit exporters,
+  not built-in analytics ([otel/src/config.rs:69](https://github.com/openai/codex/blob/29eb79e9866b3262a777fdf8195c1b9e63684c91/codex-rs/otel/src/config.rs#L69)–76).
+  It can run an executable or shell command with inherited environment
+  ([otel/src/headers_helper.rs:135](https://github.com/openai/codex/blob/29eb79e9866b3262a777fdf8195c1b9e63684c91/codex-rs/otel/src/headers_helper.rs#L135)–153).
+  Uzi's config emits no such helper. Permission updates preserve current
+  deny-read restrictions at
+  [core/src/session/environment.rs:191](https://github.com/openai/codex/blob/29eb79e9866b3262a777fdf8195c1b9e63684c91/codex-rs/core/src/session/environment.rs#L191)–234
+  (preserve_deny_read_restrictions_from at line 206); Cwd/Template path
+  handling is in [protocol/src/permissions.rs:45](https://github.com/openai/codex/blob/29eb79e9866b3262a777fdf8195c1b9e63684c91/codex-rs/protocol/src/permissions.rs#L45).
+  Native child restriction handling in
+  [core/src/agent/host/types.rs:21](https://github.com/openai/codex/blob/29eb79e9866b3262a777fdf8195c1b9e63684c91/codex-rs/core/src/agent/host/types.rs#L21)–40 is unchanged from the baseline.
+  Those native subagents are distinct from uzi's worker-managed children.
+- **0.171.0:** workspace metadata protection and legacy workspace fallback
+  change in [protocol/src/permissions.rs:926](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/protocol/src/permissions.rs#L926) and
+  [protocol/src/permissions.rs:2451](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/protocol/src/permissions.rs#L2451).
+  Approval environment_id scopes registration
+  ([protocol/src/approvals.rs:480](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/protocol/src/approvals.rs#L480)); it does not grant
+  worker callback authority. Resume admission uses canonical-ID shared
+  permits with ownership checks and exclusive fallback
+  ([app-server/src/request_processors/thread_processor/resume_permit.rs:10](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/app-server/src/request_processors/thread_processor/resume_permit.rs#L10)–63).
+  These shared-runtime/app-server changes need actual-binary coverage.
+- Remote app-server optional auth and required human approval
+  ([app-server-client/src/remote.rs:78](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/app-server-client/src/remote.rs#L78)),
+  experimental streaming search and realtime paths are unconsumed by uzi's
+  fixed stdio composition. This does not make shared runtime changes irrelevant.
+- bioPolicy predates this upgrade: the baseline already has the error and
+  wire mapping at [protocol/src/error.rs:203](https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/protocol/src/error.rs#L203),
+  [protocol/src/error.rs:485](https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/protocol/src/error.rs#L485) and
+  [protocol/src/error.rs:553](https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/protocol/src/error.rs#L553).
+  The bounded local classifier in
+  [terminal-normalize.ts:144](../agent/src/codex/terminal-normalize.ts)–180
+  remains an unknown classification for this tag, not recognized policy.
+  There is no newly introduced “previously Other” delta.
+
+The 0.171.0 catalog entries for gpt-6.2-sol and gpt-6.2-astra
+([models-manager/models.json:4](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/models-manager/models.json#L4) and
+[models-manager/models.json:184](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/models-manager/models.json#L184)) both require client 0.166.0,
+default to low effort, list low/medium/high/xhigh/max/ultra, use shell_command
+and code_mode_only, and have null default_service_tier. Priority/Fast is
+optional, not the default. Both IDs already occur in the retained 0.169.1
+catalog. Uzi's five-effort vocabulary still excludes ultra.
+The native-disable construction in
+[config.ts:96](../agent/src/codex/config.ts)–119 remains in place;
+new catalog and incremental-tool behavior require M6 actual-binary proofs.
+No such proof is claimed here.
+
+### Environment boundary
+
+The rule union is enforced by the shared fixture and its two language mirrors:
+[agent rules](../agent/src/run-env-names.ts),
+[agent tests](../agent/test/run-env-names.test.ts),
+[API rules](../api/internal/runenv/names.go),
+[API tests](../api/internal/runenv/names_test.go) and
+[shared fixture](../fixtures/run-env/name-rules.json).
+New exact denials are SPIFFE_ENDPOINT_SOCKET, SSH2_CLIENT, COMSPEC,
+DENO_CERT, CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE, OTEL_RESOURCE_ATTRIBUTES and
+AWS_ENDPOINT_URL; new denied prefixes are AWS_ENDPOINT_URL_, OTEL_LOG_ and
+OTEL_EXPORTER_OTLP_. Existing #4619 names are preserved. The AWS endpoint
+prefix is reserved as requested for #4594, which is not merged at this HEAD;
+this is a union of name rules, not adoption of that branch.
+
+- Workload identity/SPIFFE adds OPENAI_ names already covered by the existing
+  prefix denial. Selection requires OpenAI identity markers; an ambient SPIFFE
+  socket alone does not select it
+  ([login/src/auth/workload_identity.rs:132](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/login/src/auth/workload_identity.rs#L132)–180,
+  [login/src/auth/workload_identity.rs:290](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/login/src/auth/workload_identity.rs#L290)–309).
+  The child scrubber removes the listed OpenAI identity names but does not
+  remove SPIFFE_ENDPOINT_SOCKET
+  ([protocol/src/shell_environment.rs:19](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/protocol/src/shell_environment.rs#L19)–72).
+- Network-proxy CA handling explicitly preserves child CA settings
+  ([network-proxy/src/certs.rs:289](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/network-proxy/src/certs.rs#L289),
+  [network-proxy/src/proxy.rs:870](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/network-proxy/src/proxy.rs#L870)–894); this is not a proxy-root
+  trust grant. DENO_CERT and CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE therefore
+  remain relevant child settings. SSH2_CLIENT presence, even empty, changes
+  credential restoration eligibility in
+  [network-proxy/src/credential_broker.rs:83](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/network-proxy/src/credential_broker.rs#L83)–99.
+  Windows helper shell selection uses COMSPEC
+  ([http-headers-helper/src/lib.rs:45](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/http-headers-helper/src/lib.rs#L45)–64).
+- OTLP metrics compression/header variable presence suppresses the Statsig
+  zstd default ([otel/src/metrics/client.rs:670](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/otel/src/metrics/client.rs#L670)–689).
+  TUI status-line collection is a separate effect: nonempty
+  OTEL_RESOURCE_ATTRIBUTES or OTLP metrics/general headers disable its
+  built-in collector eligibility; empty values are tolerated
+  ([tui/src/statusline_metrics.rs:19](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/tui/src/statusline_metrics.rs#L19)–48).
+  Transitive opentelemetry-otlp 0.31.0 endpoint, header, compression and timeout
+  names fall under OTEL_EXPORTER_OTLP_. An explicit Codex endpoint may
+  override environment selection. This is not a broad OTEL_ ban; dependency
+  coverage and supported exclusions are recorded below.
+
+[buildReplacedEnv:780](../agent/src/codex/launcher.ts) constructs the full
+replacement environment for app-server; user command variables are not merged
+into that process environment. Command environment handling is separate.
+Helpers inherit their launching environment, and user child settings still
+matter, so the launcher boundary is not evidence that these names are harmless
+across native, TUI, transitive-library and app-server uses.
+
+### Transitive inventory and dispositions
+
+The adjacent Cargo locks were compared, including changed dependency edges
+and newly enabled compression, networking and workload-identity paths.
+0.169.0 and 0.169.1 have identical Cargo locks; this does not make their
+release commits interchangeable. The source review traversed lock dependencies
+from rmcp, crossterm, SPIFFE, OTLP/SDK, reqwest, HTTP/3, compression and
+sandbox-network roots in both locks, deliberately overapproximating targets
+and build dependencies. It retrieved 408 registry archives and matched every
+archive SHA-256 to its lock checksum. Seven exact-revision git archives were
+also retrieved; git archives have observed hashes, not Cargo registry checksums.
+
+The changed rmcp revision is
+[98a5478 → b11a40d](https://github.com/modelcontextprotocol/rust-sdk/compare/98a54789b80110ad210495c4ad845c89e1980471...b11a40d889e022087d7f2b8cd23aa28e19ceaf5b)
+(3.5.1 → 3.6.0). Its changed transport/auth/model code introduces no
+runtime environment lookup identified by the changed-source review;
+TokioChildProcessBuilder still preserves the supplied command environment
+([child_process.rs:120](https://github.com/modelcontextprotocol/rust-sdk/blob/b11a40d889e022087d7f2b8cd23aa28e19ceaf5b/crates/rmcp/src/transport/child_process.rs#L120)).
+The crossterm revision changes from ed1cdab335221515706178d68495bba2aed1924f
+to [37ca4a2](https://github.com/openai-oss-forks/crossterm/tree/37ca4a27a9424ec5dbe6451f48c339d7b45f8d63);
+its changed event/parser paths do not add an identified runtime environment
+lookup. Existing TERM/COLORTERM/NO_COLOR are terminal presentation controls,
+not newly introduced execution controls.
+
+Changed registry sources reviewed include async-compression 0.4.44,
+compression-codecs 0.4.39, compression-core 0.4.34, zstd 0.14.3,
+zstd-safe 8.2.0, zstd-sys 2.1.2+zstd.1.5.7, libz-sys 1.1.33,
+lzma-rust2 0.22.0, zip 9.0.5, etherparse 0.21.0, smoltcp 0.14.0,
+heapless 0.9.3 and quinn's changed protocol/UDP libraries, including bundled
+C and headers. Registry source URLs are immutable versioned archives at
+https://static.crates.io/crates/NAME/NAME-VERSION.crate; expected hashes
+come from each release's Cargo.lock.
+ZSTD_SYS_NO_HIDE_SYMBOLS, compiler/pkg-config, SMOLTCP_* and heapless
+compiler-probe settings act during compilation, not configuration of the
+prebuilt runtime. BZIP/BZIP2 are read by bzip2's CLI source, excluded from
+the library's compiled C-file list. QEMU_EMULATING in optional zlib-ng ARM
+probing is a runtime read, but exists in both old and new libz-sys; it is not
+a new control or proof that this optional ARM path runs on the worker.
+Test-only keylogging and test-helper variables are not treated as production
+environment reads. Existing proxy selectors map to the _PROXY rule
+(lowercase spellings fail the name grammar), and existing TLS-root reads
+map to SSL_CERT_. Finding a keylogger implementation or a vendored
+OpenSSL source does not prove activation/linkage in this build.
+
+The exact opentelemetry_sdk 0.31.0 source is
+[versioned here](https://static.crates.io/crates/opentelemetry_sdk/opentelemetry_sdk-0.31.0.crate),
+with lock checksum
+e14ae4f5991976fd48df6d843de219ca6d31b01daaab2dad5af2badeded372bd.
+Resource::builder (src/resource/mod.rs:67) invokes env detectors:
+src/resource/env.rs:22 reads OTEL_RESOURCE_ATTRIBUTES and :75 reads
+OTEL_SERVICE_NAME. Codex make_resource at otel/src/provider.rs:411 and
+metrics client.rs:376 subsequently override service.name/version/environment.
+Thus arbitrary other resource attributes can survive, supporting the exact
+OTEL_RESOURCE_ATTRIBUTES denial; OTEL_SERVICE_NAME's value is overridden on
+these provider paths and remains allowed application configuration.
+
+The same SDK/version/configuration already existed in 0.169.0. Its
+OTEL_BLRP_* batching controls (logs/batch_log_processor.rs:701),
+OTEL_BSP_* trace batching controls (trace/span_processor.rs:887),
+OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT / EVENT_COUNT_LIMIT / LINK_COUNT_LIMIT
+and OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG (trace/config.rs:39–60),
+and OTEL_METRIC_EXPORT_INTERVAL (metrics/periodic_reader.rs:39) are
+pre-existing conditional exporter controls, not new or newly enabled reads
+in this runtime delta. They configure an exporter; they do not enable one.
+These remain allowed application variables under the existing policy:
+uzi's app-server environment does not inherit them, analytics is disabled,
+and uzi emits no telemetry exporter/helper configuration. Their names alone
+cannot justify a new broad OTEL_ denial. Experimental async-reader timeout
+controls are not asserted active on the ordinary reader. This disposition
+does not claim arbitrary managed settings or external helpers ignore them.
+
+AWS endpoint selection is likewise pre-existing rather than introduced by
+this bump: aws-auth uses the SDK default configuration chain without disabling
+endpoint configuration. AWS_ENDPOINT_URL plus AWS_ENDPOINT_URL_ are reserved
+to preserve #4594's union; other AWS application configuration remains allowed.
+All previous #4619 denials, including the underscore-prefixed provider
+selector, are retained.
+
+Coverage is source-based and bounded: adjacent native source/manifests/locks,
+changed Rust/C/header dependency implementations, constant-based reads and
+environment propagation were inspected. Compile-time and test-only names are
+separated from runtime reads. The inventory is not proof about arbitrary
+external helper programs, dynamically supplied code, every system TLS
+library, or runtime feature activation on every platform. Uzi keeps those
+opt-in helper/native paths disabled; this review grants no new authority.
+The new rules are independent of those exclusions and apply to inherited
+command environments as well as the harness controls.
+
+### Evidence and limits
+
+The complete API runenv package passed with -race -count=1; all 243 agent
+name-rule tests passed with zero skips. Independent, fixture-independent
+expectations rejected coordinated removal of each of the seven new exact
+names, three new prefixes and the existing OPENAI_ prefix in both Go and
+TypeScript: 22 expected assertion failures in isolated exports, with green
+candidate and restored controls. These tests prove rule-removal detection,
+not resistance to arbitrary validation bypass additions or runtime isolation.
+The source audit does not establish that 0.171.0 is installed. Independent
+price verification and actual-binary catalog/incremental-tool proofs are
+separate adoption obligations; existing historical binary results above
+retain their dated runtime boundaries.
