@@ -23,11 +23,11 @@ import (
 // Postgres; run via ./e2e/run-store-it.sh.
 
 const (
-	ovMrIID      int64 = 4617001
-	ovSeedPipe   int64 = 1111
-	ovCandPipe   int64 = 9001
-	ovSeedSig          = "seed-sig"
-	ovSeedAttemp int32 = 1
+	ovMrIID       int64 = 4617001
+	ovSeedPipe    int64 = 1111
+	ovCandPipe    int64 = 9001
+	ovSeedSig           = "seed-sig"
+	ovSeedAttempt int32 = 1
 )
 
 // ovForge is the detector's code host / issue tracker (cfForge) plus the forge.Forge surface
@@ -101,7 +101,7 @@ func newOvFix(t *testing.T, pool *pgxpool.Pool, iid int64, sourceStatus string, 
 	f.exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status,created_at)
 	        VALUES ($1,$2,$3,'issue',$4,'t','d',$5,$6,'opened',$7,now() - interval '1 hour')`, f.source, f.owner, f.repo, iid, f.ref, ovMrIID, sourceStatus)
 	f.exec("INSERT INTO pipeline_statuses (repo_id,ref,pipeline_id,sha,status,web_url,synced_at) VALUES ($1,$2,$3,'deadbeef','failed','https://forge.test/p',now())", f.repo, f.ref, ovCandPipe)
-	f.exec("INSERT INTO ci_autofix_attempts (repo_id,ref,attempt_count,last_signature,last_pipeline_id,halt_notified) VALUES ($1,$2,$3,$4,$5,true)", f.repo, f.ref, ovSeedAttemp, ovSeedSig, ovSeedPipe)
+	f.exec("INSERT INTO ci_autofix_attempts (repo_id,ref,attempt_count,last_signature,last_pipeline_id,halt_notified) VALUES ($1,$2,$3,$4,$5,true)", f.repo, f.ref, ovSeedAttempt, ovSeedSig, ovSeedPipe)
 
 	f.forge = &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 	svc := workersvc.New(f.q, nil, workersvc.Params{})
@@ -137,10 +137,10 @@ func (f *ovFix) assertLedgerUnchanged() {
 	if err != nil {
 		f.t.Fatalf("read ledger: %v", err)
 	}
-	if got.AttemptCount != ovSeedAttemp || !got.LastSignature.Valid || got.LastSignature.String != ovSeedSig ||
+	if got.AttemptCount != ovSeedAttempt || !got.LastSignature.Valid || got.LastSignature.String != ovSeedSig ||
 		!got.LastPipelineID.Valid || got.LastPipelineID.Int64 != ovSeedPipe || !got.HaltNotified {
 		f.t.Fatalf("ledger changed: count=%d sig=%+v pipeline=%+v halt=%v, want count=%d sig=%s pipeline=%d halt=true",
-			got.AttemptCount, got.LastSignature, got.LastPipelineID, got.HaltNotified, ovSeedAttemp, ovSeedSig, ovSeedPipe)
+			got.AttemptCount, got.LastSignature, got.LastPipelineID, got.HaltNotified, ovSeedAttempt, ovSeedSig, ovSeedPipe)
 	}
 }
 
@@ -251,8 +251,8 @@ func TestCIAutofixOverrideAdminGateLiveDB(t *testing.T) {
 			t.Fatalf("ci_fix rows = %d override = %+v, want exactly one carrying true", n, enabled)
 		}
 		got, err := f.q.GetCIAutofixAttempt(f.ctx, store.GetCIAutofixAttemptParams{RepoID: f.repo, Ref: f.ref})
-		if err != nil || got.AttemptCount != ovSeedAttemp+1 || got.LastPipelineID.Int64 != ovCandPipe {
-			t.Fatalf("ledger = %+v, %v; want attempt_count %d and last pipeline %d", got, err, ovSeedAttemp+1, ovCandPipe)
+		if err != nil || got.AttemptCount != ovSeedAttempt+1 || got.LastPipelineID.Int64 != ovCandPipe {
+			t.Fatalf("ledger = %+v, %v; want attempt_count %d and last pipeline %d", got, err, ovSeedAttempt+1, ovCandPipe)
 		}
 	})
 	t.Run("admin off", func(t *testing.T) {

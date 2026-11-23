@@ -37,7 +37,9 @@ type ciAutofixStore interface {
 // automatic fix and a manual "Fix CI" click share one state machine and one set of
 // guards — the one-active-ci_fix-per-ref index and the cross-kind same-branch
 // exclusion — so the detector receives ErrActiveFixExists / ErrBranchInUse to
-// swallow on a race with the manual button.
+// swallow on a race with the manual button. It also returns
+// workersvc.ErrCIAutofixIneligible when the in-transaction recheck finds the branch's
+// selected run opted out (issue #4617); the detector treats that as a skip, not a failure.
 type CIAutoFixRunStarter interface {
 	CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot workersvc.FailureSnapshot, ciConfigPaths []string) (store.Run, error)
 }

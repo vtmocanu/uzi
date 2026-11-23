@@ -906,6 +906,10 @@ type RunDTO struct {
 	// the wire means "no per-run opinion", which the web renders as the effective
 	// inherited value. It is what the per-run checkbox / `uzi run mr-rework` read back.
 	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	// CiAutofixEnabled is the run's per-run CI-autofix override (issue #4617), tri-state like
+	// MrReworkEnabled: null = inherit the owner default, true/false = explicit override. It is
+	// read LIVE, so null on the wire means "no per-run opinion".
+	CiAutofixEnabled *bool `json:"ci_autofix_enabled"`
 	// MrReworkAutoCycles and MrReworkAutoCap are the OWNER-ONLY view of the automatic
 	// rework loop guard (PRD #1202 D11), so the owner can see WHY the watcher stopped and
 	// decide whether to rework on demand. MrReworkAutoCycles is the ledger's attempt_count
@@ -1877,6 +1881,10 @@ type RunSummaryItemDTO struct {
 	// the wire means "no per-run opinion", which the web renders as the effective
 	// inherited value. It is what the per-run checkbox / `uzi run mr-rework` read back.
 	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	// CiAutofixEnabled is the run's per-run CI-autofix override (issue #4617), tri-state like
+	// MrReworkEnabled: null = inherit the owner default, true/false = explicit override. It is
+	// read LIVE, so null on the wire means "no per-run opinion".
+	CiAutofixEnabled *bool `json:"ci_autofix_enabled"`
 	// MrReworkAutoCycles and MrReworkAutoCap are the OWNER-ONLY view of the automatic
 	// rework loop guard (PRD #1202 D11), so the owner can see WHY the watcher stopped and
 	// decide whether to rework on demand. MrReworkAutoCycles is the ledger's attempt_count
@@ -2301,6 +2309,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		UsageEstimatedTail:            item.UsageEstimatedTail,
 		WaitOnLimit:                   item.WaitOnLimit,
 		MrReworkEnabled:               item.MrReworkEnabled,
+		CiAutofixEnabled:              item.CiAutofixEnabled,
 		MrReworkAutoCycles:            item.MrReworkAutoCycles,
 		MrReworkAutoCap:               item.MrReworkAutoCap,
 		LimitResetsAt:                 item.LimitResetsAt,
@@ -2498,6 +2507,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			UsageEstimatedTail:            s.UsageEstimatedTail,
 			WaitOnLimit:                   s.WaitOnLimit,
 			MrReworkEnabled:               s.MrReworkEnabled,
+			CiAutofixEnabled:              s.CiAutofixEnabled,
 			MrReworkAutoCycles:            s.MrReworkAutoCycles,
 			MrReworkAutoCap:               s.MrReworkAutoCap,
 			LimitResetsAt:                 s.LimitResetsAt,
