@@ -47,13 +47,15 @@ clone key and read that git as unattributed residue, failing the successor.
   the inventory operation, and the admitted seed's sweep can still meet it and
   take the terminal residue path, so an unreadable-only result is not clear (this
   replaces the earlier accepted boundary that treated it as clear). Consequence:
-  a non-dumpable runner-uid process that persists (measured on the uzi worker:
-  `uzi-codex-super`) keeps every probe unverified, so the exclusion stands.
-  Same-key seeds wait once, retry once and stop for retry nonterminally with
-  custody kept while it persists, and persistent stranding can exhaust requeues.
-  The production probe always carries a deadline (see Helper bounds), so an
-  unreadable pid there already yields unverified with no processes; the verdict
-  change is defense in depth at the verdict level.
+  a non-dumpable runner-uid process that persists keeps probes unverified only
+  while nothing positively attributes it (see Helper bounds). An attributed peer,
+  such as the Codex supervisor (`uzi-codex-super`, measured on the uzi worker),
+  no longer blocks. While an unattributed one persists the exclusion stands:
+  same-key seeds wait once, retry once and stop for retry nonterminally with
+  custody kept, and persistent stranding can exhaust requeues. The production
+  probe carries a deadline, and with it a per-PID access denial reaches
+  attribution instead of failing the table, so the verdict rule above is what
+  decides it.
 - **Helper bounds.** Before- and after-scan helpers also get their bound from the
   parent-side group kill at the gate deadline (`run-quiescence.ts`) and the
   section race. The inventory before- and after-scans (opt-in
@@ -62,18 +64,27 @@ clone key and read that git as unattributed residue, failing the successor.
   `ScanRequest`, so the helper's own scan and kill gates stop no later than `D`. Other helper
   scans (the #3980 gate checkpoints, terminal preservation) do not carry it,
   deliberately: forwarding it would let an attributed non-dumpable peer (the Codex
-  supervisor) block them. Effect, kept fail-closed: with a deadline set, the
-  helper's bounded table wrapper records an EACCES (or other non-ENOENT/ESRCH)
-  read of a pid's environ or cwd as a table failure, and the whole scan returns
-  unverified with no processes, after any kill an earlier pass already made.
-  Ancestry attribution of that pid, the #3915 late-root re-proof and the
-  unreadable-process reap are unreachable for these scans. A before-scan then
-  refuses `process_not_quiescent_before_git` and keeps custody, an after-scan
-  refuses `process_not_quiescent_after_git` and the exclusion is retained (full
-  probe skipped), and the probe is not clear.
-  Liveness cost: any unreadable runner-uid process on the worker, including an
-  attributed peer such as the Codex supervisor, blocks inventory source proofs
-  while it lives.
+  supervisor) block them.
+  In a scan whose serialized request carries `deadlineAt`, a per-PID EACCES or
+  EPERM on a process's `environ` or `cwd` is not a table failure. It reaches the
+  existing attribution (`attributedToOtherLive`): the pid, its pgid, sid or an
+  ancestor must be a recorded root, of another live attempt or a worker-launched
+  root, with matching pid and start time. Only such a positively attributed
+  process is exempt; there is no exemption by ancestry alone or by start-time
+  cutoff. An unattributed or ambiguous one (a start-time mismatch, say) reads
+  `unreadable_unattributed`: the scan is unverified, the clear verdict is not
+  clear and the exclusion stays. Still fail closed: any other errno, listPids,
+  status or stat read failures, the byte, PID and work budgets, and the deadline
+  itself. For the opted-in signalling inventory scans the
+  `mayKillUnreadableUnattributed` reap (uid split, no other live attempt or
+  claim) and the #3915 late-root re-proof are reachable again, as before the
+  deadline was forwarded. The #3980 checkpoints and terminal preservation do not
+  carry the serialized deadline and are unchanged. An expired helper result of a
+  deadline-forwarded scan is withdrawn as unverified in every result state, so a
+  late `survivors` result can never read clear.
+  Revised 2026-11-23 on the owner's review of MR !4643: the earlier accepted
+  liveness cost (any unreadable runner-uid process, including an attributed peer,
+  blocked inventory proofs) is withdrawn.
 - **Ambient scopes.** The section is bound by the ambient boundary, recovery
   operation, report and maintenance-budget scopes `withLock` honours: their
   signals abort it and their remaining time caps `D`. The predecessor path also
@@ -98,7 +109,9 @@ clone key and read that git as unattributed residue, failing the successor.
 - **Restart boundary.** The registry is process memory. A worker restart is
   safe only where the PID namespace ends with the worker (tini as PID 1, or
   docker-init over tini); other postures are logged once as not namespace-scoped
-  and fall back to the unchanged seed sweep after a restart.
+  and fall back to the unchanged seed sweep after a restart. A census stat read
+  that fails other than by vanishing (ENOENT, ESRCH), for example EACCES, also
+  makes the posture not scoped.
 - **Timing changes.** The inventory status read has a 3 s timeout instead of the
   10 min git default. The predecessor content proof is bounded by the section and
   fails closed on large trees; that path is disabled in production
@@ -108,8 +121,9 @@ clone key and read that git as unattributed residue, failing the successor.
   Containers are not covered by the probe. A descendant that forges a marker
   escapes the clear. A canonical reseed is over-excluded. While unmarked residue
   persists, a same-key claim waits once, retries once and stops, so repeated
-  claims can exhaust requeues; base would instead have killed that unmarked
-  residue in its seed sweep. The clear's bare-config reads and observe-only probe
+  claims can exhaust requeues; base would instead have failed the seed
+  terminally (`worker_residue_blocked`), since seed mode kills only
+  terminal-attempt residue and an unmarked in-scope process survives. The clear's bare-config reads and observe-only probe
   can outlive the section's budget on expiry, but stay tracked until they settle;
   none of them runs in the clone.
 - **Rollout.** The checks `source_lock_unavailable` and

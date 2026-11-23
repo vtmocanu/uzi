@@ -1506,11 +1506,12 @@ anything, the proof installs an in-memory exclusion keyed by bare repository and
 clone key. Once runner git has started, the exclusion clears only when every
 operation it started has settled and a fresh observe-only probe over the full
 same-key seed scope reads clear. The probe ignores marked processes of other
-attempts; unmarked residue in scope keeps the exclusion, and so does a probe that
-cannot verify the scan (for example an unreadable process owned by the runner
-user), so a persistent one can strand same-key seeds until requeues run out. The
-helper scans in the section enforce the section deadline themselves, and no
-stage starts after it.
+attempts; unmarked residue in scope keeps the exclusion. So does an unreadable process
+owned by the runner user, unless the worker can tie it (by process id and start
+time) to another live attempt or a worker-launched process; a persistent untied
+one can strand same-key seeds until requeues run out. A failed process-table
+read or the deadline also keeps it. The helper scans in the section enforce the
+section deadline themselves, and no stage starts after it.
 
 While a key is excluded, a same-key seed or orphan reclaim refuses
 nonterminally: it waits once (up to 30 s), retries once, then stops for retry
