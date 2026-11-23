@@ -90,6 +90,7 @@ function OutcomeAlert({ outcome, onReload, reloading }: { outcome: SaveOutcome; 
 export function ModelsSaveBar({
   dirtyRows,
   saving,
+  busy,
   blocked,
   outcome,
   reloading,
@@ -99,6 +100,8 @@ export function ModelsSaveBar({
   /** The accessible name of every changed value, in grid order. */
   dirtyRows: string[];
   saving: boolean;
+  /** A save or a reload is in flight: Save and Discard wait for it. */
+  busy: boolean;
   /** A local problem (an empty custom model ID) that must be fixed before saving. */
   blocked: boolean;
   outcome: SaveOutcome | null;
@@ -132,10 +135,10 @@ export function ModelsSaveBar({
           )}
         </p>
         <div className="flex justify-end gap-2">
-          <Button type="button" variant="secondary" disabled={saving || count === 0} onClick={onDiscard}>
+          <Button type="button" variant="secondary" disabled={busy || (count === 0 && !blocked)} onClick={onDiscard}>
             Discard
           </Button>
-          <Button type="submit" disabled={saving || count === 0 || blocked}>
+          <Button type="submit" disabled={busy || count === 0 || blocked}>
             {saving ? "Saving…" : "Save changes"}
           </Button>
         </div>

@@ -24,10 +24,10 @@ import {
   baselineFromSettings,
   buildModelsPatch,
   dirtyFields,
+  emptyCustomFields,
   fieldLabel,
   mapFieldErrors,
   MODELS_FIELDS,
-  normalizeValue,
   type ModelsField,
   type ModelsValues,
 } from "../lib/modelsDraft";
@@ -117,6 +117,12 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [outcome, setOutcome] = useState<SaveOutcome | null>(null);
   const [customMode, setCustomMode] = useState<Record<string, boolean>>({});
+  // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
+  // (whose value never changed, so it would not re-derive) returns to its stored option.
+  const [pickerGeneration, setPickerGeneration] = useState(0);
+  // Save and Reload never overlap: each disables the other, so neither can outrank the other's
+  // request token and leave its busy flag set.
+  const busy = saving || reloading;
 
   // A response is installed only if it answers the newest request, for this viewer, while
   // this editor is still mounted.
@@ -158,11 +164,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const dirty = useMemo(() => dirtyFields(baseline, draft), [baseline, draft]);
   const dirtyKeys = useMemo(() => new Set(dirty.map((f) => f.key)), [dirty]);
   // "Other (custom model ID)" with an empty box would otherwise save as Default while the
-  // picker still shows Other, so a changed value in that state blocks Save with its own error.
-  const customEmpty = useMemo(
-    () => new Set(dirty.filter((f) => f.kind === "model" && customMode[f.key] && normalizeValue(draft[f.key]) === "").map((f) => f.key)),
-    [dirty, customMode, draft],
-  );
+  // picker still shows Other, so any cell in that state, dirty or not, blocks Save with its own error.
+  const customEmpty = useMemo(() => new Set(emptyCustomFields(draft, customMode).map((f) => f.key)), [customMode, draft]);
 
   const setValue = (key: string, value: string) => {
     setDraft((d) => ({ ...d, [key]: value }));
@@ -179,11 +182,12 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     setDraft(baseline);
     setFieldErrors({});
     setOutcome(null);
+    setPickerGeneration((g) => g + 1);
   }, [baseline]);
 
   const save = async (e?: FormEvent) => {
     e?.preventDefault();
-    if (saving || dirty.length === 0 || customEmpty.size > 0) return;
+    if (busy || dirty.length === 0 || customEmpty.size > 0) return;
     const seq = ++requestSeq.current;
     const count = dirty.length;
     setSaving(true);
@@ -218,13 +222,16 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         setOutcome({ kind: "unknown" });
       }
     } finally {
-      if (isCurrent(seq)) setSaving(false);
+      // Cleared whenever still mounted, not only for the newest request: a busy flag left set
+      // by a superseded request would disable its button for good.
+      if (mounted.current) setSaving(false);
     }
   };
 
   // Reconciliation after an uncertain save: re-read what is stored and make it the baseline,
   // keeping the draft, so the dirty set shows exactly which edits are not stored. No retry.
   const reload = async () => {
+    if (busy) return;
     const seq = ++requestSeq.current;
     setReloading(true);
     try {
@@ -238,7 +245,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     } catch (err) {
       if (isCurrent(seq)) setOutcome({ kind: "reload_failed", message: errorMessage(err, "request failed") });
     } finally {
-      if (isCurrent(seq)) setReloading(false);
+      if (mounted.current) setReloading(false);
     }
   };
 
@@ -292,6 +299,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     const cell = planning ? settings.planning_models?.find((c) => c.harness === field.family) : workerModelCell(field.family!);
     return (
       <ModelSelect
+        key={pickerGeneration}
         id={ids.control}
         value={draft[field.key] ?? ""}
         onChange={(v) => setValue(field.key, v)}
@@ -334,7 +342,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   return (
     <form onSubmit={(e) => void save(e)} className="space-y-4 pb-6" noValidate>
       <UnsavedModelsGuard dirtyCount={dirty.length} viewerId={viewerId} onDiscard={discard} />
-      <fieldset disabled={saving} className="min-w-0 space-y-4 disabled:opacity-80">
+      <fieldset disabled={busy} className="min-w-0 space-y-4 disabled:opacity-80">
         <legend className="sr-only">Model settings</legend>
         <Card className="space-y-1">
           <p id="models-precedence" className="max-w-prose text-sm text-muted">
@@ -413,6 +421,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       <ModelsSaveBar
         dirtyRows={dirtyRows}
         saving={saving}
+        busy={busy}
         blocked={customEmpty.size > 0}
         outcome={outcome}
         reloading={reloading}

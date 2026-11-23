@@ -54,7 +54,15 @@ export function UnsavedModelsGuard({
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [dirty]);
 
-  if (blocker.state !== "blocked") return null;
+  // Nothing left unsaved while the dialog is open (a pending save finished, or the draft was
+  // edited back): the user asked to leave and there is nothing to lose, so let them go rather
+  // than ask about "0 changes".
+  const blockedClean = blocker.state === "blocked" && !dirty;
+  useEffect(() => {
+    if (blockedClean) blocker.proceed?.();
+  }, [blockedClean, blocker]);
+
+  if (blocker.state !== "blocked" || !dirty) return null;
   const stay = () => blocker.reset();
   const discard = () => {
     onDiscard();

@@ -365,6 +365,47 @@ describe("Models page", () => {
     fireEvent.change(screen.getByLabelText("Worker model — Claude, custom model ID"), { target: { value: "claude-x" } });
     expect(saveButton().disabled).toBe(false);
   });
+
+  it("blocks Save on an empty custom ID even when that cell is not dirty, and Discard leaves custom mode", async () => {
+    // Stored Default (""), then Other with an empty box: the value is still "", so not dirty.
+    mount();
+    await screen.findByLabelText("Worker model — Claude");
+    select("Worker model — Claude", "custom");
+    select("Worker model — Codex", "gpt-6-sol");
+    expect(status()).toBe("1 unsaved change: Worker model — Codex");
+    expect(describedText("Worker model — Claude")).toContain("Enter a custom model ID, or choose Default.");
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(discardButton());
+    expect(control("Worker model — Claude").value).toBe("inherit");
+    expect(screen.queryByLabelText("Worker model — Claude, custom model ID")).toBeNull();
+    expect(describedText("Worker model — Claude")).not.toContain("Enter a custom model ID");
+    // With only the non-dirty empty custom entry left, Discard still clears it.
+    select("Worker model — Claude", "custom");
+    expect(status()).toBe("No unsaved changes");
+    expect(discardButton().disabled).toBe(false);
+    fireEvent.click(discardButton());
+    expect(control("Worker model — Claude").value).toBe("inherit");
+  });
+
+  it("a Save attempted while Reload is pending cannot leave Reload stuck", async () => {
+    mockApi.putMyModelSettings.mockRejectedValue(new TypeError("Failed to fetch"));
+    mount();
+    await screen.findByLabelText("Worker model — Codex");
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText(/could not confirm whether this save was applied/);
+    const reloadPending = deferred<{ settings: UserSettings }>();
+    mockApi.getMySettings.mockReturnValueOnce(reloadPending.promise);
+    fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
+    await waitFor(() => expect(within(bar()).getByRole("button", { name: "Reloading…" })).toBeTruthy());
+    // Save while the reload is in flight: it must not start a request that outranks the reload.
+    fireEvent.click(saveButton());
+    await act(async () => {});
+    await act(async () => reloadPending.reject(new TypeError("Failed to fetch")));
+    const reload = await within(bar()).findByRole("button", { name: "Reload saved settings" });
+    expect((reload as HTMLButtonElement).disabled).toBe(false);
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("viewer fencing", () => {

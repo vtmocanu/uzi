@@ -99,6 +99,13 @@ export function dirtyFields(baseline: ModelsValues, draft: ModelsValues, fields:
   return fields.filter((f) => normalizeValue(draft[f.key]) !== normalizeValue(baseline[f.key]));
 }
 
+/** emptyCustomFields lists every model field whose picker is in "Other (custom model ID)" mode
+ *  with an empty box, dirty or not: saving would send Default while the picker still shows Other,
+ *  so the page blocks Save on any of them. */
+export function emptyCustomFields(draft: ModelsValues, customMode: Readonly<Record<string, boolean>>, fields: readonly ModelsField[] = MODELS_FIELDS): ModelsField[] {
+  return fields.filter((f) => f.kind === "model" && customMode[f.key] === true && normalizeValue(draft[f.key]) === "");
+}
+
 /** buildModelsPatch is the one save body: only dirty fields, trimmed, Default as null. Pin
  *  members of one stage/harness cell share one cross_check_pins entry, in field order. */
 export function buildModelsPatch(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): ModelSettingsPatch {

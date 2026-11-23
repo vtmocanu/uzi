@@ -6,7 +6,8 @@
 // navigate("/login"), which can reach the router before that render, is covered by the /login
 // rule.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { useEffect, useState } from "react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { UnsavedModelsGuard } from "./UnsavedModelsGuard";
 
@@ -42,6 +43,32 @@ describe("UnsavedModelsGuard", () => {
     act(() => screen.getByRole("button", { name: "Discard changes" }).click());
     expect(onDiscard).toHaveBeenCalledTimes(1);
     expect(router.state.location.pathname).toBe("/settings/run-defaults");
+  });
+
+  it("proceeds when the draft stops being dirty while the dialog is open (a pending save finished)", async () => {
+    const onDiscard = vi.fn();
+    const host: { setDirty?: (n: number) => void } = {};
+    function Host() {
+      const [n, set] = useState(1);
+      useEffect(() => {
+        host.setDirty = set;
+      }, []);
+      return <UnsavedModelsGuard dirtyCount={n} viewerId="u1" onDiscard={onDiscard} />;
+    }
+    const router = createMemoryRouter(
+      [
+        { path: "/settings/models", element: <Host /> },
+        { path: "*", element: <p>elsewhere</p> },
+      ],
+      { initialEntries: ["/settings/models"] },
+    );
+    render(<RouterProvider router={router} />);
+    await act(() => router.navigate("/schedules"));
+    expect(screen.getByRole("dialog", { name: DIALOG })).toBeTruthy();
+    await act(async () => host.setDirty!(0));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/schedules"));
+    expect(screen.queryByText(/0 changes/)).toBeNull();
+    expect(onDiscard).not.toHaveBeenCalled();
   });
 
   it("does not block /login, a same-path change, or a clean page", async () => {

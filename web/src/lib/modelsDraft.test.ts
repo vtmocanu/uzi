@@ -4,6 +4,7 @@ import {
   baselineFromSettings,
   buildModelsPatch,
   dirtyFields,
+  emptyCustomFields,
   fieldLabel,
   mapFieldErrors,
   MODELS_FIELDS,
@@ -125,5 +126,18 @@ describe("modelSettingsFieldErrors / modelSettingsFailureReason (lib/api)", () =
     expect(modelSettingsFailureReason(new ApiError(500, "x", { reason: "settings_saved_readback_failed" }))).toBe("settings_saved_readback_failed");
     expect(modelSettingsFailureReason(new ApiError(500, "internal error", { error: "internal error" }))).toBeNull();
     expect(modelSettingsFailureReason(new Error("network"))).toBeNull();
+  });
+});
+
+describe("emptyCustomFields", () => {
+  it("flags a model cell in custom mode with an empty ID whether or not it is dirty", () => {
+    const base = baselineFromSettings(settings({ default_codex_model: "gpt-6-sol" }));
+    // Stored Default, Other with an empty box: not dirty, still flagged.
+    const draft = { ...base, default_codex_model: "  " };
+    expect(dirtyFields(base, base).length).toBe(0);
+    const custom = { default_claude_model: true, default_codex_model: true, planning_claude_model: false };
+    expect(emptyCustomFields(draft, custom).map((f) => f.key)).toEqual(["default_claude_model", "default_codex_model"]);
+    expect(emptyCustomFields({ ...draft, default_claude_model: "claude-x" }, custom).map((f) => f.key)).toEqual(["default_codex_model"]);
+    expect(emptyCustomFields(draft, {})).toEqual([]);
   });
 });
