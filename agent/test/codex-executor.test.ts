@@ -38835,11 +38835,31 @@ describe("M2 provider executor composition", () => {
         const { ctx } = makeCtx({ config, leadConfig: reporter,
           ...(route === "thread/resume" ? { sessionId: "th-1" } : {}),
           redactText: makeTextRedactor(providerKeyForms(runtimeKey)) });
-        await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "bounded runtime report");
+        const result = await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "bounded runtime report");
         assert.equal(rig.transport.requests.filter(r => r.method === route).length, 1);
+        if (route === "thread/resume") {
+          // An implementation resume verifies the observed thread model against the mapped wire
+          // model, with no provider exemption: every observation other than "corp-code" holds the run
+          // before any turn, and the hold evidence carries scrubbed text only.
+          assert.equal(result.phaseSwitchHeld?.phase, "implement");
+          assert.equal(result.phaseSwitchHeld?.cause, "model_mismatch");
+          assert.equal(rig.transport.turnStartCount, 0, "a model mismatch holds before turn/start");
+          assert.equal(result.phaseSwitchHeld?.requested.model, "corp-code");
+          assert.ok(posts.every(p => p.observed_model === null), "no observation follows a held resume");
+          for (const p of posts) assert.equal(p.requested_model, "corp-code", "a requested row reports the mapped wire model");
+          if (index === 0) assert.equal(result.phaseSwitchHeld?.observed.model, "corp-observed-clean");
+          for (const [sink, value] of Object.entries({ posts, logs: lines, held: result.phaseSwitchHeld })) {
+            const serialized = JSON.stringify(value);
+            for (const form of runtimeForms) {
+              assert.ok(!serialized.includes(form), `provider credential escaped ${sink}; held form=${index}`);
+              assert.ok(!serialized.includes(JSON.stringify(form).slice(1, -1)), `escaped provider credential escaped ${sink}; held form=${index}`);
+            }
+          }
+          return;
+        }
         assert.equal(rig.transport.turnStartCount, 1, "observation follows accepted turn/start");
         assert.equal(posts.length, 2, "requested and observed rows reached report client");
-        assert.equal(posts[0]!.requested_model, provider.model, "requested row retains logical provider default");
+        assert.equal(posts[0]!.requested_model, "corp-code", "requested row reports the mapped wire model, never the vendor default");
         assert.equal(rec(rig.transport.requests.find(r => r.method === "turn/start")!.params).model, "corp-code", "wire uses mapped provider default");
         assert.equal(posts[0]!.requested_model_source, "builtin");
         assert.equal(posts[1]!.observed_effort, "medium");
@@ -38856,6 +38876,31 @@ describe("M2 provider executor composition", () => {
       });
     }
   }
+
+  it("a resumed implementation whose thread answers with the wire model proceeds to its turn", async () => {
+    const binding = createCodexProviderExecutionAuthority({ ...providerClaim(), credential: runtimeKey });
+    const posts: LeadConfigReportBody[] = [];
+    const { logger } = recordingLogger();
+    const config = { default_effort_source: "builtin" as const };
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_id, body) { posts.push(structuredClone(body)); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger,
+    });
+    const rig = makeRig({ responder: c => {
+      const answer = c.method === "thread/resume" ? { thread: { id: "th-1" } } : defaultResponder(c);
+      return c.method === "thread/resume" ? { ...rec(answer), model: "corp-code", reasoningEffort: "medium" } : answer;
+    } });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted()).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter, sessionId: "th-1",
+      redactText: makeTextRedactor(providerKeyForms(runtimeKey)) });
+    const result = await withTimeout(makeExecutor(rig, binding, logger).run(ctx), 3000, "wire-model resume");
+    assert.equal(result.phaseSwitchHeld, undefined);
+    assert.equal(rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(rig.transport.turnStartCount, 1, "the verified resume dispatches its turn");
+    assert.equal(rec(rig.transport.requests.find(r => r.method === "turn/start")!.params).model, "corp-code");
+    assert.equal(posts[0]!.requested_model, "corp-code");
+    assert.equal(posts[1]!.observed_model, "corp-code");
+  });
 
   it("refuses unmapped explicit models before login or vendor release", async () => {
     const rig = makeRig();
@@ -39629,4 +39674,117 @@ describe("B2 cold approval model handoff", () => {
       assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "one implementation segment after replacement");
     });
   }
+});
+
+// Issue #4323: provider-bound plan -> implement phase models. Only a model whose source is run_override
+// or schedule_pin is an explicit owner choice (its own map key or provider_model_unmapped); every
+// uzi-selected model (the owner's planning default, user default, template) uses its own key when the
+// map has one and the `default` slot otherwise. Effort passes through unchanged; the lead-config row
+// reports the mapped wire model; a provider run's per-model segments carry token counts but no cost.
+describe("provider phase models (issue #4323)", () => {
+  afterEach(() => { mock.restoreAll(); });
+  const saved = "p4323-thread";
+  const planTurn = "p4323-plan-turn";
+  const planResponder = (): Responder => epochResponder(saved, planTurn, (t, th, tn) => {
+    t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+      .push(toolCall(1, "submit_plan", { plan_md: "bounded implementation" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn));
+  });
+  const implementResponder = (observe?: (model: unknown) => string): Responder => c => {
+    if (c.method === "thread/resume") {
+      c.transport.push(tokenUsageUpdated(saved, planTurn, { inputTokens: 100, totalTokens: 100 }));
+      const wire = rec(c.params).model;
+      return { thread: { id: rec(c.params).threadId }, model: observe ? observe(wire) : wire };
+    }
+    if (c.method === "turn/start") {
+      const tn = "p4323-implement";
+      c.transport.push({ kind: "turn_started", method: "turn/started", threadId: saved, turnId: tn,
+        params: { threadId: saved, turn: { id: tn } } })
+        .push(tokenUsageUpdated(saved, tn, { inputTokens: 160, totalTokens: 160 }, { inputTokens: 60, totalTokens: 60 }))
+        .push(signalDone(saved, tn)).push(turnCompleted("completed", saved, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const approval = async () => ({ kind: "approve", selection: { status: "ok",
+    selection: { source: "own", exclusions: [] } } }) as never;
+  const claimWith = (model_map: Record<string, { model: string }>) => ({
+    provider_id: "phase-gateway", revision: 1, engine: "codex" as const, protocol: "openai_responses" as const,
+    auth_style: "bearer" as const, base_url: "https://gateway.example.test/v1",
+    credential: ["phase", "gateway", "key", "0123456789"].join("-"), model_map,
+  }) as import("../src/protocol.js").ClaimCodexProviderBinding;
+  const planPin = (source: "user_planning_default" | "run_override" | "schedule_pin"): ClaimConfig => ({
+    default_model: "gpt-6.1-sol", default_model_source: "user_default",
+    default_effort: "medium", default_effort_source: "user_default",
+    plan_phase: { model: "gpt-6-astra", model_source: source, effort: "high", effort_source: "user_planning_default" },
+  });
+  const drive = async (config: ClaimConfig, map: Record<string, { model: string }>) => {
+    const posts: LeadConfigReportBody[] = [];
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_id, body) { posts.push(structuredClone(body)); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger: noopLog,
+    });
+    const rig = makeMultiEpochRig([planResponder(), implementResponder()]);
+    const { ctx, emitted } = makeCtx({ config, leadConfig: reporter, planApproved: false, approvedPlan: undefined,
+      gatePlan: approval, reportIteration: async () => {} });
+    const exec = makeExecutor(rig, createCodexProviderExecutionAuthority(claimWith(map)));
+    return { rig, posts, emitted, run: () => withTimeout(exec.run(ctx), 5000, "provider phase models") };
+  };
+  const turnOf = (transport: FakeTransport) => rec(transport.requests.find(r => r.method === "turn/start")!.params);
+
+  it("the owner's planning default and the implement model resolve through their own keys, else default", async () => {
+    const { rig, posts, run } = await drive(planPin("user_planning_default"),
+      { default: { model: "corp-default" }, "gpt-6.1-sol": { model: "corp-sol" } });
+    const result = await run();
+    assert.equal(result.phaseSwitchHeld, undefined);
+    // gpt-6-astra has no key: uzi-selected, so the default slot. gpt-6.1-sol has its own key.
+    assert.equal(turnOf(rig.epochs[0]!.transport).model, "corp-default");
+    assert.equal(turnOf(rig.epochs[0]!.transport).effort, "high");
+    assert.equal(rec(rig.epochs[1]!.transport.requests.find(r => r.method === "thread/resume")!.params).model, "corp-sol");
+    assert.equal(turnOf(rig.epochs[1]!.transport).model, "corp-sol");
+    assert.equal(turnOf(rig.epochs[1]!.transport).effort, "medium");
+    assert.deepEqual(posts.filter(p => p.observed_model === null).map(p => [p.phase, p.requested_model, p.requested_effort]),
+      [["plan", "corp-default", "high"], ["implement", "corp-sol", "medium"]],
+      "the lead-config rows report the mapped wire models, never the vendor ids");
+  });
+
+  it("an owner implement pin (run_override) next to an unmapped model refuses at implement, not at planning", async () => {
+    const config: ClaimConfig = { ...planPin("user_planning_default"), default_model_source: "run_override" };
+    const { rig, run } = await drive(config, { default: { model: "corp-default" } });
+    await assert.rejects(run(), /provider_model_unmapped/);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the uzi-selected planning model ran on the default slot");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+  });
+
+  for (const source of ["run_override", "schedule_pin"] as const) {
+    it(`an explicit planning model (${source}) must have its own key`, async () => {
+      const { rig, run } = await drive(planPin(source), { default: { model: "corp-default" }, "gpt-6.1-sol": { model: "corp-sol" } });
+      await assert.rejects(run(), /provider_model_unmapped/);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 0, "refused before any provider turn");
+    });
+
+    it(`an explicit planning model (${source}) with its own key resolves through it`, async () => {
+      const { rig, run } = await drive(planPin(source),
+        { default: { model: "corp-default" }, "gpt-6-astra": { model: "corp-astra" }, "gpt-6.1-sol": { model: "corp-sol" } });
+      assert.equal((await run()).phaseSwitchHeld, undefined);
+      assert.equal(turnOf(rig.epochs[0]!.transport).model, "corp-astra");
+      assert.equal(turnOf(rig.epochs[1]!.transport).model, "corp-sol");
+    });
+  }
+
+  it("crossing a planning to implementation segment cut leaves both vendor-named mapped models unpriced", async () => {
+    // The mapped names equal vendor ids that codex-pricing.json prices; a provider run must never use them.
+    const { emitted, run } = await drive(planPin("user_planning_default"),
+      { default: { model: "gpt-6-astra" }, "gpt-6.1-sol": { model: "gpt-6.1-sol" } });
+    const result = await run();
+    assert.equal(result.phaseSwitchHeld, undefined);
+    const usage = lastResultModelUsage(emitted)!;
+    assert.deepEqual(Object.keys(usage).sort(), ["gpt-6-astra", "gpt-6.1-sol"]);
+    assert.equal(rec(usage["gpt-6-astra"]).inputTokens, 100, "planning segment");
+    assert.equal(rec(usage["gpt-6.1-sol"]).inputTokens, 60, "implementation segment");
+    for (const model of ["gpt-6-astra", "gpt-6.1-sol"]) {
+      assert.equal(rec(usage[model]).costStatus, "unreported", model);
+      assert.equal(rec(usage[model]).costUSD, undefined, model);
+    }
+  });
 });

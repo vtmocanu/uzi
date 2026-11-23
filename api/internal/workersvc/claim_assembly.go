@@ -518,10 +518,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// review run left defaultModel nil above and is exempt; judge/chat never reach here. A custom
 	// id is exactly one harnessModelCompatible rejects for the Codex harness (non-empty,
 	// non-curated), so the same closed vocabulary decides the claim gate and this re-check.
-	if harness == HarnessCodex && !isReviewRun &&
-		defaultModel.Valid && !harnessModelCompatible(HarnessCodex, defaultModel.String) &&
-		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
-		return nil, errCustomModelCapabilityMissing
+	if harness == HarnessCodex && !isReviewRun && defaultModel.Valid {
+		if err := requireCodexCustomModelCapability(run, defaultModel.String, wkr.ProtocolCapabilities); err != nil {
+			return nil, err
+		}
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). Ordinary lanes resolve NULL
@@ -574,10 +574,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 		// Resolve the final plan before checking custom passthrough: effort-only planning inherits
 		// the effective root model, and a planning model may differ from the implementation root.
-		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil &&
-			!harnessModelCompatible(HarnessCodex, *leadSettings.Plan.Model) &&
-			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
-			return nil, errCustomModelCapabilityMissing
+		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil {
+			if err := requireCodexCustomModelCapability(run, *leadSettings.Plan.Model, wkr.ProtocolCapabilities); err != nil {
+				return nil, err
+			}
 		}
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
@@ -1608,4 +1608,18 @@ func phaseModelsCapability(h Harness) string {
 		return capability.CodexPhaseModelsV1
 	}
 	return capability.ClaudePhaseModelsV1
+}
+
+// requireCodexCustomModelCapability returns errCustomModelCapabilityMissing when a Codex run's
+// effective model is not in the curated vocabulary and the worker lacks codex_custom_model_v1. A
+// provider-bound run is exempt: its model names are slots in the frozen provider map, resolved by
+// the worker, never vendor models. Phase-model capability is checked separately.
+func requireCodexCustomModelCapability(run store.Run, model string, caps []string) error {
+	if providerBoundRun(run) {
+		return nil
+	}
+	if !harnessModelCompatible(HarnessCodex, model) && !slices.Contains(caps, capability.CodexCustomModelV1) {
+		return errCustomModelCapabilityMissing
+	}
+	return nil
 }

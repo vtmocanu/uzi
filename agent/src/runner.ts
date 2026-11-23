@@ -3390,15 +3390,31 @@ export function isFinalizeBoundResult(
     !result.phaseSwitchHeld;
 }
 
-/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are clipped
- *  and stripped of control characters; nothing else from the runtime reaches the feed. */
+/** Whether the claim runs on the Codex engine, vendor block or Codex provider binding alike. Uses the
+ *  engine-aware selector; a malformed Codex block or binding throws there (fail-closed executor), so it
+ *  counts as Codex-bound here too. */
+function isCodexBoundClaim(claim: ClaimResponse): boolean {
+  let codexBound = false;
+  try {
+    codexBound = selectCodexExecutionAuthority(claim.secrets).kind === "codex";
+  } catch {
+    codexBound = true;
+  }
+  return codexBound;
+}
+
+/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are redacted
+ *  (every registered secret form, including a provider key's encodings), then stripped of control
+ *  characters and clipped; nothing else from the runtime reaches the feed. Redaction precedes the clip so
+ *  a clip can never leave a prefix of a secret that no longer matches a registered form. */
 function phaseSwitchHoldText(
   phase: "plan" | "implement",
   cause: PhaseSwitchCause,
   requested: PhaseSettings,
   observed: PhaseSettings,
+  redact: (text: string) => string,
 ): string {
-  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : v.replace(/[^\x20-\x7e]/g, "").slice(0, 80));
+  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : redact(v).replace(/[^\x20-\x7e]/g, "").slice(0, 80));
   const tail = "Resume retries on a new claim; Cancel ends the run.";
   const kept = phase === "implement" ? "planning" : "implementation";
   const mismatch = (noun: "model" | "effort"): string => {
@@ -16015,7 +16031,7 @@ export class RunRunner {
     // Codex can only re-present the persisted gate with its preflighted conversation.
     // Without it the executor replans, so buffered approval must not inherit the old gate.
     // SDK retains its existing session-less gate recovery behaviour.
-    if (claim.secrets.codex && !sessionId && claim.plan_approved !== true && claim.plan_md?.trim()) {
+    if (isCodexBoundClaim(claim) && !sessionId && claim.plan_approved !== true && claim.plan_md?.trim()) {
       this.gatedRuns.add(runId);
       this.gateResumes.delete(runId);
     }
@@ -16229,12 +16245,7 @@ export class RunRunner {
     // A Codex-bound claim never reads, writes or shows the memo (Codex has no seam for it), so
     // skip the GET entirely. Same discriminator makeExecutor's seam uses; a malformed Codex
     // block throws there (fail-closed executor), so it counts as Codex-bound here too.
-    let codexBound = false;
-    try {
-      codexBound = selectCodexExecutionAuthority(claim.secrets).kind === "codex";
-    } catch {
-      codexBound = true;
-    }
+    const codexBound = isCodexBoundClaim(claim);
     if (isDecisionsMemoKind(claimKind) && !codexBound) {
       try {
         const parsed = parseDecisionsMemoResponse(
@@ -27454,7 +27465,7 @@ export class RunRunner {
       }
     }
     // 3. Status line, flushed ahead of the hold request.
-    batcher.emit({ kind: "status", agent: "worker", payload: { text: phaseSwitchHoldText(phase, cause, requested, observed) } });
+    batcher.emit({ kind: "status", agent: "worker", payload: { text: phaseSwitchHoldText(phase, cause, requested, observed, flight.redactText) } });
     await batcher.flush(AbortSignal.timeout(this.completionHoldReconcileTimeoutMs)).catch(() => undefined);
     // 4. The hold request, retried against ownership evidence.
     const deadline = Date.now() + this.phaseSwitchHoldDeadlineMs;

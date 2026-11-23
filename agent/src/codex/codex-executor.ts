@@ -5905,9 +5905,7 @@ export class CodexExecutor implements Executor {
     } = shared;
     const { binding, committedGeneration } = authority;
     authority.assertCurrent();
-    const providerSlot = binding.authMode === "provider"
-      ? resolveCodexProviderModelSlot(this.leadRequestFor(ctx, "plan").model, binding.providerBinding.model_map, (ctx.config?.default_model_source === "run_override" || ctx.config?.default_model_source === "schedule_pin"))
-      : undefined;
+    const providerSlot = binding.authMode === "provider" ? this.providerSlotFor(ctx, "plan") : undefined;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
     // owner/group/mode/directory-type immediately before each credentialed provider root. The
@@ -6592,7 +6590,7 @@ export class CodexExecutor implements Executor {
         const reporter = ctx.leadConfig;
         // Scrub reporting copies before validation or reporter retention; execution keeps
         // the original request. scrubLeadText combines claim and runtime-released secrets.
-        const entry = await reporter.enterPhase(phase, redactStrings(this.leadRequestFor(ctx, phase), scrubLeadText));
+        const entry = await reporter.enterPhase(phase, redactStrings(this.reportedLeadRequestFor(ctx, phase), scrubLeadText));
         onRuntimeConfig = (obs) => {
           try {
             reporter.observe(entry, toLeadObservation(redactStrings(obs, scrubLeadText)));
@@ -7390,6 +7388,27 @@ export class CodexExecutor implements Executor {
     });
   }
 
+  /** The provider map slot a phase's lead model resolves to on a provider-bound run (undefined for a vendor
+   *  run). Only a model whose source is `run_override` or `schedule_pin` is an explicit owner choice and
+   *  must have its own map key; every uzi-selected model (the owner's planning default, user default,
+   *  template, built-in) uses its own key when the map has one and the `default` slot otherwise. The source
+   *  is the one the phase's request carries, so a planning model is judged by its own source. */
+  private providerSlotFor(ctx: RunContext, phase: "plan" | "implement", request = this.leadRequestFor(ctx, phase)): keyof import("../protocol.js").ClaimCodexProviderBinding["model_map"] | undefined {
+    const binding = this.opts.binding;
+    if (binding.authMode !== "provider") return undefined;
+    return resolveCodexProviderModelSlot(request.model, binding.providerBinding.model_map,
+      request.modelSource === "run_override" || request.modelSource === "schedule_pin");
+  }
+
+  /** The lead request as reported to the lead-config row. A provider run reports the mapped gateway
+   *  model it actually sends and observes, never the logical vendor name; effort and sources pass through. */
+  private reportedLeadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
+    const request = this.leadRequestFor(ctx, phase);
+    const binding = this.opts.binding;
+    if (binding.authMode !== "provider") return request;
+    return { ...request, model: binding.providerBinding.model_map[this.providerSlotFor(ctx, phase, request)!]!.model };
+  }
+
   private buildRunRequest(
     ctx: RunContext,
     phase: "plan" | "implement",
@@ -7491,7 +7510,7 @@ export class CodexExecutor implements Executor {
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
       model: this.opts.binding.authMode === "provider"
-        ? this.opts.binding.providerBinding.model_map[resolveCodexProviderModelSlot(leadRequest.model, this.opts.binding.providerBinding.model_map, (ctx.config?.default_model_source === "run_override" || ctx.config?.default_model_source === "schedule_pin"))]!.model
+        ? this.opts.binding.providerBinding.model_map[this.providerSlotFor(ctx, phase, leadRequest)!]!.model
         : leadRequest.model!,
       // PRD #1551 (D4/D5): mark the ROOT model's provenance ONLY when it came from the
       // server-shipped phase/default model (present and non-empty). This is the sole

@@ -171,6 +171,53 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     });
   }
 
+  // A provider-bound Codex claim carries secrets.provider (engine codex) and NO secrets.codex. Its
+  // lost-session replan must gate exactly like the vendor Codex claim above: the buffered approve
+  // belongs to the old gate and must not approve the fresh candidate.
+  it("provider-bound Codex replaces the persisted gate identity when its session is lost", { skip: LINUX_ONLY }, async () => {
+    newApi();
+    const { gitlab } = fakeGitlab();
+    const homeRoot = path.join(fx.dataDir, "gate-preflight-provider");
+    const presentationId = "0f5c2d4e-1111-4a2b-8c3d-000000000002";
+    const plan = "persisted candidate";
+    const claim = gitlabClaim(706, {
+      claim_generation: 2, session_id: SID, plan_approved: false, plan_md: plan,
+      plan_source: "agent", resume_phase: "awaiting_approval",
+      resume_plan_at: "2000-01-01T00:00:00.000000Z",
+      resume_gate_revision: 3, resume_gate_presentation_id: presentationId,
+      secrets: { forge_pat: "fixture-forge", forge_username: "bot", provider: {
+        provider_id: "codex-gate-proof", revision: 1, engine: "codex", protocol: "openai_responses",
+        base_url: "https://gateway.example.test/v1", auth_style: "bearer",
+        credential: ["pk", "-gate-proof-", "0123456789abcdef"].join(""),
+        model_map: { default: { model: "corp-codex" } },
+      } },
+    });
+    api.setInputClaimGeneration(claim.run_id, 2);
+    api.seedGate(claim.run_id, { revision: 3, presentationId, historical: [], payload: { plan_md: plan } });
+    send(claim.run_id, row("approve_plan", null, { gate_binding: "bound", gate_revision: 3 }));
+    api.onState(claim.run_id, body => {
+      if (body.status === "awaiting_approval") send(claim.run_id, row("reject_plan", "fresh gate"));
+    });
+    let verdict: string | undefined;
+    await runnerWith(runId => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        resumesAtGate: true,
+        run: async ctx => {
+          assert.equal(ctx.sessionId, undefined);
+          assert.equal(await ctx.takeResumedGateEvent?.(), undefined, "queued approve stays buffered");
+          verdict = (await ctx.gatePlan!(plan)).kind;
+          throw new Error("gate identity observed");
+        },
+      },
+    }), gitlab).execute(claim);
+    const [gate] = gates(claim.run_id);
+    assert.ok(gate, "the candidate was presented");
+    assert.notEqual(gate.presentation_id, presentationId, "a lost-session gate is a fresh presentation");
+    assert.equal(api.gateOf(claim.run_id).revision, 4);
+    assert.equal(verdict, "reject");
+  });
+
   it("drops the resume and says so when the transcript is not on this worker", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-resume-"));

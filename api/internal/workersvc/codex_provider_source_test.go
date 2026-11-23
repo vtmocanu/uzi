@@ -283,3 +283,19 @@ func (f *sourceMatrixStore) GetUserProviderLaneSources(context.Context, uuid.UUI
 	f.sourceReads++
 	return store.GetUserProviderLaneSourcesRow{ClaudeProviderID: f.claude.ProviderID, CodexProviderID: f.source.ProviderID}, nil
 }
+
+// A Codex provider-bound lead-lane run never consults the owner's planning default at create: it is
+// uzi-selected and resolves through its own map key or `default`. The nil Queries would panic on any
+// planning lookup, so reaching nil proves none happened.
+func TestCodexProviderCreateIgnoresUnmappedPlanningDefault(t *testing.T) {
+	src := EvaluateProviderSource("codex", codexSourceRow(), allowOnly(pvBase)).Source
+	for _, origin := range []string{"", string(leadcfg.ModelSourceUserDefault), string(leadcfg.ModelSourceUserPlanningDefault)} {
+		run := store.Run{Kind: "issue", Model: pgtype.Text{String: "not-in-map-planning", Valid: true}, ModelSource: pgtype.Text{String: origin, Valid: origin != ""}}
+		if origin == "" {
+			run.Model = pgtype.Text{}
+		}
+		if err := (&Service{}).checkProviderModels(context.Background(), nil, run, src); err != nil {
+			t.Fatalf("origin=%q: %v", origin, err)
+		}
+	}
+}

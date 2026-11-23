@@ -2073,3 +2073,61 @@ describe("provider advice foundation", () => {
     }
   });
 });
+
+// Issue #4323: the task-review model is uzi-selected, never an explicit owner pin, so on a provider
+// claim it resolves through its own map key when present and the `default` slot otherwise. The
+// configured review effort passes through unchanged.
+describe("provider task review: model resolution and effort (issue #4323)", () => {
+  const reviewClaim = (model: string | undefined, effort: string | undefined) => ({
+    run_id: "review-run", claim_generation: 3, kind: "task", review_target_run_id: "target", branch: "topic",
+    last_seq: 0, agents: [], repo: { clone_url: "https://example.test/repo.git", default_branch: "main" },
+    ...(model !== undefined ? { task_review_model: model } : {}),
+    ...(effort !== undefined ? { task_review_effort: effort } : {}),
+    secrets: { forge_pat: "", provider: {
+      provider_id: "review-gateway", revision: 1, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example/v1", auth_style: "bearer", credential: "review-fixture-key-0123456789",
+      model_map: { default: { model: "corp-default" }, "gpt-6.1-sol": { model: "corp-sol" } },
+    } },
+  }) as unknown as import("../src/protocol.js").ClaimResponse;
+
+  for (const [label, model, effort, wire] of [
+    ["a mapped review model uses its own key", "gpt-6.1-sol", "high", "corp-sol"],
+    ["an unmapped review model uses the default slot", "gpt-6-luna", "low", "corp-default"],
+    ["no configured review model uses the built-in model through the default slot", undefined, undefined, "corp-default"],
+  ] as const) {
+    it(label, async () => {
+      const fs = await import("node:fs/promises");
+      const { fileURLToPath } = await import("node:url");
+      const { ReviewRunner } = await import("../src/review-runner.js");
+      await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
+      const homeRoot = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/p4323-review-", import.meta.url)));
+      let posted: { status?: string; summary?: string } | undefined;
+      const failures: unknown[] = [];
+      const client = {
+        hasFeature: () => false,
+        reportState: async (_id: string, body: { status: string }) => { if (body.status === "failed") failures.push(body); return { applied: true }; },
+        postMessages: async () => {},
+        postTaskReview: async (_id: string, value: unknown) => { posted = value as typeof posted; },
+      } as unknown as import("../src/client.js").WorkerClient;
+      const transport = new FakeTransport(authResponder);
+      transport.push(agentMessage(JSON.stringify({ status: "complete", summary: "Reviewed", findings: [] }))).push(turnCompleted()).end();
+      const specs: CodexAdviceLaunchSpec[] = [];
+      const factory = makeProductionCodexAdviceHarnessFactory(client, noopLog, homeRoot, {
+        launchRoot: async spec => { specs.push(spec); return { transport, cwd: homeRoot, dispose: async () => {} }; },
+      });
+      try {
+        await new ReviewRunner(client, { ensureClone: async () => "bare", reviewDiff: async () => "diff" } as never, noopLog,
+          { homeRoot, modelTimeoutMs: 5000, codexAdviceHarnessFactory: factory }).execute(reviewClaim(model, effort));
+        assert.equal(posted?.summary, "Reviewed", JSON.stringify(failures));
+        const thread = transport.requests.find(r => r.method === "thread/start")!.params as { model?: string };
+        const turn = transport.requests.find(r => r.method === "turn/start")!.params as { model?: string; effort?: string };
+        assert.equal(thread.model, wire);
+        assert.equal(turn.model, wire);
+        if (effort === undefined) assert.equal(Object.hasOwn(turn, "effort"), false);
+        else assert.equal(turn.effort, effort);
+      } finally {
+        await fs.rm(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+});

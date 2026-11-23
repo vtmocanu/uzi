@@ -60,6 +60,11 @@ const EXACT_SITES: Record<string, Site[]> = {
   "summary-runner.ts": [
     { label: "claim view type", line: "readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown; readonly provider?: ClaimProviderBinding };", count: 1 },
     { label: "the editor pass's token, from the holder-built claim view", line: "const token = claim.secrets.anthropic_oauth_token?.trim();", count: 1 },
+    { label: "optional claim input type (a provider-bound claim carries no token)", line: "claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown; readonly provider?: ClaimProviderBinding; readonly anthropic_oauth_token?: string } };", count: 1 },
+  ],
+  // Engine selection reads the token only in a parameter TYPE; the value is handed to the fail-closed decoder.
+  "codex/select.ts": [
+    { label: "selector parameter type", line: "secrets: CodexClaimView & { readonly provider?: unknown; readonly anthropic_oauth_token?: string },", count: 1 },
   ],
   // Pure types and the redaction-secret list (no model call is made with the value).
   "executor.ts": [{ label: "type", line: "oauthToken?: string;", count: 1 }],
