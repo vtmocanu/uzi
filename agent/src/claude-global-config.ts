@@ -130,7 +130,8 @@ const MKDIR_TIMEOUT_MS = 5_000;
  *  mkdir arguments and throws on failure). Production callers pass nothing. */
 export interface PrepareDeps {
   onStep?: (name: string) => void;
-  mkdirAsRunner?: (args: readonly string[]) => void;
+  /** Run `/bin/mkdir <args>` as the runner: returns its exit status; throws on a transient failure. */
+  mkdirAsRunner?: (args: readonly string[]) => number;
 }
 
 const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException | undefined)?.code;
@@ -205,7 +206,7 @@ function renameAside(p: string): void {
  *  SIGKILL only bound the wait until the kill is attempted: under the split the child is the runner
  *  uid after setpriv and the worker cannot kill(2) it (EPERM, see runner-uid.ts), so no stronger
  *  bound is claimed. The argv is fixed and the command short-lived. */
-function defaultMkdirAsRunner(args: readonly string[]): void {
+function defaultMkdirAsRunner(args: readonly string[]): number {
   const wrapped = runnerCommand(MKDIR_BIN, args);
   const r = spawnSync(wrapped.command, wrapped.args, {
     env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
@@ -214,11 +215,14 @@ function defaultMkdirAsRunner(args: readonly string[]): void {
     timeout: MKDIR_TIMEOUT_MS,
     killSignal: "SIGKILL",
   });
-  if (r.error || r.signal || r.status !== 0) throw refuse("the runner could not create the .claude targets");
+  // A spawn error, a signal or a timeout is transient: it refuses this start only, so a burst of
+  // load never moves the shared chat root's transcripts aside. A completed mkdir reports its exit.
+  if (r.error || r.signal || r.status === null) throw refuse("the runner mkdir of the .claude targets did not complete");
+  return r.status;
 }
 
 /** Make `<HOME>/.claude/{projects,tasks}` exist, writable by the CLI (see the Targets section). */
-function ensureTargets(home: string, mkdir: (args: readonly string[]) => void, step: (name: string) => void): void {
+function ensureTargets(home: string, mkdir: (args: readonly string[]) => number, step: (name: string) => void): void {
   const claude = path.join(home, ".claude");
   let retriedAfterMkdirFailure = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -228,7 +232,9 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => void, s
       step("claude-aside");
       continue;
     }
-    if (st === undefined) mkdir(["-p", "-m", "700", "--", claude]);
+    if (st === undefined && mkdir(["-p", "-m", "700", "--", claude]) !== 0) {
+      throw refuse("the runner could not create .claude");
+    }
     const missing: string[] = [];
     let aside = false;
     for (const name of ["projects", "tasks"] as const) {
@@ -253,13 +259,12 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => void, s
       continue;
     }
     if (missing.length > 0) {
-      try {
-        mkdir(["-p", "-m", "700", "--", ...missing]);
-      } catch (err) {
+      if (mkdir(["-p", "-m", "700", "--", ...missing]) !== 0) {
         // Under the split the worker cannot look into the runner-private .claude, so a non-directory
-        // (or an unsearchable .claude) shows up only as this failure. Move the HOME entry aside once
-        // and rebuild; a second failure refuses the start.
-        if (retriedAfterMkdirFailure) throw err;
+        // (or an unsearchable .claude) shows up only as a completed mkdir with a non-zero exit. Only
+        // that moves the HOME entry aside, once, and rebuilds; a second such exit refuses the start.
+        // A transient failure (spawn error, signal, timeout) throws above and keeps .claude in place.
+        if (retriedAfterMkdirFailure) throw refuse("the runner could not create the .claude targets");
         retriedAfterMkdirFailure = true;
         renameAside(claude);
         step("claude-aside");

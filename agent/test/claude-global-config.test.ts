@@ -40,8 +40,9 @@ let savedSplit: string | undefined;
 let counter = 0;
 
 /** The runner-uid mkdir stand-in for tests: the same argv, run directly (these tests are one uid). */
-const mkdirStub = (args: readonly string[]): void => {
+const mkdirStub = (args: readonly string[]): number => {
   execFileSync("/bin/mkdir", [...args]);
+  return 0;
 };
 const prep = (env: Parameters<typeof prepareClaudeConfigDir>[0], deps: PrepareDeps = {}): void =>
   prepareClaudeConfigDir(env, { mkdirAsRunner: mkdirStub, ...deps });
@@ -122,9 +123,9 @@ describe("prepareClaudeConfigDir: build and reuse", () => {
 
   it("creates the targets through the runner-uid mkdir seam only, with a fixed argv, and repeats nothing", () => {
     const calls: string[][] = [];
-    const rec = (args: readonly string[]): void => {
+    const rec = (args: readonly string[]): number => {
       calls.push([...args]);
-      mkdirStub(args);
+      return mkdirStub(args);
     };
     prepareClaudeConfigDir(envOf(), { mkdirAsRunner: rec });
     const claude = path.join(home, ".claude");
@@ -141,10 +142,21 @@ describe("prepareClaudeConfigDir: build and reuse", () => {
 
   it("a failing runner-uid mkdir refuses the start and builds no config directory", () => {
     assert.throws(
-      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { throw new Error("mkdir failed"); } }),
+      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => 1 }),
       TrustedExecutionRefusal,
     );
     assert.ok(!fs.existsSync(dirOf()));
+  });
+
+  it("a transient runner mkdir failure (spawn error, signal, timeout) refuses this start and keeps .claude in place", () => {
+    fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "projects", "keep.jsonl"), "x");
+    assert.throws(
+      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { throw new TrustedExecutionRefusal("transient"); } }),
+      TrustedExecutionRefusal,
+    );
+    assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0, "no aside on a transient failure");
+    assert.ok(fs.existsSync(path.join(home, ".claude", "projects", "keep.jsonl")), "the transcripts stay where resume finds them");
   });
 
   it("one uid: a CLI that tries to write the directory fails, so repeated starts reuse it and leave no stale copy", { skip: process.getuid?.() === 0 }, () => {
@@ -406,8 +418,8 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
     let calls = 0;
     prepareClaudeConfigDir(envOf(), {
       mkdirAsRunner: (a) => {
-        if (++calls === 1) throw new Error("mkdir failed");
-        mkdirStub(a);
+        if (++calls === 1) return 1;
+        return mkdirStub(a);
       },
     });
     assert.strictEqual(calls, 3, "targets (fails), .claude, targets");
@@ -416,12 +428,21 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
 
     const h = path.join(root, "twice");
     fs.mkdirSync(path.join(h, ".claude"), { recursive: true });
-    let n = 0;
+    // Only the TARGETS mkdir exits non-zero; creating .claude itself succeeds, so the retry-once
+    // guard (not the .claude creation) is what refuses.
+    const claudeH = path.join(h, ".claude");
+    const calls2: string[][] = [];
     assert.throws(
-      () => prepareClaudeConfigDir(envOf(h), { mkdirAsRunner: () => { n++; throw new Error("mkdir failed"); } }),
+      () => prepareClaudeConfigDir(envOf(h), {
+        mkdirAsRunner: (a) => {
+          calls2.push([...a]);
+          return a.length === 5 && a[4] === claudeH ? mkdirStub(a) : 1;
+        },
+      }),
       TrustedExecutionRefusal,
     );
-    assert.strictEqual(n, 2, "the targets mkdir fails, .claude moves aside, the retry fails, then refusal");
+    assert.strictEqual(calls2.length, 3, "targets exit 1, .claude aside and recreated, targets exit 1 again, then refusal");
+    assert.strictEqual(fs.readdirSync(h).filter((e) => e.startsWith(".claude.stale-")).length, 1, "exactly one aside");
     assert.ok(!fs.existsSync(claudeConfigDir(h)), "no config directory is built");
   });
 
