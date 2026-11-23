@@ -407,18 +407,32 @@ The split-across-files and elided-context patch gaps are closed by the `multi_li
   `terminal-<claim_generation>.json` under `<dataDir>/outbox/<runId>/` (`agent/src/outbox.ts`) is
   MAC-authenticated, the first durable writer for a generation wins, and the body is replayed
   verbatim by `listPendingTerminals` then `resolvePendingTerminal` (`agent/src/terminal-resolve.ts`).
-  A fully drained run's subtree is age-deleted after `WORKER_OUTBOX_RETENTION` (default 7 days,
-  `docs/configuration.md`); a run with an undrained segment is never removed by retention.
+  `sweepRetention` in `agent/src/outbox.ts` age-removes a run only when it has no pending manifest
+  records, terminal journals, finalize outcomes or publication outcomes. A run with a pending
+  terminal, finalize or publication outcome is never aged out, so `WORKER_OUTBOX_RETENTION`
+  (`docs/configuration.md`) is not an upper bound on the set of affected journals.
 
   Identification procedure for affected pre-release deployment journals (steps to follow; none has
   been run by this change):
 
-  1. On each pre-release worker data volume that may still hold journals within the retention
-     window, list the pending terminal journals under `<dataDir>/outbox/<runId>/`.
+  1. Audit every retained source that may predate the release, whatever its age: worker data
+     volumes and any backups or snapshots of them. List the terminal journals under
+     `<dataDir>/outbox/<runId>/`.
   2. A journal is affected when its `body.preserved_patch` is non-empty, its run's repo held a
      multi-line secret run variable, and it was written by a worker build from before this change.
-  3. Record a disposition per affected journal (replayed and landed, discarded, or left to age out)
-     without copying the report's contents.
+     A journal may be excluded only by matching it against that run's exact delivered secret
+     history, retained versions included; the current repo configuration alone cannot exclude one.
+  3. Classify as unknown, never unaffected: a run whose delivered history is incomplete; a journal
+     whose MAC cannot be verified (the worker's key is missing or unreadable, or the file is
+     truncated or malformed); and a journal with an unknown writer. The terminal journal
+     (`TerminalJournalData` in `agent/src/outbox.ts`) records no writer build identity, so the
+     writer is known only from deployment records.
+  4. Keep every affected or unknown journal retained until an explicit owner resolution is
+     recorded for it, without copying the report's contents. Manual journal deletion is not a
+     retirement mechanism.
+
+  The maintainers run this check through a private authenticated inventory with exact correlation
+  against delivered history, and record metadata-only results with owner dispositions.
 
   Deployment check: pending - maintainers supply the evidence; no fleet check has been performed by
   this change.

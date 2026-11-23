@@ -195,6 +195,9 @@ terminal preservation packs, recovery archives and the preserved patch.
   journaled with a patch can still replay with that patch after an upgrade. An
   upgraded worker never creates a new patch for a run holding a multi-line
   secret.
+  Such a journal is kept while its outcome is pending, whatever its age.
+  Maintainers audit retained pre-release journals before rollout and resolve
+  each one explicitly rather than deleting it.
 - Known gap: the planning diff sent to a cross-check and the diff context in a
   pull request description are only redacted, not path-scanned. A secret with
   non-ASCII characters used as a path name reaches them octal-escaped
