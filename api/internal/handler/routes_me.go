@@ -87,7 +87,9 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		})
 	})
 
-	// Model providers (PRD #4320 M1): user-defined Anthropic-compatible endpoints. Reads, create,
+	// Model providers (PRD #4320 M1): user-defined Anthropic-compatible endpoints, plus the admin-shared
+	// definitions (PRD #4324): reads, the key routes, Test and source selection see those too, while the
+	// owner mutation routes (PATCH, endpoint, retire, delete) reach only the caller's own. Reads, create,
 	// the name/model-map edit and retire are RequireUser (a CLI `uzi provider` command can drive
 	// them): none reveals or replaces a credential, and the destination they can set is bound to
 	// the operator allowlist. Everything that handles the key or moves the destination (key
@@ -105,7 +107,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			// The Claude provider source (PRD #4320 M4): selecting or clearing which provider the
 			// caller's Claude runs use. RequireUser (a CLI `uzi provider use` can drive it, plan
 			// decision P1): it reveals no key and cannot move a destination, and a select is
-			// refused unless the provider is the caller's, usable and allowlisted. A static path,
+			// refused unless the provider is visible to the caller (their own, or an admin-shared definition), usable and allowlisted. A static path,
 			// matched ahead of /{id}.
 			r.Put("/claude-source", h.SetMyClaudeProviderSource)
 			r.Put("/codex-source", h.SetMyCodexProviderSource)

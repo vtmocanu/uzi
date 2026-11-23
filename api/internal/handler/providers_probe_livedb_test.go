@@ -31,6 +31,11 @@ type fakeProviderGateway struct {
 	mu   sync.Mutex
 	mode string // "ok" | "unauthorized"
 	auth []string
+	// rejectAuth lists Authorization header values answered 401 whatever the mode (per-key outcomes).
+	rejectAuth map[string]bool
+	// onRequest, when set, runs on the gateway goroutine after the request is recorded and before it
+	// is answered: the "between the dial and the evidence write" interleaving point.
+	onRequest func()
 }
 
 func newFakeProviderGateway(t *testing.T) *fakeProviderGateway {
@@ -41,7 +46,14 @@ func newFakeProviderGateway(t *testing.T) *fakeProviderGateway {
 		g.mu.Lock()
 		g.auth = append(g.auth, r.Header.Get("Authorization"))
 		mode := g.mode
+		if g.rejectAuth[r.Header.Get("Authorization")] {
+			mode = "unauthorized"
+		}
+		hook := g.onRequest
 		g.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		if mode == "unauthorized" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -312,7 +324,7 @@ type providerProbeFinalReadInterleave struct {
 }
 
 func (db *providerProbeFinalReadInterleave) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	if strings.Contains(sql, "-- name: GetModelProviderForOwner ") {
+	if strings.Contains(sql, "-- name: GetVisibleProviderForUse ") {
 		db.mu.Lock()
 		db.reads++
 		fire := db.reads == 3 && !db.inHook
