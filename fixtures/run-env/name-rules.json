@@ -1,7 +1,7 @@
 {
   "harness_versions": {
     "claude_agent_sdk": "0.3.325",
-    "codex": "0.169.0"
+    "codex": "0.171.0"
   },
   "denied_names": [
     "HOME",

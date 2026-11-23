@@ -1223,7 +1223,7 @@ SELECT EXISTS (
 -- inflating health/placement plan cost into an earlier JIT threshold.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -11590,7 +11590,7 @@ WHERE id = @id;
 -- workers primary-key probe, and only for a run that carries a fact.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -11889,7 +11889,7 @@ WHERE w.user_id = @user_id
 -- would turn "weekly reserve" into a bogus "no worker can claim" reading.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -12518,7 +12518,7 @@ WHERE w.user_id = @user_id
 -- @max_rows bounds the work per tick.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -12737,7 +12737,7 @@ LIMIT @max_rows;
 -- equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL

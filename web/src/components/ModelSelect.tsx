@@ -8,7 +8,7 @@ import { Input, Select } from "./ui";
 // Claude keeps today's aliases (this is the single shared source for that set, PRD
 // #17 risk: alias drift — reused by the agent-template editor and the per-user
 // default-model setting) plus a free-text "Other…" custom escape hatch. Codex's
-// picker has EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol`/`gpt-6.1-sol` as curated
+// picker uses CODEX_CURATED_MODELS (including gpt-6.2-sol/astra) as curated
 // options, with no catalog discovery — matching D6's "the product-owned Codex picker
 // remains exactly" rule. Custom entry defaults off for Codex; worker defaults and
 // dedicated checker pins explicitly opt in.

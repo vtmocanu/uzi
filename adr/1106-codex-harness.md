@@ -1765,3 +1765,37 @@ The source audit does not establish that 0.171.0 is installed. Independent
 price verification and actual-binary catalog/incremental-tool proofs are
 separate adoption obligations; existing historical binary results above
 retain their dated runtime boundaries.
+
+### 2026-11-23 — 0.171.0 package adoption (M2)
+
+The adopted release is [rust-v0.171.0](https://github.com/openai/codex/releases/tag/rust-v0.171.0),
+source commit ccf9be8cc458bd6b8336fe84d68d8893f2691a5e.
+Independent release metadata was compared with the artifact research: both complete
+combined archives were hashed and matched the published checksum file and release
+API digest. The amd64 SHA256 is
+8391d67757496bfd14893eca6cbf0c96994bf2627566ff1f018f70600c9ef6b3;
+the arm64 SHA256 is
+d8c43bee6cf11b01eb18b95f4d7961092bc40228180808859e70dabb7784c1c9.
+Both archive manifests match version, layout and musl target; the five required
+members have the expected file types, modes and ELF architecture. The annotated
+tag is unsigned; Sigstore bundles were not verified. Publisher checksum/API
+agreement is integrity evidence, not an independent provenance attestation.
+
+The reviewed lock SHA256 is
+599b1ab6037bd57e1565c0b24b7e49a0f81ea9fdb51e15d8cfb55ad7353c14e0.
+The adoption marker was written separately after reviewing those facts.
+Pin sync updates deployment/test mirrors; it does not certify adoption.
+The prior completed M1 source/environment audit supports advancing the audited
+version mirrors to 0.171.0. This adds no native execution authority.
+
+The runtime probe now requires schema 1, the architecture's musl target, matching
+install roots and exactly the five lock members, rejecting omissions, duplicates
+and unexpected entries before advertising. Worker registration tests feed tiny
+receipt fixtures through the probe and combined isolation decision: an intact
+171 fixture advertises harness v1 and runtime v2/v3 together, while stale 169,
+invalid JSON/schema, integrity/member/architecture mismatch and failed required
+isolation advertise none. Installer tests use a synthetic archive and explicitly
+override its digest; they are not evidence of executing the published archive.
+The existing best-effort isolation policy remains in force. Runtime v3 is admitted
+as protocol vocabulary only; placement changes, actual-binary catalog/native-tool
+proofs, image builds and hosted rollout verification remain separate obligations.

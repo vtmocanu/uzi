@@ -7,7 +7,7 @@
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
   claude_agent_sdk: "0.3.325",
-  codex: "0.169.0",
+  codex: "0.171.0",
 } as const;
 
 /** Exact names a variable may not use. */

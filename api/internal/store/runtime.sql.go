@@ -1106,7 +1106,7 @@ func (q *Queries) ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUI
 const claimRun = `-- name: ClaimRun :one
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -2977,7 +2977,7 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -12737,7 +12737,7 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -16018,7 +16018,7 @@ func (q *Queries) ListRunsPendingUsageRefold(ctx context.Context, arg ListRunsPe
 const listSaturationQueuedRunsForEphemeral = `-- name: ListSaturationQueuedRunsForEphemeral :many
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -16475,7 +16475,7 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 const listUnplaceableQueuedRunsForEphemeral = `-- name: ListUnplaceableQueuedRunsForEphemeral :many
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL

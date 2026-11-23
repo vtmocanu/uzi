@@ -15,7 +15,7 @@ import {
 import { DEFAULT_CODEX_MODEL } from "../components/ModelSelect";
 
 describe("templateModelFieldWarning", () => {
-  it.each(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"])(
+  it.each(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"])(
     "rejects %s on Claude and accepts it on Codex", (model) => {
       expect(templateModelFieldWarning(model, "claude")).toMatch(/Claude.*template/);
       expect(templateModelFieldWarning(model, "codex")).toBe("");

@@ -11,6 +11,10 @@ it("a Codex lock upgrade must reconcile the production probe and launcher pins",
     assert.ok(match, `missing ${key}`);
     return match[1]!;
   };
+  const probeSource = readFileSync(new URL("../src/codex/codex-runtime-probe.ts", import.meta.url), "utf8");
+  const required = probeSource.match(/const REQUIRED_MEMBERS = (\[[^;]+\]) as const;/);
+  assert.ok(required, "probe must declare its bounded compile-time member set");
+  assert.deepEqual((JSON.parse(required[1]!) as string[]).sort(), value("CODEX_MEMBERS").split(" ").sort());
   const version = value("CODEX_VERSION");
   assert.equal(value("CODEX_MANIFEST_VERSION"), version);
   assert.equal(value("CODEX_TAG"), `rust-v${version}`);

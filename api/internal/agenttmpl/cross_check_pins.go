@@ -17,14 +17,14 @@ const DefaultCodexModel = "gpt-6.1-sol"
 // CuratedCodexModels and KnownClaudeAliases are the closed family guards shared
 // by worker lanes and checker pins. Custom IDs remain provider-validated.
 var CuratedCodexModels = map[string]bool{
-	"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-6-sol": true, "gpt-6.1-sol": true,
+	"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-6-sol": true, "gpt-6.1-sol": true, "gpt-6.2-sol": true, "gpt-6.2-astra": true,
 }
 
 // CodexRoleModels is CuratedCodexModels plus gpt-6-luna: the model contract of
 // agent advice and role pins. It is not a picker vocabulary; the Claude-lane
 // guard uses it to refuse every id that only a Codex run can serve.
 var CodexRoleModels = map[string]bool{
-	"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-6-luna": true, "gpt-6-sol": true, "gpt-6.1-sol": true,
+	"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-6-luna": true, "gpt-6-sol": true, "gpt-6.1-sol": true, "gpt-6.2-sol": true, "gpt-6.2-astra": true,
 }
 
 // Both sets above are pinned to fixtures/codex-models/models.json by tests.
@@ -37,7 +37,7 @@ func ValidateFamilyModel(harness, raw string) (string, error) {
 	}
 	switch harness {
 	case "claude":
-		if CuratedCodexModels[model] {
+		if CodexRoleModels[model] {
 			return "", fmt.Errorf("model is a Codex model id")
 		}
 	case "codex":

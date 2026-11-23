@@ -35,7 +35,7 @@ function Harness({
 }
 
 describe("ModelSelect — closed models override", () => {
-  it.each([undefined, "claude", "codex"] as const)("offers exactly the five role options for harness %s", (pickerHarness) => {
+  it.each([undefined, "claude", "codex"] as const)("offers exactly the role options for harness %s", (pickerHarness) => {
     render(<Harness initial="" pickerHarness={pickerHarness} models={CODEX_ROLE_MODELS} />);
     expect(Array.from(combo().options, (o) => o.value)).toEqual(["inherit", ...CODEX_ROLE_MODELS]);
     fireEvent.change(combo(), { target: { value: "gpt-6-luna" } });
@@ -233,7 +233,7 @@ describe("ModelSelect label association", () => {
 
 // PRD #1429 D6: the two closed harness vocabularies. Claude keeps today's aliases
 // (defaulting harness omitted, so every pre-M4a call site is unaffected); Codex is
-// EXACTLY gpt-6-astra/gpt-5.6-sol/gpt-6-sol with NO custom escape hatch.
+// Exactly CODEX_CURATED_MODELS with no custom escape hatch.
 describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
   it("offers today's Claude aliases plus Other… when harness is omitted (back-compat)", () => {
     render(<Harness initial="" />);
@@ -375,5 +375,20 @@ describe("ModelSelect — custom-mode report (PRD #3245)", () => {
   it("wires aria-describedby onto the select", () => {
     render(<ModelSelect value="" onChange={() => {}} defaultLabel="Default · test" ariaDescribedBy="hint" />);
     expect(combo().getAttribute("aria-describedby")).toBe("hint");
+  });
+});
+
+
+describe("6.2 picker writes", () => {
+  it.each(["gpt-6.2-sol", "gpt-6.2-astra"])("emits %s from both curated and closed role pickers", (model) => {
+    const { unmount } = render(<Harness initial="" pickerHarness="codex" />);
+    fireEvent.change(combo(), { target: { value: model } });
+    expect(value()).toBe(model);
+    expect(screen.queryByLabelText("Custom model ID")).toBeNull();
+    unmount();
+    render(<Harness initial="" models={CODEX_ROLE_MODELS} />);
+    fireEvent.change(combo(), { target: { value: model } });
+    expect(value()).toBe(model);
+    expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
   });
 });

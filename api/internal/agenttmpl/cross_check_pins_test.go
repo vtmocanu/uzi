@@ -122,3 +122,40 @@ func TestCrossCheckDefaultEffortIsALevel(t *testing.T) {
 		t.Fatal("ordinary worker effort defaults changed")
 	}
 }
+
+func TestM2ModelWriteBoundaries(t *testing.T) {
+	for _, model := range []string{"gpt-6.2-sol", "gpt-6.2-astra"} {
+		for _, raw := range []string{model, " " + model + " "} {
+			if got, err := ValidateFamilyModel("codex", raw); err != nil || got != model {
+				t.Errorf("Codex write %q: %q, %v", raw, got, err)
+			}
+			if _, err := ValidateFamilyModel("claude", raw); err == nil {
+				t.Errorf("Claude checker accepted %q", raw)
+			}
+			if _, err := ValidateClaudeLaneModel(raw); err == nil {
+				t.Errorf("Claude lane accepted %q", raw)
+			}
+			if got, err := ValidateTemplatePin("codex", raw); err != nil || got != model {
+				t.Errorf("Codex role %q: %q, %v", raw, got, err)
+			}
+			if _, err := ValidateTemplatePin("claude", raw); err == nil {
+				t.Errorf("Claude role accepted %q", raw)
+			}
+		}
+		got := ResolveCrossCheck("codex", nil, nil, nil, nil, &model)
+		if got.Model == nil || *got.Model != model {
+			t.Errorf("template fallback dropped %s: %+v", model, got)
+		}
+	}
+	for _, model := range []string{"custom-root", "custom-planning"} {
+		if got, err := ValidateFamilyModel("codex", model); err != nil || got != model {
+			t.Errorf("custom write %s: %q, %v", model, got, err)
+		}
+		if _, err := ValidateTemplatePin("codex", model); err == nil {
+			t.Errorf("role accepted custom %s", model)
+		}
+	}
+	if _, err := ValidateFamilyModel("claude", "gpt-6-luna"); err == nil {
+		t.Error("Claude checker accepted luna")
+	}
+}
